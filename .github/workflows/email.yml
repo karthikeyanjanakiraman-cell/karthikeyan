@@ -1,0 +1,49 @@
+name: Run Fyers email strategy
+
+on:
+  schedule:
+    # Every 15 minutes (GitHub uses UTC time)
+    - cron: "*/15 * * * *"
+  workflow_dispatch: {}  # allows manual trigger from the Actions tab
+
+jobs:
+  run-strategy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install fyers_apiv3 pandas numpy scipy ta
+
+      - name: Create Config.ini from secrets
+        run: |
+          cat > Config.ini << 'EOF'
+          [fyers_credentials]
+          client_id = ${{ secrets.CLIENT_ID }}
+          secret_key = ${{ secrets.SECRET_KEY }}
+          redirect_uri = ${{ secrets.REDIRECT_URI }}
+          auth_code = ${{ secrets.AUTH_CODE }}
+          access_token = ${{ secrets.ACCESS_TOKEN }}
+
+          [email_settings]
+          sender_email = ${{ secrets.SENDER_EMAIL }}
+          sender_password = ${{ secrets.SENDER_PASSWORD }}
+          recipient_email = ${{ secrets.RECIPIENT_EMAIL }}
+          smtp_server = smtp.gmail.com
+          smtp_port = 587
+          EOF
+
+      - name: Run Fyers v3 email script
+        env:
+          TZ: Asia/Kolkata
+        run: |
+          python app-fyers_v3_0_COMPLETE_WITH_EMAIL.py
