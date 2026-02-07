@@ -44,4 +44,4 @@ jobs:
         env:
           TZ: Asia/Kolkata
         run: |
-          python EMAIL.py
+          python email.py
