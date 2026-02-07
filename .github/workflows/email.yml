@@ -46,4 +46,4 @@ jobs:
         env:
           TZ: Asia/Kolkata
         run: |
-          python app-fyers_v3_0_COMPLETE_WITH_EMAIL.py
+          python EMAIL.py
