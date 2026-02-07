@@ -37,5 +37,5 @@ jobs:
           SMTP_PORT:       ${{ secrets.SMTP_PORT }}
           TZ:              Asia/Kolkata
         run: |
-          python email.py
+          python EMAIL.py
           # or: python app-fyers_v3_0_COMPLETE_WITH_EMAIL.py
