@@ -24,24 +24,18 @@ jobs:
           python -m pip install --upgrade pip
           pip install fyers_apiv3 pandas numpy scipy ta
 
-      - name: Create Config.ini from secrets
-        run: |
-          env:
-          # Fyers credentials (from Repository secrets)
+      - name: Run Fyers v3 email script
+        env:                         # env is part of THIS step
           CLIENT_ID:       ${{ secrets.CLIENT_ID }}
           SECRET_KEY:      ${{ secrets.SECRET_KEY }}
           REDIRECT_URI:    ${{ secrets.REDIRECT_URI }}
           AUTH_CODE:       ${{ secrets.AUTH_CODE }}
           ACCESS_TOKEN:    ${{ secrets.ACCESS_TOKEN }}
-
-          # Email settings
           SENDER_EMAIL:    ${{ secrets.SENDER_EMAIL }}
           SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
           SMTP_PORT:       ${{ secrets.SMTP_PORT }}
-
-      - name: Run Fyers v3 email script
-        env:
-          TZ: Asia/Kolkata
+          TZ:              Asia/Kolkata
         run: |
           python email.py
+          # or: python app-fyers_v3_0_COMPLETE_WITH_EMAIL.py
