@@ -2,8 +2,8 @@ name: Email
 
 on:
   schedule:
-    # Every 15 minutes (GitHub uses UTC time)
-    - cron: "*/15 * * * *"
+    # Every 15 minutes, 03:00–10:59 UTC (≈ 8:30–15:29 IST), Monday–Friday
+    - cron: "*/15 3-10 * * 1-5"
   workflow_dispatch: {}  # allows manual trigger from the Actions tab
 
 jobs:
