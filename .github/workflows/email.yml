@@ -26,21 +26,19 @@ jobs:
 
       - name: Create Config.ini from secrets
         run: |
-          cat > Config.ini << 'EOF'
-          [fyers_credentials]
-          client_id = ${{ secrets.CLIENT_ID }}
-          secret_key = ${{ secrets.SECRET_KEY }}
-          redirect_uri = ${{ secrets.REDIRECT_URI }}
-          auth_code = ${{ secrets.AUTH_CODE }}
-          access_token = ${{ secrets.ACCESS_TOKEN }}
+          env:
+          # Fyers credentials (from Repository secrets)
+          CLIENT_ID:       ${{ secrets.CLIENT_ID }}
+          SECRET_KEY:      ${{ secrets.SECRET_KEY }}
+          REDIRECT_URI:    ${{ secrets.REDIRECT_URI }}
+          AUTH_CODE:       ${{ secrets.AUTH_CODE }}
+          ACCESS_TOKEN:    ${{ secrets.ACCESS_TOKEN }}
 
-          [email_settings]
-          sender_email = ${{ secrets.SENDER_EMAIL }}
-          sender_password = ${{ secrets.SENDER_PASSWORD }}
-          recipient_email = ${{ secrets.RECIPIENT_EMAIL }}
-          smtp_server = smtp.gmail.com
-          smtp_port = 587
-          EOF
+          # Email settings
+          SENDER_EMAIL:    ${{ secrets.SENDER_EMAIL }}
+          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          SMTP_PORT:       ${{ secrets.SMTP_PORT }}
 
       - name: Run Fyers v3 email script
         env:
