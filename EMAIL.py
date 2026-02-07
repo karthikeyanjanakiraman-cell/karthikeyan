@@ -1761,7 +1761,7 @@ def rank_all_stocks_multitimeframe_v30(symbols):
 # EMAIL FUNCTIONALITY
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 
-def send_email_with_attachment(filename, config):
+def send_email_with_attachment(filename):
     """
     Send email with CSV file attachment
 
