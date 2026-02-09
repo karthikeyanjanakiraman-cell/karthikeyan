@@ -2044,7 +2044,7 @@ def query_fresh_breakdowns_bearish(limit=10):
       FROM hist WHERE DominantTrend = 'BEARISH'
     )
     SELECT * FROM breakdowns
-    WHERE prev_min_rank IS NOT NULL AND breakdown_size >= 0.0 AND latest_rank <= 0.0
+    WHERE prev_min_rank IS NOT NULL AND breakdown_size > 0.0 AND latest_rank <= 0.0
     ORDER BY breakdown_size DESC LIMIT {limit};
     """
     try:
