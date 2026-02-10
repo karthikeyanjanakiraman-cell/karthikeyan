@@ -2057,100 +2057,154 @@ def query_fresh_breakdowns_bearish(limit=10):
         return pd.DataFrame()
 
 
+# ===================== DB BREAKOUT / BREAKDOWN QUERIES =====================
+
+def query_fresh_breakouts_bullish(limit=10):
+    """
+    Query top bullish fresh breakouts:
+    current RankScore15Tier vs its own previous max today.
+    """
+    conn = sqlite3.connect(DBPATH)
+    from datetime import date as date
+    today_str = date.today().strftime("%Y-%m-%d")
+
+    query = f"""
+    WITH hist AS (
+        SELECT
+            date,
+            Symbol,
+            runtime,
+            RankScore15Tier,
+            DominantTrend,
+            PositionSizeMultiplier,
+            LTP,
+            MAX(RankScore15Tier) OVER (
+                PARTITION BY date, Symbol
+                ORDER BY runtime
+                ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+            ) AS prevmaxrank
+        FROM stocksignals
+        WHERE date = '{today_str}'
+    ),
+    breakouts AS (
+        SELECT
+            Symbol,
+            runtime,
+            RankScore15Tier AS latestrank,
+            prevmaxrank,
+            RankScore15Tier - prevmaxrank AS breakoutsize,
+            PositionSizeMultiplier,
+            LTP,
+            DominantTrend
+        FROM hist
+        WHERE DominantTrend = 'BULLISH'
+    )
+    SELECT *
+    FROM breakouts
+    WHERE prevmaxrank IS NOT NULL
+      AND breakoutsize > 0.3
+      AND latestrank > 5.5
+    ORDER BY breakoutsize DESC
+    LIMIT {limit}
+    """
+
+    try:
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df
+    except Exception as e:
+        logger.error(f"Bullish query error {e}")
+        conn.close()
+        return pd.DataFrame()
+
+
+def query_fresh_breakdowns_bearish(limit=10):
+    """
+    Query top bearish fresh breakdowns:
+    current RankScore15Tier vs its own previous min today.
+    """
+    conn = sqlite3.connect(DBPATH)
+    from datetime import date as date
+    today_str = date.today().strftime("%Y-%m-%d")
+
+    query = f"""
+    WITH hist AS (
+        SELECT
+            date,
+            Symbol,
+            runtime,
+            RankScore15Tier,
+            DominantTrend,
+            PositionSizeMultiplier,
+            LTP,
+            MIN(RankScore15Tier) OVER (
+                PARTITION BY date, Symbol
+                ORDER BY runtime
+                ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+            ) AS prevminrank
+        FROM stocksignals
+        WHERE date = '{today_str}'
+    ),
+    breakdowns AS (
+        SELECT
+            Symbol,
+            runtime,
+            RankScore15Tier AS latestrank,
+            prevminrank,
+            prevminrank - RankScore15Tier AS breakdownsize,
+            PositionSizeMultiplier,
+            LTP,
+            DominantTrend
+        FROM hist
+        WHERE DominantTrend = 'BEARISH'
+    )
+    SELECT *
+    FROM breakdowns
+    WHERE prevminrank IS NOT NULL
+      AND breakdownsize > 0.0
+      AND latestrank < 0.0
+    ORDER BY breakdownsize DESC
+    LIMIT {limit}
+    """
+
+    try:
+        df = pd.read_sql_query(query, conn)
+        conn.close()
+        return df
+    except Exception as e:
+        logger.error(f"Bearish query error {e}")
+        conn.close()
+        return pd.DataFrame()
+
+
+# Backward‑compat aliases (so old names also work)
+def queryfreshbreakoutsbullish(limit=10):
+    return query_fresh_breakouts_bullish(limit=limit)
+
+
+def queryfreshbreakdownsbearish(limit=10):
+    return query_fresh_breakdowns_bearish(limit=limit)
+
+
+# ===================== EMAIL WITH DB INSIGHTS =====================
+
 def send_email_with_db_insights(csv_filename):
-    # """Send email with DB query results + CSV attachment"""
-    # top10_bullish = query_fresh_breakouts_bullish(limit=10)
-    # top10_bearish = query_fresh_breakdowns_bearish(limit=10)
-
-    # if not top10_bullish.empty:
-    #     bullish_html = top10_bullish.to_html(index=False, border=1)
-    # else:
-    #     bullish_html = "<p><em>No fresh breakouts (need 2+ runs for comparison)</em></p>"
-
-    # if not top10_bearish.empty:
-    #     bearish_html = top10_bearish.to_html(index=False, border=1)
-    # else:
-    #     bearish_html = "<p><em>No fresh breakdowns (need 2+ runs)</em></p>"
-
-    # sender_email = os.getenv('SENDER_EMAIL')
-    # sender_password = os.getenv('SENDER_PASSWORD')
-    # recipient_email = os.getenv('RECIPIENT_EMAIL')
-    # smtp_server = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
-    # smtp_port = int(os.getenv('SMTP_PORT', 587))
-
-    # if not all([sender_email, sender_password, recipient_email]):
-    #     logger.warning("⚠ Missing email credentials")
-    #     return False
-
-    # msg = MIMEMultipart()
-    # msg['From'] = sender_email
-    # msg['To'] = recipient_email
-    # msg['Subject'] = f"Asit v3.0 SQLite Breakouts - {datetime.now().strftime('%Y-%m-%d %H:%M IST')}"
-
-    # body_html = f"""
-    # <html><body style="font-family: Arial, sans-serif;">
-    # <h1 style="color: #2c3e50;">📊 Asit Strategy v3.0 Multi-Run Report</h1>
-    # <p><strong>Generated:</strong> {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}</p>
-    # <hr>
-    # <h2 style="color: #27ae60;">🚀 Top 10 BULLISH Fresh Breakouts</h2>
-    # <p><em>Current RankScore > its own previous max today</em></p>
-    # {bullish_html}
-    # <hr>
-    # <h2 style="color: #e74c3c;">📉 Top 10 BEARISH Fresh Breakdowns</h2>
-    # <p><em>Current RankScore < its own previous min today</em></p>
-    # {bearish_html}
-    # <hr>
-    # <h3>📎 Attached: {csv_filename}</h3>
-    # <p style="font-size: 12px; color: #7f8c8d;">
-    # DB auto-clears daily | Window functions | Fresh momentum detection
-    # </p>
-    # </body></html>
-    # """
-
-    # msg.attach(MIMEText(body_html, 'html'))
-
-    # try:
-    #     with open(csv_filename, 'rb') as f:
-    #         part = MIMEBase('application', 'octet-stream')
-    #         part.set_payload(f.read())
-    #         encoders.encode_base64(part)
-    #         part.add_header('Content-Disposition', f'attachment; filename={os.path.basename(csv_filename)}')
-    #         msg.attach(part)
-    # except Exception as e:
-    #     logger.error(f"❌ CSV attach error: {e}")
-    #     return False
-
-    # try:
-    #     server = smtplib.SMTP(smtp_server, smtp_port)
-    #     server.starttls()
-    #     server.login(sender_email, sender_password)
-    #     server.sendmail(sender_email, recipient_email, msg.as_string())
-    #     server.quit()
-    #     logger.info(f"✓ Email sent: {len(top10_bullish)} bullish, {len(top10_bearish)} bearish")
-    #     print(f"✓ EMAIL SENT! Bullish: {len(top10_bullish)}, Bearish: {len(top10_bearish)}")
-    #     return True
-    # except Exception as e:
-    #     logger.error(f"❌ SMTP error: {e}")
-    #     return False
-
     """
     Send email with DB query results + CSV attachment.
 
     - Primary: use fresh breakout / breakdown logic (current vs previous max/min today)
-    - Fallback: if no fresh breakouts, show top 10 current bullish symbols by RankScore for today
+    - Fallback: if no fresh breakouts, show top 10 current bullish symbols by RankScore for today.
     """
-
-    # Run window-function queries (your existing logic)
-    top10bullish = queryfreshbreakoutsbullish(limit=10)
-    top10bearish = queryfreshbreakdownsbearish(limit=10)
+    # Get bullish / bearish data
+    top10bullish = query_fresh_breakouts_bullish(limit=10)
+    top10bearish = query_fresh_breakdowns_bearish(limit=10)
 
     conn = sqlite3.connect(DBPATH)
     from datetime import date as date
-    todaystr = date.today().strftime("%Y-%m-%d")
+    today_str = date.today().strftime("%Y-%m-%d")
 
     # --------- BULLISH HTML (with fallback) ---------
     if not top10bullish.empty:
-        # Normal case: we have real "fresh breakout" rows
         bullish_html = top10bullish.to_html(index=False, border=1)
     else:
         # Fallback: show top 10 current bullish by RankScore for today
@@ -2164,7 +2218,7 @@ def send_email_with_db_insights(csv_filename):
                 LTP,
                 DominantTrend
             FROM stocksignals
-            WHERE date = '{todaystr}'
+            WHERE date = '{today_str}'
               AND DominantTrend = 'BULLISH'
             ORDER BY RankScore15Tier DESC
             LIMIT 10
@@ -2185,7 +2239,7 @@ def send_email_with_db_insights(csv_filename):
             logger.error(f"EMAIL Fallback bullish query error: {e}")
             bullish_html = "<em>Error preparing bullish table.</em>"
 
-    # --------- BEARISH HTML (unchanged logic) ---------
+    # --------- BEARISH HTML (same logic as before if you want) ---------
     if not top10bearish.empty:
         bearish_html = top10bearish.to_html(index=False, border=1)
     else:
@@ -2193,7 +2247,7 @@ def send_email_with_db_insights(csv_filename):
 
     conn.close()
 
-    # --------- Build and send the email (same structure as your original) ---------
+    # --------- Build and send the email ---------
     sender_email = os.getenv("SENDER_EMAIL")
     sender_password = os.getenv("SENDER_PASSWORD")
     recipient_email = os.getenv("RECIPIENT_EMAIL")
@@ -2207,7 +2261,10 @@ def send_email_with_db_insights(csv_filename):
     msg = MIMEMultipart()
     msg["From"] = sender_email
     msg["To"] = recipient_email
-    msg["Subject"] = f"Asit v3.0 SQLite Breakouts - {datetime.now().strftime('%Y-%m-%d %H:%M IST')}"
+    msg["Subject"] = (
+        f"Asit v3.0 SQLite Breakouts - "
+        f"{datetime.now().strftime('%Y-%m-%d %H:%M IST')}"
+    )
 
     body_html = f"""
     <html>
@@ -2255,13 +2312,19 @@ def send_email_with_db_insights(csv_filename):
         server.login(sender_email, sender_password)
         server.sendmail(sender_email, recipient_email, msg.as_string())
         server.quit()
-        logger.info(f"Email sent. Bullish {len(top10bullish)}, Bearish {len(top10bearish)}")
+        logger.info(
+            f"Email sent. Bullish {len(top10bullish)}, Bearish {len(top10bearish)}"
+        )
         print("EMAIL SENT!")
         return True
     except Exception as e:
         logger.error(f"SMTP error {e}")
         return False
 
+
+# Backward‑compat alias so old main call still works if it used this name
+def sendemailwithdbinsights(csv_filename):
+    return send_email_with_db_insights(csv_filename)
 
 if __name__ == "__main__":
     print("\n" + "="*100)
