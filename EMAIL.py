@@ -2402,13 +2402,13 @@ if __name__ == "__main__":
     """)
 
 # Safe insert for results_df
- try:
-       if 'date' not in results_df.columns:
-          results_df['date'] = '2026-02-10'
-       if 'runtime' not in results_df.columns:
-          results_df['runtime'] = datetime.now().strftime('%H:%M:%S')
+    try:
+        if 'date' not in results_df.columns:
+           results_df['date'] = '2026-02-10'
+        if 'runtime' not in results_df.columns:
+           results_df['runtime'] = datetime.now().strftime('%H:%M:%S')
     
-       db_data = pd.DataFrame({
+        db_data = pd.DataFrame({
         'date': results_df.get('date', '2026-02-10'),
         'runtime': results_df.get('runtime', datetime.now().strftime('%H:%M:%S')),
         'Symbol': results_df.get('Symbol', results_df.get('symbol', '')),
@@ -2418,13 +2418,13 @@ if __name__ == "__main__":
         'LTP': results_df.get('LTP', results_df.get('ltp', results_df.get('Close', 0)))
         })
     
-    db_data.to_sql('stocksignals', conn, if_exists='append', index=False)
-    print(f"✅ DB: {len(db_data)} rows from results_df")
-except Exception as e:
-     print(f"DB ok: {e}")
-finally:
-    conn.commit()
-    conn.close()
+        db_data.to_sql('stocksignals', conn, if_exists='append', index=False)
+        print(f"✅ DB: {len(db_data)} rows from results_df")
+    except Exception as e:
+        print(f"DB ok: {e}")
+    finally:
+        conn.commit()
+        conn.close()
      
 
     logger.info(f"✅ DB populated ({len(df)} rows) - EMAIL.py now works")
