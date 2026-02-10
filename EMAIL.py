@@ -2387,6 +2387,7 @@ if __name__ == "__main__":
     results_df = rank_all_stocks_multitimeframe_v30(symbols)
    
     DB_PATH = 'intraday_signals.db'
+    conn = sqlite3.connect('intraday_signals.db').execute("CREATE TABLE IF NOT EXISTS stocksignals (date TEXT, runtime TEXT, Symbol TEXT, RankScore15Tier REAL, DominantTrend TEXT, PositionSizeMultiplier REAL, LTP REAL)").close()
 
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
