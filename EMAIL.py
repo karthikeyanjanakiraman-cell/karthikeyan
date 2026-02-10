@@ -177,6 +177,9 @@ failed_symbols = []
 local_iv_cache = {}
 daily_pnl_tracker = {}  # GAP #4: Daily P&L tracking
 
+DB_PATH = "intradaysignals.db"
+DBPATH = DB_PATH
+
 # ===== MARKET PARAMETERS =====
 MARKET_OPEN_TIME = datetime.strptime("09:15", "%H:%M").time()
 MARKET_CLOSE_TIME = datetime.strptime("15:30", "%H:%M").time()
