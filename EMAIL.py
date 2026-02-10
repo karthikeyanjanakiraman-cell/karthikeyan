@@ -2198,51 +2198,59 @@ def send_email_with_db_insights(csv_filename):
     - Primary: use fresh breakout / breakdown logic (current vs previous max/min today)
     - Fallback: if no fresh breakouts, show top 10 current bullish symbols by RankScore for today.
     """
-    # Get bullish / bearish data
+    from datetime import date as date
+
+    today_str = date.today().strftime("%Y-%m-%d")
+
+    # Get bullish / bearish fresh moves
     top10bullish = query_fresh_breakouts_bullish(limit=10)
     top10bearish = query_fresh_breakdowns_bearish(limit=10)
 
     conn = sqlite3.connect(DBPATH)
-    from datetime import date as date
-    today_str = date.today().strftime("%Y-%m-%d")
 
-    # --------- BULLISH HTML (with fallback) ---------
+    # --------- BULLISH HTML (with robust fallback) ---------
     if not top10bullish.empty:
+        # Normal case: we have real "fresh breakout" rows
         bullish_html = top10bullish.to_html(index=False, border=1)
     else:
-        # Fallback: show top 10 current bullish by RankScore for today
+        # Fallback: read today's rows and filter in pandas instead of SQL
         try:
-            fallback_query = f"""
-            SELECT
-                Symbol,
-                runtime,
-                RankScore15Tier AS latestrank,
-                PositionSizeMultiplier,
-                LTP,
-                DominantTrend
-            FROM stocksignals
-            WHERE date = '{today_str}'
-              AND DominantTrend = 'BULLISH'
-            ORDER BY RankScore15Tier DESC
-            LIMIT 10
-            """
-            df_fallback = pd.read_sql_query(fallback_query, conn)
+            df_all = pd.read_sql_query(
+                "SELECT * FROM stocksignals WHERE date = ?",
+                conn,
+                params=(today_str,),
+            )
 
-            if not df_fallback.empty:
+            df_bull = df_all[df_all["DominantTrend"] == "BULLISH"].copy()
+
+            if not df_bull.empty:
+                df_bull = (
+                    df_bull.sort_values("RankScore15Tier", ascending=False)
+                    .head(10)[
+                        [
+                            "Symbol",
+                            "runtime",
+                            "RankScore15Tier",
+                            "PositionSizeMultiplier",
+                            "LTP",
+                            "DominantTrend",
+                        ]
+                    ]
+                )
                 bullish_html = (
                     "<p><em>No fresh breakouts vs previous run; "
                     "showing top 10 current bullish by RankScore.</em></p>"
-                    + df_fallback.to_html(index=False, border=1)
+                    + df_bull.to_html(index=False, border=1)
                 )
             else:
                 bullish_html = (
                     "<em>No bullish symbols found for today (no data in DB).</em>"
                 )
         except Exception as e:
-            logger.error(f"EMAIL Fallback bullish query error: {e}")
+            logger.error(f"EMAIL Fallback bullish table error: {e}")
             bullish_html = "<em>Error preparing bullish table.</em>"
 
-    # --------- BEARISH HTML (same logic as before if you want) ---------
+    # --------- BEARISH HTML (unchanged logic) ---------
     if not top10bearish.empty:
         bearish_html = top10bearish.to_html(index=False, border=1)
     else:
