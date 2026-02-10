@@ -2385,7 +2385,32 @@ if __name__ == "__main__":
     print("[LAUNCH] PROCESSING WITH v3.0 (ALL 12 GAPS FIXED AND INTEGRATED)...\n")
     
     results_df = rank_all_stocks_multitimeframe_v30(symbols)
-    
+
+    DB_PATH = 'intraday_signals.db'
+
+# Create/populate stocksignals table
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+    CREATE TABLE IF NOT EXISTS stocksignals (
+    date TEXT,
+    runtime TEXT, 
+    Symbol TEXT,
+    RankScore15Tier REAL,
+    DominantTrend TEXT,
+    PositionSizeMultiplier REAL,
+    LTP REAL
+    )
+    """)
+
+# Insert current df (adjust cols if your df differs)
+    cols = ['date', 'runtime', 'Symbol', 'RankScore15Tier', 'DominantTrend', 'PositionSizeMultiplier', 'LTP']
+    df[cols].to_sql('stocksignals', conn, if_exists='append', index=False)
+
+    conn.commit()
+    conn.close()
+
+    logger.info(f"✅ DB populated ({len(df)} rows) - EMAIL.py now works")
+    print("📧 EMAIL.py → Top 10 Bearish Breakdowns table ready")
     if results_df is None or results_df.empty:
         logger.error("[ERROR] No results generated.")
         exit()
@@ -2433,46 +2458,7 @@ if __name__ == "__main__":
     print("[OK] ✅ GAP #10: THETA DECAY MODELING (Exit before acceleration)")
     print("[OK] ✅ GAP #11: NEGATIVE SKEW PREFERENCE (IV skew optimization)")
     print("[OK] ✅ GAP #12: LEVERAGE AVOIDANCE (Risk control discipline)\n")
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""
-    CREATE TABLE IF NOT EXISTS stocksignals (
-    date TEXT,
-    runtime TEXT,
-    Symbol TEXT,
-    RankScore15Tier REAL,
-    DominantTrend TEXT,
-    PositionSizeMultiplier REAL,
-    LTP REAL,
-    EntryConfidence REAL,
-    EntryReason TEXT,
-    ShouldExit INTEGER,
-    ExitConfidence REAL,
-    ExitReason TEXT,
-    ExitSignalsCount INTEGER
-    )
-    """)
-
-    today = datetime.now().strftime('%Y-%m-%d')
-    runtime = datetime.now().strftime('%H:%M:%S')
-
-# Read your output CSV and write to DB
-    df = pd.read_csv(output_filename)  # Replace with your CSV var name
-    df['date'] = today
-    df['runtime'] = runtime
-
-# Map column names if needed (RankScore_15Tier -> RankScore15Tier)
-    if 'RankScore_15Tier' in df.columns:
-        df['RankScore15Tier'] = df['RankScore_15Tier']
-
-    db_cols = ['date', 'runtime', 'Symbol', 'RankScore15Tier', 'DominantTrend', 
-           'PositionSizeMultiplier', 'LTP', 'EntryConfidence', 'EntryReason',
-           'ShouldExit', 'ExitConfidence', 'ExitReason', 'ExitSignalsCount']
-    df[db_cols].to_sql('stocksignals', conn, if_exists='append', index=False)
-
-    conn.commit()
-    conn.close()
-    logger.info(f"✅ DB: Stored {len(df)} signals for email queries")
-
+    
     print("✅ DB populated - Email will now show Top 10 BULLISH/BEARISH")
     print("="*100)
     print("[OK] v3.0 PRODUCTION READY!")
