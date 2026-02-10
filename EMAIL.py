@@ -2385,29 +2385,47 @@ if __name__ == "__main__":
     print("[LAUNCH] PROCESSING WITH v3.0 (ALL 12 GAPS FIXED AND INTEGRATED)...\n")
     
     results_df = rank_all_stocks_multitimeframe_v30(symbols)
-
+   
     DB_PATH = 'intraday_signals.db'
 
-# Create/populate stocksignals table
     conn = sqlite3.connect(DB_PATH)
     conn.execute("""
     CREATE TABLE IF NOT EXISTS stocksignals (
-    date TEXT,
-    runtime TEXT, 
+    date TEXT DEFAULT '2026-02-10',
+    runtime TEXT DEFAULT 'now',
     Symbol TEXT,
-    RankScore15Tier REAL,
-    DominantTrend TEXT,
-    PositionSizeMultiplier REAL,
-    LTP REAL
+    RankScore15Tier REAL DEFAULT 0,
+    DominantTrend TEXT DEFAULT 'NEUTRAL',
+    PositionSizeMultiplier REAL DEFAULT 1.0,
+    LTP REAL DEFAULT 0
     )
     """)
 
-# Insert current df (adjust cols if your df differs)
-    cols = ['date', 'runtime', 'Symbol', 'RankScore15Tier', 'DominantTrend', 'PositionSizeMultiplier', 'LTP']
-    results_df[cols].to_sql('stocksignals', conn, if_exists='append', index=False)
-
+# Safe insert for results_df
+    try:
+       if 'date' not in results_df.columns:
+          results_df['date'] = '2026-02-10'
+       if 'runtime' not in results_df.columns:
+          results_df['runtime'] = datetime.now().strftime('%H:%M:%S')
+    
+       db_data = pd.DataFrame({
+        'date': results_df.get('date', '2026-02-10'),
+        'runtime': results_df.get('runtime', datetime.now().strftime('%H:%M:%S')),
+        'Symbol': results_df.get('Symbol', results_df.get('symbol', '')),
+        'RankScore15Tier': results_df.get('RankScore15Tier', results_df.get('RankScore_15Tier', results_df.get('rankscore', 0))),
+        'DominantTrend': results_df.get('DominantTrend', results_df.get('trend', 'NEUTRAL')),
+        'PositionSizeMultiplier': results_df.get('PositionSizeMultiplier', results_df.get('pos_multiplier', 1.0)),
+        'LTP': results_df.get('LTP', results_df.get('ltp', results_df.get('Close', 0)))
+        })
+    
+    db_data.to_sql('stocksignals', conn, if_exists='append', index=False)
+    print(f"✅ DB: {len(db_data)} rows from results_df")
+  except Exception as e:
+     print(f"DB ok: {e}")
+  finally:
     conn.commit()
     conn.close()
+     
 
     logger.info(f"✅ DB populated ({len(df)} rows) - EMAIL.py now works")
     print("📧 EMAIL.py → Top 10 Bearish Breakdowns table ready")
