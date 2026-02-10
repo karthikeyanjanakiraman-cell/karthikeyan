@@ -2,9 +2,13 @@ name: Email
 
 on:
   schedule:
-    # Every 15 minutes, 03:00–09:59 UTC (≈ 08:30–15:29 IST), Monday–Friday
+    # Every 5 minutes, 03:00–10:59 UTC (≈ 08:30–16:29 IST), Monday–Friday
     - cron: "*/5 3-10 * * 1-5"
   workflow_dispatch: {}
+
+# Needed so the workflow can commit and push changes (DB + CSV) back to the repo
+permissions:
+  contents: write
 
 jobs:
   run-strategy:
@@ -13,6 +17,9 @@ jobs:
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # Full history so commits and pushes work correctly
+          fetch-depth: 0
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -39,3 +46,30 @@ jobs:
         run: |
           python EMAIL.py
           # or: python app-fyers_v3_0_COMPLETE_WITH_EMAIL.py
+
+      - name: Commit updated DB and CSV
+        if: always()  # try to commit even if the script step fails
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # Configure git identity for the automated commit
+          git config user.name "github-actions"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          # Add SQLite DB if it exists (EMAIL.py uses DBPATH = 'intradaysignals.db')
+          if [ -f "intradaysignals.db" ]; then
+            git add intradaysignals.db
+          fi
+
+          # Add any generated CSV files (e.g. asitintradaygreeksv30*.csv)
+          if ls asitintradaygreeksv30*.csv 1> /dev/null 2>&1; then
+            git add asitintradaygreeksv30*.csv
+          fi
+
+          # Only commit if there are staged changes
+          if git diff --cached --quiet; then
+            echo "No DB/CSV changes to commit."
+          else
+            git commit -m "Auto-update intraday SQLite DB and CSV [skip ci]" || exit 0
+            git push
+          fi
