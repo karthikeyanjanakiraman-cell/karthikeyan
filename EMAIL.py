@@ -2402,7 +2402,7 @@ if __name__ == "__main__":
     """)
 
 # Safe insert for results_df
-    try:
+ try:
        if 'date' not in results_df.columns:
           results_df['date'] = '2026-02-10'
        if 'runtime' not in results_df.columns:
@@ -2420,9 +2420,9 @@ if __name__ == "__main__":
     
     db_data.to_sql('stocksignals', conn, if_exists='append', index=False)
     print(f"✅ DB: {len(db_data)} rows from results_df")
-  except Exception as e:
+except Exception as e:
      print(f"DB ok: {e}")
-  finally:
+finally:
     conn.commit()
     conn.close()
      
