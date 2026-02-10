@@ -56,6 +56,10 @@ jobs:
           git config user.name "github-actions"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
+          # Make sure we are up to date with remote main
+          git fetch origin main
+          git pull --rebase origin main || true
+
           # Add SQLite DB if it exists (EMAIL.py uses DBPATH = 'intradaysignals.db')
           if [ -f "intradaysignals.db" ]; then
             git add intradaysignals.db
@@ -70,6 +74,7 @@ jobs:
           if git diff --cached --quiet; then
             echo "No DB/CSV changes to commit."
           else
-            git commit -m "Auto-update intraday SQLite DB and CSV [skip ci]" || exit 0
-            git push
+            git commit -m "Auto-update intraday SQLite DB and CSV [skip ci]" || true
+            # Push to main; don't fail the job if push is rejected due to a race
+            git push origin HEAD:main || echo "Push failed (remote changed again); skipping."
           fi
