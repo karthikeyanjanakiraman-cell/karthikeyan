@@ -2202,8 +2202,8 @@ def send_email_with_db_insights(csv_filename):
 
     # Ensure the SQLite DB file and 'stocksignals' table exist
     # initdailydb() does: CREATE TABLE IF NOT EXISTS stocksignals ... and deletes old dates.
-    initdailydb()
-
+    init_daily_db()
+   
     today_str = date.today().strftime("%Y-%m-%d")
 
     # Get bullish / bearish fresh moves (will now see an existing table)
