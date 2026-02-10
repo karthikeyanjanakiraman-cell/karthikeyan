@@ -2462,7 +2462,7 @@ if __name__ == "__main__":
 
 # Map column names if needed (RankScore_15Tier -> RankScore15Tier)
     if 'RankScore_15Tier' in df.columns:
-    df['RankScore15Tier'] = df['RankScore_15Tier']
+        df['RankScore15Tier'] = df['RankScore_15Tier']
 
     db_cols = ['date', 'runtime', 'Symbol', 'RankScore15Tier', 'DominantTrend', 
            'PositionSizeMultiplier', 'LTP', 'EntryConfidence', 'EntryReason',
