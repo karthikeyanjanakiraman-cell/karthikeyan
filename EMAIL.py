@@ -2200,9 +2200,13 @@ def send_email_with_db_insights(csv_filename):
     """
     from datetime import date as date
 
+    # Ensure the SQLite DB file and 'stocksignals' table exist
+    # initdailydb() does: CREATE TABLE IF NOT EXISTS stocksignals ... and deletes old dates.
+    initdailydb()
+
     today_str = date.today().strftime("%Y-%m-%d")
 
-    # Get bullish / bearish fresh moves
+    # Get bullish / bearish fresh moves (will now see an existing table)
     top10bullish = query_fresh_breakouts_bullish(limit=10)
     top10bearish = query_fresh_breakdowns_bearish(limit=10)
 
@@ -2210,10 +2214,9 @@ def send_email_with_db_insights(csv_filename):
 
     # --------- BULLISH HTML (with robust fallback) ---------
     if not top10bullish.empty:
-        # Normal case: we have real "fresh breakout" rows
         bullish_html = top10bullish.to_html(index=False, border=1)
     else:
-        # Fallback: read today's rows and filter in pandas instead of SQL
+        # Fallback: read today's rows and filter in pandas instead of SQL window function
         try:
             df_all = pd.read_sql_query(
                 "SELECT * FROM stocksignals WHERE date = ?",
@@ -2244,7 +2247,7 @@ def send_email_with_db_insights(csv_filename):
                 )
             else:
                 bullish_html = (
-                    "<em>No bullish symbols found for today (no data in DB).</em>"
+                    "<em>No bullish symbols found for today (no data in DB yet).</em>"
                 )
         except Exception as e:
             logger.error(f"EMAIL Fallback bullish table error: {e}")
@@ -2301,7 +2304,6 @@ def send_email_with_db_insights(csv_filename):
 
     msg.attach(MIMEText(body_html, "html"))
 
-    # Attach the CSV file
     try:
         with open(csv_filename, "rb") as f:
             part = MIMEBase("application", "octet-stream")
@@ -2316,7 +2318,6 @@ def send_email_with_db_insights(csv_filename):
         logger.error(f"CSV attach error {e}")
         return False
 
-    # Send email
     try:
         server = smtplib.SMTP(smtp_server, smtp_port)
         server.starttls()
