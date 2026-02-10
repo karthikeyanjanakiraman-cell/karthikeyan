@@ -2427,7 +2427,7 @@ if __name__ == "__main__":
         conn.close()
      
 
-    logger.info(f"✅ DB populated ({len(df)} rows) - EMAIL.py now works")
+    logger.info(f"✅ DB populated ({len(results_df)} rows) - EMAIL.py now works")
     print("📧 EMAIL.py → Top 10 Bearish Breakdowns table ready")
     if results_df is None or results_df.empty:
         logger.error("[ERROR] No results generated.")
