@@ -2404,7 +2404,7 @@ if __name__ == "__main__":
 
 # Insert current df (adjust cols if your df differs)
     cols = ['date', 'runtime', 'Symbol', 'RankScore15Tier', 'DominantTrend', 'PositionSizeMultiplier', 'LTP']
-    df[cols].to_sql('stocksignals', conn, if_exists='append', index=False)
+    results_df[cols].to_sql('stocksignals', conn, if_exists='append', index=False)
 
     conn.commit()
     conn.close()
