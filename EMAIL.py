@@ -2339,6 +2339,7 @@ def sendemailwithdbinsights(csv_filename):
     return send_email_with_db_insights(csv_filename)
 
 if __name__ == "__main__":
+   init_daily_db()
     print("\n" + "="*100)
     print("[OK] ASIT INTRADAY GREEKS - PRODUCTION v3.0 WITH ALL 12 GAPS FIXED")
     print(" WITH RANK SCALING + PYRAMID ENTRY + IV RANK + DAILY P&L + DELTA RANGE + PCR + MULTI-EXIT + PULLBACK + AFTERNOON + THETA + SKEW + LEVERAGE")
