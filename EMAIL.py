@@ -2057,6 +2057,7 @@ def query_fresh_breakdowns_bearish(limit=10):
         return pd.DataFrame()
 
 def sendemail_rank_watchlist(csv_filename: str) -> bool:
+    print("DEBUG: RUNNING UPDATED Email.py with sendemail_rank_watchlist")
     """
     Email layout for each side (BULLISH / BEARISH):
 
@@ -2070,7 +2071,7 @@ def sendemail_rank_watchlist(csv_filename: str) -> bool:
             is APPENDED permanently for that day.
       - Final email for a run:
           • Shows ALL symbols that have EVER been in a TOP 10 list today (first run + all appends).
-          • No deletions: list only grows during the day, capped at 15 symbols per side.
+          • No deletions: list only grows during the day, with no row limit.
 
     Prev / Diff:
       - Prev Score = previous intraday MAX (bullish) / MIN (bearish) RankScore15Tier
@@ -2126,8 +2127,6 @@ def sendemail_rank_watchlist(csv_filename: str) -> bool:
     first_run_time = run_times[0]
 
     # --- Build ever‑in‑TOP10 watchlists per side across ALL runs ---
-    MAX_WATCH_SIZE = 15  # hard cap per side
-
     bull_first_in_time = {}  # Symbol -> earliest runtime when it was in bull TOP10
     bear_first_in_time = {}  # Symbol -> earliest runtime when it was in bear TOP10
 
@@ -2144,7 +2143,7 @@ def sendemail_rank_watchlist(csv_filename: str) -> bool:
             .head(10)
         )
         for sym in bulls_t["Symbol"].unique():
-            if sym not in bull_first_in_time and len(bull_first_in_time) < MAX_WATCH_SIZE:
+            if sym not in bull_first_in_time:
                 bull_first_in_time[sym] = rt
 
         # Top 10 bearish for this run
@@ -2157,7 +2156,7 @@ def sendemail_rank_watchlist(csv_filename: str) -> bool:
             .head(10)
         )
         for sym in bears_t["Symbol"].unique():
-            if sym not in bear_first_in_time and len(bear_first_in_time) < MAX_WATCH_SIZE:
+            if sym not in bear_first_in_time:
                 bear_first_in_time[sym] = rt
 
     bull_watch_syms = list(bull_first_in_time.keys())
@@ -2198,7 +2197,6 @@ def sendemail_rank_watchlist(csv_filename: str) -> bool:
     )
 
     # --- Convert to display tables matching your example ---
-
     def _build_display(df_side: _pd.DataFrame, side: str) -> _pd.DataFrame:
         """
         side = 'BULLISH' or 'BEARISH'
@@ -2288,9 +2286,8 @@ def sendemail_rank_watchlist(csv_filename: str) -> bool:
         out_df = out_df.iloc[order].reset_index(drop=True)
         return out_df
 
-    # Cap display to 15 rows per side
-    bull_display = _build_display(bull_all, "BULLISH").head(15)
-    bear_display = _build_display(bear_all, "BEARISH").head(15)
+    bull_display = _build_display(bull_all, "BULLISH")
+    bear_display = _build_display(bear_all, "BEARISH")
 
     if bull_display.empty:
         bullish_html = "<p><i>No bullish entries for today yet.</i></p>"
@@ -2363,283 +2360,283 @@ def sendemail_rank_watchlist(csv_filename: str) -> bool:
         logger.error(f"[EMAIL] SMTP error: {e}")
         return False
 
-def sendemailwithdbinsights(csv_filename: str) -> bool:
-    """
-    Email layout for each side (BULLISH / BEARISH):
 
-        "Symbol", "Latest Score", "Prev Score", "Diff", "Runtime", "Status"
-    """
-    from datetime import date as _date
-    import pandas as _pd
-    import numpy as _np
+# def sendemailwithdbinsights(csv_filename: str) -> bool:
+#     """
+#     Email layout for each side (BULLISH / BEARISH):
 
-    today_str = _date.today().strftime("%Y-%m-%d")
+#         "Symbol", "Latest Score", "Prev Score", "Diff", "Runtime", "Status"
+#     """
+#     from datetime import date as _date
+#     import pandas as _pd
+#     import numpy as _np
 
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        df = _pd.read_sql_query(
-            """
-            SELECT
-                date,
-                runtime,
-                Symbol,
-                RankScore15Tier,
-                BullMultiTFScore,
-                BearMultiTFScore,
-                DominantTrend,
-                TrendStrength,
-                PositionSizeMultiplier,
-                EntryConfidence,
-                LTP
-            FROM stocksignals
-            WHERE date = ?
-            ORDER BY runtime ASC
-            """,
-            conn,
-            params=(today_str,),
-        )
-        conn.close()
-    except Exception as e:
-        logger.error(f"[DB] Error loading today's stocksignals: {e}")
-        return False
+#     today_str = _date.today().strftime("%Y-%m-%d")
 
-    if df.empty:
-        logger.warning("[DB] No stocksignals rows for today; email not sent.")
-        return False
+#     try:
+#         conn = sqlite3.connect(DB_PATH)
+#         df = _pd.read_sql_query(
+#             """
+#             SELECT
+#                 date,
+#                 runtime,
+#                 Symbol,
+#                 RankScore15Tier,
+#                 BullMultiTFScore,
+#                 BearMultiTFScore,
+#                 DominantTrend,
+#                 TrendStrength,
+#                 PositionSizeMultiplier,
+#                 EntryConfidence,
+#                 LTP
+#             FROM stocksignals
+#             WHERE date = ?
+#             ORDER BY runtime ASC
+#             """,
+#             conn,
+#             params=(today_str,),
+#         )
+#         conn.close()
+#     except Exception as e:
+#         logger.error(f"[DB] Error loading today's stocksignals: {e}")
+#         return False
 
-    df["runtime"] = df["runtime"].astype(str)
-    df = df.sort_values(["runtime", "Symbol"]).copy()
+#     if df.empty:
+#         logger.warning("[DB] No stocksignals rows for today; email not sent.")
+#         return False
 
-    run_times = sorted(df["runtime"].unique())
-    first_run_time = run_times[0]
+#     df["runtime"] = df["runtime"].astype(str)
+#     df = df.sort_values(["runtime", "Symbol"]).copy()
 
-    bull_first_in_time = {}  # Symbol -> earliest runtime when it was in bull TOP10
-bear_first_in_time = {}  # Symbol -> earliest runtime when it was in bear TOP10
+#     run_times = sorted(df["runtime"].unique())
+#     first_run_time = run_times[0]
 
-for rt in run_times:
-    df_t = df[df["runtime"] == rt]
+#     MAX_WATCH_SIZE = 15
 
-    # Top 10 bullish for this run
-    bulls_t = (
-        df_t[
-            (df_t["DominantTrend"] == "BULLISH")
-            & (df_t["RankScore15Tier"] > 0)
-        ]
-        .sort_values("RankScore15Tier", ascending=False)
-        .head(10)
-    )
-    for sym in bulls_t["Symbol"].unique():
-        if sym not in bull_first_in_time:
-            bull_first_in_time[sym] = rt
+#     bull_first_in_time = {}
+#     bear_first_in_time = {}
 
-    # Top 10 bearish for this run
-    bears_t = (
-        df_t[
-            (df_t["DominantTrend"] == "BEARISH")
-            & (df_t["RankScore15Tier"] < 0)
-        ]
-        .sort_values("RankScore15Tier", ascending=True)
-        .head(10)
-    )
-    for sym in bears_t["Symbol"].unique():
-        if sym not in bear_first_in_time:
-            bear_first_in_time[sym] = rt
-    
+#     for rt in run_times:
+#         df_t = df[df["runtime"] == rt]
 
-    
+#         bulls_t = (
+#             df_t[
+#                 (df_t["DominantTrend"] == "BULLISH")
+#                 & (df_t["RankScore15Tier"] > 0)
+#             ]
+#             .sort_values("RankScore15Tier", ascending=False)
+#             .head(10)
+#         )
+#         for sym in bulls_t["Symbol"].unique():
+#             if sym not in bull_first_in_time and len(bull_first_in_time) < MAX_WATCH_SIZE:
+#                 bull_first_in_time[sym] = rt
 
-        bears_t = (
-            df_t[
-                (df_t["DominantTrend"] == "BEARISH")
-                & (df_t["RankScore15Tier"] < 0)
-            ]
-            .sort_values("RankScore15Tier", ascending=True)
-            .head(10)
-        )
-        for sym in bears_t["Symbol"].unique():
-            if sym not in bear_first_in_time and len(bear_first_in_time) < MAX_WATCH_SIZE:
-                bear_first_in_time[sym] = rt
+#         bears_t = (
+#             df_t[
+#                 (df_t["DominantTrend"] == "BEARISH")
+#                 & (df_t["RankScore15Tier"] < 0)
+#             ]
+#             .sort_values("RankScore15Tier", ascending=True)
+#             .head(10)
+#         )
+#         for sym in bears_t["Symbol"].unique():
+#             if sym not in bear_first_in_time and len(bear_first_in_time) < MAX_WATCH_SIZE:
+#                 bear_first_in_time[sym] = rt
 
-    bull_watch_syms = list(bull_first_in_time.keys())
-    bear_watch_syms = list(bear_first_in_time.keys())
+#     bull_watch_syms = list(bull_first_in_time.keys())
+#     bear_watch_syms = list(bear_first_in_time.keys())
 
-    df = df.sort_values(["Symbol", "runtime"]).copy()
+#     df = df.sort_values(["Symbol", "runtime"]).copy()
 
-    df["prevmax"] = df.groupby("Symbol")["RankScore15Tier"].cummax().shift(1)
-    df["prevmin"] = df.groupby("Symbol")["RankScore15Tier"].cummin().shift(1)
+#     df["prevmax"] = df.groupby("Symbol")["RankScore15Tier"].cummax().shift(1)
+#     df["prevmin"] = df.groupby("Symbol")["RankScore15Tier"].cummin().shift(1)
 
-    df["PrevIntraRank"] = _np.where(
-        df["DominantTrend"] == "BULLISH",
-        df["prevmax"],
-        df["prevmin"],
-    )
+#     df["PrevIntraRank"] = _np.where(
+#         df["DominantTrend"] == "BULLISH",
+#         df["prevmax"],
+#         df["prevmin"],
+#     )
 
-    df["RankDiffPrev"] = df["RankScore15Tier"] - df["PrevIntraRank"]
+#     df["RankDiffPrev"] = df["RankScore15Tier"] - df["PrevIntraRank"]
 
-    df_latest = (
-        df.sort_values(["Symbol", "runtime"])
-          .groupby("Symbol")
-          .tail(1)
-          .copy()
-    )
+#     df_latest = (
+#         df.sort_values(["Symbol", "runtime"])
+#           .groupby("Symbol")
+#           .tail(1)
+#           .copy()
+#     )
 
-    bull_all = df_latest[df_latest["Symbol"].isin(bull_watch_syms)].copy()
-    bear_all = df_latest[df_latest["Symbol"].isin(bear_watch_syms)].copy()
+#     bull_all = df_latest[df_latest["Symbol"].isin(bull_watch_syms)].copy()
+#     bear_all = df_latest[df_latest["Symbol"].isin(bear_watch_syms)].copy()
 
-    bull_all["Source"] = bull_all["Symbol"].apply(
-        lambda s: "FIRST_RUN" if bull_first_in_time.get(s) == first_run_time else "APPENDED"
-    )
-    bear_all["Source"] = bear_all["Symbol"].apply(
-        lambda s: "FIRST_RUN" if bear_first_in_time.get(s) == first_run_time else "APPENDED"
-    )
+#     bull_all["Source"] = bull_all["Symbol"].apply(
+#         lambda s: "FIRST_RUN" if bull_first_in_time.get(s) == first_run_time else "APPENDED"
+#     )
+#     bear_all["Source"] = bear_all["Symbol"].apply(
+#         lambda s: "FIRST_RUN" if bear_first_in_time.get(s) == first_run_time else "APPENDED"
+#     )
 
-    def _build_display(df_side: _pd.DataFrame, side: str) -> _pd.DataFrame:
-        if df_side.empty:
-            return _pd.DataFrame(
-                columns=["Symbol", "Latest Score", "Prev Score", "Diff", "Runtime", "Status"]
-            )
+#     def _build_display(df_side: _pd.DataFrame, side: str) -> _pd.DataFrame:
+#         if df_side.empty:
+#             return _pd.DataFrame(
+#                 columns=["Symbol", "Latest Score", "Prev Score", "Diff", "Runtime", "Status"]
+#             )
 
-        out_rows = []
-        for _, row in df_side.iterrows():
-            symbol = row["Symbol"]
-            latest = float(row["RankScore15Tier"])
-            prev_intra = row["PrevIntraRank"]
-            runtime = row["runtime"]
-            source = row.get("Source", "FIRST_RUN")
+#         out_rows = []
+#         for _, row in df_side.iterrows():
+#             symbol = row["Symbol"]
+#             latest = float(row["RankScore15Tier"])
+#             prev_intra = row["PrevIntraRank"]
+#             runtime = row["runtime"]
+#             source = row.get("Source", "FIRST_RUN")
 
-            if _pd.isna(prev_intra):
-                if source == "FIRST_RUN":
-                    prev_score = latest
-                    diff_val = 0.0
-                else:
-                    prev_score = None
-                    diff_val = None
-            else:
-                prev_score = float(prev_intra)
-                diff_val = latest - prev_score
+#             if _pd.isna(prev_intra):
+#                 if source == "FIRST_RUN":
+#                     prev_score = latest
+#                     diff_val = 0.0
+#                 else:
+#                     prev_score = None
+#                     diff_val = None
+#             else:
+#                 prev_score = float(prev_intra)
+#                 diff_val = latest - prev_score
 
-            if source == "APPENDED" and prev_score is None:
-                status = "New Append"
-            elif source == "FIRST_RUN":
-                if diff_val is None or abs(diff_val) < 1e-9:
-                    status = "First (no update)"
-                else:
-                    if side == "BULLISH":
-                        status = "First + Up" if diff_val > 0 else "First - Down"
-                    else:
-                        status = "First + Worse" if diff_val < 0 else "First - Better"
-            else:
-                if diff_val is None or abs(diff_val) < 1e-9:
-                    status = "Append (no update)"
-                else:
-                    if side == "BULLISH":
-                        status = "Append + Up" if diff_val > 0 else "Append - Down"
-                    else:
-                        status = "Append + Worse" if diff_val < 0 else "Append - Better"
+#             if source == "APPENDED" and prev_score is None:
+#                 status = "New Append"
+#             elif source == "FIRST_RUN":
+#                 if diff_val is None or abs(diff_val) < 1e-9:
+#                     status = "First (no update)"
+#                 else:
+#                     if side == "BULLISH":
+#                         status = "First + Up" if diff_val > 0 else "First - Down"
+#                     else:
+#                         status = "First + Worse" if diff_val < 0 else "First - Better"
+#             else:
+#                 if diff_val is None or abs(diff_val) < 1e-9:
+#                     status = "Append (no update)"
+#                 else:
+#                     if side == "BULLISH":
+#                         status = "Append + Up" if diff_val > 0 else "Append - Down"
+#                     else:
+#                         status = "Append + Worse" if diff_val < 0 else "Append - Better"
 
-            latest_str = f"{latest:.2f}"
-            if prev_score is None:
-                prev_str = "N/A"
-                diff_str = "N/A"
-            else:
-                prev_str = f"{prev_score:.2f}"
-                diff_str = "0" if abs(diff_val) < 1e-9 else f"{diff_val:+.2f}"
+#             latest_str = f"{latest:.2f}"
+#             if prev_score is None:
+#                 prev_str = "N/A"
+#                 diff_str = "N/A"
+#             else:
+#                 prev_str = f"{prev_score:.2f}"
+#                 diff_str = "0" if abs(diff_val) < 1e-9 else f"{diff_val:+.2f}"
 
-            out_rows.append(
-                {
-                    "Symbol": symbol,
-                    "Latest Score": latest_str,
-                    "Prev Score": prev_str,
-                    "Diff": diff_str,
-                    "Runtime": runtime,
-                    "Status": status,
-                }
-            )
+#             out_rows.append(
+#                 {
+#                     "Symbol": symbol,
+#                     "Latest Score": latest_str,
+#                     "Prev Score": prev_str,
+#                     "Diff": diff_str,
+#                     "Runtime": runtime,
+#                     "Status": status,
+#                 }
+#             )
 
-        out_df = _pd.DataFrame(out_rows)
+#         out_df = _pd.DataFrame(out_rows)
 
-        try:
-            sort_vals = out_df["Latest Score"].replace("N/A", "0").astype(float)
-        except Exception:
-            sort_vals = _pd.Series([0.0] * len(out_df))
+#         try:
+#             sort_vals = out_df["Latest Score"].replace("N/A", "0").astype(float)
+#         except Exception:
+#             sort_vals = _pd.Series([0.0] * len(out_df))
 
-        ascending = True if side == "BEARISH" else False
-        order = _np.argsort(sort_vals.values)
-        if not ascending:
-            order = order[::-1]
-        out_df = out_df.iloc[order].reset_index(drop=True)
-        return out_df
+#         ascending = True if side == "BEARISH" else False
+#         order = _np.argsort(sort_vals.values)
+#         if not ascending:
+#             order = order[::-1]
+#         out_df = out_df.iloc[order].reset_index(drop=True)
+#         return out_df
 
-    bull_display = _build_display(bull_all, "BULLISH").head(15)
-    bear_display = _build_display(bear_all, "BEARISH").head(15)
+#     bull_display = _build_display(bull_all, "BULLISH").head(15)
+#     bear_display = _build_display(bear_all, "BEARISH").head(15)
 
-    if bull_display.empty:
-        bullish_html = "<p><i>No bullish entries for today yet.</i></p>"
-    else:
-        bullish_html = bull_display.to_html(index=False, border=1, justify="center")
+#     # --- Build HTML for email body ---
+#     if bull_display.empty:
+#         bullish_html = "<p><i>No bullish entries for today yet.</i></p>"
+#     else:
+#         bullish_html = bull_display.to_html(index=False, border=1, justify="center")
 
-    if bear_display.empty:
-        bearish_html = "<p><i>No bearish entries for today yet.</i></p>"
-    else:
-        bearish_html = bear_display.to_html(index=False, border=1, justify="center")
+#     if bear_display.empty:
+#         bearish_html = "<p><i>No bearish entries for today yet.</i></p>"
+#     else:
+#         bearish_html = bear_display.to_html(index=False, border=1, justify="center")
 
-    sender_email = os.getenv("SENDER_EMAIL")
-    sender_password = os.getenv("SENDER_PASSWORD")
-    recipient_email = os.getenv("RECIPIENT_EMAIL")
-    smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
-    smtp_port = int(os.getenv("SMTP_PORT", 587))
+#     # --- Email send (env-based config) ---
+#     sender_email = os.getenv("SENDER_EMAIL")
+#     sender_password = os.getenv("SENDER_PASSWORD")
+#     recipient_email = os.getenv("RECIPIENT_EMAIL")
+#     smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+#     smtp_port = int(os.getenv("SMTP_PORT", 587))
 
-    if not all([sender_email, sender_password, recipient_email]):
-        logger.warning("[EMAIL] Missing email credentials (SENDER_EMAIL / SENDER_PASSWORD / RECIPIENT_EMAIL)")
-        return False
+#     if not all([sender_email, sender_password, recipient_email]):
+#         logger.warning("[EMAIL] Missing email credentials (SENDER_EMAIL / SENDER_PASSWORD / RECIPIENT_EMAIL)")
+#         return False
 
-    msg = MIMEMultipart()
-    msg["From"] = sender_email
-    msg["To"] = recipient_email
-    msg["Subject"] = f"Asit v3.0 Intraday RankScore Watchlist - {datetime.now().strftime('%Y-%m-%d %H:%M IST')}"
+#     msg = MIMEMultipart()
+#     msg["From"] = sender_email
+#     msg["To"] = recipient_email
+#     msg["Subject"] = f"Asit v3.0 Intraday RankScore Watchlist - {datetime.now().strftime('%Y-%m-%d %H:%M IST')}"
 
-    body_html = f"""
-    <html>
-      <body style="font-family: Arial, sans-serif;">
-        <h2>BULLISH</h2>
-        {bullish_html}
+#     body_html = f"""
+#     <html>
+#       <body style="font-family: Arial, sans-serif;">
+#         <h2>BULLISH</h2>
+#         {bullish_html}
 
-        <h2>BEARISH</h2>
-        {bearish_html}
-      </body>
-    </html>
-    """
+#         <h2>BEARISH</h2>
+#         {bearish_html}
 
-    msg.attach(MIMEText(body_html, "html"))
+#         <hr>
+#         <p>Hello,</p>
+#         <p>Please find attached the Asit Strategy v3.0 analysis results.</p>
+#         <p><b>File:</b> {os.path.basename(csv_filename)}<br>
+#            <b>Generated:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+#         <p>This is an automated email from the Asit Strategy Trading System v3.0.<br>
+#            DB auto-clears daily; window functions detect fresh momentum moves.</p>
+#         <p>Best regards,<br>
+#            Asit Strategy Automated Analysis System</p>
+#       </body>
+#     </html>
+#     """
 
-    try:
-        with open(csv_filename, "rb") as f:
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(f.read())
-        encoders.encode_base64(part)
-        part.add_header(
-            "Content-Disposition",
-            f"attachment; filename={os.path.basename(csv_filename)}",
-        )
-        msg.attach(part)
-    except Exception as e:
-        logger.error(f"[EMAIL] CSV attach error: {e}")
-        return False
+#     msg.attach(MIMEText(body_html, "html"))
 
-    try:
-        server = smtplib.SMTP(smtp_server, smtp_port)
-        server.starttls()
-        server.login(sender_email, sender_password)
-        server.sendmail(sender_email, recipient_email, msg.as_string())
-        server.quit()
-        logger.info(
-            f"[EMAIL] Sent intraday RankScore watchlist: "
-            f"{len(bull_watch_syms)} bullish symbols, {len(bear_watch_syms)} bearish symbols accumulated today."
-        )
-        return True
-    except Exception as e:
-        logger.error(f"[EMAIL] SMTP error: {e}")
-        return False
+#     # Attach the CSV
+#     try:
+#         with open(csv_filename, "rb") as f:
+#             part = MIMEBase("application", "octet-stream")
+#             part.set_payload(f.read())
+#         encoders.encode_base64(part)
+#         part.add_header(
+#             "Content-Disposition",
+#             f"attachment; filename={os.path.basename(csv_filename)}",
+#         )
+#         msg.attach(part)
+#     except Exception as e:
+#         logger.error(f"[EMAIL] CSV attach error: {e}")
+#         return False
+
+#     # Send email
+#     try:
+#         server = smtplib.SMTP(smtp_server, smtp_port)
+#         server.starttls()
+#         server.login(sender_email, sender_password)
+#         server.sendmail(sender_email, recipient_email, msg.as_string())
+#         server.quit()
+#         logger.info(
+#             f"[EMAIL] Sent intraday RankScore watchlist: "
+#             f"{len(bull_watch_syms)} bullish symbols, {len(bear_watch_syms)} bearish symbols accumulated today."
+#         )
+#         return True
+#     except Exception as e:
+#         logger.error(f"[EMAIL] SMTP error: {e}")
+#         return False
 
 
 
@@ -3025,6 +3022,9 @@ if __name__ == "__main__":
     filename = f"asit_intraday_greeks_v3_0_{timestamp}.csv"
     results_df.to_csv(filename, index=False)
 
+    print("EMAIL Attempting to send email with CSV DB insights...")
+    emailsent = sendemail_rank_watchlist(filename)
+
     print("=" * 100)
     print(f"[DATA] CSV GENERATED: {filename}")
     print("=" * 100)
@@ -3033,7 +3033,7 @@ if __name__ == "__main__":
     print(f"[DATA] File Size: {os.path.getsize(filename) / 1024:.2f} KB\n")
 
     print("[EMAIL] Attempting to send email with CSV + DB insights...")
-    email_sent = sendemail_rank_watchlist(filename)
+    email_sent = send_email_with_db_insights(filename)
 
     if email_sent:
         print("[EMAIL] ✅ Report successfully emailed!")
