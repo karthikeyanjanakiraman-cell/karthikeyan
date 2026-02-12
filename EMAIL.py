@@ -2413,25 +2413,40 @@ def sendemailwithdbinsights(csv_filename: str) -> bool:
     run_times = sorted(df["runtime"].unique())
     first_run_time = run_times[0]
 
-    MAX_WATCH_SIZE = 15
+    bull_first_in_time = {}  # Symbol -> earliest runtime when it was in bull TOP10
+bear_first_in_time = {}  # Symbol -> earliest runtime when it was in bear TOP10
 
-    bull_first_in_time = {}
-    bear_first_in_time = {}
+for rt in run_times:
+    df_t = df[df["runtime"] == rt]
 
-    for rt in run_times:
-        df_t = df[df["runtime"] == rt]
+    # Top 10 bullish for this run
+    bulls_t = (
+        df_t[
+            (df_t["DominantTrend"] == "BULLISH")
+            & (df_t["RankScore15Tier"] > 0)
+        ]
+        .sort_values("RankScore15Tier", ascending=False)
+        .head(10)
+    )
+    for sym in bulls_t["Symbol"].unique():
+        if sym not in bull_first_in_time:
+            bull_first_in_time[sym] = rt
 
-        bulls_t = (
-            df_t[
-                (df_t["DominantTrend"] == "BULLISH")
-                & (df_t["RankScore15Tier"] > 0)
-            ]
-            .sort_values("RankScore15Tier", ascending=False)
-            .head(10)
-        )
-        for sym in bulls_t["Symbol"].unique():
-            if sym not in bull_first_in_time and len(bull_first_in_time) < MAX_WATCH_SIZE:
-                bull_first_in_time[sym] = rt
+    # Top 10 bearish for this run
+    bears_t = (
+        df_t[
+            (df_t["DominantTrend"] == "BEARISH")
+            & (df_t["RankScore15Tier"] < 0)
+        ]
+        .sort_values("RankScore15Tier", ascending=True)
+        .head(10)
+    )
+    for sym in bears_t["Symbol"].unique():
+        if sym not in bear_first_in_time:
+            bear_first_in_time[sym] = rt
+    
+
+    
 
         bears_t = (
             df_t[
