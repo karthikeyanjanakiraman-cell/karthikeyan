@@ -1932,34 +1932,371 @@ def send_email_with_attachment(filename):
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 # SQLITE DATABASE FUNCTIONS - MULTI-RUN CONSENSUS
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-
 def init_daily_db():
-    """Initialize DB and clear old data (keep only today)"""
+    """Initialize DB and clear old data, keep only today."""
+    from datetime import date as date_module
+    today_str = date_module.today().strftime('%Y-%m-%d')
+    
     conn = sqlite3.connect(DB_PATH)
-    conn.execute('''
-    CREATE TABLE IF NOT EXISTS stock_signals (
-        run_id INTEGER PRIMARY KEY AUTOINCREMENT,
-        date TEXT,
-        run_time TEXT,
-        Symbol TEXT,
-        RankScore_15Tier REAL,
-        Bull_MultiTF_Score REAL,
-        Bear_MultiTF_Score REAL,
-        DominantTrend TEXT,
-        TrendStrength REAL,
-        PositionSizeMultiplier REAL,
-        EntryConfidence REAL,
-        LTP REAL,
-        CanTradeToday TEXT
-    )
-    ''')
-    from datetime import date as _date
-    today_str = _date.today().strftime('%Y-%m-%d')
-    conn.execute(f"DELETE FROM stock_signals WHERE date != '{today_str}'")
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS stocksignals (
+            runid INTEGER PRIMARY KEY AUTOINCREMENT,
+            date TEXT,
+            runtime TEXT,
+            Symbol TEXT,
+            RankScore15Tier REAL,
+            BullMultiTFScore REAL,
+            BearMultiTFScore REAL,
+            DominantTrend TEXT,
+            TrendStrength REAL,
+            PositionSizeMultiplier REAL,
+            EntryConfidence REAL,
+            LTP REAL,
+            CanTradeToday TEXT
+        )
+    """)
+    conn.execute("DELETE FROM stocksignals WHERE date != ?", (today_str,))
     conn.commit()
-    row_count = conn.execute(f"SELECT COUNT(*) FROM stock_signals WHERE date='{today_str}'").fetchone()[0]
-    logger.info(f"✓ DB initialized. Today's rows: {row_count}")
+    
+    rowcount = conn.execute("SELECT COUNT(*) FROM stocksignals WHERE date=?", (today_str,)).fetchone()[0]
+    logger.info(f"[DB] Initialized. Today's rows: {rowcount}")
     conn.close()
+
+
+def store_results_in_db(df):
+    """Store current run results in DB."""
+    if df is None or df.empty:
+        logger.warning("[DB] No data to store in DB")
+        return
+    
+    from datetime import date as date_module, datetime as dt
+    today_str = date_module.today().strftime('%Y-%m-%d')
+    runtime_str = dt.now().strftime('%H:%M:%S')
+    
+    conn = sqlite3.connect(DB_PATH)
+    df_store = df.copy()
+    df_store['date'] = today_str
+    df_store['runtime'] = runtime_str
+    
+    # Normalize column names
+    df_store['Symbol'] = df_store.get('Symbol', df_store.get('symbol', ''))
+    df_store['RankScore15Tier'] = df_store.get('RankScore_15Tier', df_store.get('RankScore15Tier', df_store.get('rankscore', 0)))
+    df_store['BullMultiTFScore'] = df_store.get('Bull_MultiTF_Score', df_store.get('BullMultiTFScore', 0))
+    df_store['BearMultiTFScore'] = df_store.get('Bear_MultiTF_Score', df_store.get('BearMultiTFScore', 0))
+    df_store['DominantTrend'] = df_store.get('DominantTrend', df_store.get('trend', 'NEUTRAL'))
+    df_store['TrendStrength'] = df_store.get('TrendStrength', 0)
+    df_store['PositionSizeMultiplier'] = df_store.get('PositionSizeMultiplier', df_store.get('pos_multiplier', 1.0))
+    df_store['EntryConfidence'] = df_store.get('EntryConfidence', 0)
+    df_store['LTP'] = df_store.get('LTP', df_store.get('ltp', df_store.get('Close', 0)))
+    df_store['CanTradeToday'] = df_store.get('CanTradeToday', True)
+    
+    cols = ['date', 'runtime', 'Symbol', 'RankScore15Tier', 'BullMultiTFScore', 
+            'BearMultiTFScore', 'DominantTrend', 'TrendStrength', 
+            'PositionSizeMultiplier', 'EntryConfidence', 'LTP', 'CanTradeToday']
+    
+    df_store = df_store[[c for c in cols if c in df_store.columns]]
+    df_store.to_sql('stocksignals', conn, if_exists='append', index=False)
+    conn.commit()
+    conn.close()
+    logger.info(f"[DB] Stored {len(df_store)} rows at {runtime_str}")
+
+
+def builddisplay(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
+    """
+    Build display table for email.
+    
+    side: 'BULLISH' or 'BEARISH'
+    
+    Output columns: Symbol | Latest Score | Prev Score | Diff | Runtime | Status
+    """
+    if df_side is None or df_side.empty:
+        return pd.DataFrame(columns=["Symbol", "Latest Score", "Prev Score", "Diff", "Runtime", "Status"])
+    
+    outrows = []
+    
+    for _, row in df_side.iterrows():
+        symbol = row.get("Symbol", "")
+        
+        # Latest score from current run
+        latest_raw = row.get("RankScore15Tier", row.get("RankScore_15Tier", 0.0))
+        try:
+            latest = float(latest_raw)
+        except Exception:
+            latest = 0.0
+        
+        # Previous intraday extreme
+        prev_intra = row.get("PrevIntraRank", None)
+        runtime = row.get("runtime", "")
+        source = row.get("Source", "FIRSTRUN")
+        
+        # Normalize previous score
+        if prev_intra is None or (isinstance(prev_intra, float) and pd.isna(prev_intra)):
+            prevscore = None
+        else:
+            try:
+                prevscore = float(prev_intra)
+            except Exception:
+                prevscore = None
+        
+        if prevscore is None:
+            diffval = None
+            absdiff = None
+        else:
+            diffval = latest - prevscore
+            absdiff = abs(diffval)
+        
+        # ===== STATUS TEXT =====
+        if source == "APPENDED" and prevscore is None:
+            status = "New Append"
+        elif source == "FIRSTRUN":
+            if diffval is None or (absdiff is not None and absdiff < 1e-9):
+                status = "First no update"
+            else:
+                if side == "BULLISH":
+                    status = "First + Up" if diffval > 0 else "First - Down"
+                else:
+                    status = "First Worse" if diffval < 0 else "First - Better"
+        else:
+            # APPENDED with previous
+            if diffval is None or (absdiff is not None and absdiff < 1e-9):
+                status = "Append no update"
+            else:
+                if side == "BULLISH":
+                    status = "Append + Up" if diffval > 0 else "Append - Down"
+                else:
+                    status = "Append Worse" if diffval < 0 else "Append - Better"
+        
+        latest_str = f"{latest:.2f}"
+        prev_str = "NA" if prevscore is None else f"{prevscore:.2f}"
+        
+        if diffval is None or (absdiff is not None and absdiff < 1e-9):
+            diff_str = "0"
+        else:
+            sign = "+" if diffval > 0 else ""
+            diff_str = f"{sign}{diffval:.2f}"
+        
+        outrows.append({
+            "Symbol": symbol,
+            "Latest Score": latest_str,
+            "Prev Score": prev_str,
+            "Diff": diff_str,
+            "Runtime": runtime,
+            "Status": status,
+        })
+    
+    outdf = pd.DataFrame(outrows)
+    if outdf.empty:
+        return outdf[["Symbol", "Latest Score", "Prev Score", "Diff", "Runtime", "Status"]]
+    
+    # Sort by numeric latest score
+    try:
+        sortvals = pd.to_numeric(outdf["Latest Score"].replace("NA", 0), errors="coerce").fillna(0)
+    except Exception:
+        sortvals = pd.Series(0.0, index=outdf.index)
+    
+    ascending = True if side == "BEARISH" else False
+    order = np.argsort(sortvals.values)
+    if not ascending:
+        order = order[::-1]
+    
+    outdf = outdf.iloc[order].reset_index(drop=True)
+    
+    # HARD CAP: keep only top 15 rows per side
+    outdf = outdf.head(15)
+    
+    return outdf[["Symbol", "Latest Score", "Prev Score", "Diff", "Runtime", "Status"]]
+
+
+def send_email_rankwatchlist(csv_filename: str) -> bool:
+    """
+    Email layout: Symbol | Latest Score | Prev Score | Diff | Runtime | Status
+    
+    Watchlist rules:
+    - First run: Take TOP 10 bullish + TOP 10 bearish by RankScore15Tier
+    - Subsequent runs: Any symbol in TOP 10 that wasn't already in watchlist gets APPENDED permanently
+    - Final email shows ALL symbols that have EVER been in a TOP 10 list today
+    - Prev Score = previous intraday MAX (bullish) or MIN (bearish) for that symbol
+    - Diff = Latest - Prev (signed)
+    """
+    from datetime import date as date_module
+    today_str = date_module.today().strftime('%Y-%m-%d')
+    
+    # --- Load today's rows from DB ---
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        df = pd.read_sql_query("""
+            SELECT date, runtime, Symbol, RankScore15Tier, BullMultiTFScore, BearMultiTFScore,
+                   DominantTrend, TrendStrength, PositionSizeMultiplier, EntryConfidence, LTP
+            FROM stocksignals
+            WHERE date = ?
+            ORDER BY runtime ASC
+        """, conn, params=(today_str,))
+        conn.close()
+    except Exception as e:
+        logger.error(f"[DB] Error loading today's stocksignals: {e}")
+        return False
+    
+    if df.empty:
+        logger.warning("[DB] No stocksignals rows for today, email not sent.")
+        return False
+    
+    # --- Normalize runtime and sort ---
+    df['runtime'] = df['runtime'].astype(str)
+    df = df.sort_values(['runtime', 'Symbol']).copy()
+    
+    runtimes = sorted(df['runtime'].unique())
+    first_runtime = runtimes[0]
+    
+    # --- Build ever-in-TOP10 watchlists per side across ALL runs ---
+    bull_first_in_time = {}
+    bear_first_in_time = {}
+    
+    for rt in runtimes:
+        dft = df[df['runtime'] == rt]
+        
+        # Top 10 bullish for this run
+        bullst = dft[(dft['DominantTrend'] == 'BULLISH') & (dft['RankScore15Tier'] > 0)].sort_values('RankScore15Tier', ascending=False).head(10)
+        for sym in bullst['Symbol'].unique():
+            if sym not in bull_first_in_time:
+                bull_first_in_time[sym] = rt
+        
+        # Top 10 bearish for this run
+        bearst = dft[(dft['DominantTrend'] == 'BEARISH') & (dft['RankScore15Tier'] < 0)].sort_values('RankScore15Tier', ascending=True).head(10)
+        for sym in bearst['Symbol'].unique():
+            if sym not in bear_first_in_time:
+                bear_first_in_time[sym] = rt
+    
+    bull_watch_syms = list(bull_first_in_time.keys())
+    bear_watch_syms = list(bear_first_in_time.keys())
+    
+    # --- Build combined watchlists for current email run ---
+    df_latest = df.sort_values(['Symbol', 'runtime']).groupby('Symbol').tail(1).copy()
+    
+    bull_all = df_latest[df_latest['Symbol'].isin(bull_watch_syms)].copy()
+    bear_all = df_latest[df_latest['Symbol'].isin(bear_watch_syms)].copy()
+    
+    # --- Compute PrevIntraRank (previous intraday extreme) for each symbol ---
+    def compute_prev_intra(symbol, side):
+        """Get previous intraday MAX (bull) or MIN (bear) RankScore for this symbol."""
+        sym_df = df[df['Symbol'] == symbol].sort_values('runtime')
+        if len(sym_df) <= 1:
+            return None
+        
+        # Exclude latest row
+        prev_df = sym_df.iloc[:-1]
+        if prev_df.empty:
+            return None
+        
+        if side == 'BULLISH':
+            return prev_df['RankScore15Tier'].max()
+        else:
+            return prev_df['RankScore15Tier'].min()
+    
+    bull_all['PrevIntraRank'] = bull_all['Symbol'].apply(lambda s: compute_prev_intra(s, 'BULLISH'))
+    bear_all['PrevIntraRank'] = bear_all['Symbol'].apply(lambda s: compute_prev_intra(s, 'BEARISH'))
+    
+    # --- Tag each symbol as FIRSTRUN or APPENDED ---
+    bull_all['Source'] = bull_all['Symbol'].apply(lambda s: 'FIRSTRUN' if bull_first_in_time.get(s) == first_runtime else 'APPENDED')
+    bear_all['Source'] = bear_all['Symbol'].apply(lambda s: 'FIRSTRUN' if bear_first_in_time.get(s) == first_runtime else 'APPENDED')
+    
+    # --- Convert to display tables ---
+    bull_display = builddisplay(bull_all, 'BULLISH')
+    bear_display = builddisplay(bear_all, 'BEARISH')
+    
+    if bull_display.empty:
+        bullish_html = "<p><i>No bullish entries for today yet.</i></p>"
+    else:
+        bullish_html = bull_display.to_html(index=False, border=1, justify="center")
+    
+    if bear_display.empty:
+        bearish_html = "<p><i>No bearish entries for today yet.</i></p>"
+    else:
+        bearish_html = bear_display.to_html(index=False, border=1, justify="center")
+    
+    # --- Email send (env-based config) ---
+    sender_email = os.getenv("SENDER_EMAIL")
+    sender_password = os.getenv("SENDER_PASSWORD")
+    recipient_email = os.getenv("RECIPIENT_EMAIL")
+    smtp_server = os.getenv("SMTP_SERVER", "smtp.gmail.com")
+    smtp_port = int(os.getenv("SMTP_PORT", 587))
+    
+    if not all([sender_email, sender_password, recipient_email]):
+        logger.warning("[EMAIL] Missing email credentials (SENDER_EMAIL / SENDER_PASSWORD / RECIPIENT_EMAIL)")
+        return False
+    
+    msg = MIMEMultipart()
+    msg["From"] = sender_email
+    msg["To"] = recipient_email
+    msg["Subject"] = f"Asit v3.0 Intraday RankScore Watchlist - {datetime.now().strftime('%Y-%m-%d %H:%M IST')}"
+    
+    body_html = f"""
+<html>
+<body>
+<p>Hello,</p>
+
+<p>Please find attached the Asit Strategy v3.0 analysis results.</p>
+
+<p><b>File:</b> {os.path.basename(csv_filename)}<br>
+<b>Generated:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+
+<h2>📈 Bullish Watchlist (LONG Candidates)</h2>
+{bullish_html}
+
+<h2>📉 Bearish Watchlist (SHORT Candidates)</h2>
+{bearish_html}
+
+<h3>Column Guide:</h3>
+<ul>
+<li><b>Latest Score</b>: Current run RankScore (-15 to +15)</li>
+<li><b>Prev Score</b>: Previous intraday MAX (bullish) or MIN (bearish)</li>
+<li><b>Diff</b>: Latest - Prev (signed change)</li>
+<li><b>Status</b>: First run vs Appended, Up/Down/Better/Worse</li>
+</ul>
+
+<p>This is an automated email from the Asit Strategy Trading System v3.0.</p>
+
+<p>DB auto-clears daily; window functions detect fresh momentum moves.</p>
+
+<p>Best regards,<br>
+Asit Strategy Automated Analysis System</p>
+</body>
+</html>
+"""
+    
+    msg.attach(MIMEText(body_html, 'html'))
+    
+    # --- Attach CSV ---
+    try:
+        with open(csv_filename, 'rb') as f:
+            part = MIMEBase('application', 'octet-stream')
+            part.set_payload(f.read())
+        encoders.encode_base64(part)
+        part.add_header('Content-Disposition', f'attachment; filename={os.path.basename(csv_filename)}')
+        msg.attach(part)
+    except Exception as e:
+        logger.error(f"[EMAIL] CSV attach error: {e}")
+        return False
+    
+    # --- Send ---
+    try:
+        server = smtplib.SMTP(smtp_server, smtp_port)
+        server.starttls()
+        server.login(sender_email, sender_password)
+        server.sendmail(sender_email, recipient_email, msg.as_string())
+        server.quit()
+        logger.info("[EMAIL] Email sent with watchlist")
+        return True
+    except Exception as e:
+        logger.error(f"[EMAIL] SMTP error: {e}")
+        return False
+
+
+def send_email_with_db_insights(csv_filename: str) -> bool:
+    """
+    Wrapper function to maintain compatibility with existing code.
+    Calls the watchlist email function.
+    """
+    return send_email_rankwatchlist(csv_filename)
 
 
 def store_results_in_db(df):
@@ -2286,8 +2623,8 @@ def sendemail_rank_watchlist(csv_filename: str) -> bool:
         out_df = out_df.iloc[order].reset_index(drop=True)
         return out_df
 
-    bull_display = _build_display(bull_all, "BULLISH")
-    bear_display = _build_display(bear_all, "BEARISH")
+    bull_display = builddisplay(bull_all, "BULLISH")
+    bear_display = builddisplay(bear_all, "BEARISH")
 
     if bull_display.empty:
         bullish_html = "<p><i>No bullish entries for today yet.</i></p>"
@@ -2735,231 +3072,6 @@ def store_results_in_db(df: pd.DataFrame):
     logger.info(f"[DB] Stored {len(df_store)} rows at {runtime_str}")
 
 
-def send_email_with_db_insights(csv_filename: str) -> bool:
-    """
-    Send email with DB‑based fresh breakout/breakdown tables + CSV attachment.
-    Uses today's date dynamically.
-    """
-    from datetime import date as _date
-
-    today_str = _date.today().strftime("%Y-%m-%d")
-
-    # --- fresh breakouts / breakdowns using window functions ---
-    conn = sqlite3.connect(DB_PATH)
-
-    bullish_query = f"""
-        WITH hist AS (
-            SELECT
-                date,
-                Symbol,
-                runtime,
-                RankScore15Tier,
-                DominantTrend,
-                PositionSizeMultiplier,
-                LTP,
-                MAX(RankScore15Tier) OVER (
-                    PARTITION BY date, Symbol
-                    ORDER BY runtime
-                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-                ) AS prevmaxrank
-            FROM stocksignals
-            WHERE date = ?
-        ),
-        breakouts AS (
-            SELECT
-                Symbol,
-                runtime,
-                RankScore15Tier AS latestrank,
-                prevmaxrank,
-                RankScore15Tier - prevmaxrank AS breakoutsize,
-                PositionSizeMultiplier,
-                LTP,
-                DominantTrend
-            FROM hist
-            WHERE DominantTrend = 'BULLISH'
-        )
-        SELECT *
-        FROM breakouts
-        WHERE prevmaxrank IS NOT NULL
-          AND breakoutsize > 0.3
-          AND latestrank > 5.5
-        ORDER BY breakoutsize DESC
-        LIMIT 10
-    """
-
-    bearish_query = f"""
-        WITH hist AS (
-            SELECT
-                date,
-                Symbol,
-                runtime,
-                RankScore15Tier,
-                DominantTrend,
-                PositionSizeMultiplier,
-                LTP,
-                MIN(RankScore15Tier) OVER (
-                    PARTITION BY date, Symbol
-                    ORDER BY runtime
-                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
-                ) AS prevminrank
-            FROM stocksignals
-            WHERE date = ?
-        ),
-        breakdowns AS (
-            SELECT
-                Symbol,
-                runtime,
-                RankScore15Tier AS latestrank,
-                prevminrank,
-                prevminrank - RankScore15Tier AS breakdownsize,
-                PositionSizeMultiplier,
-                LTP,
-                DominantTrend
-            FROM hist
-            WHERE DominantTrend = 'BEARISH'
-        )
-        SELECT *
-        FROM breakdowns
-        WHERE prevminrank IS NOT NULL
-          AND breakdownsize > 0.0
-          AND latestrank < 0.0
-        ORDER BY breakdownsize DESC
-        LIMIT 10
-    """
-
-    try:
-        top10_bullish = pd.read_sql_query(bullish_query, conn, params=(today_str,))
-    except Exception as e:
-        logger.error(f"[DB] Bullish query error: {e}")
-        top10_bullish = pd.DataFrame()
-
-    try:
-        top10_bearish = pd.read_sql_query(bearish_query, conn, params=(today_str,))
-    except Exception as e:
-        logger.error(f"[DB] Bearish query error: {e}")
-        top10_bearish = pd.DataFrame()
-
-    conn.close()
-
-    # --- fallback: if fresh breakouts/breakdowns empty, show top N by RankScore today ---
-    bullish_html = "<em>No fresh breakouts vs previous run; showing top 10 current bullish by RankScore.</em>"
-    bearish_html = "<em>No fresh breakdowns; showing top 10 current bearish by RankScore.</em>"
-
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        df_all = pd.read_sql_query(
-            "SELECT * FROM stocksignals WHERE date = ?",
-            conn,
-            params=(today_str,),
-        )
-        conn.close()
-
-        if not df_all.empty:
-            df_bull = df_all[df_all["DominantTrend"] == "BULLISH"].copy()
-            if not df_bull.empty:
-                df_bull = df_bull.sort_values(
-                    "RankScore15Tier", ascending=False
-                ).head(10)[
-                    ["Symbol", "runtime", "RankScore15Tier",
-                     "PositionSizeMultiplier", "LTP", "DominantTrend"]
-                ]
-                bullish_html = df_bull.to_html(index=False, border=1)
-
-            df_bear = df_all[df_all["DominantTrend"] == "BEARISH"].copy()
-            if not df_bear.empty:
-                df_bear = df_bear.sort_values(
-                    "RankScore15Tier", ascending=True
-                ).head(10)[
-                    ["Symbol", "runtime", "RankScore15Tier",
-                     "PositionSizeMultiplier", "LTP", "DominantTrend"]
-                ]
-                bearish_html = df_bear.to_html(index=False, border=1)
-    except Exception as e:
-        logger.error(f"[EMAIL] Fallback bullish/bearish table error: {e}")
-
-    # --- build and send email (kept same style as your existing code) ---
-    try:
-        sender_email = get_cfg(
-            "email_settings", "sender_email", env_name="SENDER_EMAIL"
-        )
-        sender_password = get_cfg(
-            "email_settings", "sender_password", env_name="SENDER_PASSWORD"
-        )
-        recipient_email = get_cfg(
-            "email_settings", "recipient_email", env_name="RECIPIENT_EMAIL"
-        )
-        smtp_server = get_cfg(
-            "email_settings", "smtp_server",
-            env_name="SMTP_SERVER", default="smtp.gmail.com"
-        )
-        smtp_port = get_cfg(
-            "email_settings", "smtp_port",
-            env_name="SMTP_PORT", default=587, is_int=True
-        )
-        if not sender_email or not sender_password or not recipient_email:
-            logger.warning("[EMAIL] Missing email credentials")
-            return False
-    except Exception as e:
-        logger.error(f"[EMAIL] Error reading email config: {e}")
-        return False
-
-    msg = MIMEMultipart()
-    msg["From"] = sender_email
-    msg["To"] = recipient_email
-    msg["Subject"] = f"Asit Strategy v3.0 Results - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-
-    body_html = f"""
-<html>
-  <body>
-    <p>Hello,</p>
-    <p>Please find attached the Asit Strategy v3.0 analysis results.</p>
-    <p><b>File</b>: {os.path.basename(csv_filename)}<br>
-       <b>Generated</b>: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
-
-    <h2>Fresh Bullish Breakouts (vs previous intraday max)</h2>
-    {bullish_html}
-
-    <h2>Fresh Bearish Breakdowns (vs previous intraday min)</h2>
-    {bearish_html}
-
-    <p>This is an automated email from the Asit Strategy Trading System v3.0.<br>
-       DB auto‑clears daily; window functions detect fresh momentum moves.</p>
-
-    <p>Best regards,<br>
-       Asit Strategy Automated Analysis System</p>
-  </body>
-</html>
-"""
-    msg.attach(MIMEText(body_html, "html"))
-
-    # attach CSV
-    try:
-        with open(csv_filename, "rb") as f:
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(f.read())
-        encoders.encode_base64(part)
-        part.add_header(
-            "Content-Disposition",
-            f'attachment; filename="{os.path.basename(csv_filename)}"',
-        )
-        msg.attach(part)
-    except Exception as e:
-        logger.error(f"[EMAIL] CSV attach error: {e}")
-        return False
-
-    try:
-        server = smtplib.SMTP(smtp_server, smtp_port)
-        server.starttls()
-        server.login(sender_email, sender_password)
-        server.sendmail(sender_email, recipient_email, msg.as_string())
-        server.quit()
-        logger.info("[EMAIL] Email sent with DB insights")
-        return True
-    except Exception as e:
-        logger.error(f"[EMAIL] SMTP error: {e}")
-        return False
-
-
 if __name__ == "__main__":
     init_daily_db()
 
@@ -3036,12 +3148,15 @@ if __name__ == "__main__":
     email_sent = send_email_with_db_insights(filename)
 
     if email_sent:
-        print("[EMAIL] ✅ Report successfully emailed!")
+         print("[EMAIL] ✅ Report successfully emailed!")
     else:
-        print("[EMAIL] ⚠️ Email not sent - check config.ini or continue without email")
+         print("[EMAIL] ⚠️ Email not sent - check config.ini or continue without email")
 
     print("\n" + "=" * 100)
     print(f"[DATA] File Size: {os.path.getsize(filename) / 1024:.2f} KB\n")
     print("[OK] v3.0 ALL GAPS FIXED:")
     # ... your GAP prints unchanged ...
     print("=" * 100)
+    print(f"DATA Records: {len(results_df)}")
+    print(f"DATA Columns: {len(results_df.columns)}")
+    print(f"DATA File Size: {os.path.getsize(filename) / 1024:.2f} KB")
