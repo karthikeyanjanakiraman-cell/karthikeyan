@@ -1221,7 +1221,7 @@ def store_results_in_db(df):
     
     # Normalize column names
     df_store['Symbol'] = df_store.get('Symbol', df_store.get('symbol', ''))
-    df_store['RankScore15Tier'] = df_store.get('RankScore15Tier', df_store.get('rank_score', 0))
+    df_store['RankScore15Tier'] = df_store.get('RankScore15Tier',df_store.get('RankScore_15Tier', df_store.get('rank_score', 0)))
     df_store['BullMultiTFScore'] = df_store.get('BullMultiTFScore', 0)
     df_store['BearMultiTFScore'] = df_store.get('BearMultiTFScore', 0)
     df_store['DominantTrend'] = df_store.get('DominantTrend', df_store.get('trend', 'NEUTRAL'))
@@ -1291,6 +1291,18 @@ def build_display_df(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
                 prev_score = float(prev_intra)
             except Exception:
                 prev_score = None
+
+        # When formatting:
+        latest_str = f"{latest:.2f}"
+        prev_str = "NA" if prev_score is None else f"{prev_score:.2f}"
+
+        if prev_score is None:
+            diff_val = None
+            diff_str = "0"
+        else:
+            diff_val = latest - prev_score
+            sign = "+" if diff_val > 0 else ""
+            diff_str = f"{sign}{diff_val:.2f}"
         
         # Calculate diff
         if prev_score is None:
@@ -1449,10 +1461,18 @@ def send_email_rank_watchlist(csv_filename: str) -> bool:
         if prev_df.empty:
             return None
         
-        if side == "BULLISH":
-            return prev_df['RankScore15Tier'].max()
+        # Support both RankScore15Tier and RankScore_15Tier
+        if 'RankScore15Tier' in prev_df.columns:
+            col = 'RankScore15Tier'
+        elif 'RankScore_15Tier' in prev_df.columns:
+            col = 'RankScore_15Tier'
         else:
-            return prev_df['RankScore15Tier'].min()
+            return None
+        series = pd.to_numeric(prev_df[col], errors='coerce').dropna()
+        if series.empty:
+            return None
+
+            return series.max() if side == "BULLISH" else series.min()
     
     bull_all['PrevIntraRank'] = bull_all['Symbol'].apply(lambda s: compute_prev_intra(s, "BULLISH"))
     bear_all['PrevIntraRank'] = bear_all['Symbol'].apply(lambda s: compute_prev_intra(s, "BEARISH"))
