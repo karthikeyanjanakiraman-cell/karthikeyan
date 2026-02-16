@@ -1572,6 +1572,8 @@ def send_email_rank_watchlist(csv_filename: str) -> bool:
         logger.error(f"[EMAIL] SMTP error: {str(e)}")
         return False
 
+
+
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 # MAIN EXECUTION
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -1581,14 +1583,38 @@ if __name__ == "__main__":
     print("[LAUNCH] ASIT STRATEGY v3.0 - ALL 12 GAPS FIXED AND INTEGRATED")
     print("=" * 80 + "\n")
     
-    # NSE symbols (top liquid stocks for intraday)
-    NSE_SYMBOLS = [
-        "NSE:RELIANCE-EQ", "NSE:TCS-EQ", "NSE:HDFCBANK-EQ", "NSE:INFY-EQ",
-        "NSE:ICICIBANK-EQ", "NSE:HINDUNILVR-EQ", "NSE:SBIN-EQ", "NSE:BHARTIARTL-EQ",
-        "NSE:ITC-EQ", "NSE:KOTAKBANK-EQ", "NSE:LT-EQ", "NSE:AXISBANK-EQ",
-        "NSE:ASIANPAINT-EQ", "NSE:MARUTI-EQ", "NSE:SUNPHARMA-EQ", "NSE:TITAN-EQ",
-        "NSE:BAJFINANCE-EQ", "NSE:ULTRACEMCO-EQ", "NSE:NESTLEIND-EQ", "NSE:WIPRO-EQ"
-    ]
+    def create_sector_map_from_industry(sectors_folder="sectors", direct_csv=None):
+        sector_map = {}
+        
+        if direct_csv and os.path.exists(direct_csv):
+            try:
+                df = pd.read_csv(direct_csv)
+                for _, row in df.iterrows():
+                    symbol = str(row.get("Symbol", "")).strip()
+                    if symbol:
+                        sector_map[f"NSE:{symbol}-EQ"] = str(row.get("Industry", "Unknown")).strip()
+                logger.info(f"[OK] Loaded {len(sector_map)} symbols from {direct_csv}\n")
+                return sector_map
+            except Exception as e:
+                logger.warning(f"Error reading {direct_csv}: {e}\n")
+        
+        if os.path.exists(sectors_folder):
+            for filename in os.listdir(sectors_folder):
+                if filename.endswith(".csv"):
+                    try:
+                        df = pd.read_csv(os.path.join(sectors_folder, filename))
+                        for _, row in df.iterrows():
+                            symbol = str(row.get("Symbol", "")).strip()
+                            if symbol:
+                                sector_map[f"NSE:{symbol}-EQ"] = str(row.get("Industry", "Unknown")).strip()
+                    except Exception as e:
+                        logger.warning(f"Error reading {filename}: {e}")
+        
+        logger.info(f"[OK] Loaded {len(sector_map)} symbols\n")
+        return sector_map
+    
+    sector_map = create_sector_map_from_industry(sectors_folder="sectors", direct_csv="ind_nifty100list.csv")
+    NSE_SYMBOLS = list(sector_map.keys())
     
     # Initialize daily database
     print("[DB] Initializing daily database...")
