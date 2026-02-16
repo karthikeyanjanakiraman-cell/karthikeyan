@@ -1656,11 +1656,12 @@ if __name__ == "__main__":
     NSE_SYMBOLS = list(sector_map.keys())
     
     # Initialize daily database
-    if os.getenv("INIT_DB", "1") == "1":
-        print("[DB] FIRST_RUN_OF_DAY=1 → Initializing daily database...")
+    init_DB = os.getenv("INIT_DB")
+    if init_DB:
+        print("[DB] INIT_DB=TRUE → Initializing daily database...")
         init_daily_db()
     else:
-        print("[DB] FIRST_RUN_OF_DAY!=1 → Skipping DB init; appending to today's history...")
+        print("[DB] FIRST_RUN_OF_DAY=FALSE → Skipping DB init; appending to today's history...")
         
     # Process all stocks
     print(f"[PROCESS] Processing {len(NSE_SYMBOLS)} stocks across 5 timeframes...")
