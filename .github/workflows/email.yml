@@ -74,11 +74,7 @@ jobs:
           if [ -f "intraday_signals.db" ]; then
             git add intraday_signals.db
           fi
-
-          if ls asit_intraday_greeks_v3_0_*.csv 1> /dev/null 2>&1; then
-            git add asit_intraday_greeks_v3_0_*.csv
-          fi
-
+          
           if git diff --cached --quiet; then
             echo "No DB/CSV changes to commit."
           else
