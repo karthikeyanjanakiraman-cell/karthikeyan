@@ -6,7 +6,6 @@ on:
     - cron: "*/5 3-10 * * 1-5"
   workflow_dispatch: {}
 
-# Needed so the workflow can commit and push changes (DB + CSV) back to the repo
 permissions:
   contents: write
 
@@ -18,7 +17,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
         with:
-          # Full history so commits and pushes work correctly
           fetch-depth: 0
 
       - name: Set up Python
@@ -30,6 +28,14 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install fyers_apiv3 pandas numpy scipy ta
+
+      # NEW: bring back last run's DB (if any) into the workspace
+      - name: Download previous intraday DB (if exists)
+        uses: actions/download-artifact@v4
+        with:
+          name: intraday-signals-db
+          path: .
+        continue-on-error: true
 
       - name: Run Fyers v3 email script
         env:
@@ -45,36 +51,37 @@ jobs:
           TZ:              Asia/Kolkata
         run: |
           python EMAIL.py
-          # or: python app-fyers_v3_0_COMPLETE_WITH_EMAIL.py
+
+      # NEW: persist updated DB for the next run
+      - name: Upload intraday DB
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: intraday-signals-db
+          path: intraday_signals.db
 
       - name: Commit updated DB and CSV
-        if: always()  # try to commit even if the script step fails
+        if: always()
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # Configure git identity for the automated commit
           git config user.name "github-actions"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          # Make sure we are up to date with remote main
           git fetch origin main
           git pull --rebase origin main || true
 
-          # Add SQLite DB if it exists (EMAIL.py uses DBPATH = 'intradaysignals.db')
-          if [ -f "intradaysignals.db" ]; then
-            git add intradaysignals.db
+          if [ -f "intraday_signals.db" ]; then
+            git add intraday_signals.db
           fi
 
-          # Add any generated CSV files (e.g. asitintradaygreeksv30*.csv)
-          if ls asitintradaygreeksv30*.csv 1> /dev/null 2>&1; then
-            git add asitintradaygreeksv30*.csv
+          if ls asit_intraday_greeks_v3_0_*.csv 1> /dev/null 2>&1; then
+            git add asit_intraday_greeks_v3_0_*.csv
           fi
 
-          # Only commit if there are staged changes
           if git diff --cached --quiet; then
             echo "No DB/CSV changes to commit."
           else
             git commit -m "Auto-update intraday SQLite DB and CSV [skip ci]" || true
-            # Push to main; don't fail the job if push is rejected due to a race
-            git push origin HEAD:main || echo "Push failed (remote changed again); skipping."
+            git push origin HEAD:main || echo "Push failed; skipping."
           fi
