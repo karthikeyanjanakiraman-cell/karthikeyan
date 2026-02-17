@@ -1036,13 +1036,13 @@ def get_historical_data_with_validation(symbol, resolution, days_back):
 # MULTI-TIMEFRAME STOCK PROCESSING (CORE STRATEGY)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 
+
 def process_stock_multitimeframe_v30(symbol):
     """
-    Process single stock across all timeframes with ALL 12 GAPs integrated
-    Returns stock analysis with RankScore, exit signals, and all GAP features
+    Process single stock across all timeframes with ALL 12 GAPs integrated.
+    Returns stock analysis with RankScore, exit signals, and all GAP features.
     """
     logger.info(f"[PROCESS] Starting {symbol}")
-
     timeframe_results = {}
 
     # Fetch data for all timeframes
@@ -1052,13 +1052,11 @@ def process_stock_multitimeframe_v30(symbol):
             tf_config['resolution'],
             tf_config['days']
         )
-
         if df is None:
             logger.warning(f"[PROCESS] {symbol} {tf_name}: No data")
             continue
 
         df_with_indicators = calculate_technical_indicators(df)
-
         if df_with_indicators is None:
             continue
 
@@ -1069,21 +1067,21 @@ def process_stock_multitimeframe_v30(symbol):
             'df': df_with_indicators,
             'bull_score': bull_score,
             'bear_score': bear_score,
-            'weight': tf_config['weight']
+            'weight': tf_config['weight'],
         }
 
     if not timeframe_results:
         logger.warning(f"[PROCESS] {symbol}: No valid timeframes")
         return None
 
-    # Calculate weighted multi-timeframe scores
+    # ===== ORIGINAL AGGREGATE MULTI‑TF SCORE (kept) =====
     total_bull = sum(r['bull_score'] * r['weight'] for r in timeframe_results.values())
     total_bear = sum(r['bear_score'] * r['weight'] for r in timeframe_results.values())
 
-    # GAP #1: Rank magnitude scaling
+    # GAP #1: Rank magnitude scaling (aggregate across all TFs)
     rank_score, position_multiplier = calculate_continuous_rank_score(total_bull, total_bear)
 
-    # Determine dominant trend
+    # Determine aggregate dominant trend
     if rank_score > 0:
         dominant_trend = 'BULLISH'
     elif rank_score < 0:
@@ -1091,11 +1089,42 @@ def process_stock_multitimeframe_v30(symbol):
     else:
         dominant_trend = 'NEUTRAL'
 
-    # Get LTP from most recent data
-    latest_df = timeframe_results['5min']['df'] if '5min' in timeframe_results else list(timeframe_results.values())[0]['df']
+    # ===== NEW: PER‑TIMEFRAME 15‑TIER SCORE & DOMINANT TREND =====
+    per_tf_fields = {}
+    for tf_name, tf_data in timeframe_results.items():
+        tf_bull = tf_data['bull_score']
+        tf_bear = tf_data['bear_score']
+
+        # Use the same GAP #1 scaling logic per timeframe
+        tf_rank_score, _ = calculate_continuous_rank_score(tf_bull, tf_bear)
+
+        if tf_rank_score > 0:
+            tf_dom = 'BULLISH'
+        elif tf_rank_score < 0:
+            tf_dom = 'BEARISH'
+        else:
+            tf_dom = 'NEUTRAL'
+
+        prefix = tf_name  # e.g., "5min", "1day"
+        per_tf_fields[f"{prefix}_Score15Tier"] = tf_rank_score
+        per_tf_fields[f"{prefix}_DominantTrend"] = tf_dom
+        per_tf_fields[f"{prefix}_BullScore"] = tf_bull
+        per_tf_fields[f"{prefix}_BearScore"] = tf_bear
+
+        logger.info(
+            f"[PROCESS] {symbol} {tf_name}: "
+            f"Score15Tier={tf_rank_score:.2f}, Dominant={tf_dom}, "
+            f"bull={tf_bull:.3f}, bear={tf_bear:.3f}"
+        )
+
+    # Get LTP from most recent data (as before)
+    if '5min' in timeframe_results:
+        latest_df = timeframe_results['5min']['df']
+    else:
+        latest_df = list(timeframe_results.values())[0]['df']
     ltp = latest_df['close'].iloc[-1]
 
-    # GAP #7: Calculate exit signals (2-of-4 indicator rule)
+    # GAP #7: Multi‑indicator exit signals
     exit_decision = calculate_exit_signals_with_two_indicator_rule(latest_df, dominant_trend)
 
     # GAP #8: Pullback metrics
@@ -1107,12 +1136,13 @@ def process_stock_multitimeframe_v30(symbol):
     # GAP #10: DTE and theta decay
     dte_info = calculate_dynamic_dte_with_decay()
 
-    # Calculate entry confidence
+    # Entry confidence from aggregate rank
     entry_confidence = abs(rank_score) / 15.0
 
-    # Recommend option strikes (GAP #5: Delta range)
+    # GAP #5: Recommend option strikes (delta range)
     option_rec = recommend_option_strikes_with_greeks_liquid_v30(symbol, ltp, dominant_trend)
 
+    # Base result fields (existing)
     result = {
         'Symbol': symbol,
         'RankScore15Tier': rank_score,
@@ -1135,12 +1165,20 @@ def process_stock_multitimeframe_v30(symbol):
         'OptionStrike': option_rec['strike'] if option_rec else None,
         'OptionDelta': option_rec['delta'] if option_rec else None,
         'OptionTheta': option_rec['theta'] if option_rec else None,
-        'CanTradeToday': True
+        'CanTradeToday': True,
     }
 
-    logger.info(f"[PROCESS] {symbol}: Rank={rank_score:.2f}, Trend={dominant_trend}, Exit={exit_decision['exit_signals_count']}")
+    # Add NEW per‑TF fields into result (goes to CSV)
+    result.update(per_tf_fields)
 
+    logger.info(
+        f"[PROCESS] {symbol}: "
+        f"Rank={rank_score:.2f}, Trend={dominant_trend}, "
+        f"ExitSignals={exit_decision['exit_signals_count']}"
+    )
     return result
+        
+    
 
 
 def rank_all_stocks_multitimeframe_v30(symbols_list):
@@ -1268,19 +1306,29 @@ def store_results_in_db(df):
 # EMAIL FUNCTIONS - FIXED VERSION (SINGLE EMAIL, SORTED BY DIFF, WITH EXIT COLUMNS)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 
+
 def build_display_df(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
     """
-    Build display table for email
-    side: 'BULLISH' or 'BEARISH'
+    Build display table for email side: 'BULLISH' or 'BEARISH'
 
     Output columns:
-    Symbol | Latest Score | Prev Score | Diff | Runtime | Status | ExitSignalsCount | ExitReason
+        Symbol | Latest Score | Prev Score | Diff | Runtime | Status |
+        ExitSignalsCount | ExitReason | TF_Dominants
     """
+    base_cols = [
+        'Symbol',
+        'Latest Score',
+        'Prev Score',
+        'Diff',
+        'Runtime',
+        'Status',
+        'ExitSignalsCount',
+        'ExitReason',
+        'TF_Dominants',
+    ]
+
     if df_side is None or df_side.empty:
-        return pd.DataFrame(columns=[
-            'Symbol', 'Latest Score', 'Prev Score', 'Diff', 'Runtime',
-            'Status', 'ExitSignalsCount', 'ExitReason'
-        ])
+        return pd.DataFrame(columns=base_cols)
 
     out_rows = []
 
@@ -1331,7 +1379,8 @@ def build_display_df(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
                     status = "First + Up" if diff_val > 0 else "First - Down"
                 else:
                     status = "First Worse" if diff_val < 0 else "First - Better"
-        else:  # APPENDED with previous
+        else:
+            # APPENDED with previous
             if diff_val is None or (abs_diff is not None and abs_diff < 1e-9):
                 status = "Append no update"
             else:
@@ -1350,6 +1399,26 @@ def build_display_df(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
             sign = "+" if diff_val > 0 else ""
             diff_str = f"{sign}{diff_val:.2f}"
 
+        # NEW: collect all timeframe DominantTrend values (from merged CSV+DB)
+        tf_cols = [
+            '5min_DominantTrend',
+            '15min_DominantTrend',
+            '1hour_DominantTrend',
+            '4hour_DominantTrend',
+            '1day_DominantTrend',
+        ]
+        tf_doms = []
+        for col in tf_cols:
+            val = row.get(col, None)
+            if isinstance(val, float) and pd.isna(val):
+                tf_doms.append("NA")
+            elif val is None:
+                tf_doms.append("NA")
+            else:
+                tf_doms.append(str(val))
+
+        tf_dominants_str = " | ".join(tf_doms)
+
         out_rows.append({
             'Symbol': symbol,
             'Latest Score': latest_str,
@@ -1358,16 +1427,13 @@ def build_display_df(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
             'Runtime': runtime,
             'Status': status,
             'ExitSignalsCount': exit_signals_count,
-            'ExitReason': exit_reason
+            'ExitReason': exit_reason,
+            'TF_Dominants': tf_dominants_str,
         })
 
     out_df = pd.DataFrame(out_rows)
-
     if out_df.empty:
-        return out_df[[
-            'Symbol', 'Latest Score', 'Prev Score', 'Diff', 'Runtime',
-            'Status', 'ExitSignalsCount', 'ExitReason'
-        ]]
+        return out_df[base_cols]
 
     # Sort by Diff (numeric), NOT by Latest Score
     try:
@@ -1377,44 +1443,55 @@ def build_display_df(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
         ).fillna(0)
 
         if side == "BEARISH":
-            # Bearish: Most negative Diff first (ascending)
+            # Bearish: most negative Diff first
             out_df = out_df.sort_values('Diff_numeric', ascending=True).reset_index(drop=True)
         else:
-            # Bullish: Most positive Diff first (descending)
+            # Bullish: most positive Diff first
             out_df = out_df.sort_values('Diff_numeric', ascending=False).reset_index(drop=True)
 
         out_df = out_df.drop('Diff_numeric', axis=1)
     except Exception as e:
         logger.warning(f"[WARN] Sorting by Diff failed: {str(e)}")
 
-    # Take top 10 by Diff
+    # Top 10
     out_df = out_df.head(10)
-
-    return out_df[[
-        'Symbol', 'Latest Score', 'Prev Score', 'Diff', 'Runtime',
-        'Status', 'ExitSignalsCount', 'ExitReason'
-    ]]
-
+    return out_df[base_cols]
 
 def send_email_rank_watchlist(csv_filename: str) -> bool:
     """
     Single email with top 10 bullish/bearish sorted by Diff.
-    Includes ExitSignalsCount and ExitReason columns.
+    Includes ExitSignalsCount, ExitReason, and per‑timeframe DominantTrend info.
     """
     from datetime import date as date_module
+
     today_str = date_module.today().strftime('%Y-%m-%d')
 
     # --- Load today's rows from DB ---
     try:
         conn = sqlite3.connect(DB_PATH)
-        df = pd.read_sql_query("""
-            SELECT date, runtime, Symbol, RankScore15Tier, BullMultiTFScore, BearMultiTFScore,
-                   DominantTrend, TrendStrength, PositionSizeMultiplier, EntryConfidence, LTP,
-                   ExitSignalsCount, ExitReason
+        df = pd.read_sql_query(
+            """
+            SELECT
+                date,
+                runtime,
+                Symbol,
+                RankScore15Tier,
+                BullMultiTFScore,
+                BearMultiTFScore,
+                DominantTrend,
+                TrendStrength,
+                PositionSizeMultiplier,
+                EntryConfidence,
+                LTP,
+                ExitSignalsCount,
+                ExitReason
             FROM stock_signals
             WHERE date = ?
             ORDER BY runtime ASC
-        """, conn, params=(today_str,))
+            """,
+            conn,
+            params=(today_str,),
+        )
         conn.close()
     except Exception as e:
         logger.error(f"[DB] Error loading today's stock_signals: {e}")
@@ -1424,10 +1501,19 @@ def send_email_rank_watchlist(csv_filename: str) -> bool:
         logger.warning("[DB] No stock_signals rows for today, email not sent.")
         return False
 
+    # --- Load current CSV (for per‑TF columns) ---
+    df_csv = None
+    try:
+        if os.path.exists(csv_filename):
+            df_csv = pd.read_csv(csv_filename)
+        else:
+            logger.warning(f"[EMAIL] CSV file not found: {csv_filename}")
+    except Exception as e:
+        logger.warning(f"[EMAIL] Error reading CSV {csv_filename}: {e}")
+
     # --- Normalize runtime and sort ---
     df['runtime'] = df['runtime'].astype(str)
     df = df.sort_values(['runtime', 'Symbol']).copy()
-
     runtimes = sorted(df['runtime'].unique())
     first_runtime = runtimes[0]
 
@@ -1464,20 +1550,27 @@ def send_email_rank_watchlist(csv_filename: str) -> bool:
     # --- Latest row per symbol for current snapshot ---
     df_latest = df.sort_values(['Symbol', 'runtime']).groupby('Symbol').tail(1).copy()
 
+    # Merge per‑TF data from CSV (if available)
+    if df_csv is not None and 'Symbol' in df_csv.columns:
+        try:
+            df_latest = df_latest.merge(df_csv, on='Symbol', how='left', suffixes=('', '_csv'))
+        except Exception as e:
+            logger.warning(f"[EMAIL] Merge with CSV failed: {e}")
+
     bull_all = df_latest[df_latest['Symbol'].isin(bull_watch_syms)].copy()
     bear_all = df_latest[df_latest['Symbol'].isin(bear_watch_syms)].copy()
 
     # --- Compute PrevIntraRank (previous intraday extreme for each symbol) ---
     def compute_prev_intra(symbol, side):
-        """Get previous intraday MAX (bull) or MIN (bear) RankScore for this symbol"""
+        """
+        Get previous intraday MAX (bull) or MIN (bear) RankScore for this symbol.
+        """
         sym_df = df[df['Symbol'] == symbol].sort_values('runtime')
-
         if len(sym_df) <= 1:
             return None
 
         # Exclude current run
         prev_df = sym_df.iloc[:-1]
-
         if prev_df.empty:
             return None
 
@@ -1539,39 +1632,38 @@ def send_email_rank_watchlist(csv_filename: str) -> bool:
     msg["Subject"] = f"Asit v3.0 Intraday RankScore Watchlist - {datetime.now().strftime('%Y-%m-%d %H:%M IST')}"
 
     body_html = f"""
-    <html>
-    <body style="font-family: Arial, sans-serif;">
-      <p>Hello,</p>
+<html>
+  <body style="font-family: Arial, sans-serif;">
+    <p>Hello,</p>
+    <p>Please find attached the Asit Strategy v3.0 analysis results.</p>
+    <p><b>File</b>: {os.path.basename(csv_filename)}<br>
+       <b>Generated</b>: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
 
-      <p>Please find attached the Asit Strategy v3.0 analysis results.</p>
+    <h2>Bullish Watchlist (LONG Candidates)</h2>
+    {bullish_html}
 
-      <p><b>File:</b> {os.path.basename(csv_filename)}<br>
-         <b>Generated:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+    <h2>Bearish Watchlist (SHORT Candidates)</h2>
+    {bearish_html}
 
-      <h2>📈 Bullish Watchlist (LONG Candidates)</h2>
-      {bullish_html}
+    <h3>Column Guide</h3>
+    <ul>
+      <li><b>Latest Score</b>: Current run RankScore (-15 to 15)</li>
+      <li><b>Prev Score</b>: Previous intraday MAX bullish or MIN bearish</li>
+      <li><b>Diff</b>: Latest - Prev (signed change, used for ranking)</li>
+      <li><b>Status</b>: First run vs APPENDED, Up/Down/Better/Worse</li>
+      <li><b>ExitSignalsCount</b>: Number of exit indicators triggered</li>
+      <li><b>ExitReason</b>: Specific exit signals detected</li>
+      <li><b>TF_Dominants</b>: DominantTrend across 5min / 15min / 1hour / 4hour / 1day</li>
+    </ul>
 
-      <h2>📉 Bearish Watchlist (SHORT Candidates)</h2>
-      {bearish_html}
+    <p>This is an automated email from the Asit Strategy Trading System v3.0.<br>
+       DB auto-clears daily; window functions detect fresh momentum moves.</p>
 
-      <h3>Column Guide:</h3>
-      <ul>
-        <li><b>Latest Score:</b> Current run RankScore (-15 to +15)</li>
-        <li><b>Prev Score:</b> Previous intraday MAX (bullish) or MIN (bearish)</li>
-        <li><b>Diff:</b> Latest - Prev (signed change, used for ranking)</li>
-        <li><b>Status:</b> First run vs APPENDED, Up/Down/Better/Worse</li>
-        <li><b>ExitSignalsCount:</b> Number of exit indicators triggered</li>
-        <li><b>ExitReason:</b> Specific exit signal(s) detected</li>
-      </ul>
-
-      <p>This is an automated email from the Asit Strategy Trading System v3.0.</p>
-      <p>DB auto-clears daily; window functions detect fresh momentum moves.</p>
-
-      <p>Best regards,<br>
-         Asit Strategy Automated Analysis System</p>
-    </body>
-    </html>
-    """
+    <p>Best regards,<br>
+       Asit Strategy Automated Analysis System</p>
+  </body>
+</html>
+"""
 
     msg.attach(MIMEText(body_html, "html"))
 
@@ -1580,12 +1672,11 @@ def send_email_rank_watchlist(csv_filename: str) -> bool:
         with open(csv_filename, "rb") as f:
             part = MIMEBase("application", "octet-stream")
             part.set_payload(f.read())
-
         encoders.encode_base64(part)
-        part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(csv_filename)}")
+        part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(csv_filename)}"')
         msg.attach(part)
     except Exception as e:
-        logger.error(f"[EMAIL] CSV attach error: {str(e)}")
+        logger.error(f"[EMAIL] CSV attach error: {e}")
         return False
 
     # --- Send email ---
@@ -1597,21 +1688,23 @@ def send_email_rank_watchlist(csv_filename: str) -> bool:
         server.quit()
 
         logger.info(f"[EMAIL] Sent intraday RankScore watchlist to {recipient_email}")
-        logger.info(f"[EMAIL] Bullish symbols: {len(bull_watch_syms)}, Bearish symbols: {len(bear_watch_syms)}")
-
+        logger.info(f"[EMAIL] Bullish symbols: {len(bull_display)}, Bearish symbols: {len(bear_display)}")
         print("=" * 80)
-        print("[EMAIL] ✅ EMAIL SENT SUCCESSFULLY!")
+        print("[EMAIL] EMAIL SENT SUCCESSFULLY!")
         print(f"[EMAIL] Recipient: {recipient_email}")
         print(f"[EMAIL] Attachment: {csv_filename}")
         print(f"[EMAIL] Bullish stocks (top 10 by Diff): {len(bull_display)}")
         print(f"[EMAIL] Bearish stocks (top 10 by Diff): {len(bear_display)}")
         print("=" * 80)
-
         return True
-
     except Exception as e:
-        logger.error(f"[EMAIL] SMTP error: {str(e)}")
+        logger.error(f"[EMAIL] SMTP error: {e}")
         return False
+
+
+
+    
+        
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 # MAIN EXECUTION
