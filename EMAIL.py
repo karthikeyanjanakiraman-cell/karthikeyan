@@ -1309,7 +1309,7 @@ def store_results_in_db(df):
 
 
 
-   def build_display_df(df_side: pd.DataFrame, side: str, sectormap: dict = None) -> pd.DataFrame:
+def build_display_df(df_side: pd.DataFrame, side: str, sectormap: dict = None) -> pd.DataFrame:
     """
     Hybrid: FYERS LTP + yfinance for prev_close and sector indices.
     Stock %Chg = (FYERS LTP - yfinance prev_close) / prev_close * 100
