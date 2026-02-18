@@ -1309,11 +1309,12 @@ def store_results_in_db(df):
 
 def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) -> pd.DataFrame:
     """
-    Hybrid: FYERS LTP + yfinance for prev_close and sector indices.
+    Hybrid: FYERS LTP + yfinance for prev_close, sector indices, and volatility.
+    Adds 'Avg Daily Vol' column. Optimized to fetch YF data only once per symbol.
     """
     import yfinance as yf
     
-    out_cols = ['Symbol', 'Stock %Chg', 'Sector %Chg', 'Sector', 'Runtime', 'Status', 'ExitSignalsCount', 'ExitReason']
+    out_cols = ['Symbol', 'Stock %Chg', 'Sector %Chg', 'Avg Daily Vol', 'Sector', 'Runtime', 'Status', 'ExitSignalsCount', 'ExitReason']
     
     if df_side is None or df_side.empty:
         return pd.DataFrame(columns=out_cols)
@@ -1331,23 +1332,38 @@ def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) 
         'Infrastructure': '^CNXINFRA', 'Construction': '^CNXINFRA', 'Cement': '^CNXINFRA'
     }
     
-    prev_close_cache = {}
+    # Unified Cache: Store the whole history dataframe
+    # Key: Symbol, Value: DataFrame (history)
+    history_cache = {} 
     sector_pct_cache = {}
     
-    def get_prev_close_yf(symbol: str) -> float:
-        if symbol in prev_close_cache:
-            return prev_close_cache[symbol]
+    def get_yf_symbol(symbol):
+        return symbol.replace('NSE:', '').replace('-EQ', '') + '.NS'
+
+    def get_stock_history(symbol: str):
+        """Fetch 3mo history once and cache it"""
+        if symbol in history_cache: return history_cache[symbol]
         try:
-            yf_symbol = symbol.replace('NSE:', '').replace('-EQ', '') + '.NS'
-            ticker = yf.Ticker(yf_symbol)
-            hist = ticker.history(period='5d')
-            if len(hist) >= 2:
-                prev_close = float(hist['Close'].iloc[-2])
-                prev_close_cache[symbol] = prev_close
-                return prev_close
+            ticker = yf.Ticker(get_yf_symbol(symbol))
+            # Fetch 3mo to cover both prev_close (needs 5d) and volatility (needs 3mo)
+            hist = ticker.history(period='3mo')
+            history_cache[symbol] = hist
+            return hist
         except:
-            pass
-        prev_close_cache[symbol] = None
+            history_cache[symbol] = None
+            return None
+
+    def get_prev_close_from_hist(hist) -> float:
+        """Extract prev close from cached history"""
+        if hist is not None and not hist.empty and len(hist) >= 2:
+            return float(hist['Close'].iloc[-2])
+        return None
+
+    def get_volatility_from_hist(hist) -> float:
+        """Calculate volatility from cached history"""
+        if hist is not None and not hist.empty and len(hist) > 10:
+            daily_returns = hist['Close'].pct_change()
+            return round(daily_returns.std() * 100, 2)
         return None
     
     def get_sector_label(symbol: str) -> str:
@@ -1357,29 +1373,22 @@ def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) 
         return 'Unknown'
     
     def get_sector_pct_yf(sector_name: str) -> float:
-        if sector_name in sector_pct_cache:
-            return sector_pct_cache[sector_name]
-        
+        if sector_name in sector_pct_cache: return sector_pct_cache[sector_name]
         index_symbol = None
         for key, idx in SECTOR_IDX.items():
             if key.lower() in sector_name.lower():
                 index_symbol = idx
                 break
-        
-        if not index_symbol:
-            index_symbol = '^NSEI'
-        
+        if not index_symbol: index_symbol = '^NSEI'
         try:
             ticker = yf.Ticker(index_symbol)
             hist = ticker.history(period='5d')
             if len(hist) >= 2:
-                prev = hist['Close'].iloc[-2]
-                curr = hist['Close'].iloc[-1]
+                prev, curr = hist['Close'].iloc[-2], hist['Close'].iloc[-1]
                 pct = round(((curr - prev) / prev) * 100, 2)
                 sector_pct_cache[sector_name] = pct
                 return pct
-        except:
-            pass
+        except: pass
         sector_pct_cache[sector_name] = None
         return None
     
@@ -1389,41 +1398,39 @@ def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) 
         symbol = row.get('Symbol', '')
         ltp = row.get('LTP', None)
         
-        if ltp is None or ltp == 0:
-            continue
+        if ltp is None or ltp == 0: continue
         
-        prev_close = get_prev_close_yf(symbol)
-        if prev_close is None or prev_close == 0:
-            continue
+        # 1. Fetch History ONCE
+        hist = get_stock_history(symbol)
+        
+        # 2. Extract Data from History
+        prev_close = get_prev_close_from_hist(hist)
+        daily_vol = get_volatility_from_hist(hist)
+        
+        if prev_close is None or prev_close == 0: continue
         
         stock_pct = round(((ltp - prev_close) / prev_close) * 100, 2)
         sector = get_sector_label(symbol)
         sector_pct = get_sector_pct_yf(sector)
         
-        if sector_pct is None:
-            continue
+        if sector_pct is None: continue
         
-        if side == 'BULLISH':
-            if stock_pct <= sector_pct:
-                continue
-        else:
-            if stock_pct >= sector_pct:
-                continue
+        # Filter Logic
+        if side == 'BULLISH' and stock_pct <= sector_pct: continue
+        if side == 'BEARISH' and stock_pct >= sector_pct: continue
         
         source = row.get('Source', 'FIRSTRUN')
         prev_intra = row.get('PrevIntraRank', None)
         
-        if source == 'FIRSTRUN':
-            status = 'First Run'
-        elif prev_intra is not None:
-            status = 'Updated'
-        else:
-            status = 'New'
+        if source == 'FIRSTRUN': status = 'First Run'
+        elif prev_intra is not None: status = 'Updated'
+        else: status = 'New'
         
         rows.append({
             'Symbol': symbol,
             'Stock %Chg': f"{stock_pct:+.2f}%",
             'Sector %Chg': f"{sector_pct:+.2f}%",
+            'Avg Daily Vol': f"{daily_vol:.2f}%" if daily_vol is not None else "NA",
             'Sector': sector,
             'Runtime': row.get('runtime', ''),
             'Status': status,
@@ -1432,15 +1439,14 @@ def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) 
         })
     
     df_out = pd.DataFrame(rows)
-    if df_out.empty:
-        return pd.DataFrame(columns=out_cols)
+    if df_out.empty: return pd.DataFrame(columns=out_cols)
     
+    # Sort by numeric stock change (helper column)
     df_out['_sort'] = df_out['Stock %Chg'].str.replace('%', '').astype(float)
     df_out = df_out.sort_values('_sort', ascending=(side == 'BEARISH'))
-    df_out = df_out.drop('_sort', axis=1)
     
+    # Return finalized columns
     return df_out[out_cols].head(10).reset_index(drop=True)
-
 
         
 def send_email_rank_watchlist(csv_filename: str) -> bool:
