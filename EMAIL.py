@@ -31,6 +31,7 @@ OUTPUT: asit_intraday_greeks_v3_0_[timestamp].csv
 """
 
 import configparser
+import yfinance as yf
 import pandas as pd
 from fyers_apiv3 import fyersModel
 from datetime import datetime, timedelta, time
