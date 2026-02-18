@@ -1587,8 +1587,8 @@ def send_email_rank_watchlist(csv_filename: str) -> bool:
 
     # --- Convert to display tables (sorted by Diff, top 10) 
 
-    bull_display = build_display_df(bull_all, 'BULLISH', sectormap=sector_map)
-    bear_display = build_display_df(bear_all, 'BEARISH', sectormap=sector_map)
+    bull_display = build_display_df(bull_all, 'BULLISH', sector_map=sector_map)
+    bear_display = build_display_df(bear_all, 'BEARISH', sector_map=sector_map)
 
     # --- Generate HTML tables ---
     if bull_display.empty:
