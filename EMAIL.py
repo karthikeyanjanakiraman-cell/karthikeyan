@@ -1309,155 +1309,52 @@ def store_results_in_db(df):
 
 
 def build_display_df(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
-    """
-    Build display table for email side: 'BULLISH' or 'BEARISH'
-
-    Output columns:
-        Symbol | Latest Score | Prev Score | Diff | Runtime | Status |
-        ExitSignalsCount | ExitReason | TF_Dominants
-    """
-    base_cols = [
-        'Symbol',
-        'Latest Score',
-        'Prev Score',
-        'Diff',
-        'Runtime',
-        'Status',
-        'ExitSignalsCount',
-        'ExitReason',
-        'TF_Dominants',
-    ]
-
+    import yfinance as yf
+    
+    out_cols = ['Symbol', 'Stock %Chg', 'Sector %Chg', 'Sector', 'Runtime', 'Status', 'ExitSignalsCount', 'ExitReason']
     if df_side is None or df_side.empty:
-        return pd.DataFrame(columns=base_cols)
-
-    out_rows = []
-
-    for _, row in df_side.iterrows():
-        symbol = row.get('Symbol', '')
-
-        # Latest score from current run
-        latest_raw = row.get('RankScore15Tier', row.get('RankScore15Tier', 0.0))
+        return pd.DataFrame(columns=out_cols)
+    
+    SECTOR_IDX = {'Auto': '^CNXAUTO', 'Bank': '^NSEBANK', 'IT': '^CNXIT', 'Pharma': '^CNXPHARMA', 
+                  'Metal': '^CNXMETAL', 'FMCG': '^CNXFMCG', 'Energy': '^CNXENERGY'}
+    
+    def stock_pct(sym):
         try:
-            latest = float(latest_raw)
-        except Exception:
-            latest = 0.0
-
-        # Previous intraday extreme
-        prev_intra = row.get('PrevIntraRank', None)
-        runtime = row.get('runtime', '')
-        source = row.get('Source', 'FIRST_RUN')
-
-        # Exit info
-        exit_signals_count = row.get('ExitSignalsCount', 0)
-        exit_reason = row.get('ExitReason', 'UNKNOWN')
-
-        # Normalize previous score
-        if prev_intra is None or (isinstance(prev_intra, float) and pd.isna(prev_intra)):
-            prev_score = None
-        else:
-            try:
-                prev_score = float(prev_intra)
-            except Exception:
-                prev_score = None
-
-        # Calculate diff
-        if prev_score is None:
-            diff_val = None
-            abs_diff = None
-        else:
-            diff_val = latest - prev_score
-            abs_diff = abs(diff_val)
-
-        # STATUS TEXT
-        if source == "APPENDED" and prev_score is None:
-            status = "New Append"
-        elif source == "FIRST_RUN":
-            if diff_val is None or (abs_diff is not None and abs_diff < 1e-9):
-                status = "First no update"
-            else:
-                if side == "BULLISH":
-                    status = "First + Up" if diff_val > 0 else "First - Down"
-                else:
-                    status = "First Worse" if diff_val < 0 else "First - Better"
-        else:
-            # APPENDED with previous
-            if diff_val is None or (abs_diff is not None and abs_diff < 1e-9):
-                status = "Append no update"
-            else:
-                if side == "BULLISH":
-                    status = "Append + Up" if diff_val > 0 else "Append - Down"
-                else:
-                    status = "Append Worse" if diff_val < 0 else "Append - Better"
-
-        # String formatting
-        latest_str = f"{latest:.2f}"
-        prev_str = "NA" if prev_score is None else f"{prev_score:.2f}"
-
-        if diff_val is None or (abs_diff is not None and abs_diff < 1e-9):
-            diff_str = "0"
-        else:
-            sign = "+" if diff_val > 0 else ""
-            diff_str = f"{sign}{diff_val:.2f}"
-
-        # NEW: collect all timeframe DominantTrend values (from merged CSV+DB)
-        tf_cols = [
-            '5min_DominantTrend',
-            '15min_DominantTrend',
-            '1hour_DominantTrend',
-            '4hour_DominantTrend',
-            '1day_DominantTrend',
-        ]
-        tf_doms = []
-        for col in tf_cols:
-            val = row.get(col, None)
-            if isinstance(val, float) and pd.isna(val):
-                tf_doms.append("NA")
-            elif val is None:
-                tf_doms.append("NA")
-            else:
-                tf_doms.append(str(val))
-
-        tf_dominants_str = " | ".join(tf_doms)
-
-        out_rows.append({
-            'Symbol': symbol,
-            'Latest Score': latest_str,
-            'Prev Score': prev_str,
-            'Diff': diff_str,
-            'Runtime': runtime,
-            'Status': status,
-            'ExitSignalsCount': exit_signals_count,
-            'ExitReason': exit_reason,
-            'TF_Dominants': tf_dominants_str,
-        })
-
-    out_df = pd.DataFrame(out_rows)
-    if out_df.empty:
-        return out_df[base_cols]
-
-    # Sort by Diff (numeric), NOT by Latest Score
-    try:
-        out_df['Diff_numeric'] = pd.to_numeric(
-            out_df['Diff'].replace('NA', '0'),
-            errors='coerce'
-        ).fillna(0)
-
-        if side == "BEARISH":
-            # Bearish: most negative Diff first
-            out_df = out_df.sort_values('Diff_numeric', ascending=True).reset_index(drop=True)
-        else:
-            # Bullish: most positive Diff first
-            out_df = out_df.sort_values('Diff_numeric', ascending=False).reset_index(drop=True)
-
-        out_df = out_df.drop('Diff_numeric', axis=1)
-    except Exception as e:
-        logger.warning(f"[WARN] Sorting by Diff failed: {str(e)}")
-
-    # Top 10
-    out_df = out_df.head(10)
-    return out_df[base_cols]
-
+            t = yf.Ticker(sym.replace('NSE:','').replace('-EQ','')+'.NS')
+            h = t.history(period='2d')
+            return round(((h['Close'][-1] - h['Close'][-2]) / h['Close'][-2]) * 100, 2) if len(h) >= 2 else None
+        except: return None
+    
+    def sector_pct(sec):
+        for k in SECTOR_IDX:
+            if k.lower() in sec.lower():
+                try:
+                    t = yf.Ticker(SECTOR_IDX[k])
+                    h = t.history(period='2d')
+                    return round(((h['Close'][-1] - h['Close'][-2]) / h['Close'][-2]) * 100, 2) if len(h) >= 2 else None
+                except: return None
+        return None
+    
+    rows = []
+    for _, row in df_side.iterrows():
+        sym = row.get('Symbol', '')
+        spc = stock_pct(sym)
+        if spc is None: continue
+        
+        sec = str(sectormap.get(sym, 'Unknown')) if isinstance(sectormap, dict) else 'Unknown'
+        sepc = sector_pct(sec)
+        if sepc is None: continue
+        
+        if (side == 'BULLISH' and spc <= sepc) or (side == 'BEARISH' and spc >= sepc):
+            continue
+        
+        rows.append({'Symbol': sym, 'Stock %Chg': f"{spc:+.2f}%", 'Sector %Chg': f"{sepc:+.2f}%",
+                     'Sector': sec, 'Runtime': row.get('runtime',''), 'Status': 'Active',
+                     'ExitSignalsCount': row.get('ExitSignalsCount',0), 'ExitReason': row.get('ExitReason','')})
+    
+    df = pd.DataFrame(rows)
+    return df[out_cols].head(10) if not df.empty else pd.DataFrame(columns=out_cols)
+        
 def send_email_rank_watchlist(csv_filename: str) -> bool:
     """
     Single email with top 10 bullish/bearish sorted by Diff.
