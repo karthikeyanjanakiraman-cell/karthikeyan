@@ -1307,13 +1307,9 @@ def store_results_in_db(df):
 # EMAIL FUNCTIONS - FIXED VERSION (SINGLE EMAIL, SORTED BY DIFF, WITH EXIT COLUMNS)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 
-
-
-def build_display_df(df_side: pd.DataFrame, side: str, sectormap: dict = None) -> pd.DataFrame:
+def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) -> pd.DataFrame:
     """
     Hybrid: FYERS LTP + yfinance for prev_close and sector indices.
-    Stock %Chg = (FYERS LTP - yfinance prev_close) / prev_close * 100
-    Sector %Chg = yfinance sector index % change
     """
     import yfinance as yf
     
@@ -1322,7 +1318,6 @@ def build_display_df(df_side: pd.DataFrame, side: str, sectormap: dict = None) -
     if df_side is None or df_side.empty:
         return pd.DataFrame(columns=out_cols)
     
-    # Sector to Index mapping
     SECTOR_IDX = {
         'Auto': '^CNXAUTO', 'Automobile': '^CNXAUTO',
         'Bank': '^NSEBANK', 'Private Bank': '^NSEBANK', 'PSU Bank': '^CNXPSUBANK',
@@ -1336,7 +1331,6 @@ def build_display_df(df_side: pd.DataFrame, side: str, sectormap: dict = None) -
         'Infrastructure': '^CNXINFRA', 'Construction': '^CNXINFRA', 'Cement': '^CNXINFRA'
     }
     
-    # Caches
     prev_close_cache = {}
     sector_pct_cache = {}
     
@@ -1357,8 +1351,8 @@ def build_display_df(df_side: pd.DataFrame, side: str, sectormap: dict = None) -
         return None
     
     def get_sector_label(symbol: str) -> str:
-        if sectormap and isinstance(sectormap, dict):
-            sector = sectormap.get(symbol, 'Unknown')
+        if sector_map and isinstance(sector_map, dict):
+            sector = sector_map.get(symbol, 'Unknown')
             return str(sector).strip() if sector else 'Unknown'
         return 'Unknown'
     
@@ -1445,7 +1439,9 @@ def build_display_df(df_side: pd.DataFrame, side: str, sectormap: dict = None) -
     df_out = df_out.sort_values('_sort', ascending=(side == 'BEARISH'))
     df_out = df_out.drop('_sort', axis=1)
     
-    return df_out[out_cols].head(10).reset_index(drop=True) 
+    return df_out[out_cols].head(10).reset_index(drop=True)
+
+
         
 def send_email_rank_watchlist(csv_filename: str) -> bool:
     """
@@ -1591,8 +1587,8 @@ def send_email_rank_watchlist(csv_filename: str) -> bool:
 
     # --- Convert to display tables (sorted by Diff, top 10) 
 
-    bull_display = build_display_df(bull_all, 'BULLISH', sectormap=sectormap)
-    bear_display = build_display_df(bear_all, 'BEARISH', sectormap=sectormap)
+    bull_display = build_display_df(bull_all, 'BULLISH', sectormap=sector_map)
+    bear_display = build_display_df(bear_all, 'BEARISH', sectormap=sector_map)
 
     # --- Generate HTML tables ---
     if bull_display.empty:
