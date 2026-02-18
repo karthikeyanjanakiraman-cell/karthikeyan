@@ -1308,44 +1308,7 @@ def store_results_in_db(df):
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 
 
-def build_display_df(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
-    import yfinance as yf
-    
-    out_cols = ['Symbol', 'Stock %Chg', 'Sector %Chg', 'Sector', 'Runtime', 'Status', 'ExitSignalsCount', 'ExitReason']
-    if df_side is None or df_side.empty:
-        return pd.DataFrame(columns=out_cols)
-    
-    SECTOR_IDX = {'Auto': '^CNXAUTO', 'Bank': '^NSEBANK', 'IT': '^CNXIT', 'Pharma': '^CNXPHARMA', 
-                  'Metal': '^CNXMETAL', 'FMCG': '^CNXFMCG', 'Energy': '^CNXENERGY'}
-    
-    def stock_pct(sym):
-        try:
-            t = yf.Ticker(sym.replace('NSE:','').replace('-EQ','')+'.NS')
-            h = t.history(period='2d')
-            return round(((h['Close'][-1] - h['Close'][-2]) / h['Close'][-2]) * 100, 2) if len(h) >= 2 else None
-        except: return None
-    
-    def sector_pct(sec):
-        for k in SECTOR_IDX:
-            if k.lower() in sec.lower():
-                try:
-                    t = yf.Ticker(SECTOR_IDX[k])
-                    h = t.history(period='2d')
-                    return round(((h['Close'][-1] - h['Close'][-2]) / h['Close'][-2]) * 100, 2) if len(h) >= 2 else None
-                except: return None
-        return None
-    
-    rows = []
-    for _, row in df_side.iterrows():
-        sym = row.get('Symbol', '')
-        spc = stock_pct(sym)
-        if spc is None: continue
-        
-        sec = str(sectormap.get(sym, 'Unknown')) if isinstance(sectormap, dict) else 'Unknown'
-        sepc = sector_pct(sec)
-        if sepc is None: continue
-        
-        if (side == 'BULLISH' and spc <= sepc) or (side == 'BEARISH' and spc >= sepc):
+if (side == 'BULLISH' and spc <= sepc) or (side == 'BEARISH' and spc >= sepc):
             continue
         
         rows.append({'Symbol': sym, 'Stock %Chg': f"{spc:+.2f}%", 'Sector %Chg': f"{sepc:+.2f}%",
@@ -1354,6 +1317,7 @@ def build_display_df(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
     
     df = pd.DataFrame(rows)
     return df[out_cols].head(10) if not df.empty else pd.DataFrame(columns=out_cols)
+        
         
 def send_email_rank_watchlist(csv_filename: str) -> bool:
     """
