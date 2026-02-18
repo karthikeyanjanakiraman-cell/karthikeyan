@@ -1308,15 +1308,162 @@ def store_results_in_db(df):
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 
 
-if (side == 'BULLISH' and spc <= sepc) or (side == 'BEARISH' and spc >= sepc):
+def build_display_df(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
+    """
+    Hybrid approach: FYERS LTP + yfinance for prev_close and sector indices.
+    Stock %Chg = (FYERS LTP - yfinance prev_close) / prev_close * 100
+    Sector %Chg = yfinance sector index % change
+    """
+    import yfinance as yf
+    
+    out_cols = ['Symbol', 'Stock %Chg', 'Sector %Chg', 'Sector', 'Runtime', 'Status', 'ExitSignalsCount', 'ExitReason']
+    
+    if df_side is None or df_side.empty:
+        return pd.DataFrame(columns=out_cols)
+    
+    # Sector to Index mapping
+    SECTOR_IDX = {
+        'Auto': '^CNXAUTO', 'Automobile': '^CNXAUTO',
+        'Bank': '^NSEBANK', 'Private Bank': '^NSEBANK', 'PSU Bank': '^CNXPSUBANK',
+        'IT': '^CNXIT', 'Software': '^CNXIT', 'Information Technology': '^CNXIT',
+        'Pharma': '^CNXPHARMA', 'Healthcare': '^CNXPHARMA',
+        'Metal': '^CNXMETAL',
+        'FMCG': '^CNXFMCG', 'Consumer': '^CNXFMCG',
+        'Energy': '^CNXENERGY', 'Oil & Gas': '^CNXENERGY', 'Power': '^CNXENERGY',
+        'Realty': '^CNXREALTY', 'Real Estate': '^CNXREALTY',
+        'Media': '^CNXMEDIA',
+        'Infrastructure': '^CNXINFRA', 'Construction': '^CNXINFRA', 'Cement': '^CNXINFRA'
+    }
+    
+    # Caches
+    prev_close_cache = {}
+    sector_pct_cache = {}
+    
+    def get_prev_close_yf(symbol: str) -> float:
+        """Get previous close from yfinance"""
+        if symbol in prev_close_cache:
+            return prev_close_cache[symbol]
+        
+        try:
+            yf_symbol = symbol.replace('NSE:', '').replace('-EQ', '') + '.NS'
+            ticker = yf.Ticker(yf_symbol)
+            hist = ticker.history(period='5d')
+            
+            if len(hist) >= 2:
+                prev_close = float(hist['Close'].iloc[-2])
+                prev_close_cache[symbol] = prev_close
+                return prev_close
+        except:
+            pass
+        
+        prev_close_cache[symbol] = None
+        return None
+    
+    def get_sector_label(symbol: str) -> str:
+        """Get sector from sectormap"""
+        if isinstance(sectormap, dict):
+            sector = sectormap.get(symbol, 'Unknown')
+            return str(sector).strip() if sector else 'Unknown'
+        return 'Unknown'
+    
+    def get_sector_pct_yf(sector_name: str) -> float:
+        """Get sector index % change from yfinance"""
+        if sector_name in sector_pct_cache:
+            return sector_pct_cache[sector_name]
+        
+        # Find matching index
+        index_symbol = None
+        for key, idx in SECTOR_IDX.items():
+            if key.lower() in sector_name.lower():
+                index_symbol = idx
+                break
+        
+        if not index_symbol:
+            index_symbol = '^NSEI'  # Default to NIFTY 50
+        
+        try:
+            ticker = yf.Ticker(index_symbol)
+            hist = ticker.history(period='5d')
+            
+            if len(hist) >= 2:
+                prev = hist['Close'].iloc[-2]
+                curr = hist['Close'].iloc[-1]
+                pct = round(((curr - prev) / prev) * 100, 2)
+                sector_pct_cache[sector_name] = pct
+                return pct
+        except:
+            pass
+        
+        sector_pct_cache[sector_name] = None
+        return None
+    
+    # Build output rows
+    rows = []
+    
+    for _, row in df_side.iterrows():
+        symbol = row.get('Symbol', '')
+        
+        # Get FYERS LTP (real-time from your script)
+        ltp = row.get('LTP', None)
+        if ltp is None or ltp == 0:
             continue
         
-        rows.append({'Symbol': sym, 'Stock %Chg': f"{spc:+.2f}%", 'Sector %Chg': f"{sepc:+.2f}%",
-                     'Sector': sec, 'Runtime': row.get('runtime',''), 'Status': 'Active',
-                     'ExitSignalsCount': row.get('ExitSignalsCount',0), 'ExitReason': row.get('ExitReason','')})
+        # Get yfinance previous close
+        prev_close = get_prev_close_yf(symbol)
+        if prev_close is None or prev_close == 0:
+            continue
+        
+        # Calculate stock % change
+        stock_pct = round(((ltp - prev_close) / prev_close) * 100, 2)
+        
+        # Get sector and sector % change
+        sector = get_sector_label(symbol)
+        sector_pct = get_sector_pct_yf(sector)
+        
+        if sector_pct is None:
+            continue
+        
+        # Apply filter
+        if side == 'BULLISH':
+            if stock_pct <= sector_pct:  # Must outperform
+                continue
+        else:  # BEARISH
+            if stock_pct >= sector_pct:  # Must underperform
+                continue
+        
+        # Build status
+        source = row.get('Source', 'FIRSTRUN')
+        prev_intra = row.get('PrevIntraRank', None)
+        
+        if source == 'FIRSTRUN':
+            status = 'First Run'
+        elif prev_intra is not None:
+            status = 'Updated'
+        else:
+            status = 'New'
+        
+        rows.append({
+            'Symbol': symbol,
+            'Stock %Chg': f"{stock_pct:+.2f}%",
+            'Sector %Chg': f"{sector_pct:+.2f}%",
+            'Sector': sector,
+            'Runtime': row.get('runtime', ''),
+            'Status': status,
+            'ExitSignalsCount': row.get('ExitSignalsCount', 0),
+            'ExitReason': row.get('ExitReason', 'NONE')
+        })
     
-    df = pd.DataFrame(rows)
-    return df[out_cols].head(10) if not df.empty else pd.DataFrame(columns=out_cols)
+    df_out = pd.DataFrame(rows)
+    
+    if df_out.empty:
+        return pd.DataFrame(columns=out_cols)
+    
+    # Sort
+    df_out['_sort'] = df_out['Stock %Chg'].str.replace('%', '').astype(float)
+    df_out = df_out.sort_values('_sort', ascending=(side == 'BEARISH'))
+    df_out = df_out.drop('_sort', axis=1)
+    
+    return df_out[out_cols].head(10).reset_index(drop=True)
         
         
 def send_email_rank_watchlist(csv_filename: str) -> bool:
