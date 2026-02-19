@@ -1307,22 +1307,21 @@ def store_results_in_db(df):
 # EMAIL FUNCTIONS - FIXED VERSION (SINGLE EMAIL, SORTED BY DIFF, WITH EXIT COLUMNS) 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 
-
 def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) -> pd.DataFrame:
     """
-    Hybrid: FYERS LTP + yfinance.
-    - Status column REMOVED.
-    - Sorted by VOL SHOCK (Descending).
+    State-of-the-Art Ranking: "Work Done per Unit of Energy" (Wyckoff Efficiency).
+    - Filters out 'Churning' (High Vol, No Move).
+    - Ranks by 'Total Power' (Price^2 * Volume) for high-quality movers.
     """
     import yfinance as yf
     import numpy as np
     
-    # 1. Removed 'Status' from output columns
-    out_cols = ['Symbol', 'Stock %Chg', 'Sector %Chg', 'Avg Daily Vol', 'Vol Shock', 'Sector', 'Runtime', 'ExitSignalsCount', 'ExitReason']
+    out_cols = ['Symbol', 'Stock %Chg', 'Sector %Chg', 'Avg Daily Vol', 'Vol Shock', 'Efficiency', 'Score', 'Sector', 'Runtime', 'ExitSignalsCount', 'ExitReason']
     
     if df_side is None or df_side.empty:
         return pd.DataFrame(columns=out_cols)
     
+    # Sector Map
     SECTOR_IDX = {
         'Auto': '^CNXAUTO', 'Automobile': '^CNXAUTO',
         'Bank': '^NSEBANK', 'Private Bank': '^NSEBANK', 'PSU Bank': '^CNXPSUBANK',
@@ -1336,8 +1335,10 @@ def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) 
         'Infrastructure': '^CNXINFRA', 'Construction': '^CNXINFRA', 'Cement': '^CNXINFRA'
     }
     
+    # Caches
     history_cache = {} 
     sector_pct_cache = {}
+    intraday_cache = {} # Cache for 5m candles
     
     def get_yf_symbol(symbol):
         return symbol.replace('NSE:', '').replace('-EQ', '') + '.NS'
@@ -1352,26 +1353,33 @@ def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) 
         except:
             history_cache[symbol] = None
             return None
-    
-    def get_intraday_volume_shock(symbol: str) -> float:
+            
+    def get_intraday_data(symbol):
+        if symbol in intraday_cache: return intraday_cache[symbol]
         try:
             ticker = yf.Ticker(get_yf_symbol(symbol))
             intra = ticker.history(period='1d', interval='5m')
-            
-            if intra is None or len(intra) < 5: return None
-            
-            recent_vol = intra['Volume'].tail(3).mean()
-            baseline_vol = intra['Volume'].iloc[:-3].mean()
-            
-            if baseline_vol == 0 or np.isnan(baseline_vol):
-                hist = get_stock_history(symbol)
-                if hist is not None and not hist.empty:
-                    daily_vol = hist['Volume'].iloc[-5:].mean()
-                    baseline_vol = daily_vol / 75 
+            intraday_cache[symbol] = intra
+            return intra
+        except:
+            intraday_cache[symbol] = None
+            return None
+    
+    def get_intraday_volume_shock(symbol: str) -> float:
+        intra = get_intraday_data(symbol)
+        if intra is None or len(intra) < 5: return None
+        
+        recent_vol = intra['Volume'].tail(3).mean()
+        baseline_vol = intra['Volume'].iloc[:-3].mean()
+        
+        if baseline_vol == 0 or np.isnan(baseline_vol):
+            hist = get_stock_history(symbol)
+            if hist is not None and not hist.empty:
+                daily_vol = hist['Volume'].iloc[-5:].mean()
+                baseline_vol = daily_vol / 75 
 
-            if baseline_vol == 0 or recent_vol == 0: return None
-            return round(recent_vol / baseline_vol, 2)
-        except: return None
+        if baseline_vol == 0 or recent_vol == 0: return None
+        return round(recent_vol / baseline_vol, 2)
 
     def get_prev_close_from_hist(hist) -> float:
         if hist is not None and not hist.empty and len(hist) >= 2:
@@ -1418,7 +1426,10 @@ def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) 
         
         if ltp is None or ltp == 0: continue
         
+        # 1. Fetch Data
         hist = get_stock_history(symbol)
+        intra = get_intraday_data(symbol)
+        
         prev_close = get_prev_close_from_hist(hist)
         daily_vol = get_volatility_from_hist(hist)
         vol_shock = get_intraday_volume_shock(symbol) 
@@ -1431,22 +1442,56 @@ def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) 
         
         if sector_pct is None: continue
         
+        # 2. CALCULATE WYCKOFF EFFICIENCY (Work / Energy)
+        # Work = Price Range (High - Low)
+        # Energy = Volume
+        efficiency_ratio = 1.0 # Default
+        
+        if intra is not None and not intra.empty:
+            # Total Work Today
+            day_high = intra['High'].max()
+            day_low = intra['Low'].min()
+            work = (day_high - day_low) / day_low * 100 # % Range
+            
+            # Total Energy Today (Relative to Avg)
+            energy = vol_shock if vol_shock else 1.0
+            
+            # Efficiency = Work / Energy
+            # High Eff (> 1.0) = Easy Move (Good)
+            # Low Eff (< 0.5) = Churning (Bad)
+            if energy > 0:
+                efficiency_ratio = work / energy
+        
+        # 3. FILTER LOGIC
+        # Filter out "Churning" stocks (High Vol, No Move)
+        # HDFCLIFE: Work 0.5% / Energy 10x = 0.05 Efficiency (REJECTED)
+        # OIL: Work 5% / Energy 3x = 1.6 Efficiency (ACCEPTED)
+        
+        is_efficient = efficiency_ratio > 0.2 # Bare minimum threshold
+        
         normal_pass = (
             (side == 'BULLISH' and stock_pct > sector_pct) or 
             (side == 'BEARISH' and stock_pct < sector_pct)
         )
         
-        shock_pass = (vol_shock is not None and vol_shock >= 2.5)
-        decoupling_pass = (side == 'BULLISH' and stock_pct > 0.5 and sector_pct < -0.2)
-        
-        if not (normal_pass or shock_pass or decoupling_pass):
+        # Only allow stocks that are moving efficiently OR beating sector
+        if not (is_efficient or normal_pass):
             continue
+        
+        # 4. SCORING LOGIC (Power Score)
+        # Score = (Price^2) * Volume * Efficiency
+        # We multiply by Efficiency to boost "Clean Movers" and punish "Messy Movers"
+        stock_pct_abs = abs(stock_pct)
+        vol_val = vol_shock if vol_shock else 1.0
+        
+        # Final Score Formula:
+        # (Price^2 * Volume) * Efficiency
+        # This is (Price^2 * Volume) * (Price / Volume) = Price^3
+        # Essentially, Price becomes the CUBED factor. Extreme focus on price movement.
+        power_score = (stock_pct_abs ** 2) * vol_val * efficiency_ratio
         
         exit_signals = row.get('ExitSignalsCount', 0)
         exit_reason = row.get('ExitReason', 'NONE')
-
-        if vol_shock and vol_shock >= 3.0 and exit_signals > 0:
-            exit_reason = f"Override ({exit_reason})" 
         
         rows.append({
             'Symbol': symbol,
@@ -1454,6 +1499,8 @@ def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) 
             'Sector %Chg': f"{sector_pct:+.2f}%",
             'Avg Daily Vol': f"{daily_vol:.2f}%" if daily_vol is not None else "NA",
             'Vol Shock': f"{vol_shock:.1f}x" if vol_shock is not None else "NA",
+            'Efficiency': f"{efficiency_ratio:.2f}",
+            'Score': f"{power_score:.1f}",
             'Sector': sector,
             'Runtime': row.get('runtime', ''),
             'ExitSignalsCount': exit_signals,
@@ -1463,17 +1510,16 @@ def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) 
     df_out = pd.DataFrame(rows)
     if df_out.empty: return pd.DataFrame(columns=out_cols)
     
-    # 2. Sort by VOL SHOCK (Descending)
-    # Extract numeric value from "3.1x" string
-    df_out['_vol_sort'] = df_out['Vol Shock'].astype(str).str.replace('x', '').replace('NA', '0').astype(float)
+    # 5. SORT BY SCORE (Descending)
+    df_out['_score_sort'] = pd.to_numeric(df_out['Score'], errors='coerce').fillna(0)
+    df_out = df_out.sort_values('_score_sort', ascending=False)
     
-    # Secondary sort: Absolute Stock %Chg
-    df_out['_pct_sort'] = df_out['Stock %Chg'].str.replace('%', '').astype(float).abs()
-    
-    # Sort: Primary = Vol Shock (Desc), Secondary = Price Move (Desc)
-    df_out = df_out.sort_values(['_vol_sort', '_pct_sort'], ascending=[False, False])
-    
+    # Drop helper
+    df_out = df_out.drop('_score_sort', axis=1)
+
     return df_out[out_cols].head(10).reset_index(drop=True)
+
+
 
         
 def send_email_rank_watchlist(csv_filename: str) -> bool:
