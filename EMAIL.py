@@ -1304,27 +1304,25 @@ def store_results_in_db(df):
     logger.info(f"[DB] Stored {len(df_store)} rows at {runtime_str}")
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# EMAIL FUNCTIONS - FIXED VERSION (SINGLE EMAIL, SORTED BY DIFF, WITH EXIT COLUMNS)
+# EMAIL FUNCTIONS - FIXED VERSION (SINGLE EMAIL, SORTED BY DIFF, WITH EXIT COLUMNS) 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
+
 
 def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) -> pd.DataFrame:
     """
-    Hybrid: FYERS LTP + yfinance for prev_close, sector indices, volatility, and Volume Shock.
-    Features:
-    - Avg Daily Vol: 3-month volatility
-    - Vol Shock: Real-time volume surge vs. average
-    - Gap Up/Down handling for morning breakouts
+    Hybrid: FYERS LTP + yfinance.
+    - Status column REMOVED.
+    - Sorted by VOL SHOCK (Descending).
     """
     import yfinance as yf
     import numpy as np
     
-    # 1. Add "Vol Shock" to output columns
-    out_cols = ['Symbol', 'Stock %Chg', 'Sector %Chg', 'Avg Daily Vol', 'Vol Shock', 'Sector', 'Runtime', 'Status', 'ExitSignalsCount', 'ExitReason']
+    # 1. Removed 'Status' from output columns
+    out_cols = ['Symbol', 'Stock %Chg', 'Sector %Chg', 'Avg Daily Vol', 'Vol Shock', 'Sector', 'Runtime', 'ExitSignalsCount', 'ExitReason']
     
     if df_side is None or df_side.empty:
         return pd.DataFrame(columns=out_cols)
     
-    # Sector to Index mapping
     SECTOR_IDX = {
         'Auto': '^CNXAUTO', 'Automobile': '^CNXAUTO',
         'Bank': '^NSEBANK', 'Private Bank': '^NSEBANK', 'PSU Bank': '^CNXPSUBANK',
@@ -1338,7 +1336,6 @@ def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) 
         'Infrastructure': '^CNXINFRA', 'Construction': '^CNXINFRA', 'Cement': '^CNXINFRA'
     }
     
-    # Caches
     history_cache = {} 
     sector_pct_cache = {}
     
@@ -1346,11 +1343,9 @@ def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) 
         return symbol.replace('NSE:', '').replace('-EQ', '') + '.NS'
 
     def get_stock_history(symbol: str):
-        """Fetch 3mo history once and cache it"""
         if symbol in history_cache: return history_cache[symbol]
         try:
             ticker = yf.Ticker(get_yf_symbol(symbol))
-            # 3mo for daily stats
             hist = ticker.history(period='3mo')
             history_cache[symbol] = hist
             return hist
@@ -1359,40 +1354,24 @@ def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) 
             return None
     
     def get_intraday_volume_shock(symbol: str) -> float:
-        """
-        Calculate Volume Shock Ratio (Current vs Average)
-        Returns: Multiplier (e.g., 2.5 = Volume is 2.5x normal)
-        """
         try:
             ticker = yf.Ticker(get_yf_symbol(symbol))
-            # Get today's 5-minute candles to check immediate flow
             intra = ticker.history(period='1d', interval='5m')
             
-            if intra is None or len(intra) < 5:
-                return None
+            if intra is None or len(intra) < 5: return None
             
-            # Volume of last 3 candles (15 mins)
             recent_vol = intra['Volume'].tail(3).mean()
-            
-            # Average volume of earlier part of day (baseline)
             baseline_vol = intra['Volume'].iloc[:-3].mean()
             
-            # If start of day (first 15 mins), use yesterday's average 5m vol as baseline
             if baseline_vol == 0 or np.isnan(baseline_vol):
                 hist = get_stock_history(symbol)
                 if hist is not None and not hist.empty:
                     daily_vol = hist['Volume'].iloc[-5:].mean()
-                    # Approx 5-min vol = Daily Vol / 75 candles
                     baseline_vol = daily_vol / 75 
 
-            if baseline_vol == 0 or recent_vol == 0:
-                return None
-            
-            # Ratio
-            shock_ratio = recent_vol / baseline_vol
-            return round(shock_ratio, 2)
-        except:
-            return None
+            if baseline_vol == 0 or recent_vol == 0: return None
+            return round(recent_vol / baseline_vol, 2)
+        except: return None
 
     def get_prev_close_from_hist(hist) -> float:
         if hist is not None and not hist.empty and len(hist) >= 2:
@@ -1439,11 +1418,10 @@ def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) 
         
         if ltp is None or ltp == 0: continue
         
-        # 1. Fetch data
         hist = get_stock_history(symbol)
         prev_close = get_prev_close_from_hist(hist)
         daily_vol = get_volatility_from_hist(hist)
-        vol_shock = get_intraday_volume_shock(symbol) # <--- New Logic
+        vol_shock = get_intraday_volume_shock(symbol) 
         
         if prev_close is None or prev_close == 0: continue
         
@@ -1453,48 +1431,31 @@ def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) 
         
         if sector_pct is None: continue
         
-        # 2. Enhanced Filter Logic (Includes Vol Shock override)
-        # Normal check: Stock vs Sector
-        normal_pass = (side == 'BULLISH' and stock_pct > sector_pct) or \
-                      (side == 'BEARISH' and stock_pct < sector_pct)
+        normal_pass = (
+            (side == 'BULLISH' and stock_pct > sector_pct) or 
+            (side == 'BEARISH' and stock_pct < sector_pct)
+        )
         
-        # Override check: Massive Volume Shock (> 2.5x) allows entry even if sector is weak
         shock_pass = (vol_shock is not None and vol_shock >= 2.5)
-        
-        # Decoupling check: Stock Green while Sector Red (Bullish)
         decoupling_pass = (side == 'BULLISH' and stock_pct > 0.5 and sector_pct < -0.2)
         
         if not (normal_pass or shock_pass or decoupling_pass):
             continue
         
-        source = row.get('Source', 'FIRSTRUN')
-        prev_intra = row.get('PrevIntraRank', None)
         exit_signals = row.get('ExitSignalsCount', 0)
         exit_reason = row.get('ExitReason', 'NONE')
 
-        # 3. Status Definition
-        status = "New"
-        if vol_shock and vol_shock >= 3.0:
-            status = "🔥 VOL SHOCK"
-            # If huge volume, we ignore minor exit signals (like MACD lag)
-            if exit_signals > 0:
-                exit_reason = f"Override ({exit_reason})" 
-        elif decoupling_pass:
-            status = "💪 Decoupling"
-        elif source == 'FIRSTRUN':
-            status = "First Run"
-        elif prev_intra is not None:
-            status = "Updated"
+        if vol_shock and vol_shock >= 3.0 and exit_signals > 0:
+            exit_reason = f"Override ({exit_reason})" 
         
         rows.append({
             'Symbol': symbol,
             'Stock %Chg': f"{stock_pct:+.2f}%",
             'Sector %Chg': f"{sector_pct:+.2f}%",
             'Avg Daily Vol': f"{daily_vol:.2f}%" if daily_vol is not None else "NA",
-            'Vol Shock': f"{vol_shock:.1f}x" if vol_shock is not None else "NA", # <--- New Column Data
+            'Vol Shock': f"{vol_shock:.1f}x" if vol_shock is not None else "NA",
             'Sector': sector,
             'Runtime': row.get('runtime', ''),
-            'Status': status,
             'ExitSignalsCount': exit_signals,
             'ExitReason': exit_reason
         })
@@ -1502,14 +1463,15 @@ def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) 
     df_out = pd.DataFrame(rows)
     if df_out.empty: return pd.DataFrame(columns=out_cols)
     
-    # Sort: Prioritize "Vol Shock" status, then Stock %Chg
-    df_out['_sort'] = df_out['Stock %Chg'].str.replace('%', '').astype(float)
+    # 2. Sort by VOL SHOCK (Descending)
+    # Extract numeric value from "3.1x" string
+    df_out['_vol_sort'] = df_out['Vol Shock'].astype(str).str.replace('x', '').replace('NA', '0').astype(float)
     
-    # Custom sort: Put 'VOL SHOCK' at top
-    df_out['_status_score'] = df_out['Status'].apply(lambda s: 100 if 'VOL' in s else 0)
-    df_out['_final_sort'] = df_out['_status_score'] + df_out['_sort'].abs()
+    # Secondary sort: Absolute Stock %Chg
+    df_out['_pct_sort'] = df_out['Stock %Chg'].str.replace('%', '').astype(float).abs()
     
-    df_out = df_out.sort_values('_final_sort', ascending=False)
+    # Sort: Primary = Vol Shock (Desc), Secondary = Price Move (Desc)
+    df_out = df_out.sort_values(['_vol_sort', '_pct_sort'], ascending=[False, False])
     
     return df_out[out_cols].head(10).reset_index(drop=True)
 
