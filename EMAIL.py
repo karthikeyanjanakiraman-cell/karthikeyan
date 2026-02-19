@@ -1309,16 +1309,22 @@ def store_results_in_db(df):
 
 def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) -> pd.DataFrame:
     """
-    Hybrid: FYERS LTP + yfinance for prev_close, sector indices, and volatility.
-    Adds 'Avg Daily Vol' column. Optimized to fetch YF data only once per symbol.
+    Hybrid: FYERS LTP + yfinance for prev_close, sector indices, volatility, and Volume Shock.
+    Features:
+    - Avg Daily Vol: 3-month volatility
+    - Vol Shock: Real-time volume surge vs. average
+    - Gap Up/Down handling for morning breakouts
     """
     import yfinance as yf
+    import numpy as np
     
-    out_cols = ['Symbol', 'Stock %Chg', 'Sector %Chg', 'Avg Daily Vol', 'Sector', 'Runtime', 'Status', 'ExitSignalsCount', 'ExitReason']
+    # 1. Add "Vol Shock" to output columns
+    out_cols = ['Symbol', 'Stock %Chg', 'Sector %Chg', 'Avg Daily Vol', 'Vol Shock', 'Sector', 'Runtime', 'Status', 'ExitSignalsCount', 'ExitReason']
     
     if df_side is None or df_side.empty:
         return pd.DataFrame(columns=out_cols)
     
+    # Sector to Index mapping
     SECTOR_IDX = {
         'Auto': '^CNXAUTO', 'Automobile': '^CNXAUTO',
         'Bank': '^NSEBANK', 'Private Bank': '^NSEBANK', 'PSU Bank': '^CNXPSUBANK',
@@ -1332,8 +1338,7 @@ def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) 
         'Infrastructure': '^CNXINFRA', 'Construction': '^CNXINFRA', 'Cement': '^CNXINFRA'
     }
     
-    # Unified Cache: Store the whole history dataframe
-    # Key: Symbol, Value: DataFrame (history)
+    # Caches
     history_cache = {} 
     sector_pct_cache = {}
     
@@ -1345,22 +1350,56 @@ def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) 
         if symbol in history_cache: return history_cache[symbol]
         try:
             ticker = yf.Ticker(get_yf_symbol(symbol))
-            # Fetch 3mo to cover both prev_close (needs 5d) and volatility (needs 3mo)
+            # 3mo for daily stats
             hist = ticker.history(period='3mo')
             history_cache[symbol] = hist
             return hist
         except:
             history_cache[symbol] = None
             return None
+    
+    def get_intraday_volume_shock(symbol: str) -> float:
+        """
+        Calculate Volume Shock Ratio (Current vs Average)
+        Returns: Multiplier (e.g., 2.5 = Volume is 2.5x normal)
+        """
+        try:
+            ticker = yf.Ticker(get_yf_symbol(symbol))
+            # Get today's 5-minute candles to check immediate flow
+            intra = ticker.history(period='1d', interval='5m')
+            
+            if intra is None or len(intra) < 5:
+                return None
+            
+            # Volume of last 3 candles (15 mins)
+            recent_vol = intra['Volume'].tail(3).mean()
+            
+            # Average volume of earlier part of day (baseline)
+            baseline_vol = intra['Volume'].iloc[:-3].mean()
+            
+            # If start of day (first 15 mins), use yesterday's average 5m vol as baseline
+            if baseline_vol == 0 or np.isnan(baseline_vol):
+                hist = get_stock_history(symbol)
+                if hist is not None and not hist.empty:
+                    daily_vol = hist['Volume'].iloc[-5:].mean()
+                    # Approx 5-min vol = Daily Vol / 75 candles
+                    baseline_vol = daily_vol / 75 
+
+            if baseline_vol == 0 or recent_vol == 0:
+                return None
+            
+            # Ratio
+            shock_ratio = recent_vol / baseline_vol
+            return round(shock_ratio, 2)
+        except:
+            return None
 
     def get_prev_close_from_hist(hist) -> float:
-        """Extract prev close from cached history"""
         if hist is not None and not hist.empty and len(hist) >= 2:
             return float(hist['Close'].iloc[-2])
         return None
 
     def get_volatility_from_hist(hist) -> float:
-        """Calculate volatility from cached history"""
         if hist is not None and not hist.empty and len(hist) > 10:
             daily_returns = hist['Close'].pct_change()
             return round(daily_returns.std() * 100, 2)
@@ -1400,12 +1439,11 @@ def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) 
         
         if ltp is None or ltp == 0: continue
         
-        # 1. Fetch History ONCE
+        # 1. Fetch data
         hist = get_stock_history(symbol)
-        
-        # 2. Extract Data from History
         prev_close = get_prev_close_from_hist(hist)
         daily_vol = get_volatility_from_hist(hist)
+        vol_shock = get_intraday_volume_shock(symbol) # <--- New Logic
         
         if prev_close is None or prev_close == 0: continue
         
@@ -1415,37 +1453,64 @@ def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) 
         
         if sector_pct is None: continue
         
-        # Filter Logic
-        if side == 'BULLISH' and stock_pct <= sector_pct: continue
-        if side == 'BEARISH' and stock_pct >= sector_pct: continue
+        # 2. Enhanced Filter Logic (Includes Vol Shock override)
+        # Normal check: Stock vs Sector
+        normal_pass = (side == 'BULLISH' and stock_pct > sector_pct) or \
+                      (side == 'BEARISH' and stock_pct < sector_pct)
+        
+        # Override check: Massive Volume Shock (> 2.5x) allows entry even if sector is weak
+        shock_pass = (vol_shock is not None and vol_shock >= 2.5)
+        
+        # Decoupling check: Stock Green while Sector Red (Bullish)
+        decoupling_pass = (side == 'BULLISH' and stock_pct > 0.5 and sector_pct < -0.2)
+        
+        if not (normal_pass or shock_pass or decoupling_pass):
+            continue
         
         source = row.get('Source', 'FIRSTRUN')
         prev_intra = row.get('PrevIntraRank', None)
-        
-        if source == 'FIRSTRUN': status = 'First Run'
-        elif prev_intra is not None: status = 'Updated'
-        else: status = 'New'
+        exit_signals = row.get('ExitSignalsCount', 0)
+        exit_reason = row.get('ExitReason', 'NONE')
+
+        # 3. Status Definition
+        status = "New"
+        if vol_shock and vol_shock >= 3.0:
+            status = "🔥 VOL SHOCK"
+            # If huge volume, we ignore minor exit signals (like MACD lag)
+            if exit_signals > 0:
+                exit_reason = f"Override ({exit_reason})" 
+        elif decoupling_pass:
+            status = "💪 Decoupling"
+        elif source == 'FIRSTRUN':
+            status = "First Run"
+        elif prev_intra is not None:
+            status = "Updated"
         
         rows.append({
             'Symbol': symbol,
             'Stock %Chg': f"{stock_pct:+.2f}%",
             'Sector %Chg': f"{sector_pct:+.2f}%",
             'Avg Daily Vol': f"{daily_vol:.2f}%" if daily_vol is not None else "NA",
+            'Vol Shock': f"{vol_shock:.1f}x" if vol_shock is not None else "NA", # <--- New Column Data
             'Sector': sector,
             'Runtime': row.get('runtime', ''),
             'Status': status,
-            'ExitSignalsCount': row.get('ExitSignalsCount', 0),
-            'ExitReason': row.get('ExitReason', 'NONE')
+            'ExitSignalsCount': exit_signals,
+            'ExitReason': exit_reason
         })
     
     df_out = pd.DataFrame(rows)
     if df_out.empty: return pd.DataFrame(columns=out_cols)
     
-    # Sort by numeric stock change (helper column)
+    # Sort: Prioritize "Vol Shock" status, then Stock %Chg
     df_out['_sort'] = df_out['Stock %Chg'].str.replace('%', '').astype(float)
-    df_out = df_out.sort_values('_sort', ascending=(side == 'BEARISH'))
     
-    # Return finalized columns
+    # Custom sort: Put 'VOL SHOCK' at top
+    df_out['_status_score'] = df_out['Status'].apply(lambda s: 100 if 'VOL' in s else 0)
+    df_out['_final_sort'] = df_out['_status_score'] + df_out['_sort'].abs()
+    
+    df_out = df_out.sort_values('_final_sort', ascending=False)
+    
     return df_out[out_cols].head(10).reset_index(drop=True)
 
         
