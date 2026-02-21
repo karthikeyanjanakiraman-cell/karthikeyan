@@ -1359,102 +1359,107 @@ def append_hft_microstructure_targets(df):
 
 def build_display_df(df_side, side: str, sector_map: dict = None):
     """
-    Hybrid: FYERS LTP + yfinance for prev_close, sector indices, and volatility.
-    Adds High-Frequency Trading (HFT) Microstructure columns: LOB Vacuum, Toxicity, and Target %.
+    Hybrid: FYERS LTP + yfinance for prev_close and sector indices.
+    Outputs exact column layout including the pure physics Score and Efficiency.
     """
-    import numpy as np
+    import yfinance as yf
     import pandas as pd
 
-    # 1. Define the final columns you want to see in the HTML email body
+    # 1. Exact requested columns in the EXACT order you asked for
     out_cols = [
         'Symbol', 'Stock %Chg', 'Sector %Chg', 'Avg Daily Vol', 
-        'LOB Vacuum', 'Toxicity', 'Target %', 'Trade Signal',
-        'Sector', 'Runtime', 'Status', 'ExitSignalsCount', 'ExitReason'
+        'Vol Shock', 'Efficiency', 'Score', 'Sector', 'Runtime', 
+        'ExitSignalsCount', 'ExitReason'
     ]
     
     if df_side is None or df_side.empty:
         return pd.DataFrame(columns=out_cols)
     
-    df_out = df_side.copy()
+    out_rows = []
     
-    # ---------------------------------------------------------
-    # Safely convert percentage strings to floats for math
-    # ---------------------------------------------------------
-    if 'Stock %Chg' in df_out.columns and df_out['Stock %Chg'].dtype == object:
-        stock_chg_float = df_out['Stock %Chg'].str.replace('%', '').astype(float)
-    elif 'Stock %Chg' in df_out.columns:
-        stock_chg_float = df_out['Stock %Chg'].astype(float)
-    else:
-        stock_chg_float = pd.Series(0.0, index=df_out.index)
-
-    if 'Sector %Chg' in df_out.columns and df_out['Sector %Chg'].dtype == object:
-        sector_chg_float = df_out['Sector %Chg'].str.replace('%', '').astype(float)
-    elif 'Sector %Chg' in df_out.columns:
-        sector_chg_float = df_out['Sector %Chg'].astype(float)
-    else:
-        sector_chg_float = pd.Series(0.0, index=df_out.index)
+    # 2. Iterate through each stock to fetch yfinance data and build rows
+    for _, row in df_side.iterrows():
+        symbol = row.get('Symbol', '')
+        ltp = float(row.get('LTP', 0.0))
+        sector_name = row.get('Sector', 'Unknown')
         
-    # Safely handle Vol Shock and Efficiency
-    m = df_out.get('Vol_Shock', pd.Series(1.0, index=df_out.index)).astype(float)
-    eta = df_out.get('Efficiency', pd.Series(1.0, index=df_out.index)).astype(float)
+        # FYERS custom physics columns
+        m = float(row.get('Vol_Shock', 1.0))
+        eta = float(row.get('Efficiency', 1.0))
+        
+        # Strictly fetch the 'Score' column (ignoring RankScore)
+        score = row.get('Score', 0.0)
+        
+        runtime = row.get('Runtime', '')
+        exit_signals = row.get('ExitSignalsCount', 0)
+        exit_reason = row.get('ExitReason', 'NONE')
+        
+        yf_sym = symbol.replace('NSE:', '').replace('-EQ', '') + '.NS'
+        
+        stock_chg = 0.0
+        avg_daily_vol = 2.0  # Fallback
+        
+        # --- FETCH STOCK VOLATILITY & CHG ---
+        try:
+            hist = yf.download(yf_sym, period='3mo', progress=False)
+            if len(hist) > 1:
+                prev_close = float(hist['Close'].iloc[-2])
+                stock_chg = ((ltp - prev_close) / prev_close) * 100
+                
+                daily_returns = hist['Close'].pct_change().dropna()
+                avg_daily_vol = float(daily_returns.std() * 100)
+        except Exception:
+            pass
 
-    # Ensure Avg Daily Vol exists as a float for the HFT math
-    if 'Avg Daily Vol' in df_out.columns:
-        if df_out['Avg Daily Vol'].dtype == object:
-             sigma = df_out['Avg Daily Vol'].str.replace('%', '').astype(float)
-        else:
-             sigma = df_out['Avg Daily Vol'].astype(float)
-    else:
-        sigma = pd.Series(2.0, index=df_out.index) # Fallback
-        df_out['Avg Daily Vol'] = "2.00%"
+        # --- FETCH SECTOR CHG ---
+        sector_chg = 0.0
+        if sector_map and sector_name in sector_map:
+            sec_ticker = sector_map[sector_name]
+            try:
+                sec_hist = yf.download(sec_ticker, period='5d', progress=False)
+                if len(sec_hist) > 1:
+                    sec_prev_close = float(sec_hist['Close'].iloc[-2])
+                    sec_ltp = float(sec_hist['Close'].iloc[-1])
+                    sector_chg = ((sec_ltp - sec_prev_close) / sec_prev_close) * 100
+            except Exception:
+                pass
 
-    # =========================================================
-    # HFT MICROSTRUCTURE MATH (The Ultimate Stat)
-    # =========================================================
-    v = stock_chg_float.abs()
-
-    # 1. Limit Order Book (LOB) Vacuum
-    lob_vacuum = (sigma - v).clip(lower=0.0).round(2)
-    df_out['LOB Vacuum'] = lob_vacuum.astype(str) + "%"
-
-    # 2. Order Flow Toxicity (Absorption Trap Detection)
-    toxicity = (m / (eta + 1e-9)).round(2)
-    df_out['Toxicity'] = toxicity
-
-    # 3. StatArb Cointegration (Sector Trend Alignment)
-    # True if moving in the same direction, False if fighting the sector
-    stat_arb_safe = np.sign(stock_chg_float) == np.sign(sector_chg_float)
-
-    # 4. EXACT TARGET %
-    exact_target = np.where(
-        (lob_vacuum <= 0.01) | (toxicity > 1.5) | (~stat_arb_safe),
-        0.0,
-        (lob_vacuum * (eta / (m + 1e-9)))
-    ).round(2)
+        # --- FORMATTING EXACTLY AS REQUESTED ---
+        stock_chg_str = f"+{stock_chg:.2f}%" if stock_chg > 0 else f"{stock_chg:.2f}%"
+        sector_chg_str = f"+{sector_chg:.2f}%" if sector_chg > 0 else f"{sector_chg:.2f}%"
+        
+        # Handle formatting of Score (1 decimal place as requested)
+        try:
+            score_str = f"{float(score):.1f}"
+        except ValueError:
+            score_str = str(score)
+            
+        out_rows.append({
+            'Symbol': symbol,
+            'Stock %Chg': stock_chg_str,
+            'Sector %Chg': sector_chg_str,
+            'Avg Daily Vol': f"{avg_daily_vol:.2f}%",
+            'Vol Shock': f"{m:.1f}x",
+            'Efficiency': f"{eta:.2f}",
+            'Score': score_str,
+            'Sector': sector_name,
+            'Runtime': runtime,
+            'ExitSignalsCount': exit_signals,
+            'ExitReason': exit_reason,
+            '_score_sort': float(score) if isinstance(score, (int, float)) else 0.0
+        })
+        
+    # 3. Create DataFrame and Sort by Score (highest first)
+    df_out = pd.DataFrame(out_rows)
+    if df_out.empty:
+        return pd.DataFrame(columns=out_cols)
+        
+    df_out = df_out.sort_values(by='_score_sort', ascending=False)
     
-    # Add a "+" sign to make the target clear in the email
-    df_out['Target %'] = np.where(exact_target > 0, "+" + pd.Series(exact_target).astype(str) + "%", "0.0%")
-
-    # 5. Execution Signal
-    df_out['Trade Signal'] = np.where(
-        exact_target > 0, 
-        '🟢 EXECUTE', 
-        '🔴 AVOID'
-    )
-    # =========================================================
-
-    # Ensure all required output columns exist to prevent KeyError
-    for col in out_cols:
-        if col not in df_out.columns:
-            df_out[col] = "N/A"
-    
-    # Sort the dataframe so the executable trades are at the top of the email
-    df_out['_target_sort'] = exact_target
-    df_out = df_out.sort_values(by='_target_sort', ascending=False)
-    
-    # Return the formatted Top 10 with the new HFT columns
     return df_out[out_cols].head(10).reset_index(drop=True)
 
+
+    
         
 def send_email_rank_watchlist(csv_filename: str) -> bool:
     """
