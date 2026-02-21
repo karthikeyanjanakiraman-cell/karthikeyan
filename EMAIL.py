@@ -1307,6 +1307,56 @@ def store_results_in_db(df):
 # EMAIL FUNCTIONS - FIXED VERSION (SINGLE EMAIL, SORTED BY DIFF, WITH EXIT COLUMNS) 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 
+
+def append_hft_microstructure_targets(df):
+    """
+    Applies High-Frequency Trading (HFT) Market Microstructure math to the dataframe.
+    Calculates LOB Vacuum, Order Flow Toxicity, StatArb Safety, and an Exact Target %.
+    """
+    # Ensure we are not modifying a slice
+    df = df.copy()
+
+    # Physical Variable Mapping
+    v = df['Stock_Chg'].abs()
+    s_chg = df['Sector_Chg']
+    sigma = df['Avg_Daily_Vol']
+    m = df['Vol_Shock']
+    eta = df['Efficiency']
+
+    # 1. Limit Order Book (LOB) Vacuum
+    # The exact % of daily statistical distance remaining. If < 0, the wall is hit.
+    df['LOB_Vacuum_%'] = (sigma - v).clip(lower=0.0).round(2)
+
+    # 2. Order Flow Toxicity (Dark Pool Absorption)
+    # > 1.5 = Toxic (Institutions are absorbing aggressive market orders)
+    df['Toxicity_Ratio'] = (m / (eta + 1e-9)).round(2)
+
+    # 3. StatArb Cointegration (Mean Reversion Risk)
+    # True = Safe. False = High-frequency bots will fade the anomaly.
+    df['StatArb_Safe'] = np.sign(df['Stock_Chg']) == np.sign(s_chg)
+
+    # 4. EXACT TARGET %
+    # Target = LOB Vacuum * (Inverse Toxicity)
+    # Only valid if the stock has room, is non-toxic, and aligns with the sector.
+    df['Exact_Target_%'] = np.where(
+        (df['LOB_Vacuum_%'] <= 0.01) | (df['Toxicity_Ratio'] > 1.5) | (~df['StatArb_Safe']),
+        0.0,
+        (df['LOB_Vacuum_%'] * (eta / (m + 1e-9)))
+    ).round(2)
+
+    # 5. HFT Execution Signal (Text format for the email body)
+    df['Trade_Signal'] = np.where(
+        df['Exact_Target_%'] > 0, 
+        '🟢 EXECUTE: Target +' + df['Exact_Target_%'].astype(str) + '%', 
+        '🔴 AVOID: Microstructure Trap'
+    )
+    
+    # Optional: Sort the dataframe so the executable targets appear at the top of the email
+    df = df.sort_values(by='Exact_Target_%', ascending=False).reset_index(drop=True)
+
+    return df
+
+
 def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) -> pd.DataFrame:
     """
     State-of-the-Art Ranking: "Work Done per Unit of Energy" (Wyckoff Efficiency).
