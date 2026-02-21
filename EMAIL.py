@@ -1357,219 +1357,103 @@ def append_hft_microstructure_targets(df):
     return df
 
 
-def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) -> pd.DataFrame:
+def build_display_df(df_side, side: str, sector_map: dict = None):
     """
-    State-of-the-Art Ranking: "Work Done per Unit of Energy" (Wyckoff Efficiency).
-    - Filters out 'Churning' (High Vol, No Move).
-    - Ranks by 'Total Power' (Price^2 * Volume) for high-quality movers.
+    Hybrid: FYERS LTP + yfinance for prev_close, sector indices, and volatility.
+    Adds High-Frequency Trading (HFT) Microstructure columns: LOB Vacuum, Toxicity, and Target %.
     """
-    import yfinance as yf
     import numpy as np
-    
-    out_cols = ['Symbol', 'Stock %Chg', 'Sector %Chg', 'Avg Daily Vol', 'Vol Shock', 'Efficiency', 'Score', 'Sector', 'Runtime', 'ExitSignalsCount', 'ExitReason']
+    import pandas as pd
+
+    # 1. Define the final columns you want to see in the HTML email body
+    out_cols = [
+        'Symbol', 'Stock %Chg', 'Sector %Chg', 'Avg Daily Vol', 
+        'LOB Vacuum', 'Toxicity', 'Target %', 'Trade Signal',
+        'Sector', 'Runtime', 'Status', 'ExitSignalsCount', 'ExitReason'
+    ]
     
     if df_side is None or df_side.empty:
         return pd.DataFrame(columns=out_cols)
     
-    # Sector Map
-    SECTOR_IDX = {
-        'Auto': '^CNXAUTO', 'Automobile': '^CNXAUTO',
-        'Bank': '^NSEBANK', 'Private Bank': '^NSEBANK', 'PSU Bank': '^CNXPSUBANK',
-        'IT': '^CNXIT', 'Software': '^CNXIT', 'Information Technology': '^CNXIT',
-        'Pharma': '^CNXPHARMA', 'Healthcare': '^CNXPHARMA',
-        'Metal': '^CNXMETAL',
-        'FMCG': '^CNXFMCG', 'Consumer': '^CNXFMCG',
-        'Energy': '^CNXENERGY', 'Oil & Gas': '^CNXENERGY', 'Power': '^CNXENERGY',
-        'Realty': '^CNXREALTY', 'Real Estate': '^CNXREALTY',
-        'Media': '^CNXMEDIA',
-        'Infrastructure': '^CNXINFRA', 'Construction': '^CNXINFRA', 'Cement': '^CNXINFRA'
-    }
+    df_out = df_side.copy()
     
-    # Caches
-    history_cache = {} 
-    sector_pct_cache = {}
-    intraday_cache = {} # Cache for 5m candles
-    
-    def get_yf_symbol(symbol):
-        return symbol.replace('NSE:', '').replace('-EQ', '') + '.NS'
+    # ---------------------------------------------------------
+    # Safely convert percentage strings to floats for math
+    # ---------------------------------------------------------
+    if 'Stock %Chg' in df_out.columns and df_out['Stock %Chg'].dtype == object:
+        stock_chg_float = df_out['Stock %Chg'].str.replace('%', '').astype(float)
+    elif 'Stock %Chg' in df_out.columns:
+        stock_chg_float = df_out['Stock %Chg'].astype(float)
+    else:
+        stock_chg_float = pd.Series(0.0, index=df_out.index)
 
-    def get_stock_history(symbol: str):
-        if symbol in history_cache: return history_cache[symbol]
-        try:
-            ticker = yf.Ticker(get_yf_symbol(symbol))
-            hist = ticker.history(period='3mo')
-            history_cache[symbol] = hist
-            return hist
-        except:
-            history_cache[symbol] = None
-            return None
-            
-    def get_intraday_data(symbol):
-        if symbol in intraday_cache: return intraday_cache[symbol]
-        try:
-            ticker = yf.Ticker(get_yf_symbol(symbol))
-            intra = ticker.history(period='1d', interval='5m')
-            intraday_cache[symbol] = intra
-            return intra
-        except:
-            intraday_cache[symbol] = None
-            return None
-    
-    def get_intraday_volume_shock(symbol: str) -> float:
-        intra = get_intraday_data(symbol)
-        if intra is None or len(intra) < 5: return None
+    if 'Sector %Chg' in df_out.columns and df_out['Sector %Chg'].dtype == object:
+        sector_chg_float = df_out['Sector %Chg'].str.replace('%', '').astype(float)
+    elif 'Sector %Chg' in df_out.columns:
+        sector_chg_float = df_out['Sector %Chg'].astype(float)
+    else:
+        sector_chg_float = pd.Series(0.0, index=df_out.index)
         
-        recent_vol = intra['Volume'].tail(3).mean()
-        baseline_vol = intra['Volume'].iloc[:-3].mean()
-        
-        if baseline_vol == 0 or np.isnan(baseline_vol):
-            hist = get_stock_history(symbol)
-            if hist is not None and not hist.empty:
-                daily_vol = hist['Volume'].iloc[-5:].mean()
-                baseline_vol = daily_vol / 75 
+    # Safely handle Vol Shock and Efficiency
+    m = df_out.get('Vol_Shock', pd.Series(1.0, index=df_out.index)).astype(float)
+    eta = df_out.get('Efficiency', pd.Series(1.0, index=df_out.index)).astype(float)
 
-        if baseline_vol == 0 or recent_vol == 0: return None
-        return round(recent_vol / baseline_vol, 2)
+    # Ensure Avg Daily Vol exists as a float for the HFT math
+    if 'Avg Daily Vol' in df_out.columns:
+        if df_out['Avg Daily Vol'].dtype == object:
+             sigma = df_out['Avg Daily Vol'].str.replace('%', '').astype(float)
+        else:
+             sigma = df_out['Avg Daily Vol'].astype(float)
+    else:
+        sigma = pd.Series(2.0, index=df_out.index) # Fallback
+        df_out['Avg Daily Vol'] = "2.00%"
 
-    def get_prev_close_from_hist(hist) -> float:
-        if hist is not None and not hist.empty and len(hist) >= 2:
-            return float(hist['Close'].iloc[-2])
-        return None
+    # =========================================================
+    # HFT MICROSTRUCTURE MATH (The Ultimate Stat)
+    # =========================================================
+    v = stock_chg_float.abs()
 
-    def get_volatility_from_hist(hist) -> float:
-        if hist is not None and not hist.empty and len(hist) > 10:
-            daily_returns = hist['Close'].pct_change()
-            return round(daily_returns.std() * 100, 2)
-        return None
-    
-    def get_sector_label(symbol: str) -> str:
-        if sector_map and isinstance(sector_map, dict):
-            sector = sector_map.get(symbol, 'Unknown')
-            return str(sector).strip() if sector else 'Unknown'
-        return 'Unknown'
-    
-    def get_sector_pct_yf(sector_name: str) -> float:
-        if sector_name in sector_pct_cache: return sector_pct_cache[sector_name]
-        index_symbol = None
-        for key, idx in SECTOR_IDX.items():
-            if key.lower() in sector_name.lower():
-                index_symbol = idx
-                break
-        if not index_symbol: index_symbol = '^NSEI'
-        try:
-            ticker = yf.Ticker(index_symbol)
-            hist = ticker.history(period='5d')
-            if len(hist) >= 2:
-                prev, curr = hist['Close'].iloc[-2], hist['Close'].iloc[-1]
-                pct = round(((curr - prev) / prev) * 100, 2)
-                sector_pct_cache[sector_name] = pct
-                return pct
-        except: pass
-        sector_pct_cache[sector_name] = None
-        return None
-    
-    rows = []
-    
-    for _, row in df_side.iterrows():
-        symbol = row.get('Symbol', '')
-        ltp = row.get('LTP', None)
-        
-        if ltp is None or ltp == 0: continue
-        
-        # 1. Fetch Data
-        hist = get_stock_history(symbol)
-        intra = get_intraday_data(symbol)
-        
-        prev_close = get_prev_close_from_hist(hist)
-        daily_vol = get_volatility_from_hist(hist)
-        vol_shock = get_intraday_volume_shock(symbol) 
-        
-        if prev_close is None or prev_close == 0: continue
-        
-        stock_pct = round(((ltp - prev_close) / prev_close) * 100, 2)
-        sector = get_sector_label(symbol)
-        sector_pct = get_sector_pct_yf(sector)
-        
-        if sector_pct is None: continue
-        
-        # 2. CALCULATE WYCKOFF EFFICIENCY (Work / Energy)
-        # Work = Price Range (High - Low)
-        # Energy = Volume
-        efficiency_ratio = 1.0 # Default
-        
-        if intra is not None and not intra.empty:
-            # Total Work Today
-            day_high = intra['High'].max()
-            day_low = intra['Low'].min()
-            work = (day_high - day_low) / day_low * 100 # % Range
-            
-            # Total Energy Today (Relative to Avg)
-            energy = vol_shock if vol_shock else 1.0
-            
-            # Efficiency = Work / Energy
-            # High Eff (> 1.0) = Easy Move (Good)
-            # Low Eff (< 0.5) = Churning (Bad)
-            if energy > 0:
-                efficiency_ratio = work / energy
-        
-        # 3. FILTER LOGIC
-        # Filter out "Churning" stocks (High Vol, No Move)
-        # HDFCLIFE: Work 0.5% / Energy 10x = 0.05 Efficiency (REJECTED)
-        # OIL: Work 5% / Energy 3x = 1.6 Efficiency (ACCEPTED)
-        
-        is_efficient = efficiency_ratio > 0.2 # Bare minimum threshold
-        
-        normal_pass = (
-            (side == 'BULLISH' and stock_pct > sector_pct) or 
-            (side == 'BEARISH' and stock_pct < sector_pct)
-        )
-        
-        # Only allow stocks that are moving efficiently OR beating sector
-        if not (is_efficient or normal_pass):
-            continue
-        
-        # 4. SCORING LOGIC (Power Score)
-        # Score = (Price^2) * Volume * Efficiency
-        # We multiply by Efficiency to boost "Clean Movers" and punish "Messy Movers"
-        stock_pct_abs = abs(stock_pct)
-        vol_val = vol_shock if vol_shock else 1.0
-        
-        # Final Score Formula:
-        # (Price^2 * Volume) * Efficiency
-        # This is (Price^2 * Volume) * (Price / Volume) = Price^3
-        # Essentially, Price becomes the CUBED factor. Extreme focus on price movement.
-        power_score = (stock_pct_abs ** 2) * vol_val * efficiency_ratio
-        
-        exit_signals = row.get('ExitSignalsCount', 0)
-        exit_reason = row.get('ExitReason', 'NONE')
-        
-        rows.append({
-            'Symbol': symbol,
-            'Stock %Chg': f"{stock_pct:+.2f}%",
-            'Sector %Chg': f"{sector_pct:+.2f}%",
-            'Avg Daily Vol': f"{daily_vol:.2f}%" if daily_vol is not None else "NA",
-            'Vol Shock': f"{vol_shock:.1f}x" if vol_shock is not None else "NA",
-            'Efficiency': f"{efficiency_ratio:.2f}",
-            'Score': f"{power_score:.1f}",
-            'Sector': sector,
-            'Runtime': row.get('runtime', ''),
-            'ExitSignalsCount': exit_signals,
-            'ExitReason': exit_reason
-        })
-    
-    df_out = pd.DataFrame(rows)
-    if df_out.empty: return pd.DataFrame(columns=out_cols)
-    
-    # 5. SORT BY SCORE (Descending)
-    df_out['_score_sort'] = pd.to_numeric(df_out['Score'], errors='coerce').fillna(0)
-    df_out = df_out.sort_values('_score_sort', ascending=False)
-    
-    # Drop helper
-    df_out = df_out.drop('_score_sort', axis=1)
+    # 1. Limit Order Book (LOB) Vacuum
+    lob_vacuum = (sigma - v).clip(lower=0.0).round(2)
+    df_out['LOB Vacuum'] = lob_vacuum.astype(str) + "%"
 
+    # 2. Order Flow Toxicity (Absorption Trap Detection)
+    toxicity = (m / (eta + 1e-9)).round(2)
+    df_out['Toxicity'] = toxicity
+
+    # 3. StatArb Cointegration (Sector Trend Alignment)
+    # True if moving in the same direction, False if fighting the sector
+    stat_arb_safe = np.sign(stock_chg_float) == np.sign(sector_chg_float)
+
+    # 4. EXACT TARGET %
+    exact_target = np.where(
+        (lob_vacuum <= 0.01) | (toxicity > 1.5) | (~stat_arb_safe),
+        0.0,
+        (lob_vacuum * (eta / (m + 1e-9)))
+    ).round(2)
+    
+    # Add a "+" sign to make the target clear in the email
+    df_out['Target %'] = np.where(exact_target > 0, "+" + pd.Series(exact_target).astype(str) + "%", "0.0%")
+
+    # 5. Execution Signal
+    df_out['Trade Signal'] = np.where(
+        exact_target > 0, 
+        '🟢 EXECUTE', 
+        '🔴 AVOID'
+    )
+    # =========================================================
+
+    # Ensure all required output columns exist to prevent KeyError
+    for col in out_cols:
+        if col not in df_out.columns:
+            df_out[col] = "N/A"
+    
+    # Sort the dataframe so the executable trades are at the top of the email
+    df_out['_target_sort'] = exact_target
+    df_out = df_out.sort_values(by='_target_sort', ascending=False)
+    
+    # Return the formatted Top 10 with the new HFT columns
     return df_out[out_cols].head(10).reset_index(drop=True)
-
-
 
         
 def send_email_rank_watchlist(csv_filename: str) -> bool:
