@@ -1,0 +1,82 @@
+name: Mail
+
+on:
+  repository_dispatch:
+    types: [trigger-fyers-email]
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  run-strategy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install fyers_apiv3 pandas numpy scipy ta yfinance
+
+      # NEW: bring back last run's DB (if any) into the workspace
+      - name: Download previous intraday DB (if exists)
+        uses: actions/download-artifact@v4
+        with:
+          name: intraday-signals-db
+          path: .
+        continue-on-error: true
+
+      - name: Run Fyers v3 email script
+        env:
+          CLIENT_ID:       ${{ secrets.CLIENT_ID }}
+          SECRET_KEY:      ${{ secrets.SECRET_KEY }}
+          REDIRECT_URI:    ${{ secrets.REDIRECT_URI }}
+          AUTH_CODE:       ${{ secrets.AUTH_CODE }}
+          ACCESS_TOKEN:    ${{ secrets.ACCESS_TOKEN }}
+          SENDER_EMAIL:    ${{ secrets.SENDER_EMAIL }}
+          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          SMTP_PORT:       ${{ secrets.SMTP_PORT }}
+          TZ:              Asia/Kolkata
+        run: |
+          python EMAIL.py
+
+      # NEW: persist updated DB for the next run
+      - name: Upload intraday DB
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: intraday-signals-db
+          path: intraday_signals.db
+
+      - name: Commit updated DB and CSV
+        if: always()
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git fetch origin main
+          git pull --rebase origin main || true
+
+          if [ -f "intraday_signals.db" ]; then
+            git add intraday_signals.db
+          fi
+          
+          if git diff --cached --quiet; then
+            echo "No DB/CSV changes to commit."
+          else
+            git commit -m "Auto-update intraday SQLite DB and CSV [skip ci]" || true
+            git push origin HEAD:main || echo "Push failed; skipping."
+          fi
