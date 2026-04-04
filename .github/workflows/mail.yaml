@@ -24,9 +24,13 @@ jobs:
       - name: Install dependencies
         run: pip install fyers-apiv3 pandas
 
-      - name: Write Python script
+      - name: Fetch Nifty 5min candles
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          FETCH_DATE: ${{ github.event.inputs.date }}
         run: |
-          cat > fetch_nifty.py << 'EOF'
+          python - << 'EOF'
 import os
 import pandas as pd
 from fyers_apiv3 import fyersModel
@@ -74,13 +78,6 @@ print(df.to_string(index=False))
 print(f"
 Saved: {filename}")
 EOF
-
-      - name: Run Python script
-        env:
-          CLIENT_ID: ${{ secrets.CLIENT_ID }}
-          ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-          FETCH_DATE: ${{ github.event.inputs.date }}
-        run: python fetch_nifty.py
 
       - name: Upload CSV artifact
         uses: actions/upload-artifact@v4
