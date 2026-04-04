@@ -24,60 +24,66 @@ jobs:
       - name: Install dependencies
         run: pip install fyers-apiv3 pandas
 
-      - name: Fetch Nifty 5min candles
+      - name: Write Python script
+        run: |
+          cat << 'EOF' > fetch_nifty.py
+          import os
+          import pandas as pd
+          from fyers_apiv3 import fyersModel
+
+          CLIENT_ID    = os.environ["CLIENT_ID"]
+          ACCESS_TOKEN = os.environ["ACCESS_TOKEN"]
+          date         = os.environ["FETCH_DATE"]
+
+          fyers = fyersModel.FyersModel(
+              client_id=CLIENT_ID,
+              token=ACCESS_TOKEN,
+              log_path=""
+          )
+
+          data = {
+              "symbol"     : "NSE:NIFTY50-INDEX",
+              "resolution" : "5",
+              "date_format": "1",
+              "range_from" : date,
+              "range_to"   : date,
+              "cont_flag"  : "1"
+          }
+
+          response = fyers.history(data=data)
+
+          if response.get("s") != "ok":
+              raise Exception(f"API Error: {response}")
+
+          df = pd.DataFrame(
+              response["candles"],
+              columns=["timestamp","open","high","low","close","volume"]
+          )
+
+          df["time"] = (
+              pd.to_datetime(df["timestamp"], unit="s")
+              .dt.tz_localize("UTC")
+              .dt.tz_convert("Asia/Kolkata")
+              .dt.strftime("%H:%M")
+          )
+
+          df = df[["time","open","high","low","close","volume"]]
+          filename = f"nifty_{date}_5min.csv"
+          df.to_csv(filename, index=False)
+          print(df.to_string(index=False))
+          print(f"
+Saved: {filename}")
+          EOF
+          
+          # Fix Python indentation automatically
+          sed -i 's/^          //' fetch_nifty.py
+
+      - name: Run Python script
         env:
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
           ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
           FETCH_DATE: ${{ github.event.inputs.date }}
-        run: |
-          python - << 'EOF'
-import os
-import pandas as pd
-from fyers_apiv3 import fyersModel
-
-CLIENT_ID    = os.environ["CLIENT_ID"]
-ACCESS_TOKEN = os.environ["ACCESS_TOKEN"]
-date         = os.environ["FETCH_DATE"]
-
-fyers = fyersModel.FyersModel(
-    client_id=CLIENT_ID,
-    token=ACCESS_TOKEN,
-    log_path=""
-)
-
-data = {
-    "symbol"     : "NSE:NIFTY50-INDEX",
-    "resolution" : "5",
-    "date_format": "1",
-    "range_from" : date,
-    "range_to"   : date,
-    "cont_flag"  : "1"
-}
-
-response = fyers.history(data=data)
-
-if response.get("s") != "ok":
-    raise Exception(f"API Error: {response}")
-
-df = pd.DataFrame(
-    response["candles"],
-    columns=["timestamp","open","high","low","close","volume"]
-)
-
-df["time"] = (
-    pd.to_datetime(df["timestamp"], unit="s")
-    .dt.tz_localize("UTC")
-    .dt.tz_convert("Asia/Kolkata")
-    .dt.strftime("%H:%M")
-)
-
-df = df[["time","open","high","low","close","volume"]]
-filename = f"nifty_{date}_5min.csv"
-df.to_csv(filename, index=False)
-print(df.to_string(index=False))
-print(f"
-Saved: {filename}")
-EOF
+        run: python fetch_nifty.py
 
       - name: Upload CSV artifact
         uses: actions/upload-artifact@v4
