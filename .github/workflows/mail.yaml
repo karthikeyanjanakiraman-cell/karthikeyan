@@ -71,8 +71,7 @@ jobs:
           filename = f"nifty_{date}_5min.csv"
           df.to_csv(filename, index=False)
           print(df.to_string(index=False))
-          print(f"
-Saved: {filename}")
+          print(f"Saved: {filename}")
           EOF
           
           # Fix Python indentation automatically
