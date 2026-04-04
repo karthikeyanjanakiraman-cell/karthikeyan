@@ -76,7 +76,7 @@ jobs:
           df.to_csv(filename, index=False)
           print(df.to_string(index=False))
           print(f"
-Saved: {filename}")
+          Saved: {filename}")
           EOF
 
       - name: Upload CSV artifact
