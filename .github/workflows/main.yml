@@ -1,18 +1,24 @@
-name: Fetch 5min Data
+name: Fetch Market Data
 
 on:
   workflow_dispatch:
     inputs:
       stock:
-        description: "Stock name or FYERS symbol (example: RELIANCE or NSE:NIFTY50-INDEX)"
+        description: 'Stock Name (e.g. RELIANCE, NIFTY)'
         required: true
-        default: "NIFTY"
-        type: string
-      date:
-        description: "Date (YYYY-MM-DD)"
+        default: 'NIFTY'
+      from_date:
+        description: 'From Date (YYYY-MM-DD)'
         required: true
-        default: "2026-04-01"
-        type: string
+        default: '2026-04-01'
+      to_date:
+        description: 'To Date (YYYY-MM-DD)'
+        required: true
+        default: '2026-04-05'
+      interval:
+        description: 'Interval (e.g., 1, 5, 15, 60, 1D)'
+        required: true
+        default: '5'
 
 jobs:
   fetch_data:
@@ -25,7 +31,7 @@ jobs:
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
-          python-version: "3.11"
+          python-version: '3.11'
 
       - name: Install dependencies
         run: pip install fyers-apiv3 pandas
@@ -37,43 +43,40 @@ jobs:
           import pandas as pd
           from fyers_apiv3 import fyersModel
 
-          CLIENT_ID    = os.environ["CLIENT_ID"]
-          ACCESS_TOKEN = os.environ["ACCESS_TOKEN"]
-          FETCH_DATE   = os.environ["FETCH_DATE"]
-          STOCK_INPUT  = os.environ["STOCK_NAME"].strip().upper()
+          CLIENT_ID      = os.environ["CLIENT_ID"]
+          ACCESS_TOKEN   = os.environ["ACCESS_TOKEN"]
+          FROM_DATE      = os.environ["FROM_DATE"].strip()
+          TO_DATE        = os.environ["TO_DATE"].strip()
+          FETCH_INTERVAL = os.environ["FETCH_INTERVAL"].strip()
+          STOCK_INPUT    = os.environ["STOCK_NAME"].strip().upper()
 
+          # Format the symbol for FYERS API
           def normalize_symbol(stock_input: str) -> str:
               if ":" in stock_input:
                   return stock_input
-
               special_map = {
                   "NIFTY": "NSE:NIFTY50-INDEX",
-                  "NIFTY50": "NSE:NIFTY50-INDEX",
                   "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
-                  "FINNIFTY": "NSE:FINNIFTY-INDEX",
-                  "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX",
-                  "SENSEX": "BSE:SENSEX-INDEX",
+                  "FINNIFTY": "NSE:FINNIFTY-INDEX"
               }
-
-              if stock_input in special_map:
-                  return special_map[stock_input]
-
-              return f"NSE:{stock_input}-EQ"
+              return special_map.get(stock_input, f"NSE:{stock_input}-EQ")
 
           SYMBOL = normalize_symbol(STOCK_INPUT)
 
+          # Initialize FYERS API
           fyers = fyersModel.FyersModel(
               client_id=CLIENT_ID,
               token=ACCESS_TOKEN,
               log_path=""
           )
 
+          # Fetch Data using the user-given date range and interval
           data = {
               "symbol": SYMBOL,
-              "resolution": "5",
+              "resolution": FETCH_INTERVAL,
               "date_format": "1",
-              "range_from": FETCH_DATE,
-              "range_to": FETCH_DATE,
+              "range_from": FROM_DATE,
+              "range_to": TO_DATE,
               "cont_flag": "1"
           }
 
@@ -87,17 +90,19 @@ jobs:
               columns=["timestamp", "open", "high", "low", "close", "volume"]
           )
 
-          df["time"] = (
-              pd.to_datetime(df["timestamp"], unit="s")
-              .dt.tz_localize("UTC")
-              .dt.tz_convert("Asia/Kolkata")
-              .dt.strftime("%H:%M")
-          )
+          if not df.empty:
+              # Format time properly to include date and time
+              df["time"] = (
+                  pd.to_datetime(df["timestamp"], unit="s")
+                  .dt.tz_localize("UTC")
+                  .dt.tz_convert("Asia/Kolkata")
+                  .dt.strftime("%Y-%m-%d %H:%M")
+              )
+              df = df[["time", "open", "high", "low", "close", "volume"]]
 
-          df = df[["time", "open", "high", "low", "close", "volume"]]
-
+          # Save the file with the date range in the name
           safe_symbol = SYMBOL.replace(":", "_").replace("-", "_")
-          filename = f"{safe_symbol}_{FETCH_DATE}_5min.csv"
+          filename = f"{safe_symbol}_{FROM_DATE}_to_{TO_DATE}_{FETCH_INTERVAL}.csv"
 
           df.to_csv(filename, index=False)
           print(df.to_string(index=False))
@@ -108,13 +113,15 @@ jobs:
         env:
           CLIENT_ID: ${{ secrets.CLIENT_ID }}
           ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-          FETCH_DATE: ${{ inputs.date }}
-          STOCK_NAME: ${{ inputs.stock }}
+          STOCK_NAME: ${{ github.event.inputs.stock }}
+          FROM_DATE: ${{ github.event.inputs.from_date }}
+          TO_DATE: ${{ github.event.inputs.to_date }}
+          FETCH_INTERVAL: ${{ github.event.inputs.interval }}
         run: python fetch_data.py
 
       - name: Upload CSV artifact
         uses: actions/upload-artifact@v4
         with:
-          name: data-5min-${{ inputs.stock }}-${{ inputs.date }}
+          name: data-${{ github.event.inputs.stock }}-${{ github.event.inputs.interval }}-${{ github.event.inputs.from_date }}-to-${{ github.event.inputs.to_date }}
           path: "*.csv"
-          retention-days: 7
+          retention-days: 1
