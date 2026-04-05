@@ -1,0 +1,120 @@
+name: Fetch 5min Data
+
+on:
+  workflow_dispatch:
+    inputs:
+      stock:
+        description: "Stock name or FYERS symbol (example: RELIANCE or NSE:NIFTY50-INDEX)"
+        required: true
+        default: "NIFTY"
+        type: string
+      date:
+        description: "Date (YYYY-MM-DD)"
+        required: true
+        default: "2026-04-01"
+        type: string
+
+jobs:
+  fetch_data:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install fyers-apiv3 pandas
+
+      - name: Write Python script
+        run: |
+          cat << 'EOF' > fetch_data.py
+          import os
+          import pandas as pd
+          from fyers_apiv3 import fyersModel
+
+          CLIENT_ID    = os.environ["CLIENT_ID"]
+          ACCESS_TOKEN = os.environ["ACCESS_TOKEN"]
+          FETCH_DATE   = os.environ["FETCH_DATE"]
+          STOCK_INPUT  = os.environ["STOCK_NAME"].strip().upper()
+
+          def normalize_symbol(stock_input: str) -> str:
+              if ":" in stock_input:
+                  return stock_input
+
+              special_map = {
+                  "NIFTY": "NSE:NIFTY50-INDEX",
+                  "NIFTY50": "NSE:NIFTY50-INDEX",
+                  "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
+                  "FINNIFTY": "NSE:FINNIFTY-INDEX",
+                  "MIDCPNIFTY": "NSE:MIDCPNIFTY-INDEX",
+                  "SENSEX": "BSE:SENSEX-INDEX",
+              }
+
+              if stock_input in special_map:
+                  return special_map[stock_input]
+
+              return f"NSE:{stock_input}-EQ"
+
+          SYMBOL = normalize_symbol(STOCK_INPUT)
+
+          fyers = fyersModel.FyersModel(
+              client_id=CLIENT_ID,
+              token=ACCESS_TOKEN,
+              log_path=""
+          )
+
+          data = {
+              "symbol": SYMBOL,
+              "resolution": "5",
+              "date_format": "1",
+              "range_from": FETCH_DATE,
+              "range_to": FETCH_DATE,
+              "cont_flag": "1"
+          }
+
+          response = fyers.history(data=data)
+
+          if response.get("s") != "ok":
+              raise Exception(f"API Error: {response}")
+
+          df = pd.DataFrame(
+              response["candles"],
+              columns=["timestamp", "open", "high", "low", "close", "volume"]
+          )
+
+          df["time"] = (
+              pd.to_datetime(df["timestamp"], unit="s")
+              .dt.tz_localize("UTC")
+              .dt.tz_convert("Asia/Kolkata")
+              .dt.strftime("%H:%M")
+          )
+
+          df = df[["time", "open", "high", "low", "close", "volume"]]
+
+          safe_symbol = SYMBOL.replace(":", "_").replace("-", "_")
+          filename = f"{safe_symbol}_{FETCH_DATE}_5min.csv"
+
+          df.to_csv(filename, index=False)
+          print(df.to_string(index=False))
+          print(f"Saved: {filename}")
+          EOF
+
+      - name: Run Python script
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          FETCH_DATE: ${{ inputs.date }}
+          STOCK_NAME: ${{ inputs.stock }}
+        run: python fetch_data.py
+
+      - name: Upload CSV artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: data-5min-${{ inputs.stock }}-${{ inputs.date }}
+          path: "*.csv"
+          retention-days: 7
