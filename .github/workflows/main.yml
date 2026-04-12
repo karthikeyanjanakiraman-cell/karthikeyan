@@ -10,11 +10,11 @@ on:
       from_date:
         description: 'From Date (YYYY-MM-DD)'
         required: true
-        default: '2026-04-01'
+        default: 'today'
       to_date:
         description: 'To Date (YYYY-MM-DD)'
         required: true
-        default: '2026-04-05'
+        default: 'today'
       interval:
         description: 'Interval (e.g., 1, 5, 15, 60, 1D)'
         required: true
@@ -40,6 +40,7 @@ jobs:
         run: |
           cat << 'EOF' > fetch_data.py
           import os
+          from datetime import datetime, timedelta
           import pandas as pd
           from fyers_apiv3 import fyersModel
 
@@ -57,7 +58,7 @@ jobs:
               special_map = {
                   "NIFTY": "NSE:NIFTY50-INDEX",
                   "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
-                  "FINNIFTY": "NSE:FINNIFTY-INDEX"
+                  "FINNIFTY": "NSE:FINNIFTY-INDEX",
               }
               return special_map.get(stock_input, f"NSE:{stock_input}-EQ")
 
@@ -70,28 +71,57 @@ jobs:
               log_path=""
           )
 
-          # Fetch Data using the user-given date range and interval
-          data = {
-              "symbol": SYMBOL,
-              "resolution": FETCH_INTERVAL,
-              "date_format": "1",
-              "range_from": FROM_DATE,
-              "range_to": TO_DATE,
-              "cont_flag": "1"
-          }
+          def fetch_chunk(range_from: str, range_to: str):
+              params = {
+                  "symbol": SYMBOL,
+                  "resolution": FETCH_INTERVAL,
+                  "date_format": "1",
+                  "range_from": range_from,
+                  "range_to": range_to,
+                  "cont_flag": "1",
+              }
+              print(f"Fetching {range_from} to {range_to} ...")
+              response = fyers.history(data=params)
+              status = response.get("s")
+              if status != "ok":
+                  raise Exception(f"API Error for {range_from} to {range_to}: {response}")
+              candles = response.get("candles", [])
+              return candles
 
-          response = fyers.history(data=data)
+          # Parse dates
+          try:
+              start_date = datetime.strptime(FROM_DATE, "%Y-%m-%d").date()
+              end_date = datetime.strptime(TO_DATE, "%Y-%m-%d").date()
+          except ValueError as e:
+              raise ValueError(f"Invalid date format. Use YYYY-MM-DD. Error: {e}")
 
-          if response.get("s") != "ok":
-              raise Exception(f"API Error: {response}")
+          if start_date > end_date:
+              raise ValueError(f"FROM_DATE ({FROM_DATE}) cannot be after TO_DATE ({TO_DATE}).")
 
-          df = pd.DataFrame(
-              response["candles"],
-              columns=["timestamp", "open", "high", "low", "close", "volume"]
-          )
+          # FYERS history API effectively limits the span per call (approx 100 days), so chunk it.[web:68][web:74]
+          max_span_days = 99  # inclusive: start .. end
 
-          if not df.empty:
-              # Format time properly to include date and time
+          all_candles = []
+          current_start = start_date
+
+          while current_start <= end_date:
+              current_end = min(current_start + timedelta(days=max_span_days), end_date)
+              chunk_from = current_start.strftime("%Y-%m-%d")
+              chunk_to = current_end.strftime("%Y-%m-%d")
+              candles = fetch_chunk(chunk_from, chunk_to)
+              all_candles.extend(candles)
+              current_start = current_end + timedelta(days=1)
+
+          # Build DataFrame
+          if all_candles:
+              df = pd.DataFrame(
+                  all_candles,
+                  columns=["timestamp", "open", "high", "low", "close", "volume"],
+              )
+              # Remove any accidental duplicates on timestamp
+              df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
+
+              # Convert timestamp to IST "YYYY-MM-DD HH:MM"
               df["time"] = (
                   pd.to_datetime(df["timestamp"], unit="s")
                   .dt.tz_localize("UTC")
@@ -99,8 +129,12 @@ jobs:
                   .dt.strftime("%Y-%m-%d %H:%M")
               )
               df = df[["time", "open", "high", "low", "close", "volume"]]
+          else:
+              # No data returned for the entire range
+              df = pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
+              print("Warning: No candles returned for the given date range.")
 
-          # Save the file with the date range in the name
+          # Save the file with the full requested date range in the name
           safe_symbol = SYMBOL.replace(":", "_").replace("-", "_")
           filename = f"{safe_symbol}_{FROM_DATE}_to_{TO_DATE}_{FETCH_INTERVAL}.csv"
 
