@@ -19,284 +19,227 @@ from email import encoders
 class UTF8Formatter(logging.Formatter):
     def format(self, record):
         msg = record.getMessage()
-        msg = msg.replace("âŒ", "[ERROR]").replace("âœ…", "[OK]")
-        msg = msg.replace("ðŸŸ¢", "[GREEN]").replace("ðŸŸ¡", "[YELLOW]").replace("ðŸ”´", "[RED]")
-        msg = msg.replace("âš ï¸", "[WARN]").replace("ðŸ“Š", "[DATA]").replace("ðŸŽ¯", "[TARGET]")
-        record.msg = msg
+        # Force encoding to ascii, ignoring/replacing non-ascii, then back to string
+        record.msg = msg.encode("ascii", "ignore").decode("ascii")
         return super().format(record)
 
 
-LOG_FORMAT = "%(asctime)s - %(levelname)s - %(message)s"
-logger = logging.getLogger(__name__)
+# ------------------------------------------------------------------------------
+# CONFIGURATION
+# ------------------------------------------------------------------------------
+logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-logger.handlers.clear()
+if logger.hasHandlers():
+    logger.handlers.clear()
 
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setFormatter(UTF8Formatter(LOG_FORMAT))
-logger.addHandler(console_handler)
+ch = logging.StreamHandler(sys.stdout)
+ch.setLevel(logging.INFO)
+formatter = UTF8Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+ch.setFormatter(formatter)
+logger.addHandler(ch)
 
-file_handler = logging.FileHandler("fo_fyers_iteration_email.log", encoding="utf-8")
-file_handler.setFormatter(UTF8Formatter(LOG_FORMAT))
-logger.addHandler(file_handler)
+SECTORS_FILE = "sectors"
+CREDENTIALS_FILE = "email.yml.txt"
 
-logger.info("[OK] FO Fyers Iteration-based Volatility + Volume Scanner initialized")
+DAILY_LOOKBACK_DAYS = 60
+INTRADAY_LOOKBACK_DAYS = 20
 
-
-config = configparser.ConfigParser()
-config.read("config.ini")
-
-
-def get_cfg(section, key, env_name=None, default=None, is_int=False):
-    if env_name:
-        val = os.getenv(env_name)
-        if val is not None and val.strip() != "":
-            return int(val) if is_int else val
-    if section and key and config.has_option(section, key):
-        val = config.get(section, key)
-        return int(val) if is_int else val
-    return default
-
-
-try:
-    client_id = get_cfg("fyers_credentials", "client_id", env_name="CLIENT_ID")
-    token = (
-        get_cfg("fyers_credentials", "access_token", env_name="ACCESS_TOKEN")
-        or get_cfg("fyers_credentials", "token", env_name="TOKEN")
-    )
-    if not client_id or not token:
-        raise ValueError("Missing CLIENT_ID or ACCESS_TOKEN")
-    fyers = fyersModel.FyersModel(client_id=client_id, token=token)
-    logger.info("[OK] Fyers API connected successfully")
-except Exception as e:
-    logger.error(f"[ERROR] Fyers init failed: {e}")
-    fyers = None
-
-
-MARKET_OPEN = time(9, 15)
+# THRESHOLDS
 DAILY_VOL_THRESHOLD = 1.0
 DAILY_VOLUME_THRESHOLD = 1.0
-SHORT_DAYS = 20
-LONG_DAYS = 252
-RVOL_SHORT = 10
-RVOL_LONG = 20
-INTRADAY_LOOKBACK_DAYS = 45
-DAILY_LOOKBACK_DAYS = 365
+
+fyers: Optional[fyersModel.FyersModel] = None
+
+# ------------------------------------------------------------------------------
+# FYERS INITIALIZATION
+# ------------------------------------------------------------------------------
+def init_fyers():
+    global fyers
+    try:
+        client_id = os.environ.get("FYERS_CLIENT_ID")
+        access_token = os.environ.get("FYERS_ACCESS_TOKEN")
+        if not client_id or not access_token:
+            logger.error("[INIT] FYERS_CLIENT_ID or FYERS_ACCESS_TOKEN not set in environment.")
+            sys.exit(1)
+        fyers = fyersModel.FyersModel(client_id=client_id, is_async=False, token=access_token, log_path="")
+        logger.info("[INIT] FyersModel initialized successfully.")
+    except Exception as e:
+        logger.error(f"[INIT] Failed to initialize FyersModel: {e}")
+        sys.exit(1)
 
 
-def load_fno_symbols_from_sectors(root_dir: str = "sectors") -> List[str]:
+# ------------------------------------------------------------------------------
+# DATA LOADING
+# ------------------------------------------------------------------------------
+def load_fno_symbols_from_sectors(folder_path: str) -> List[str]:
     symbols = set()
-    if not os.path.isdir(root_dir):
-        logger.warning(f"[FNO] Sectors folder '{root_dir}' not found; returning empty list.")
+    if not os.path.exists(folder_path):
+        logger.warning(f"[CORE] Sectors folder '{folder_path}' not found.")
         return []
-    for dirpath, _, filenames in os.walk(root_dir):
-        for fname in filenames:
-            if not fname.lower().endswith(".csv"):
-                continue
-            fpath = os.path.join(dirpath, fname)
+    for fn in os.listdir(folder_path):
+        if fn.endswith(".txt") and fn != "fno.txt":
             try:
-                df = pd.read_csv(fpath)
-                col = None
-                for c in df.columns:
-                    if c.lower() in ("symbol", "symbols", "ticker"):
-                        col = c
-                        break
-                if col is None:
-                    continue
-                for s in df[col].dropna().astype(str):
-                    s = s.strip()
-                    if s:
-                        symbols.add(s)
+                with open(os.path.join(folder_path, fn), "r") as f:
+                    for line in f:
+                        line = line.strip()
+                        if line and not line.startswith("#"):
+                            symbols.add(line)
             except Exception as e:
-                logger.warning(f"[FNO] Error reading {fpath}: {e}")
-    symbols_list = sorted(symbols)
-    logger.info(f"[FNO] Loaded {len(symbols_list)} unique F&O symbols.")
-    return symbols_list
+                logger.error(f"[CORE] Error reading {fn}: {e}")
+    logger.info(f"[CORE] Loaded {len(symbols)} unique F&O symbols from sectors folder.")
+    return sorted(list(symbols))
 
 
-def format_fyers_symbol(sym: str) -> str:
-    s = sym.strip().upper()
-    if s.startswith("NSE:") and ("-EQ" in s or "-INDEX" in s):
-        return s
-    s = s.replace("NSE:", "").replace("-EQ", "")
-    if s in ["NIFTY", "NIFTY50"]:
-        return "NSE:NIFTY50-INDEX"
-    if s == "BANKNIFTY":
-        return "NSE:NIFTYBANK-INDEX"
-    if s == "FINNIFTY":
-        return "NSE:FINNIFTY-INDEX"
-    if s == "MIDCPNIFTY":
-        return "NSE:MIDCPNIFTY-INDEX"
-    return f"NSE:{s}-EQ"
+def format_fyers_symbol(symbol: str) -> str:
+    if symbol.startswith("NSE:") and symbol.endswith("-EQ"):
+        return symbol
+    return f"NSE:{symbol}-EQ"
 
 
 def get_fyers_history(symbol: str, resolution: str, days_back: int) -> Optional[pd.DataFrame]:
-    if fyers is None or days_back <= 0:
+    if not fyers:
         return None
-    per_call_limit = 366 if resolution == "D" else 100
-    all_chunks = []
-    end_date = datetime.now()
-    remaining_days = days_back
-
-    while remaining_days > 0:
-        chunk_days = min(per_call_limit, remaining_days)
-        start_date = end_date - timedelta(days=chunk_days - 1)
+    try:
+        now = datetime.now()
+        start_date = now - timedelta(days=days_back)
         data = {
             "symbol": symbol,
             "resolution": resolution,
             "date_format": "1",
             "range_from": start_date.strftime("%Y-%m-%d"),
-            "range_to": end_date.strftime("%Y-%m-%d"),
+            "range_to": now.strftime("%Y-%m-%d"),
             "cont_flag": "1",
         }
-        try:
-            resp = fyers.history(data=data)
-            if resp.get("s") != "ok" or "candles" not in resp:
-                break
-            candles = resp["candles"]
-            if not candles:
-                break
-            df_chunk = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
-            df_chunk["timestamp"] = pd.to_datetime(df_chunk["timestamp"], unit="s").dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
-            all_chunks.append(df_chunk)
-        except Exception as e:
-            logger.warning(f"[API] {symbol} {resolution} history fetch failed: {e}")
-            break
-        remaining_days -= chunk_days
-        end_date = start_date - timedelta(days=1)
-
-    if not all_chunks:
+        res = fyers.history(data=data)
+        if res and res.get("s") == "ok" and "candles" in res and res["candles"]:
+            df = pd.DataFrame(res["candles"], columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
+            # Convert to IST
+            df["timestamp"] = df["timestamp"].dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+            df.sort_values("timestamp", inplace=True)
+            df.reset_index(drop=True, inplace=True)
+            return df
+        return None
+    except Exception as e:
+        logger.error(f"[FYERS] Error fetching {resolution} data for {symbol}: {e}")
         return None
 
-    df = pd.concat(all_chunks, ignore_index=True)
-    df = df.drop_duplicates(subset=["timestamp"])
-    df = df.sort_values("timestamp").reset_index(drop=True)
-    return df
 
-
-def compute_annualized_volatility_from_daily(df: pd.DataFrame) -> Optional[float]:
-    if df is None or df.empty or len(df) < 10:
-        return None
-    closes = df["close"].astype(float)
-    returns = np.log(closes / closes.shift(1)).dropna()
-    if len(returns) < 5:
-        return None
-    vol = returns.std() * math.sqrt(252) * 100.0
-    return float(vol)
-
-
-def compute_volatility_pair(df_daily: pd.DataFrame, short_days: int = SHORT_DAYS, long_days: int = LONG_DAYS) -> Dict[str, Optional[float]]:
-    if df_daily is None or df_daily.empty:
-        return {"DailyCurrVolPct": None, "DailyAvgVolPct": None, "VolExpansion": None}
-    df_sorted = df_daily.sort_values("timestamp").reset_index(drop=True)
-    curr_vol_ann = compute_annualized_volatility_from_daily(df_sorted.tail(short_days))
-    avg_vol_ann = compute_annualized_volatility_from_daily(df_sorted.tail(long_days))
-    sqrt_252 = math.sqrt(252)
-    daily_curr = (curr_vol_ann / sqrt_252) if curr_vol_ann else None
-    daily_avg = (avg_vol_ann / sqrt_252) if avg_vol_ann else None
-    vol_expansion = (daily_curr / daily_avg) if (daily_curr and daily_avg and daily_avg > 0) else None
+# ------------------------------------------------------------------------------
+# COMPUTATIONS
+# ------------------------------------------------------------------------------
+def compute_volatility_pair(daily_df: Optional[pd.DataFrame]) -> Dict[str, float]:
+    if daily_df is None or daily_df.empty or len(daily_df) < 11:
+        return {}
+    df = daily_df.copy()
+    df["Daily_Volatility"] = df["high"] - df["low"]
+    current_vol = float(df["Daily_Volatility"].iloc[-1])
+    avg_10d_vol = float(df["Daily_Volatility"].iloc[-11:-1].mean())
+    vol_exp = (current_vol / avg_10d_vol) if avg_10d_vol > 0 else 0.0
     return {
-        "Current Daily Volatility": daily_curr,
-        "Avg Daily Volatility": daily_avg,
-        "Daily Volatility Expansion": vol_expansion,
+        "Current Daily Volatility": current_vol,
+        "Avg Daily Volatility": avg_10d_vol,
+        "Daily Volatility Expansion": vol_exp,
     }
 
 
-def _safe_max(values: List[Optional[float]]) -> Optional[float]:
-    vals = [float(v) for v in values if pd.notna(v)]
-    return max(vals) if vals else None
+def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[Dict, pd.DataFrame]:
+    if intra_df is None or intra_df.empty:
+        return {}, pd.DataFrame()
 
+    df = intra_df.copy()
+    df["date"] = df["timestamp"].dt.date
+    df["time"] = df["timestamp"].dt.time
+    dates = sorted(df["date"].unique())
+    if len(dates) < 2:
+        return {}, pd.DataFrame()
 
-def compute_iteration_volume_profile(
-    df: pd.DataFrame,
-    lookback_short: int = RVOL_SHORT,
-    lookback_long: int = RVOL_LONG,
-    market_open: time = MARKET_OPEN,
-) -> Tuple[Dict[str, Optional[float]], pd.DataFrame]:
-    empty_summary = {
-        "Current Volume": None,
-        "10 Day Relative Volume": None,
-        "20 Day Relative Volume": None,
-        "Daily Volume Expansion": None,
-        "Total Iterations": 0,
-        "Last Iteration Minutes": None,
-        "Last Iteration Time": None,
-        "LTP": None,
-    }
-    if df is None or df.empty or len(df) < 10:
-        return empty_summary, pd.DataFrame()
+    current_date = dates[-1]
+    hist_dates_10 = dates[-11:-1] if len(dates) >= 11 else dates[:-1]
+    hist_dates_20 = dates[-21:-1] if len(dates) >= 21 else dates[:-1]
 
-    s = df.copy()
-    s["datetime"] = pd.to_datetime(s["timestamp"])
-    s = s.sort_values("datetime").reset_index(drop=True)
-    s["date"] = s["datetime"].dt.date
-    s["time"] = s["datetime"].dt.time
-    s = s[s["time"] >= market_open].copy()
-    if s.empty:
-        return empty_summary, pd.DataFrame()
+    curr_df = df[df["date"] == current_date].copy()
+    hist_df_10 = df[df["date"].isin(hist_dates_10)].copy()
+    hist_df_20 = df[df["date"].isin(hist_dates_20)].copy()
 
-    s["cum_volume"] = s.groupby("date")["volume"].cumsum()
-    latest = s.iloc[-1]
-    latest_date = latest["date"]
-    today_df = s[s["date"] == latest_date].copy().sort_values("datetime")
-    if today_df.empty:
-        return empty_summary, pd.DataFrame()
+    if curr_df.empty:
+        return {}, pd.DataFrame()
 
-    detail_rows = []
-    base_dt = datetime.combine(latest_date, market_open)
+    curr_df.sort_values("time", inplace=True)
+    ltp = float(curr_df["close"].iloc[-1])
 
-    for _, row in today_df.iterrows():
-        cutoff_dt = row["datetime"]
-        minutes_elapsed = int((cutoff_dt - base_dt).total_seconds() // 60)
-        if minutes_elapsed <= 0:
-            continue
+    rows = []
+    total_iters = 0
+    last_iter_mins = None
+    last_iter_time = None
+    last_cum_vol = 0
+    last_rvol_10 = 0
+    last_rvol_20 = 0
+    last_dvol_exp = 0
 
-        cutoff_time = row["time"]
-        current_cum_vol = float(row["cum_volume"])
-        prior = s[(s["date"] < latest_date) & (s["time"] <= cutoff_time)].copy()
-        if prior.empty:
-            continue
-
-        prior_cum = prior.groupby("date")["cum_volume"].max().sort_index()
-        if prior_cum.empty:
-            continue
-
-        avg10 = float(prior_cum.tail(lookback_short).mean()) if len(prior_cum.tail(lookback_short)) > 0 else None
-        avg20 = float(prior_cum.tail(lookback_long).mean()) if len(prior_cum.tail(lookback_long)) > 0 else None
-        rel10 = (current_cum_vol / avg10) if (avg10 and avg10 > 0) else None
-        rel20 = (current_cum_vol / avg20) if (avg20 and avg20 > 0) else None
-        volume_exp = _safe_max([rel10, rel20])
-
-        detail_rows.append({
-            "Iteration No": len(detail_rows) + 1,
-            "Iteration Minutes": minutes_elapsed,
-            "Iteration Time": cutoff_time.strftime("%H:%M"),
-            "Current Volume": current_cum_vol,
-            "10 Day Relative Volume": rel10,
-            "20 Day Relative Volume": rel20,
-            "Daily Volume Expansion": volume_exp,
-            "LTP": float(row["close"]),
+    avg_daily_vol_10 = hist_df_10.groupby("date")["volume"].sum().mean() if not hist_df_10.empty else 0
+    
+    # Iterate through current day's candles to build the profile
+    curr_df["cum_vol"] = curr_df["volume"].cumsum()
+    
+    for i in range(len(curr_df)):
+        total_iters += 1
+        row = curr_df.iloc[i]
+        t = row["time"]
+        cum_vol = float(row["cum_vol"])
+        
+        # Calculate 10-day average cumulative volume up to this time
+        h10 = hist_df_10[hist_df_10["time"] <= t]
+        avg_cum_10 = h10.groupby("date")["volume"].sum().mean() if not h10.empty else 0
+        rvol_10 = (cum_vol / avg_cum_10) if avg_cum_10 > 0 else 0
+        
+        # Calculate 20-day average cumulative volume up to this time
+        h20 = hist_df_20[hist_df_20["time"] <= t]
+        avg_cum_20 = h20.groupby("date")["volume"].sum().mean() if not h20.empty else 0
+        rvol_20 = (cum_vol / avg_cum_20) if avg_cum_20 > 0 else 0
+        
+        # Daily Volume Expansion is based on the 10-day total average
+        dvol_exp = (cum_vol / avg_daily_vol_10) if avg_daily_vol_10 > 0 else 0
+        
+        # Calculate iteration minutes (e.g. 5, 10, 15...)
+        dt_time = datetime.combine(current_date, t)
+        market_open = datetime.combine(current_date, time(9, 15))
+        iter_mins = int((dt_time - market_open).total_seconds() / 60) + 5
+        
+        rows.append({
+            "Iteration No": total_iters,
+            "Iteration Minutes": iter_mins,
+            "Iteration Time": t.strftime("%H:%M"),
+            "Current Volume": cum_vol,
+            "10 Day Relative Volume": rvol_10,
+            "20 Day Relative Volume": rvol_20,
+            "Daily Volume Expansion": dvol_exp,
         })
-
-    detail_df = pd.DataFrame(detail_rows)
-    if detail_df.empty:
-        summary = empty_summary.copy()
-        summary["LTP"] = float(today_df.iloc[-1]["close"])
-        return summary, detail_df
-
-    latest_detail = detail_df.iloc[-1]
+        
+        last_cum_vol = cum_vol
+        last_rvol_10 = rvol_10
+        last_rvol_20 = rvol_20
+        last_dvol_exp = dvol_exp
+        last_iter_mins = iter_mins
+        last_iter_time = t.strftime("%H:%M")
+        
+    detail_df = pd.DataFrame(rows)
     summary = {
-        "Current Volume": float(latest_detail["Current Volume"]),
-        "10 Day Relative Volume": float(latest_detail["10 Day Relative Volume"]) if pd.notna(latest_detail["10 Day Relative Volume"]) else None,
-        "20 Day Relative Volume": float(latest_detail["20 Day Relative Volume"]) if pd.notna(latest_detail["20 Day Relative Volume"]) else None,
-        "Daily Volume Expansion": float(latest_detail["Daily Volume Expansion"]) if pd.notna(latest_detail["Daily Volume Expansion"]) else None,
-        "Total Iterations": int(len(detail_df)),
-        "Last Iteration Minutes": int(latest_detail["Iteration Minutes"]),
-        "Last Iteration Time": latest_detail["Iteration Time"],
-        "LTP": float(latest_detail["LTP"]),
+        "LTP": ltp,
+        "Current Volume": last_cum_vol,
+        "10 Day Relative Volume": last_rvol_10,
+        "20 Day Relative Volume": last_rvol_20,
+        "Daily Volume Expansion": last_dvol_exp,
+        "Total Iterations": total_iters,
+        "Last Iteration Minutes": last_iter_mins,
+        "Last Iteration Time": last_iter_time,
     }
     return summary, detail_df
 
 
+# ------------------------------------------------------------------------------
+# MAIN SCANNER
+# ------------------------------------------------------------------------------
 def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
     symbols = load_fno_symbols_from_sectors("sectors")
     if not symbols:
@@ -326,7 +269,12 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
         pct_change = ((ltp - prev_close) / prev_close) * 100 if (ltp and prev_close and prev_close > 0) else 0.0
         daily_vol_exp = vol_info.get("Daily Volatility Expansion")
         daily_volume_exp = iter_summary.get("Daily Volume Expansion")
-        momentum_score = (daily_vol_exp * daily_volume_exp) if (daily_vol_exp is not None and daily_volume_exp is not None) else None
+
+        rvol_10d = iter_summary.get("10 Day Relative Volume")
+        if pct_change is not None and rvol_10d and rvol_10d > 0:
+            ease_of_movement = abs(pct_change) / rvol_10d
+        else:
+            ease_of_movement = None
 
         if not iter_detail.empty:
             if daily_vol_exp is not None and daily_vol_exp > DAILY_VOL_THRESHOLD:
@@ -418,9 +366,9 @@ def format_value(col: str, val):
     if col == "% Change":
         return f"{val:+.2f}%"
     if col == "Current Volume":
-        return f"{val:,.0f}"
+        return f"{int(val):,}"
     if col == "Above Threshold Ratio":
-        return f"{val:.2%}"
+        return f"{val*100:.2f}%"
     if col in ["Total Iterations", "Above Threshold Iterations", "Last Iteration Minutes"]:
         return f"{int(val)}"
     return str(val)
@@ -428,112 +376,128 @@ def format_value(col: str, val):
 
 def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     if df is None or df.empty:
-        return "<p>No data available.</p>"
-    df_disp = df.copy().head(max_rows)
-    for col in df_disp.columns:
-        df_disp[col] = df_disp[col].map(lambda x, c=col: format_value(c, x))
-    return df_disp.to_html(index=False, border=1, justify="center", escape=False)
+        return "<p>No candidates found.</p>"
+    df_slice = df.head(max_rows)
+    html = "<table style='border-collapse: collapse; width: 100%; font-family: Arial, sans-serif; font-size: 12px;'>"
+    html += "<thead><tr style='background-color: #f2f2f2;'>"
+    for col in df_slice.columns:
+        html += f"<th style='border: 1px solid #ddd; padding: 6px; text-align: left;'>{col}</th>"
+    html += "</tr></thead><tbody>"
+    for _, row in df_slice.iterrows():
+        html += "<tr>"
+        for col in df_slice.columns:
+            val_str = format_value(col, row[col])
+            html += f"<td style='border: 1px solid #ddd; padding: 6px;'>{val_str}</td>"
+        html += "</tr>"
+    html += "</tbody></table>"
+    return html
 
 
+# ------------------------------------------------------------------------------
+# EMAIL SENDING
+# ------------------------------------------------------------------------------
 def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str, detail_csv_filename: str) -> bool:
-    sender_email = get_cfg("email", "sender_email", env_name="SENDER_EMAIL")
-    sender_password = get_cfg("email", "sender_password", env_name="SENDER_PASSWORD")
-    recipient_email = get_cfg("email", "recipient_email", env_name="RECIPIENT_EMAIL")
-    smtp_server = get_cfg("email", "smtp_server", env_name="SMTP_SERVER", default="smtp.gmail.com")
-    smtp_port = get_cfg("email", "smtp_port", env_name="SMTP_PORT", default="587", is_int=True)
-
-    if not all([sender_email, sender_password, recipient_email]):
-        logger.warning("[EMAIL] Missing email credentials.")
+    if not os.path.exists(CREDENTIALS_FILE):
+        logger.error(f"[EMAIL] Credentials file '{CREDENTIALS_FILE}' not found.")
         return False
 
-    now = datetime.now()
-    subject = f"F&O Iteration Expansion Scan - {now.strftime('%Y-%m-%d %H:%M IST')}"
-    long_html = df_to_html_table(long_df, max_rows=15)
-    short_html = df_to_html_table(short_df, max_rows=15)
+    try:
+        config = configparser.ConfigParser()
+        config.read(CREDENTIALS_FILE)
+        sender_email = config.get("email", "sender_email", fallback=None)
+        sender_app_password = config.get("email", "sender_app_password", fallback=None)
+        recipient_email = config.get("email", "recipient_email", fallback=None)
 
-    body_html = f"""
-    <html>
-    <head>
-      <style>
-        body {{ font-family: Arial, sans-serif; font-size: 13px; }}
-        table {{ border-collapse: collapse; width: 100%; margin-bottom: 18px; }}
-        th, td {{ border: 1px solid #dddddd; padding: 6px; text-align: right; }}
-        th {{ background-color: #f2f2f2; text-align: center; }}
-        td:first-child {{ text-align: left; font-weight: bold; }}
-        p, li {{ line-height: 1.4; }}
-      </style>
-    </head>
-    <body>
-      <p>Hello,</p>
-      <p>This scan uses rolling cumulative iterations from market open. Example: 9:15-9:20, 9:15-9:25, 9:15-9:30 and so on, with every iteration compared against the same elapsed window over the previous 10 and 20 trading days.</p>
-      <p>Ease of Movement = Abs(% Change) / 10 Day Relative Volume. Stocks moving less than 1% are filtered out.</p>
-      <h3>Long Candidates - Top 15</h3>
-      {long_html}
-      <h3>Short Candidates - Top 15</h3>
-      {short_html}
-      <p><b>Columns</b></p>
-      <ul>
-        <li><b>Total Iterations</b>: number of 5-minute cumulative windows completed today.</li>
-        <li><b>Above Threshold Iterations</b>: number of iterations where Daily Volatility Expansion &gt; 1 and Daily Volume Expansion &gt; 1.</li>
-        <li><b>Above Threshold Ratio</b>: Above Threshold Iterations / Total Iterations.</li>
-      </ul>
-      <p>Attached files: {os.path.basename(csv_filename)} and {os.path.basename(detail_csv_filename)}</p>
-      <p>Generated at: {now.strftime('%Y-%m-%d %H:%M:%S')}</p>
-    </body>
-    </html>
-    """
+        if not all([sender_email, sender_app_password, recipient_email]):
+            logger.error("[EMAIL] Missing email credentials in config file.")
+            return False
 
-    msg = MIMEMultipart()
-    msg["From"] = sender_email
-    msg["To"] = recipient_email
-    msg["Subject"] = subject
-    msg.attach(MIMEText(body_html, "html"))
+        long_html = df_to_html_table(long_df, max_rows=15)
+        short_html = df_to_html_table(short_df, max_rows=15)
 
-    for fpath in [csv_filename, detail_csv_filename]:
-        try:
-            with open(fpath, "rb") as f:
+        html_body = f"""
+        <html>
+        <body style="font-family: Arial, sans-serif; color: #333;">
+            <h2>F&O Volatility & Volume Iteration Scan (Intraday)</h2>
+            <p>Scan completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}.</p>
+            <p>Filters applied: Daily Volatility Expansion &gt; {DAILY_VOL_THRESHOLD} AND Daily Volume Expansion &gt; {DAILY_VOLUME_THRESHOLD}.</p>
+            <p>Ease of Movement = Abs(% Change) / 10 Day Relative Volume. Stocks moving less than 1% are filtered out.</p>
+            <h3>Long Candidates - Top 15</h3>
+            {long_html}
+            <h3>Short Candidates - Top 15</h3>
+            {short_html}
+            <br>
+            <p>Full scan summary and detailed iteration data are attached as CSV files.</p>
+        </body>
+        </html>
+        """
+
+        msg = MIMEMultipart()
+        msg["From"] = sender_email
+        msg["To"] = recipient_email
+        msg["Subject"] = f"Intraday Vol & Iteration Alert - {datetime.now().strftime('%d %b %H:%M')}"
+        msg.attach(MIMEText(html_body, "html"))
+
+        # Attach Summary CSV
+        if os.path.exists(csv_filename):
+            with open(csv_filename, "rb") as f:
                 part = MIMEBase("application", "octet-stream")
                 part.set_payload(f.read())
             encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(fpath)}"')
+            part.add_header("Content-Disposition", f"attachment; filename= {os.path.basename(csv_filename)}")
             msg.attach(part)
-        except Exception as e:
-            logger.warning(f"[EMAIL] Failed to attach {fpath}: {e}")
 
-    try:
-        with smtplib.SMTP(smtp_server, smtp_port) as server:
-            server.starttls()
-            server.login(sender_email, sender_password)
-            server.send_message(msg)
-        logger.info("[EMAIL] Email sent successfully.")
+        # Attach Detail CSV
+        if os.path.exists(detail_csv_filename):
+            with open(detail_csv_filename, "rb") as f:
+                part2 = MIMEBase("application", "octet-stream")
+                part2.set_payload(f.read())
+            encoders.encode_base64(part2)
+            part2.add_header("Content-Disposition", f"attachment; filename= {os.path.basename(detail_csv_filename)}")
+            msg.attach(part2)
+
+        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server.starttls()
+        server.login(sender_email, sender_app_password)
+        server.send_message(msg)
+        server.quit()
+        logger.info(f"[EMAIL] Sent successfully to {recipient_email}")
         return True
     except Exception as e:
-        logger.error(f"[EMAIL] Error sending email: {e}")
+        logger.error(f"[EMAIL] Failed to send email: {e}")
         return False
 
 
+# ------------------------------------------------------------------------------
+# MAIN PIPELINE
+# ------------------------------------------------------------------------------
 def main():
+    logger.info("=== Starting F&O Iteration Volume & Volatility Scan ===")
+    init_fyers()
     df_all, df_iter = scan_fno_universe()
-    if df_all is None or df_all.empty:
-        logger.error("[MAIN] No data to email. Exiting.")
-        return
 
-    long_df, short_df = build_candidate_tables(df_all)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    summary_csv = f"fo_fyers_iteration_summary_{timestamp}.csv"
+    detail_csv = f"fo_fyers_iteration_details_{timestamp}.csv"
 
-    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-    summary_csv = f"fo_fyers_iteration_scan_{ts}.csv"
-    detail_csv = f"fo_fyers_iteration_detail_{ts}.csv"
-
-    df_all.to_csv(summary_csv, index=False)
-    logger.info(f"[MAIN] Saved summary scan to {summary_csv}")
+    if df_all is not None and not df_all.empty:
+        df_all.to_csv(summary_csv, index=False)
+        logger.info(f"[OUTPUT] Saved summary scan results to {summary_csv}")
+        long_df, short_df = build_candidate_tables(df_all)
+    else:
+        logger.warning("[OUTPUT] Summary dataframe is empty.")
+        pd.DataFrame(columns=DISPLAY_COLS).to_csv(summary_csv, index=False)
+        long_df, short_df = pd.DataFrame(columns=DISPLAY_COLS), pd.DataFrame(columns=DISPLAY_COLS)
 
     if df_iter is not None and not df_iter.empty:
         df_iter.to_csv(detail_csv, index=False)
+        logger.info(f"[OUTPUT] Saved detailed iteration results to {detail_csv}")
     else:
+        logger.warning("[OUTPUT] Iteration details dataframe is empty.")
         pd.DataFrame(columns=["Symbol", "Iteration No", "Iteration Minutes", "Iteration Time", "Current Volume", "10 Day Relative Volume", "20 Day Relative Volume", "Daily Volume Expansion", "LTP", "% Change", "Daily Volatility Expansion", "Above DV and DVol"]).to_csv(detail_csv, index=False)
-    logger.info(f"[MAIN] Saved iteration detail scan to {detail_csv}")
 
     send_email_with_tables(long_df, short_df, summary_csv, detail_csv)
+    logger.info("=== Scan Pipeline Completed ===")
 
 
 if __name__ == "__main__":
