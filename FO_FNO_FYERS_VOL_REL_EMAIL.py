@@ -44,8 +44,8 @@ def init_fyers():
     global fyers
     try:
         # STRICTLY USE SECRETS/ENV VARIABLES AS REQUESTED
-        client_id = os.environ.get("CLIENTID")
-        access_token = os.environ.get("ACCESSTOKEN")
+        client_id = os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID")
+        access_token = os.environ.get("ACCESS_TOKEN") or os.environ.get("ACCESSTOKEN")
 
         if not client_id or not access_token:
             logger.warning("[INIT] Missing Fyers credentials in environment. Check GitHub Secrets. Proceeding with empty data.")
@@ -416,10 +416,10 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
 def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str, detail_csv_filename: str) -> bool:
     try:
         # STRICTLY USE SECRETS/ENV VARIABLES AS REQUESTED
-        sender_email = os.environ.get("SENDEREMAIL")
-        sender_app_password = os.environ.get("SENDERPASSWORD")
-        recipient_email = os.environ.get("RECIPIENTEMAIL")
-        smtp_port = os.environ.get("SMTPPORT", "587")
+        sender_email = os.environ.get("SENDER_EMAIL") or os.environ.get("SENDEREMAIL")
+        sender_app_password = os.environ.get("SENDER_PASSWORD") or os.environ.get("SENDERPASSWORD")
+        recipient_email = os.environ.get("RECIPIENT_EMAIL") or os.environ.get("RECIPIENTEMAIL")
+        smtp_port = os.environ.get("SMTP_PORT") or os.environ.get("SMTPPORT", "587")
 
         if not all([sender_email, sender_app_password, recipient_email]):
             logger.warning("[EMAIL] Missing email credentials in environment. Check GitHub Secrets. Skipping email notification.")
