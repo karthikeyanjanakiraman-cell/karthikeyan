@@ -1,7 +1,6 @@
 import os
 import sys
 import logging
-import configparser
 from datetime import datetime, timedelta, time
 from typing import List, Dict, Optional, Tuple
 
@@ -32,9 +31,6 @@ formatter = UTF8Formatter("%(asctime)s [%(levelname)s] %(message)s", datefmt="%Y
 ch.setFormatter(formatter)
 logger.addHandler(ch)
 
-SECTORS_FILE = "sectors"
-CREDENTIALS_FILE = "config.ini"
-
 DAILY_LOOKBACK_DAYS = 60
 INTRADAY_LOOKBACK_DAYS = 20
 
@@ -44,37 +40,15 @@ DAILY_VOLUME_THRESHOLD = 1.0
 fyers: Optional[fyersModel.FyersModel] = None
 
 
-def get_env_or_config(section: str, key: str, env_names: List[str], default=None):
-    for env_name in env_names:
-        val = os.environ.get(env_name)
-        if val is not None and str(val).strip() != "":
-            return val
-    if os.path.exists(CREDENTIALS_FILE):
-        config = configparser.ConfigParser()
-        config.read(CREDENTIALS_FILE)
-        if config.has_section(section):
-            return config.get(section, key, fallback=default)
-    return default
-
-
 def init_fyers():
     global fyers
     try:
-        # Try both the original keys used in other scripts and the new ones
-        client_id = get_env_or_config(
-            "fyers_credentials", "client_id", ["FYERS_CLIENT_ID", "CLIENTID", "CLIENT_ID"]
-        ) or get_env_or_config(
-            "fyers", "client_id", ["FYERS_CLIENT_ID", "CLIENTID", "CLIENT_ID"]
-        )
-        
-        access_token = get_env_or_config(
-            "fyers_credentials", "access_token", ["FYERS_ACCESS_TOKEN", "ACCESSTOKEN", "ACCESS_TOKEN", "TOKEN"]
-        ) or get_env_or_config(
-            "fyers", "access_token", ["FYERS_ACCESS_TOKEN", "ACCESSTOKEN", "ACCESS_TOKEN", "TOKEN"]
-        )
+        # STRICTLY USE SECRETS/ENV VARIABLES AS REQUESTED
+        client_id = os.environ.get("CLIENTID")
+        access_token = os.environ.get("ACCESSTOKEN")
 
         if not client_id or not access_token:
-            logger.warning("[INIT] Missing Fyers credentials. Setting fyers=None and proceeding with empty data.")
+            logger.warning("[INIT] Missing Fyers credentials in environment. Check GitHub Secrets. Proceeding with empty data.")
             fyers = None
             return
 
@@ -90,23 +64,36 @@ def init_fyers():
         fyers = None
 
 
-def load_fno_symbols_from_sectors(folder_path: str) -> List[str]:
+def load_fno_symbols_from_sectors(root_dir: str = "sectors") -> List[str]:
     symbols = set()
-    if not os.path.exists(folder_path):
-        logger.warning(f"[CORE] Sectors folder '{folder_path}' not found.")
+    if not os.path.isdir(root_dir):
+        logger.warning(f"[FNO] Sectors folder '{root_dir}' not found; returning empty list.")
         return []
-    for fn in os.listdir(folder_path):
-        if fn.endswith(".txt") and fn != "fno.txt":
+
+    for dirpath, _, filenames in os.walk(root_dir):
+        for fname in filenames:
+            if not fname.lower().endswith(".csv"):
+                continue
+            fpath = os.path.join(dirpath, fname)
             try:
-                with open(os.path.join(folder_path, fn), "r") as f:
-                    for line in f:
-                        line = line.strip()
-                        if line and not line.startswith("#"):
-                            symbols.add(line)
+                df = pd.read_csv(fpath)
+                col = None
+                for c in df.columns:
+                    if c.lower() in ("symbol", "symbols", "ticker"):
+                        col = c
+                        break
+                if col is None:
+                    continue
+                for s in df[col].dropna().astype(str):
+                    s = s.strip()
+                    if s:
+                        symbols.add(s)
             except Exception as e:
-                logger.error(f"[CORE] Error reading {fn}: {e}")
-    logger.info(f"[CORE] Loaded {len(symbols)} unique F&O symbols from sectors folder.")
-    return sorted(list(symbols))
+                logger.warning(f"[FNO] Error reading {fpath}: {e}")
+
+    symbols_list = sorted(symbols)
+    logger.info(f"[FNO] Loaded {len(symbols_list)} unique F&O symbols.")
+    return symbols_list
 
 
 def format_fyers_symbol(symbol: str) -> str:
@@ -428,13 +415,14 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
 
 def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str, detail_csv_filename: str) -> bool:
     try:
-        sender_email = get_env_or_config("email", "sender_email", ["SENDEREMAIL", "SENDER_EMAIL"])
-        sender_app_password = get_env_or_config("email", "sender_app_password", ["SENDERPASSWORD", "SENDER_PASSWORD"])
-        recipient_email = get_env_or_config("email", "recipient_email", ["RECIPIENTEMAIL", "RECIPIENT_EMAIL"])
-        smtp_port = get_env_or_config("email", "smtp_port", ["SMTPPORT", "SMTP_PORT"], default="587")
+        # STRICTLY USE SECRETS/ENV VARIABLES AS REQUESTED
+        sender_email = os.environ.get("SENDEREMAIL")
+        sender_app_password = os.environ.get("SENDERPASSWORD")
+        recipient_email = os.environ.get("RECIPIENTEMAIL")
+        smtp_port = os.environ.get("SMTPPORT", "587")
 
         if not all([sender_email, sender_app_password, recipient_email]):
-            logger.warning("[EMAIL] Missing email credentials. Skipping email notification.")
+            logger.warning("[EMAIL] Missing email credentials in environment. Check GitHub Secrets. Skipping email notification.")
             return False
 
         long_html = df_to_html_table(long_df, max_rows=15)
