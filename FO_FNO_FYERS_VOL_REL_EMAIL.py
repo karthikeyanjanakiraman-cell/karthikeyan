@@ -156,7 +156,7 @@ def get_fyers_history(symbol: str, resolution: str, days_back: int) -> Optional[
             if not candles:
                 break
             df_chunk = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
-            df_chunk["timestamp"] = pd.to_datetime(df_chunk["timestamp"], unit="s")
+            df_chunk["timestamp"] = pd.to_datetime(df_chunk["timestamp"], unit="s").dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
             all_chunks.append(df_chunk)
         except Exception as e:
             logger.warning(f"[API] {symbol} {resolution} history fetch failed: {e}")
