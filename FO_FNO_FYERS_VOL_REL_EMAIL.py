@@ -355,7 +355,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"),
             "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"),
             "Daily Volume Expansion": daily_volume_exp,
-            "Momentum Score": momentum_score,
+            "Ease of Movement": ease_of_movement,
             "Total Iterations": total_iterations,
             "Above Threshold Iterations": above_count,
             "Above Threshold Ratio": above_ratio,
@@ -376,7 +376,7 @@ DISPLAY_COLS = [
     "10 Day Relative Volume",
     "20 Day Relative Volume",
     "Daily Volume Expansion",
-    "Momentum Score",
+    "Ease of Movement",
     "Total Iterations",
     "Above Threshold Iterations",
     "Above Threshold Ratio",
@@ -392,17 +392,17 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
     base = df_all.copy()
     base = base[(base["Daily Volatility Expansion"] > DAILY_VOL_THRESHOLD) & (base["Daily Volume Expansion"] > DAILY_VOLUME_THRESHOLD)].copy()
 
-    long_df = base[base["% Change"] > 0].copy()
-    short_df = base[base["% Change"] < 0].copy()
+    long_df = base[base["% Change"] >= 1.0].copy()
+    short_df = base[base["% Change"] <= -1.0].copy()
 
     long_df = long_df.sort_values(
-        by=["Above Threshold Iterations", "Momentum Score", "% Change"],
+        by=["Above Threshold Iterations", "Ease of Movement", "% Change"],
         ascending=[False, False, False],
         na_position="last",
     ).head(15)
 
     short_df = short_df.sort_values(
-        by=["Above Threshold Iterations", "Momentum Score", "% Change"],
+        by=["Above Threshold Iterations", "Ease of Movement", "% Change"],
         ascending=[False, False, True],
         na_position="last",
     ).head(15)
@@ -413,7 +413,7 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
 def format_value(col: str, val):
     if pd.isna(val):
         return ""
-    if col in ["LTP", "Current Daily Volatility", "Avg Daily Volatility", "Daily Volatility Expansion", "10 Day Relative Volume", "20 Day Relative Volume", "Daily Volume Expansion", "Momentum Score"]:
+    if col in ["LTP", "Current Daily Volatility", "Avg Daily Volatility", "Daily Volatility Expansion", "10 Day Relative Volume", "20 Day Relative Volume", "Daily Volume Expansion", "Ease of Movement"]:
         return f"{val:.2f}"
     if col == "% Change":
         return f"{val:+.2f}%"
@@ -466,7 +466,7 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
     <body>
       <p>Hello,</p>
       <p>This scan uses rolling cumulative iterations from market open. Example: 9:15-9:20, 9:15-9:25, 9:15-9:30 and so on, with every iteration compared against the same elapsed window over the previous 10 and 20 trading days.</p>
-      <p>Momentum Score = Daily Volatility Expansion × Daily Volume Expansion. % Change is not part of the score.</p>
+      <p>Ease of Movement = Abs(% Change) / 10 Day Relative Volume. Stocks moving less than 1% are filtered out.</p>
       <h3>Long Candidates - Top 15</h3>
       {long_html}
       <h3>Short Candidates - Top 15</h3>
