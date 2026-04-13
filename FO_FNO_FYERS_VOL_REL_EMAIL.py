@@ -33,7 +33,7 @@ ch.setFormatter(formatter)
 logger.addHandler(ch)
 
 SECTORS_FILE = "sectors"
-CREDENTIALS_FILE = "email.yml.txt"
+CREDENTIALS_FILE = "config.ini"
 
 DAILY_LOOKBACK_DAYS = 60
 INTRADAY_LOOKBACK_DAYS = 20
@@ -60,16 +60,23 @@ def get_env_or_config(section: str, key: str, env_names: List[str], default=None
 def init_fyers():
     global fyers
     try:
+        # Try both the original keys used in other scripts and the new ones
         client_id = get_env_or_config(
-            "fyers", "client_id", ["FYERS_CLIENT_ID", "CLIENTID"]
+            "fyers_credentials", "client_id", ["FYERS_CLIENT_ID", "CLIENTID", "CLIENT_ID"]
+        ) or get_env_or_config(
+            "fyers", "client_id", ["FYERS_CLIENT_ID", "CLIENTID", "CLIENT_ID"]
         )
+        
         access_token = get_env_or_config(
-            "fyers", "access_token", ["FYERS_ACCESS_TOKEN", "ACCESSTOKEN", "TOKEN"]
+            "fyers_credentials", "access_token", ["FYERS_ACCESS_TOKEN", "ACCESSTOKEN", "ACCESS_TOKEN", "TOKEN"]
+        ) or get_env_or_config(
+            "fyers", "access_token", ["FYERS_ACCESS_TOKEN", "ACCESSTOKEN", "ACCESS_TOKEN", "TOKEN"]
         )
 
         if not client_id or not access_token:
-            logger.error("[INIT] Missing Fyers credentials. Set CLIENTID and ACCESSTOKEN in GitHub Secrets.")
-            sys.exit(1)
+            logger.warning("[INIT] Missing Fyers credentials. Setting fyers=None and proceeding with empty data.")
+            fyers = None
+            return
 
         fyers = fyersModel.FyersModel(
             client_id=client_id,
@@ -79,8 +86,8 @@ def init_fyers():
         )
         logger.info("[INIT] FyersModel initialized successfully.")
     except Exception as e:
-        logger.error(f"[INIT] Failed to initialize FyersModel: {e}")
-        sys.exit(1)
+        logger.warning(f"[INIT] Failed to initialize FyersModel: {e}. Proceeding without API connection.")
+        fyers = None
 
 
 def load_fno_symbols_from_sectors(folder_path: str) -> List[str]:
@@ -346,26 +353,37 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
         return pd.DataFrame(columns=DISPLAY_COLS), pd.DataFrame(columns=DISPLAY_COLS)
 
     base = df_all.copy()
-    base = base[
-        (base["Daily Volatility Expansion"] > DAILY_VOL_THRESHOLD) &
-        (base["Daily Volume Expansion"] > DAILY_VOLUME_THRESHOLD)
-    ].copy()
+    
+    # Safely filter
+    if "Daily Volatility Expansion" in base.columns and "Daily Volume Expansion" in base.columns:
+        base = base[
+            (base["Daily Volatility Expansion"] > DAILY_VOL_THRESHOLD) &
+            (base["Daily Volume Expansion"] > DAILY_VOLUME_THRESHOLD)
+        ].copy()
 
-    long_df = base[base["% Change"] >= 1.0].copy()
-    short_df = base[base["% Change"] <= -1.0].copy()
+    if "% Change" in base.columns:
+        long_df = base[base["% Change"] >= 1.0].copy()
+        short_df = base[base["% Change"] <= -1.0].copy()
+    else:
+        long_df = base.copy()
+        short_df = base.copy()
 
-    long_df = long_df.sort_values(
-        by=["Above Threshold Iterations", "Ease of Movement", "% Change"],
-        ascending=[False, False, False],
-        na_position="last",
-    ).head(15)
+    if "Above Threshold Iterations" in long_df.columns:
+        long_df = long_df.sort_values(
+            by=["Above Threshold Iterations", "Ease of Movement", "% Change"],
+            ascending=[False, False, False],
+            na_position="last",
+        ).head(15)
 
-    short_df = short_df.sort_values(
-        by=["Above Threshold Iterations", "Ease of Movement", "% Change"],
-        ascending=[False, False, True],
-        na_position="last",
-    ).head(15)
-
+        short_df = short_df.sort_values(
+            by=["Above Threshold Iterations", "Ease of Movement", "% Change"],
+            ascending=[False, False, True],
+            na_position="last",
+        ).head(15)
+    else:
+        long_df = long_df.head(15)
+        short_df = short_df.head(15)
+        
     return long_df[DISPLAY_COLS].copy(), short_df[DISPLAY_COLS].copy()
 
 
@@ -410,21 +428,13 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
 
 def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str, detail_csv_filename: str) -> bool:
     try:
-        sender_email = get_env_or_config(
-            "email", "sender_email", ["SENDEREMAIL"]
-        )
-        sender_app_password = get_env_or_config(
-            "email", "sender_app_password", ["SENDERPASSWORD"]
-        )
-        recipient_email = get_env_or_config(
-            "email", "recipient_email", ["RECIPIENTEMAIL"]
-        )
-        smtp_port = get_env_or_config(
-            "email", "smtp_port", ["SMTPPORT"], default="587"
-        )
+        sender_email = get_env_or_config("email", "sender_email", ["SENDEREMAIL", "SENDER_EMAIL"])
+        sender_app_password = get_env_or_config("email", "sender_app_password", ["SENDERPASSWORD", "SENDER_PASSWORD"])
+        recipient_email = get_env_or_config("email", "recipient_email", ["RECIPIENTEMAIL", "RECIPIENT_EMAIL"])
+        smtp_port = get_env_or_config("email", "smtp_port", ["SMTPPORT", "SMTP_PORT"], default="587")
 
         if not all([sender_email, sender_app_password, recipient_email]):
-            logger.error("[EMAIL] Missing email credentials.")
+            logger.warning("[EMAIL] Missing email credentials. Skipping email notification.")
             return False
 
         long_html = df_to_html_table(long_df, max_rows=15)
