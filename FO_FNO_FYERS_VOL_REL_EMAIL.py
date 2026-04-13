@@ -1,12 +1,10 @@
 import os
 import sys
-import math
 import logging
 import configparser
 from datetime import datetime, timedelta, time
 from typing import List, Dict, Optional, Tuple
 
-import numpy as np
 import pandas as pd
 from fyers_apiv3 import fyersModel
 import smtplib
@@ -19,14 +17,10 @@ from email import encoders
 class UTF8Formatter(logging.Formatter):
     def format(self, record):
         msg = record.getMessage()
-        # Force encoding to ascii, ignoring/replacing non-ascii, then back to string
         record.msg = msg.encode("ascii", "ignore").decode("ascii")
         return super().format(record)
 
 
-# ------------------------------------------------------------------------------
-# CONFIGURATION
-# ------------------------------------------------------------------------------
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 if logger.hasHandlers():
@@ -44,33 +38,51 @@ CREDENTIALS_FILE = "email.yml.txt"
 DAILY_LOOKBACK_DAYS = 60
 INTRADAY_LOOKBACK_DAYS = 20
 
-# THRESHOLDS
 DAILY_VOL_THRESHOLD = 1.0
 DAILY_VOLUME_THRESHOLD = 1.0
 
 fyers: Optional[fyersModel.FyersModel] = None
 
-# ------------------------------------------------------------------------------
-# FYERS INITIALIZATION
-# ------------------------------------------------------------------------------
+
+def get_env_or_config(section: str, key: str, env_names: List[str], default=None):
+    for env_name in env_names:
+        val = os.environ.get(env_name)
+        if val is not None and str(val).strip() != "":
+            return val
+    if os.path.exists(CREDENTIALS_FILE):
+        config = configparser.ConfigParser()
+        config.read(CREDENTIALS_FILE)
+        if config.has_section(section):
+            return config.get(section, key, fallback=default)
+    return default
+
+
 def init_fyers():
     global fyers
     try:
-        client_id = os.environ.get("FYERS_CLIENT_ID")
-        access_token = os.environ.get("FYERS_ACCESS_TOKEN")
+        client_id = get_env_or_config(
+            "fyers", "client_id", ["FYERS_CLIENT_ID", "CLIENTID"]
+        )
+        access_token = get_env_or_config(
+            "fyers", "access_token", ["FYERS_ACCESS_TOKEN", "ACCESSTOKEN", "TOKEN"]
+        )
+
         if not client_id or not access_token:
-            logger.error("[INIT] FYERS_CLIENT_ID or FYERS_ACCESS_TOKEN not set in environment.")
+            logger.error("[INIT] Missing Fyers credentials. Set CLIENTID and ACCESSTOKEN in GitHub Secrets.")
             sys.exit(1)
-        fyers = fyersModel.FyersModel(client_id=client_id, is_async=False, token=access_token, log_path="")
+
+        fyers = fyersModel.FyersModel(
+            client_id=client_id,
+            is_async=False,
+            token=access_token,
+            log_path=""
+        )
         logger.info("[INIT] FyersModel initialized successfully.")
     except Exception as e:
         logger.error(f"[INIT] Failed to initialize FyersModel: {e}")
         sys.exit(1)
 
 
-# ------------------------------------------------------------------------------
-# DATA LOADING
-# ------------------------------------------------------------------------------
 def load_fno_symbols_from_sectors(folder_path: str) -> List[str]:
     symbols = set()
     if not os.path.exists(folder_path):
@@ -112,10 +124,17 @@ def get_fyers_history(symbol: str, resolution: str, days_back: int) -> Optional[
         }
         res = fyers.history(data=data)
         if res and res.get("s") == "ok" and "candles" in res and res["candles"]:
-            df = pd.DataFrame(res["candles"], columns=["timestamp", "open", "high", "low", "close", "volume"])
+            df = pd.DataFrame(
+                res["candles"],
+                columns=["timestamp", "open", "high", "low", "close", "volume"]
+            )
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
-            # Convert to IST
-            df["timestamp"] = df["timestamp"].dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+            df["timestamp"] = (
+                df["timestamp"]
+                .dt.tz_localize("UTC")
+                .dt.tz_convert("Asia/Kolkata")
+                .dt.tz_localize(None)
+            )
             df.sort_values("timestamp", inplace=True)
             df.reset_index(drop=True, inplace=True)
             return df
@@ -125,9 +144,6 @@ def get_fyers_history(symbol: str, resolution: str, days_back: int) -> Optional[
         return None
 
 
-# ------------------------------------------------------------------------------
-# COMPUTATIONS
-# ------------------------------------------------------------------------------
 def compute_volatility_pair(daily_df: Optional[pd.DataFrame]) -> Dict[str, float]:
     if daily_df is None or daily_df.empty or len(daily_df) < 11:
         return {}
@@ -166,9 +182,11 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         return {}, pd.DataFrame()
 
     curr_df.sort_values("time", inplace=True)
-    ltp = float(curr_df["close"].iloc[-1])
+    curr_df["cum_vol"] = curr_df["volume"].cumsum()
 
+    ltp = float(curr_df["close"].iloc[-1])
     rows = []
+
     total_iters = 0
     last_iter_mins = None
     last_iter_time = None
@@ -178,34 +196,27 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
     last_dvol_exp = 0
 
     avg_daily_vol_10 = hist_df_10.groupby("date")["volume"].sum().mean() if not hist_df_10.empty else 0
-    
-    # Iterate through current day's candles to build the profile
-    curr_df["cum_vol"] = curr_df["volume"].cumsum()
-    
+
     for i in range(len(curr_df)):
         total_iters += 1
         row = curr_df.iloc[i]
         t = row["time"]
         cum_vol = float(row["cum_vol"])
-        
-        # Calculate 10-day average cumulative volume up to this time
+
         h10 = hist_df_10[hist_df_10["time"] <= t]
         avg_cum_10 = h10.groupby("date")["volume"].sum().mean() if not h10.empty else 0
         rvol_10 = (cum_vol / avg_cum_10) if avg_cum_10 > 0 else 0
-        
-        # Calculate 20-day average cumulative volume up to this time
+
         h20 = hist_df_20[hist_df_20["time"] <= t]
         avg_cum_20 = h20.groupby("date")["volume"].sum().mean() if not h20.empty else 0
         rvol_20 = (cum_vol / avg_cum_20) if avg_cum_20 > 0 else 0
-        
-        # Daily Volume Expansion is based on the 10-day total average
+
         dvol_exp = (cum_vol / avg_daily_vol_10) if avg_daily_vol_10 > 0 else 0
-        
-        # Calculate iteration minutes (e.g. 5, 10, 15...)
+
         dt_time = datetime.combine(current_date, t)
         market_open = datetime.combine(current_date, time(9, 15))
         iter_mins = int((dt_time - market_open).total_seconds() / 60) + 5
-        
+
         rows.append({
             "Iteration No": total_iters,
             "Iteration Minutes": iter_mins,
@@ -215,14 +226,14 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
             "20 Day Relative Volume": rvol_20,
             "Daily Volume Expansion": dvol_exp,
         })
-        
+
         last_cum_vol = cum_vol
         last_rvol_10 = rvol_10
         last_rvol_20 = rvol_20
         last_dvol_exp = dvol_exp
         last_iter_mins = iter_mins
         last_iter_time = t.strftime("%H:%M")
-        
+
     detail_df = pd.DataFrame(rows)
     summary = {
         "LTP": ltp,
@@ -237,9 +248,6 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
     return summary, detail_df
 
 
-# ------------------------------------------------------------------------------
-# MAIN SCANNER
-# ------------------------------------------------------------------------------
 def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
     symbols = load_fno_symbols_from_sectors("sectors")
     if not symbols:
@@ -338,7 +346,10 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
         return pd.DataFrame(columns=DISPLAY_COLS), pd.DataFrame(columns=DISPLAY_COLS)
 
     base = df_all.copy()
-    base = base[(base["Daily Volatility Expansion"] > DAILY_VOL_THRESHOLD) & (base["Daily Volume Expansion"] > DAILY_VOLUME_THRESHOLD)].copy()
+    base = base[
+        (base["Daily Volatility Expansion"] > DAILY_VOL_THRESHOLD) &
+        (base["Daily Volume Expansion"] > DAILY_VOLUME_THRESHOLD)
+    ].copy()
 
     long_df = base[base["% Change"] >= 1.0].copy()
     short_df = base[base["% Change"] <= -1.0].copy()
@@ -361,14 +372,18 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
 def format_value(col: str, val):
     if pd.isna(val):
         return ""
-    if col in ["LTP", "Current Daily Volatility", "Avg Daily Volatility", "Daily Volatility Expansion", "10 Day Relative Volume", "20 Day Relative Volume", "Daily Volume Expansion", "Ease of Movement"]:
+    if col in [
+        "LTP", "Current Daily Volatility", "Avg Daily Volatility",
+        "Daily Volatility Expansion", "10 Day Relative Volume",
+        "20 Day Relative Volume", "Daily Volume Expansion", "Ease of Movement"
+    ]:
         return f"{val:.2f}"
     if col == "% Change":
         return f"{val:+.2f}%"
     if col == "Current Volume":
         return f"{int(val):,}"
     if col == "Above Threshold Ratio":
-        return f"{val*100:.2f}%"
+        return f"{val * 100:.2f}%"
     if col in ["Total Iterations", "Above Threshold Iterations", "Last Iteration Minutes"]:
         return f"{int(val)}"
     return str(val)
@@ -393,23 +408,23 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     return html
 
 
-# ------------------------------------------------------------------------------
-# EMAIL SENDING
-# ------------------------------------------------------------------------------
 def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str, detail_csv_filename: str) -> bool:
-    if not os.path.exists(CREDENTIALS_FILE):
-        logger.error(f"[EMAIL] Credentials file '{CREDENTIALS_FILE}' not found.")
-        return False
-
     try:
-        config = configparser.ConfigParser()
-        config.read(CREDENTIALS_FILE)
-        sender_email = config.get("email", "sender_email", fallback=None)
-        sender_app_password = config.get("email", "sender_app_password", fallback=None)
-        recipient_email = config.get("email", "recipient_email", fallback=None)
+        sender_email = get_env_or_config(
+            "email", "sender_email", ["SENDEREMAIL"]
+        )
+        sender_app_password = get_env_or_config(
+            "email", "sender_app_password", ["SENDERPASSWORD"]
+        )
+        recipient_email = get_env_or_config(
+            "email", "recipient_email", ["RECIPIENTEMAIL"]
+        )
+        smtp_port = get_env_or_config(
+            "email", "smtp_port", ["SMTPPORT"], default="587"
+        )
 
         if not all([sender_email, sender_app_password, recipient_email]):
-            logger.error("[EMAIL] Missing email credentials in config file.")
+            logger.error("[EMAIL] Missing email credentials.")
             return False
 
         long_html = df_to_html_table(long_df, max_rows=15)
@@ -438,29 +453,28 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
         msg["Subject"] = f"Intraday Vol & Iteration Alert - {datetime.now().strftime('%d %b %H:%M')}"
         msg.attach(MIMEText(html_body, "html"))
 
-        # Attach Summary CSV
         if os.path.exists(csv_filename):
             with open(csv_filename, "rb") as f:
                 part = MIMEBase("application", "octet-stream")
                 part.set_payload(f.read())
             encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f"attachment; filename= {os.path.basename(csv_filename)}")
+            part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(csv_filename)}")
             msg.attach(part)
 
-        # Attach Detail CSV
         if os.path.exists(detail_csv_filename):
             with open(detail_csv_filename, "rb") as f:
                 part2 = MIMEBase("application", "octet-stream")
                 part2.set_payload(f.read())
             encoders.encode_base64(part2)
-            part2.add_header("Content-Disposition", f"attachment; filename= {os.path.basename(detail_csv_filename)}")
+            part2.add_header("Content-Disposition", f"attachment; filename={os.path.basename(detail_csv_filename)}")
             msg.attach(part2)
 
-        server = smtplib.SMTP("smtp.gmail.com", 587)
+        server = smtplib.SMTP("smtp.gmail.com", int(smtp_port))
         server.starttls()
         server.login(sender_email, sender_app_password)
         server.send_message(msg)
         server.quit()
+
         logger.info(f"[EMAIL] Sent successfully to {recipient_email}")
         return True
     except Exception as e:
@@ -468,9 +482,6 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
         return False
 
 
-# ------------------------------------------------------------------------------
-# MAIN PIPELINE
-# ------------------------------------------------------------------------------
 def main():
     logger.info("=== Starting F&O Iteration Volume & Volatility Scan ===")
     init_fyers()
@@ -494,7 +505,12 @@ def main():
         logger.info(f"[OUTPUT] Saved detailed iteration results to {detail_csv}")
     else:
         logger.warning("[OUTPUT] Iteration details dataframe is empty.")
-        pd.DataFrame(columns=["Symbol", "Iteration No", "Iteration Minutes", "Iteration Time", "Current Volume", "10 Day Relative Volume", "20 Day Relative Volume", "Daily Volume Expansion", "LTP", "% Change", "Daily Volatility Expansion", "Above DV and DVol"]).to_csv(detail_csv, index=False)
+        pd.DataFrame(columns=[
+            "Symbol", "Iteration No", "Iteration Minutes", "Iteration Time",
+            "Current Volume", "10 Day Relative Volume", "20 Day Relative Volume",
+            "Daily Volume Expansion", "LTP", "% Change",
+            "Daily Volatility Expansion", "Above DV and DVol"
+        ]).to_csv(detail_csv, index=False)
 
     send_email_with_tables(long_df, short_df, summary_csv, detail_csv)
     logger.info("=== Scan Pipeline Completed ===")
