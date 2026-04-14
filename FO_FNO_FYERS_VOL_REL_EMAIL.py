@@ -397,10 +397,12 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
 
     base = df_all.copy()
     if "Daily Volatility Expansion" in base.columns and "Daily Volume Expansion" in base.columns:
-        base = base[
+        filtered = base[
             (base["Daily Volatility Expansion"] > DAILY_VOL_THRESHOLD)
             & (base["Daily Volume Expansion"] > DAILY_VOLUME_THRESHOLD)
         ].copy()
+        if not filtered.empty:
+            base = filtered
 
     def _sort_long(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
@@ -425,25 +427,31 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
         strict_short = base[(base["% Change"] < 0) & (base["Cumulative -DI"] > base["Cumulative +DI"])].copy()
         fallback_long = base[base["% Change"] > 0].copy()
         fallback_short = base[base["% Change"] < 0].copy()
+        broader_short = base.copy().sort_values(by=["% Change"], ascending=[True], na_position="last")
     else:
         strict_long = base.copy()
         strict_short = base.copy()
         fallback_long = base.copy()
         fallback_short = base.copy()
+        broader_short = base.copy()
 
     long_df = _sort_long(strict_long)
     short_df = _sort_short(strict_short)
 
     if len(long_df) < 15:
         extra_long = _sort_long(fallback_long[~fallback_long["Symbol"].isin(long_df["Symbol"])])
-        long_df = pd.concat([long_df, extra_long], ignore_index=False)
+        long_df = pd.concat([long_df, extra_long])
 
     if len(short_df) < 15:
         extra_short = _sort_short(fallback_short[~fallback_short["Symbol"].isin(short_df["Symbol"])])
-        short_df = pd.concat([short_df, extra_short], ignore_index=False)
+        short_df = pd.concat([short_df, extra_short])
 
-    long_df = long_df.head(15)
-    short_df = short_df.head(15)
+    if len(short_df) < 15:
+        extra_broader = broader_short[~broader_short["Symbol"].isin(short_df["Symbol"])]
+        short_df = pd.concat([short_df, extra_broader])
+
+    long_df = long_df.drop_duplicates(subset=["Symbol"]).head(15)
+    short_df = short_df.drop_duplicates(subset=["Symbol"]).head(15)
 
     return long_df[DISPLAY_COLS].copy(), short_df[DISPLAY_COLS].copy()
 
@@ -517,7 +525,7 @@ def _first_env(*keys: str) -> Optional[str]:
 def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str, detail_csv_filename: str) -> bool:
     try:
         sender_email_keys = ["SENDER_EMAIL", "EMAIL_USER", "GMAIL_USER", "SMTP_USERNAME", "MAIL_USERNAME", "FROM_EMAIL", "EMAIL_FROM"]
-        sender_password_keys = ["SENDER_APP_PASSWORD", "EMAIL_PASSWORD", "GMAIL_APP_PASSWORD", "SMTP_PASSWORD", "MAIL_PASSWORD", "APP_PASSWORD", "EMAIL_APP_PASSWORD"]
+        sender_password_keys = ["SENDER_APP_PASSWORD", "SENDER_PASSWORD", "EMAIL_PASSWORD", "EMAIL_PASS", "GMAIL_APP_PASSWORD", "GMAIL_PASSWORD", "SMTP_PASSWORD", "MAIL_PASSWORD", "APP_PASSWORD", "EMAIL_APP_PASSWORD", "PASSWORD"]
         recipient_keys = ["RECIPIENT_EMAIL", "TO_EMAIL", "ALERT_EMAIL", "MAIL_TO", "EMAIL_TO"]
 
         sender_email = _first_env(*sender_email_keys)
@@ -526,44 +534,41 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
         smtp_host = _first_env("SMTP_HOST", "MAIL_SERVER", "EMAIL_HOST") or "smtp.gmail.com"
         smtp_port = _first_env("SMTP_PORT", "MAIL_PORT", "EMAIL_PORT") or "587"
 
-        logger.info(f"EMAIL Env sender keys present: {[k for k in sender_email_keys if os.environ.get(k)]}")
-        logger.info(f"EMAIL Env password keys present: {[k for k in sender_password_keys if os.environ.get(k)]}")
-        logger.info(f"EMAIL Env recipient keys present: {[k for k in recipient_keys if os.environ.get(k)]}")
-
-        if not sender_email or not sender_app_password:
-            logger.error(
-                "EMAIL Missing email credentials in environment. Supported sender keys: "
-                + ", ".join(sender_email_keys)
-                + " | Supported password keys: "
-                + ", ".join(sender_password_keys)
-            )
-            return False
-
-        if not recipient_email:
-            logger.error(
-                "EMAIL Missing recipient email in environment. Supported recipient keys: "
-                + ", ".join(recipient_keys)
-            )
-            return False
+        present_sender = [k for k in sender_email_keys if os.environ.get(k)]
+        present_password = [k for k in sender_password_keys if os.environ.get(k)]
+        present_recipient = [k for k in recipient_keys if os.environ.get(k)]
+        logger.info(f"EMAIL Env sender keys present: {present_sender}")
+        logger.info(f"EMAIL Env password keys present: {present_password}")
+        logger.info(f"EMAIL Env recipient keys present: {present_recipient}")
 
         long_table = df_to_html_table(long_df, max_rows=15)
         short_table = df_to_html_table(short_df, max_rows=15)
-
         html_body = f"""
         <html>
-        <body style=\"font-family:Arial,sans-serif;font-size:14px;color:#222;\">
-            <h2 style=\"margin-bottom:8px;\">Intraday Vol Iteration Alert</h2>
-            <p style=\"margin:0 0 12px 0;\">Scan completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}.</p>
-            <p style=\"margin:0 0 12px 0;\">Filters applied: Daily Volatility Expansion &gt; {DAILY_VOL_THRESHOLD} and Daily Volume Expansion &gt; {DAILY_VOLUME_THRESHOLD}.</p>
-            <p style=\"margin:0 0 18px 0;\"><b>Ranking:</b> Cumulative KER descending, then Survival Score, then Cumulative ADX. Longs require +DI &gt; -DI, shorts require -DI &gt; +DI.</p>
-            <h3 style=\"margin:18px 0 8px 0;\">Long Candidates Top 15</h3>
+        <body style="font-family:Arial,sans-serif;font-size:14px;color:#222;">
+            <h2 style="margin-bottom:8px;">Intraday Vol Iteration Alert</h2>
+            <p style="margin:0 0 12px 0;">Scan completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}.</p>
+            <p style="margin:0 0 12px 0;">Filters applied: Daily Volatility Expansion &gt; {DAILY_VOL_THRESHOLD} and Daily Volume Expansion &gt; {DAILY_VOLUME_THRESHOLD}.</p>
+            <p style="margin:0 0 18px 0;"><b>Ranking:</b> Cumulative KER descending, then Survival Score, then Cumulative ADX. Longs require +DI &gt; -DI, shorts prefer -DI &gt; +DI but will be filled up to 15 from the strongest negative movers if strict matches are fewer.</p>
+            <h3 style="margin:18px 0 8px 0;">Long Candidates Top 15</h3>
             {long_table}
-            <h3 style=\"margin:18px 0 8px 0;\">Short Candidates Top 15</h3>
+            <h3 style="margin:18px 0 8px 0;">Short Candidates Top 15</h3>
             {short_table}
-            <p style=\"margin-top:18px;\">Full scan summary and detailed iteration data are attached as CSV files.</p>
+            <p style="margin-top:18px;">Full scan summary and detailed iteration data are attached as CSV files.</p>
         </body>
         </html>
         """
+
+        if not sender_email or not recipient_email:
+            logger.error("EMAIL Missing sender or recipient email in environment.")
+            return False
+
+        if not sender_app_password:
+            fallback_html = csv_filename.replace('.csv', '_email_preview.html')
+            with open(fallback_html, 'w', encoding='utf-8') as f:
+                f.write(html_body)
+            logger.warning(f"EMAIL Password secret missing. Saved email preview HTML instead: {fallback_html}")
+            return False
 
         msg = MIMEMultipart()
         msg["From"] = sender_email
