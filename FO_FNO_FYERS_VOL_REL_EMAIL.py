@@ -484,13 +484,36 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
 
 def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str, detail_csv_filename: str) -> bool:
     try:
-        sender_email = os.environ.get("SENDER_EMAIL")
-        sender_app_password = os.environ.get("SENDER_APP_PASSWORD")
-        recipient_email = os.environ.get("RECIPIENT_EMAIL")
+        sender_email = (
+            os.environ.get("SENDER_EMAIL")
+            or os.environ.get("EMAIL_USER")
+            or os.environ.get("GMAIL_USER")
+            or os.environ.get("SMTP_USERNAME")
+        )
+        sender_app_password = (
+            os.environ.get("SENDER_APP_PASSWORD")
+            or os.environ.get("EMAIL_PASSWORD")
+            or os.environ.get("GMAIL_APP_PASSWORD")
+            or os.environ.get("SMTP_PASSWORD")
+        )
+        recipient_email = (
+            os.environ.get("RECIPIENT_EMAIL")
+            or os.environ.get("TO_EMAIL")
+            or os.environ.get("ALERT_EMAIL")
+            or sender_email
+        )
         smtp_port = os.environ.get("SMTP_PORT", "587")
 
-        if not sender_email or not sender_app_password or not recipient_email:
-            logger.error("EMAIL Missing sender/recipient email configuration in environment.")
+        if not sender_email or not sender_app_password:
+            logger.error(
+                "EMAIL Missing email credentials in environment. Set SENDER_EMAIL/SENDER_APP_PASSWORD or EMAIL_USER/EMAIL_PASSWORD."
+            )
+            return False
+
+        if not recipient_email:
+            logger.error(
+                "EMAIL Missing recipient email in environment. Set RECIPIENT_EMAIL, TO_EMAIL, or ALERT_EMAIL."
+            )
             return False
 
         long_table = df_to_html_table(long_df, max_rows=15)
