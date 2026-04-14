@@ -482,37 +482,46 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     )
 
 
+def _first_env(*keys: str) -> Optional[str]:
+    for key in keys:
+        value = os.environ.get(key)
+        if value is not None and str(value).strip() != "":
+            return value.strip()
+    return None
+
+
 def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str, detail_csv_filename: str) -> bool:
     try:
-        sender_email = (
-            os.environ.get("SENDER_EMAIL")
-            or os.environ.get("EMAIL_USER")
-            or os.environ.get("GMAIL_USER")
-            or os.environ.get("SMTP_USERNAME")
-        )
-        sender_app_password = (
-            os.environ.get("SENDER_APP_PASSWORD")
-            or os.environ.get("EMAIL_PASSWORD")
-            or os.environ.get("GMAIL_APP_PASSWORD")
-            or os.environ.get("SMTP_PASSWORD")
-        )
-        recipient_email = (
-            os.environ.get("RECIPIENT_EMAIL")
-            or os.environ.get("TO_EMAIL")
-            or os.environ.get("ALERT_EMAIL")
-            or sender_email
-        )
-        smtp_port = os.environ.get("SMTP_PORT", "587")
+        sender_email_keys = ["SENDER_EMAIL", "EMAIL_USER", "GMAIL_USER", "SMTP_USERNAME", "MAIL_USERNAME", "FROM_EMAIL", "EMAIL_FROM"]
+        sender_password_keys = ["SENDER_APP_PASSWORD", "EMAIL_PASSWORD", "GMAIL_APP_PASSWORD", "SMTP_PASSWORD", "MAIL_PASSWORD", "APP_PASSWORD", "EMAIL_APP_PASSWORD"]
+        recipient_keys = ["RECIPIENT_EMAIL", "TO_EMAIL", "ALERT_EMAIL", "MAIL_TO", "EMAIL_TO"]
+
+        sender_email = _first_env(*sender_email_keys)
+        sender_app_password = _first_env(*sender_password_keys)
+        recipient_email = _first_env(*recipient_keys) or sender_email
+        smtp_host = _first_env("SMTP_HOST", "MAIL_SERVER", "EMAIL_HOST") or "smtp.gmail.com"
+        smtp_port = _first_env("SMTP_PORT", "MAIL_PORT", "EMAIL_PORT") or "587"
+
+        present_sender = [k for k in sender_email_keys if os.environ.get(k)]
+        present_password = [k for k in sender_password_keys if os.environ.get(k)]
+        present_recipient = [k for k in recipient_keys if os.environ.get(k)]
+        logger.info(f"EMAIL Env sender keys present: {present_sender}")
+        logger.info(f"EMAIL Env password keys present: {present_password}")
+        logger.info(f"EMAIL Env recipient keys present: {present_recipient}")
 
         if not sender_email or not sender_app_password:
             logger.error(
-                "EMAIL Missing email credentials in environment. Set SENDER_EMAIL/SENDER_APP_PASSWORD or EMAIL_USER/EMAIL_PASSWORD."
+                "EMAIL Missing email credentials in environment. Supported sender keys: "
+                + ", ".join(sender_email_keys)
+                + " | Supported password keys: "
+                + ", ".join(sender_password_keys)
             )
             return False
 
         if not recipient_email:
             logger.error(
-                "EMAIL Missing recipient email in environment. Set RECIPIENT_EMAIL, TO_EMAIL, or ALERT_EMAIL."
+                "EMAIL Missing recipient email in environment. Supported recipient keys: "
+                + ", ".join(recipient_keys)
             )
             return False
 
@@ -557,7 +566,7 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
                 part2.add_header("Content-Disposition", f"attachment; filename={os.path.basename(detail_csv_filename)}")
                 msg.attach(part2)
 
-        server = smtplib.SMTP("smtp.gmail.com", int(smtp_port))
+        server = smtplib.SMTP(smtp_host, int(smtp_port))
         server.starttls()
         server.login(sender_email, sender_app_password)
         server.send_message(msg)
