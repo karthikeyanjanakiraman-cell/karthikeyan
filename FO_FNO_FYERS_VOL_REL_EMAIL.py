@@ -402,26 +402,48 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
             & (base["Daily Volume Expansion"] > DAILY_VOLUME_THRESHOLD)
         ].copy()
 
-    if {"% Change", "Cumulative +DI", "Cumulative -DI"}.issubset(base.columns):
-        long_df = base[(base["% Change"] > 0) & (base["Cumulative +DI"] > base["Cumulative -DI"])].copy()
-        short_df = base[(base["% Change"] < 0) & (base["Cumulative -DI"] > base["Cumulative +DI"])].copy()
-    else:
-        long_df = base.copy()
-        short_df = base.copy()
-
-    if "Cumulative KER" in long_df.columns:
-        long_df = long_df.sort_values(
+    def _sort_long(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        return df.sort_values(
             by=["Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
             ascending=[False, False, False, False],
             na_position="last",
-        ).head(15)
+        )
 
-    if "Cumulative KER" in short_df.columns:
-        short_df = short_df.sort_values(
+    def _sort_short(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        return df.sort_values(
             by=["Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
             ascending=[False, False, False, True],
             na_position="last",
-        ).head(15)
+        )
+
+    if {"% Change", "Cumulative +DI", "Cumulative -DI"}.issubset(base.columns):
+        strict_long = base[(base["% Change"] > 0) & (base["Cumulative +DI"] > base["Cumulative -DI"])].copy()
+        strict_short = base[(base["% Change"] < 0) & (base["Cumulative -DI"] > base["Cumulative +DI"])].copy()
+        fallback_long = base[base["% Change"] > 0].copy()
+        fallback_short = base[base["% Change"] < 0].copy()
+    else:
+        strict_long = base.copy()
+        strict_short = base.copy()
+        fallback_long = base.copy()
+        fallback_short = base.copy()
+
+    long_df = _sort_long(strict_long)
+    short_df = _sort_short(strict_short)
+
+    if len(long_df) < 15:
+        extra_long = _sort_long(fallback_long[~fallback_long["Symbol"].isin(long_df["Symbol"])])
+        long_df = pd.concat([long_df, extra_long], ignore_index=False)
+
+    if len(short_df) < 15:
+        extra_short = _sort_short(fallback_short[~fallback_short["Symbol"].isin(short_df["Symbol"])])
+        short_df = pd.concat([short_df, extra_short], ignore_index=False)
+
+    long_df = long_df.head(15)
+    short_df = short_df.head(15)
 
     return long_df[DISPLAY_COLS].copy(), short_df[DISPLAY_COLS].copy()
 
@@ -495,38 +517,18 @@ def _first_env(*keys: str) -> Optional[str]:
 def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str, detail_csv_filename: str) -> bool:
     try:
         sender_email_keys = ["SENDER_EMAIL", "EMAIL_USER", "GMAIL_USER", "SMTP_USERNAME", "MAIL_USERNAME", "FROM_EMAIL", "EMAIL_FROM"]
-        sender_password_keys = [
-            "SENDER_APP_PASSWORD", "SENDER_PASSWORD", "EMAIL_PASSWORD", "EMAIL_PASS",
-            "GMAIL_APP_PASSWORD", "GMAIL_PASSWORD", "SMTP_PASSWORD", "MAIL_PASSWORD",
-            "APP_PASSWORD", "EMAIL_APP_PASSWORD", "PASSWORD"
-        ]
+        sender_password_keys = ["SENDER_APP_PASSWORD", "EMAIL_PASSWORD", "GMAIL_APP_PASSWORD", "SMTP_PASSWORD", "MAIL_PASSWORD", "APP_PASSWORD", "EMAIL_APP_PASSWORD"]
         recipient_keys = ["RECIPIENT_EMAIL", "TO_EMAIL", "ALERT_EMAIL", "MAIL_TO", "EMAIL_TO"]
 
         sender_email = _first_env(*sender_email_keys)
+        sender_app_password = _first_env(*sender_password_keys)
         recipient_email = _first_env(*recipient_keys) or sender_email
         smtp_host = _first_env("SMTP_HOST", "MAIL_SERVER", "EMAIL_HOST") or "smtp.gmail.com"
         smtp_port = _first_env("SMTP_PORT", "MAIL_PORT", "EMAIL_PORT") or "587"
 
-        present_sender = [k for k in sender_email_keys if os.environ.get(k)]
-        present_password = [k for k in sender_password_keys if os.environ.get(k)]
-        present_recipient = [k for k in recipient_keys if os.environ.get(k)]
-
-        sender_app_password = _first_env(*sender_password_keys)
-        if not sender_app_password and present_sender:
-            derived_password_keys = []
-            for key in present_sender:
-                if key.endswith("_EMAIL"):
-                    derived_password_keys.extend([key.replace("_EMAIL", "_APP_PASSWORD"), key.replace("_EMAIL", "_PASSWORD")])
-                if key.endswith("_USER"):
-                    derived_password_keys.extend([key.replace("_USER", "_PASSWORD"), key.replace("_USER", "_APP_PASSWORD")])
-                if key.endswith("USERNAME"):
-                    derived_password_keys.extend([key.replace("USERNAME", "PASSWORD")])
-            sender_app_password = _first_env(*derived_password_keys)
-            present_password.extend([k for k in derived_password_keys if os.environ.get(k)])
-
-        logger.info(f"EMAIL Env sender keys present: {present_sender}")
-        logger.info(f"EMAIL Env password keys present: {sorted(set(present_password))}")
-        logger.info(f"EMAIL Env recipient keys present: {present_recipient}")
+        logger.info(f"EMAIL Env sender keys present: {[k for k in sender_email_keys if os.environ.get(k)]}")
+        logger.info(f"EMAIL Env password keys present: {[k for k in sender_password_keys if os.environ.get(k)]}")
+        logger.info(f"EMAIL Env recipient keys present: {[k for k in recipient_keys if os.environ.get(k)]}")
 
         if not sender_email or not sender_app_password:
             logger.error(
