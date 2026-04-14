@@ -156,17 +156,21 @@ def compute_volatility_pair(daily_df: Optional[pd.DataFrame]) -> Dict[str, float
 
 
 
-
 def compute_cumulative_directional_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
     df = curr_df.copy().sort_values("time").reset_index(drop=True)
+    if len(df) == 0:
+        return df
+
     h = df["high"].astype(float).to_numpy()
     l = df["low"].astype(float).to_numpy()
     c = df["close"].astype(float).to_numpy()
     o = df["open"].astype(float).to_numpy()
     n = len(df)
+
     tr = np.zeros(n)
     plus_dm = np.zeros(n)
     minus_dm = np.zeros(n)
+
     tr[0] = max(h[0] - l[0], 0)
     for i in range(1, n):
         tr[i] = max(h[i] - l[i], abs(h[i] - c[i - 1]), abs(l[i] - c[i - 1]))
@@ -174,24 +178,31 @@ def compute_cumulative_directional_metrics(curr_df: pd.DataFrame) -> pd.DataFram
         dn = l[i - 1] - l[i]
         plus_dm[i] = up if up > dn and up > 0 else 0.0
         minus_dm[i] = dn if dn > up and dn > 0 else 0.0
+
     out = []
     qualified = 0
     for i in range(n):
         if i == 0:
-            out.append([np.nan, np.nan, np.nan, np.nan, '0/0'])
+            out.append([np.nan, np.nan, np.nan, np.nan, '0/0', 0.0])
             continue
+
         path = abs(c[0] - o[0]) + np.sum(np.abs(np.diff(c[:i+1])))
         ker = abs(c[i] - o[0]) / path if path > 0 else 0.0
+
         prior_kers = []
         for j in range(1, i + 1):
             p = abs(c[0] - o[0]) + np.sum(np.abs(np.diff(c[:j+1])))
             prior_kers.append(abs(c[j] - o[0]) / p if p > 0 else 0.0)
+
         cum_ker = float(np.mean(prior_kers)) if prior_kers else np.nan
+
         tr_sum = tr[1:i+1].sum()
         plus_sum = plus_dm[1:i+1].sum()
         minus_sum = minus_dm[1:i+1].sum()
+
         pdi = 100 * plus_sum / tr_sum if tr_sum > 0 else 0.0
         mdi = 100 * minus_sum / tr_sum if tr_sum > 0 else 0.0
+
         dxs = []
         for k in range(1, i + 1):
             ktr = tr[1:k+1].sum()
@@ -200,12 +211,17 @@ def compute_cumulative_directional_metrics(curr_df: pd.DataFrame) -> pd.DataFram
             kpdi = 100 * kp / ktr if ktr > 0 else 0.0
             kmdi = 100 * km / ktr if ktr > 0 else 0.0
             dxs.append(100 * abs(kpdi - kmdi) / (kpdi + kmdi) if (kpdi + kmdi) > 0 else 0.0)
+
         adx = float(np.mean(dxs)) if dxs else np.nan
+
         if ker >= KER_CUTOFF:
             qualified += 1
-        out.append([cum_ker, pdi, mdi, adx, f'{qualified}/{i}'])
-    cols = ['Cumulative KER', 'Cumulative +DI', 'Cumulative -DI', 'Cumulative ADX', 'Survival Score']
-    return pd.concat([df, pd.DataFrame(out, columns=cols)], axis=1)
+
+        out.append([cum_ker, pdi, mdi, adx, f'{qualified}/{i}', float(qualified)])
+
+    cols = ['Cumulative KER', 'Cumulative +DI', 'Cumulative -DI', 'Cumulative ADX', 'Survival Score', 'Survival_Num']
+    new_df = pd.DataFrame(out, columns=cols)
+    return pd.concat([df, new_df], axis=1)
 
 def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[Dict, pd.DataFrame]:
     if intra_df is None or intra_df.empty:
@@ -231,6 +247,8 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
 
     curr_df.sort_values("time", inplace=True)
     curr_df["cum_vol"] = curr_df["volume"].cumsum()
+
+    # Calculate KER Metrics
     metric_df = compute_cumulative_directional_metrics(curr_df[["time", "open", "high", "low", "close", "volume"]].copy())
 
     ltp = float(curr_df["close"].iloc[-1])
@@ -266,14 +284,29 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         market_open = datetime.combine(current_date, time(9, 15))
         iter_mins = int((dt_time - market_open).total_seconds() / 60)
 
-        rows.append({
-            "Iteration No": total_iters,
-            "Iteration Minutes": iter_mins,
-            "Iteration Time": t.strftime("%H:%M"),
-            "Current Volume": cum_vol,
-            "10 Day Relative Volume": rvol_10,
-            "20 Day Relative Volume": rvol_20,
-            "Daily Volume Expansion": dvol_exp,
+                rows.append({
+            "Symbol": sym,
+            "LTP": ltp,
+            "% Change": pct_change,
+            "Current Daily Volatility": vol_info.get("Current Daily Volatility"),
+            "Avg Daily Volatility": vol_info.get("Avg Daily Volatility"),
+            "Daily Volatility Expansion": daily_vol_exp,
+            "Current Volume": iter_summary.get("Current Volume"),
+            "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"),
+            "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"),
+            "Daily Volume Expansion": daily_volume_exp,
+            "Ease of Movement": ease_of_movement,
+            "Total Iterations": total_iterations,
+            "Above Threshold Iterations": above_count,
+            "Above Threshold Ratio": above_ratio,
+            "Last Iteration Minutes": iter_summary.get("Last Iteration Minutes"),
+            "Last Iteration Time": iter_summary.get("Last Iteration Time"),
+            "Cumulative KER": iter_summary.get("Cumulative KER"),
+            "Cumulative +DI": iter_summary.get("Cumulative +DI"),
+            "Cumulative -DI": iter_summary.get("Cumulative -DI"),
+            "Cumulative ADX": iter_summary.get("Cumulative ADX"),
+            "Survival Score": iter_summary.get("Survival Score"),
+            "Survival_Num": iter_summary.get("Survival_Num")
         })
 
         last_cum_vol = cum_vol
@@ -284,15 +317,21 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         last_iter_time = t.strftime("%H:%M")
 
     detail_df = pd.DataFrame(rows)
-    summary = {
+        summary = {
         "LTP": ltp,
         "Current Volume": last_cum_vol,
-        "10 Day Relative Volume": last_rvol_10,
-        "20 Day Relative Volume": last_rvol_20,
-        "Daily Volume Expansion": last_dvol_exp,
+        "10 Day Relative Volume": last_rvol10,
+        "20 Day Relative Volume": last_rvol20,
+        "Daily Volume Expansion": last_dvolexp,
         "Total Iterations": total_iters,
         "Last Iteration Minutes": last_iter_mins,
         "Last Iteration Time": last_iter_time,
+        "Cumulative KER": float(metric_df["Cumulative KER"].iloc[-1]) if not metric_df.empty and "Cumulative KER" in metric_df.columns else np.nan,
+        "Cumulative +DI": float(metric_df["Cumulative +DI"].iloc[-1]) if not metric_df.empty and "Cumulative +DI" in metric_df.columns else np.nan,
+        "Cumulative -DI": float(metric_df["Cumulative -DI"].iloc[-1]) if not metric_df.empty and "Cumulative -DI" in metric_df.columns else np.nan,
+        "Cumulative ADX": float(metric_df["Cumulative ADX"].iloc[-1]) if not metric_df.empty and "Cumulative ADX" in metric_df.columns else np.nan,
+        "Survival Score": str(metric_df["Survival Score"].iloc[-1]) if not metric_df.empty and "Survival Score" in metric_df.columns else "0/0",
+        "Survival_Num": float(metric_df["Survival_Num"].iloc[-1]) if not metric_df.empty and "Survival_Num" in metric_df.columns else 0.0
     }
     return summary, detail_df
 
@@ -353,11 +392,6 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "Symbol": sym,
             "LTP": ltp,
             "% Change": pct_change,
-            "Cumulative KER": iter_summary.get("Cumulative KER"),
-            "Cumulative +DI": iter_summary.get("Cumulative +DI"),
-            "Cumulative -DI": iter_summary.get("Cumulative -DI"),
-            "Cumulative ADX": iter_summary.get("Cumulative ADX"),
-            "Survival Score": iter_summary.get("Survival Score"),
             "Current Daily Volatility": vol_info.get("Current Daily Volatility"),
             "Avg Daily Volatility": vol_info.get("Avg Daily Volatility"),
             "Daily Volatility Expansion": daily_vol_exp,
@@ -379,24 +413,21 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 
 DISPLAY_COLS = [
-    "Symbol",
-    "LTP",
-    "% Change",
+    "Symbol", 
+    "LTP", 
+    "% Change", 
+    "Daily Volatility Expansion",
+    "10 Day Relative Volume",
+    "20 Day Relative Volume",
+    "Daily Volume Expansion",
     "Cumulative KER",
     "Cumulative +DI",
     "Cumulative -DI",
     "Cumulative ADX",
     "Survival Score",
-    "Daily Volatility Expansion",
-    "10 Day Relative Volume",
-    "20 Day Relative Volume",
-    "Daily Volume Expansion",
     "Ease of Movement",
-    "Total Iterations",
     "Above Threshold Iterations",
-    "Above Threshold Ratio",
-    "Last Iteration Minutes",
-    "Last Iteration Time",
+    "Last Iteration Time"
 ]
 
 
@@ -405,55 +436,55 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
         return pd.DataFrame(columns=DISPLAY_COLS), pd.DataFrame(columns=DISPLAY_COLS)
 
     base = df_all.copy()
-    
-    # Safely filter
-    if "Daily Volatility Expansion" in base.columns and "Daily Volume Expansion" in base.columns:
-        base = base[
-            (base["Daily Volatility Expansion"] > DAILY_VOL_THRESHOLD) &
-            (base["Daily Volume Expansion"] > DAILY_VOLUME_THRESHOLD)
-        ].copy()
 
-    if "% Change" in base.columns:
-        long_df = base[base["% Change"] >= 1.0].copy()
-        short_df = base[base["% Change"] <= -1.0].copy()
+    # Base filter
+    if "Daily Volatility Expansion" in base.columns and "Daily Volume Expansion" in base.columns:
+        base = base[(base["Daily Volatility Expansion"] > DAILY_VOL_THRESHOLD) & 
+                    (base["Daily Volume Expansion"] > DAILY_VOLUME_THRESHOLD)].copy()
+
+    if "% Change" in base.columns and "Cumulative +DI" in base.columns and "Cumulative -DI" in base.columns:
+        # Long candidates: Change > 0 and +DI > -DI
+        long_df = base[(base["% Change"] > 0) & (base["Cumulative +DI"] > base["Cumulative -DI"])].copy()
+        # Short candidates: Change < 0 and -DI > +DI
+        short_df = base[(base["% Change"] < 0) & (base["Cumulative -DI"] > base["Cumulative +DI"])].copy()
     else:
         long_df = base.copy()
         short_df = base.copy()
 
-    if "Above Threshold Iterations" in long_df.columns:
+    # Sort Longs: High KER, High Survival, High ADX, then % Change Descending
+    if "Cumulative KER" in long_df.columns:
         long_df = long_df.sort_values(
-            by=["Above Threshold Iterations", "Ease of Movement", "% Change"],
-            ascending=[False, False, False],
-            na_position="last",
+            by=["Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"], 
+            ascending=[False, False, False, False], 
+            na_position='last'
         ).head(15)
 
+    # Sort Shorts: High KER, High Survival, High ADX, then % Change Ascending (most negative)
+    if "Cumulative KER" in short_df.columns:
         short_df = short_df.sort_values(
-            by=["Above Threshold Iterations", "Ease of Movement", "% Change"],
-            ascending=[False, False, True],
-            na_position="last",
+            by=["Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"], 
+            ascending=[False, False, False, True], 
+            na_position='last'
         ).head(15)
-    else:
-        long_df = long_df.head(15)
-        short_df = short_df.head(15)
-        
-    return long_df[DISPLAY_COLS].copy(), short_df[DISPLAY_COLS].copy()
+
+    # Filter only display columns that exist
+    disp_cols = [c for c in DISPLAY_COLS if c in long_df.columns]
+    return long_df[disp_cols].copy(), short_df[disp_cols].copy()
 
 
-def format_value(col: str, val):
+def format_value(col: str, val) -> str:
     if pd.isna(val):
         return ""
-    if col in [
-        "LTP", "Current Daily Volatility", "Avg Daily Volatility",
-        "Daily Volatility Expansion", "10 Day Relative Volume",
-        "20 Day Relative Volume", "Daily Volume Expansion", "Ease of Movement"
-    ]:
-        return f"{val:.2f}"
+    if col in ["LTP", "Current Daily Volatility", "Avg Daily Volatility", "Daily Volatility Expansion", 
+               "10 Day Relative Volume", "20 Day Relative Volume", "Daily Volume Expansion", 
+               "Ease of Movement", "Cumulative KER", "Cumulative +DI", "Cumulative -DI", "Cumulative ADX"]:
+        return f"{float(val):.2f}"
     if col == "% Change":
-        return f"{val:+.2f}%"
+        return f"{float(val):.2f}%"
     if col == "Current Volume":
         return f"{int(val):,}"
     if col == "Above Threshold Ratio":
-        return f"{val * 100:.2f}%"
+        return f"{float(val) * 100:.2f}%"
     if col in ["Total Iterations", "Above Threshold Iterations", "Last Iteration Minutes"]:
         return f"{int(val)}"
     return str(val)
@@ -498,8 +529,8 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
         <body style="font-family: Arial, sans-serif; color: #333;">
             <h2>F&O Volatility & Volume Iteration Scan (Intraday)</h2>
             <p>Scan completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}.</p>
-            <p>Filters applied: Daily Volatility Expansion &gt; {DAILY_VOL_THRESHOLD} AND Daily Volume Expansion &gt; {DAILY_VOLUME_THRESHOLD}.</p>
-            <p>Ease of Movement = Abs(% Change) / 10 Day Relative Volume. Stocks moving less than 1% are filtered out.</p>
+                    <p>Filters applied: Daily Volatility Expansion &gt; {DAILY_VOL_THRESHOLD} AND Daily Volume Expansion &gt; {DAILY_VOLUME_THRESHOLD}.</p>
+        <p><strong>Ranking Methodology:</strong> Candidates are strictly ranked by directional efficiency using <b>Cumulative KER (Kaufman Efficiency Ratio)</b> descending, followed by Survival Score, ADX, and % Change. Longs require +DI > -DI. Shorts require -DI > +DI.</p>
             <h3>Long Candidates - Top 15</h3>
             {long_html}
             <h3>Short Candidates - Top 15</h3>
