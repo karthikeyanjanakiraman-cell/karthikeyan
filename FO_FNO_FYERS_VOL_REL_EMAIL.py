@@ -316,7 +316,7 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         last_iter_mins = iter_mins
         last_iter_time = t.strftime("%H:%M")
 
-    detail_df = pd.DataFrame(rows)
+        detail_df = pd.DataFrame(rows)
         summary = {
         "LTP": ltp,
         "Current Volume": last_cum_vol,
