@@ -456,48 +456,59 @@ def format_value(col: str, val):
 def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     if df is None or df.empty:
         return "<p>No candidates found.</p>"
-    df_slice = df.head(max_rows)
-    html = '<table style="border-collapse: collapse; width: 100%; font-family: Arial, sans-serif; font-size: 12px;">'
-    html += '<thead><tr style="background-color: #f2f2f2;">'
-    for col in df_slice.columns:
-        html += f'<th style="border: 1px solid #ddd; padding: 6px; text-align: left;">{col}</th>'
-    html += '</tr></thead><tbody>'
+
+    df_slice = df.head(max_rows).copy()
+    cols = [c for c in DISPLAY_COLS if c in df_slice.columns]
+
+    header_html = "".join(
+        f'<th style="padding:8px;border:1px solid #d0d0d0;background:#f5f5f5;text-align:left;">{col}</th>'
+        for col in cols
+    )
+
+    body_rows = []
     for _, row in df_slice.iterrows():
-        html += '<tr>'
-        for col in df_slice.columns:
-            val_str = format_value(col, row[col])
-            html += f'<td style="border: 1px solid #ddd; padding: 6px;">{val_str}</td>'
-        html += '</tr>'
-    html += '</tbody></table>'
-    return html
+        cells = "".join(
+            f'<td style="padding:8px;border:1px solid #d0d0d0;white-space:nowrap;">{format_value(col, row.get(col))}</td>'
+            for col in cols
+        )
+        body_rows.append(f"<tr>{cells}</tr>")
+
+    return (
+        '<div style="overflow-x:auto; margin:12px 0 20px 0;">'
+        '<table style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:13px;">'
+        f'<thead><tr>{header_html}</tr></thead>'
+        f'<tbody>{"".join(body_rows)}</tbody>'
+        '</table></div>'
+    )
 
 
 def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str, detail_csv_filename: str) -> bool:
     try:
-        sender_email = os.environ.get("SENDER_EMAIL") or os.environ.get("SENDEREMAIL")
-        sender_app_password = os.environ.get("SENDER_PASSWORD") or os.environ.get("SENDERPASSWORD")
-        recipient_email = os.environ.get("RECIPIENT_EMAIL") or os.environ.get("RECIPIENTEMAIL")
-        smtp_port = os.environ.get("SMTP_PORT") or os.environ.get("SMTPPORT") or 587
-        if not all([sender_email, sender_app_password, recipient_email]):
-            logger.warning("EMAIL Missing email credentials in environment. Check GitHub Secrets. Skipping email notification.")
+        sender_email = os.environ.get("SENDER_EMAIL")
+        sender_app_password = os.environ.get("SENDER_APP_PASSWORD")
+        recipient_email = os.environ.get("RECIPIENT_EMAIL")
+        smtp_port = os.environ.get("SMTP_PORT", "587")
+
+        if not sender_email or not sender_app_password or not recipient_email:
+            logger.error("EMAIL Missing sender/recipient email configuration in environment.")
             return False
 
-        long_html = df_to_html_table(long_df, max_rows=15)
-        short_html = df_to_html_table(short_df, max_rows=15)
+        long_table = df_to_html_table(long_df, max_rows=15)
+        short_table = df_to_html_table(short_df, max_rows=15)
+
         html_body = f"""
         <html>
-          <body style=\"font-family: Arial, sans-serif; color: #333;\">
-            <h2>F&O Volatility Volume Iteration Scan - Intraday</h2>
-            <p>Scan completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}.</p>
-            <p>Filters applied: Daily Volatility Expansion &gt; {DAILY_VOL_THRESHOLD} AND Daily Volume Expansion &gt; {DAILY_VOLUME_THRESHOLD}.</p>
-            <p><strong>Ranking Methodology:</strong> Candidates are ranked by <b>Cumulative KER</b> descending, then Survival Score, then Cumulative ADX. Longs require +DI &gt; -DI, shorts require -DI &gt; +DI.</p>
-            <h3>Long Candidates - Top 15</h3>
-            {long_html}
-            <h3>Short Candidates - Top 15</h3>
-            {short_html}
-            <br>
-            <p>Full scan summary and detailed iteration data are attached as CSV files.</p>
-          </body>
+        <body style="font-family:Arial,sans-serif;font-size:14px;color:#222;">
+            <h2 style="margin-bottom:8px;">Intraday Vol Iteration Alert</h2>
+            <p style="margin:0 0 12px 0;">Scan completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}.</p>
+            <p style="margin:0 0 12px 0;">Filters applied: Daily Volatility Expansion &gt; {DAILY_VOL_THRESHOLD} and Daily Volume Expansion &gt; {DAILY_VOLUME_THRESHOLD}.</p>
+            <p style="margin:0 0 18px 0;"><b>Ranking:</b> Cumulative KER descending, then Survival Score, then Cumulative ADX. Longs require +DI &gt; -DI, shorts require -DI &gt; +DI.</p>
+            <h3 style="margin:18px 0 8px 0;">Long Candidates Top 15</h3>
+            {long_table}
+            <h3 style="margin:18px 0 8px 0;">Short Candidates Top 15</h3>
+            {short_table}
+            <p style="margin-top:18px;">Full scan summary and detailed iteration data are attached as CSV files.</p>
+        </body>
         </html>
         """
 
@@ -533,7 +544,6 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
     except Exception as e:
         logger.error(f"EMAIL Failed to send email: {e}")
         return False
-
 
 def main():
     logger.info("Starting F&O Iteration Volume Volatility Scan")
