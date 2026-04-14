@@ -284,7 +284,7 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         market_open = datetime.combine(current_date, time(9, 15))
         iter_mins = int((dt_time - market_open).total_seconds() / 60)
 
-                rows.append({
+        rows.append({
             "Symbol": sym,
             "LTP": ltp,
             "% Change": pct_change,
