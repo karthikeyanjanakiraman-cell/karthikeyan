@@ -61,6 +61,7 @@ def load_fno_symbols_from_sectors(root_dir: str = "sectors") -> List[str]:
     if not os.path.isdir(root_dir):
         logger.warning(f"FNO Sectors folder '{root_dir}' not found, returning empty list.")
         return []
+
     for dirpath, _, filenames in os.walk(root_dir):
         for fname in filenames:
             if not fname.lower().endswith(".csv"):
@@ -81,6 +82,7 @@ def load_fno_symbols_from_sectors(root_dir: str = "sectors") -> List[str]:
                         symbols.add(s)
             except Exception as e:
                 logger.warning(f"FNO Error reading {fpath}: {e}")
+
     symbols_list = sorted(symbols)
     logger.info(f"FNO Loaded {len(symbols_list)} unique F&O symbols.")
     return symbols_list
@@ -194,7 +196,6 @@ def compute_cumulative_directional_metrics(curr_df: pd.DataFrame) -> pd.DataFram
 
         if ker >= KER_CUTOFF:
             qualified += 1
-
         out.append([cum_ker, pdi, mdi, adx, f"{qualified}/{i}", float(qualified)])
 
     cols = ["Cumulative KER", "Cumulative +DI", "Cumulative -DI", "Cumulative ADX", "Survival Score", "Survival_Num"]
@@ -308,6 +309,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
         fyers_sym = format_fyers_symbol(sym)
         daily_df = get_fyers_history(fyers_sym, resolution="D", days_back=DAILY_LOOKBACK_DAYS)
         intra_df = get_fyers_history(fyers_sym, resolution="5", days_back=INTRADAY_LOOKBACK_DAYS)
+
         vol_info = compute_volatility_pair(daily_df)
         iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
 
@@ -502,12 +504,9 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
         smtp_host = _first_env("SMTP_HOST", "MAIL_SERVER", "EMAIL_HOST") or "smtp.gmail.com"
         smtp_port = _first_env("SMTP_PORT", "MAIL_PORT", "EMAIL_PORT") or "587"
 
-        present_sender = [k for k in sender_email_keys if os.environ.get(k)]
-        present_password = [k for k in sender_password_keys if os.environ.get(k)]
-        present_recipient = [k for k in recipient_keys if os.environ.get(k)]
-        logger.info(f"EMAIL Env sender keys present: {present_sender}")
-        logger.info(f"EMAIL Env password keys present: {present_password}")
-        logger.info(f"EMAIL Env recipient keys present: {present_recipient}")
+        logger.info(f"EMAIL Env sender keys present: {[k for k in sender_email_keys if os.environ.get(k)]}")
+        logger.info(f"EMAIL Env password keys present: {[k for k in sender_password_keys if os.environ.get(k)]}")
+        logger.info(f"EMAIL Env recipient keys present: {[k for k in recipient_keys if os.environ.get(k)]}")
 
         if not sender_email or not sender_app_password:
             logger.error(
@@ -530,16 +529,16 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
 
         html_body = f"""
         <html>
-        <body style="font-family:Arial,sans-serif;font-size:14px;color:#222;">
-            <h2 style="margin-bottom:8px;">Intraday Vol Iteration Alert</h2>
-            <p style="margin:0 0 12px 0;">Scan completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}.</p>
-            <p style="margin:0 0 12px 0;">Filters applied: Daily Volatility Expansion &gt; {DAILY_VOL_THRESHOLD} and Daily Volume Expansion &gt; {DAILY_VOLUME_THRESHOLD}.</p>
-            <p style="margin:0 0 18px 0;"><b>Ranking:</b> Cumulative KER descending, then Survival Score, then Cumulative ADX. Longs require +DI &gt; -DI, shorts require -DI &gt; +DI.</p>
-            <h3 style="margin:18px 0 8px 0;">Long Candidates Top 15</h3>
+        <body style=\"font-family:Arial,sans-serif;font-size:14px;color:#222;\">
+            <h2 style=\"margin-bottom:8px;\">Intraday Vol Iteration Alert</h2>
+            <p style=\"margin:0 0 12px 0;\">Scan completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}.</p>
+            <p style=\"margin:0 0 12px 0;\">Filters applied: Daily Volatility Expansion &gt; {DAILY_VOL_THRESHOLD} and Daily Volume Expansion &gt; {DAILY_VOLUME_THRESHOLD}.</p>
+            <p style=\"margin:0 0 18px 0;\"><b>Ranking:</b> Cumulative KER descending, then Survival Score, then Cumulative ADX. Longs require +DI &gt; -DI, shorts require -DI &gt; +DI.</p>
+            <h3 style=\"margin:18px 0 8px 0;\">Long Candidates Top 15</h3>
             {long_table}
-            <h3 style="margin:18px 0 8px 0;">Short Candidates Top 15</h3>
+            <h3 style=\"margin:18px 0 8px 0;\">Short Candidates Top 15</h3>
             {short_table}
-            <p style="margin-top:18px;">Full scan summary and detailed iteration data are attached as CSV files.</p>
+            <p style=\"margin-top:18px;\">Full scan summary and detailed iteration data are attached as CSV files.</p>
         </body>
         </html>
         """
@@ -576,6 +575,7 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
     except Exception as e:
         logger.error(f"EMAIL Failed to send email: {e}")
         return False
+
 
 def main():
     logger.info("Starting F&O Iteration Volume Volatility Scan")
