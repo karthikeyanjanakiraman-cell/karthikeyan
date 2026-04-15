@@ -204,55 +204,47 @@ def compute_cumulative_directional_metrics(curr_df: pd.DataFrame) -> pd.DataFram
 
 
 
-def compute_cumulative_indicators(intra_df: Optional[pd.DataFrame]) -> Dict[str, float]:
-    if intra_df is None or intra_df.empty:
-        return {
-            "Cumulative RSI": 0.0,
-            "Cumulative OBV": 0.0,
-            "Cumulative VWAP": 0.0,
-        }
-
+def compute_cumulative_indicators(intra_df: pd.DataFrame) -> pd.DataFrame:
     df = intra_df.copy()
-    req = {"close", "volume", "high", "low"}
-    if not req.issubset(df.columns):
-        return {
-            "Cumulative RSI": 0.0,
-            "Cumulative OBV": 0.0,
-            "Cumulative VWAP": 0.0,
-        }
+    if df.empty:
+        df["Cumulative RSI"] = np.nan
+        df["Cumulative OBV"] = np.nan
+        df["Cumulative VWAP"] = np.nan
+        return df
 
-    close = pd.to_numeric(df["close"], errors="coerce")
-    high = pd.to_numeric(df["high"], errors="coerce")
-    low = pd.to_numeric(df["low"], errors="coerce")
-    volume = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+    close = df["close"].astype(float)
+    high = df["high"].astype(float)
+    low = df["low"].astype(float)
+    volume = df["volume"].astype(float).fillna(0.0)
 
-    delta = close.diff()
-    gain = delta.clip(lower=0.0)
-    loss = (-delta).clip(lower=0.0)
-    rsi_period = 14
-    avg_gain = gain.rolling(rsi_period, min_periods=rsi_period).mean()
-    avg_loss = loss.rolling(rsi_period, min_periods=rsi_period).mean()
-    rs = avg_gain / avg_loss.replace(0, pd.NA)
-    rsi = 100 - (100 / (1 + rs))
-    if pd.notna(avg_loss.iloc[-1]) and float(avg_loss.iloc[-1]) == 0.0:
-        rsi.iloc[-1] = 100.0
-    cumulative_rsi = float(rsi.fillna(0.0).sum()) if not rsi.empty else 0.0
-
-    direction = close.diff().fillna(0.0).apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
-    obv = (direction * volume).cumsum()
-    cumulative_obv = float(obv.iloc[-1]) if not obv.empty else 0.0
-
+    # 1) VWAP
     typical_price = (high + low + close) / 3.0
-    pv = (typical_price * volume).cumsum()
+    cum_pv = (typical_price * volume).cumsum()
     cum_vol = volume.cumsum()
-    vwap = pv / cum_vol.replace(0, pd.NA)
-    cumulative_vwap = float(vwap.iloc[-1]) if not vwap.empty and pd.notna(vwap.iloc[-1]) else 0.0
+    vwap = cum_pv / cum_vol.replace(0, np.nan)
+    df["Cumulative VWAP"] = vwap.fillna(0.0)
 
-    return {
-        "Cumulative RSI": cumulative_rsi,
-        "Cumulative OBV": cumulative_obv,
-        "Cumulative VWAP": cumulative_vwap,
-    }
+    # 2) OBV
+    delta = close.diff().fillna(0.0)
+    direction = np.where(delta > 0, 1, np.where(delta < 0, -1, 0))
+    obv = (direction * volume).cumsum()
+    df["Cumulative OBV"] = obv.fillna(0.0)
+
+    # 3) RSI (14 period)
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+
+    # Simple moving average over 14 periods for gain and loss
+    avg_gain = pd.Series(gain).rolling(window=14, min_periods=1).mean()
+    avg_loss = pd.Series(loss).rolling(window=14, min_periods=1).mean()
+
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = 100.0 - (100.0 / (1.0 + rs))
+    # If loss is 0, RS is inf, RSI is 100
+    rsi = rsi.fillna(100.0)
+    df["Cumulative RSI"] = rsi
+
+    return df
 
 def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[Dict, pd.DataFrame]:
     if intra_df is None or intra_df.empty:
@@ -290,6 +282,10 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
     last_dvolexp = 0
     avg_daily_vol_10 = hist_df_10.groupby("date")["volume"].sum().mean() if not hist_df_10.empty else 0
 
+
+    # Calculate cumulative indicators
+    cum_df = compute_cumulative_indicators(curr_df[["time", "open", "high", "low", "close", "volume"]].copy())
+
     for i in range(len(curr_df)):
         total_iters += 1
         row = curr_df.iloc[i]
@@ -317,6 +313,9 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
             "10 Day Relative Volume": rvol10,
             "20 Day Relative Volume": rvol20,
             "Daily Volume Expansion": dvolexp,
+            "Cumulative RSI": float(cum_df["Cumulative RSI"].iloc[i]) if not cum_df.empty else 0.0,
+            "Cumulative OBV": float(cum_df["Cumulative OBV"].iloc[i]) if not cum_df.empty else 0.0,
+            "Cumulative VWAP": float(cum_df["Cumulative VWAP"].iloc[i]) if not cum_df.empty else 0.0,
         })
 
         last_cum_vol = cum_vol
@@ -337,6 +336,9 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         "Last Iteration Minutes": last_iter_mins,
         "Last Iteration Time": last_iter_time,
         "Cumulative KER": float(metric_df["Cumulative KER"].iloc[-1]) if not metric_df.empty else np.nan,
+        "Cumulative RSI": float(cum_df["Cumulative RSI"].iloc[-1]) if not cum_df.empty else np.nan,
+        "Cumulative OBV": float(cum_df["Cumulative OBV"].iloc[-1]) if not cum_df.empty else np.nan,
+        "Cumulative VWAP": float(cum_df["Cumulative VWAP"].iloc[-1]) if not cum_df.empty else np.nan,
         "Cumulative +DI": float(metric_df["Cumulative +DI"].iloc[-1]) if not metric_df.empty else np.nan,
         "Cumulative -DI": float(metric_df["Cumulative -DI"].iloc[-1]) if not metric_df.empty else np.nan,
         "Cumulative ADX": float(metric_df["Cumulative ADX"].iloc[-1]) if not metric_df.empty else np.nan,
@@ -363,7 +365,6 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
         intra_df = get_fyers_history(fyers_sym, resolution="5", days_back=INTRADAY_LOOKBACK_DAYS)
 
         vol_info = compute_volatility_pair(daily_df)
-        cumulative_info = compute_cumulative_indicators(intra_df)
         iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
 
         if daily_df is not None and len(daily_df) >= 2:
@@ -405,9 +406,9 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"),
             "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"),
             "Daily Volume Expansion": daily_volume_exp,
-            "Cumulative RSI": cumulative_info.get("Cumulative RSI"),
-            "Cumulative OBV": cumulative_info.get("Cumulative OBV"),
-            "Cumulative VWAP": cumulative_info.get("Cumulative VWAP"),
+            "Cumulative RSI": iter_summary.get("Cumulative RSI"),
+            "Cumulative OBV": iter_summary.get("Cumulative OBV"),
+            "Cumulative VWAP": iter_summary.get("Cumulative VWAP"),
             "Ease of Movement": ease_of_movement,
             "Total Iterations": total_iterations,
             "Above Threshold Iterations": above_count,
@@ -435,6 +436,9 @@ DISPLAY_COLS = [
     "10 Day Relative Volume",
     "20 Day Relative Volume",
     "Daily Volume Expansion",
+    "Cumulative RSI",
+    "Cumulative OBV",
+    "Cumulative VWAP",
     "Cumulative KER",
     "Cumulative +DI",
     "Cumulative -DI",
@@ -524,6 +528,8 @@ def format_value(col: str, val):
         "20 Day Relative Volume",
         "Daily Volume Expansion",
         "Ease of Movement",
+        "Cumulative RSI",
+        "Cumulative VWAP",
         "Cumulative KER",
         "Cumulative +DI",
         "Cumulative -DI",
@@ -532,7 +538,7 @@ def format_value(col: str, val):
         return f"{float(val):.2f}"
     if col == "% Change":
         return f"{float(val):.2f}%"
-    if col in ["Current Volume", "Cumulative OBV"]:
+    if col == "Current Volume":
         return f"{int(val):,}"
     if col == "Above Threshold Ratio":
         return f"{float(val) * 100:.2f}%"
@@ -685,7 +691,7 @@ def main():
         pd.DataFrame(columns=[
             "Symbol", "% Change", "Daily Volatility Expansion", "Iteration No", "Iteration Minutes",
             "Iteration Time", "Current Volume", "10 Day Relative Volume", "20 Day Relative Volume",
-            "Daily Volume Expansion", "Above DV and DVol"
+            "Daily Volume Expansion", "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "Above DV and DVol"
         ]).to_csv(detail_csv, index=False)
 
     send_email_with_tables(long_df, short_df, summary_csv, detail_csv)
