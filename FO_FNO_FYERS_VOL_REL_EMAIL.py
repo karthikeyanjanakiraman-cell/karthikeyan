@@ -194,9 +194,13 @@ def compute_cumulative_directional_metrics(curr_df: pd.DataFrame) -> pd.DataFram
             dxs.append(100 * abs(kpdi - kmdi) / (kpdi + kmdi) if (kpdi + kmdi) > 0 else 0.0)
         adx = float(np.mean(dxs)) if dxs else np.nan
 
-        if ker >= KER_CUTOFF:
+        # Count up-iterations based on close > previous close
+        if c[i] > c[i - 1]:
             qualified += 1
-        out.append([cum_ker, pdi, mdi, adx, f"{qualified}/{i}", float(qualified)])
+
+        length_so_far = i + 1
+        survival_ratio = qualified / length_so_far if length_so_far > 0 else 0.0
+        out.append([cum_ker, pdi, mdi, adx, survival_ratio, float(qualified)])
 
     cols = ["Cumulative KER", "Cumulative +DI", "Cumulative -DI", "Cumulative ADX", "Survival Score", "Survival_Num"]
     return pd.concat([df, pd.DataFrame(out, columns=cols)], axis=1)
@@ -541,6 +545,7 @@ def format_value(col: str, val):
         "Cumulative +DI",
         "Cumulative -DI",
         "Cumulative ADX",
+        "Survival Score",
     ]:
         return f"{float(val):.2f}"
     if col == "% Change":
