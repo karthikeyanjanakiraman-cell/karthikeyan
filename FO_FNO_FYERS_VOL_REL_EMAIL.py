@@ -202,6 +202,58 @@ def compute_cumulative_directional_metrics(curr_df: pd.DataFrame) -> pd.DataFram
     return pd.concat([df, pd.DataFrame(out, columns=cols)], axis=1)
 
 
+
+
+def compute_cumulative_indicators(intra_df: Optional[pd.DataFrame]) -> Dict[str, float]:
+    if intra_df is None or intra_df.empty:
+        return {
+            "Cumulative RSI": 0.0,
+            "Cumulative OBV": 0.0,
+            "Cumulative VWAP": 0.0,
+        }
+
+    df = intra_df.copy()
+    req = {"close", "volume", "high", "low"}
+    if not req.issubset(df.columns):
+        return {
+            "Cumulative RSI": 0.0,
+            "Cumulative OBV": 0.0,
+            "Cumulative VWAP": 0.0,
+        }
+
+    close = pd.to_numeric(df["close"], errors="coerce")
+    high = pd.to_numeric(df["high"], errors="coerce")
+    low = pd.to_numeric(df["low"], errors="coerce")
+    volume = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    rsi_period = 14
+    avg_gain = gain.rolling(rsi_period, min_periods=rsi_period).mean()
+    avg_loss = loss.rolling(rsi_period, min_periods=rsi_period).mean()
+    rs = avg_gain / avg_loss.replace(0, pd.NA)
+    rsi = 100 - (100 / (1 + rs))
+    if pd.notna(avg_loss.iloc[-1]) and float(avg_loss.iloc[-1]) == 0.0:
+        rsi.iloc[-1] = 100.0
+    cumulative_rsi = float(rsi.fillna(0.0).sum()) if not rsi.empty else 0.0
+
+    direction = close.diff().fillna(0.0).apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
+    obv = (direction * volume).cumsum()
+    cumulative_obv = float(obv.iloc[-1]) if not obv.empty else 0.0
+
+    typical_price = (high + low + close) / 3.0
+    pv = (typical_price * volume).cumsum()
+    cum_vol = volume.cumsum()
+    vwap = pv / cum_vol.replace(0, pd.NA)
+    cumulative_vwap = float(vwap.iloc[-1]) if not vwap.empty and pd.notna(vwap.iloc[-1]) else 0.0
+
+    return {
+        "Cumulative RSI": cumulative_rsi,
+        "Cumulative OBV": cumulative_obv,
+        "Cumulative VWAP": cumulative_vwap,
+    }
+
 def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[Dict, pd.DataFrame]:
     if intra_df is None or intra_df.empty:
         return {}, pd.DataFrame()
@@ -311,6 +363,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
         intra_df = get_fyers_history(fyers_sym, resolution="5", days_back=INTRADAY_LOOKBACK_DAYS)
 
         vol_info = compute_volatility_pair(daily_df)
+        cumulative_info = compute_cumulative_indicators(intra_df)
         iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
 
         if daily_df is not None and len(daily_df) >= 2:
@@ -352,6 +405,9 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"),
             "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"),
             "Daily Volume Expansion": daily_volume_exp,
+            "Cumulative RSI": cumulative_info.get("Cumulative RSI"),
+            "Cumulative OBV": cumulative_info.get("Cumulative OBV"),
+            "Cumulative VWAP": cumulative_info.get("Cumulative VWAP"),
             "Ease of Movement": ease_of_movement,
             "Total Iterations": total_iterations,
             "Above Threshold Iterations": above_count,
@@ -476,7 +532,7 @@ def format_value(col: str, val):
         return f"{float(val):.2f}"
     if col == "% Change":
         return f"{float(val):.2f}%"
-    if col == "Current Volume":
+    if col in ["Current Volume", "Cumulative OBV"]:
         return f"{int(val):,}"
     if col == "Above Threshold Ratio":
         return f"{float(val) * 100:.2f}%"
