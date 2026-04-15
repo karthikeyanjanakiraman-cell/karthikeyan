@@ -218,17 +218,17 @@ def compute_cumulative_flow_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
     period = 14
     avg_gain = gain.rolling(period, min_periods=period).mean()
     avg_loss = loss.rolling(period, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rs = avg_gain / avg_loss.replace(0, float('nan'))
     rsi = 100 - (100 / (1 + rs))
     zero_loss = (avg_loss == 0) & avg_loss.notna()
     rsi = rsi.mask(zero_loss, 100.0).fillna(0.0)
 
-    direction = np.sign(delta)
+    direction = close.diff().fillna(0.0).apply(lambda x: 1 if x > 0 else (-1 if x < 0 else 0))
     obv = (direction * volume).cumsum()
 
     typical_price = (high + low + close) / 3.0
     cum_pv = (typical_price * volume).cumsum()
-    cum_vol = volume.cumsum().replace(0, np.nan)
+    cum_vol = volume.cumsum().replace(0, float('nan'))
     vwap = (cum_pv / cum_vol).fillna(0.0)
 
     out = pd.DataFrame({
@@ -237,7 +237,6 @@ def compute_cumulative_flow_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
         "Cumulative VWAP": vwap,
     })
     return pd.concat([df.reset_index(drop=True), out.reset_index(drop=True)], axis=1)
-
 
 def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[Dict, pd.DataFrame]:
     if intra_df is None or intra_df.empty:
@@ -303,9 +302,9 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
             "10 Day Relative Volume": rvol10,
             "20 Day Relative Volume": rvol20,
             "Daily Volume Expansion": dvolexp,
-            "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else np.nan,
-            "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[i]) if not flow_df.empty else np.nan,
-            "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[i]) if not flow_df.empty else np.nan,
+            "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else float("nan"),
+            "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[i]) if not flow_df.empty else float("nan"),
+            "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[i]) if not flow_df.empty else float("nan"),
         })
 
         last_cum_vol = cum_vol
@@ -322,9 +321,9 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         "10 Day Relative Volume": last_rvol10,
         "20 Day Relative Volume": last_rvol20,
         "Daily Volume Expansion": last_dvolexp,
-        "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[-1]) if not flow_df.empty else np.nan,
-        "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[-1]) if not flow_df.empty else np.nan,
-        "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[-1]) if not flow_df.empty else np.nan,
+        "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[-1]) if not flow_df.empty else float("nan"),
+        "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[-1]) if not flow_df.empty else float("nan"),
+        "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Total Iterations": total_iters,
         "Last Iteration Minutes": last_iter_mins,
         "Last Iteration Time": last_iter_time,
@@ -396,6 +395,9 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"),
             "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"),
             "Daily Volume Expansion": daily_volume_exp,
+            "Cumulative RSI": iter_summary.get("Cumulative RSI"),
+            "Cumulative OBV": iter_summary.get("Cumulative OBV"),
+            "Cumulative VWAP": iter_summary.get("Cumulative VWAP"),
             "Ease of Movement": ease_of_movement,
             "Total Iterations": total_iterations,
             "Above Threshold Iterations": above_count,
@@ -436,7 +438,6 @@ DISPLAY_COLS = [
     "Last Iteration Minutes",
     "Last Iteration Time",
 ]
-
 
 EMAIL_DISPLAY_COLS = [
     "Symbol",
@@ -533,6 +534,7 @@ def format_value(col: str, val):
         "20 Day Relative Volume",
         "Daily Volume Expansion",
         "Cumulative RSI",
+        "Cumulative OBV",
         "Cumulative VWAP",
         "Ease of Movement",
         "Cumulative KER",
