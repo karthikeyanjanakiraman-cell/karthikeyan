@@ -114,6 +114,7 @@ def get_fyers_history(symbol: str, resolution: str, days_back: int) -> Optional[
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
             df["timestamp"] = df["timestamp"].dt.tz_localize("UTC").dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
             df.sort_values("timestamp", inplace=True)
+            df.drop_duplicates(subset=["timestamp"], keep="last", inplace=True)
             df.reset_index(drop=True, inplace=True)
             return df
         return None
