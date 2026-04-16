@@ -236,10 +236,16 @@ def compute_cumulative_flow_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
     cum_vol = volume.cumsum().replace(0, float('nan'))
     vwap = (cum_pv / cum_vol).fillna(0.0)
 
+    cum_pv2 = ((typical_price ** 2) * volume).cumsum()
+    vwap_variance = (cum_pv2 / cum_vol) - (vwap ** 2)
+    vwap_variance = vwap_variance.clip(lower=0.0)
+    vwap_std = np.sqrt(vwap_variance).fillna(0.0)
+
     out = pd.DataFrame({
         "Cumulative RSI": rsi,
         "Cumulative OBV": obv,
         "Cumulative VWAP": vwap,
+        "VWAP StdDev": vwap_std,
     })
     return pd.concat([df.reset_index(drop=True), out.reset_index(drop=True)], axis=1)
 
@@ -310,6 +316,8 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
             "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else float("nan"),
             "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[i]) if not flow_df.empty else float("nan"),
             "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[i]) if not flow_df.empty else float("nan"),
+            "VWAP StdDev": float(flow_df["VWAP StdDev"].iloc[i]) if not flow_df.empty else float("nan"),
+            "VWAP Z-Score": (float(curr_df["close"].iloc[i]) - float(flow_df["Cumulative VWAP"].iloc[i])) / float(flow_df["VWAP StdDev"].iloc[i]) if not flow_df.empty and float(flow_df["VWAP StdDev"].iloc[i]) > 0 else 0.0,
         })
 
         last_cum_vol = cum_vol
@@ -329,6 +337,8 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[-1]) if not flow_df.empty else float("nan"),
+        "VWAP StdDev": float(flow_df["VWAP StdDev"].iloc[-1]) if not flow_df.empty else float("nan"),
+        "VWAP Z-Score": (ltp - float(flow_df["Cumulative VWAP"].iloc[-1])) / float(flow_df["VWAP StdDev"].iloc[-1]) if not flow_df.empty and float(flow_df["VWAP StdDev"].iloc[-1]) > 0 else 0.0,
         "Total Iterations": total_iters,
         "Last Iteration Minutes": last_iter_mins,
         "Last Iteration Time": last_iter_time,
@@ -403,6 +413,8 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "Cumulative RSI": iter_summary.get("Cumulative RSI"),
             "Cumulative OBV": iter_summary.get("Cumulative OBV"),
             "Cumulative VWAP": iter_summary.get("Cumulative VWAP"),
+            "VWAP StdDev": iter_summary.get("VWAP StdDev"),
+            "VWAP Z-Score": iter_summary.get("VWAP Z-Score"),
             "Ease of Movement": ease_of_movement,
             "Total Iterations": total_iterations,
             "Above Threshold Iterations": above_count,
@@ -433,6 +445,7 @@ DISPLAY_COLS = [
     "Cumulative RSI",
     "Cumulative OBV",
     "Cumulative VWAP",
+    "VWAP Z-Score",
     "Cumulative KER",
     "Cumulative +DI",
     "Cumulative -DI",
@@ -453,6 +466,7 @@ EMAIL_DISPLAY_COLS = [
     "Cumulative RSI",
     "Cumulative OBV",
     "Cumulative VWAP",
+    "VWAP Z-Score",
     "Cumulative KER",
     "Cumulative +DI",
     "Cumulative -DI",
@@ -507,7 +521,6 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
     long_df = _sort_long(strict_long)
     short_df = _sort_short(strict_short)
 
-    # Append fallback longs/shorts if there's room, but ONLY of the correct sign
     extra_long = _sort_long(fallback_long[~fallback_long["Symbol"].isin(long_df["Symbol"])])
     long_df = pd.concat([long_df, extra_long])
 
@@ -534,6 +547,8 @@ def format_value(col: str, val):
         "Cumulative RSI",
         "Cumulative OBV",
         "Cumulative VWAP",
+        "VWAP StdDev",
+        "VWAP Z-Score",
         "Ease of Movement",
         "Cumulative KER",
         "Cumulative +DI",
