@@ -498,31 +498,24 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
         strict_short = base[(base["% Change"] < 0) & (base["Cumulative -DI"] > base["Cumulative +DI"])].copy()
         fallback_long = base[base["% Change"] > 0].copy()
         fallback_short = base[base["% Change"] < 0].copy()
-        broader_short = base.copy().sort_values(by=["% Change"], ascending=[True], na_position="last")
     else:
         strict_long = base.copy()
         strict_short = base.copy()
         fallback_long = base.copy()
         fallback_short = base.copy()
-        broader_short = base.copy()
 
     long_df = _sort_long(strict_long)
     short_df = _sort_short(strict_short)
 
-    if len(long_df) < 15:
-        extra_long = _sort_long(fallback_long[~fallback_long["Symbol"].isin(long_df["Symbol"])])
-        long_df = pd.concat([long_df, extra_long])
+    # Append fallback longs/shorts if there's room, but ONLY of the correct sign
+    extra_long = _sort_long(fallback_long[~fallback_long["Symbol"].isin(long_df["Symbol"])])
+    long_df = pd.concat([long_df, extra_long])
 
-    if len(short_df) < 15:
-        extra_short = _sort_short(fallback_short[~fallback_short["Symbol"].isin(short_df["Symbol"])])
-        short_df = pd.concat([short_df, extra_short])
+    extra_short = _sort_short(fallback_short[~fallback_short["Symbol"].isin(short_df["Symbol"])])
+    short_df = pd.concat([short_df, extra_short])
 
-    if len(short_df) < 15:
-        extra_broader = broader_short[~broader_short["Symbol"].isin(short_df["Symbol"])]
-        short_df = pd.concat([short_df, extra_broader])
-
-    long_df = long_df.drop_duplicates(subset=["Symbol"]).head(15)
-    short_df = short_df.drop_duplicates(subset=["Symbol"]).head(15)
+    long_df = long_df.drop_duplicates(subset=["Symbol"])
+    short_df = short_df.drop_duplicates(subset=["Symbol"])
 
     return long_df[DISPLAY_COLS].copy(), short_df[DISPLAY_COLS].copy()
 
