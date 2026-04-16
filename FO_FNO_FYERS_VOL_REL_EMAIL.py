@@ -236,16 +236,17 @@ def compute_cumulative_flow_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
     cum_vol = volume.cumsum().replace(0, float('nan'))
     vwap = (cum_pv / cum_vol).fillna(0.0)
 
-    cum_pv2 = ((typical_price ** 2) * volume).cumsum()
-    vwap_variance = (cum_pv2 / cum_vol) - (vwap ** 2)
-    vwap_variance = vwap_variance.clip(lower=0.0)
+    # NEW VWAP STD DEV & Z-SCORE LOGIC
+    vwap_variance = (volume * (typical_price - vwap)**2).cumsum() / cum_vol
     vwap_std = np.sqrt(vwap_variance).fillna(0.0)
+    # Z-Score shows how many standard deviations price is away from VWAP
+    vwap_z_score = np.where(vwap_std > 0, (close - vwap) / vwap_std, 0.0)
 
     out = pd.DataFrame({
         "Cumulative RSI": rsi,
         "Cumulative OBV": obv,
         "Cumulative VWAP": vwap,
-        "VWAP StdDev": vwap_std,
+        "VWAP Z-Score": pd.Series(vwap_z_score, index=df.index).fillna(0.0),
     })
     return pd.concat([df.reset_index(drop=True), out.reset_index(drop=True)], axis=1)
 
@@ -316,8 +317,6 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
             "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else float("nan"),
             "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[i]) if not flow_df.empty else float("nan"),
             "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[i]) if not flow_df.empty else float("nan"),
-            "VWAP StdDev": float(flow_df["VWAP StdDev"].iloc[i]) if not flow_df.empty else float("nan"),
-            "VWAP Z-Score": (float(curr_df["close"].iloc[i]) - float(flow_df["Cumulative VWAP"].iloc[i])) / float(flow_df["VWAP StdDev"].iloc[i]) if not flow_df.empty and float(flow_df["VWAP StdDev"].iloc[i]) > 0 else 0.0,
         })
 
         last_cum_vol = cum_vol
@@ -337,8 +336,7 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[-1]) if not flow_df.empty else float("nan"),
-        "VWAP StdDev": float(flow_df["VWAP StdDev"].iloc[-1]) if not flow_df.empty else float("nan"),
-        "VWAP Z-Score": (ltp - float(flow_df["Cumulative VWAP"].iloc[-1])) / float(flow_df["VWAP StdDev"].iloc[-1]) if not flow_df.empty and float(flow_df["VWAP StdDev"].iloc[-1]) > 0 else 0.0,
+        "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Total Iterations": total_iters,
         "Last Iteration Minutes": last_iter_mins,
         "Last Iteration Time": last_iter_time,
@@ -413,8 +411,6 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "Cumulative RSI": iter_summary.get("Cumulative RSI"),
             "Cumulative OBV": iter_summary.get("Cumulative OBV"),
             "Cumulative VWAP": iter_summary.get("Cumulative VWAP"),
-            "VWAP StdDev": iter_summary.get("VWAP StdDev"),
-            "VWAP Z-Score": iter_summary.get("VWAP Z-Score"),
             "Ease of Movement": ease_of_movement,
             "Total Iterations": total_iterations,
             "Above Threshold Iterations": above_count,
@@ -507,11 +503,35 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
             na_position="last",
         )
 
-    if {"% Change", "Cumulative +DI", "Cumulative -DI"}.issubset(base.columns):
-        strict_long = base[(base["% Change"] > 0) & (base["Cumulative +DI"] > base["Cumulative -DI"])].copy()
-        strict_short = base[(base["% Change"] < 0) & (base["Cumulative -DI"] > base["Cumulative +DI"])].copy()
-        fallback_long = base[base["% Change"] > 0].copy()
-        fallback_short = base[base["% Change"] < 0].copy()
+    if {"% Change", "Cumulative +DI", "Cumulative -DI", "VWAP Z-Score"}.issubset(base.columns):
+        # 1. Filter Longs: Positive trend, +DI > -DI, AND Z-Score between 0.0 and 1.8
+        strict_long = base[
+            (base["% Change"] > 0) & 
+            (base["Cumulative +DI"] > base["Cumulative -DI"]) &
+            (base["VWAP Z-Score"] > 0.0) & 
+            (base["VWAP Z-Score"] <= 1.8)
+        ].copy()
+
+        # 2. Filter Shorts: Negative trend, -DI > +DI, AND Z-Score between -1.8 and 0.0
+        strict_short = base[
+            (base["% Change"] < 0) & 
+            (base["Cumulative -DI"] > base["Cumulative +DI"]) &
+            (base["VWAP Z-Score"] < 0.0) & 
+            (base["VWAP Z-Score"] >= -1.8)
+        ].copy()
+
+        # 3. Fallbacks must also respect the Z-Score limits to avoid padding with traps
+        fallback_long = base[
+            (base["% Change"] > 0) & 
+            (base["VWAP Z-Score"] > 0.0) & 
+            (base["VWAP Z-Score"] <= 1.8)
+        ].copy()
+
+        fallback_short = base[
+            (base["% Change"] < 0) & 
+            (base["VWAP Z-Score"] < 0.0) & 
+            (base["VWAP Z-Score"] >= -1.8)
+        ].copy()
     else:
         strict_long = base.copy()
         strict_short = base.copy()
@@ -521,14 +541,16 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
     long_df = _sort_long(strict_long)
     short_df = _sort_short(strict_short)
 
-    extra_long = _sort_long(fallback_long[~fallback_long["Symbol"].isin(long_df["Symbol"])])
-    long_df = pd.concat([long_df, extra_long])
+    if len(long_df) < 15:
+        extra_long = _sort_long(fallback_long[~fallback_long["Symbol"].isin(long_df["Symbol"])])
+        long_df = pd.concat([long_df, extra_long])
 
-    extra_short = _sort_short(fallback_short[~fallback_short["Symbol"].isin(short_df["Symbol"])])
-    short_df = pd.concat([short_df, extra_short])
+    if len(short_df) < 15:
+        extra_short = _sort_short(fallback_short[~fallback_short["Symbol"].isin(short_df["Symbol"])])
+        short_df = pd.concat([short_df, extra_short])
 
-    long_df = long_df.drop_duplicates(subset=["Symbol"])
-    short_df = short_df.drop_duplicates(subset=["Symbol"])
+    long_df = long_df.drop_duplicates(subset=["Symbol"]).head(15)
+    short_df = short_df.drop_duplicates(subset=["Symbol"]).head(15)
 
     return long_df[DISPLAY_COLS].copy(), short_df[DISPLAY_COLS].copy()
 
@@ -547,7 +569,6 @@ def format_value(col: str, val):
         "Cumulative RSI",
         "Cumulative OBV",
         "Cumulative VWAP",
-        "VWAP StdDev",
         "VWAP Z-Score",
         "Ease of Movement",
         "Cumulative KER",
