@@ -510,7 +510,7 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
         strict_long = base[
             (base["% Change"] > 0) & 
             (base["Cumulative +DI"] > base["Cumulative -DI"]) &
-            (base["VWAP Z-Score"] > 0.0) & 
+            (base["VWAP Z-Score"] > 0.3) & 
             (base["VWAP Z-Score"] <= 1.8)
         ].copy()
 
@@ -518,20 +518,20 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
         strict_short = base[
             (base["% Change"] < 0) & 
             (base["Cumulative -DI"] > base["Cumulative +DI"]) &
-            (base["VWAP Z-Score"] < 0.0) & 
+            (base["VWAP Z-Score"] < -0.3) & 
             (base["VWAP Z-Score"] >= -1.8)
         ].copy()
 
         # 3. Fallbacks must also respect the Z-Score limits to avoid padding with traps
         fallback_long = base[
             (base["% Change"] > 0) & 
-            (base["VWAP Z-Score"] > 0.0) & 
+            (base["VWAP Z-Score"] > 0.3) & 
             (base["VWAP Z-Score"] <= 1.8)
         ].copy()
 
         fallback_short = base[
             (base["% Change"] < 0) & 
-            (base["VWAP Z-Score"] < 0.0) & 
+            (base["VWAP Z-Score"] < -0.3) & 
             (base["VWAP Z-Score"] >= -1.8)
         ].copy()
     else:
