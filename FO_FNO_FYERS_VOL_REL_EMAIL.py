@@ -847,3 +847,74 @@ def main():
 
 if __name__ == "__main__":
     main()
+# ==========================================
+# HYBRID SMC FRESHNESS & TRAP FILTER
+# ==========================================
+def calculate_hybrid_freshness(df_intraday):
+    if df_intraday is None or df_intraday.empty:
+        return df_intraday
+
+    if 'time' not in df_intraday.columns and 'timestamp' in df_intraday.columns:
+        df_intraday.rename(columns={'timestamp': 'time'}, inplace=True)
+
+    df_intraday = df_intraday.sort_values('time').reset_index(drop=True)
+
+    if len(df_intraday) < 3:
+        df_intraday['Freshness_Score'] = 50.0
+        df_intraday['Is_Fresh'] = False
+        return df_intraday
+
+    df_intraday['rolling_HOD'] = df_intraday['high'].cummax()
+    df_intraday['vol_sma_10'] = df_intraday['volume'].rolling(window=10, min_periods=1).mean().shift(1).fillna(df_intraday['volume'].mean())
+    df_intraday['vol_ratio'] = df_intraday['volume'] / df_intraday['vol_sma_10']
+
+    open_price = df_intraday.iloc[0]['open']
+    df_intraday['close_vs_open_pct'] = (df_intraday['close'] - open_price) / open_price * 100
+
+    ib_high = df_intraday.iloc[0:3]['high'].max()
+    ib_vol_avg = df_intraday.iloc[0:3]['volume'].mean()
+
+    freshness_scores = []
+    is_fresh_flags = []
+
+    for i in range(len(df_intraday)):
+        row = df_intraday.iloc[i]
+
+        base_score = min(100, max(0, row['close_vs_open_pct'] / 3.0 * 100))
+        score = base_score
+        is_fresh = False
+
+        if i < 3:
+            score = base_score
+        elif 3 <= i < 11:
+            dist_to_ib_high = (ib_high - row['close']) / ib_high * 100
+            vol_vs_ib = row['volume'] / ib_vol_avg
+
+            if dist_to_ib_high < 0.3 or row['close'] > ib_high:
+                if vol_vs_ib < 0.8:
+                    score = score * 0.2
+                else:
+                    score = min(100, score * 1.5)
+                    is_fresh = True
+        else:
+            prev_hod = df_intraday.iloc[i-1]['rolling_HOD']
+            dist_to_prev_hod = (prev_hod - row['close']) / prev_hod * 100
+
+            if dist_to_prev_hod < 0.3 or row['close'] > prev_hod:
+                if row['vol_ratio'] < 1.3:
+                    score = score * 0.2
+                else:
+                    score = min(100, score * 1.5)
+                    is_fresh = True
+            elif row['vol_ratio'] > 2.0 and row['close'] > row['open']:
+                score = min(100, score * 1.2)
+                is_fresh = True
+
+        freshness_scores.append(round(score, 1))
+        is_fresh_flags.append(is_fresh)
+
+    df_intraday['Freshness_Score'] = freshness_scores
+    df_intraday['Is_Fresh'] = is_fresh_flags
+    return df_intraday
+
+
