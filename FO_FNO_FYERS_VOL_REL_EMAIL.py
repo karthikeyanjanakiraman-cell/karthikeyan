@@ -7,6 +7,7 @@ from typing import List, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 from fyers_apiv3 import fyersModel
+
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -61,7 +62,6 @@ def load_fno_symbols_from_sectors(root_dir: str = "sectors") -> List[str]:
     if not os.path.isdir(root_dir):
         logger.warning(f"FNO Sectors folder '{root_dir}' not found, returning empty list.")
         return []
-
     for dirpath, _, filenames in os.walk(root_dir):
         for fname in filenames:
             if not fname.lower().endswith(".csv"):
@@ -82,7 +82,6 @@ def load_fno_symbols_from_sectors(root_dir: str = "sectors") -> List[str]:
                         symbols.add(s)
             except Exception as e:
                 logger.warning(f"FNO Error reading {fpath}: {e}")
-
     symbols_list = sorted(symbols)
     logger.info(f"FNO Loaded {len(symbols_list)} unique F&O symbols.")
     return symbols_list
@@ -170,8 +169,6 @@ def compute_cumulative_directional_metrics(curr_df: pd.DataFrame) -> pd.DataFram
 
         path = abs(c[i] - o[0])
         walked = abs(c[0] - o[0]) + np.sum(np.abs(np.diff(c[: i + 1])))
-        ker = path / walked if walked > 0 else 0.0
-
         prior_kers = []
         for j in range(1, i + 1):
             pj = abs(c[j] - o[0])
@@ -195,10 +192,8 @@ def compute_cumulative_directional_metrics(curr_df: pd.DataFrame) -> pd.DataFram
             dxs.append(100 * abs(kpdi - kmdi) / (kpdi + kmdi) if (kpdi + kmdi) > 0 else 0.0)
         adx = float(np.mean(dxs)) if dxs else np.nan
 
-        # Count up-iterations based on close > previous close
         if c[i] > c[i - 1]:
             qualified += 1
-
         length_so_far = i + 1
         survival_ratio = qualified / length_so_far if length_so_far > 0 else 0.0
         out.append([cum_ker, pdi, mdi, adx, f"{qualified}/{length_so_far}", survival_ratio])
@@ -223,7 +218,7 @@ def compute_cumulative_flow_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
     period = 14
     avg_gain = gain.rolling(period, min_periods=period).mean()
     avg_loss = loss.rolling(period, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, float('nan'))
+    rs = avg_gain / avg_loss.replace(0, float("nan"))
     rsi = 100 - (100 / (1 + rs))
     zero_loss = (avg_loss == 0) & avg_loss.notna()
     rsi = rsi.mask(zero_loss, 100.0).fillna(0.0)
@@ -233,13 +228,11 @@ def compute_cumulative_flow_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
 
     typical_price = (high + low + close) / 3.0
     cum_pv = (typical_price * volume).cumsum()
-    cum_vol = volume.cumsum().replace(0, float('nan'))
+    cum_vol = volume.cumsum().replace(0, float("nan"))
     vwap = (cum_pv / cum_vol).fillna(0.0)
 
-    # NEW VWAP STD DEV & Z-SCORE LOGIC
-    vwap_variance = (volume * (typical_price - vwap)**2).cumsum() / cum_vol
+    vwap_variance = (volume * (typical_price - vwap) ** 2).cumsum() / cum_vol
     vwap_std = np.sqrt(vwap_variance).fillna(0.0)
-    # Z-Score shows how many standard deviations price is away from VWAP
     vwap_z_score = np.where(vwap_std > 0, (close - vwap) / vwap_std, 0.0)
 
     out = pd.DataFrame({
@@ -249,6 +242,71 @@ def compute_cumulative_flow_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
         "VWAP Z-Score": pd.Series(vwap_z_score, index=df.index).fillna(0.0),
     })
     return pd.concat([df.reset_index(drop=True), out.reset_index(drop=True)], axis=1)
+
+
+def calculate_hybrid_freshness(df_intraday: pd.DataFrame) -> pd.DataFrame:
+    if df_intraday is None or df_intraday.empty:
+        return df_intraday
+
+    df_intraday = df_intraday.sort_values("time").reset_index(drop=True)
+
+    if len(df_intraday) < 3:
+        df_intraday["Freshness_Score"] = 50.0
+        df_intraday["Is_Fresh"] = False
+        return df_intraday
+
+    df_intraday["rolling_HOD"] = df_intraday["high"].cummax()
+    df_intraday["vol_sma_10"] = (
+        df_intraday["volume"].rolling(window=10, min_periods=1).mean().shift(1).fillna(df_intraday["volume"].mean())
+    )
+    df_intraday["vol_ratio"] = df_intraday["volume"] / df_intraday["vol_sma_10"]
+
+    open_price = float(df_intraday.iloc[0]["open"])
+    df_intraday["close_vs_open_pct"] = (df_intraday["close"] - open_price) / open_price * 100
+
+    ib_high = df_intraday.iloc[0:3]["high"].max()
+    ib_vol_avg = df_intraday.iloc[0:3]["volume"].mean()
+
+    freshness_scores = []
+    is_fresh_flags = []
+
+    for i in range(len(df_intraday)):
+        row = df_intraday.iloc[i]
+        base_score = min(100, max(0, row["close_vs_open_pct"] / 3.0 * 100))
+        score = base_score
+        is_fresh = False
+
+        if i < 3:
+            score = base_score
+        elif 3 <= i < 11:
+            dist_to_ib_high = (ib_high - row["close"]) / ib_high * 100
+            vol_vs_ib = row["volume"] / ib_vol_avg if ib_vol_avg > 0 else 0.0
+            if dist_to_ib_high < 0.3 or row["close"] > ib_high:
+                if vol_vs_ib < 0.8:
+                    score = score * 0.2
+                else:
+                    score = min(100, score * 1.5)
+                    is_fresh = True
+        else:
+            prev_hod = df_intraday.iloc[i - 1]["rolling_HOD"]
+            dist_to_prev_hod = (prev_hod - row["close"]) / prev_hod * 100 if prev_hod > 0 else 999
+            if dist_to_prev_hod < 0.3 or row["close"] > prev_hod:
+                if row["vol_ratio"] < 1.3:
+                    score = score * 0.2
+                else:
+                    score = min(100, score * 1.5)
+                    is_fresh = True
+            elif row["vol_ratio"] > 2.0 and row["close"] > row["open"]:
+                score = min(100, score * 1.2)
+                is_fresh = True
+
+        freshness_scores.append(round(score, 1))
+        is_fresh_flags.append(is_fresh)
+
+    df_intraday["Freshness_Score"] = freshness_scores
+    df_intraday["Is_Fresh"] = is_fresh_flags
+    return df_intraday
+
 
 def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[Dict, pd.DataFrame]:
     if intra_df is None or intra_df.empty:
@@ -273,10 +331,14 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
 
     curr_df.sort_values("time", inplace=True)
     curr_df["cum_vol"] = curr_df["volume"].cumsum()
+
     metric_df = compute_cumulative_directional_metrics(curr_df[["time", "open", "high", "low", "close", "volume"]].copy())
     flow_df = compute_cumulative_flow_metrics(curr_df[["time", "high", "low", "close", "volume"]].copy())
-    ltp = float(curr_df["close"].iloc[-1])
 
+    fresh_input_df = curr_df[["time", "open", "high", "low", "close", "volume"]].copy()
+    fresh_df = calculate_hybrid_freshness(fresh_input_df)
+
+    ltp = float(curr_df["close"].iloc[-1])
     rows = []
     total_iters = 0
     last_iter_mins = None
@@ -302,6 +364,7 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         rvol20 = cum_vol / avg_cum_20 if avg_cum_20 > 0 else 0
 
         dvolexp = cum_vol / avg_daily_vol_10 if avg_daily_vol_10 > 0 else 0
+
         dt_time = datetime.combine(current_date, t)
         market_open = datetime.combine(current_date, time(9, 15))
         iter_mins = int((dt_time - market_open).total_seconds() / 60)
@@ -318,6 +381,8 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
             "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[i]) if not flow_df.empty else float("nan"),
             "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[i]) if not flow_df.empty else float("nan"),
             "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[i]) if not flow_df.empty else float("nan"),
+            "Freshness_Score": float(fresh_df["Freshness_Score"].iloc[i]) if not fresh_df.empty else 0.0,
+            "Is_Fresh": bool(fresh_df["Is_Fresh"].iloc[i]) if not fresh_df.empty else False,
         })
 
         last_cum_vol = cum_vol
@@ -328,81 +393,39 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         last_iter_time = t.strftime("%H:%M")
 
     detail_df = pd.DataFrame(rows)
-    # ---------- Freshness metrics (score + trap filter) ----------
-    if not curr_df.empty:
-        hod = float(curr_df["high"].max())
-    else:
-        hod = float("nan")
 
-    if hod and hod > 0 and ltp is not None:
-        strike_distance = (hod - ltp) / hod
-    else:
-        strike_distance = 1.0
+    hod = float(curr_df["high"].max()) if not curr_df.empty else float("nan")
+    strike_distance = (hod - ltp) / hod if hod and hod > 0 and ltp is not None else 1.0
 
     if not curr_df.empty:
         last_5m_volume = float(curr_df["volume"].iloc[-1])
         recent_12 = curr_df["volume"].tail(12)
         vol_1h_avg_5m = float(recent_12.mean()) if len(recent_12) > 0 else last_5m_volume
-
-        last3 = curr_df["volume"].tail(3)
-        vol_last3 = float(last3.sum())
-        vol_avg3 = vol_1h_avg_5m * max(len(last3), 1)
-        vol_ratio = vol_last3 / vol_avg3 if vol_avg3 > 0 else 0.0
     else:
         last_5m_volume = 0.0
         vol_1h_avg_5m = 0.0
-        vol_ratio = 0.0
 
     obv_30m_delta = 0.0
     rsi_30m_delta = 0.0
-    rsi_now = float("nan")
-
     if not flow_df.empty and len(flow_df) >= 7:
         obv_now = float(flow_df["Cumulative OBV"].iloc[-1])
         obv_30m_ago = float(flow_df["Cumulative OBV"].iloc[-7])
         obv_30m_delta = obv_now - obv_30m_ago
-
         rsi_now = float(flow_df["Cumulative RSI"].iloc[-1])
         rsi_30m_ago = float(flow_df["Cumulative RSI"].iloc[-7])
         rsi_30m_delta = rsi_now - rsi_30m_ago
     elif not flow_df.empty:
         rsi_now = float(flow_df["Cumulative RSI"].iloc[-1])
+    else:
+        rsi_now = float("nan")
 
     adx_now = float(metric_df["Cumulative ADX"].iloc[-1]) if not metric_df.empty else float("nan")
     ker_now = float(metric_df["Cumulative KER"].iloc[-1]) if not metric_df.empty else float("nan")
 
-    fresh_score = 0.0
-
-    # Location score
-    if strike_distance <= 0.005:
-        fresh_score += 30.0
-    elif strike_distance <= 0.01:
-        fresh_score += 15.0
-
-    # 3-bar volume score
-    if vol_ratio >= 1.5:
-        fresh_score += 30.0
-    elif vol_ratio >= 1.0:
-        fresh_score += 15.0
-
-    # OBV score
-    if obv_30m_delta > 0:
-        fresh_score += 20.0
-
-    # RSI score
-    if not np.isnan(rsi_now):
-        if 55 <= rsi_now <= 70:
-            fresh_score += 20.0
-        elif 50 <= rsi_now < 55:
-            fresh_score += 10.0
-
-    # SMC trap filter: near HOD but weak volume = fake breakout
-    if strike_distance <= 0.002 and vol_ratio < 1.3:
-        fresh_score = 0.0
-
+    fresh_score = float(fresh_df["Freshness_Score"].iloc[-1]) if not fresh_df.empty else 0.0
     adx_live = bool(adx_now > 20.0)
     ker_live = bool(ker_now > 0.40)
-    is_fresh = (fresh_score >= 60.0) and adx_live and ker_live
+    is_fresh = bool(fresh_score >= 60.0) and adx_live and ker_live
 
     summary = {
         "LTP": ltp,
@@ -525,46 +548,18 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 
 DISPLAY_COLS = [
-    "Symbol",
-    "LTP",
-    "% Change",
-    "Daily Volatility Expansion",
-    "10 Day Relative Volume",
-    "20 Day Relative Volume",
-    "Daily Volume Expansion",
-    "Cumulative RSI",
-    "Cumulative OBV",
-    "Cumulative VWAP",
-    "VWAP Z-Score",
-    "Freshness_Score",
-    "Cumulative KER",
-    "Cumulative +DI",
-    "Cumulative -DI",
-    "Cumulative ADX",
-    "Survival Score",
-    "Ease of Movement",
-    "Above Threshold Iterations",
-    "Last Iteration Minutes",
-    "Last Iteration Time",
+    "Symbol", "LTP", "% Change", "Daily Volatility Expansion", "10 Day Relative Volume",
+    "20 Day Relative Volume", "Daily Volume Expansion", "Cumulative RSI", "Cumulative OBV",
+    "Cumulative VWAP", "VWAP Z-Score", "Freshness_Score", "Cumulative KER", "Cumulative +DI",
+    "Cumulative -DI", "Cumulative ADX", "Survival Score", "Ease of Movement",
+    "Above Threshold Iterations", "Last Iteration Minutes", "Last Iteration Time",
 ]
 
 EMAIL_DISPLAY_COLS = [
-    "Symbol",
-    "LTP",
-    "% Change",
-    "Daily Volatility Expansion",
-    "Daily Volume Expansion",
-    "Cumulative RSI",
-    "Cumulative OBV",
-    "Cumulative VWAP",
-    "VWAP Z-Score",
-    "Freshness_Score",
-    "Cumulative KER",
-    "Cumulative +DI",
-    "Cumulative -DI",
-    "Cumulative ADX",
-    "Survival Score",
-    "Last Iteration Time",
+    "Symbol", "LTP", "% Change", "Daily Volatility Expansion", "Daily Volume Expansion",
+    "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score",
+    "Freshness_Score", "Cumulative KER", "Cumulative +DI", "Cumulative -DI",
+    "Cumulative ADX", "Survival Score", "Last Iteration Time",
 ]
 
 
@@ -573,15 +568,14 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
         return pd.DataFrame(columns=DISPLAY_COLS), pd.DataFrame(columns=DISPLAY_COLS)
 
     base = df_all.copy()
-
-    # Safe reindexing to prevent KeyError if the df is completely empty but passed through
     for col in DISPLAY_COLS:
         if col not in base.columns:
-            base[col] = float('nan')
+            base[col] = float("nan")
+
     if "Daily Volatility Expansion" in base.columns and "Daily Volume Expansion" in base.columns:
         filtered = base[
-            (base["Daily Volatility Expansion"] > DAILY_VOL_THRESHOLD)
-            & (base["Daily Volume Expansion"] > DAILY_VOLUME_THRESHOLD)
+            (base["Daily Volatility Expansion"] > DAILY_VOL_THRESHOLD) &
+            (base["Daily Volume Expansion"] > DAILY_VOLUME_THRESHOLD)
         ].copy()
         if not filtered.empty:
             base = filtered
@@ -605,32 +599,30 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
         )
 
     if {"% Change", "Cumulative +DI", "Cumulative -DI", "VWAP Z-Score"}.issubset(base.columns):
-        # 1. Filter Longs: Positive trend, +DI > -DI, AND Z-Score between 0.0 and 1.8
         strict_long = base[
-            (base["% Change"] > 0) & 
+            (base["Is_Fresh"] == True) &
+            (base["% Change"] > 0) &
             (base["Cumulative +DI"] > base["Cumulative -DI"]) &
-            (base["VWAP Z-Score"] > 0.3) & 
+            (base["VWAP Z-Score"] > 0.3) &
             (base["VWAP Z-Score"] <= 1.8)
         ].copy()
-
-        # 2. Filter Shorts: Negative trend, -DI > +DI, AND Z-Score between -1.8 and 0.0
         strict_short = base[
-            (base["% Change"] < 0) & 
+            (base["Is_Fresh"] == True) &
+            (base["% Change"] < 0) &
             (base["Cumulative -DI"] > base["Cumulative +DI"]) &
-            (base["VWAP Z-Score"] < -0.3) & 
+            (base["VWAP Z-Score"] < -0.3) &
             (base["VWAP Z-Score"] >= -1.8)
         ].copy()
-
-        # 3. Fallbacks must also respect the Z-Score limits to avoid padding with traps
         fallback_long = base[
-            (base["% Change"] > 0) & 
-            (base["VWAP Z-Score"] > 0.3) & 
+            (base["Is_Fresh"] == True) &
+            (base["% Change"] > 0) &
+            (base["VWAP Z-Score"] > 0.3) &
             (base["VWAP Z-Score"] <= 1.8)
         ].copy()
-
         fallback_short = base[
-            (base["% Change"] < 0) & 
-            (base["VWAP Z-Score"] < -0.3) & 
+            (base["Is_Fresh"] == True) &
+            (base["% Change"] < 0) &
+            (base["VWAP Z-Score"] < -0.3) &
             (base["VWAP Z-Score"] >= -1.8)
         ].copy()
     else:
@@ -645,19 +637,12 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
     if len(long_df) < 15:
         extra_long = _sort_long(fallback_long[~fallback_long["Symbol"].isin(long_df["Symbol"])])
         long_df = pd.concat([long_df, extra_long])
-
     if len(short_df) < 15:
         extra_short = _sort_short(fallback_short[~fallback_short["Symbol"].isin(short_df["Symbol"])])
         short_df = pd.concat([short_df, extra_short])
 
-    if "Is_Fresh" in long_df.columns:
-        long_df = long_df[long_df["Is_Fresh"] == True]
-    if "Is_Fresh" in short_df.columns:
-        short_df = short_df[short_df["Is_Fresh"] == True]
-
     long_df = long_df.drop_duplicates(subset=["Symbol"]).head(15)
     short_df = short_df.drop_duplicates(subset=["Symbol"]).head(15)
-
     return long_df[DISPLAY_COLS].copy(), short_df[DISPLAY_COLS].copy()
 
 
@@ -665,22 +650,10 @@ def format_value(col: str, val):
     if pd.isna(val):
         return ""
     if col in [
-        "LTP",
-        "Current Daily Volatility",
-        "Avg Daily Volatility",
-        "Daily Volatility Expansion",
-        "10 Day Relative Volume",
-        "20 Day Relative Volume",
-        "Daily Volume Expansion",
-        "Cumulative RSI",
-        "Cumulative OBV",
-        "Cumulative VWAP",
-        "VWAP Z-Score",
-        "Ease of Movement",
-        "Cumulative KER",
-        "Cumulative +DI",
-        "Cumulative -DI",
-        "Cumulative ADX",
+        "LTP", "Current Daily Volatility", "Avg Daily Volatility", "Daily Volatility Expansion",
+        "10 Day Relative Volume", "20 Day Relative Volume", "Daily Volume Expansion",
+        "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score",
+        "Ease of Movement", "Cumulative KER", "Cumulative +DI", "Cumulative -DI", "Cumulative ADX",
     ]:
         return f"{float(val):.2f}"
     if col == "% Change":
@@ -702,72 +675,44 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     cols = [c for c in EMAIL_DISPLAY_COLS if c in df_slice.columns]
 
     header_html = "".join(
-        f'<th style="padding:8px;border:1px solid #d0d0d0;background:#f5f5f5;text-align:left;">{col}</th>'
-        for col in cols
+        f'<th style="padding:8px;border:1px solid #ccc;background:#f5f5f5;">{c}</th>'
+        for c in cols
     )
-
     body_rows = []
     for _, row in df_slice.iterrows():
-        cells = "".join(
-            f'<td style="padding:8px;border:1px solid #d0d0d0;white-space:nowrap;">{format_value(col, row.get(col))}</td>'
-            for col in cols
+        tds = "".join(
+            f'<td style="padding:8px;border:1px solid #ccc;">{format_value(c, row[c])}</td>'
+            for c in cols
         )
-        body_rows.append(f"<tr>{cells}</tr>")
+        body_rows.append(f"<tr>{tds}</tr>")
 
-    return (
-        '<div style="overflow-x:auto; margin:12px 0 20px 0;">'
-        '<table style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:13px;">'
-        f'<thead><tr>{header_html}</tr></thead>'
-        f'<tbody>{"".join(body_rows)}</tbody>'
-        '</table></div>'
-    )
-
-
-def _first_env(*keys: str) -> Optional[str]:
-    for key in keys:
-        value = os.environ.get(key)
-        if value is not None and str(value).strip() != "":
-            return value.strip()
-    return None
+    return f"<table style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:13px;"><thead><tr>{header_html}</tr></thead><tbody>{''.join(body_rows)}</tbody></table>"
 
 
 def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str, detail_csv_filename: str) -> bool:
+    sender_email = os.environ.get("SENDER_EMAIL")
+    sender_app_password = os.environ.get("SENDER_APP_PASSWORD") or os.environ.get("EMAIL_APP_PASSWORD")
+    recipient_email = os.environ.get("RECIPIENT_EMAIL")
+    smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = os.environ.get("SMTP_PORT", "587")
+
+    long_html = df_to_html_table(long_df)
+    short_html = df_to_html_table(short_df)
+
+    html_body = f"""
+    <html><body>
+    <h2>Intraday Volatility Iteration Alert</h2>
+    <p>Scan completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}.</p>
+    <p>Filters applied: Daily Volatility Expansion &gt; {DAILY_VOL_THRESHOLD} and Daily Volume Expansion &gt; {DAILY_VOLUME_THRESHOLD}.</p>
+    <h3>Long Candidates</h3>
+    {long_html}
+    <h3>Short Candidates</h3>
+    {short_html}
+    <p>Full scan summary and detailed iteration data are attached as CSV files.</p>
+    </body></html>
+    """
+
     try:
-        sender_email_keys = ["SENDER_EMAIL", "EMAIL_USER", "GMAIL_USER", "SMTP_USERNAME", "MAIL_USERNAME", "FROM_EMAIL", "EMAIL_FROM"]
-        sender_password_keys = ["SENDER_APP_PASSWORD", "SENDER_PASSWORD", "EMAIL_PASSWORD", "EMAIL_PASS", "GMAIL_APP_PASSWORD", "GMAIL_PASSWORD", "SMTP_PASSWORD", "MAIL_PASSWORD", "APP_PASSWORD", "EMAIL_APP_PASSWORD", "PASSWORD"]
-        recipient_keys = ["RECIPIENT_EMAIL", "TO_EMAIL", "ALERT_EMAIL", "MAIL_TO", "EMAIL_TO"]
-
-        sender_email = _first_env(*sender_email_keys)
-        sender_app_password = _first_env(*sender_password_keys)
-        recipient_email = _first_env(*recipient_keys) or sender_email
-        smtp_host = _first_env("SMTP_HOST", "MAIL_SERVER", "EMAIL_HOST") or "smtp.gmail.com"
-        smtp_port = _first_env("SMTP_PORT", "MAIL_PORT", "EMAIL_PORT") or "587"
-
-        present_sender = [k for k in sender_email_keys if os.environ.get(k)]
-        present_password = [k for k in sender_password_keys if os.environ.get(k)]
-        present_recipient = [k for k in recipient_keys if os.environ.get(k)]
-        logger.info(f"EMAIL Env sender keys present: {present_sender}")
-        logger.info(f"EMAIL Env password keys present: {present_password}")
-        logger.info(f"EMAIL Env recipient keys present: {present_recipient}")
-
-        long_table = df_to_html_table(long_df, max_rows=15)
-        short_table = df_to_html_table(short_df, max_rows=15)
-        html_body = f"""
-        <html>
-        <body style="font-family:Arial,sans-serif;font-size:14px;color:#222;">
-            <h2 style="margin-bottom:8px;">Intraday Vol Iteration Alert</h2>
-            <p style="margin:0 0 12px 0;">Scan completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}.</p>
-            <p style="margin:0 0 12px 0;">Filters applied: Daily Volatility Expansion &gt; {DAILY_VOL_THRESHOLD} and Daily Volume Expansion &gt; {DAILY_VOLUME_THRESHOLD}.</p>
-            <p style="margin:0 0 18px 0;"><b>Ranking:</b> Cumulative KER descending, then Survival Score, then Cumulative ADX. Longs require +DI &gt; -DI, shorts prefer -DI &gt; +DI but will be filled up to 15 from the strongest negative movers if strict matches are fewer.</p>
-            <h3 style="margin:18px 0 8px 0;">Long Candidates Top 15</h3>
-            {long_table}
-            <h3 style="margin:18px 0 8px 0;">Short Candidates Top 15</h3>
-            {short_table}
-            <p style="margin-top:18px;">Full scan summary and detailed iteration data are attached as CSV files.</p>
-        </body>
-        </html>
-        """
-
         if not sender_email or not recipient_email:
             logger.error("EMAIL Missing sender or recipient email in environment.")
             return False
@@ -789,17 +734,17 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
             with open(csv_filename, "rb") as f:
                 part = MIMEBase("application", "octet-stream")
                 part.set_payload(f.read())
-                encoders.encode_base64(part)
-                part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(csv_filename)}")
-                msg.attach(part)
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(csv_filename)}")
+            msg.attach(part)
 
         if os.path.exists(detail_csv_filename):
             with open(detail_csv_filename, "rb") as f:
                 part2 = MIMEBase("application", "octet-stream")
                 part2.set_payload(f.read())
-                encoders.encode_base64(part2)
-                part2.add_header("Content-Disposition", f"attachment; filename={os.path.basename(detail_csv_filename)}")
-                msg.attach(part2)
+            encoders.encode_base64(part2)
+            part2.add_header("Content-Disposition", f"attachment; filename={os.path.basename(detail_csv_filename)}")
+            msg.attach(part2)
 
         server = smtplib.SMTP(smtp_host, int(smtp_port))
         server.starttls()
@@ -817,6 +762,7 @@ def main():
     logger.info("Starting F&O Iteration Volume Volatility Scan")
     init_fyers()
     df_all, df_iter = scan_fno_universe()
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     summary_csv = f"fo_fyers_iteration_summary_{timestamp}.csv"
     detail_csv = f"fo_fyers_iteration_details_{timestamp}.csv"
@@ -838,7 +784,8 @@ def main():
         pd.DataFrame(columns=[
             "Symbol", "% Change", "Daily Volatility Expansion", "Iteration No", "Iteration Minutes",
             "Iteration Time", "Current Volume", "10 Day Relative Volume", "20 Day Relative Volume",
-            "Daily Volume Expansion", "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "Above DV and DVol"
+            "Daily Volume Expansion", "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP",
+            "Above DV and DVol", "Freshness_Score", "Is_Fresh"
         ]).to_csv(detail_csv, index=False)
 
     send_email_with_tables(long_df, short_df, summary_csv, detail_csv)
@@ -847,74 +794,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-# ==========================================
-# HYBRID SMC FRESHNESS & TRAP FILTER
-# ==========================================
-def calculate_hybrid_freshness(df_intraday):
-    if df_intraday is None or df_intraday.empty:
-        return df_intraday
-
-    if 'time' not in df_intraday.columns and 'timestamp' in df_intraday.columns:
-        df_intraday.rename(columns={'timestamp': 'time'}, inplace=True)
-
-    df_intraday = df_intraday.sort_values('time').reset_index(drop=True)
-
-    if len(df_intraday) < 3:
-        df_intraday['Freshness_Score'] = 50.0
-        df_intraday['Is_Fresh'] = False
-        return df_intraday
-
-    df_intraday['rolling_HOD'] = df_intraday['high'].cummax()
-    df_intraday['vol_sma_10'] = df_intraday['volume'].rolling(window=10, min_periods=1).mean().shift(1).fillna(df_intraday['volume'].mean())
-    df_intraday['vol_ratio'] = df_intraday['volume'] / df_intraday['vol_sma_10']
-
-    open_price = df_intraday.iloc[0]['open']
-    df_intraday['close_vs_open_pct'] = (df_intraday['close'] - open_price) / open_price * 100
-
-    ib_high = df_intraday.iloc[0:3]['high'].max()
-    ib_vol_avg = df_intraday.iloc[0:3]['volume'].mean()
-
-    freshness_scores = []
-    is_fresh_flags = []
-
-    for i in range(len(df_intraday)):
-        row = df_intraday.iloc[i]
-
-        base_score = min(100, max(0, row['close_vs_open_pct'] / 3.0 * 100))
-        score = base_score
-        is_fresh = False
-
-        if i < 3:
-            score = base_score
-        elif 3 <= i < 11:
-            dist_to_ib_high = (ib_high - row['close']) / ib_high * 100
-            vol_vs_ib = row['volume'] / ib_vol_avg
-
-            if dist_to_ib_high < 0.3 or row['close'] > ib_high:
-                if vol_vs_ib < 0.8:
-                    score = score * 0.2
-                else:
-                    score = min(100, score * 1.5)
-                    is_fresh = True
-        else:
-            prev_hod = df_intraday.iloc[i-1]['rolling_HOD']
-            dist_to_prev_hod = (prev_hod - row['close']) / prev_hod * 100
-
-            if dist_to_prev_hod < 0.3 or row['close'] > prev_hod:
-                if row['vol_ratio'] < 1.3:
-                    score = score * 0.2
-                else:
-                    score = min(100, score * 1.5)
-                    is_fresh = True
-            elif row['vol_ratio'] > 2.0 and row['close'] > row['open']:
-                score = min(100, score * 1.2)
-                is_fresh = True
-
-        freshness_scores.append(round(score, 1))
-        is_fresh_flags.append(is_fresh)
-
-    df_intraday['Freshness_Score'] = freshness_scores
-    df_intraday['Is_Fresh'] = is_fresh_flags
-    return df_intraday
-
-
