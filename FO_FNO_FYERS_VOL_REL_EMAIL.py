@@ -348,6 +348,100 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         "Survival Score": str(metric_df["Survival Score"].iloc[-1]) if not metric_df.empty else "0/0",
         "Survival_Num": float(metric_df["Survival_Num"].iloc[-1]) if not metric_df.empty else 0.0,
     }
+
+    # ---------- Freshness metrics (score + window) ----------
+
+    # High of Day and distance
+    if not curr_df.empty:
+        hod = float(curr_df["high"].max())
+    else:
+        hod = float("nan")
+
+    if hod and hod > 0 and ltp is not None:
+        strike_distance = (hod - ltp) / hod
+    else:
+        strike_distance = 1.0
+
+    # Localized volume: use last 3 bars vs 1h avg
+    if not curr_df.empty:
+        last_5m_volume = float(curr_df["volume"].iloc[-1])
+        recent_12 = curr_df["volume"].tail(12)
+        vol_1h_avg_5m = float(recent_12.mean()) if len(recent_12) > 0 else last_5m_volume
+
+        last3 = curr_df["volume"].tail(3)
+        vol_last3 = float(last3.sum())
+        vol_avg3 = vol_1h_avg_5m * max(len(last3), 1)
+        vol_ratio = vol_last3 / vol_avg3 if vol_avg3 > 0 else 0.0
+    else:
+        last_5m_volume = 0.0
+        vol_1h_avg_5m = 0.0
+        vol_ratio = 0.0
+
+    # OBV and RSI 30m delta
+    obv_30m_delta = 0.0
+    rsi_30m_delta = 0.0
+    rsi_now = float("nan")
+
+    if not flow_df.empty and len(flow_df) >= 7:
+        obv_now = float(flow_df["Cumulative OBV"].iloc[-1])
+        obv_30m_ago = float(flow_df["Cumulative OBV"].iloc[-7])
+        obv_30m_delta = obv_now - obv_30m_ago
+
+        rsi_now = float(flow_df["Cumulative RSI"].iloc[-1])
+        rsi_30m_ago = float(flow_df["Cumulative RSI"].iloc[-7])
+        rsi_30m_delta = rsi_now - rsi_30m_ago
+    elif not flow_df.empty:
+        obv_30m_delta = 0.0
+        rsi_now = float(flow_df["Cumulative RSI"].iloc[-1])
+        rsi_30m_delta = 0.0
+
+    # Trend quality from cumulative metrics
+    adx_now = float(metric_df["Cumulative ADX"].iloc[-1]) if not metric_df.empty else float("nan")
+    ker_now = float(metric_df["Cumulative KER"].iloc[-1]) if not metric_df.empty else float("nan")
+
+    # ---- Build a Freshness_Score (0-100) ----
+    fresh_score = 0.0
+
+    # Location (max 30)
+    if strike_distance <= 0.005:  # within 0.5% of HOD
+        fresh_score += 30.0
+    elif strike_distance <= 0.01:  # 0.5â€“1.0%
+        fresh_score += 15.0
+
+    # Volume window (max 30)
+    if vol_ratio >= 1.5:
+        fresh_score += 30.0
+    elif vol_ratio >= 1.0:
+        fresh_score += 15.0
+
+    # OBV 30m delta (max 20)
+    if obv_30m_delta > 0:
+        fresh_score += 20.0
+
+    # RSI (max 20)
+    if not np.isnan(rsi_now):
+        if 55 <= rsi_now <= 70:
+            fresh_score += 20.0
+        elif 50 <= rsi_now < 55:
+            fresh_score += 10.0
+
+    # Trend gates (ADX / KER still required)
+    adx_live = bool(adx_now > 20.0)
+    ker_live = bool(ker_now > 0.40)
+
+    is_fresh = (fresh_score >= 60.0) and adx_live and ker_live
+
+    summary.update({
+        "HOD": hod,
+        "Strike_Distance": strike_distance,
+        "Last_5m_Volume": last_5m_volume,
+        "Volume_1h_Avg_5m": vol_1h_avg_5m,
+        "OBV_30m_Delta": obv_30m_delta,
+        "RSI_30m_Delta": rsi_30m_delta,
+        "Freshness_Score": float(fresh_score),
+        "Is_Fresh": bool(is_fresh),
+    })
+
     return summary, detail_df
 
 
@@ -383,12 +477,11 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
         ease_of_movement = abs(pct_change) / rvol_10d if (pct_change is not None and rvol_10d and rvol_10d > 0) else None
 
         if not iter_detail.empty:
-            flag_col = "Above DV and DVol"
             if daily_vol_exp is not None and daily_vol_exp > DAILY_VOL_THRESHOLD:
-                iter_detail[flag_col] = iter_detail["Daily Volume Expansion"].gt(DAILY_VOLUME_THRESHOLD)
+                iter_detail["Above DV and DVol"] = iter_detail["Daily Volume Expansion"].gt(DAILY_VOLUME_THRESHOLD)
             else:
-                iter_detail[flag_col] = False
-            above_count = int(iter_detail[flag_col].sum()) if flag_col in iter_detail.columns else 0
+                iter_detail["Above DV and DVol"] = False
+            above_count = int(iter_detail["Above DV and DVol"].sum())
             iter_detail.insert(0, "Symbol", sym)
             iter_detail.insert(1, "% Change", pct_change)
             iter_detail.insert(2, "Daily Volatility Expansion", daily_vol_exp)
