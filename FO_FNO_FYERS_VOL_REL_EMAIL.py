@@ -608,11 +608,14 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
 
 
 def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str, detail_csv_filename: str) -> bool:
-    sender_email = os.environ.get("SENDER_EMAIL") or os.environ.get("FROM_EMAIL")
-    sender_app_password = os.environ.get("SENDER_APP_PASSWORD") or os.environ.get("GMAIL_APP_PASSWORD")
-    recipient_email = os.environ.get("RECIPIENT_EMAIL") or os.environ.get("TO_EMAIL")
-    smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-    smtp_port = os.environ.get("SMTP_PORT", "587")
+    sender_email = (os.environ.get("SENDER_EMAIL") or "").strip()
+    sender_password = (os.environ.get("SENDER_PASSWORD") or os.environ.get("SENDER_APP_PASSWORD") or os.environ.get("GMAIL_APP_PASSWORD") or "").strip().replace(" ", "").replace('"', '').replace("'", "")
+    recipient_email = (os.environ.get("RECIPIENT_EMAIL") or "").strip()
+    smtp_host = (os.environ.get("SMTP_SERVER") or os.environ.get("SMTP_HOST") or "smtp.gmail.com").strip()
+    smtp_port = int((os.environ.get("SMTP_PORT") or "587").strip())
+
+    logger.info(f"EMAIL Runtime check | sender_email_set={bool(sender_email)} | sender_password_set={bool(sender_password)} | recipient_email_set={bool(recipient_email)} | smtp_host={smtp_host} | smtp_port={smtp_port}")
+
     long_html = df_to_html_table(long_df)
     short_html = df_to_html_table(short_df)
     html_body = f"""
@@ -625,52 +628,55 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
         {short_html}
         <br/>
         <p>Scan completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}.</p>
-        <p>Filters applied: Daily Volatility Expansion &gt; {DAILY_VOL_THRESHOLD} and Daily Volume Expansion &gt; {DAILY_VOLUME_THRESHOLD}.</p>
     </body>
     </html>
     """
-    try:
-        if not sender_email or not recipient_email:
-            logger.error("EMAIL Missing sender or recipient email in environment.")
-            return False
-        if not sender_app_password:
-            fallback_html = csv_filename.replace(".csv", "_email_preview.html")
-            with open(fallback_html, "w", encoding="utf-8") as f:
-                f.write(html_body)
-            logger.warning(f"EMAIL Password secret missing. Set SENDER_APP_PASSWORD or SENDER_PASSWORD. Saved email preview HTML instead: {fallback_html}")
-            return False
-        msg = MIMEMultipart()
-        msg["From"] = sender_email
-        msg["To"] = recipient_email
-        msg["Subject"] = f"Intraday Vol Iteration Alert - {datetime.now().strftime('%d %b %H:%M')}"
-        msg.attach(MIMEText(html_body, "html"))
-        if os.path.exists(csv_filename):
-            with open(csv_filename, "rb") as f:
+
+    if not sender_email:
+        logger.error("EMAIL Missing SENDER_EMAIL at runtime.")
+        return False
+    if not sender_password:
+        logger.error("EMAIL Missing SENDER_PASSWORD at runtime. The secret exists in GitHub, but it is not reaching os.environ in this workflow run.")
+        return False
+    if not recipient_email:
+        logger.error("EMAIL Missing RECIPIENT_EMAIL at runtime.")
+        return False
+
+    msg = MIMEMultipart()
+    msg["From"] = sender_email
+    msg["To"] = recipient_email
+    msg["Subject"] = f"Intraday Vol Iteration Alert - {datetime.now().strftime('%d %b %H:%M')}"
+    msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+    for filename in [csv_filename, detail_csv_filename]:
+        if os.path.exists(filename):
+            with open(filename, "rb") as f:
                 part = MIMEBase("application", "octet-stream")
                 part.set_payload(f.read())
             encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(csv_filename)}")
+            part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(filename)}")
             msg.attach(part)
-        if os.path.exists(detail_csv_filename):
-            with open(detail_csv_filename, "rb") as f:
-                part2 = MIMEBase("application", "octet-stream")
-                part2.set_payload(f.read())
-            encoders.encode_base64(part2)
-            part2.add_header("Content-Disposition", f"attachment; filename={os.path.basename(detail_csv_filename)}")
-            msg.attach(part2)
-        server = smtplib.SMTP(smtp_host, int(smtp_port), timeout=30)
-        server.ehlo()
-        server.starttls()
-        server.ehlo()
-        server.login(sender_email, sender_app_password)
-        server.send_message(msg)
-        server.quit()
+
+    try:
+        if smtp_port == 465:
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=40) as server:
+                server.login(sender_email, sender_password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=40) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(sender_email, sender_password)
+                server.send_message(msg)
         logger.info(f"EMAIL Sent successfully to {recipient_email}")
         return True
-    except Exception as e:
-        logger.error(f"EMAIL Failed to send email: {e}. Check sender/recipient secrets and use a Gmail App Password if using Gmail SMTP.")
+    except smtplib.SMTPAuthenticationError as e:
+        logger.error(f"EMAIL SMTP authentication failed: {e}")
         return False
-
+    except Exception as e:
+        logger.error(f"EMAIL Failed to send email: {type(e).__name__}: {e}")
+        return False
 
 def main():
     logger.info("Starting F&O Iteration Volume Volatility Scan")
