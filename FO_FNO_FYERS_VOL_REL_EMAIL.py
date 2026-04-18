@@ -608,9 +608,9 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
 
 
 def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str, detail_csv_filename: str) -> bool:
-    sender_email = os.environ.get("SENDER_EMAIL")
-    sender_app_password = os.environ.get("SENDER_APP_PASSWORD")
-    recipient_email = os.environ.get("RECIPIENT_EMAIL")
+    sender_email = os.environ.get("SENDER_EMAIL") or os.environ.get("FROM_EMAIL")
+    sender_app_password = os.environ.get("SENDER_APP_PASSWORD") or os.environ.get("GMAIL_APP_PASSWORD")
+    recipient_email = os.environ.get("RECIPIENT_EMAIL") or os.environ.get("TO_EMAIL")
     smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
     smtp_port = os.environ.get("SMTP_PORT", "587")
     long_html = df_to_html_table(long_df)
@@ -637,7 +637,7 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
             fallback_html = csv_filename.replace(".csv", "_email_preview.html")
             with open(fallback_html, "w", encoding="utf-8") as f:
                 f.write(html_body)
-            logger.warning(f"EMAIL Password secret missing. Saved email preview HTML instead: {fallback_html}")
+            logger.warning(f"EMAIL Password secret missing. Set SENDER_APP_PASSWORD or GMAIL_APP_PASSWORD. Saved email preview HTML instead: {fallback_html}")
             return False
         msg = MIMEMultipart()
         msg["From"] = sender_email
@@ -658,15 +658,17 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
             encoders.encode_base64(part2)
             part2.add_header("Content-Disposition", f"attachment; filename={os.path.basename(detail_csv_filename)}")
             msg.attach(part2)
-        server = smtplib.SMTP(smtp_host, int(smtp_port))
+        server = smtplib.SMTP(smtp_host, int(smtp_port), timeout=30)
+        server.ehlo()
         server.starttls()
+        server.ehlo()
         server.login(sender_email, sender_app_password)
         server.send_message(msg)
         server.quit()
         logger.info(f"EMAIL Sent successfully to {recipient_email}")
         return True
     except Exception as e:
-        logger.error(f"EMAIL Failed to send email: {e}")
+        logger.error(f"EMAIL Failed to send email: {e}. Check sender/recipient secrets and use a Gmail App Password if using Gmail SMTP.")
         return False
 
 
