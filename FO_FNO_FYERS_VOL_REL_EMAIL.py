@@ -282,29 +282,36 @@ def calculate_hybrid_freshness(df_intraday: pd.DataFrame) -> pd.DataFrame:
         is_fresh_flags.append(is_fresh)
     work["Freshness_Score"] = freshness_scores
     work["Is_Fresh"] = is_fresh_flags
-    prev_fresh = pd.Series(work["Is_Fresh"]).shift(1).fillna(False)
-    state_count = 0
-    last_fresh_start = ""
+
+    prev_fresh = work["Is_Fresh"].shift(1).fillna(False)
     fresh_states = []
     fresh_since = []
+    fresh_start_time = ""
+    fresh_cycle = 0
+
     for i in range(len(work)):
-        current_time = pd.to_datetime(work.iloc[i]["time"]).strftime("%H:%M")
-        prev_val = bool(prev_fresh.iloc[i])
-        curr_val = bool(work.iloc[i]["Is_Fresh"])
-        if curr_val and not prev_val:
-            state_count += 1
-            last_fresh_start = current_time
-            fresh_states.append("Fresh" if state_count == 1 else "Re-Ignited")
-            fresh_since.append(current_time)
-        elif curr_val and prev_val:
-            fresh_states.append("Fresh")
-            fresh_since.append(last_fresh_start)
-        elif (not curr_val) and prev_val:
-            fresh_states.append("Fresh Lost")
-            fresh_since.append(current_time)
+        curr = bool(work.loc[i, "Is_Fresh"])
+        prev = bool(prev_fresh.iloc[i])
+        tstr = pd.to_datetime(work.loc[i, "time"]).strftime("%H:%M")
+
+        if curr and not prev:
+            fresh_cycle += 1
+            fresh_start_time = tstr
+            state = "Fresh" if fresh_cycle == 1 else "Re-Ignited"
+            since = tstr
+        elif curr and prev:
+            state = "Fresh"
+            since = fresh_start_time
+        elif (not curr) and prev:
+            state = "Fresh Lost"
+            since = tstr
         else:
-            fresh_states.append("")
-            fresh_since.append("")
+            state = ""
+            since = ""
+
+        fresh_states.append(state)
+        fresh_since.append(since)
+
     work["Fresh_State"] = fresh_states
     work["Fresh_Since"] = fresh_since
     return work
@@ -436,8 +443,8 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         "OBV_30m_Delta": obv_30m_delta,
         "RSI_30m_Delta": rsi_30m_delta,
         "Freshness_Score": float(fresh_score),
-        "Fresh_State": str(curr_df["Fresh_State"].iloc[-1]) if "Fresh_State" in curr_df.columns else "",
-        "Fresh_Since": str(curr_df["Fresh_Since"].iloc[-1]) if "Fresh_Since" in curr_df.columns else "",
+        "Fresh_State": str(df["Fresh_State"].iloc[-1]) if "Fresh_State" in df.columns else "",
+        "Fresh_Since": str(df["Fresh_Since"].iloc[-1]) if "Fresh_Since" in df.columns else "",
         "Is_Fresh": bool(is_fresh),
     }
     return summary, detail_df
