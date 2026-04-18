@@ -637,7 +637,7 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
             fallback_html = csv_filename.replace(".csv", "_email_preview.html")
             with open(fallback_html, "w", encoding="utf-8") as f:
                 f.write(html_body)
-            logger.warning(f"EMAIL Password secret missing. Set SENDER_APP_PASSWORD or GMAIL_APP_PASSWORD. Saved email preview HTML instead: {fallback_html}")
+            logger.warning(f"EMAIL Password secret missing. Set SENDER_APP_PASSWORD or SENDER_PASSWORD. Saved email preview HTML instead: {fallback_html}")
             return False
         msg = MIMEMultipart()
         msg["From"] = sender_email
