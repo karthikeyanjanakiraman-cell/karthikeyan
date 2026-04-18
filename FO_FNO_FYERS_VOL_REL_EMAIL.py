@@ -280,6 +280,33 @@ def calculate_hybrid_freshness(df_intraday: pd.DataFrame) -> pd.DataFrame:
         is_fresh_flags.append(is_fresh)
     work["Freshness_Score"] = freshness_scores
     work["Is_Fresh"] = is_fresh_flags
+    prev_fresh = pd.Series(work["Is_Fresh"]).shift(1).fillna(False)
+    work["Is_New_Fresh"] = work["Is_Fresh"] & (~prev_fresh)
+    state_count = 0
+    last_fresh_start = None
+    fresh_states = []
+    fresh_since = []
+    for i in range(len(work)):
+        current_time = pd.to_datetime(work.iloc[i]["time"])
+        current_label = current_time.strftime("%H:%M")
+        prev_val = bool(prev_fresh.iloc[i]) if i < len(prev_fresh) else False
+        curr_val = bool(work.iloc[i]["Is_Fresh"])
+        if curr_val and not prev_val:
+            state_count += 1
+            last_fresh_start = current_label
+            fresh_states.append("Fresh" if state_count == 1 else "Re-Ignited")
+            fresh_since.append(current_label)
+        elif curr_val and prev_val:
+            fresh_states.append("Fresh")
+            fresh_since.append(last_fresh_start)
+        elif (not curr_val) and prev_val:
+            fresh_states.append("Fresh Lost")
+            fresh_since.append(current_label)
+        else:
+            fresh_states.append("")
+            fresh_since.append("")
+    work["Fresh_State"] = fresh_states
+    work["Fresh_Since"] = fresh_since
     return work
 
 
@@ -380,6 +407,8 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
     adx_now = float(metric_df["Cumulative ADX"].iloc[-1]) if not metric_df.empty else float("nan")
     ker_now = float(metric_df["Cumulative KER"].iloc[-1]) if not metric_df.empty else float("nan")
     fresh_score = float(curr_df["Freshness_Score"].iloc[-1]) if "Freshness_Score" in curr_df.columns else 0.0
+    fresh_state = str(curr_df["Fresh_State"].iloc[-1]) if "Fresh_State" in curr_df.columns else ""
+    fresh_since = str(curr_df["Fresh_Since"].iloc[-1]) if "Fresh_Since" in curr_df.columns else ""
     adx_live = bool(adx_now > 20.0)
     ker_live = bool(ker_now > 0.40)
     is_fresh = bool(fresh_score >= 60.0) and adx_live and ker_live
@@ -409,6 +438,8 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         "OBV_30m_Delta": obv_30m_delta,
         "RSI_30m_Delta": rsi_30m_delta,
         "Freshness_Score": float(fresh_score),
+        "Fresh_State": fresh_state,
+        "Fresh_Since": fresh_since,
         "Is_Fresh": bool(is_fresh),
     }
     return summary, detail_df
@@ -487,6 +518,8 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "OBV_30m_Delta": iter_summary.get("OBV_30m_Delta"),
             "RSI_30m_Delta": iter_summary.get("RSI_30m_Delta"),
             "Freshness_Score": iter_summary.get("Freshness_Score"),
+            "Fresh_State": iter_summary.get("Fresh_State"),
+            "Fresh_Since": iter_summary.get("Fresh_Since"),
             "Is_Fresh": iter_summary.get("Is_Fresh"),
         })
     summary_df = pd.DataFrame(rows)
@@ -497,7 +530,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
 DISPLAY_COLS = [
     "Symbol", "LTP", "% Change", "Daily Volatility Expansion", "10 Day Relative Volume",
     "20 Day Relative Volume", "Daily Volume Expansion", "Cumulative RSI", "Cumulative OBV",
-    "Cumulative VWAP", "VWAP Z-Score", "Freshness_Score", "Cumulative KER", "Cumulative +DI",
+    "Cumulative VWAP", "VWAP Z-Score", "Freshness_Score", "Fresh_State", "Fresh_Since", "Cumulative KER", "Cumulative +DI",
     "Cumulative -DI", "Cumulative ADX", "Survival Score", "Ease of Movement",
     "Above Threshold Iterations", "Last Iteration Minutes", "Last Iteration Time",
 ]
@@ -514,7 +547,7 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
     if df_all is None or df_all.empty:
         return pd.DataFrame(columns=DISPLAY_COLS), pd.DataFrame(columns=DISPLAY_COLS)
     base = df_all.copy()
-    for col in DISPLAY_COLS + ["Survival_Num", "Is_Fresh"]:
+    for col in DISPLAY_COLS + ["Survival_Num", "Is_Fresh", "Fresh_State", "Fresh_Since"]:
         if col not in base.columns:
             base[col] = np.nan
     if "Daily Volatility Expansion" in base.columns and "Daily Volume Expansion" in base.columns:
