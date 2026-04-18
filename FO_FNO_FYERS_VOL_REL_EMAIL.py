@@ -283,25 +283,24 @@ def calculate_hybrid_freshness(df_intraday: pd.DataFrame) -> pd.DataFrame:
     prev_fresh = pd.Series(work["Is_Fresh"]).shift(1).fillna(False)
     work["Is_New_Fresh"] = work["Is_Fresh"] & (~prev_fresh)
     state_count = 0
-    last_fresh_start = None
+    last_fresh_start = ""
     fresh_states = []
     fresh_since = []
     for i in range(len(work)):
-        current_time = pd.to_datetime(work.iloc[i]["time"])
-        current_label = current_time.strftime("%H:%M")
-        prev_val = bool(prev_fresh.iloc[i]) if i < len(prev_fresh) else False
+        current_time = pd.to_datetime(work.iloc[i]["time"]).strftime("%H:%M")
+        prev_val = bool(prev_fresh.iloc[i])
         curr_val = bool(work.iloc[i]["Is_Fresh"])
         if curr_val and not prev_val:
             state_count += 1
-            last_fresh_start = current_label
+            last_fresh_start = current_time
             fresh_states.append("Fresh" if state_count == 1 else "Re-Ignited")
-            fresh_since.append(current_label)
+            fresh_since.append(current_time)
         elif curr_val and prev_val:
             fresh_states.append("Fresh")
             fresh_since.append(last_fresh_start)
         elif (not curr_val) and prev_val:
             fresh_states.append("Fresh Lost")
-            fresh_since.append(current_label)
+            fresh_since.append(current_time)
         else:
             fresh_states.append("")
             fresh_since.append("")
@@ -530,15 +529,16 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
 DISPLAY_COLS = [
     "Symbol", "LTP", "% Change", "Daily Volatility Expansion", "10 Day Relative Volume",
     "20 Day Relative Volume", "Daily Volume Expansion", "Cumulative RSI", "Cumulative OBV",
-    "Cumulative VWAP", "VWAP Z-Score", "Freshness_Score", "Fresh_State", "Fresh_Since", "Cumulative KER", "Cumulative +DI",
+    "Cumulative VWAP", "VWAP Z-Score", "Freshness_Score", "Cumulative KER", "Cumulative +DI",
     "Cumulative -DI", "Cumulative ADX", "Survival Score", "Ease of Movement",
     "Above Threshold Iterations", "Last Iteration Minutes", "Last Iteration Time",
 ]
 
 EMAIL_DISPLAY_COLS = [
     "Symbol", "LTP", "% Change", "Daily Volatility Expansion", "Daily Volume Expansion",
-    "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score", "Freshness_Score",
-    "Cumulative KER", "Cumulative +DI", "Cumulative -DI", "Cumulative ADX", "Survival Score",
+    "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score",
+    "Freshness_Score", "Fresh_State", "Fresh_Since", "Cumulative KER",
+    "Cumulative +DI", "Cumulative -DI", "Cumulative ADX", "Survival Score",
     "Last Iteration Time",
 ]
 
@@ -547,7 +547,7 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
     if df_all is None or df_all.empty:
         return pd.DataFrame(columns=DISPLAY_COLS), pd.DataFrame(columns=DISPLAY_COLS)
     base = df_all.copy()
-    for col in DISPLAY_COLS + ["Survival_Num", "Is_Fresh", "Fresh_State", "Fresh_Since"]:
+    for col in DISPLAY_COLS + ["Survival_Num", "Is_Fresh"]:
         if col not in base.columns:
             base[col] = np.nan
     if "Daily Volatility Expansion" in base.columns and "Daily Volume Expansion" in base.columns:
