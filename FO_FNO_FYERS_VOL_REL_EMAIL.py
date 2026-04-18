@@ -425,6 +425,12 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         elif 50 <= rsi_now < 55:
             fresh_score += 10.0
 
+    # --- SMC LIQUIDITY SWEEP TRAP FILTER ---
+    # If price is at/near HOD (< 0.2% away) but volume expansion is weak (< 1.3x), 
+    # it's an inducement trap (false breakout). Kill the score.
+    if strike_distance <= 0.002 and vol_ratio < 1.3:
+        fresh_score = 0.0
+
     # Trend gates (ADX / KER still required)
     adx_live = bool(adx_now > 20.0)
     ker_live = bool(ker_now > 0.40)
@@ -538,6 +544,7 @@ DISPLAY_COLS = [
     "Cumulative OBV",
     "Cumulative VWAP",
     "VWAP Z-Score",
+    "Freshness_Score",
     "Cumulative KER",
     "Cumulative +DI",
     "Cumulative -DI",
@@ -559,6 +566,7 @@ EMAIL_DISPLAY_COLS = [
     "Cumulative OBV",
     "Cumulative VWAP",
     "VWAP Z-Score",
+    "Freshness_Score",
     "Cumulative KER",
     "Cumulative +DI",
     "Cumulative -DI",
@@ -679,7 +687,7 @@ def format_value(col: str, val):
         return f"{int(float(val)):,}"
     if col == "Above Threshold Ratio":
         return f"{float(val) * 100:.2f}%"
-    if col in ["Total Iterations", "Above Threshold Iterations", "Last Iteration Minutes"]:
+    if col in ["Total Iterations", "Above Threshold Iterations", "Last Iteration Minutes", "Freshness_Score"]:
         return f"{int(val)}"
     return str(val)
 
