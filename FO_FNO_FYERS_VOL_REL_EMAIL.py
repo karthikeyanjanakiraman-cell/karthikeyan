@@ -282,18 +282,15 @@ def calculate_hybrid_freshness(df_intraday: pd.DataFrame) -> pd.DataFrame:
         is_fresh_flags.append(is_fresh)
     work["Freshness_Score"] = freshness_scores
     work["Is_Fresh"] = is_fresh_flags
-
     prev_fresh = work["Is_Fresh"].shift(1).fillna(False)
     fresh_states = []
     fresh_since = []
     fresh_start_time = ""
     fresh_cycle = 0
-
     for i in range(len(work)):
         curr = bool(work.loc[i, "Is_Fresh"])
         prev = bool(prev_fresh.iloc[i])
         tstr = pd.to_datetime(work.loc[i, "time"]).strftime("%H:%M")
-
         if curr and not prev:
             fresh_cycle += 1
             fresh_start_time = tstr
@@ -308,10 +305,8 @@ def calculate_hybrid_freshness(df_intraday: pd.DataFrame) -> pd.DataFrame:
         else:
             state = ""
             since = ""
-
         fresh_states.append(state)
         fresh_since.append(since)
-
     work["Fresh_State"] = fresh_states
     work["Fresh_Since"] = fresh_since
     return work
@@ -533,28 +528,28 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 
 DISPLAY_COLS = [
-    "Symbol", "LTP", "% Change", "Daily Volatility Expansion", "10 Day Relative Volume",
-    "20 Day Relative Volume", "Daily Volume Expansion", "Cumulative RSI", "Cumulative OBV",
-    "Cumulative VWAP", "VWAP Z-Score", "Freshness_Score", "Cumulative KER", "Cumulative +DI",
-    "Cumulative -DI", "Cumulative ADX", "Survival Score", "Ease of Movement",
-    "Above Threshold Iterations", "Last Iteration Minutes", "Last Iteration Time",
+    "Symbol", "LTP", "% Change", "Daily Volatility Expansion", "10 Day Relative Volume", "20 Day Relative Volume",
+    "Daily Volume Expansion", "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score",
+    "Freshness_Score", "Fresh_State", "Fresh_Since", "Cumulative KER", "Cumulative +DI", "Cumulative -DI",
+    "Cumulative ADX", "Survival Score", "Ease of Movement", "Above Threshold Iterations", "Last Iteration Minutes", "Last Iteration Time",
 ]
 
 EMAIL_DISPLAY_COLS = [
     "Symbol", "LTP", "% Change", "Daily Volatility Expansion", "Daily Volume Expansion",
-    "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score", "Freshness_Score",
-    "Cumulative KER", "Cumulative +DI", "Cumulative -DI", "Cumulative ADX", "Survival Score",
-    "Last Iteration Time",
+    "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score",
+    "Freshness_Score", "Fresh_State", "Fresh_Since", "Cumulative KER", "Cumulative +DI", "Cumulative -DI",
+    "Cumulative ADX", "Survival Score", "Last Iteration Time",
 ]
-
 
 def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df_all is None or df_all.empty:
         return pd.DataFrame(columns=DISPLAY_COLS), pd.DataFrame(columns=DISPLAY_COLS)
+
     base = df_all.copy()
     for col in DISPLAY_COLS + ["Survival_Num", "Is_Fresh", "Fresh_State", "Fresh_Since"]:
         if col not in base.columns:
             base[col] = np.nan
+
     if "Daily Volatility Expansion" in base.columns and "Daily Volume Expansion" in base.columns:
         filtered = base[
             (base["Daily Volatility Expansion"] > DAILY_VOL_THRESHOLD) &
@@ -562,14 +557,23 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
         ].copy()
         if not filtered.empty:
             base = filtered
+
     def _sort_long(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
             return df
-        return df.sort_values(by=["Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"], ascending=[False, False, False, False], na_position="last")
+        return df.sort_values(
+            by=["Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
+            ascending=[False, False, False, False], na_position="last"
+        )
+
     def _sort_short(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
             return df
-        return df.sort_values(by=["Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"], ascending=[False, False, False, True], na_position="last")
+        return df.sort_values(
+            by=["Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
+            ascending=[False, False, False, True], na_position="last"
+        )
+
     strict_long = base[
         (base["Is_Fresh"] == True) &
         (base["% Change"] > 0) &
@@ -577,6 +581,7 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
         (base["VWAP Z-Score"] > 0.3) &
         (base["VWAP Z-Score"] <= 1.8)
     ].copy()
+
     strict_short = base[
         (base["Is_Fresh"] == True) &
         (base["% Change"] < 0) &
@@ -584,30 +589,35 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
         (base["VWAP Z-Score"] < -0.3) &
         (base["VWAP Z-Score"] >= -1.8)
     ].copy()
+
     fallback_long = base[
         (base["Is_Fresh"] == True) &
         (base["% Change"] > 0) &
         (base["VWAP Z-Score"] > 0.3) &
         (base["VWAP Z-Score"] <= 1.8)
     ].copy()
+
     fallback_short = base[
         (base["Is_Fresh"] == True) &
         (base["% Change"] < 0) &
         (base["VWAP Z-Score"] < -0.3) &
         (base["VWAP Z-Score"] >= -1.8)
     ].copy()
+
     long_df = _sort_long(strict_long)
     short_df = _sort_short(strict_short)
+
     if len(long_df) < 15:
         extra_long = _sort_long(fallback_long[~fallback_long["Symbol"].isin(long_df["Symbol"])])
         long_df = pd.concat([long_df, extra_long], ignore_index=True)
+
     if len(short_df) < 15:
         extra_short = _sort_short(fallback_short[~fallback_short["Symbol"].isin(short_df["Symbol"])])
         short_df = pd.concat([short_df, extra_short], ignore_index=True)
+
     long_df = long_df.drop_duplicates(subset=["Symbol"]).head(15)
     short_df = short_df.drop_duplicates(subset=["Symbol"]).head(15)
     return long_df[DISPLAY_COLS].copy(), short_df[DISPLAY_COLS].copy()
-
 
 def format_value(col: str, val):
     if pd.isna(val):
@@ -620,61 +630,49 @@ def format_value(col: str, val):
         return f"{int(float(val))}"
     return f"{float(val):.2f}" if isinstance(val, (int, float, np.integer, np.floating)) else str(val)
 
-
 def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     if df is None or df.empty:
         return "<p>No candidates found.</p>"
+
     df_slice = df.head(max_rows).copy()
     cols = [c for c in EMAIL_DISPLAY_COLS if c in df_slice.columns]
-    header_html = "".join(
-        f"<th style='padding:8px;border:1px solid #ddd;background:#f5f5f5;text-align:left'>{c}</th>"
-        for c in cols
-    )
-    body_rows = []
-    for _, row in df_slice.iterrows():
-        row_html = "".join(
-            f"<td style='padding:8px;border:1px solid #ddd'>{format_value(c, row[c])}</td>"
-            for c in cols
-        )
-        body_rows.append(f"<tr>{row_html}</tr>")
-    return (
-        "<table style='border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:12px'>"
-        f"<thead><tr>{header_html}</tr></thead>"
-        f"<tbody>{''.join(body_rows)}</tbody>"
-        "</table>"
-    )
+    if not cols:
+        return "<p>No candidates found.</p>"
 
+    header_html = "".join(f"<th style='border:1px solid #ddd;padding:6px;background:#f5f5f5'>{c}</th>" for c in cols)
+    rows_html = []
+    for _, row in df_slice.iterrows():
+        tds = "".join(f"<td style='border:1px solid #ddd;padding:6px'>{format_value(c, row[c])}</td>" for c in cols)
+        rows_html.append(f"<tr>{tds}</tr>")
+    body_html = "".join(rows_html)
+    return f"<table style='border-collapse:collapse;font-family:Arial,sans-serif;font-size:12px'><thead><tr>{header_html}</tr></thead><tbody>{body_html}</tbody></table>"
 
 def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str, detail_csv_filename: str) -> bool:
-    sender_email = (os.environ.get("SENDER_EMAIL") or "").strip()
-    sender_password = (os.environ.get("SENDER_PASSWORD") or os.environ.get("SENDER_APP_PASSWORD") or os.environ.get("GMAIL_APP_PASSWORD") or "").strip().replace(" ", "").replace('"', '').replace("'", "")
-    recipient_email = (os.environ.get("RECIPIENT_EMAIL") or "").strip()
-    smtp_host = (os.environ.get("SMTP_SERVER") or os.environ.get("SMTP_HOST") or "smtp.gmail.com").strip()
-    smtp_port = int((os.environ.get("SMTP_PORT") or "587").strip())
-
-    logger.info(f"EMAIL Runtime check | sender_email_set={bool(sender_email)} | sender_password_set={bool(sender_password)} | recipient_email_set={bool(recipient_email)} | smtp_host={smtp_host} | smtp_port={smtp_port}")
+    sender_email = os.environ.get("SENDER_EMAIL")
+    sender_password = os.environ.get("SENDER_PASSWORD")
+    recipient_email = os.environ.get("RECIPIENT_EMAIL")
+    smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.environ.get("SMTP_PORT", "465"))
 
     long_html = df_to_html_table(long_df)
     short_html = df_to_html_table(short_df)
     html_body = f"""
-    <html>
-    <body style=\"font-family:Arial,sans-serif;font-size:13px;color:#111;\">
-        <h2>Long Candidates</h2>
-        {long_html}
-        <br/>
-        <h2>Short Candidates</h2>
-        {short_html}
-        <br/>
-        <p>Scan completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}.</p>
-    </body>
-    </html>
+    <html><body>
+    <h3>Long Candidates</h3>
+    {long_html}
+    <br>
+    <h3>Short Candidates</h3>
+    {short_html}
+    <br>
+    <p>Scan completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}.</p>
+    </body></html>
     """
 
     if not sender_email:
         logger.error("EMAIL Missing SENDER_EMAIL at runtime.")
         return False
     if not sender_password:
-        logger.error("EMAIL Missing SENDER_PASSWORD at runtime. The secret exists in GitHub, but it is not reaching os.environ in this workflow run.")
+        logger.error("EMAIL Missing SENDER_PASSWORD at runtime.")
         return False
     if not recipient_email:
         logger.error("EMAIL Missing RECIPIENT_EMAIL at runtime.")
@@ -723,6 +721,7 @@ def main():
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     summary_csv = f"fo_fyers_iteration_summary_{timestamp}.csv"
     detail_csv = f"fo_fyers_iteration_details_{timestamp}.csv"
+
     if df_all is not None and not df_all.empty:
         df_all.to_csv(summary_csv, index=False)
         logger.info(f"OUTPUT Saved summary scan results to {summary_csv}")
@@ -731,20 +730,21 @@ def main():
         logger.warning("OUTPUT Summary dataframe is empty.")
         pd.DataFrame(columns=DISPLAY_COLS).to_csv(summary_csv, index=False)
         long_df, short_df = pd.DataFrame(columns=DISPLAY_COLS), pd.DataFrame(columns=DISPLAY_COLS)
+
     if df_iter is not None and not df_iter.empty:
         df_iter.to_csv(detail_csv, index=False)
         logger.info(f"OUTPUT Saved detailed iteration results to {detail_csv}")
     else:
         logger.warning("OUTPUT Iteration details dataframe is empty.")
         pd.DataFrame(columns=[
-            "Symbol", "% Change", "Daily Volatility Expansion", "Iteration No", "Iteration Minutes",
-            "Iteration Time", "Current Volume", "10 Day Relative Volume", "20 Day Relative Volume",
-            "Daily Volume Expansion", "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP",
-            "Freshness_Score", "Is_Fresh", "Above DV and DVol"
+            "Symbol", "% Change", "Daily Volatility Expansion", "Iteration No", "Iteration Minutes", "Iteration Time",
+            "Current Volume", "10 Day Relative Volume", "20 Day Relative Volume", "Daily Volume Expansion",
+            "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "Freshness_Score", "Fresh_State", "Fresh_Since",
+            "Is_Fresh", "Above DV and DVol"
         ]).to_csv(detail_csv, index=False)
+
     send_email_with_tables(long_df, short_df, summary_csv, detail_csv)
     logger.info("Scan Pipeline Completed")
-
 
 if __name__ == "__main__":
     main()
