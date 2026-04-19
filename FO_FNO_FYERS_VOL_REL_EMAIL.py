@@ -444,8 +444,8 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     if df is None or df.empty:
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     base = df.copy()
-    strict_long = base[(base["Is_Fresh"] == True) & (base["% Change"] > 0) & (base["Cumulative +DI"] > base["Cumulative -DI"]) & (base["VWAP Z-Score"] > 0.3) & (base["VWAP Z-Score"] <= 1.8)].copy()
-    strict_short = base[(base["Is_Fresh"] == True) & (base["% Change"] < 0) & (base["Cumulative -DI"] > base["Cumulative +DI"]) & (base["VWAP Z-Score"] < -0.3) & (base["VWAP Z-Score"] >= -1.8)].copy()
+    strict_long = base[(base["% Change"] > 0) & (base["Cumulative +DI"] > base["Cumulative -DI"])].copy()
+    strict_short = base[(base["% Change"] < 0) & (base["Cumulative -DI"] > base["Cumulative +DI"])].copy()
     long_df = strict_long.sort_values(by=["Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"], ascending=[False, False, False, False], na_position="last").drop_duplicates(subset=["Symbol"]).head(15)
     short_df = strict_short.sort_values(by=["Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"], ascending=[False, False, False, True], na_position="last").drop_duplicates(subset=["Symbol"]).head(15)
     long_df = long_df[[c for c in EMAIL_DISPLAY_COLS if c in long_df.columns]] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
