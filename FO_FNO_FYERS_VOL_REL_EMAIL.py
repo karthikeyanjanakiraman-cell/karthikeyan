@@ -526,14 +526,14 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 DISPLAY_COLS = [
     "Symbol", "LTP", "% Change", "Daily Volatility Expansion", "10 Day Relative Volume", "20 Day Relative Volume",
-    "Daily Volume Expansion", "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score",
+    "Daily Volume Expansion", "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP",
     "Freshness_Score", "Fresh_State", "Fresh_Since", "Cumulative KER", "Cumulative +DI", "Cumulative -DI",
     "Cumulative ADX", "Survival Score", "Ease of Movement", "Above Threshold Iterations", "Last Iteration Minutes", "Last Iteration Time",
 ]
 
 EMAIL_DISPLAY_COLS = [
     "Symbol", "LTP", "% Change", "Daily Volatility Expansion", "Daily Volume Expansion",
-    "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score",
+    "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP",
     "Freshness_Score", "Fresh_State", "Fresh_Since", "Cumulative KER", "Cumulative +DI", "Cumulative -DI",
     "Cumulative ADX", "Survival Score", "Last Iteration Time",
 ]
