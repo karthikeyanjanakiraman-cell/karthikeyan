@@ -31,8 +31,10 @@ logger.addHandler(ch)
 
 DAILY_LOOKBACK_DAYS = 60
 INTRADAY_LOOKBACK_DAYS = 20
+IVP_LOOKBACK_DAYS = 252
 fyers: Optional[fyersModel.FyersModel] = None
-EMAIL_DISPLAY_COLS = ["Symbol", "LTP", "% Change", "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal", "Bull_Signal", "Bear_Signal", "Overall_Signal", "Entry State", "Last Iteration Time"]
+EMAIL_DISPLAY_COLS = ["Symbol", "LTP", "% Change", "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal", "Bull_Signal", "Bear_Signal", "Overall_Signal", "IVP", "Volatility State", "Last Iteration Time"]
+
 
 def init_fyers():
     global fyers
@@ -48,6 +50,7 @@ def init_fyers():
     except Exception as e:
         logger.warning(f"INIT Failed: {e}")
         fyers = None
+
 
 def load_fno_symbols_from_sectors(root_dir: str = "sectors") -> List[str]:
     symbols = set()
@@ -70,10 +73,12 @@ def load_fno_symbols_from_sectors(root_dir: str = "sectors") -> List[str]:
                 pass
     return sorted(symbols)
 
+
 def format_fyers_symbol(symbol: str) -> str:
     if symbol.startswith("NSE:") and symbol.endswith("-EQ"):
         return symbol
     return f"NSE:{symbol}-EQ"
+
 
 def get_fyers_history(symbol: str, resolution: str, days_back: int) -> Optional[pd.DataFrame]:
     if not fyers:
@@ -93,6 +98,30 @@ def get_fyers_history(symbol: str, resolution: str, days_back: int) -> Optional[
     except Exception as e:
         logger.error(f"FYERS Error fetching {resolution} data for {symbol}: {e}")
     return None
+
+
+def compute_iv_proxies(daily_df: Optional[pd.DataFrame]) -> Dict[str, float]:
+    if daily_df is None or daily_df.empty or len(daily_df) < 30:
+        return {"IVP": np.nan, "Volatility State": "Neutral Vol"}
+    df = daily_df.copy().sort_values("timestamp" if "timestamp" in daily_df.columns else daily_df.columns[0]).reset_index(drop=True)
+    close = pd.to_numeric(df["close"], errors="coerce").astype(float)
+    high = pd.to_numeric(df["high"], errors="coerce").astype(float)
+    low = pd.to_numeric(df["low"], errors="coerce").astype(float)
+    iv_proxy = ((high - low) / close.replace(0, np.nan) * 100.0).replace([np.inf, -np.inf], np.nan)
+    iv_proxy = iv_proxy.dropna()
+    if iv_proxy.empty:
+        return {"IVP": np.nan, "Volatility State": "Neutral Vol"}
+    lookback = iv_proxy.tail(min(IVP_LOOKBACK_DAYS, len(iv_proxy)))
+    current_iv = float(lookback.iloc[-1])
+    ivp = round((lookback.lt(current_iv).sum() / len(lookback)) * 100, 2)
+    if ivp < 30:
+        vol_state = "Buyer Zone"
+    elif ivp > 50:
+        vol_state = "Avoid Buy Premium"
+    else:
+        vol_state = "Neutral Vol"
+    return {"IVP": ivp, "Volatility State": vol_state}
+
 
 def compute_cumulative_directional_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
     df = curr_df.copy().sort_values("time").reset_index(drop=True)
@@ -147,6 +176,7 @@ def compute_cumulative_directional_metrics(curr_df: pd.DataFrame) -> pd.DataFram
     cols = ["Cumulative KER", "Cumulative +DI", "Cumulative -DI", "Cumulative ADX", "Survival Score", "Survival_Num"]
     return pd.concat([df, pd.DataFrame(out, columns=cols)], axis=1)
 
+
 def compute_cumulative_flow_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
     df = curr_df.copy().sort_values("time").reset_index(drop=True)
     if df.empty:
@@ -176,6 +206,7 @@ def compute_cumulative_flow_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
     vwap_z_score = np.where(vwap_std > 0, (close - vwap) / vwap_std, 0.0)
     out = pd.DataFrame({"Cumulative RSI": rsi, "Cumulative OBV": obv, "Cumulative VWAP": vwap, "VWAP Z-Score": pd.Series(vwap_z_score, index=df.index).fillna(0.0)})
     return pd.concat([df.reset_index(drop=True), out.reset_index(drop=True)], axis=1)
+
 
 def calculate_hybrid_freshness(df_intraday: pd.DataFrame) -> pd.DataFrame:
     if df_intraday is None or df_intraday.empty:
@@ -253,6 +284,7 @@ def calculate_hybrid_freshness(df_intraday: pd.DataFrame) -> pd.DataFrame:
     work["Fresh_Since"] = fresh_since
     return work
 
+
 def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[Dict, pd.DataFrame]:
     if intra_df is None or intra_df.empty:
         return {}, pd.DataFrame()
@@ -320,6 +352,7 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
     summary = {"LTP": ltp, "Current Volume": last_cum_vol, "10 Day Relative Volume": last_rvol10, "20 Day Relative Volume": last_rvol20, "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[-1]) if not flow_df.empty else float("nan"), "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[-1]) if not flow_df.empty else float("nan"), "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[-1]) if not flow_df.empty else float("nan"), "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[-1]) if not flow_df.empty else float("nan"), "Total Iterations": total_iters, "Last Iteration Minutes": last_iter_mins, "Last Iteration Time": last_iter_time, "Cumulative KER": float(metric_df["Cumulative KER"].iloc[-1]) if not metric_df.empty else np.nan, "Cumulative +DI": float(metric_df["Cumulative +DI"].iloc[-1]) if not metric_df.empty else np.nan, "Cumulative -DI": float(metric_df["Cumulative -DI"].iloc[-1]) if not metric_df.empty else np.nan, "Cumulative ADX": float(metric_df["Cumulative ADX"].iloc[-1]) if not metric_df.empty else np.nan, "Survival Score": str(metric_df["Survival Score"].iloc[-1]) if not metric_df.empty else "0/0", "Survival_Num": float(metric_df["Survival_Num"].iloc[-1]) if not metric_df.empty else 0.0, "HOD": hod, "Strike_Distance": strike_distance, "Last_5m_Volume": last_5m_volume, "Volume_1h_Avg_5m": vol_1h_avg_5m, "OBV_30m_Delta": obv_30m_delta, "RSI_30m_Delta": rsi_30m_delta, "Freshness_Score": float(fresh_score), "Fresh_State": str(df["Fresh_State"].iloc[-1]) if "Fresh_State" in df.columns else "", "Fresh_Since": str(df["Fresh_Since"].iloc[-1]) if "Fresh_Since" in df.columns else "", "Is_Fresh": bool(is_fresh)}
     return summary, detail_df
 
+
 def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
     symbols = load_fno_symbols_from_sectors("sectors")
     if not symbols:
@@ -330,9 +363,10 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
     for idx, sym in enumerate(symbols, start=1):
         logger.info(f"CORE [{idx}/{total}] Processing {sym}")
         fyers_sym = format_fyers_symbol(sym)
-        daily_df = get_fyers_history(fyers_sym, resolution="D", days_back=DAILY_LOOKBACK_DAYS)
+        daily_df = get_fyers_history(fyers_sym, resolution="D", days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
         intra_df = get_fyers_history(fyers_sym, resolution="5", days_back=INTRADAY_LOOKBACK_DAYS)
         iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
+        iv_info = compute_iv_proxies(daily_df)
         prev_close = float(daily_df["close"].iloc[-2]) if daily_df is not None and len(daily_df) >= 2 else None
         ltp = iter_summary.get("LTP")
         pct_change = ((ltp - prev_close) / prev_close * 100) if (ltp is not None and prev_close and prev_close != 0) else 0.0
@@ -340,8 +374,9 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             iter_detail.insert(0, "Symbol", sym)
             iter_detail.insert(1, "% Change", pct_change)
             iteration_rows.append(iter_detail)
-        rows.append({"Symbol": sym, "LTP": ltp, "% Change": pct_change, "Current Volume": iter_summary.get("Current Volume"), "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"), "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"), "Cumulative RSI": iter_summary.get("Cumulative RSI"), "Cumulative OBV": iter_summary.get("Cumulative OBV"), "Cumulative VWAP": iter_summary.get("Cumulative VWAP"), "VWAP Z-Score": iter_summary.get("VWAP Z-Score"), "Total Iterations": iter_summary.get("Total Iterations"), "Last Iteration Minutes": iter_summary.get("Last Iteration Minutes"), "Last Iteration Time": iter_summary.get("Last Iteration Time"), "Cumulative KER": iter_summary.get("Cumulative KER"), "Cumulative +DI": iter_summary.get("Cumulative +DI"), "Cumulative -DI": iter_summary.get("Cumulative -DI"), "Cumulative ADX": iter_summary.get("Cumulative ADX"), "Survival Score": iter_summary.get("Survival Score"), "Survival_Num": iter_summary.get("Survival_Num"), "HOD": iter_summary.get("HOD"), "Strike_Distance": iter_summary.get("Strike_Distance"), "Last_5m_Volume": iter_summary.get("Last_5m_Volume"), "Volume_1h_Avg_5m": iter_summary.get("Volume_1h_Avg_5m"), "OBV_30m_Delta": iter_summary.get("OBV_30m_Delta"), "RSI_30m_Delta": iter_summary.get("RSI_30m_Delta"), "Freshness_Score": iter_summary.get("Freshness_Score"), "Fresh_State": iter_summary.get("Fresh_State"), "Fresh_Since": iter_summary.get("Fresh_Since"), "Is_Fresh": iter_summary.get("Is_Fresh")})
+        rows.append({"Symbol": sym, "LTP": ltp, "% Change": pct_change, "Current Volume": iter_summary.get("Current Volume"), "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"), "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"), "Cumulative RSI": iter_summary.get("Cumulative RSI"), "Cumulative OBV": iter_summary.get("Cumulative OBV"), "Cumulative VWAP": iter_summary.get("Cumulative VWAP"), "VWAP Z-Score": iter_summary.get("VWAP Z-Score"), "Total Iterations": iter_summary.get("Total Iterations"), "Last Iteration Minutes": iter_summary.get("Last Iteration Minutes"), "Last Iteration Time": iter_summary.get("Last Iteration Time"), "Cumulative KER": iter_summary.get("Cumulative KER"), "Cumulative +DI": iter_summary.get("Cumulative +DI"), "Cumulative -DI": iter_summary.get("Cumulative -DI"), "Cumulative ADX": iter_summary.get("Cumulative ADX"), "Survival Score": iter_summary.get("Survival Score"), "Survival_Num": iter_summary.get("Survival_Num"), "HOD": iter_summary.get("HOD"), "Strike_Distance": iter_summary.get("Strike_Distance"), "Last_5m_Volume": iter_summary.get("Last_5m_Volume"), "Volume_1h_Avg_5m": iter_summary.get("Volume_1h_Avg_5m"), "OBV_30m_Delta": iter_summary.get("OBV_30m_Delta"), "RSI_30m_Delta": iter_summary.get("RSI_30m_Delta"), "Freshness_Score": iter_summary.get("Freshness_Score"), "Fresh_State": iter_summary.get("Fresh_State"), "Fresh_Since": iter_summary.get("Fresh_Since"), "Is_Fresh": iter_summary.get("Is_Fresh"), "IVP": iv_info.get("IVP"), "Volatility State": iv_info.get("Volatility State")})
     return pd.DataFrame(rows), (pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame())
+
 
 def rank_delta_to_label(delta: float) -> str:
     if pd.isna(delta): return ""
@@ -353,19 +388,6 @@ def rank_delta_to_label(delta: float) -> str:
     if delta <= -4: return "Sell+"
     return "Sell"
 
-def compute_entry_state(row) -> str:
-    is_fresh = bool(row.get("Is_Fresh", False))
-    change = pd.to_numeric(row.get("% Change"), errors="coerce")
-    vwap_z = pd.to_numeric(row.get("VWAP Z-Score"), errors="coerce")
-    pdi = pd.to_numeric(row.get("Cumulative +DI"), errors="coerce")
-    mdi = pd.to_numeric(row.get("Cumulative -DI"), errors="coerce")
-    adx = pd.to_numeric(row.get("Cumulative ADX"), errors="coerce")
-    overall = str(row.get("Overall_Signal", "")).strip()
-    long_aligned = is_fresh and pd.notna(change) and change > 0 and pd.notna(pdi) and pd.notna(mdi) and pdi > mdi and pd.notna(vwap_z) and 0.30 <= vwap_z <= 1.80 and pd.notna(adx) and adx >= 20
-    short_aligned = is_fresh and pd.notna(change) and change < 0 and pd.notna(pdi) and pd.notna(mdi) and mdi > pdi and pd.notna(vwap_z) and -1.80 <= vwap_z <= -0.30 and pd.notna(adx) and adx >= 20
-    if pd.notna(change) and change > 0 and pd.notna(pdi) and pd.notna(mdi) and pdi > mdi: return "Buy"
-    if pd.notna(change) and change < 0 and pd.notna(pdi) and pd.notna(mdi) and mdi > pdi: return "Sell"
-    return "Neutral"
 
 def derive_rank_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
@@ -404,8 +426,10 @@ def derive_rank_columns(df: pd.DataFrame) -> pd.DataFrame:
         out[f"{tf}RankDelta"] = out[f"{tf}BullRank"] - out[f"{tf}BearRank"]
     return out
 
+
 def add_signal_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty: return df
+    if df is None or df.empty:
+        return df
     out = df.copy()
     for tf in ["5m", "15m", "30m", "60m"]:
         out[f"{tf}_Signal"] = out[f"{tf}RankDelta"].apply(rank_delta_to_label) if f"{tf}RankDelta" in out.columns else ""
@@ -414,27 +438,29 @@ def add_signal_columns(df: pd.DataFrame) -> pd.DataFrame:
     out["Overall_Signal"] = out["Rank Delta"].apply(rank_delta_to_label) if "Rank Delta" in out.columns else ""
     return out
 
+
 def signal_color(label: str) -> str:
     label = str(label).strip()
     if label == "Buy++": return "#0b6623"
     if label == "Buy+": return "#1e8449"
     if label == "Buy": return "#27ae60"
-    if label == "Ready Long": return "#145a32"
-    if label == "Watch Long": return "#1f7a4c"
+    if label == "Buyer Zone": return "#145a32"
     if label == "Neutral": return "#555555"
+    if label == "Neutral Vol": return "#555555"
     if label == "Sell++": return "#922b21"
     if label == "Sell+": return "#c0392b"
     if label == "Sell": return "#e74c3c"
-    if label == "Ready Short": return "#7b241c"
-    if label == "Watch Short": return "#a93226"
-    if label == "Avoid Overheat": return "#7d6608"
+    if label == "Avoid Buy Premium": return "#7d6608"
     return "#2c2c2c"
+
 
 def format_value(col: str, val):
     if pd.isna(val): return ""
     if col == "% Change": return f"{float(val):.2f}%"
+    if col == "IVP": return f"{float(val):.2f}"
     if isinstance(val, (int, float, np.integer, np.floating)): return f"{float(val):.2f}"
     return str(val)
+
 
 def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df is None or df.empty:
@@ -447,6 +473,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     long_df = long_df[[c for c in EMAIL_DISPLAY_COLS if c in long_df.columns]] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     short_df = short_df[[c for c in EMAIL_DISPLAY_COLS if c in short_df.columns]] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     return long_df, short_df
+
 
 def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     if df is None or df.empty:
@@ -479,7 +506,7 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
                     extra = 'font-weight:700;'
                 except Exception:
                     pass
-            if c.endswith('_Signal') or c in ('Bull_Signal', 'Bear_Signal', 'Overall_Signal', 'Entry State'):
+            if c.endswith('_Signal') or c in ('Bull_Signal', 'Bear_Signal', 'Overall_Signal', 'Volatility State'):
                 bgcolor = signal_color(val)
                 color = '#ffffff'
                 extra = 'font-weight:700;'
@@ -487,6 +514,7 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
         html.append('</tr>')
     html.append('</table>')
     return ''.join(html)
+
 
 def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str, detail_csv_filename: str) -> bool:
     smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
@@ -500,13 +528,7 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
     long_table = df_to_html_table(long_df)
     short_table = df_to_html_table(short_df)
     scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S IST")
-    html_body = (
-        '<html><body style="font-family:Arial,sans-serif;background:#0f1115;color:#f5f5f5;padding:16px;">'
-        '<h2 style="color:#f5f5f5;">Long Candidates</h2>' + long_table +
-        '<br><h2 style="color:#f5f5f5;">Short Candidates</h2>' + short_table +
-        f'<p style="margin-top:16px;color:#cccccc;">Scan completed at {scan_time}.</p>' +
-        '</body></html>'
-    )
+    html_body = ('<html><body style="font-family:Arial,sans-serif;background:#0f1115;color:#f5f5f5;padding:16px;">' '<h2 style="color:#f5f5f5;">Long Candidates</h2>' + long_table + '<br><h2 style="color:#f5f5f5;">Short Candidates</h2>' + short_table + f'<p style="margin-top:16px;color:#cccccc;">Scan completed at {scan_time}.</p>' + '</body></html>')
     msg = MIMEMultipart()
     msg["From"] = sender_email
     msg["To"] = recipient_email
@@ -534,6 +556,7 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
         logger.error(f"EMAIL Failed to send email: {type(e).__name__}: {e}")
         return False
 
+
 def main():
     logger.info("Starting F&O Iteration Volume Volatility Scan")
     init_fyers()
@@ -555,6 +578,7 @@ def main():
         pd.DataFrame().to_csv(detail_csv, index=False)
     send_email_with_tables(long_df, short_df, summary_csv, detail_csv)
     logger.info("Scan Pipeline Completed")
+
 
 if __name__ == "__main__":
     main()
