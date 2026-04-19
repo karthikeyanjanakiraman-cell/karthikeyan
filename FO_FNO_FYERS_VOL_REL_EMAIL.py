@@ -648,12 +648,8 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
     if "Last Iteration Time" not in base.columns:
         base["Last Iteration Time"] = ""
 
-    filtered = base[(base["Daily Volatility Expansion"] > DAILY_VOL_THRESHOLD) & (base["Daily Volume Expansion"] > DAILY_VOLUME_THRESHOLD)].copy()
-    if filtered.empty:
-        filtered = base.copy()
-
-    long_df = filtered[(filtered["% Change"] > 0) & (filtered["Bull Rank"] >= 1)].copy()
-    short_df = filtered[(filtered["% Change"] < 0) & (filtered["Bear Rank"] >= 1)].copy()
+    long_df = base[(base["% Change"] > 0) & (base["Bull Rank"] >= 1)].copy()
+    short_df = base[(base["% Change"] < 0) & (base["Bear Rank"] >= 1)].copy()
 
     long_df = long_df.sort_values(by=["Alignment Count", "Bull Rank", "5m_Rank_Delta", "15m_Rank_Delta", "30m_Rank_Delta", "60m_Rank_Delta", "% Change"], ascending=[False, False, False, False, False, False, False], na_position="last")
     short_df = short_df.sort_values(by=["Alignment Count", "Bear Rank", "5m_Rank_Delta", "15m_Rank_Delta", "30m_Rank_Delta", "60m_Rank_Delta", "% Change"], ascending=[False, False, True, True, True, True, True], na_position="last")
