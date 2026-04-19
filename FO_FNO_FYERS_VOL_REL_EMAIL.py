@@ -671,18 +671,141 @@ def format_value(col: str, val):
     return str(val)
 
 
-def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
-    if df is None or df.empty:
-        return "<p>No candidates found.</p>"
-    df_slice = df.head(max_rows).copy()
-    cols = [c for c in EMAIL_DISPLAY_COLS if c in df_slice.columns]
-    if not cols:
-        return "<p>No candidates found.</p>"
-    df_slice = df_slice[cols].copy()
-    for c in df_slice.columns:
-        df_slice[c] = df_slice[c].apply(lambda x: format_value(c, x))
-    return df_slice.to_html(index=False, escape=False, border=0)
 
+def signal_label(delta):
+    try:
+        d = float(delta)
+    except Exception:
+        return "Neutral"
+    if d >= 6:
+        return "Buy++"
+    if d >= 3:
+        return "Buy+"
+    if d > 0:
+        return "Buy"
+    if d <= -6:
+        return "Sell++"
+    if d <= -3:
+        return "Sell+"
+    if d < 0:
+        return "Sell"
+    return "Neutral"
+
+
+def signal_cell_style(label: str) -> str:
+    label = (label or "").strip().lower()
+    if label.startswith("buy"):
+        return "background:#2e7d32;color:#ffffff;font-weight:700;text-align:center;"
+    if label.startswith("sell"):
+        return "background:#b23a48;color:#ffffff;font-weight:700;text-align:center;"
+    return "background:#50545f;color:#ffffff;font-weight:700;text-align:center;"
+
+
+def metric_cell_style(value, positive_good=True) -> str:
+    try:
+        v = float(value)
+    except Exception:
+        return "background:#3c4048;color:#ffffff;text-align:center;"
+    if positive_good:
+        if v > 0:
+            return "background:#1f5f3a;color:#d8ffe6;text-align:right;font-weight:700;"
+        if v < 0:
+            return "background:#6f2530;color:#ffd9de;text-align:right;font-weight:700;"
+    else:
+        if v < 0:
+            return "background:#1f5f3a;color:#d8ffe6;text-align:right;font-weight:700;"
+        if v > 0:
+            return "background:#6f2530;color:#ffd9de;text-align:right;font-weight:700;"
+    return "background:#3c4048;color:#ffffff;text-align:right;font-weight:700;"
+
+
+def df_to_html_table(df: pd.DataFrame, title: str = "Candidates", max_rows: int = 15, side: str = "long") -> str:
+    if df is None or df.empty:
+        return f"""
+        <div style='margin:18px 0 28px;'>
+          <h3 style='margin:0 0 10px;color:#f3f4f6;font-family:Arial,sans-serif;'>{title}</h3>
+          <div style='background:#1f2430;border:1px solid #343b48;border-radius:10px;padding:16px;color:#cfd6df;font-family:Arial,sans-serif;'>
+            No candidates found.
+          </div>
+        </div>
+        """
+
+    df_slice = df.head(max_rows).copy()
+    display_cols = [
+        "Symbol", "LTP", "% Change",
+        "5m_Rank_Delta", "15m_Rank_Delta", "30m_Rank_Delta", "60m_Rank_Delta",
+        "Bull Rank", "Bear Rank", "Rank Delta", "Entry State"
+    ]
+    cols = [c for c in display_cols if c in df_slice.columns]
+
+    rename_map = {
+        "5m_Rank_Delta": "5m",
+        "15m_Rank_Delta": "15m",
+        "30m_Rank_Delta": "30m",
+        "60m_Rank_Delta": "60m",
+    }
+
+    accent = "#2e7d32" if side == "long" else "#b23a48"
+    badge_bg = "#1f5f3a" if side == "long" else "#6f2530"
+    badge_text = "#d8ffe6" if side == "long" else "#ffd9de"
+
+    header_html = "".join(
+        f"<th style='padding:10px 8px;background:#2b303b;color:#f3f4f6;border:1px solid #434955;font-size:12px;font-family:Arial,sans-serif;text-transform:uppercase;letter-spacing:.4px;text-align:center;'>{rename_map.get(c,c)}</th>"
+        for c in cols
+    )
+
+    body_rows = []
+    for _, row in df_slice.iterrows():
+        tds = []
+        for col in cols:
+            val = row.get(col, "")
+            if col == "Symbol":
+                style = "background:#252a33;color:#f8fafc;font-weight:700;padding:9px 8px;border:1px solid #434955;text-align:left;font-family:Arial,sans-serif;"
+                cell = str(val)
+            elif col == "LTP":
+                style = "background:#252a33;color:#e5e7eb;font-weight:700;padding:9px 8px;border:1px solid #434955;text-align:right;font-family:Arial,sans-serif;"
+                cell = f"{float(val):.2f}" if pd.notna(val) and str(val) != "" else ""
+            elif col == "% Change":
+                style = metric_cell_style(val, positive_good=(side == "long")) + "padding:9px 8px;border:1px solid #434955;font-family:Arial,sans-serif;"
+                cell = f"{float(val):.2f}%" if pd.notna(val) and str(val) != "" else ""
+            elif col in ["5m_Rank_Delta", "15m_Rank_Delta", "30m_Rank_Delta", "60m_Rank_Delta"]:
+                label = signal_label(val)
+                style = signal_cell_style(label) + "padding:9px 8px;border:1px solid #434955;font-family:Arial,sans-serif;"
+                cell = label
+            elif col in ["Bull Rank", "Bear Rank", "Rank Delta"]:
+                positive_good = True if col != "Bear Rank" else False
+                style = metric_cell_style(val, positive_good=positive_good) + "padding:9px 8px;border:1px solid #434955;font-family:Arial,sans-serif;"
+                cell = f"{float(val):.2f}" if pd.notna(val) and str(val) != "" else ""
+            elif col == "Entry State":
+                label = str(val) if pd.notna(val) else ""
+                label_low = label.lower()
+                if "ready" in label_low:
+                    style = "background:#1f5f3a;color:#d8ffe6;font-weight:700;text-align:center;padding:9px 8px;border:1px solid #434955;font-family:Arial,sans-serif;"
+                elif "early" in label_low:
+                    style = "background:#6a4b16;color:#ffe7b3;font-weight:700;text-align:center;padding:9px 8px;border:1px solid #434955;font-family:Arial,sans-serif;"
+                else:
+                    style = "background:#50545f;color:#ffffff;font-weight:700;text-align:center;padding:9px 8px;border:1px solid #434955;font-family:Arial,sans-serif;"
+                cell = label or "-"
+            else:
+                style = "background:#252a33;color:#e5e7eb;padding:9px 8px;border:1px solid #434955;text-align:center;font-family:Arial,sans-serif;"
+                cell = str(val)
+            tds.append(f"<td style='{style}'>{cell}</td>")
+        body_rows.append(f"<tr>{''.join(tds)}</tr>")
+
+    return f"""
+    <div style='margin:18px 0 28px;'>
+      <div style='display:flex;align-items:center;justify-content:space-between;margin-bottom:10px;'>
+        <h3 style='margin:0;color:#f3f4f6;font-size:18px;font-family:Arial,sans-serif;'>{title}</h3>
+        <span style='background:{badge_bg};color:{badge_text};padding:6px 10px;border-radius:999px;font-size:12px;font-weight:700;font-family:Arial,sans-serif;border:1px solid {accent};'>{len(df_slice)} rows</span>
+      </div>
+      <div style='overflow-x:auto;border:1px solid #343b48;border-radius:12px;background:#1f2430;padding:10px;'>
+        <table style='width:100%;border-collapse:collapse;background:#1f2430;'>
+          <thead><tr>{header_html}</tr></thead>
+          <tbody>{''.join(body_rows)}</tbody>
+        </table>
+      </div>
+    </div>
+    """
 
 def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str, detail_csv_filename: str) -> bool:
     sender_email = os.environ.get("SENDER_EMAIL")
@@ -705,7 +828,7 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
     short_html = df_to_html_table(short_df)
     html_body = f"""
     <html>
-      <body>
+      <body style="margin:0;padding:24px;background:#111827;">
         <h2>Long Candidates</h2>
         {long_html}
         <h2>Short Candidates</h2>
