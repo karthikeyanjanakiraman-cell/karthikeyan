@@ -540,7 +540,7 @@ EMAIL_DISPLAY_COLS = [
     "15m_Bull_Rank", "15m_Bear_Rank", "15m_Rank_Delta",
     "30m_Bull_Rank", "30m_Bear_Rank", "30m_Rank_Delta",
     "60m_Bull_Rank", "60m_Bear_Rank", "60m_Rank_Delta",
-    "Bull Rank", "Bear Rank", "Rank Delta", "MTF Alignment", "Alignment Count",
+    "Bull Rank", "Bear Rank", "Rank Delta", "Alignment Count",
     "Momentum Build", "Overheat Flag", "Entry State", "Last Iteration Time",
 ]
 
