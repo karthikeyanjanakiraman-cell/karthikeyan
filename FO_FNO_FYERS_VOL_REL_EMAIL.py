@@ -421,7 +421,8 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[-1]) if not flow_df.empty else float("nan"),
-                "Total Iterations": total_iters,
+        "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[-1]) if not flow_df.empty else float("nan"),
+        "Total Iterations": total_iters,
         "Last Iteration Minutes": last_iter_mins,
         "Last Iteration Time": last_iter_time,
         "Cumulative KER": float(metric_df["Cumulative KER"].iloc[-1]) if not metric_df.empty else np.nan,
@@ -436,7 +437,10 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         "Volume_1h_Avg_5m": vol_1h_avg_5m,
         "OBV_30m_Delta": obv_30m_delta,
         "RSI_30m_Delta": rsi_30m_delta,
-                                "Is_Fresh": bool(is_fresh),
+        "Freshness_Score": float(fresh_score),
+        "Fresh_State": str(df["Fresh_State"].iloc[-1]) if "Fresh_State" in df.columns else "",
+        "Fresh_Since": str(df["Fresh_Since"].iloc[-1]) if "Fresh_Since" in df.columns else "",
+        "Is_Fresh": bool(is_fresh),
     }
     return summary, detail_df
 
@@ -494,7 +498,8 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "Cumulative RSI": iter_summary.get("Cumulative RSI"),
             "Cumulative OBV": iter_summary.get("Cumulative OBV"),
             "Cumulative VWAP": iter_summary.get("Cumulative VWAP"),
-                        "Ease of Movement": ease_of_movement,
+            "VWAP Z-Score": iter_summary.get("VWAP Z-Score"),
+            "Ease of Movement": ease_of_movement,
             "Total Iterations": total_iterations,
             "Above Threshold Iterations": above_count,
             "Above Threshold Ratio": above_ratio,
@@ -512,7 +517,10 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "Volume_1h_Avg_5m": iter_summary.get("Volume_1h_Avg_5m"),
             "OBV_30m_Delta": iter_summary.get("OBV_30m_Delta"),
             "RSI_30m_Delta": iter_summary.get("RSI_30m_Delta"),
-                                                "Is_Fresh": iter_summary.get("Is_Fresh"),
+            "Freshness_Score": iter_summary.get("Freshness_Score"),
+            "Fresh_State": iter_summary.get("Fresh_State"),
+            "Fresh_Since": iter_summary.get("Fresh_Since"),
+            "Is_Fresh": iter_summary.get("Is_Fresh"),
         })
     summary_df = pd.DataFrame(rows)
     iteration_df = pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame()
@@ -532,7 +540,10 @@ DISPLAY_COLS = [
     "Cumulative +DI",
     "Cumulative -DI",
     "Cumulative ADX",
-    "Survival Score",
+    "Bull Rank",
+    "Bear Rank",
+    "Rank Delta",
+    "Overheat",
     "Last Iteration Time",
 ]
 EMAIL_DISPLAY_COLS = DISPLAY_COLS
@@ -540,14 +551,14 @@ EMAIL_DISPLAY_COLS = DISPLAY_COLS
 def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df_all is None or df_all.empty:
         return pd.DataFrame(columns=DISPLAY_COLS), pd.DataFrame(columns=DISPLAY_COLS)
-    base = df_all.copy()
-    for col in DISPLAY_COLS + ["Survival_Num"]:
+    base = compute_rank_columns(df_all.copy())
+    for col in DISPLAY_COLS:
         if col not in base.columns:
             base[col] = np.nan
-    long_df = base[(base["% Change"] > 0)].copy()
-    short_df = base[(base["% Change"] < 0)].copy()
-    long_df = long_df.sort_values(by=["Daily Volume Expansion", "Cumulative KER", "Survival_Num", "% Change"], ascending=[False, False, False, False], na_position="last").drop_duplicates(subset=["Symbol"]).head(15)
-    short_df = short_df.sort_values(by=["Daily Volume Expansion", "Cumulative KER", "Survival_Num", "% Change"], ascending=[False, False, False, True], na_position="last").drop_duplicates(subset=["Symbol"]).head(15)
+    long_df = base[(base["Bull Rank"] >= 7) & (base["Rank Delta"] > 1) & (base["% Change"] > 0)].copy()
+    short_df = base[(base["Bear Rank"] >= 7) & (base["Rank Delta"] < -1) & (base["% Change"] < 0)].copy()
+    long_df = long_df.sort_values(by=["Bull Rank", "Rank Delta", "Daily Volume Expansion", "% Change"], ascending=[False, False, False, False], na_position="last").drop_duplicates(subset=["Symbol"]).head(15)
+    short_df = short_df.sort_values(by=["Bear Rank", "Rank Delta", "Daily Volume Expansion", "% Change"], ascending=[False, True, False, True], na_position="last").drop_duplicates(subset=["Symbol"]).head(15)
     return long_df[DISPLAY_COLS].copy(), short_df[DISPLAY_COLS].copy()
 
 def format_value(col: str, val):
