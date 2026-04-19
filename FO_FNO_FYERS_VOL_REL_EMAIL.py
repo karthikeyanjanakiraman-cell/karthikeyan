@@ -528,65 +528,95 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 
 DISPLAY_COLS = [
-    "Symbol",
-    "LTP",
-    "% Change",
-    "Daily Volatility Expansion",
-    "Daily Volume Expansion",
-    "Cumulative RSI",
-    "Cumulative OBV",
-    "Cumulative VWAP",
-    "Cumulative KER",
-    "Cumulative +DI",
-    "Cumulative -DI",
-    "Cumulative ADX",
-    "Survival Score",
-    "Bull Rank",
-    "Bear Rank",
-    "Rank Delta",
-    "Overheat",
-    "Last Iteration Time",
+    "Symbol", "LTP", "% Change", "Daily Volatility Expansion", "10 Day Relative Volume", "20 Day Relative Volume",
+    "Daily Volume Expansion", "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score",
+    "Freshness_Score", "Fresh_State", "Fresh_Since", "Cumulative KER", "Cumulative +DI", "Cumulative -DI",
+    "Cumulative ADX", "Survival Score", "Ease of Movement", "Above Threshold Iterations", "Last Iteration Minutes", "Last Iteration Time",
 ]
 
-EMAIL_DISPLAY_COLS = DISPLAY_COLS
-
-def compute_rank_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    req = ["% Change", "Daily Volatility Expansion", "Daily Volume Expansion", "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "Cumulative KER", "Cumulative +DI", "Cumulative -DI", "Cumulative ADX", "Last Iteration Time"]
-    for c in req:
-        if c not in out.columns:
-            out[c] = np.nan
-    bull_trend = (out["Cumulative +DI"] > out["Cumulative -DI"]).astype(int)
-    bear_trend = (out["Cumulative -DI"] > out["Cumulative +DI"]).astype(int)
-    bull_momo = (out["Cumulative RSI"] > 50).astype(int) + (out["Cumulative KER"] > 0.5).astype(int)
-    bear_momo = (out["Cumulative RSI"] < 50).astype(int) + (out["Cumulative KER"] < 0.4).astype(int)
-    bull_vol = (out["Daily Volume Expansion"] > 1.0).astype(int) + (out["Cumulative OBV"] > 0).astype(int)
-    bear_vol = (out["Daily Volume Expansion"] > 1.0).astype(int) + (out["Cumulative OBV"] < 0).astype(int)
-    bull_vola = (out["Daily Volatility Expansion"] > 1.0).astype(int)
-    bear_vola = (out["Daily Volatility Expansion"] > 1.0).astype(int)
-    bull_px = (out["% Change"] > 0).astype(int)
-    bear_px = (out["% Change"] < 0).astype(int)
-    bull_adx = (out["Cumulative ADX"] > 20).astype(int)
-    bear_adx = (out["Cumulative ADX"] > 20).astype(int)
-    out["Bull Rank"] = (bull_px + bull_vol + bull_momo + bull_trend + bull_adx + bull_vola)
-    out["Bear Rank"] = (bear_px + bear_vol + bear_momo + bear_trend + bear_adx + bear_vola)
-    out["Rank Delta"] = out["Bull Rank"] - out["Bear Rank"]
-    out["Overheat"] = np.where((out["Bull Rank"] >= 5) | (out["Bear Rank"] >= 5), "YES", "")
-    return out
+EMAIL_DISPLAY_COLS = [
+    "Symbol", "LTP", "% Change", "Daily Volatility Expansion", "Daily Volume Expansion",
+    "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score",
+    "Freshness_Score", "Fresh_State", "Fresh_Since", "Cumulative KER", "Cumulative +DI", "Cumulative -DI",
+    "Cumulative ADX", "Survival Score", "Last Iteration Time",
+]
 
 def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df_all is None or df_all.empty:
         return pd.DataFrame(columns=DISPLAY_COLS), pd.DataFrame(columns=DISPLAY_COLS)
-    base = compute_rank_columns(df_all.copy())
-    for col in DISPLAY_COLS:
+
+    base = df_all.copy()
+    for col in DISPLAY_COLS + ["Survival_Num", "Is_Fresh", "Fresh_State", "Fresh_Since"]:
         if col not in base.columns:
             base[col] = np.nan
-    long_df = base[(base["Bull Rank"] >= 4) & (base["Rank Delta"] > 0) & (base["% Change"] > 0)].copy()
-    short_df = base[(base["Bear Rank"] >= 4) & (base["Rank Delta"] < 0) & (base["% Change"] < 0)].copy()
-    long_df = long_df.sort_values(by=["Bull Rank", "Rank Delta", "Daily Volume Expansion", "% Change"], ascending=[False, False, False, False], na_position="last").drop_duplicates(subset=["Symbol"]).head(15)
-    short_df = short_df.sort_values(by=["Bear Rank", "Rank Delta", "Daily Volume Expansion", "% Change"], ascending=[False, True, False, True], na_position="last").drop_duplicates(subset=["Symbol"]).head(15)
+
+    if "Daily Volatility Expansion" in base.columns and "Daily Volume Expansion" in base.columns:
+        filtered = base[
+            (base["Daily Volatility Expansion"] > DAILY_VOL_THRESHOLD) &
+            (base["Daily Volume Expansion"] > DAILY_VOLUME_THRESHOLD)
+        ].copy()
+        if not filtered.empty:
+            base = filtered
+
+    def _sort_long(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        return df.sort_values(
+            by=["Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
+            ascending=[False, False, False, False], na_position="last"
+        )
+
+    def _sort_short(df: pd.DataFrame) -> pd.DataFrame:
+        if df.empty:
+            return df
+        return df.sort_values(
+            by=["Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
+            ascending=[False, False, False, True], na_position="last"
+        )
+
+    strict_long = base[
+        (base["Is_Fresh"] == True) &
+        (base["% Change"] > 0) &
+        (base["Cumulative +DI"] > base["Cumulative -DI"]) &
+        (base["VWAP Z-Score"] > 0.3) &
+        (base["VWAP Z-Score"] <= 1.8)
+    ].copy()
+
+    strict_short = base[
+        (base["Is_Fresh"] == True) &
+        (base["% Change"] < 0) &
+        (base["Cumulative -DI"] > base["Cumulative +DI"]) &
+        (base["VWAP Z-Score"] < -0.3) &
+        (base["VWAP Z-Score"] >= -1.8)
+    ].copy()
+
+    fallback_long = base[
+        (base["Is_Fresh"] == True) &
+        (base["% Change"] > 0) &
+        (base["VWAP Z-Score"] > 0.3) &
+        (base["VWAP Z-Score"] <= 1.8)
+    ].copy()
+
+    fallback_short = base[
+        (base["Is_Fresh"] == True) &
+        (base["% Change"] < 0) &
+        (base["VWAP Z-Score"] < -0.3) &
+        (base["VWAP Z-Score"] >= -1.8)
+    ].copy()
+
+    long_df = _sort_long(strict_long)
+    short_df = _sort_short(strict_short)
+
+    if len(long_df) < 15:
+        extra_long = _sort_long(fallback_long[~fallback_long["Symbol"].isin(long_df["Symbol"])])
+        long_df = pd.concat([long_df, extra_long], ignore_index=True)
+
+    if len(short_df) < 15:
+        extra_short = _sort_short(fallback_short[~fallback_short["Symbol"].isin(short_df["Symbol"])])
+        short_df = pd.concat([short_df, extra_short], ignore_index=True)
+
+    long_df = long_df.drop_duplicates(subset=["Symbol"]).head(15)
+    short_df = short_df.drop_duplicates(subset=["Symbol"]).head(15)
     return long_df[DISPLAY_COLS].copy(), short_df[DISPLAY_COLS].copy()
 
 def format_value(col: str, val):
