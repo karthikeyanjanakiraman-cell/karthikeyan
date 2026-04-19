@@ -33,7 +33,7 @@ INTRADAY_LOOKBACK_DAYS = 20
 fyers: Optional[fyersModel.FyersModel] = None
 
 EMAIL_DISPLAY_COLS = [
-    "Symbol", "LTP", "% Change", "Daily Volatility Expansion", "Daily Volume Expansion",
+    "Symbol", "LTP", "% Change",
     "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
     "Bull_Signal", "Bear_Signal", "Overall_Signal", "Entry State", "Last Iteration Time"
 ]
@@ -111,18 +111,7 @@ def get_fyers_history(symbol: str, resolution: str, days_back: int) -> Optional[
 
 
 def compute_volatility_pair(daily_df: Optional[pd.DataFrame]) -> Dict[str, float]:
-    if daily_df is None or daily_df.empty or len(daily_df) < 11:
-        return {}
-    df = daily_df.copy()
-    df["DailyVolatility"] = df["high"] - df["low"]
-    current_vol = float(df["DailyVolatility"].iloc[-1])
-    avg_10d_vol = float(df["DailyVolatility"].iloc[-11:-1].mean())
-    vol_exp = current_vol / avg_10d_vol if avg_10d_vol > 0 else 0.0
-    return {
-        "Current Daily Volatility": current_vol,
-        "Avg Daily Volatility": avg_10d_vol,
-        "Daily Volatility Expansion": vol_exp,
-    }
+    return {}
 
 
 def compute_cumulative_directional_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
@@ -322,7 +311,7 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
     total_iters = 0
     last_iter_mins = None
     last_iter_time = None
-    last_cum_vol = last_rvol10 = last_rvol20 = last_dvolexp = 0
+    last_cum_vol = last_rvol10 = last_rvol20 = 0
     for i in range(len(curr_df)):
         total_iters += 1
         row = curr_df.iloc[i]
@@ -345,7 +334,6 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
             "Current Volume": cum_vol,
             "10 Day Relative Volume": rvol10,
             "20 Day Relative Volume": rvol20,
-            "Daily Volume Expansion": dvolexp,
             "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else float("nan"),
             "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[i]) if not flow_df.empty else float("nan"),
             "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[i]) if not flow_df.empty else float("nan"),
@@ -353,7 +341,7 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
             "Freshness_Score": float(curr_df["Freshness_Score"].iloc[i]) if "Freshness_Score" in curr_df.columns else float("nan"),
             "Is_Fresh": bool(curr_df["Is_Fresh"].iloc[i]) if "Is_Fresh" in curr_df.columns else False,
         })
-        last_cum_vol, last_rvol10, last_rvol20, last_dvolexp = cum_vol, rvol10, rvol20, dvolexp
+        last_cum_vol, last_rvol10, last_rvol20 = cum_vol, rvol10, rvol20
         last_iter_mins = iter_mins
         last_iter_time = t.strftime("%H:%M")
     detail_df = pd.DataFrame(rows)
@@ -377,7 +365,6 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         "Current Volume": last_cum_vol,
         "10 Day Relative Volume": last_rvol10,
         "20 Day Relative Volume": last_rvol20,
-        "Daily Volume Expansion": last_dvolexp,
         "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[-1]) if not flow_df.empty else float("nan"),
@@ -417,27 +404,21 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
         fyers_sym = format_fyers_symbol(sym)
         daily_df = get_fyers_history(fyers_sym, resolution="D", days_back=DAILY_LOOKBACK_DAYS)
         intra_df = get_fyers_history(fyers_sym, resolution="5", days_back=INTRADAY_LOOKBACK_DAYS)
-        vol_info = compute_volatility_pair(daily_df)
         iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
         prev_close = float(daily_df["close"].iloc[-2]) if daily_df is not None and len(daily_df) >= 2 else None
         ltp = iter_summary.get("LTP")
         pct_change = ((ltp - prev_close) / prev_close * 100) if (ltp is not None and prev_close and prev_close != 0) else 0.0
-        daily_vol_exp = vol_info.get("Daily Volatility Expansion")
-        daily_volume_exp = iter_summary.get("Daily Volume Expansion")
         if not iter_detail.empty:
             iter_detail.insert(0, "Symbol", sym)
             iter_detail.insert(1, "% Change", pct_change)
-            iter_detail.insert(2, "Daily Volatility Expansion", daily_vol_exp)
             iteration_rows.append(iter_detail)
         rows.append({
             "Symbol": sym,
             "LTP": ltp,
             "% Change": pct_change,
-            "Daily Volatility Expansion": daily_vol_exp,
             "Current Volume": iter_summary.get("Current Volume"),
             "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"),
             "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"),
-            "Daily Volume Expansion": daily_volume_exp,
             "Cumulative RSI": iter_summary.get("Cumulative RSI"),
             "Cumulative OBV": iter_summary.get("Cumulative OBV"),
             "Cumulative VWAP": iter_summary.get("Cumulative VWAP"),
@@ -606,7 +587,7 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
             style = 'border:1px solid #333;padding:5px 7px;text-align:center;background:#181a1b;color:#f5f5f5;'
             if c == 'Symbol': style += 'font-weight:700;color:#ff7b72;'
             elif c == 'LTP': style += 'font-weight:700;color:#6ee7a8;'
-            elif c in ('% Change', 'Daily Volatility Expansion', 'Daily Volume Expansion'):
+            elif c in ('% Change',):
                 try:
                     num = float(row[c])
                     style += f'font-weight:700;color:{"#6ee7a8" if num >= 0 else "#ff7b72"};'
