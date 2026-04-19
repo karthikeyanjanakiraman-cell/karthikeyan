@@ -363,11 +363,8 @@ def compute_entry_state(row) -> str:
     overall = str(row.get("Overall_Signal", "")).strip()
     long_aligned = is_fresh and pd.notna(change) and change > 0 and pd.notna(pdi) and pd.notna(mdi) and pdi > mdi and pd.notna(vwap_z) and 0.30 <= vwap_z <= 1.80 and pd.notna(adx) and adx >= 20
     short_aligned = is_fresh and pd.notna(change) and change < 0 and pd.notna(pdi) and pd.notna(mdi) and mdi > pdi and pd.notna(vwap_z) and -1.80 <= vwap_z <= -0.30 and pd.notna(adx) and adx >= 20
-    if long_aligned and overall in ("Buy+", "Buy++"): return "Ready Long"
-    if short_aligned and overall in ("Sell+", "Sell++"): return "Ready Short"
-    if pd.notna(vwap_z) and (vwap_z > 1.80 or vwap_z < -1.80): return "Avoid Overheat"
-    if is_fresh and pd.notna(change) and change > 0 and pd.notna(pdi) and pd.notna(mdi) and pdi > mdi: return "Watch Long"
-    if is_fresh and pd.notna(change) and change < 0 and pd.notna(pdi) and pd.notna(mdi) and mdi > pdi: return "Watch Short"
+    if pd.notna(change) and change > 0 and pd.notna(pdi) and pd.notna(mdi) and pdi > mdi: return "Buy"
+    if pd.notna(change) and change < 0 and pd.notna(pdi) and pd.notna(mdi) and mdi > pdi: return "Sell"
     return "Neutral"
 
 def derive_rank_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -415,7 +412,6 @@ def add_signal_columns(df: pd.DataFrame) -> pd.DataFrame:
     out["Bull_Signal"] = out["Bull Rank"].apply(rank_delta_to_label) if "Bull Rank" in out.columns else ""
     out["Bear_Signal"] = out["Bear Rank"].apply(lambda x: rank_delta_to_label(-x)) if "Bear Rank" in out.columns else ""
     out["Overall_Signal"] = out["Rank Delta"].apply(rank_delta_to_label) if "Rank Delta" in out.columns else ""
-    out["Entry State"] = out.apply(compute_entry_state, axis=1)
     return out
 
 def signal_color(label: str) -> str:
