@@ -536,9 +536,12 @@ DISPLAY_COLS = [
 
 EMAIL_DISPLAY_COLS = [
     "Symbol", "LTP", "% Change", "Daily Volatility Expansion", "Daily Volume Expansion",
-    "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score",
-    "Freshness_Score", "Fresh_State", "Fresh_Since", "Cumulative KER", "Cumulative +DI", "Cumulative -DI",
-    "Cumulative ADX", "Survival Score", "Last Iteration Time",
+    "5m_Bull_Rank", "5m_Bear_Rank", "5m_Rank_Delta",
+    "15m_Bull_Rank", "15m_Bear_Rank", "15m_Rank_Delta",
+    "30m_Bull_Rank", "30m_Bear_Rank", "30m_Rank_Delta",
+    "60m_Bull_Rank", "60m_Bear_Rank", "60m_Rank_Delta",
+    "Bull Rank", "Bear Rank", "Rank Delta", "MTF Alignment", "Alignment Count",
+    "Momentum Build", "Overheat Flag", "Entry State", "Last Iteration Time",
 ]
 
 def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
