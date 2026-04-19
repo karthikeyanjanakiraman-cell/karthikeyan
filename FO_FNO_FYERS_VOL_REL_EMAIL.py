@@ -707,10 +707,6 @@ def derive_rank_columns(dfall: pd.DataFrame) -> pd.DataFrame:
         score = 0
         if pd.notna(row.get("% Change")) and row.get("% Change") > 0:
             score += 2
-        if pd.notna(row.get("Daily Volatility Expansion")) and row.get("Daily Volatility Expansion") >= 1.0:
-            score += 1
-        if pd.notna(row.get("Daily Volume Expansion")) and row.get("Daily Volume Expansion") >= 1.0:
-            score += 1
         if pd.notna(row.get("VWAP Z-Score")) and row.get("VWAP Z-Score") >= 0.30:
             score += 2
         if pd.notna(row.get("Cumulative +DI")) and pd.notna(row.get("Cumulative -DI")) and row.get("Cumulative +DI") > row.get("Cumulative -DI"):
@@ -731,10 +727,6 @@ def derive_rank_columns(dfall: pd.DataFrame) -> pd.DataFrame:
         score = 0
         if pd.notna(row.get("% Change")) and row.get("% Change") < 0:
             score += 2
-        if pd.notna(row.get("Daily Volatility Expansion")) and row.get("Daily Volatility Expansion") >= 1.0:
-            score += 1
-        if pd.notna(row.get("Daily Volume Expansion")) and row.get("Daily Volume Expansion") >= 1.0:
-            score += 1
         if pd.notna(row.get("VWAP Z-Score")) and row.get("VWAP Z-Score") <= -0.30:
             score += 2
         if pd.notna(row.get("Cumulative +DI")) and pd.notna(row.get("Cumulative -DI")) and row.get("Cumulative -DI") > row.get("Cumulative +DI"):
@@ -807,7 +799,6 @@ def add_signal_columns(dfall: pd.DataFrame) -> pd.DataFrame:
 
     df["Entry State"] = df.apply(compute_entry_state, axis=1)
     return df
-    return df
 
 
 def signal_color(label: str) -> str:
@@ -851,40 +842,73 @@ def format_value(col: str, val):
 
 def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     if df is None or df.empty:
-        return "<p>No candidates found.</p>"
+        return '<p style="font-family:Arial,sans-serif;color:#dddddd;">No candidates found.</p>'
 
     df_slice = df.head(max_rows).copy()
     cols = [c for c in EMAIL_DISPLAY_COLS if c in df_slice.columns]
     if not cols:
-        return "<p>No candidates found.</p>"
+        return '<p style="font-family:Arial,sans-serif;color:#dddddd;">No candidates found.</p>'
 
-    header_html = "".join(f"<th style='border:1px solid #ddd;padding:6px;background:#f5f5f5'>{c}</th>" for c in cols)
+    header_html = ''.join(
+        f'<th style="border:1px solid #333;padding:6px 8px;background:#202225;color:#f5f5f5;text-align:center;font-weight:700;">{c}</th>'
+        for c in cols
+    )
+
     rows_html = []
     for _, row in df_slice.iterrows():
-        tds = "".join(f"<td style='border:1px solid #ddd;padding:6px'>{format_value(c, row[c])}</td>" for c in cols)
-        rows_html.append(f"<tr>{tds}</tr>")
-    body_html = "".join(rows_html)
-    return f"<table style='border-collapse:collapse;font-family:Arial,sans-serif;font-size:12px'><thead><tr>{header_html}</tr></thead><tbody>{body_html}</tbody></table>"
+        cells = []
+        for c in cols:
+            val = format_value(c, row[c])
+            style = 'border:1px solid #333;padding:5px 7px;text-align:center;background:#181a1b;color:#f5f5f5;'
+
+            if c == 'Symbol':
+                style += 'font-weight:700;color:#ff7b72;'
+            elif c == 'LTP':
+                style += 'font-weight:700;color:#6ee7a8;'
+            elif c in ('% Change', 'Daily Volatility Expansion', 'Daily Volume Expansion'):
+                try:
+                    num = float(row[c])
+                    style += f'font-weight:700;color:{"#6ee7a8" if num >= 0 else "#ff7b72"};'
+                except Exception:
+                    pass
+
+            if c.endswith('_Signal') or c in ('Bull_Signal', 'Bear_Signal', 'Overall_Signal', 'Entry State'):
+                bg = signal_color(val)
+                style += f'background:{bg};color:#ffffff;font-weight:700;'
+
+            cells.append(f'<td style="{style}">{val}</td>')
+        rows_html.append('<tr>' + ''.join(cells) + '</tr>')
+
+    body_html = ''.join(rows_html)
+    return (
+        '<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:12px;background:#111111;color:#f5f5f5;">'
+        '<thead><tr>' + header_html + '</tr></thead>'
+        '<tbody>' + body_html + '</tbody></table>'
+    )
+
 
 def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str, detail_csv_filename: str) -> bool:
-    sender_email = os.environ.get("SENDER_EMAIL")
-    sender_password = os.environ.get("SENDER_PASSWORD")
-    recipient_email = os.environ.get("RECIPIENT_EMAIL")
-    smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-    smtp_port = int(os.environ.get("SMTP_PORT", "465"))
+    sender_email = os.environ.get("SENDER_EMAIL") or os.environ.get("SENDEREMAIL")
+    sender_password = os.environ.get("SENDER_PASSWORD") or os.environ.get("SENDERPASSWORD")
+    recipient_email = os.environ.get("RECIPIENT_EMAIL") or os.environ.get("RECIPIENTEMAIL")
+    smtp_host = os.environ.get("SMTP_HOST") or os.environ.get("SMTPHOST", "smtp.gmail.com")
+    smtp_port = int(os.environ.get("SMTP_PORT") or os.environ.get("SMTPPORT", 465))
 
     long_html = df_to_html_table(long_df)
     short_html = df_to_html_table(short_df)
+
     html_body = f"""
-    <html><body>
-    <h3>Long Candidates</h3>
-    {long_html}
-    <br>
-    <h3>Short Candidates</h3>
-    {short_html}
-    <br>
-    <p>Scan completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}.</p>
-    </body></html>
+    <html>
+      <body style="background:#0f1115;color:#f5f5f5;font-family:Arial,sans-serif;">
+        <h3 style="color:#f5f5f5;">Long Candidates</h3>
+        {long_html}
+        <br>
+        <h3 style="color:#f5f5f5;">Short Candidates</h3>
+        {short_html}
+        <br>
+        <p style="color:#cfcfcf;">Scan completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}.</p>
+      </body>
+    </html>
     """
 
     if not sender_email:
@@ -908,9 +932,9 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
             with open(filename, "rb") as f:
                 part = MIMEBase("application", "octet-stream")
                 part.set_payload(f.read())
-            encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(filename)}")
-            msg.attach(part)
+                encoders.encode_base64(part)
+                part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(filename)}")
+                msg.attach(part)
 
     try:
         if smtp_port == 465:
@@ -932,6 +956,7 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
     except Exception as e:
         logger.error(f"EMAIL Failed to send email: {type(e).__name__}: {e}")
         return False
+
 
 def main():
     logger.info("Starting F&O Iteration Volume Volatility Scan")
