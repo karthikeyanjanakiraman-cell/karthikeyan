@@ -373,7 +373,8 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
             "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else float("nan"),
             "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[i]) if not flow_df.empty else float("nan"),
             "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[i]) if not flow_df.empty else float("nan"),
-                "Freshness_Score": float(curr_df["Freshness_Score"].iloc[i]) if "Freshness_Score" in curr_df.columns else float("nan"),
+            "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[i]) if not flow_df.empty else float("nan"),
+            "Freshness_Score": float(curr_df["Freshness_Score"].iloc[i]) if "Freshness_Score" in curr_df.columns else float("nan"),
             "Is_Fresh": bool(curr_df["Is_Fresh"].iloc[i]) if "Is_Fresh" in curr_df.columns else False,
         })
         last_cum_vol = cum_vol
@@ -420,6 +421,7 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[-1]) if not flow_df.empty else float("nan"),
+        "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Total Iterations": total_iters,
         "Last Iteration Minutes": last_iter_mins,
         "Last Iteration Time": last_iter_time,
@@ -496,7 +498,8 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "Cumulative RSI": iter_summary.get("Cumulative RSI"),
             "Cumulative OBV": iter_summary.get("Cumulative OBV"),
             "Cumulative VWAP": iter_summary.get("Cumulative VWAP"),
-                "Ease of Movement": ease_of_movement,
+            "VWAP Z-Score": iter_summary.get("VWAP Z-Score"),
+            "Ease of Movement": ease_of_movement,
             "Total Iterations": total_iterations,
             "Above Threshold Iterations": above_count,
             "Above Threshold Ratio": above_ratio,
@@ -526,27 +529,23 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 DISPLAY_COLS = [
     "Symbol", "LTP", "% Change", "Daily Volatility Expansion", "10 Day Relative Volume", "20 Day Relative Volume",
-    "Daily Volume Expansion", "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP",
-    "Freshness_Score", "Fresh_State", "Fresh_Since", "Cumulative KER", "Cumulative +DI", "Cumulative -DI",
+    "Daily Volume Expansion", "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP",     "Freshness_Score", "Fresh_State", "Fresh_Since", "Cumulative KER", "Cumulative +DI", "Cumulative -DI",
     "Cumulative ADX", "Survival Score", "Ease of Movement", "Above Threshold Iterations", "Last Iteration Minutes", "Last Iteration Time",
 ]
 
 EMAIL_DISPLAY_COLS = [
     "Symbol", "LTP", "% Change", "Daily Volatility Expansion", "Daily Volume Expansion",
-    "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP",
-    "Freshness_Score", "Fresh_State", "Fresh_Since", "Cumulative KER", "Cumulative +DI", "Cumulative -DI",
+    "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP",     "Freshness_Score", "Fresh_State", "Fresh_Since", "Cumulative KER", "Cumulative +DI", "Cumulative -DI",
     "Cumulative ADX", "Survival Score", "Last Iteration Time",
 ]
 
 def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df_all is None or df_all.empty:
         return pd.DataFrame(columns=DISPLAY_COLS), pd.DataFrame(columns=DISPLAY_COLS)
-
     base = df_all.copy()
-    for col in DISPLAY_COLS + ["Survival_Num", "Is_Fresh", "Fresh_State", "Fresh_Since"]:
+    for col in DISPLAY_COLS + ["Survival_Num", "Fresh_State", "Fresh_Since"]:
         if col not in base.columns:
             base[col] = np.nan
-
     if "Daily Volatility Expansion" in base.columns and "Daily Volume Expansion" in base.columns:
         filtered = base[
             (base["Daily Volatility Expansion"] > DAILY_VOL_THRESHOLD) &
@@ -554,68 +553,19 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
         ].copy()
         if not filtered.empty:
             base = filtered
-
     def _sort_long(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
             return df
-        return df.sort_values(
-            by=["Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
-            ascending=[False, False, False, False], na_position="last"
-        )
-
+        return df.sort_values(by=["Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"], ascending=[False, False, False, False], na_position="last")
     def _sort_short(df: pd.DataFrame) -> pd.DataFrame:
         if df.empty:
             return df
-        return df.sort_values(
-            by=["Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
-            ascending=[False, False, False, True], na_position="last"
-        )
-
-    strict_long = base[
-        (base["Is_Fresh"] == True) &
-        (base["% Change"] > 0) &
-        (base["Cumulative +DI"] > base["Cumulative -DI"]) &
-        (base["VWAP Z-Score"] > 0.3) &
-        (base["VWAP Z-Score"] <= 1.8)
-    ].copy()
-
-    strict_short = base[
-        (base["Is_Fresh"] == True) &
-        (base["% Change"] < 0) &
-        (base["Cumulative -DI"] > base["Cumulative +DI"]) &
-        (base["VWAP Z-Score"] < -0.3) &
-        (base["VWAP Z-Score"] >= -1.8)
-    ].copy()
-
-    fallback_long = base[
-        (base["Is_Fresh"] == True) &
-        (base["% Change"] > 0) &
-        (base["VWAP Z-Score"] > 0.3) &
-        (base["VWAP Z-Score"] <= 1.8)
-    ].copy()
-
-    fallback_short = base[
-        (base["Is_Fresh"] == True) &
-        (base["% Change"] < 0) &
-        (base["VWAP Z-Score"] < -0.3) &
-        (base["VWAP Z-Score"] >= -1.8)
-    ].copy()
-
-    long_df = _sort_long(strict_long)
-    short_df = _sort_short(strict_short)
-
-    if len(long_df) < 15:
-        extra_long = _sort_long(fallback_long[~fallback_long["Symbol"].isin(long_df["Symbol"])])
-        long_df = pd.concat([long_df, extra_long], ignore_index=True)
-
-    if len(short_df) < 15:
-        extra_short = _sort_short(fallback_short[~fallback_short["Symbol"].isin(short_df["Symbol"])])
-        short_df = pd.concat([short_df, extra_short], ignore_index=True)
-
-    long_df = long_df.drop_duplicates(subset=["Symbol"]).head(15)
-    short_df = short_df.drop_duplicates(subset=["Symbol"]).head(15)
+        return df.sort_values(by=["Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"], ascending=[False, False, False, True], na_position="last")
+    long_df = base[(base["% Change"] > 0) & (base["Cumulative +DI"] > base["Cumulative -DI"])].copy()
+    short_df = base[(base["% Change"] < 0) & (base["Cumulative -DI"] > base["Cumulative +DI"])].copy()
+    long_df = _sort_long(long_df).drop_duplicates(subset=["Symbol"]).head(15)
+    short_df = _sort_short(short_df).drop_duplicates(subset=["Symbol"]).head(15)
     return long_df[DISPLAY_COLS].copy(), short_df[DISPLAY_COLS].copy()
-
 def format_value(col: str, val):
     if pd.isna(val):
         return ""
