@@ -540,13 +540,41 @@ DISPLAY_COLS = [
     "Cumulative +DI",
     "Cumulative -DI",
     "Cumulative ADX",
+    "Survival Score",
     "Bull Rank",
     "Bear Rank",
     "Rank Delta",
     "Overheat",
     "Last Iteration Time",
 ]
+
 EMAIL_DISPLAY_COLS = DISPLAY_COLS
+
+def compute_rank_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    req = ["% Change", "Daily Volatility Expansion", "Daily Volume Expansion", "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "Cumulative KER", "Cumulative +DI", "Cumulative -DI", "Cumulative ADX", "Last Iteration Time"]
+    for c in req:
+        if c not in out.columns:
+            out[c] = np.nan
+    bull_trend = (out["Cumulative +DI"] > out["Cumulative -DI"]).astype(int)
+    bear_trend = (out["Cumulative -DI"] > out["Cumulative +DI"]).astype(int)
+    bull_momo = (out["Cumulative RSI"] > 50).astype(int) + (out["Cumulative KER"] > 0.5).astype(int)
+    bear_momo = (out["Cumulative RSI"] < 50).astype(int) + (out["Cumulative KER"] < 0.4).astype(int)
+    bull_vol = (out["Daily Volume Expansion"] > 1.0).astype(int) + (out["Cumulative OBV"] > 0).astype(int)
+    bear_vol = (out["Daily Volume Expansion"] > 1.0).astype(int) + (out["Cumulative OBV"] < 0).astype(int)
+    bull_vola = (out["Daily Volatility Expansion"] > 1.0).astype(int)
+    bear_vola = (out["Daily Volatility Expansion"] > 1.0).astype(int)
+    bull_px = (out["% Change"] > 0).astype(int)
+    bear_px = (out["% Change"] < 0).astype(int)
+    bull_adx = (out["Cumulative ADX"] > 20).astype(int)
+    bear_adx = (out["Cumulative ADX"] > 20).astype(int)
+    out["Bull Rank"] = (bull_px + bull_vol + bull_momo + bull_trend + bull_adx + bull_vola)
+    out["Bear Rank"] = (bear_px + bear_vol + bear_momo + bear_trend + bear_adx + bear_vola)
+    out["Rank Delta"] = out["Bull Rank"] - out["Bear Rank"]
+    out["Overheat"] = np.where((out["Bull Rank"] >= 5) | (out["Bear Rank"] >= 5), "YES", "")
+    return out
 
 def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df_all is None or df_all.empty:
@@ -555,8 +583,8 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
     for col in DISPLAY_COLS:
         if col not in base.columns:
             base[col] = np.nan
-    long_df = base[(base["Bull Rank"] >= 7) & (base["Rank Delta"] > 1) & (base["% Change"] > 0)].copy()
-    short_df = base[(base["Bear Rank"] >= 7) & (base["Rank Delta"] < -1) & (base["% Change"] < 0)].copy()
+    long_df = base[(base["Bull Rank"] >= 4) & (base["Rank Delta"] > 0) & (base["% Change"] > 0)].copy()
+    short_df = base[(base["Bear Rank"] >= 4) & (base["Rank Delta"] < 0) & (base["% Change"] < 0)].copy()
     long_df = long_df.sort_values(by=["Bull Rank", "Rank Delta", "Daily Volume Expansion", "% Change"], ascending=[False, False, False, False], na_position="last").drop_duplicates(subset=["Symbol"]).head(15)
     short_df = short_df.sort_values(by=["Bear Rank", "Rank Delta", "Daily Volume Expansion", "% Change"], ascending=[False, True, False, True], na_position="last").drop_duplicates(subset=["Symbol"]).head(15)
     return long_df[DISPLAY_COLS].copy(), short_df[DISPLAY_COLS].copy()
