@@ -537,7 +537,7 @@ DISPLAY_COLS = [
 EMAIL_DISPLAY_COLS = [
     "Symbol",
     "LTP",
-    "Change",
+    "% Change",
     "Daily Volatility Expansion",
     "Daily Volume Expansion",
     "5m_Signal",
@@ -627,7 +627,7 @@ def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataF
 
     long_df = long_df.drop_duplicates(subset=["Symbol"]).head(15)
     short_df = short_df.drop_duplicates(subset=["Symbol"]).head(15)
-    return long_df[DISPLAY_COLS].copy(), short_df[DISPLAY_COLS].copy()
+    return long_df.copy(), short_df.copy()
 
 
 
@@ -658,10 +658,10 @@ def rank_to_label(bull: float, bear: float) -> str:
 
 
 def compute_entry_state(row) -> str:
-    is_fresh = bool(row.get("IsFresh", False))
-    change = pd.to_numeric(row.get("Change"), errors="coerce")
+    is_fresh = bool(row.get("Is_Fresh", False))
+    change = pd.to_numeric(row.get("% Change"), errors="coerce")
     vwap_z = pd.to_numeric(row.get("VWAP Z-Score"), errors="coerce")
-    pdi = pd.to_numeric(row.get("Cumulative DI"), errors="coerce")
+    pdi = pd.to_numeric(row.get("Cumulative +DI"), errors="coerce")
     mdi = pd.to_numeric(row.get("Cumulative -DI"), errors="coerce")
     adx = pd.to_numeric(row.get("Cumulative ADX"), errors="coerce")
     overall = str(row.get("Overall_Signal", "")).strip()
@@ -705,7 +705,7 @@ def derive_rank_columns(dfall: pd.DataFrame) -> pd.DataFrame:
 
     def score_bull(row):
         score = 0
-        if pd.notna(row.get("Change")) and row.get("Change") > 0:
+        if pd.notna(row.get("% Change")) and row.get("% Change") > 0:
             score += 2
         if pd.notna(row.get("Daily Volatility Expansion")) and row.get("Daily Volatility Expansion") >= 1.0:
             score += 1
@@ -713,23 +713,23 @@ def derive_rank_columns(dfall: pd.DataFrame) -> pd.DataFrame:
             score += 1
         if pd.notna(row.get("VWAP Z-Score")) and row.get("VWAP Z-Score") >= 0.30:
             score += 2
-        if pd.notna(row.get("Cumulative DI")) and pd.notna(row.get("Cumulative -DI")) and row.get("Cumulative DI") > row.get("Cumulative -DI"):
+        if pd.notna(row.get("Cumulative +DI")) and pd.notna(row.get("Cumulative -DI")) and row.get("Cumulative +DI") > row.get("Cumulative -DI"):
             score += 2
         if pd.notna(row.get("Cumulative ADX")) and row.get("Cumulative ADX") >= 20:
             score += 1
-        if bool(row.get("IsFresh", False)):
+        if bool(row.get("Is_Fresh", False)):
             score += 1
         if pd.notna(row.get("Cumulative KER")) and row.get("Cumulative KER") >= 0.40:
             score += 1
         if pd.notna(row.get("Cumulative RSI")) and row.get("Cumulative RSI") >= 55:
             score += 1
-        if pd.notna(row.get("FreshnessScore")) and row.get("FreshnessScore") >= 60:
+        if pd.notna(row.get("Freshness_Score")) and row.get("Freshness_Score") >= 60:
             score += 1
         return min(score, 13)
 
     def score_bear(row):
         score = 0
-        if pd.notna(row.get("Change")) and row.get("Change") < 0:
+        if pd.notna(row.get("% Change")) and row.get("% Change") < 0:
             score += 2
         if pd.notna(row.get("Daily Volatility Expansion")) and row.get("Daily Volatility Expansion") >= 1.0:
             score += 1
@@ -737,17 +737,17 @@ def derive_rank_columns(dfall: pd.DataFrame) -> pd.DataFrame:
             score += 1
         if pd.notna(row.get("VWAP Z-Score")) and row.get("VWAP Z-Score") <= -0.30:
             score += 2
-        if pd.notna(row.get("Cumulative DI")) and pd.notna(row.get("Cumulative -DI")) and row.get("Cumulative -DI") > row.get("Cumulative DI"):
+        if pd.notna(row.get("Cumulative +DI")) and pd.notna(row.get("Cumulative -DI")) and row.get("Cumulative -DI") > row.get("Cumulative +DI"):
             score += 2
         if pd.notna(row.get("Cumulative ADX")) and row.get("Cumulative ADX") >= 20:
             score += 1
-        if bool(row.get("IsFresh", False)):
+        if bool(row.get("Is_Fresh", False)):
             score += 1
         if pd.notna(row.get("Cumulative KER")) and row.get("Cumulative KER") >= 0.40:
             score += 1
         if pd.notna(row.get("Cumulative RSI")) and row.get("Cumulative RSI") <= 45:
             score += 1
-        if pd.notna(row.get("FreshnessScore")) and row.get("FreshnessScore") >= 60:
+        if pd.notna(row.get("Freshness_Score")) and row.get("Freshness_Score") >= 60:
             score += 1
         return min(score, 13)
 
@@ -806,6 +806,7 @@ def add_signal_columns(dfall: pd.DataFrame) -> pd.DataFrame:
         df["Overall_Signal"] = ""
 
     df["Entry State"] = df.apply(compute_entry_state, axis=1)
+    return df
     return df
 
 
@@ -936,6 +937,8 @@ def main():
     logger.info("Starting F&O Iteration Volume Volatility Scan")
     init_fyers()
     df_all, df_iter = scan_fno_universe()
+    df_all = derive_rank_columns(df_all)
+    df_all = add_signal_columns(df_all)
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     summary_csv = f"fo_fyers_iteration_summary_{timestamp}.csv"
     detail_csv = f"fo_fyers_iteration_details_{timestamp}.csv"
