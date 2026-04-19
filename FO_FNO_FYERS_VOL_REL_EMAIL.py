@@ -7,7 +7,6 @@ from typing import List, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
 from fyers_apiv3 import fyersModel
-
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -205,7 +204,7 @@ def compute_cumulative_flow_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
     period = 14
     avg_gain = gain.rolling(period, min_periods=period).mean()
     avg_loss = loss.rolling(period, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, float("nan"))
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
     zero_loss = (avg_loss == 0) & avg_loss.notna()
     rsi = rsi.mask(zero_loss, 100.0).fillna(0.0)
@@ -213,7 +212,7 @@ def compute_cumulative_flow_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
     obv = (direction * volume).cumsum()
     typical_price = (high + low + close) / 3.0
     cum_pv = (typical_price * volume).cumsum()
-    cum_vol = volume.cumsum().replace(0, float("nan"))
+    cum_vol = volume.cumsum().replace(0, np.nan)
     vwap = (cum_pv / cum_vol).fillna(0.0)
     vwap_variance = (volume * (typical_price - vwap) ** 2).cumsum() / cum_vol
     vwap_std = np.sqrt(vwap_variance).fillna(0.0)
@@ -319,6 +318,7 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
     if "timestamp" in df.columns:
         df["date"] = pd.to_datetime(df["timestamp"]).dt.date
         df["time_only"] = pd.to_datetime(df["timestamp"]).dt.time
+        df["time"] = pd.to_datetime(df["timestamp"])
     else:
         df["date"] = pd.to_datetime(df["time"]).dt.date
         df["time_only"] = pd.to_datetime(df["time"]).dt.time
@@ -370,11 +370,11 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
             "10 Day Relative Volume": rvol10,
             "20 Day Relative Volume": rvol20,
             "Daily Volume Expansion": dvolexp,
-            "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else float("nan"),
-            "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[i]) if not flow_df.empty else float("nan"),
-            "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[i]) if not flow_df.empty else float("nan"),
-            "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[i]) if not flow_df.empty else float("nan"),
-            "Freshness_Score": float(curr_df["Freshness_Score"].iloc[i]) if "Freshness_Score" in curr_df.columns else float("nan"),
+            "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else np.nan,
+            "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[i]) if not flow_df.empty else np.nan,
+            "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[i]) if not flow_df.empty else np.nan,
+            "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[i]) if not flow_df.empty else np.nan,
+            "Freshness_Score": float(curr_df["Freshness_Score"].iloc[i]) if "Freshness_Score" in curr_df.columns else np.nan,
             "Is_Fresh": bool(curr_df["Is_Fresh"].iloc[i]) if "Is_Fresh" in curr_df.columns else False,
         })
         last_cum_vol = cum_vol
@@ -384,7 +384,7 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         last_iter_mins = iter_mins
         last_iter_time = t.strftime("%H:%M")
     detail_df = pd.DataFrame(rows)
-    hod = float(curr_df["high"].max()) if not curr_df.empty else float("nan")
+    hod = float(curr_df["high"].max()) if not curr_df.empty else np.nan
     strike_distance = (hod - ltp) / hod if hod and hod > 0 and ltp is not None else 1.0
     if not curr_df.empty:
         last_5m_volume = float(curr_df["volume"].iloc[-1])
@@ -396,32 +396,22 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
     obv_30m_delta = 0.0
     rsi_30m_delta = 0.0
     if not flow_df.empty and len(flow_df) >= 7:
-        obv_now = float(flow_df["Cumulative OBV"].iloc[-1])
-        obv_30m_ago = float(flow_df["Cumulative OBV"].iloc[-7])
-        obv_30m_delta = obv_now - obv_30m_ago
-        rsi_now = float(flow_df["Cumulative RSI"].iloc[-1])
-        rsi_30m_ago = float(flow_df["Cumulative RSI"].iloc[-7])
-        rsi_30m_delta = rsi_now - rsi_30m_ago
-    elif not flow_df.empty:
-        rsi_now = float(flow_df["Cumulative RSI"].iloc[-1])
-    else:
-        rsi_now = float("nan")
-    adx_now = float(metric_df["Cumulative ADX"].iloc[-1]) if not metric_df.empty else float("nan")
-    ker_now = float(metric_df["Cumulative KER"].iloc[-1]) if not metric_df.empty else float("nan")
+        obv_30m_delta = float(flow_df["Cumulative OBV"].iloc[-1]) - float(flow_df["Cumulative OBV"].iloc[-7])
+        rsi_30m_delta = float(flow_df["Cumulative RSI"].iloc[-1]) - float(flow_df["Cumulative RSI"].iloc[-7])
+    adx_now = float(metric_df["Cumulative ADX"].iloc[-1]) if not metric_df.empty else np.nan
+    ker_now = float(metric_df["Cumulative KER"].iloc[-1]) if not metric_df.empty else np.nan
     fresh_score = float(curr_df["Freshness_Score"].iloc[-1]) if "Freshness_Score" in curr_df.columns else 0.0
-    adx_live = bool(adx_now > 20.0)
-    ker_live = bool(ker_now > 0.40)
-    is_fresh = bool(fresh_score >= 60.0) and adx_live and ker_live
+    is_fresh = bool(fresh_score >= 60.0) and bool(adx_now > 20.0) and bool(ker_now > 0.40)
     summary = {
         "LTP": ltp,
         "Current Volume": last_cum_vol,
         "10 Day Relative Volume": last_rvol10,
         "20 Day Relative Volume": last_rvol20,
         "Daily Volume Expansion": last_dvolexp,
-        "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[-1]) if not flow_df.empty else float("nan"),
-        "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[-1]) if not flow_df.empty else float("nan"),
-        "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[-1]) if not flow_df.empty else float("nan"),
-        "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[-1]) if not flow_df.empty else float("nan"),
+        "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[-1]) if not flow_df.empty else np.nan,
+        "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[-1]) if not flow_df.empty else np.nan,
+        "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[-1]) if not flow_df.empty else np.nan,
+        "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[-1]) if not flow_df.empty else np.nan,
         "Total Iterations": total_iters,
         "Last Iteration Minutes": last_iter_mins,
         "Last Iteration Time": last_iter_time,
@@ -437,12 +427,79 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         "Volume_1h_Avg_5m": vol_1h_avg_5m,
         "OBV_30m_Delta": obv_30m_delta,
         "RSI_30m_Delta": rsi_30m_delta,
-        "Freshness_Score": float(fresh_score),
+        "Freshness_Score": fresh_score,
         "Fresh_State": str(df["Fresh_State"].iloc[-1]) if "Fresh_State" in df.columns else "",
         "Fresh_Since": str(df["Fresh_Since"].iloc[-1]) if "Fresh_Since" in df.columns else "",
         "Is_Fresh": bool(is_fresh),
     }
     return summary, detail_df
+
+
+def resample_intraday_ohlcv(intra_df: pd.DataFrame, rule: str) -> pd.DataFrame:
+    if intra_df is None or intra_df.empty:
+        return pd.DataFrame()
+    df = intra_df.copy()
+    ts_col = "timestamp" if "timestamp" in df.columns else "time"
+    if ts_col not in df.columns:
+        return pd.DataFrame()
+    df["bar_time"] = pd.to_datetime(df[ts_col])
+    df = df.sort_values("bar_time")
+    out = (
+        df.set_index("bar_time")[["open", "high", "low", "close", "volume"]]
+        .resample(rule, label="right", closed="right")
+        .agg({"open": "first", "high": "max", "low": "min", "close": "last", "volume": "sum"})
+        .dropna()
+        .reset_index()
+    )
+    out.rename(columns={"bar_time": "timestamp"}, inplace=True)
+    return out
+
+
+def compute_tf_metrics(intra_df: Optional[pd.DataFrame], daily_vol_exp: float, pct_change: float, above_ratio: float) -> Dict[str, float]:
+    if intra_df is None or intra_df.empty:
+        return {}
+    summary, _ = compute_iteration_volume_profile(intra_df)
+    if not summary:
+        return {}
+    summary["Daily Volatility Expansion"] = daily_vol_exp if daily_vol_exp is not None else 0.0
+    summary["% Change"] = pct_change if pct_change is not None else 0.0
+    summary["Above Threshold Ratio"] = above_ratio if above_ratio is not None else 0.0
+    return summary
+
+
+def compute_rank_block(summary: Dict[str, float], prefix: str) -> Dict[str, int]:
+    if not summary:
+        return {f"{prefix}_Bull_Rank": 0, f"{prefix}_Bear_Rank": 0, f"{prefix}_Rank_Delta": 0}
+    pct = float(summary.get("% Change") or 0.0)
+    dvol = float(summary.get("Daily Volatility Expansion") or 0.0)
+    dve = float(summary.get("Daily Volume Expansion") or 0.0)
+    r10 = float(summary.get("10 Day Relative Volume") or 0.0)
+    r20 = float(summary.get("20 Day Relative Volume") or 0.0)
+    rsi = float(summary.get("Cumulative RSI") or 0.0)
+    obv = float(summary.get("Cumulative OBV") or 0.0)
+    vwapz = float(summary.get("VWAP Z-Score") or 0.0)
+    ker = float(summary.get("Cumulative KER") or 0.0)
+    pdi = float(summary.get("Cumulative +DI") or 0.0)
+    mdi = float(summary.get("Cumulative -DI") or 0.0)
+    adx = float(summary.get("Cumulative ADX") or 0.0)
+    obv_delta = float(summary.get("OBV_30m_Delta") or 0.0)
+    rsi_delta = float(summary.get("RSI_30m_Delta") or 0.0)
+    above_ratio = float(summary.get("Above Threshold Ratio") or 0.0)
+    bull = sum([
+        pct > 0, dvol > 1.0, dve > 1.0, r10 > 1.0, r20 > 1.0,
+        rsi > 52, obv > 0, vwapz > 0.25, ker > 0.35,
+        pdi > mdi, adx > 20, obv_delta > 0, rsi_delta > 0, above_ratio > 0.55,
+    ])
+    bear = sum([
+        pct < 0, dvol > 1.0, dve > 1.0, r10 > 1.0, r20 > 1.0,
+        rsi < 48, obv < 0, vwapz < -0.25, ker > 0.35,
+        mdi > pdi, adx > 20, obv_delta < 0, rsi_delta < 0, above_ratio > 0.55,
+    ])
+    return {
+        f"{prefix}_Bull_Rank": int(bull),
+        f"{prefix}_Bear_Rank": int(bear),
+        f"{prefix}_Rank_Delta": int(bull - bear),
+    }
 
 
 def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -484,7 +541,17 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             above_count = 0
         total_iterations = int(iter_summary.get("Total Iterations") or 0)
         above_ratio = above_count / total_iterations if total_iterations > 0 else 0.0
-        rows.append({
+
+        tf5 = compute_tf_metrics(intra_df, daily_vol_exp, pct_change, above_ratio)
+        tf15 = compute_tf_metrics(resample_intraday_ohlcv(intra_df, "15min"), daily_vol_exp, pct_change, above_ratio)
+        tf30 = compute_tf_metrics(resample_intraday_ohlcv(intra_df, "30min"), daily_vol_exp, pct_change, above_ratio)
+        tf60 = compute_tf_metrics(resample_intraday_ohlcv(intra_df, "60min"), daily_vol_exp, pct_change, above_ratio)
+        rank_5 = compute_rank_block(tf5, "5m")
+        rank_15 = compute_rank_block(tf15, "15m")
+        rank_30 = compute_rank_block(tf30, "30m")
+        rank_60 = compute_rank_block(tf60, "60m")
+
+        row = {
             "Symbol": sym,
             "LTP": ltp,
             "% Change": pct_change,
@@ -521,20 +588,29 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "Fresh_State": iter_summary.get("Fresh_State"),
             "Fresh_Since": iter_summary.get("Fresh_Since"),
             "Is_Fresh": iter_summary.get("Is_Fresh"),
-        })
+        }
+        row.update(rank_5)
+        row.update(rank_15)
+        row.update(rank_30)
+        row.update(rank_60)
+        row["Bull Rank"] = max(row.get("5m_Bull_Rank", 0), row.get("15m_Bull_Rank", 0), row.get("30m_Bull_Rank", 0), row.get("60m_Bull_Rank", 0))
+        row["Bear Rank"] = max(row.get("5m_Bear_Rank", 0), row.get("15m_Bear_Rank", 0), row.get("30m_Bear_Rank", 0), row.get("60m_Bear_Rank", 0))
+        row["Rank Delta"] = row["Bull Rank"] - row["Bear Rank"]
+        row["Alignment Count"] = max(
+            sum(row.get(k, 0) > 0 for k in ["5m_Rank_Delta", "15m_Rank_Delta", "30m_Rank_Delta", "60m_Rank_Delta"]),
+            sum(row.get(k, 0) < 0 for k in ["5m_Rank_Delta", "15m_Rank_Delta", "30m_Rank_Delta", "60m_Rank_Delta"]),
+        )
+        row["Momentum Build"] = int((row.get("OBV_30m_Delta", 0) or 0) > 0 and (row.get("RSI_30m_Delta", 0) or 0) > 0) - int((row.get("OBV_30m_Delta", 0) or 0) < 0 and (row.get("RSI_30m_Delta", 0) or 0) < 0)
+        row["Overheat Flag"] = "LONG_EXT" if (row["Bull Rank"] >= 11 and (row.get("VWAP Z-Score", 0) or 0) > 1.5) else ("SHORT_EXT" if (row["Bear Rank"] >= 11 and (row.get("VWAP Z-Score", 0) or 0) < -1.5) else "")
+        row["Entry State"] = "READY" if row["Alignment Count"] >= 2 else "WATCH"
+        rows.append(row)
+
     summary_df = pd.DataFrame(rows)
     iteration_df = pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame()
     return summary_df, iteration_df
 
 
 DISPLAY_COLS = [
-    "Symbol", "LTP", "% Change", "Daily Volatility Expansion", "10 Day Relative Volume", "20 Day Relative Volume",
-    "Daily Volume Expansion", "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score",
-    "Freshness_Score", "Fresh_State", "Fresh_Since", "Cumulative KER", "Cumulative +DI", "Cumulative -DI",
-    "Cumulative ADX", "Survival Score", "Ease of Movement", "Above Threshold Iterations", "Last Iteration Minutes", "Last Iteration Time",
-]
-
-EMAIL_DISPLAY_COLS = [
     "Symbol", "LTP", "% Change", "Daily Volatility Expansion", "Daily Volume Expansion",
     "5m_Bull_Rank", "5m_Bear_Rank", "5m_Rank_Delta",
     "15m_Bull_Rank", "15m_Bear_Rank", "15m_Rank_Delta",
@@ -544,111 +620,73 @@ EMAIL_DISPLAY_COLS = [
     "Momentum Build", "Overheat Flag", "Entry State", "Last Iteration Time",
 ]
 
+EMAIL_DISPLAY_COLS = DISPLAY_COLS.copy()
+
+
 def build_candidate_tables(df_all: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df_all is None or df_all.empty:
         return pd.DataFrame(columns=DISPLAY_COLS), pd.DataFrame(columns=DISPLAY_COLS)
-
     base = df_all.copy()
-    for col in DISPLAY_COLS + ["Survival_Num", "Is_Fresh", "Fresh_State", "Fresh_Since"]:
+    needed_numeric_cols = [
+        "% Change", "Daily Volatility Expansion", "Daily Volume Expansion",
+        "5m_Bull_Rank", "5m_Bear_Rank", "5m_Rank_Delta",
+        "15m_Bull_Rank", "15m_Bear_Rank", "15m_Rank_Delta",
+        "30m_Bull_Rank", "30m_Bear_Rank", "30m_Rank_Delta",
+        "60m_Bull_Rank", "60m_Bear_Rank", "60m_Rank_Delta",
+        "Bull Rank", "Bear Rank", "Rank Delta", "Alignment Count", "Momentum Build",
+    ]
+    for col in DISPLAY_COLS:
         if col not in base.columns:
             base[col] = np.nan
+    for col in needed_numeric_cols:
+        if col in base.columns:
+            base[col] = pd.to_numeric(base[col], errors="coerce")
+    if "Overheat Flag" not in base.columns:
+        base["Overheat Flag"] = ""
+    if "Entry State" not in base.columns:
+        base["Entry State"] = ""
+    if "Last Iteration Time" not in base.columns:
+        base["Last Iteration Time"] = ""
 
-    if "Daily Volatility Expansion" in base.columns and "Daily Volume Expansion" in base.columns:
-        filtered = base[
-            (base["Daily Volatility Expansion"] > DAILY_VOL_THRESHOLD) &
-            (base["Daily Volume Expansion"] > DAILY_VOLUME_THRESHOLD)
-        ].copy()
-        if not filtered.empty:
-            base = filtered
+    filtered = base[(base["Daily Volatility Expansion"] > DAILY_VOL_THRESHOLD) & (base["Daily Volume Expansion"] > DAILY_VOLUME_THRESHOLD)].copy()
+    if filtered.empty:
+        filtered = base.copy()
 
-    def _sort_long(df: pd.DataFrame) -> pd.DataFrame:
-        if df.empty:
-            return df
-        return df.sort_values(
-            by=["Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
-            ascending=[False, False, False, False], na_position="last"
-        )
+    long_df = filtered[(filtered["% Change"] > 0) & (filtered["Bull Rank"] >= 1)].copy()
+    short_df = filtered[(filtered["% Change"] < 0) & (filtered["Bear Rank"] >= 1)].copy()
 
-    def _sort_short(df: pd.DataFrame) -> pd.DataFrame:
-        if df.empty:
-            return df
-        return df.sort_values(
-            by=["Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
-            ascending=[False, False, False, True], na_position="last"
-        )
-
-    strict_long = base[
-        (base["Is_Fresh"] == True) &
-        (base["% Change"] > 0) &
-        (base["Cumulative +DI"] > base["Cumulative -DI"]) &
-        (base["VWAP Z-Score"] > 0.3) &
-        (base["VWAP Z-Score"] <= 1.8)
-    ].copy()
-
-    strict_short = base[
-        (base["Is_Fresh"] == True) &
-        (base["% Change"] < 0) &
-        (base["Cumulative -DI"] > base["Cumulative +DI"]) &
-        (base["VWAP Z-Score"] < -0.3) &
-        (base["VWAP Z-Score"] >= -1.8)
-    ].copy()
-
-    fallback_long = base[
-        (base["Is_Fresh"] == True) &
-        (base["% Change"] > 0) &
-        (base["VWAP Z-Score"] > 0.3) &
-        (base["VWAP Z-Score"] <= 1.8)
-    ].copy()
-
-    fallback_short = base[
-        (base["Is_Fresh"] == True) &
-        (base["% Change"] < 0) &
-        (base["VWAP Z-Score"] < -0.3) &
-        (base["VWAP Z-Score"] >= -1.8)
-    ].copy()
-
-    long_df = _sort_long(strict_long)
-    short_df = _sort_short(strict_short)
-
-    if len(long_df) < 15:
-        extra_long = _sort_long(fallback_long[~fallback_long["Symbol"].isin(long_df["Symbol"])])
-        long_df = pd.concat([long_df, extra_long], ignore_index=True)
-
-    if len(short_df) < 15:
-        extra_short = _sort_short(fallback_short[~fallback_short["Symbol"].isin(short_df["Symbol"])])
-        short_df = pd.concat([short_df, extra_short], ignore_index=True)
+    long_df = long_df.sort_values(by=["Alignment Count", "Bull Rank", "5m_Rank_Delta", "15m_Rank_Delta", "30m_Rank_Delta", "60m_Rank_Delta", "% Change"], ascending=[False, False, False, False, False, False, False], na_position="last")
+    short_df = short_df.sort_values(by=["Alignment Count", "Bear Rank", "5m_Rank_Delta", "15m_Rank_Delta", "30m_Rank_Delta", "60m_Rank_Delta", "% Change"], ascending=[False, False, True, True, True, True, True], na_position="last")
 
     long_df = long_df.drop_duplicates(subset=["Symbol"]).head(15)
     short_df = short_df.drop_duplicates(subset=["Symbol"]).head(15)
     return long_df[DISPLAY_COLS].copy(), short_df[DISPLAY_COLS].copy()
+
 
 def format_value(col: str, val):
     if pd.isna(val):
         return ""
     if col == "% Change":
         return f"{float(val):.2f}%"
-    if col in ["Current Volume", "Cumulative OBV"]:
-        return f"{int(float(val)):,}"
-    if col in ["Total Iterations", "Above Threshold Iterations", "Last Iteration Minutes", "Freshness_Score"]:
+    if col in ["LTP", "Daily Volatility Expansion", "Daily Volume Expansion"]:
+        return f"{float(val):.2f}"
+    if col in ["5m_Bull_Rank", "5m_Bear_Rank", "5m_Rank_Delta", "15m_Bull_Rank", "15m_Bear_Rank", "15m_Rank_Delta", "30m_Bull_Rank", "30m_Bear_Rank", "30m_Rank_Delta", "60m_Bull_Rank", "60m_Bear_Rank", "60m_Rank_Delta", "Bull Rank", "Bear Rank", "Rank Delta", "Alignment Count", "Momentum Build"]:
         return f"{int(float(val))}"
-    return f"{float(val):.2f}" if isinstance(val, (int, float, np.integer, np.floating)) else str(val)
+    return str(val)
+
 
 def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     if df is None or df.empty:
         return "<p>No candidates found.</p>"
-
     df_slice = df.head(max_rows).copy()
     cols = [c for c in EMAIL_DISPLAY_COLS if c in df_slice.columns]
     if not cols:
         return "<p>No candidates found.</p>"
+    df_slice = df_slice[cols].copy()
+    for c in df_slice.columns:
+        df_slice[c] = df_slice[c].apply(lambda x: format_value(c, x))
+    return df_slice.to_html(index=False, escape=False, border=0)
 
-    header_html = "".join(f"<th style='border:1px solid #ddd;padding:6px;background:#f5f5f5'>{c}</th>" for c in cols)
-    rows_html = []
-    for _, row in df_slice.iterrows():
-        tds = "".join(f"<td style='border:1px solid #ddd;padding:6px'>{format_value(c, row[c])}</td>" for c in cols)
-        rows_html.append(f"<tr>{tds}</tr>")
-    body_html = "".join(rows_html)
-    return f"<table style='border-collapse:collapse;font-family:Arial,sans-serif;font-size:12px'><thead><tr>{header_html}</tr></thead><tbody>{body_html}</tbody></table>"
 
 def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str, detail_csv_filename: str) -> bool:
     sender_email = os.environ.get("SENDER_EMAIL")
@@ -656,20 +694,6 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
     recipient_email = os.environ.get("RECIPIENT_EMAIL")
     smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
     smtp_port = int(os.environ.get("SMTP_PORT", "465"))
-
-    long_html = df_to_html_table(long_df)
-    short_html = df_to_html_table(short_df)
-    html_body = f"""
-    <html><body>
-    <h3>Long Candidates</h3>
-    {long_html}
-    <br>
-    <h3>Short Candidates</h3>
-    {short_html}
-    <br>
-    <p>Scan completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}.</p>
-    </body></html>
-    """
 
     if not sender_email:
         logger.error("EMAIL Missing SENDER_EMAIL at runtime.")
@@ -680,6 +704,20 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
     if not recipient_email:
         logger.error("EMAIL Missing RECIPIENT_EMAIL at runtime.")
         return False
+
+    long_html = df_to_html_table(long_df)
+    short_html = df_to_html_table(short_df)
+    html_body = f"""
+    <html>
+      <body>
+        <h2>Long Candidates</h2>
+        {long_html}
+        <h2>Short Candidates</h2>
+        {short_html}
+        <p>Scan completed at {datetime.now().strftime('%Y-%m-%d %H:%M:%S IST')}.</p>
+      </body>
+    </html>
+    """
 
     msg = MIMEMultipart()
     msg["From"] = sender_email
@@ -717,6 +755,7 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
         logger.error(f"EMAIL Failed to send email: {type(e).__name__}: {e}")
         return False
 
+
 def main():
     logger.info("Starting F&O Iteration Volume Volatility Scan")
     init_fyers()
@@ -748,6 +787,7 @@ def main():
 
     send_email_with_tables(long_df, short_df, summary_csv, detail_csv)
     logger.info("Scan Pipeline Completed")
+
 
 if __name__ == "__main__":
     main()
