@@ -285,48 +285,45 @@ def calculate_hybrid_freshness(df_intraday: pd.DataFrame) -> pd.DataFrame:
     return work
 
 
-def classify_price_lead_status(curr_df: pd.DataFrame) -> pd.DataFrame:
-    if curr_df is None or curr_df.empty:
-        return pd.DataFrame()
-    work = curr_df.copy().sort_values("time").reset_index(drop=True)
+def compute_price_lead_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
+    df = curr_df.copy().sort_values("time").reset_index(drop=True)
+    if df.empty:
+        return pd.DataFrame(columns=["time", "range_expansion", "volume_expansion", "delta_expansion", "price_leading_flag", "price_lead_streak", "Price_Lead_Status"])
     for col in ["open", "high", "low", "close", "volume"]:
-        work[col] = pd.to_numeric(work[col], errors="coerce")
-    work["range"] = (work["high"] - work["low"]).clip(lower=0.0)
-    work["avg_range_5"] = work["range"].rolling(5, min_periods=3).mean()
-    work["range_expansion"] = np.where(work["avg_range_5"] > 0, work["range"] / work["avg_range_5"], 0.0)
-    work["avg_vol_5"] = work["volume"].rolling(5, min_periods=3).mean()
-    work["volume_expansion"] = np.where(work["avg_vol_5"] > 0, work["volume"] / work["avg_vol_5"], 0.0)
-    work["mid"] = (work["high"] + work["low"]) / 2.0
-    work["delta"] = np.where(work["close"] > work["mid"], work["volume"], np.where(work["close"] < work["mid"], -work["volume"], 0.0))
-    work["cvd"] = pd.Series(work["delta"], index=work.index).cumsum()
-    work["cvd_change"] = work["cvd"].diff().abs().fillna(0.0)
-    work["avg_cvd_change_5"] = work["cvd_change"].rolling(5, min_periods=3).mean()
-    work["delta_expansion"] = np.where(work["avg_cvd_change_5"] > 0, work["cvd_change"] / work["avg_cvd_change_5"], 0.0)
-    work["price_direction"] = np.where(work["close"] > work["open"], 1, np.where(work["close"] < work["open"], -1, 0))
-    work["price_leading_flag"] = (
-        (work["range_expansion"] >= 1.5)
-        & (work["volume_expansion"] <= 1.0)
-        & (work["delta_expansion"] <= 1.0)
-        & (work["price_direction"] != 0)
-    )
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df["range"] = (df["high"] - df["low"]).clip(lower=0.0)
+    df["avg_range_5"] = df["range"].rolling(5, min_periods=3).mean()
+    df["range_expansion"] = np.where(df["avg_range_5"] > 0, df["range"] / df["avg_range_5"], np.nan)
+    df["avg_vol_5"] = df["volume"].rolling(5, min_periods=3).mean()
+    df["volume_expansion"] = np.where(df["avg_vol_5"] > 0, df["volume"] / df["avg_vol_5"], np.nan)
+    df["mid"] = (df["high"] + df["low"]) / 2.0
+    df["delta"] = np.where(df["close"] > df["mid"], df["volume"], np.where(df["close"] < df["mid"], -df["volume"], 0.0))
+    df["cvd"] = pd.Series(df["delta"], index=df.index).cumsum()
+    df["cvd_change"] = df["cvd"].diff().abs().fillna(0.0)
+    df["avg_cvd_change_5"] = df["cvd_change"].rolling(5, min_periods=3).mean()
+    df["delta_expansion"] = np.where(df["avg_cvd_change_5"] > 0, df["cvd_change"] / df["avg_cvd_change_5"], np.nan)
+    directional_bar = (df["close"] > df["open"]) | (df["close"] < df["open"])
+    df["price_leading_flag"] = ((df["range_expansion"] >= 1.5) & (df["volume_expansion"] <= 1.0) & (df["delta_expansion"] <= 1.0) & directional_bar).fillna(False)
     streak = []
-    curr_streak = 0
-    for flag in work["price_leading_flag"].fillna(False).astype(bool):
-        curr_streak = curr_streak + 1 if flag else 0
-        streak.append(curr_streak)
-    work["price_lead_streak"] = streak
-    status = []
-    for _, row in work.iterrows():
-        if bool(row["price_leading_flag"]) and int(row["price_lead_streak"]) >= 3:
-            status.append("STRONG_PRICE_LEAD_FADE")
-        elif bool(row["price_leading_flag"]) and int(row["price_lead_streak"]) >= 2:
-            status.append("PRICE_LEADING_FADE_RISK")
-        elif bool(row["price_leading_flag"]):
-            status.append("EARLY_PRICE_LEAD")
-        else:
-            status.append("NORMAL")
-    work["Price_Lead_Status"] = status
-    return work[["time", "range_expansion", "volume_expansion", "delta_expansion", "price_leading_flag", "price_lead_streak", "Price_Lead_Status"]]
+    run = 0
+    for flag in df["price_leading_flag"].astype(bool):
+        run = run + 1 if flag else 0
+        streak.append(run)
+    df["price_lead_streak"] = streak
+    df["Price_Lead_Status"] = np.select(
+        [
+            df["price_leading_flag"] & (df["price_lead_streak"] >= 3),
+            df["price_leading_flag"] & (df["price_lead_streak"] >= 2),
+            df["price_leading_flag"]
+        ],
+        [
+            "STRONG_PRICE_LEAD_FADE",
+            "PRICE_LEADING_FADE_RISK",
+            "EARLY_PRICE_LEAD"
+        ],
+        default="NORMAL"
+    )
+    return df[["time", "range_expansion", "volume_expansion", "delta_expansion", "price_leading_flag", "price_lead_streak", "Price_Lead_Status"]]
 
 
 def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[Dict, pd.DataFrame]:
@@ -354,7 +351,7 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
     curr_df["cum_vol"] = curr_df["volume"].cumsum()
     metric_df = compute_cumulative_directional_metrics(curr_df[["time", "open", "high", "low", "close", "volume"]].copy())
     flow_df = compute_cumulative_flow_metrics(curr_df[["time", "high", "low", "close", "volume"]].copy())
-    price_lead_df = classify_price_lead_status(curr_df[["time", "open", "high", "low", "close", "volume"]].copy())
+    price_lead_df = compute_price_lead_metrics(curr_df[["time", "open", "high", "low", "close", "volume"]].copy())
     rows = []
     total_iters = 0
     last_iter_mins = None
@@ -374,7 +371,7 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         dt_time = datetime.combine(current_date, t)
         market_open = datetime.combine(current_date, time(9, 15))
         iter_mins = int((dt_time - market_open).total_seconds() / 60)
-        rows.append({"Iteration No": total_iters, "Iteration Minutes": iter_mins, "Iteration Time": t.strftime("%H:%M"), "Current Volume": cum_vol, "10 Day Relative Volume": rvol10, "20 Day Relative Volume": rvol20, "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else float("nan"), "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[i]) if not flow_df.empty else float("nan"), "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[i]) if not flow_df.empty else float("nan"), "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[i]) if not flow_df.empty else float("nan"), "Range_Expansion": float(price_lead_df["range_expansion"].iloc[i]) if not price_lead_df.empty else float("nan"), "Volume_Expansion": float(price_lead_df["volume_expansion"].iloc[i]) if not price_lead_df.empty else float("nan"), "Delta_Expansion": float(price_lead_df["delta_expansion"].iloc[i]) if not price_lead_df.empty else float("nan"), "Price_Leading_Flag": bool(price_lead_df["price_leading_flag"].iloc[i]) if not price_lead_df.empty else False, "Price_Lead_Streak": int(price_lead_df["price_lead_streak"].iloc[i]) if not price_lead_df.empty else 0, "Price_Lead_Status": str(price_lead_df["Price_Lead_Status"].iloc[i]) if not price_lead_df.empty else "NORMAL", "Freshness_Score": float(curr_df["Freshness_Score"].iloc[i]) if "Freshness_Score" in curr_df.columns else float("nan"), "Is_Fresh": bool(curr_df["Is_Fresh"].iloc[i]) if "Is_Fresh" in curr_df.columns else False})
+        rows.append({"Iteration No": total_iters, "Iteration Minutes": iter_mins, "Iteration Time": t.strftime("%H:%M"), "Current Volume": cum_vol, "10 Day Relative Volume": rvol10, "20 Day Relative Volume": rvol20, "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else float("nan"), "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[i]) if not flow_df.empty else float("nan"), "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[i]) if not flow_df.empty else float("nan"), "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[i]) if not flow_df.empty else float("nan"), "Range_Expansion": float(price_lead_df["range_expansion"].iloc[i]) if not price_lead_df.empty and pd.notna(price_lead_df["range_expansion"].iloc[i]) else float("nan"), "Volume_Expansion": float(price_lead_df["volume_expansion"].iloc[i]) if not price_lead_df.empty and pd.notna(price_lead_df["volume_expansion"].iloc[i]) else float("nan"), "Delta_Expansion": float(price_lead_df["delta_expansion"].iloc[i]) if not price_lead_df.empty and pd.notna(price_lead_df["delta_expansion"].iloc[i]) else float("nan"), "Price_Leading_Flag": bool(price_lead_df["price_leading_flag"].iloc[i]) if not price_lead_df.empty else False, "Price_Lead_Streak": int(price_lead_df["price_lead_streak"].iloc[i]) if not price_lead_df.empty else 0, "Price_Lead_Status": str(price_lead_df["Price_Lead_Status"].iloc[i]) if not price_lead_df.empty else "NORMAL", "Freshness_Score": float(curr_df["Freshness_Score"].iloc[i]) if "Freshness_Score" in curr_df.columns else float("nan"), "Is_Fresh": bool(curr_df["Is_Fresh"].iloc[i]) if "Is_Fresh" in curr_df.columns else False})
         last_cum_vol, last_rvol10, last_rvol20 = cum_vol, rvol10, rvol20
         last_iter_mins = iter_mins
         last_iter_time = t.strftime("%H:%M")
@@ -419,7 +416,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             iter_detail.insert(0, "Symbol", sym)
             iter_detail.insert(1, "% Change", pct_change)
             iteration_rows.append(iter_detail)
-        rows.append({"Symbol": sym, "LTP": ltp, "% Change": pct_change, "Current Volume": iter_summary.get("Current Volume"), "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"), "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"), "Cumulative RSI": iter_summary.get("Cumulative RSI"), "Cumulative OBV": iter_summary.get("Cumulative OBV"), "Cumulative VWAP": iter_summary.get("Cumulative VWAP"), "VWAP Z-Score": iter_summary.get("VWAP Z-Score"), "Total Iterations": iter_summary.get("Total Iterations"), "Last Iteration Minutes": iter_summary.get("Last Iteration Minutes"), "Last Iteration Time": iter_summary.get("Last Iteration Time"), "Cumulative KER": iter_summary.get("Cumulative KER"), "Cumulative +DI": iter_summary.get("Cumulative +DI"), "Cumulative -DI": iter_summary.get("Cumulative -DI"), "Cumulative ADX": iter_summary.get("Cumulative ADX"), "Survival Score": iter_summary.get("Survival Score"), "Survival_Num": iter_summary.get("Survival_Num"), "HOD": iter_summary.get("HOD"), "Strike_Distance": iter_summary.get("Strike_Distance"), "Last_5m_Volume": iter_summary.get("Last_5m_Volume"), "Volume_1h_Avg_5m": iter_summary.get("Volume_1h_Avg_5m"), "OBV_30m_Delta": iter_summary.get("OBV_30m_Delta"), "RSI_30m_Delta": iter_summary.get("RSI_30m_Delta"), "Freshness_Score": iter_summary.get("Freshness_Score"), "Fresh_State": iter_summary.get("Fresh_State"), "Fresh_Since": iter_summary.get("Fresh_Since"), "Is_Fresh": iter_summary.get("Is_Fresh"), "IVP": iv_info.get("IVP"), "Volatility State": iv_info.get("Volatility State")})
+        rows.append({"Symbol": sym, "LTP": ltp, "% Change": pct_change, "Current Volume": iter_summary.get("Current Volume"), "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"), "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"), "Cumulative RSI": iter_summary.get("Cumulative RSI"), "Cumulative OBV": iter_summary.get("Cumulative OBV"), "Cumulative VWAP": iter_summary.get("Cumulative VWAP"), "VWAP Z-Score": iter_summary.get("VWAP Z-Score"), "Total Iterations": iter_summary.get("Total Iterations"), "Last Iteration Minutes": iter_summary.get("Last Iteration Minutes"), "Last Iteration Time": iter_summary.get("Last Iteration Time"), "Cumulative KER": iter_summary.get("Cumulative KER"), "Cumulative +DI": iter_summary.get("Cumulative +DI"), "Cumulative -DI": iter_summary.get("Cumulative -DI"), "Cumulative ADX": iter_summary.get("Cumulative ADX"), "Survival Score": iter_summary.get("Survival Score"), "Survival_Num": iter_summary.get("Survival_Num"), "HOD": iter_summary.get("HOD"), "Strike_Distance": iter_summary.get("Strike_Distance"), "Last_5m_Volume": iter_summary.get("Last_5m_Volume"), "Volume_1h_Avg_5m": iter_summary.get("Volume_1h_Avg_5m"), "OBV_30m_Delta": iter_summary.get("OBV_30m_Delta"), "RSI_30m_Delta": iter_summary.get("RSI_30m_Delta"), "Price_Lead_Status": iter_summary.get("Price_Lead_Status", "NORMAL"), "Freshness_Score": iter_summary.get("Freshness_Score"), "Fresh_State": iter_summary.get("Fresh_State"), "Fresh_Since": iter_summary.get("Fresh_Since"), "Is_Fresh": iter_summary.get("Is_Fresh"), "IVP": iv_info.get("IVP"), "Volatility State": iv_info.get("Volatility State")})
     return pd.DataFrame(rows), (pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame())
 
 
