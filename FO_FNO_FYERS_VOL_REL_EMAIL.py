@@ -1568,3 +1568,17 @@ def fetch_sectoral_indices_only(csv_path: str = "MW-All-Indices-25-Apr-2026.csv"
 # Patch note: sectoral index only universe added.
 
 # Patch note: sectoral index universe is now derived from CSV, not hardcoded.
+
+
+def get_top_sectoral_indices(csv_path: str = "MW-All-Indices-25-Apr-2026.csv") -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    idx_df = fetch_sectoral_indices_only(csv_path=csv_path)
+    if idx_df is None or idx_df.empty:
+        logger.warning("INDEX No sectoral indices fetched.")
+        return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+    long_df, short_df = build_candidate_tables(idx_df)
+    long_df, short_df = ensure_min_index_candidates(idx_df, long_df, short_df)
+    logger.info(f"Top long indices: {long_df['Symbol'].tolist() if not long_df.empty else []}")
+    logger.info(f"Top short indices: {short_df['Symbol'].tolist() if not short_df.empty else []}")
+    return idx_df, long_df, short_df
+
+# FINAL PATCH: main path should call get_top_sectoral_indices() instead of legacy two-index path.
