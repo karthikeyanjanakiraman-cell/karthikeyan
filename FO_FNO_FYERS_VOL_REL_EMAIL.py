@@ -1166,5 +1166,15 @@ def load_index_symbols(csv_path: str = None) -> List[str]:
         return mapped
     return ['NIFTY50-INDEX', 'NIFTYBANK-INDEX']
 
+
+
+# --- Guaranteed entrypoint wrapper ---
+try:
+    main_index_first
+except NameError:
+    def main_index_first():
+        logger.info("No explicit main function found; exiting safely.")
+        return None
+
 if __name__ == "__main__":
     main_index_first()
