@@ -1,4 +1,5 @@
 import os
+import re
 import sys
 import logging
 from datetime import datetime, timedelta, time
@@ -1231,96 +1232,56 @@ def scan_symbol_universe(symbols: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame
 
 
 
+
+
+
+
 def load_index_symbols() -> List[str]:
-    csv_path = os.environ.get('INDEX_UNIVERSE_CSV', 'MW-All-Indices-25-Apr-2026.csv')
-    picked = os.environ.get('PICKED_INDEX_SYMBOLS', '').strip()
-    if picked:
-        vals = [s.strip() for s in picked.split(',') if s.strip()]
-        if vals:
-            logger.info(f"INDEX Using picked indices from env: {vals}")
-            return vals
-    if os.path.exists(csv_path):
-        try:
-            df = pd.read_csv(csv_path)
-            col = None
-            for c in df.columns:
-                lc = str(c).strip().lower()
-                if lc in ['index symbol', 'index_symbol', 'symbol', 'index']:
-                    col = c
-                    break
-            if col is not None:
-                vals = [str(x).strip() for x in df[col].dropna().tolist() if str(x).strip()]
-                logger.info(f"INDEX Loaded {len(vals)} indices from {csv_path}")
-                return vals
-        except Exception as e:
-            logger.warning(f"INDEX Failed reading {csv_path}: {e}")
-    fallback = ['NIFTY50-INDEX', 'NIFTYBANK-INDEX']
-    logger.info(f"INDEX Using fallback indices: {fallback}")
-    return fallback
-
-
-def load_fno_symbols_for_indices(active_index_symbols: List[str]) -> List[str]:
-    csv_candidates = [
-        os.environ.get('FNO_UNIVERSE_CSV', '').strip(),
-        'fno_stock_list-2.csv',
-        './fno_stock_list-2.csv',
-        './sectors/fno_stock_list-2.csv',
-        'fno_stock_list.csv',
-        './fno_stock_list.csv',
-        './sectors/fno_stock_list.csv',
-    ]
-    csv_path = next((p for p in csv_candidates if p and os.path.exists(p)), None)
-    if not csv_path:
-        csv_path = resolve_universe_csv()
+    csv_path = 'MW-All-Indices-25-Apr-2026.csv'
     if not os.path.exists(csv_path):
-        logger.warning(f"FNO CSV not found at {csv_path}")
-        return []
-    try:
-        df = pd.read_csv(csv_path)
-        if 'Symbol' not in df.columns:
-            logger.warning("FNO CSV missing 'Symbol' column")
-            return []
-        idx_col = None
-        for c in df.columns:
-            lc = str(c).strip().lower().replace(' ', '').replace('_', '')
-            if lc in ['belongstoindices', 'belongstoindex', 'belongs_to_indices', 'indices']:
-                idx_col = c
-                break
-        if idx_col is None:
-            logger.warning("FNO CSV missing Belongs_To_Indices column")
-            return []
+        raise FileNotFoundError(f"Required index CSV not found: {csv_path}")
+    df = pd.read_csv(csv_path)
+    cols = {str(c).strip().lower().replace(' ', '').replace('_', ''): c for c in df.columns}
+    pick_col = None
+    for key in ['indexsymbol', 'symbol', 'index', 'name']:
+        if key in cols:
+            pick_col = cols[key]
+            break
+    if pick_col is None:
+        raise ValueError(f"No valid index-name column found in {csv_path}. Columns: {list(df.columns)}")
+    vals = [str(x).strip() for x in df[pick_col].dropna().tolist() if str(x).strip()]
+    vals = list(dict.fromkeys(vals))
+    logger.info(f"INDEX Loaded indices from CSV {csv_path} ({len(vals)}): {vals}")
+    return vals
 
-        def normalize_index_name(x: str) -> str:
-            s = str(x).strip().upper()
-            s = s.replace('-INDEX', '')
-            s = s.replace('NIFTY50', 'NIFTY 50')
-            s = s.replace('NIFTY BANK', 'NIFTY BANK')
-            s = s.replace('NIFTYBANK', 'NIFTY BANK')
-            s = s.replace('NIFTYFINSERVICE', 'NIFTY FINANCIAL SERVICES')
-            s = s.replace('NIFTYFINANCIALSERVICES', 'NIFTY FINANCIAL SERVICES')
-            s = s.replace('NIFTYAUTO', 'NIFTY AUTO')
-            s = s.replace('NIFTYENERGY', 'NIFTY ENERGY')
-            s = s.replace('NIFTYIT', 'NIFTY IT')
-            s = s.replace('NIFTYPHARMA', 'NIFTY PHARMA')
-            s = s.replace('NIFTYMETAL', 'NIFTY METAL')
-            s = s.replace('NIFTYFMCG', 'NIFTY FMCG')
-            s = s.replace('NIFTYREALTY', 'NIFTY REALTY')
-            s = re.sub(r'\s+', ' ', s).strip()
-            return s
 
-        wanted = {normalize_index_name(x) for x in active_index_symbols if str(x).strip()}
-        logger.info(f"FNO Matching selected indices: {sorted(wanted)}")
 
-        def row_matches(cell) -> bool:
-            parts = [normalize_index_name(p) for p in re.split(r'[,;/|]+', str(cell)) if str(p).strip()]
-            return any(p in wanted for p in parts)
-
-        filt = df[df[idx_col].apply(row_matches)].copy()
-        symbols = sorted(filt['Symbol'].dropna().astype(str).str.strip().unique())
-        logger.info(f"FNO Filtered {len(symbols)} stocks from {csv_path} using {idx_col}")
-        return symbols
-    except Exception as e:
-        logger.error(f"Error filtering FNO CSV {csv_path}: {e}")
-        return []
+def resolve_mapping_csv() -> str:
+    csv_files = []
+    for dirpath, _, filenames in os.walk('.'):
+        for fname in filenames:
+            if fname.lower().endswith('.csv'):
+                csv_files.append(os.path.join(dirpath, fname))
+    candidates = []
+    for path in csv_files:
+        try:
+            df = pd.read_csv(path)
+            norm_cols = {str(c).strip().lower().replace(' ', '').replace('_', ''): c for c in df.columns}
+            if 'symbol' not in norm_cols:
+                continue
+            idx_key = next((k for k in norm_cols if k in ['belongstoindices','belongstoindex','indices']), None)
+            if not idx_key:
+                continue
+            idx_col = norm_cols[idx_key]
+            non_empty_idx = int(df[idx_col].astype(str).str.strip().ne('').sum())
+            candidates.append((non_empty_idx, len(df), path))
+        except Exception:
+            continue
+    if not candidates:
+        raise FileNotFoundError('No mapping CSV with Symbol and Belongs_To_Indices found in working directory')
+    candidates.sort(reverse=True)
+    chosen = candidates[0][2]
+    logger.info(f"CSV Mapping-selected file: {chosen}")
+    return chosen
 
 
