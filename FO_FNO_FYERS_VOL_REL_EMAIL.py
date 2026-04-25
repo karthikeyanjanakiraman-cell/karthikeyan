@@ -54,6 +54,14 @@ EMAIL_DISPLAY_COLS = [
     "Volatility State", "Last Iteration Time",
 ]
 
+INDEX_DISPLAY_COLS = [
+    "Symbol", "Index Name", "% Change", "Iteration No", "Iteration Minutes", "Iteration Time",
+    "Current Volume", "10 Day Relative Volume", "20 Day Relative Volume",
+    "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score",
+    "Range_Expansion", "Volume_Expansion", "Delta_Expansion",
+    "Price_Leading_Flag", "Price_Lead_Streak", "Price_Lead_Status", "Bucket",
+]
+
 
 def init_fyers():
     global fyers
@@ -1381,42 +1389,84 @@ def scan_index_universe() -> pd.DataFrame:
 def build_index_iteration_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
     if detail_df is None or detail_df.empty:
         return pd.DataFrame()
+
     work = detail_df.copy()
-    if 'Bucket' not in work.columns or 'Iteration Time' not in work.columns or '% Change' not in work.columns:
+    required = [
+        "Symbol", "% Change", "Iteration No", "Iteration Minutes", "Iteration Time",
+        "Current Volume", "10 Day Relative Volume", "20 Day Relative Volume",
+        "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score",
+        "Range_Expansion", "Volume_Expansion", "Delta_Expansion",
+        "Price_Leading_Flag", "Price_Lead_Streak", "Price_Lead_Status", "Bucket",
+    ]
+    missing = [c for c in required if c not in work.columns]
+    if missing:
+        logger.warning(f"INDEX Missing columns for index detail build: {missing}")
         return pd.DataFrame()
-    work['Bucket'] = work['Bucket'].astype(str).str.strip().str.upper()
-    work = work[work['Bucket'].isin(['LONGINDEXSTOCKS', 'SHORTINDEXSTOCKS'])].copy()
-    if work.empty:
-        return pd.DataFrame()
-    for c in ['% Change', '10 Day Relative Volume', '20 Day Relative Volume']:
-        if c in work.columns:
-            work[c] = pd.to_numeric(work[c], errors='coerce')
-    if 'Price_Leading_Flag' in work.columns:
-        work['Price_Leading_Flag'] = work['Price_Leading_Flag'].astype(str).str.lower().isin(['true','1','yes'])
-    agg = work.groupby(['Iteration Time', 'Bucket']).agg(
-        Symbols=('Symbol', 'nunique'),
-        Sum_Change=('% Change', 'sum'),
-        Avg_Change=('% Change', 'mean'),
-        Lead_Count=('Price_Leading_Flag', 'sum') if 'Price_Leading_Flag' in work.columns else ('Symbol','size'),
-        Avg_RVol20=('20 Day Relative Volume', 'mean') if '20 Day Relative Volume' in work.columns else ('% Change','size')
-    ).reset_index()
-    piv = agg.pivot(index='Iteration Time', columns='Bucket')
-    piv.columns = ['_'.join([str(x) for x in col if str(x) != '']) for col in piv.columns]
-    piv = piv.reset_index()
-    for c in ['Sum_Change_LONGINDEXSTOCKS','Sum_Change_SHORTINDEXSTOCKS','Lead_Count_LONGINDEXSTOCKS','Lead_Count_SHORTINDEXSTOCKS','Symbols_LONGINDEXSTOCKS','Symbols_SHORTINDEXSTOCKS','Avg_RVol20_LONGINDEXSTOCKS','Avg_RVol20_SHORTINDEXSTOCKS']:
-        if c not in piv.columns:
-            piv[c] = 0
-    piv['Index_Bias_Raw'] = piv['Sum_Change_LONGINDEXSTOCKS'].fillna(0) - piv['Sum_Change_SHORTINDEXSTOCKS'].abs().fillna(0)
-    piv['Lead_Bias'] = piv['Lead_Count_LONGINDEXSTOCKS'].fillna(0) - piv['Lead_Count_SHORTINDEXSTOCKS'].fillna(0)
-    piv['Breadth_Bias'] = piv['Symbols_LONGINDEXSTOCKS'].fillna(0) - piv['Symbols_SHORTINDEXSTOCKS'].fillna(0)
-    piv['Volume_Bias'] = piv['Avg_RVol20_LONGINDEXSTOCKS'].fillna(0) - piv['Avg_RVol20_SHORTINDEXSTOCKS'].fillna(0)
-    piv['Derived_Index_Score'] = (piv['Index_Bias_Raw'] * 0.55) + (piv['Lead_Bias'] * 1.50) + (piv['Breadth_Bias'] * 0.20) + (piv['Volume_Bias'] * 0.75)
-    piv['Derived_Index_View'] = pd.cut(
-        piv['Derived_Index_Score'],
-        bins=[-1e9, -2, -0.4, 0.4, 2, 1e9],
-        labels=['STRONG SHORT', 'SHORT', 'NEUTRAL', 'LONG', 'STRONG LONG']
-    )
-    return piv.sort_values('Iteration Time').reset_index(drop=True)
+
+    work["Bucket"] = work["Bucket"].astype(str).str.strip()
+    work["Index Name"] = work["Bucket"]
+
+    numeric_cols = [
+        "% Change", "Iteration No", "Iteration Minutes", "Current Volume",
+        "10 Day Relative Volume", "20 Day Relative Volume", "Cumulative RSI",
+        "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score",
+        "Range_Expansion", "Volume_Expansion", "Delta_Expansion",
+        "Price_Lead_Streak",
+    ]
+    for col in numeric_cols:
+        if col in work.columns:
+            work[col] = pd.to_numeric(work[col], errors="coerce")
+
+    work["Price_Leading_Flag"] = work["Price_Leading_Flag"].astype(str).str.lower().isin(["true", "1", "yes"])
+
+    group_cols = ["Index Name", "Iteration No", "Iteration Minutes", "Iteration Time"]
+    agg_map = {
+        "% Change": "mean",
+        "Current Volume": "sum",
+        "10 Day Relative Volume": "mean",
+        "20 Day Relative Volume": "mean",
+        "Cumulative RSI": "mean",
+        "Cumulative OBV": "sum",
+        "Cumulative VWAP": "mean",
+        "VWAP Z-Score": "mean",
+        "Range_Expansion": "mean",
+        "Volume_Expansion": "mean",
+        "Delta_Expansion": "mean",
+        "Price_Leading_Flag": "sum",
+        "Price_Lead_Streak": "max",
+    }
+
+    available_agg = {k: v for k, v in agg_map.items() if k in work.columns}
+    out = work.groupby(group_cols, dropna=False).agg(available_agg).reset_index()
+
+    out["Symbol"] = out["Index Name"]
+    out["Bucket"] = "INDEX"
+    out["Price_Leading_Flag"] = out["Price_Leading_Flag"].fillna(0).astype(int) > 0
+
+    def _lead_status(row):
+        if bool(row.get("Price_Leading_Flag", False)) and float(row.get("Price_Lead_Streak", 0) or 0) >= 3:
+            return "STRONG_PRICE_LEAD_FADE"
+        if bool(row.get("Price_Leading_Flag", False)) and float(row.get("Price_Lead_Streak", 0) or 0) >= 2:
+            return "PRICE_LEADING_FADE_RISK"
+        if bool(row.get("Price_Leading_Flag", False)):
+            return "EARLY_PRICE_LEAD"
+        return "NORMAL"
+
+    out["Price_Lead_Status"] = out.apply(_lead_status, axis=1)
+
+    final_cols = [
+        "Symbol", "Index Name", "% Change", "Iteration No", "Iteration Minutes", "Iteration Time",
+        "Current Volume", "10 Day Relative Volume", "20 Day Relative Volume",
+        "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score",
+        "Range_Expansion", "Volume_Expansion", "Delta_Expansion",
+        "Price_Leading_Flag", "Price_Lead_Streak", "Price_Lead_Status", "Bucket",
+    ]
+    for col in final_cols:
+        if col not in out.columns:
+            out[col] = np.nan
+
+    out = out[final_cols].sort_values(["Index Name", "Iteration No", "Iteration Minutes"]).reset_index(drop=True)
+    return out
 
 def main_index_first():
     logger.info('Starting Index-first FO Iteration Volume Volatility Scan')
@@ -1482,7 +1532,7 @@ def main_index_first():
     if isinstance(index_iter_df, pd.DataFrame) and not index_iter_df.empty:
         index_iter_csv = f'fo_idx_iteration_summary_{timestamp}.csv'
         index_iter_df.to_csv(index_iter_csv, index=False)
-        logger.info(f'INDEX Iteration summary saved: {index_iter_csv}')
+        logger.info(f'INDEX Detail CSV saved: {index_iter_csv}')
 
     send_email_with_tables(long_df, short_df, summary_csv, detail_csv, index_long_df=index_long_df, index_short_df=index_short_df, index_iter_csv_filename=(index_iter_csv if 'index_iter_csv' in locals() else None))
     logger.info('Index-first Scan Pipeline Completed')
