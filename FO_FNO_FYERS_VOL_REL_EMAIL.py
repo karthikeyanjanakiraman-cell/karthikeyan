@@ -42,6 +42,7 @@ logger.addHandler(ch)
 DAILY_LOOKBACK_DAYS = 60
 INTRADAY_LOOKBACK_DAYS = 20
 IVP_LOOKBACK_DAYS = 252
+SOFT_INDEX_SELECTION_COUNT = 5
 
 fyers = None
 
@@ -160,11 +161,11 @@ def load_fno_symbols_from_csv(path: str = "fno_stock_list.csv") -> List[str]:
 
 
 def format_fyers_symbol(symbol: str) -> str:
-    if symbol.startswith("NSE:") and symbol.endswith("-EQ"):
-        return symbol
     symbol = str(symbol).strip()
-    if symbol.endswith('-INDEX') or symbol.startswith('NSE:'):
-        return symbol if symbol.startswith('NSE:') else f'NSE:{symbol}'
+    if symbol.startswith('NSE:'):
+        return symbol
+    if symbol.endswith('-INDEX'):
+        return f'NSE:{symbol}'
     return f"NSE:{symbol}-EQ"
 
 
@@ -884,6 +885,39 @@ def format_value(col: str, val):
     return str(val)
 
 
+def build_candidate_tables_soft(df: pd.DataFrame, long_mode: bool = True, top_n: int = 20) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    base = df.copy()
+    if long_mode:
+        scored = base.sort_values(
+            by=["Rank Delta", "Bull Rank", "Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
+            ascending=[False, False, False, False, False, False],
+            na_position="last",
+        )
+        filt = scored[(scored["Rank Delta"] > 0) | (scored["Bull Rank"] >= 4)]
+    else:
+        scored = base.sort_values(
+            by=["Rank Delta", "Bear Rank", "Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
+            ascending=[True, False, False, False, False, True],
+            na_position="last",
+        )
+        filt = scored[(scored["Rank Delta"] < 0) | (scored["Bear Rank"] >= 4)]
+    filt = filt.drop_duplicates(subset=["Symbol"]).head(top_n)
+    return filt[[c for c in EMAIL_DISPLAY_COLS if c in filt.columns]] if not filt.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+
+def merge_candidate_priority(primary: pd.DataFrame, secondary: pd.DataFrame, top_n: int = 15) -> pd.DataFrame:
+    frames = []
+    if primary is not None and not primary.empty:
+        frames.append(primary.copy())
+    if secondary is not None and not secondary.empty:
+        frames.append(secondary.copy())
+    if not frames:
+        return pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    merged = pd.concat(frames, ignore_index=True)
+    merged = merged.drop_duplicates(subset=["Symbol"], keep="first")
+    return merged.head(top_n)
+
 def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df is None or df.empty:
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
@@ -1217,6 +1251,39 @@ def _ensure_required_columns(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+def build_candidate_tables_soft(df: pd.DataFrame, long_mode: bool = True, top_n: int = 20) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    base = df.copy()
+    if long_mode:
+        scored = base.sort_values(
+            by=["Rank Delta", "Bull Rank", "Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
+            ascending=[False, False, False, False, False, False],
+            na_position="last",
+        )
+        filt = scored[(scored["Rank Delta"] > 0) | (scored["Bull Rank"] >= 4)]
+    else:
+        scored = base.sort_values(
+            by=["Rank Delta", "Bear Rank", "Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
+            ascending=[True, False, False, False, False, True],
+            na_position="last",
+        )
+        filt = scored[(scored["Rank Delta"] < 0) | (scored["Bear Rank"] >= 4)]
+    filt = filt.drop_duplicates(subset=["Symbol"]).head(top_n)
+    return filt[[c for c in EMAIL_DISPLAY_COLS if c in filt.columns]] if not filt.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+
+def merge_candidate_priority(primary: pd.DataFrame, secondary: pd.DataFrame, top_n: int = 15) -> pd.DataFrame:
+    frames = []
+    if primary is not None and not primary.empty:
+        frames.append(primary.copy())
+    if secondary is not None and not secondary.empty:
+        frames.append(secondary.copy())
+    if not frames:
+        return pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    merged = pd.concat(frames, ignore_index=True)
+    merged = merged.drop_duplicates(subset=["Symbol"], keep="first")
+    return merged.head(top_n)
+
 def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     base = _ensure_required_columns(df)
     if base.empty:
@@ -1361,3 +1428,16 @@ if __name__ == "__main__":
 
 
 # Patch note: import fallback + safer symbol formatting added.
+
+def expand_index_candidates(index_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if index_df is None or index_df.empty:
+        return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    strict_long, strict_short = build_candidate_tables(index_df)
+    soft_long = build_candidate_tables_soft(index_df, long_mode=True, top_n=SOFT_INDEX_SELECTION_COUNT)
+    soft_short = build_candidate_tables_soft(index_df, long_mode=False, top_n=SOFT_INDEX_SELECTION_COUNT)
+    final_long = merge_candidate_priority(strict_long, soft_long, top_n=max(15, SOFT_INDEX_SELECTION_COUNT))
+    final_short = merge_candidate_priority(strict_short, soft_short, top_n=max(15, SOFT_INDEX_SELECTION_COUNT))
+    return final_long, final_short
+
+
+# Patch note: missed-index handling improved with safer index formatting and soft-boost fallback.
