@@ -100,6 +100,40 @@ def load_fno_symbols_from_sectors(root_dir: str = "sectors") -> List[str]:
     return sorted(symbols)
 
 
+def resolve_universe_csv() -> str:
+    csv_files = []
+    for dirpath, _, filenames in os.walk('.'):
+        for fname in filenames:
+            if fname.lower().endswith('.csv'):
+                csv_files.append(os.path.join(dirpath, fname))
+
+    scored = []
+    for path in csv_files:
+        try:
+            df = pd.read_csv(path, nrows=5)
+            cols = {str(c).strip().lower() for c in df.columns}
+            score = 0
+            if 'symbol' in cols:
+                score += 5
+            if 'belongstoindices' in cols or 'belongs_to_indices' in cols:
+                score += 5
+            if 'company name' in cols or 'company_name' in cols:
+                score += 2
+            if score > 0:
+                scored.append((score, os.path.getmtime(path), path))
+        except Exception:
+            continue
+
+    if scored:
+        scored.sort(reverse=True)
+        chosen = scored[0][2]
+        logger.info(f"CSV Auto-selected universe file: {chosen}")
+        return chosen
+
+    logger.warning("CSV No matching universe CSV found; defaulting to fno_stock_list.csv")
+    return 'fno_stock_list.csv'
+
+
 def load_fno_symbols_from_csv(path: str = "fno_stock_list.csv") -> List[str]:
     if not os.path.exists(path):
         logger.warning(f"FNO CSV not found at {path}")
@@ -1058,349 +1092,79 @@ def build_legacy_email_html(index_long_df: pd.DataFrame, index_short_df: pd.Data
     )
 
 
-def load_index_symbols(root_dir: str = "sectors", csv_path: str = "fno_stock_list-2.csv") -> List[str]:
+def load_index_symbols(csv_path: str = None) -> List[str]:
     env_val = os.environ.get("INDEX_SYMBOLS", "")
     if env_val:
         syms = [s.strip() for s in env_val.split(",") if s.strip()]
         if syms:
             return syms
 
+    csv_path = csv_path or resolve_universe_csv()
     index_names = set()
-
     if os.path.exists(csv_path):
         try:
             df = pd.read_csv(csv_path)
-            if "BelongsToIndices" in df.columns:
-                for cell in df["BelongsToIndices"].dropna().astype(str):
-                    for part in cell.split(","):
+            idx_col = None
+            for col in df.columns:
+                low = str(col).strip().lower()
+                if low in {"belongstoindices", "belongs_to_indices"}:
+                    idx_col = col
+                    break
+            if idx_col:
+                for cell in df[idx_col].dropna().astype(str):
+                    for part in cell.split(','):
                         name = part.strip()
-                        if not name or name.upper() == "UNMAPPEDSECTORAL":
-                            continue
-                        index_names.add(name)
-        except Exception:
-            pass
-
-    if os.path.isdir(root_dir):
-        for dirpath, _, filenames in os.walk(root_dir):
-            for fname in filenames:
-                if not fname.lower().endswith(".csv"):
-                    continue
-                file_path = os.path.join(dirpath, fname)
-                low_name = fname.lower()
-                try:
-                    df = pd.read_csv(file_path)
-                except Exception:
-                    continue
-                cols = {str(c).strip().lower(): c for c in df.columns}
-                symbol_col = next((cols[k] for k in ["symbol", "symbols", "ticker", "index", "index symbol", "index_symbol"] if k in cols), None)
-                if symbol_col is None:
-                    continue
-                market_col = next((cols[k] for k in ["market", "category", "segment", "type", "instrument"] if k in cols), None)
-                is_index_file = any(k in low_name for k in ["index", "indices", "ind_"])
-                for _, row in df.iterrows():
-                    raw = row.get(symbol_col)
-                    if pd.isna(raw):
-                        continue
-                    s = str(raw).strip().upper()
-                    if not s:
-                        continue
-                    is_index_symbol = (
-                        is_index_file
-                        or s.endswith("-INDEX")
-                        or s.startswith(("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"))
-                    )
-                    if not is_index_symbol and market_col is not None:
-                        is_index_symbol = "index" in str(row.get(market_col, "")).lower()
-                    if is_index_symbol:
-                        index_names.add(s.replace("NSE:", ""))
+                        if name and name.upper() != 'UNMAPPEDSECTORAL':
+                            index_names.add(name)
+        except Exception as e:
+            logger.warning(f"INDEX Failed reading {csv_path}: {e}")
 
     def map_to_fyers_index(name: str) -> str:
-        s = name.strip().upper().replace(" ", "")
-        if s.startswith("NSE:"):
-            s = s.split(":", 1)[1]
+        s = name.strip().upper().replace(' ', '')
+        if s.startswith('NSE:'):
+            s = s.split(':', 1)[1]
         mapping = {
-            "NIFTY50": "NIFTY50-INDEX",
-            "NIFTYBANK": "NIFTYBANK-INDEX",
-            "BANKNIFTY": "NIFTYBANK-INDEX",
-            "FINNIFTY": "FINNIFTY-INDEX",
-            "MIDCPNIFTY": "MIDCPNIFTY-INDEX",
-            "SENSEX": "SENSEX-INDEX",
-            "BANKEX": "BANKEX-INDEX",
-            "NIFTYIT": "NIFTYIT-INDEX",
-            "NIFTYAUTO": "NIFTYAUTO-INDEX",
-            "NIFTYFMCG": "NIFTYFMCG-INDEX",
-            "NIFTYPHARMA": "NIFTYPHARMA-INDEX",
-            "NIFTYREALTY": "NIFTYREALTY-INDEX",
-            "NIFTYMETAL": "NIFTYMETAL-INDEX",
-            "NIFTYENERGY": "NIFTYENERGY-INDEX",
-            "NIFTYINFRASTRUCTURE": "NIFTYINFRASTRUCTURE-INDEX",
-            "NIFTYCONSUMERDURABLES": "NIFTYCONSUMERDURABLES-INDEX",
-            "NIFTYFINANCIALSERVICES": "NIFTYFINANCIALSERVICES-INDEX",
-            "NIFTYPRIVATEBANK": "NIFTYPRIVATEBANK-INDEX",
-            "NIFTYPSUBANK": "NIFTYPSUBANK-INDEX",
-            "NIFTYSERVICESSECTOR": "NIFTYSERVICESSECTOR-INDEX",
-            "NIFTYINDIADIGITAL": "NIFTYINDIADIGITAL-INDEX",
-            "NIFTYINDIAMANUFACTURING": "NIFTYINDIAMANUFACTURING-INDEX",
-            "NIFTYINDIACONSUMPTION": "NIFTYINDIACONSUMPTION-INDEX",
-            "NIFTYCOMMODITIES": "NIFTYCOMMODITIES-INDEX",
-            "NIFTYCPSE": "NIFTYCPSE-INDEX",
-            "NIFTYMNC": "NIFTYMNC-INDEX",
-            "NIFTYPSE": "NIFTYPSE-INDEX",
+            'NIFTY50': 'NIFTY50-INDEX',
+            'NIFTYBANK': 'NIFTYBANK-INDEX',
+            'BANKNIFTY': 'NIFTYBANK-INDEX',
+            'FINNIFTY': 'FINNIFTY-INDEX',
+            'MIDCPNIFTY': 'MIDCPNIFTY-INDEX',
+            'SENSEX': 'SENSEX-INDEX',
+            'BANKEX': 'BANKEX-INDEX',
+            'NIFTYIT': 'NIFTYIT-INDEX',
+            'NIFTYAUTO': 'NIFTYAUTO-INDEX',
+            'NIFTYFMCG': 'NIFTYFMCG-INDEX',
+            'NIFTYPHARMA': 'NIFTYPHARMA-INDEX',
+            'NIFTYREALTY': 'NIFTYREALTY-INDEX',
+            'NIFTYMETAL': 'NIFTYMETAL-INDEX',
+            'NIFTYENERGY': 'NIFTYENERGY-INDEX',
+            'NIFTYINFRASTRUCTURE': 'NIFTYINFRASTRUCTURE-INDEX',
+            'NIFTYCONSUMERDURABLES': 'NIFTYCONSUMERDURABLES-INDEX',
+            'NIFTYFINANCIALSERVICES': 'NIFTYFINANCIALSERVICES-INDEX',
+            'NIFTYPRIVATEBANK': 'NIFTYPRIVATEBANK-INDEX',
+            'NIFTYPSUBANK': 'NIFTYPSUBANK-INDEX',
+            'NIFTYSERVICESSECTOR': 'NIFTYSERVICESSECTOR-INDEX',
+            'NIFTYINDIADIGITAL': 'NIFTYINDIADIGITAL-INDEX',
+            'NIFTYINDIAMANUFACTURING': 'NIFTYINDIAMANUFACTURING-INDEX',
+            'NIFTYINDIACONSUMPTION': 'NIFTYINDIACONSUMPTION-INDEX',
+            'NIFTYCOMMODITIES': 'NIFTYCOMMODITIES-INDEX',
+            'NIFTYCPSE': 'NIFTYCPSE-INDEX',
+            'NIFTYMNC': 'NIFTYMNC-INDEX',
+            'NIFTYPSE': 'NIFTYPSE-INDEX',
         }
         if s in mapping:
             return mapping[s]
-        if s.endswith("-INDEX"):
+        if s.endswith('-INDEX'):
             return s
-        if s.startswith("NIFTY") and len(s) > 5:
-            return s + "-INDEX"
+        if s.startswith('NIFTY') and len(s) > 5:
+            return s + '-INDEX'
         return None
 
-    mapped = []
-    for name in sorted(index_names):
-        fy = map_to_fyers_index(name)
-        if fy:
-            mapped.append(fy)
-
-    mapped = sorted(dict.fromkeys(mapped))
+    mapped = sorted(dict.fromkeys(filter(None, (map_to_fyers_index(x) for x in index_names))))
     if mapped:
+        logger.info(f"INDEX Auto-loaded {len(mapped)} indices from {csv_path}")
         return mapped
-    return ["NIFTY50-INDEX", "NIFTYBANK-INDEX"]
-
-def format_fyers_index_symbol(symbol: str) -> str:
-    if symbol.startswith("NSE:"):
-        return symbol
-    return f"NSE:{symbol}"
-
-
-def scan_index_universe() -> pd.DataFrame:
-    symbols = load_index_symbols()
-    if not symbols:
-        logger.error("INDEX No index symbols configured.")
-        return pd.DataFrame()
-
-    rows = []
-    total = len(symbols)
-
-    for idx, sym in enumerate(symbols, start=1):
-        logger.info(f"INDEX [{idx}/{total}] Processing {sym}")
-        fyers_sym = format_fyers_index_symbol(sym)
-
-        daily_df = get_fyers_history(
-            fyers_sym,
-            resolution="D",
-            days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS),
-        )
-        intra_df = get_fyers_history(
-            fyers_sym,
-            resolution="5",
-            days_back=INTRADAY_LOOKBACK_DAYS,
-        )
-
-        iter_summary, _ = compute_iteration_volume_profile(intra_df)
-        iv_info = compute_iv_proxies(daily_df)
-
-        prev_close = float(daily_df["close"].iloc[-2]) if (
-            daily_df is not None and len(daily_df) >= 2
-        ) else None
-        ltp = iter_summary.get("LTP")
-        pct_change = (
-            (ltp - prev_close) / prev_close * 100
-            if (ltp is not None and prev_close and prev_close != 0)
-            else 0.0
-        )
-
-        rows.append(
-            {
-                "Symbol": sym,
-                "LTP": ltp,
-                "% Change": pct_change,
-                "Current Volume": iter_summary.get("Current Volume"),
-                "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"),
-                "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"),
-                "Cumulative RSI": iter_summary.get("Cumulative RSI"),
-                "Cumulative OBV": iter_summary.get("Cumulative OBV"),
-                "Cumulative VWAP": iter_summary.get("Cumulative VWAP"),
-                "VWAP Z-Score": iter_summary.get("VWAP Z-Score"),
-                "Total Iterations": iter_summary.get("Total Iterations"),
-                "Last Iteration Minutes": iter_summary.get("Last Iteration Minutes"),
-                "Last Iteration Time": iter_summary.get("Last Iteration Time"),
-                "Cumulative KER": iter_summary.get("Cumulative KER"),
-                "Cumulative +DI": iter_summary.get("Cumulative +DI"),
-                "Cumulative -DI": iter_summary.get("Cumulative -DI"),
-                "Cumulative ADX": iter_summary.get("Cumulative ADX"),
-                "Survival Score": iter_summary.get("Survival Score"),
-                "Survival_Num": iter_summary.get("Survival_Num"),
-                "HOD": iter_summary.get("HOD"),
-                "Strike_Distance": iter_summary.get("Strike_Distance"),
-                "Last_5m_Volume": iter_summary.get("Last_5m_Volume"),
-                "Volume_1h_Avg_5m": iter_summary.get("Volume_1h_Avg_5m"),
-                "OBV_30m_Delta": iter_summary.get("OBV_30m_Delta"),
-                "RSI_30m_Delta": iter_summary.get("RSI_30m_Delta"),
-                "Price_Lead_Status": iter_summary.get("Price_Lead_Status", "NORMAL"),
-                "IVP": iv_info.get("IVP"),
-                "Volatility State": iv_info.get("Volatility State"),
-            }
-        )
-
-    df_idx = pd.DataFrame(rows)
-    df_idx = derive_rank_columns(df_idx)
-    df_idx = add_signal_columns(df_idx)
-    return df_idx
-
-
-def load_fno_symbols_for_indices(active_index_symbols: List[str]) -> List[str]:
-    # Dynamically load F&O universe from CSV; no hard-coded constituents
-    symbols = load_fno_symbols_from_csv("fno_stock_list.csv")
-    return symbols
-
-
-def scan_symbol_universe(symbols: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    if not symbols:
-        logger.error("CORE No symbols to scan.")
-        return pd.DataFrame(), pd.DataFrame()
-
-    rows, iteration_rows = [], []
-    total = len(symbols)
-
-    for idx, sym in enumerate(symbols, start=1):
-        logger.info(f"CORE [{idx}/{total}] Processing {sym}")
-        fyers_sym = format_fyers_symbol(sym)
-
-        daily_df = get_fyers_history(
-            fyers_sym,
-            resolution="D",
-            days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS),
-        )
-        intra_df = get_fyers_history(
-            fyers_sym,
-            resolution="5",
-            days_back=INTRADAY_LOOKBACK_DAYS,
-        )
-
-        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
-        iv_info = compute_iv_proxies(daily_df)
-
-        prev_close = float(daily_df["close"].iloc[-2]) if (
-            daily_df is not None and len(daily_df) >= 2
-        ) else None
-        ltp = iter_summary.get("LTP")
-        pct_change = (
-            (ltp - prev_close) / prev_close * 100
-            if (ltp is not None and prev_close and prev_close != 0)
-            else 0.0
-        )
-
-        if iter_detail is not None and not iter_detail.empty:
-            iter_detail.insert(0, "Symbol", sym)
-            iter_detail.insert(1, "% Change", pct_change)
-            iteration_rows.append(iter_detail)
-
-        rows.append(
-            {
-                "Symbol": sym,
-                "LTP": ltp,
-                "% Change": pct_change,
-                "Current Volume": iter_summary.get("Current Volume"),
-                "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"),
-                "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"),
-                "Cumulative RSI": iter_summary.get("Cumulative RSI"),
-                "Cumulative OBV": iter_summary.get("Cumulative OBV"),
-                "Cumulative VWAP": iter_summary.get("Cumulative VWAP"),
-                "VWAP Z-Score": iter_summary.get("VWAP Z-Score"),
-                "Total Iterations": iter_summary.get("Total Iterations"),
-                "Last Iteration Minutes": iter_summary.get("Last Iteration Minutes"),
-                "Last Iteration Time": iter_summary.get("Last Iteration Time"),
-                "Cumulative KER": iter_summary.get("Cumulative KER"),
-                "Cumulative +DI": iter_summary.get("Cumulative +DI"),
-                "Cumulative -DI": iter_summary.get("Cumulative -DI"),
-                "Cumulative ADX": iter_summary.get("Cumulative ADX"),
-                "Survival Score": iter_summary.get("Survival Score"),
-                "Survival_Num": iter_summary.get("Survival_Num"),
-                "HOD": iter_summary.get("HOD"),
-                "Strike_Distance": iter_summary.get("Strike_Distance"),
-                "Last_5m_Volume": iter_summary.get("Last_5m_Volume"),
-                "Volume_1h_Avg_5m": iter_summary.get("Volume_1h_Avg_5m"),
-                "OBV_30m_Delta": iter_summary.get("OBV_30m_Delta"),
-                "RSI_30m_Delta": iter_summary.get("RSI_30m_Delta"),
-                "Price_Lead_Status": iter_summary.get("Price_Lead_Status", "NORMAL"),
-                "IVP": iv_info.get("IVP"),
-                "Volatility State": iv_info.get("Volatility State"),
-            }
-        )
-
-    df_all = pd.DataFrame(rows)
-    df_iter = (
-        pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame()
-    )
-    return df_all, df_iter
-
-
-def main_index_first():
-    logger.info("Starting Index-first F&O Iteration Volume Volatility Scan")
-    init_fyers()
-
-    df_indices = scan_index_universe()
-    index_long_df, index_short_df = build_candidate_tables(df_indices)
-
-    top_long_indices = index_long_df["Symbol"].head(2).tolist()
-    top_short_indices = index_short_df["Symbol"].head(2).tolist()
-
-    logger.info(f"Top long indices: {top_long_indices}")
-    logger.info(f"Top short indices: {top_short_indices}")
-
-    long_side_symbols = load_fno_symbols_for_indices(top_long_indices)
-    short_side_symbols = load_fno_symbols_for_indices(top_short_indices)
-
-    df_long_all, df_long_iter = scan_symbol_universe(long_side_symbols)
-    if not df_long_all.empty:
-        df_long_all = derive_rank_columns(df_long_all)
-        df_long_all = add_signal_columns(df_long_all)
-        long_long_df, _ = build_candidate_tables(df_long_all)
-    else:
-        long_long_df = pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-        df_long_iter = pd.DataFrame()
-
-    df_short_all, df_short_iter = scan_symbol_universe(short_side_symbols)
-    if not df_short_all.empty:
-        df_short_all = derive_rank_columns(df_short_all)
-        df_short_all = add_signal_columns(df_short_all)
-        _, short_short_df = build_candidate_tables(df_short_all)
-    else:
-        short_short_df = pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-        df_short_iter = pd.DataFrame()
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    summary_csv = f"fo_idx_filtered_summary_{timestamp}.csv"
-    detail_csv = f"fo_idx_filtered_details_{timestamp}.csv"
-
-    df_all = pd.concat([df_long_all, df_short_all], ignore_index=True) if (
-        not df_long_all.empty or not df_short_all.empty
-    ) else pd.DataFrame()
-    df_iter = pd.concat([df_long_iter, df_short_iter], ignore_index=True) if (
-        not df_long_iter.empty or not df_short_iter.empty
-    ) else pd.DataFrame()
-
-    if not df_all.empty:
-        df_all.to_csv(summary_csv, index=False)
-    else:
-        pd.DataFrame().to_csv(summary_csv, index=False)
-
-    if not df_iter.empty:
-        df_iter.to_csv(detail_csv, index=False)
-    else:
-        pd.DataFrame().to_csv(detail_csv, index=False)
-
-    send_email_with_tables(
-        long_long_df,
-        short_short_df,
-        summary_csv,
-        detail_csv,
-        index_long_df=index_long_df,
-        index_short_df=index_short_df,
-    )
-
-    logger.info("Index-first Scan Pipeline Completed")
-
+    return ['NIFTY50-INDEX', 'NIFTYBANK-INDEX']
 
 if __name__ == "__main__":
     main_index_first()
