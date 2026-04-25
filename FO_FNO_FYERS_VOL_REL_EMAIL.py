@@ -43,6 +43,9 @@ DAILY_LOOKBACK_DAYS = 60
 INTRADAY_LOOKBACK_DAYS = 20
 IVP_LOOKBACK_DAYS = 252
 SOFT_INDEX_SELECTION_COUNT = 5
+INDEX_FALLBACK_MIN_COUNT = 8
+
+
 
 fyers = None
 
@@ -1441,3 +1444,127 @@ def expand_index_candidates(index_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
 
 
 # Patch note: missed-index handling improved with safer index formatting and soft-boost fallback.
+
+def ensure_min_index_candidates(index_df: pd.DataFrame, long_df: pd.DataFrame, short_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    base_cols = [c for c in EMAIL_DISPLAY_COLS if c in index_df.columns] if index_df is not None else EMAIL_DISPLAY_COLS
+    if index_df is None or index_df.empty:
+        return pd.DataFrame(columns=base_cols), pd.DataFrame(columns=base_cols)
+    work = index_df.copy()
+    long_need = max(0, INDEX_FALLBACK_MIN_COUNT - (0 if long_df is None else len(long_df)))
+    short_need = max(0, INDEX_FALLBACK_MIN_COUNT - (0 if short_df is None else len(short_df)))
+
+    if long_need > 0:
+        pool_long = work.sort_values(
+            by=["Rank Delta", "Bull Rank", "% Change", "Cumulative ADX", "Cumulative KER"],
+            ascending=[False, False, False, False, False],
+            na_position="last",
+        )
+        extra_long = pool_long[[c for c in EMAIL_DISPLAY_COLS if c in pool_long.columns]].copy()
+        if long_df is not None and not long_df.empty:
+            extra_long = extra_long[~extra_long["Symbol"].isin(long_df["Symbol"])]
+        long_df = merge_candidate_priority(long_df, extra_long.head(long_need), top_n=INDEX_FALLBACK_MIN_COUNT)
+
+    if short_need > 0:
+        pool_short = work.sort_values(
+            by=["Rank Delta", "Bear Rank", "% Change", "Cumulative ADX", "Cumulative KER"],
+            ascending=[True, False, True, False, False],
+            na_position="last",
+        )
+        extra_short = pool_short[[c for c in EMAIL_DISPLAY_COLS if c in pool_short.columns]].copy()
+        if short_df is not None and not short_df.empty:
+            extra_short = extra_short[~extra_short["Symbol"].isin(short_df["Symbol"])]
+        short_df = merge_candidate_priority(short_df, extra_short.head(short_need), top_n=INDEX_FALLBACK_MIN_COUNT)
+
+    return long_df, short_df
+
+# Patch note: minimum index fallback pool added to prevent only-two-index outcome.
+
+def get_sectoral_index_universe(csv_path: str = "MW-All-Indices-25-Apr-2026.csv") -> List[str]:
+    if not os.path.exists(csv_path):
+        logger.warning(f"INDEX CSV not found: {csv_path}")
+        return []
+    try:
+        df = pd.read_csv(csv_path)
+        idx_col = next((c for c in df.columns if "INDEX" in str(c).upper()), None)
+        if idx_col is None:
+            logger.warning("INDEX CSV missing index-name column")
+            return []
+        names = df[idx_col].dropna().astype(str).str.replace("\n", " ", regex=False).str.replace(r"\s+", " ", regex=True).str.strip()
+        blacklist = {
+            "NIFTY 50", "NIFTY NEXT 50", "NIFTY 100", "NIFTY 200", "NIFTY 500",
+            "NIFTY MIDCAP 50", "NIFTY MIDCAP 100", "NIFTY MIDCAP 150",
+            "NIFTY SMALLCAP 50", "NIFTY SMALLCAP 100", "NIFTY SMALLCAP 250",
+            "NIFTY MIDSMALLCAP 400", "NIFTY TOTAL MARKET", "INDIA VIX"
+        }
+        sectoral = []
+        for name in names:
+            upper = name.upper()
+            if upper in {x.upper() for x in blacklist}:
+                continue
+            if any(k in upper for k in [
+                "AUTO", "BANK", "FMCG", "IT", "METAL", "PHARMA", "REALTY",
+                "ENERGY", "MEDIA", "CONSUMER", "COMMODITIES", "INFRASTRUCTURE",
+                "SERVICES", "MANUFACTURING", "MNC", "HEALTHCARE", "OIL & GAS",
+                "FINANCIAL SERVICES", "PRIVATE BANK", "PSU BANK"
+            ]):
+                sectoral.append(name)
+        sectoral = sorted(dict.fromkeys(sectoral))
+        logger.info(f"INDEX Derived {len(sectoral)} sectoral indices from CSV")
+        return sectoral
+    except Exception as e:
+        logger.warning(f"INDEX Failed to derive sectoral universe: {e}")
+        return []
+
+def format_sectoral_index_symbol(index_name: str) -> str:
+    index_name = str(index_name).strip()
+    if index_name.startswith("NSE:"):
+        return index_name
+    if index_name.endswith("-INDEX"):
+        return f"NSE:{index_name}"
+    return f"NSE:{index_name}-INDEX"
+
+def fetch_sectoral_indices_only(csv_path: str = "MW-All-Indices-25-Apr-2026.csv") -> pd.DataFrame:
+    rows = []
+    for idx_name in get_sectoral_index_universe(csv_path):
+        fy_symbol = format_sectoral_index_symbol(idx_name)
+        daily_df = get_fyers_history(fy_symbol, resolution="D", days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
+        intra_df = get_fyers_history(fy_symbol, resolution="5", days_back=INTRADAY_LOOKBACK_DAYS)
+        iter_summary, _ = compute_iteration_volume_profile(intra_df)
+        iv_info = compute_iv_proxies(daily_df)
+        prev_close = float(daily_df["close"].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2) else np.nan
+        ltp = iter_summary.get("LTP")
+        pct_change = ((ltp - prev_close) / prev_close * 100) if (ltp is not None and pd.notna(prev_close) and prev_close != 0) else np.nan
+        rows.append({
+            "Symbol": idx_name,
+            "LTP": ltp,
+            "% Change": pct_change,
+            "Current Volume": iter_summary.get("Current Volume"),
+            "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"),
+            "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"),
+            "Cumulative RSI": iter_summary.get("Cumulative RSI"),
+            "Cumulative OBV": iter_summary.get("Cumulative OBV"),
+            "Cumulative VWAP": iter_summary.get("Cumulative VWAP"),
+            "VWAP Z-Score": iter_summary.get("VWAP Z-Score"),
+            "Total Iterations": iter_summary.get("Total Iterations"),
+            "Last Iteration Minutes": iter_summary.get("Last Iteration Minutes"),
+            "Last Iteration Time": iter_summary.get("Last Iteration Time"),
+            "Cumulative KER": iter_summary.get("Cumulative KER"),
+            "Cumulative +DI": iter_summary.get("Cumulative +DI"),
+            "Cumulative -DI": iter_summary.get("Cumulative -DI"),
+            "Cumulative ADX": iter_summary.get("Cumulative ADX"),
+            "Survival Score": iter_summary.get("Survival Score"),
+            "Survival_Num": iter_summary.get("Survival_Num"),
+            "Price_Lead_Status": iter_summary.get("Price_Lead_Status", "NORMAL"),
+            "IVP": iv_info.get("IVP"),
+            "Volatility State": iv_info.get("Volatility State"),
+        })
+    idx_df = pd.DataFrame(rows)
+    if idx_df.empty:
+        return idx_df
+    idx_df = derive_rank_columns(idx_df)
+    idx_df = add_signal_columns(idx_df)
+    return idx_df
+
+# Patch note: sectoral index only universe added.
+
+# Patch note: sectoral index universe is now derived from CSV, not hardcoded.
