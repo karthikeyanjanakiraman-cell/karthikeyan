@@ -464,14 +464,25 @@ def compute_iteration_volume_profile(
     curr_df.sort_values("time_only", inplace=True)
     curr_df["cum_vol"] = curr_df["volume"].cumsum()
 
+    work_df = curr_df.copy()
+    if "time" not in work_df.columns:
+        if "timestamp" in work_df.columns:
+            work_df["time"] = pd.to_datetime(work_df["timestamp"])
+        elif "date" in work_df.columns and "time_only" in work_df.columns:
+            work_df["time"] = pd.to_datetime(
+                work_df["date"].astype(str) + " " + work_df["time_only"].astype(str)
+            )
+        else:
+            work_df["time"] = pd.RangeIndex(start=0, stop=len(work_df), step=1)
+
     metric_df = compute_cumulative_directional_metrics(
-        curr_df[["time", "open", "high", "low", "close", "volume"]].copy()
+        work_df[["time", "open", "high", "low", "close", "volume"]].copy()
     )
     flow_df = compute_cumulative_flow_metrics(
-        curr_df[["time", "high", "low", "close", "volume"]].copy()
+        work_df[["time", "high", "low", "close", "volume"]].copy()
     )
     price_lead_df = compute_price_lead_metrics(
-        curr_df[["time", "open", "high", "low", "close", "volume"]].copy()
+        work_df[["time", "open", "high", "low", "close", "volume"]].copy()
     )
 
     rows = []
