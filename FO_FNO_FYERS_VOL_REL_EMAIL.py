@@ -1234,24 +1234,68 @@ def scan_index_universe() -> pd.DataFrame:
     return df
 
 
+
+
 def main_index_first():
     logger.info('Starting Index-first FO Iteration Volume Volatility Scan')
     init_fyers()
+
     df_indices = scan_index_universe()
-    index_long_df = df_indices[[c for c in EMAIL_DISPLAY_COLS if c in df_indices.columns]].head(15) if not df_indices.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-    index_short_df = index_long_df.copy()
-    selected_indices = df_indices['Symbol'].dropna().astype(str).tolist() if not df_indices.empty and 'Symbol' in df_indices.columns else []
-    logger.info(f'Selected indices for stock filtering ({len(selected_indices)}): {selected_indices}')
-    stock_symbols = load_fno_symbols_for_indices(selected_indices)
-    df_all, df_iter = scan_symbol_universe(stock_symbols)
-    if not df_all.empty:
-        df_all = add_signal_columns(derive_rank_columns(df_all))
-    long_df, short_df = build_candidate_tables(df_all)
+    if df_indices.empty:
+        raise ValueError('Index scan returned empty dataframe')
+
+    df_indices = add_signal_columns(derive_rank_columns(df_indices))
+    index_long_df, index_short_df = build_candidate_tables(df_indices)
+
+    long_index_symbols = index_long_df['Symbol'].dropna().astype(str).tolist() if not index_long_df.empty and 'Symbol' in index_long_df.columns else []
+    short_index_symbols = index_short_df['Symbol'].dropna().astype(str).tolist() if not index_short_df.empty and 'Symbol' in index_short_df.columns else []
+
+    logger.info(f'Long index symbols ({len(long_index_symbols)}): {long_index_symbols}')
+    logger.info(f'Short index symbols ({len(short_index_symbols)}): {short_index_symbols}')
+
+    long_stock_symbols = load_fno_symbols_for_indices(long_index_symbols)
+    short_stock_symbols = load_fno_symbols_for_indices(short_index_symbols)
+
+    long_df_all, long_iter = scan_symbol_universe(sorted(set(long_stock_symbols)))
+    short_df_all, short_iter = scan_symbol_universe(sorted(set(short_stock_symbols)))
+
+    if not long_df_all.empty:
+        long_df_all = add_signal_columns(derive_rank_columns(long_df_all))
+    if not short_df_all.empty:
+        short_df_all = add_signal_columns(derive_rank_columns(short_df_all))
+
+    long_df, _ = build_candidate_tables(long_df_all) if not long_df_all.empty else (pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame())
+    _, short_df = build_candidate_tables(short_df_all) if not short_df_all.empty else (pd.DataFrame(), pd.DataFrame(columns=EMAIL_DISPLAY_COLS))
+
+    long_df = long_df[[c for c in EMAIL_DISPLAY_COLS if c in long_df.columns]] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    short_df = short_df[[c for c in EMAIL_DISPLAY_COLS if c in short_df.columns]] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    index_long_df = index_long_df[[c for c in EMAIL_DISPLAY_COLS if c in index_long_df.columns]] if not index_long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    index_short_df = index_short_df[[c for c in EMAIL_DISPLAY_COLS if c in index_short_df.columns]] if not index_short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+
+    summary_parts = []
+    if not index_long_df.empty:
+        summary_parts.append(index_long_df.assign(Bucket='INDEX_LONG'))
+    if not index_short_df.empty:
+        summary_parts.append(index_short_df.assign(Bucket='INDEX_SHORT'))
+    if not long_df.empty:
+        summary_parts.append(long_df.assign(Bucket='STOCK_LONG_FROM_LONG_INDICES'))
+    if not short_df.empty:
+        summary_parts.append(short_df.assign(Bucket='STOCK_SHORT_FROM_SHORT_INDICES'))
+    summary_df = pd.concat(summary_parts, ignore_index=True) if summary_parts else pd.DataFrame()
+
+    detail_parts = []
+    if not long_iter.empty:
+        detail_parts.append(long_iter.assign(Bucket='LONG_INDEX_STOCKS'))
+    if not short_iter.empty:
+        detail_parts.append(short_iter.assign(Bucket='SHORT_INDEX_STOCKS'))
+    detail_df = pd.concat(detail_parts, ignore_index=True) if detail_parts else pd.DataFrame()
+
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     summary_csv = f'fo_idx_filtered_summary_{timestamp}.csv'
     detail_csv = f'fo_idx_filtered_details_{timestamp}.csv'
-    df_all.to_csv(summary_csv, index=False)
-    df_iter.to_csv(detail_csv, index=False)
+    summary_df.to_csv(summary_csv, index=False)
+    detail_df.to_csv(detail_csv, index=False)
+
     send_email_with_tables(long_df, short_df, summary_csv, detail_csv, index_long_df=index_long_df, index_short_df=index_short_df)
     logger.info('Index-first Scan Pipeline Completed')
 
