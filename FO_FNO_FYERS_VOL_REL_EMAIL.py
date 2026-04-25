@@ -1058,17 +1058,113 @@ def build_legacy_email_html(index_long_df: pd.DataFrame, index_short_df: pd.Data
     )
 
 
-def load_index_symbols() -> List[str]:
+def load_index_symbols(root_dir: str = "sectors", csv_path: str = "fno_stock_list-2.csv") -> List[str]:
     env_val = os.environ.get("INDEX_SYMBOLS", "")
     if env_val:
         syms = [s.strip() for s in env_val.split(",") if s.strip()]
         if syms:
             return syms
-    return [
-        "NIFTY50-INDEX",
-        "NIFTYBANK-INDEX",
-    ]
 
+    index_names = set()
+
+    if os.path.exists(csv_path):
+        try:
+            df = pd.read_csv(csv_path)
+            if "BelongsToIndices" in df.columns:
+                for cell in df["BelongsToIndices"].dropna().astype(str):
+                    for part in cell.split(","):
+                        name = part.strip()
+                        if not name or name.upper() == "UNMAPPEDSECTORAL":
+                            continue
+                        index_names.add(name)
+        except Exception:
+            pass
+
+    if os.path.isdir(root_dir):
+        for dirpath, _, filenames in os.walk(root_dir):
+            for fname in filenames:
+                if not fname.lower().endswith(".csv"):
+                    continue
+                file_path = os.path.join(dirpath, fname)
+                low_name = fname.lower()
+                try:
+                    df = pd.read_csv(file_path)
+                except Exception:
+                    continue
+                cols = {str(c).strip().lower(): c for c in df.columns}
+                symbol_col = next((cols[k] for k in ["symbol", "symbols", "ticker", "index", "index symbol", "index_symbol"] if k in cols), None)
+                if symbol_col is None:
+                    continue
+                market_col = next((cols[k] for k in ["market", "category", "segment", "type", "instrument"] if k in cols), None)
+                is_index_file = any(k in low_name for k in ["index", "indices", "ind_"])
+                for _, row in df.iterrows():
+                    raw = row.get(symbol_col)
+                    if pd.isna(raw):
+                        continue
+                    s = str(raw).strip().upper()
+                    if not s:
+                        continue
+                    is_index_symbol = (
+                        is_index_file
+                        or s.endswith("-INDEX")
+                        or s.startswith(("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"))
+                    )
+                    if not is_index_symbol and market_col is not None:
+                        is_index_symbol = "index" in str(row.get(market_col, "")).lower()
+                    if is_index_symbol:
+                        index_names.add(s.replace("NSE:", ""))
+
+    def map_to_fyers_index(name: str) -> str:
+        s = name.strip().upper().replace(" ", "")
+        if s.startswith("NSE:"):
+            s = s.split(":", 1)[1]
+        mapping = {
+            "NIFTY50": "NIFTY50-INDEX",
+            "NIFTYBANK": "NIFTYBANK-INDEX",
+            "BANKNIFTY": "NIFTYBANK-INDEX",
+            "FINNIFTY": "FINNIFTY-INDEX",
+            "MIDCPNIFTY": "MIDCPNIFTY-INDEX",
+            "SENSEX": "SENSEX-INDEX",
+            "BANKEX": "BANKEX-INDEX",
+            "NIFTYIT": "NIFTYIT-INDEX",
+            "NIFTYAUTO": "NIFTYAUTO-INDEX",
+            "NIFTYFMCG": "NIFTYFMCG-INDEX",
+            "NIFTYPHARMA": "NIFTYPHARMA-INDEX",
+            "NIFTYREALTY": "NIFTYREALTY-INDEX",
+            "NIFTYMETAL": "NIFTYMETAL-INDEX",
+            "NIFTYENERGY": "NIFTYENERGY-INDEX",
+            "NIFTYINFRASTRUCTURE": "NIFTYINFRASTRUCTURE-INDEX",
+            "NIFTYCONSUMERDURABLES": "NIFTYCONSUMERDURABLES-INDEX",
+            "NIFTYFINANCIALSERVICES": "NIFTYFINANCIALSERVICES-INDEX",
+            "NIFTYPRIVATEBANK": "NIFTYPRIVATEBANK-INDEX",
+            "NIFTYPSUBANK": "NIFTYPSUBANK-INDEX",
+            "NIFTYSERVICESSECTOR": "NIFTYSERVICESSECTOR-INDEX",
+            "NIFTYINDIADIGITAL": "NIFTYINDIADIGITAL-INDEX",
+            "NIFTYINDIAMANUFACTURING": "NIFTYINDIAMANUFACTURING-INDEX",
+            "NIFTYINDIACONSUMPTION": "NIFTYINDIACONSUMPTION-INDEX",
+            "NIFTYCOMMODITIES": "NIFTYCOMMODITIES-INDEX",
+            "NIFTYCPSE": "NIFTYCPSE-INDEX",
+            "NIFTYMNC": "NIFTYMNC-INDEX",
+            "NIFTYPSE": "NIFTYPSE-INDEX",
+        }
+        if s in mapping:
+            return mapping[s]
+        if s.endswith("-INDEX"):
+            return s
+        if s.startswith("NIFTY") and len(s) > 5:
+            return s + "-INDEX"
+        return None
+
+    mapped = []
+    for name in sorted(index_names):
+        fy = map_to_fyers_index(name)
+        if fy:
+            mapped.append(fy)
+
+    mapped = sorted(dict.fromkeys(mapped))
+    if mapped:
+        return mapped
+    return ["NIFTY50-INDEX", "NIFTYBANK-INDEX"]
 
 def format_fyers_index_symbol(symbol: str) -> str:
     if symbol.startswith("NSE:"):
