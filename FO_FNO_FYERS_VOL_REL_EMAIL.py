@@ -13,11 +13,13 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 
+
 class UTF8Formatter(logging.Formatter):
     def format(self, record):
         msg = record.getMessage()
         record.msg = msg.encode("ascii", "ignore").decode("ascii")
         return super().format(record)
+
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -26,8 +28,7 @@ if logger.hasHandlers():
 ch = logging.StreamHandler(sys.stdout)
 ch.setLevel(logging.INFO)
 formatter = UTF8Formatter(
-    "%(asctime)s | %(levelname)s | %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S"
+    "%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
 )
 ch.setFormatter(formatter)
 logger.addHandler(ch)
@@ -38,14 +39,31 @@ IVP_LOOKBACK_DAYS = 252
 
 fyers: Optional[fyersModel.FyersModel] = None
 
+# TODO: set these according to your email setup
+smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
+sender_password = os.environ.get("SENDER_PASSWORD", "password")
+recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
+
 EMAIL_DISPLAY_COLS = [
-    "Symbol", "LTP", "% Change",
-    "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
-    "Bull_Signal", "Bear_Signal", "Overall_Signal",
+    "Symbol",
+    "LTP",
+    "% Change",
+    "5m_Signal",
+    "15m_Signal",
+    "30m_Signal",
+    "60m_Signal",
+    "Bull_Signal",
+    "Bear_Signal",
+    "Overall_Signal",
     "Price_Lead_Status",
-    "IVP", "Volatility State",
-    "Cumulative KER", "Cumulative ADX",
-    "Cumulative +DI", "Cumulative -DI",
+    "IVP",
+    "Volatility State",
+    "Cumulative KER",
+    "Cumulative ADX",
+    "Cumulative +DI",
+    "Cumulative -DI",
     "Cumulative RSI",
     "Freshness_Score",
     "Last Iteration Time",
@@ -62,10 +80,7 @@ def init_fyers():
             fyers = None
             return
         fyers = fyersModel.FyersModel(
-            client_id=client_id,
-            is_async=False,
-            token=access_token,
-            log_path=""
+            client_id=client_id, is_async=False, token=access_token, log_path=""
         )
         logger.info("INIT FyersModel initialized successfully.")
     except Exception as e:
@@ -79,14 +94,17 @@ def load_fno_symbols_from_sectors(root_dir: str = "sectors") -> List[str]:
         return []
     for dirpath, _, filenames in os.walk(root_dir):
         for fname in filenames:
-            if not fname.lower().endswith('.csv'):
+            if not fname.lower().endswith(".csv"):
                 continue
             try:
                 df = pd.read_csv(os.path.join(dirpath, fname))
                 col = next(
-                    (c for c in df.columns
-                     if c.lower() in ["symbol", "symbols", "ticker"]),
-                    None
+                    (
+                        c
+                        for c in df.columns
+                        if c.lower() in ["symbol", "symbols", "ticker"]
+                    ),
+                    None,
                 )
                 if col is None:
                     continue
@@ -105,7 +123,9 @@ def format_fyers_symbol(symbol: str) -> str:
     return f"NSE:{symbol}-EQ"
 
 
-def get_fyers_history(symbol: str, resolution: str, days_back: int) -> Optional[pd.DataFrame]:
+def get_fyers_history(
+    symbol: str, resolution: str, days_back: int
+) -> Optional[pd.DataFrame]:
     if not fyers:
         return None
     try:
@@ -192,7 +212,7 @@ def compute_cumulative_directional_metrics(curr_df: pd.DataFrame) -> pd.DataFram
         tr[i] = max(
             h[i] - l[i],
             abs(h[i] - c[i - 1]),
-            abs(l[i] - c[i - 1])
+            abs(l[i] - c[i - 1]),
         )
         up = h[i] - h[i - 1]
         dn = l[i - 1] - l[i]
@@ -240,14 +260,16 @@ def compute_cumulative_directional_metrics(curr_df: pd.DataFrame) -> pd.DataFram
         length_so_far = i + 1
         survival_ratio = qualified / length_so_far if length_so_far > 0 else 0.0
 
-        out.append([
-            cum_ker,
-            pdi,
-            mdi,
-            adx,
-            f"{qualified}/{length_so_far}",
-            survival_ratio,
-        ])
+        out.append(
+            [
+                cum_ker,
+                pdi,
+                mdi,
+                adx,
+                f"{qualified}/{length_so_far}",
+                survival_ratio,
+            ]
+        )
 
     cols = [
         "Cumulative KER",
@@ -1003,21 +1025,22 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     if not cols:
         return "<p>No candidates found.</p>"
 
-    header = "<tr>" + "".join(f"<th>{c}</th>" for c in cols) + "</tr>"
-    rows = []
+    header_cells = "".join(f"<th>{c}</th>" for c in cols)
+    header = f"<tr>{header_cells}</tr>"
+
+    row_html = []
     for _, row in df_slice.iterrows():
         cells = "".join(f"<td>{format_value(col, row.get(col))}</td>" for col in cols)
-        rows.append(f"<tr>{cells}</tr>")
-
+        row_html.append(f"<tr>{cells}</tr>")
     body = "
-".join(rows)
-    html = f"""
-    <table border="1" cellspacing="0" cellpadding="3" style="border-collapse: collapse; font-size: 12px;">
-      {header}
-      {body}
-    </table>
-    """
-    return html
+".join(row_html)
+
+    table_html = (
+        "<table border='1' cellspacing='0' cellpadding='3' "
+        "style='border-collapse: collapse; font-size: 12px;'>"
+        f"{header}{body}</table>"
+    )
+    return table_html
 
 
 def send_email_with_tables(
@@ -1037,38 +1060,42 @@ def send_email_with_tables(
 
         scan_time = datetime.now().strftime("%d %b %Y, %H:%M")
 
+        index_long_html = df_to_html_table(index_long_df)
+        index_short_html = df_to_html_table(index_short_df)
+        stock_long_html = df_to_html_table(long_df)
+        stock_short_html = df_to_html_table(short_df)
+
         html_body = f"""
-        <html>
-        <body style="font-family: Arial, sans-serif; font-size: 13px;">
-          <h2>Intraday Vol Iteration Alert</h2>
-          <p>Scan completed at {scan_time}.</p>
+<html>
+  <body style="font-family: Arial, sans-serif; font-size: 13px;">
+    <h2>Intraday Vol Iteration Alert</h2>
+    <p>Scan completed at {scan_time}.</p>
 
-          <h3>Index Long Candidates</h3>
-          {df_to_html_table(index_long_df)}
+    <h3>Index Long Candidates</h3>
+    {index_long_html}
 
-          <h3>Index Short Candidates</h3>
-          {df_to_html_table(index_short_df)}
+    <h3>Index Short Candidates</h3>
+    {index_short_html}
 
-          <h3>Stock Long Candidates (from long indices)</h3>
-          {df_to_html_table(long_df)}
+    <h3>Stock Long Candidates (from long indices)</h3>
+    {stock_long_html}
 
-          <h3>Stock Short Candidates (from short indices)</h3>
-          {df_to_html_table(short_df)}
+    <h3>Stock Short Candidates (from short indices)</h3>
+    {stock_short_html}
 
-          <p>Attached CSVs: summary &amp; intraday iterations.</p>
-        </body>
-        </html>
-        """
+    <p>Attached CSVs: summary &amp; intraday iterations.</p>
+  </body>
+</html>
+"""
 
-        # You must have these configured somewhere in your script/env:
-        # smtp_host, smtp_port, sender_email, sender_password, recipient_email
         msg = MIMEMultipart()
         msg["From"] = sender_email
         msg["To"] = recipient_email
-        msg["Subject"] = f"Intraday Vol Iteration Alert - {datetime.now().strftime('%d %b %H:%M')}"
+        msg["Subject"] = (
+            f"Intraday Vol Iteration Alert - {datetime.now().strftime('%d %b %H:%M')}"
+        )
         msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-        # Attach CSVs
         for filename in [csv_filename, detail_csv_filename]:
             if os.path.exists(filename):
                 with open(filename, "rb") as f:
@@ -1108,13 +1135,28 @@ def send_email_with_tables(
 INDEX_CONSTITUENTS = {
     "NIFTY50-INDEX": [
         # TODO: fill with actual NIFTY 50 F&O symbols; examples:
-        "RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS", "ITC",
-        "AXISBANK", "LT", "KOTAKBANK", "SBIN",
+        "RELIANCE",
+        "HDFCBANK",
+        "ICICIBANK",
+        "INFY",
+        "TCS",
+        "ITC",
+        "AXISBANK",
+        "LT",
+        "KOTAKBANK",
+        "SBIN",
     ],
     "NIFTYBANK-INDEX": [
         # TODO: fill BANKNIFTY basket symbols
-        "HDFCBANK", "ICICIBANK", "AXISBANK", "KOTAKBANK", "SBIN",
-        "INDUSINDBK", "FEDERALBNK", "BANDHANBNK", "PNB",
+        "HDFCBANK",
+        "ICICIBANK",
+        "AXISBANK",
+        "KOTAKBANK",
+        "SBIN",
+        "INDUSINDBK",
+        "FEDERALBNK",
+        "BANDHANBNK",
+        "PNB",
     ],
 }
 
