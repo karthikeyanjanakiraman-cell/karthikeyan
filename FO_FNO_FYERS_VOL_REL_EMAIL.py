@@ -54,14 +54,6 @@ EMAIL_DISPLAY_COLS = [
     "Volatility State", "Last Iteration Time",
 ]
 
-INDEX_DISPLAY_COLS = [
-    "Symbol", "Index Name", "% Change", "Iteration No", "Iteration Minutes", "Iteration Time",
-    "Current Volume", "10 Day Relative Volume", "20 Day Relative Volume",
-    "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score",
-    "Range_Expansion", "Volume_Expansion", "Delta_Expansion",
-    "Price_Leading_Flag", "Price_Lead_Streak", "Price_Lead_Status", "Bucket",
-]
-
 
 def init_fyers():
     global fyers
@@ -109,6 +101,48 @@ def load_fno_symbols_from_sectors(root_dir: str = "sectors") -> List[str]:
                 pass
     return sorted(symbols)
 
+
+def load_symbol_to_indices_map(root_dir: str = "sectors") -> Dict[str, List[str]]:
+    mapping: Dict[str, List[str]] = {}
+    search_dirs = [root_dir, '.']
+    for base in search_dirs:
+        if not os.path.isdir(base):
+            continue
+        for dirpath, _, filenames in os.walk(base):
+            for fname in filenames:
+                if not fname.lower().endswith('.csv'):
+                    continue
+                path = os.path.join(dirpath, fname)
+                try:
+                    df = pd.read_csv(path)
+                except Exception:
+                    continue
+                cols = {str(c).strip().lower(): c for c in df.columns}
+                sym_col = None
+                for key in ['symbol', 'symbols', 'ticker']:
+                    if key in cols:
+                        sym_col = cols[key]
+                        break
+                idx_col = None
+                for key in ['belongstoindices', 'belongs_to_indices', 'index name', 'index_name', 'sector', 'indices']:
+                    if key in cols:
+                        idx_col = cols[key]
+                        break
+                if not sym_col or not idx_col:
+                    continue
+                for _, row in df[[sym_col, idx_col]].dropna().iterrows():
+                    sym = str(row[sym_col]).strip().upper()
+                    raw_idx = str(row[idx_col]).strip()
+                    if not sym or not raw_idx:
+                        continue
+                    parts = [p.strip() for p in re.split(r'[|;,/]+', raw_idx) if p.strip()]
+                    if not parts:
+                        parts = [raw_idx]
+                    current = mapping.setdefault(sym, [])
+                    for part in parts:
+                        if part not in current:
+                            current.append(part)
+    return mapping
 
 def resolve_universe_csv() -> str:
     csv_files = []
@@ -1396,15 +1430,27 @@ def build_index_iteration_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
         "Current Volume", "10 Day Relative Volume", "20 Day Relative Volume",
         "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score",
         "Range_Expansion", "Volume_Expansion", "Delta_Expansion",
-        "Price_Leading_Flag", "Price_Lead_Streak", "Price_Lead_Status", "Bucket",
+        "Price_Leading_Flag", "Price_Lead_Streak",
     ]
     missing = [c for c in required if c not in work.columns]
     if missing:
         logger.warning(f"INDEX Missing columns for index detail build: {missing}")
         return pd.DataFrame()
 
-    work["Bucket"] = work["Bucket"].astype(str).str.strip()
-    work["Index Name"] = work["Bucket"]
+    symbol_to_indices = load_symbol_to_indices_map("sectors")
+    if not symbol_to_indices:
+        logger.warning("INDEX No symbol-to-index mapping found from sectors CSVs.")
+        return pd.DataFrame()
+
+    work["Symbol"] = work["Symbol"].astype(str).str.strip().str.upper()
+    work["Index Name"] = work["Symbol"].map(symbol_to_indices)
+    work = work[work["Index Name"].notna()].copy()
+    if work.empty:
+        logger.warning("INDEX No mapped symbols found for sectoral index detail build.")
+        return pd.DataFrame()
+
+    work = work.explode("Index Name").reset_index(drop=True)
+    work["Index Name"] = work["Index Name"].astype(str).str.strip()
 
     numeric_cols = [
         "% Change", "Iteration No", "Iteration Minutes", "Current Volume",
@@ -1420,7 +1466,7 @@ def build_index_iteration_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
     work["Price_Leading_Flag"] = work["Price_Leading_Flag"].astype(str).str.lower().isin(["true", "1", "yes"])
 
     group_cols = ["Index Name", "Iteration No", "Iteration Minutes", "Iteration Time"]
-    agg_map = {
+    agg_spec = {
         "% Change": "mean",
         "Current Volume": "sum",
         "10 Day Relative Volume": "mean",
@@ -1435,20 +1481,21 @@ def build_index_iteration_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
         "Price_Leading_Flag": "sum",
         "Price_Lead_Streak": "max",
     }
+    agg_spec = {k: v for k, v in agg_spec.items() if k in work.columns}
 
-    available_agg = {k: v for k, v in agg_map.items() if k in work.columns}
-    out = work.groupby(group_cols, dropna=False).agg(available_agg).reset_index()
-
+    out = work.groupby(group_cols, dropna=False).agg(agg_spec).reset_index()
     out["Symbol"] = out["Index Name"]
     out["Bucket"] = "INDEX"
     out["Price_Leading_Flag"] = out["Price_Leading_Flag"].fillna(0).astype(int) > 0
 
     def _lead_status(row):
-        if bool(row.get("Price_Leading_Flag", False)) and float(row.get("Price_Lead_Streak", 0) or 0) >= 3:
+        streak = float(row.get("Price_Lead_Streak", 0) or 0)
+        flag = bool(row.get("Price_Leading_Flag", False))
+        if flag and streak >= 3:
             return "STRONG_PRICE_LEAD_FADE"
-        if bool(row.get("Price_Leading_Flag", False)) and float(row.get("Price_Lead_Streak", 0) or 0) >= 2:
+        if flag and streak >= 2:
             return "PRICE_LEADING_FADE_RISK"
-        if bool(row.get("Price_Leading_Flag", False)):
+        if flag:
             return "EARLY_PRICE_LEAD"
         return "NORMAL"
 
@@ -1532,7 +1579,7 @@ def main_index_first():
     if isinstance(index_iter_df, pd.DataFrame) and not index_iter_df.empty:
         index_iter_csv = f'fo_idx_iteration_summary_{timestamp}.csv'
         index_iter_df.to_csv(index_iter_csv, index=False)
-        logger.info(f'INDEX Detail CSV saved: {index_iter_csv}')
+        logger.info(f'INDEX Iteration summary saved: {index_iter_csv}')
 
     send_email_with_tables(long_df, short_df, summary_csv, detail_csv, index_long_df=index_long_df, index_short_df=index_short_df, index_iter_csv_filename=(index_iter_csv if 'index_iter_csv' in locals() else None))
     logger.info('Index-first Scan Pipeline Completed')
