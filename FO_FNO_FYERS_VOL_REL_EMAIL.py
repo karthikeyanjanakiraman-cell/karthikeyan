@@ -65,7 +65,6 @@ EMAIL_DISPLAY_COLS = [
     "Cumulative +DI",
     "Cumulative -DI",
     "Cumulative RSI",
-    "Freshness_Score",
     "Last Iteration Time",
 ]
 
@@ -343,124 +342,6 @@ def compute_cumulative_flow_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([df.reset_index(drop=True), out.reset_index(drop=True)], axis=1)
 
 
-def calculate_hybrid_freshness(df_intraday: pd.DataFrame) -> pd.DataFrame:
-    if df_intraday is None or df_intraday.empty:
-        return df_intraday
-
-    work = df_intraday.copy()
-    if "time" not in work.columns and "timestamp" in work.columns:
-        work["time"] = pd.to_datetime(work["timestamp"])
-
-    work = work.sort_values("time").reset_index(drop=True)
-    if len(work) < 3:
-        work["Freshness_Score"] = 50.0
-        work["Is_Fresh"] = False
-        work["Fresh_State"] = ""
-        work["Fresh_Since"] = ""
-        return work
-
-    work["rolling_HOD"] = work["high"].cummax()
-    work["vol_sma_10"] = (
-        work["volume"].rolling(window=10, min_periods=1).mean().shift(1)
-    )
-    work["vol_sma_10"] = work["vol_sma_10"].fillna(work["volume"].mean())
-    work["vol_ratio"] = np.where(
-        work["vol_sma_10"] > 0,
-        work["volume"] / work["vol_sma_10"],
-        0.0,
-    )
-
-    open_price = float(work.iloc[0]["open"])
-    work["close_vs_open_pct"] = (
-        (work["close"] - open_price) / open_price * 100
-    )
-
-    ib_high = float(work.iloc[0:3]["high"].max())
-    ib_vol_avg = float(work.iloc[0:3]["volume"].mean()) if len(
-        work.iloc[0:3]
-    ) > 0 else 0.0
-
-    freshness_scores, is_fresh_flags = [], []
-
-    for i in range(len(work)):
-        row = work.iloc[i]
-        base_score = min(
-            100.0, max(0.0, row["close_vs_open_pct"] / 3.0 * 100.0)
-        )
-        score = base_score
-        is_fresh = False
-
-        if i < 3:
-            score = base_score
-        elif 3 <= i < 11:
-            dist_to_ib_high = (
-                (ib_high - row["close"]) / ib_high * 100.0
-                if ib_high > 0
-                else 999.0
-            )
-            vol_vs_ib = (
-                row["volume"] / ib_vol_avg if ib_vol_avg > 0 else 0.0
-            )
-            if dist_to_ib_high < 0.3 or row["close"] > ib_high:
-                score = score * 0.2 if vol_vs_ib < 0.8 else min(
-                    100.0, score * 1.5
-                )
-                is_fresh = vol_vs_ib >= 0.8
-        else:
-            prev_hod = float(work.iloc[i - 1]["rolling_HOD"])
-            dist_to_prev_hod = (
-                (prev_hod - row["close"]) / prev_hod * 100.0
-                if prev_hod > 0
-                else 999.0
-            )
-            if dist_to_prev_hod < 0.3 or row["close"] > prev_hod:
-                score = score * 0.2 if row["vol_ratio"] < 1.3 else min(
-                    100.0, score * 1.5
-                )
-                is_fresh = row["vol_ratio"] >= 1.3
-            elif row["vol_ratio"] > 2.0 and row["close"] > row["open"]:
-                score = min(100.0, score * 1.2)
-                is_fresh = True
-
-        freshness_scores.append(round(score, 1))
-        is_fresh_flags.append(is_fresh)
-
-    work["Freshness_Score"] = freshness_scores
-    work["Is_Fresh"] = is_fresh_flags
-
-    prev_fresh = work["Is_Fresh"].shift(1).fillna(False)
-    fresh_states, fresh_since = [], []
-    fresh_start_time = ""
-    fresh_cycle = 0
-
-    for i in range(len(work)):
-        curr = bool(work.loc[i, "Is_Fresh"])
-        prev = bool(prev_fresh.iloc[i])
-        tstr = pd.to_datetime(work.loc[i, "time"]).strftime("%H:%M")
-
-        if curr and not prev:
-            fresh_cycle += 1
-            fresh_start_time = tstr
-            state = "Fresh" if fresh_cycle == 1 else "Re-Ignited"
-            since = tstr
-        elif curr and prev:
-            state = "Fresh"
-            since = fresh_start_time
-        elif (not curr) and prev:
-            state = "Fresh Lost"
-            since = tstr
-        else:
-            state = ""
-            since = ""
-
-        fresh_states.append(state)
-        fresh_since.append(since)
-
-    work["Fresh_State"] = fresh_states
-    work["Fresh_Since"] = fresh_since
-    return work
-
-
 def compute_price_lead_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
     df = curr_df.copy().sort_values("time").reset_index(drop=True)
     if df.empty:
@@ -557,7 +438,7 @@ def compute_iteration_volume_profile(
     if intra_df is None or intra_df.empty:
         return {}, pd.DataFrame()
 
-    df = calculate_hybrid_freshness(intra_df.copy())
+    df = intra_df.copy()
     if "timestamp" in df.columns:
         df["date"] = pd.to_datetime(df["timestamp"]).dt.date
         df["time_only"] = pd.to_datetime(df["timestamp"]).dt.time
@@ -674,12 +555,6 @@ def compute_iteration_volume_profile(
                 )
                 if not price_lead_df.empty
                 else "NORMAL",
-                "Freshness_Score": float(curr_df["Freshness_Score"].iloc[i])
-                if "Freshness_Score" in curr_df.columns
-                else float("nan"),
-                "Is_Fresh": bool(curr_df["Is_Fresh"].iloc[i])
-                if "Is_Fresh" in curr_df.columns
-                else False,
             }
         )
 
@@ -713,9 +588,6 @@ def compute_iteration_volume_profile(
 
     adx_now = float(metric_df["Cumulative ADX"].iloc[-1]) if not metric_df.empty else float("nan")
     ker_now = float(metric_df["Cumulative KER"].iloc[-1]) if not metric_df.empty else float("nan")
-
-    fresh_score = float(curr_df["Freshness_Score"].iloc[-1]) if "Freshness_Score" in curr_df.columns else 0.0
-    is_fresh = bool(fresh_score >= 60.0) and bool(adx_now > 20.0) and bool(ker_now > 0.40)
 
     summary = {
         "LTP": ltp,
@@ -764,14 +636,6 @@ def compute_iteration_volume_profile(
         "Price_Lead_Status": str(price_lead_df["Price_Lead_Status"].iloc[-1])
         if not price_lead_df.empty
         else "NORMAL",
-        "Freshness_Score": float(fresh_score),
-        "Fresh_State": str(df["Fresh_State"].iloc[-1])
-        if "Fresh_State" in df.columns
-        else "",
-        "Fresh_Since": str(df["Fresh_Since"].iloc[-1])
-        if "Fresh_Since" in df.columns
-        else "",
-        "Is_Fresh": bool(is_fresh),
     }
 
     return summary, detail_df
@@ -847,10 +711,6 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
                 "OBV_30m_Delta": iter_summary.get("OBV_30m_Delta"),
                 "RSI_30m_Delta": iter_summary.get("RSI_30m_Delta"),
                 "Price_Lead_Status": iter_summary.get("Price_Lead_Status", "NORMAL"),
-                "Freshness_Score": iter_summary.get("Freshness_Score"),
-                "Fresh_State": iter_summary.get("Fresh_State"),
-                "Fresh_Since": iter_summary.get("Fresh_Since"),
-                "Is_Fresh": iter_summary.get("Is_Fresh"),
                 "IVP": iv_info.get("IVP"),
                 "Volatility State": iv_info.get("Volatility State"),
             }
@@ -895,13 +755,9 @@ def derive_rank_columns(df: pd.DataFrame) -> pd.DataFrame:
             score += 2
         if pd.notna(row.get("Cumulative ADX")) and row.get("Cumulative ADX") >= 20:
             score += 1
-        if bool(row.get("Is_Fresh", False)):
-            score += 1
         if pd.notna(row.get("Cumulative KER")) and row.get("Cumulative KER") >= 0.40:
             score += 1
         if pd.notna(row.get("Cumulative RSI")) and row.get("Cumulative RSI") >= 55:
-            score += 1
-        if pd.notna(row.get("Freshness_Score")) and row.get("Freshness_Score") >= 60:
             score += 1
         return min(score, 13)
 
@@ -915,13 +771,9 @@ def derive_rank_columns(df: pd.DataFrame) -> pd.DataFrame:
             score += 2
         if pd.notna(row.get("Cumulative ADX")) and row.get("Cumulative ADX") >= 20:
             score += 1
-        if bool(row.get("Is_Fresh", False)):
-            score += 1
         if pd.notna(row.get("Cumulative KER")) and row.get("Cumulative KER") >= 0.40:
             score += 1
         if pd.notna(row.get("Cumulative RSI")) and row.get("Cumulative RSI") <= 45:
-            score += 1
-        if pd.notna(row.get("Freshness_Score")) and row.get("Freshness_Score") >= 60:
             score += 1
         return min(score, 13)
 
@@ -1229,10 +1081,6 @@ def scan_index_universe() -> pd.DataFrame:
                 "OBV_30m_Delta": iter_summary.get("OBV_30m_Delta"),
                 "RSI_30m_Delta": iter_summary.get("RSI_30m_Delta"),
                 "Price_Lead_Status": iter_summary.get("Price_Lead_Status", "NORMAL"),
-                "Freshness_Score": iter_summary.get("Freshness_Score"),
-                "Fresh_State": iter_summary.get("Fresh_State"),
-                "Fresh_Since": iter_summary.get("Fresh_Since"),
-                "Is_Fresh": iter_summary.get("Is_Fresh"),
                 "IVP": iv_info.get("IVP"),
                 "Volatility State": iv_info.get("Volatility State"),
             }
@@ -1319,10 +1167,6 @@ def scan_symbol_universe(symbols: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame
                 "OBV_30m_Delta": iter_summary.get("OBV_30m_Delta"),
                 "RSI_30m_Delta": iter_summary.get("RSI_30m_Delta"),
                 "Price_Lead_Status": iter_summary.get("Price_Lead_Status", "NORMAL"),
-                "Freshness_Score": iter_summary.get("Freshness_Score"),
-                "Fresh_State": iter_summary.get("Fresh_State"),
-                "Fresh_Since": iter_summary.get("Fresh_Since"),
-                "Is_Fresh": iter_summary.get("Is_Fresh"),
                 "IVP": iv_info.get("IVP"),
                 "Volatility State": iv_info.get("Volatility State"),
             }
