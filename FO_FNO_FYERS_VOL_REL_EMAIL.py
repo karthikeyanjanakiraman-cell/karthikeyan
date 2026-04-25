@@ -624,3 +624,281 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+
+##############################
+# INDEX-FIRST EXTENSIONS
+##############################
+from typing import List
+
+# Map indices to their F&O constituents (symbols must match your sector CSVs)
+INDEX_CONSTITUENTS = {
+    "NIFTY50-INDEX": [
+        # TODO: fill with actual NIFTY 50 F&O symbols; examples:
+        "RELIANCE", "HDFCBANK", "ICICIBANK", "INFY", "TCS", "ITC",
+        "AXISBANK", "LT", "KOTAKBANK", "SBIN",
+    ],
+    "NIFTYBANK-INDEX": [
+        # TODO: fill BANKNIFTY basket symbols
+        "HDFCBANK", "ICICIBANK", "AXISBANK", "KOTAKBANK", "SBIN",
+        "INDUSINDBK", "FEDERALBNK", "BANDHANBNK", "PNB",
+    ],
+}
+
+
+def load_index_symbols() -> List[str]:
+    """Return index symbols to scan on Fyers."""
+    return [
+        "NIFTY50-INDEX",
+        "NIFTYBANK-INDEX",
+    ]
+
+
+def format_fyers_index_symbol(symbol: str) -> str:
+    """Format index symbol for Fyers (no -EQ suffix)."""
+    if symbol.startswith("NSE:"):
+        return symbol
+    return f"NSE:{symbol}"
+
+
+def scan_index_universe() -> pd.DataFrame:
+    """Scan configured indices using same metric stack as F&O universe."""
+    symbols = load_index_symbols()
+    if not symbols:
+        logger.error("INDEX No index symbols configured.")
+        return pd.DataFrame()
+
+    rows = []
+    total = len(symbols)
+
+    for idx, sym in enumerate(symbols, start=1):
+        logger.info(f"INDEX [{idx}/{total}] Processing {sym}")
+        fyers_sym = format_fyers_index_symbol(sym)
+
+        daily_df = get_fyers_history(
+            fyers_sym,
+            resolution="D",
+            days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS),
+        )
+        intra_df = get_fyers_history(
+            fyers_sym,
+            resolution="5",
+            days_back=INTRADAY_LOOKBACK_DAYS,
+        )
+
+        iter_summary, _ = compute_iteration_volume_profile(intra_df)
+        iv_info = compute_iv_proxies(daily_df)
+
+        prev_close = float(daily_df["close"].iloc[-2]) if (
+            daily_df is not None and len(daily_df) >= 2
+        ) else None
+        ltp = iter_summary.get("LTP")
+        pct_change = (
+            (ltp - prev_close) / prev_close * 100
+            if (ltp is not None and prev_close and prev_close != 0)
+            else 0.0
+        )
+
+        rows.append({
+            "Symbol": sym,
+            "LTP": ltp,
+            "% Change": pct_change,
+            "Current Volume": iter_summary.get("Current Volume"),
+            "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"),
+            "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"),
+            "Cumulative RSI": iter_summary.get("Cumulative RSI"),
+            "Cumulative OBV": iter_summary.get("Cumulative OBV"),
+            "Cumulative VWAP": iter_summary.get("Cumulative VWAP"),
+            "VWAP Z-Score": iter_summary.get("VWAP Z-Score"),
+            "Total Iterations": iter_summary.get("Total Iterations"),
+            "Last Iteration Minutes": iter_summary.get("Last Iteration Minutes"),
+            "Last Iteration Time": iter_summary.get("Last Iteration Time"),
+            "Cumulative KER": iter_summary.get("Cumulative KER"),
+            "Cumulative +DI": iter_summary.get("Cumulative +DI"),
+            "Cumulative -DI": iter_summary.get("Cumulative -DI"),
+            "Cumulative ADX": iter_summary.get("Cumulative ADX"),
+            "Survival Score": iter_summary.get("Survival Score"),
+            "Survival_Num": iter_summary.get("Survival_Num"),
+            "HOD": iter_summary.get("HOD"),
+            "Strike_Distance": iter_summary.get("Strike_Distance"),
+            "Last_5m_Volume": iter_summary.get("Last_5m_Volume"),
+            "Volume_1h_Avg_5m": iter_summary.get("Volume_1h_Avg_5m"),
+            "OBV_30m_Delta": iter_summary.get("OBV_30m_Delta"),
+            "RSI_30m_Delta": iter_summary.get("RSI_30m_Delta"),
+            "Price_Lead_Status": iter_summary.get("Price_Lead_Status", "NORMAL"),
+            "Freshness_Score": iter_summary.get("Freshness_Score"),
+            "Fresh_State": iter_summary.get("Fresh_State"),
+            "Fresh_Since": iter_summary.get("Fresh_Since"),
+            "Is_Fresh": iter_summary.get("Is_Fresh"),
+            "IVP": iv_info.get("IVP"),
+            "Volatility State": iv_info.get("Volatility State"),
+        })
+
+    df_idx = pd.DataFrame(rows)
+    df_idx = derive_rank_columns(df_idx)
+    df_idx = add_signal_columns(df_idx)
+    return df_idx
+
+
+def load_fno_symbols_for_indices(active_index_symbols: List[str]) -> List[str]:
+    """Return F&O symbols that belong to any of the given indices."""
+    all_fno = set(load_fno_symbols_from_sectors("sectors"))
+    selected = set()
+    for idx_sym in active_index_symbols:
+        members = INDEX_CONSTITUENTS.get(idx_sym, [])
+        for s in members:
+            if s in all_fno:
+                selected.add(s)
+    return sorted(selected)
+
+
+def scan_symbol_universe(symbols: List[str]):
+    """Generic scanner using existing F&O logic for a given list of symbols."""
+    if not symbols:
+        logger.error("CORE No symbols to scan.")
+        return pd.DataFrame(), pd.DataFrame()
+
+    rows, iteration_rows = [], []
+    total = len(symbols)
+
+    for idx, sym in enumerate(symbols, start=1):
+        logger.info(f"CORE [{idx}/{total}] Processing {sym}")
+        fyers_sym = format_fyers_symbol(sym)
+
+        daily_df = get_fyers_history(
+            fyers_sym,
+            resolution="D",
+            days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS),
+        )
+        intra_df = get_fyers_history(
+            fyers_sym,
+            resolution="5",
+            days_back=INTRADAY_LOOKBACK_DAYS,
+        )
+
+        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
+        iv_info = compute_iv_proxies(daily_df)
+
+        prev_close = float(daily_df["close"].iloc[-2]) if (
+            daily_df is not None and len(daily_df) >= 2
+        ) else None
+        ltp = iter_summary.get("LTP")
+        pct_change = (
+            (ltp - prev_close) / prev_close * 100
+            if (ltp is not None and prev_close and prev_close != 0)
+            else 0.0
+        )
+
+        if iter_detail is not None and not iter_detail.empty:
+            iter_detail.insert(0, "Symbol", sym)
+            iter_detail.insert(1, "% Change", pct_change)
+            iteration_rows.append(iter_detail)
+
+        rows.append({
+            "Symbol": sym,
+            "LTP": ltp,
+            "% Change": pct_change,
+            "Current Volume": iter_summary.get("Current Volume"),
+            "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"),
+            "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"),
+            "Cumulative RSI": iter_summary.get("Cumulative RSI"),
+            "Cumulative OBV": iter_summary.get("Cumulative OBV"),
+            "Cumulative VWAP": iter_summary.get("Cumulative VWAP"),
+            "VWAP Z-Score": iter_summary.get("VWAP Z-Score"),
+            "Total Iterations": iter_summary.get("Total Iterations"),
+            "Last Iteration Minutes": iter_summary.get("Last Iteration Minutes"),
+            "Last Iteration Time": iter_summary.get("Last Iteration Time"),
+            "Cumulative KER": iter_summary.get("Cumulative KER"),
+            "Cumulative +DI": iter_summary.get("Cumulative +DI"),
+            "Cumulative -DI": iter_summary.get("Cumulative -DI"),
+            "Cumulative ADX": iter_summary.get("Cumulative ADX"),
+            "Survival Score": iter_summary.get("Survival Score"),
+            "Survival_Num": iter_summary.get("Survival_Num"),
+            "HOD": iter_summary.get("HOD"),
+            "Strike_Distance": iter_summary.get("Strike_Distance"),
+            "Last_5m_Volume": iter_summary.get("Last_5m_Volume"),
+            "Volume_1h_Avg_5m": iter_summary.get("Volume_1h_Avg_5m"),
+            "OBV_30m_Delta": iter_summary.get("OBV_30m_Delta"),
+            "RSI_30m_Delta": iter_summary.get("RSI_30m_Delta"),
+            "Price_Lead_Status": iter_summary.get("Price_Lead_Status", "NORMAL"),
+            "Freshness_Score": iter_summary.get("Freshness_Score"),
+            "Fresh_State": iter_summary.get("Fresh_State"),
+            "Fresh_Since": iter_summary.get("Fresh_Since"),
+            "Is_Fresh": iter_summary.get("Is_Fresh"),
+            "IVP": iv_info.get("IVP"),
+            "Volatility State": iv_info.get("Volatility State"),
+        })
+
+    df_all = pd.DataFrame(rows)
+    df_iter = (
+        pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame()
+    )
+    return df_all, df_iter
+
+
+def main_index_first():
+    """Entry point: index-first, direction-aligned stock selection."""
+    logger.info("Starting Index-first F&O Iteration Volume Volatility Scan")
+    init_fyers()
+
+    # 1) Scan indices and get top long / short
+    df_indices = scan_index_universe()
+    index_long_df, index_short_df = build_candidate_tables(df_indices)
+
+    top_long_indices = index_long_df["Symbol"].head(2).tolist()
+    top_short_indices = index_short_df["Symbol"].head(2).tolist()
+
+    logger.info(f"Top long indices: {top_long_indices}")
+    logger.info(f"Top short indices: {top_short_indices}")
+
+    # 2) Build direction-aligned F&O baskets
+    long_side_symbols = load_fno_symbols_for_indices(top_long_indices)
+    short_side_symbols = load_fno_symbols_for_indices(top_short_indices)
+
+    # 3) Scan long basket and keep only long candidates
+    df_long_all, df_long_iter = scan_symbol_universe(long_side_symbols)
+    if not df_long_all.empty:
+        df_long_all = derive_rank_columns(df_long_all)
+        df_long_all = add_signal_columns(df_long_all)
+        long_long_df, _ = build_candidate_tables(df_long_all)
+    else:
+        long_long_df = pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+        df_long_iter = pd.DataFrame()
+
+    # 4) Scan short basket and keep only short candidates
+    df_short_all, df_short_iter = scan_symbol_universe(short_side_symbols)
+    if not df_short_all.empty:
+        df_short_all = derive_rank_columns(df_short_all)
+        df_short_all = add_signal_columns(df_short_all)
+        _, short_short_df = build_candidate_tables(df_short_all)
+    else:
+        short_short_df = pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+        df_short_iter = pd.DataFrame()
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    summary_csv = f"fo_idx_filtered_summary_{timestamp}.csv"
+    detail_csv = f"fo_idx_filtered_details_{timestamp}.csv"
+
+    # Merge iterations just for logging/export convenience
+    df_all = pd.concat([df_long_all, df_short_all], ignore_index=True) if (
+        not df_long_all.empty or not df_short_all.empty
+    ) else pd.DataFrame()
+    df_iter = pd.concat([df_long_iter, df_short_iter], ignore_index=True) if (
+        not df_long_iter.empty or not df_short_iter.empty
+    ) else pd.DataFrame()
+
+    if not df_all.empty:
+        df_all.to_csv(summary_csv, index=False)
+    else:
+        pd.DataFrame().to_csv(summary_csv, index=False)
+
+    if not df_iter.empty:
+        df_iter.to_csv(detail_csv, index=False)
+    else:
+        pd.DataFrame().to_csv(detail_csv, index=False)
+
+    # Reuse existing email function. We pass long/short STOCK tables
+    # and let you extend the HTML later to also include index_long_df/index_short_df
+    send_email_with_tables(long_long_df, short_short_df, summary_csv, detail_csv)
+
+    logger.info("Index-first Scan Pipeline Completed")
