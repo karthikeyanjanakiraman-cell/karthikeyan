@@ -1166,15 +1166,23 @@ def load_index_symbols(csv_path: str = None) -> List[str]:
         return mapped
     return ['NIFTY50-INDEX', 'NIFTYBANK-INDEX']
 
+if __name__ == "__main__":
+    main_index_first()
 
 
-# --- Guaranteed entrypoint wrapper ---
-try:
-    main_index_first
-except NameError:
-    def main_index_first():
-        logger.info("No explicit main function found; exiting safely.")
-        return None
+
+def main_index_first():
+    logger.info("Starting Index-first FO Iteration Volume Volatility Scan")
+    init_fyers()
+    if 'scan_index_universe' in globals():
+        df_indices = scan_index_universe()
+        index_long_df, index_short_df = build_candidate_tables(df_indices) if 'build_candidate_tables' in globals() else (pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS))
+        top_long_indices = index_long_df["Symbol"].head(2).tolist() if not index_long_df.empty and "Symbol" in index_long_df.columns else []
+        top_short_indices = index_short_df["Symbol"].head(2).tolist() if not index_short_df.empty and "Symbol" in index_short_df.columns else []
+        logger.info(f"Top long indices: {top_long_indices}")
+        logger.info(f"Top short indices: {top_short_indices}")
+    else:
+        logger.info("scan_index_universe missing in source file")
 
 if __name__ == "__main__":
     main_index_first()
