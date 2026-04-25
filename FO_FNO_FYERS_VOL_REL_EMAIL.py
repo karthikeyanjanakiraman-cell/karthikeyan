@@ -6,7 +6,10 @@ from typing import List, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from fyersapiv3 import fyersModel
+try:
+    from fyersapiv3 import fyersModel
+except ModuleNotFoundError:
+    fyersModel = None
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -40,7 +43,7 @@ EMAIL_DISPLAY_COLS = [
     "Volatility State", "Last Iteration Time"
 ]
 
-fyers: Optional[fyersModel.FyersModel] = None
+fyers = None
 
 smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 smtp_port = int(os.environ.get("SMTP_PORT", 587))
@@ -56,6 +59,10 @@ def init_fyers():
         access_token = os.environ.get("ACCESS_TOKEN")
         if not client_id or not access_token:
             logger.warning("INIT Missing Fyers credentials")
+            fyers = None
+            return
+        if fyersModel is None:
+            logger.warning("INIT fyersapiv3 package not installed. Install with: pip install fyers-apiv3")
             fyers = None
             return
         fyers = fyersModel.FyersModel(client_id=client_id, is_async=False, token=access_token, log_path="")
