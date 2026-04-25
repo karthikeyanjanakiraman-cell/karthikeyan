@@ -839,27 +839,32 @@ def add_signal_columns(df: pd.DataFrame) -> pd.DataFrame:
 def signal_color(label: str) -> str:
     label = str(label).strip()
     if label == "Buy++":
-        return "#0b6623"
+        return "#2e7d32"
     if label == "Buy+":
-        return "#1e8449"
+        return "#3f8f45"
     if label == "Buy":
-        return "#27ae60"
+        return "#5b9b5f"
     if label == "Buyer Zone":
-        return "#145a32"
+        return "#33691e"
     if label == "Neutral":
-        return "#555555"
+        return "#4b5563"
     if label == "Neutral Vol":
-        return "#555555"
+        return "#4b5563"
     if label == "Sell++":
-        return "#922b21"
+        return "#7f1d1d"
     if label == "Sell+":
-        return "#c0392b"
+        return "#a83232"
     if label == "Sell":
-        return "#e74c3c"
+        return "#b94a48"
     if label == "Avoid Buy Premium":
-        return "#7d6608"
-    return "#2c2c2c"
+        return "#7a5c00"
+    return "#374151"
 
+def text_color_for_bg(bg: str) -> str:
+    bg = str(bg).lower()
+    if bg in {"#4b5563", "#374151", "#7f1d1d", "#a83232", "#b94a48", "#7a5c00", "#33691e", "#2e7d32", "#3f8f45"}:
+        return "#f3f4f6"
+    return "#ffffff"
 
 def format_value(col: str, val):
     if pd.isna(val):
@@ -916,29 +921,62 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
 
 def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     if df is None or df.empty:
-        return "<p>No candidates found.</p>"
+        return '<p style="color:#cbd5e1;font-family:Arial,sans-serif;">No candidates found.</p>'
 
     df_slice = df.head(max_rows).copy()
     cols = [c for c in EMAIL_DISPLAY_COLS if c in df_slice.columns]
     if not cols:
-        return "<p>No candidates found.</p>"
+        return '<p style="color:#cbd5e1;font-family:Arial,sans-serif;">No candidates found.</p>'
 
-    header_cells = "".join(f"<th>{c}</th>" for c in cols)
-    header = f"<tr>{header_cells}</tr>"
-
-    row_html = []
-    for _, row in df_slice.iterrows():
-        cells = "".join(f"<td>{format_value(col, row.get(col))}</td>" for col in cols)
-        row_html.append(f"<tr>{cells}</tr>")
-    body = "\n".join(row_html)
-
-    table_html = (
-        "<table border='1' cellspacing='0' cellpadding='3' "
-        "style='border-collapse: collapse; font-size: 12px;'>"
-        f"{header}{body}</table>"
+    header_cells = ''.join(
+        f'<th style="padding:8px 10px;border:1px solid #4b5563;background:#374151;color:#f9fafb;font-size:12px;font-weight:700;text-align:center;white-space:nowrap;">{c}</th>'
+        for c in cols
     )
-    return table_html
 
+    rows_html = []
+    signal_cols = {
+        '5m_Signal', '15m_Signal', '30m_Signal', '60m_Signal',
+        'Bull_Signal', 'Bear_Signal', 'Overall_Signal', 'Volatility State', 'Price_Lead_Status'
+    }
+
+    for _, row in df_slice.iterrows():
+        cells = []
+        for c in cols:
+            val = format_value(c, row.get(c))
+            bg = '#2f3542'
+            fg = '#f3f4f6'
+            extra = 'text-align:center;'
+            if c in signal_cols:
+                bg = signal_color(val)
+                fg = text_color_for_bg(bg)
+            elif c == 'Symbol':
+                bg = '#374151'
+                fg = '#f9fafb'
+                extra = 'text-align:left;font-weight:700;'
+            elif c == '% Change':
+                try:
+                    num = float(str(val).replace('%', ''))
+                    if num > 0:
+                        bg = '#2e7d32'
+                        fg = '#e8f5e9'
+                    elif num < 0:
+                        bg = '#a83232'
+                        fg = '#ffebee'
+                    else:
+                        bg = '#4b5563'
+                        fg = '#f3f4f6'
+                except Exception:
+                    bg = '#4b5563'
+                    fg = '#f3f4f6'
+            elif c in {'LTP', 'IVP'}:
+                bg = '#303643'
+                fg = '#f3f4f6'
+            else:
+                bg = '#3b4252'
+                fg = '#f3f4f6'
+            cells.append(f'<td style="padding:7px 9px;border:1px solid #4b5563;background:{bg};color:{fg};font-size:12px;font-weight:600;white-space:nowrap;{extra}">{val}</td>')
+        rows_html.append('<tr>' + ''.join(cells) + '</tr>')
+    return ('<div style="overflow-x:auto;margin:10px 0 18px 0;">' '<table style="border-collapse:collapse;background:#1f2937;font-family:Arial,sans-serif;">' f'<thead><tr>{header_cells}</tr></thead>' f'<tbody>{"".join(rows_html)}</tbody>' '</table></div>')
 
 def send_email_with_tables(
     long_df: pd.DataFrame,
