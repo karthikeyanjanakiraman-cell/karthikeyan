@@ -1166,23 +1166,182 @@ def load_index_symbols(csv_path: str = None) -> List[str]:
         return mapped
     return ['NIFTY50-INDEX', 'NIFTYBANK-INDEX']
 
-if __name__ == "__main__":
-    main_index_first()
 
+
+# --- compatibility helpers added for stable runtime ---
+
+def _ensure_required_columns(df: pd.DataFrame) -> pd.DataFrame:
+    if df is None:
+        return pd.DataFrame()
+    out = df.copy()
+    aliases = {
+        'Change': '% Change',
+        'Cumulative DI': 'Cumulative +DI',
+        'SurvivalNum': 'Survival_Num',
+        'PriceLeadStatus': 'Price_Lead_Status',
+        'StrikeDistance': 'Strike_Distance',
+        'Last5mVolume': 'Last_5m_Volume',
+        'Volume1hAvg5m': 'Volume_1h_Avg_5m',
+        'OBV30mDelta': 'OBV_30m_Delta',
+        'RSI30mDelta': 'RSI_30m_Delta',
+    }
+    for target, source in aliases.items():
+        if target not in out.columns and source in out.columns:
+            out[target] = out[source]
+    defaults = {
+        'Symbol': '', 'LTP': float('nan'), 'Change': 0.0,
+        '5mSignal': '', '15mSignal': '', '30mSignal': '', '60mSignal': '',
+        'BullSignal': '', 'BearSignal': '', 'OverallSignal': '',
+        'PriceLeadStatus': 'NORMAL', 'IVP': float('nan'),
+        'Volatility State': 'Neutral Vol', 'Last Iteration Time': '',
+        'Cumulative KER': float('nan'), 'Cumulative DI': float('nan'),
+        'Cumulative -DI': float('nan'), 'Cumulative ADX': float('nan'),
+        'SurvivalNum': 0.0,
+    }
+    for col, val in defaults.items():
+        if col not in out.columns:
+            out[col] = val
+    return out
+
+
+def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    base = _ensure_required_columns(df)
+    if base.empty:
+        return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    strict_long = base[(pd.to_numeric(base['Change'], errors='coerce').fillna(0) >= 0) &                        (pd.to_numeric(base['Cumulative DI'], errors='coerce').fillna(-1e9) >= pd.to_numeric(base['Cumulative -DI'], errors='coerce').fillna(-1e9))].copy()
+    strict_short = base[(pd.to_numeric(base['Change'], errors='coerce').fillna(0) <= 0) &                         (pd.to_numeric(base['Cumulative -DI'], errors='coerce').fillna(-1e9) >= pd.to_numeric(base['Cumulative DI'], errors='coerce').fillna(-1e9))].copy()
+    long_df = strict_long.sort_values(by=['Cumulative KER','SurvivalNum','Cumulative ADX','Change'], ascending=[False,False,False,False], na_position='last').drop_duplicates(subset=['Symbol']).head(15)
+    short_df = strict_short.sort_values(by=['Cumulative KER','SurvivalNum','Cumulative ADX','Change'], ascending=[False,False,False,True], na_position='last').drop_duplicates(subset=['Symbol']).head(15)
+    long_df = _ensure_required_columns(long_df)
+    short_df = _ensure_required_columns(short_df)
+    long_df = long_df[[c for c in EMAIL_DISPLAY_COLS if c in long_df.columns]] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    short_df = short_df[[c for c in EMAIL_DISPLAY_COLS if c in short_df.columns]] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    return long_df, short_df
+
+
+def load_index_symbols() -> List[str]:
+    env_val = os.environ.get('INDEX_SYMBOLS', '')
+    if env_val:
+        vals = [s.strip() for s in env_val.split(',') if s.strip()]
+        if vals:
+            return vals
+    return ['NIFTY50-INDEX', 'NIFTYBANK-INDEX']
+
+
+def format_fyers_index_symbol(symbol: str) -> str:
+    return symbol if symbol.startswith('NSE:') else f'NSE:{symbol}'
+
+
+def scan_index_universe() -> pd.DataFrame:
+    symbols = load_index_symbols()
+    rows = []
+    for sym in symbols:
+        fyers_sym = format_fyers_index_symbol(sym)
+        daily_df = get_fyers_history(fyers_sym, resolution='D', days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
+        intra_df = get_fyers_history(fyers_sym, resolution='5', days_back=INTRADAY_LOOKBACK_DAYS)
+        if 'compute_iteration_volume_profile' in globals():
+            iter_summary, _ = compute_iteration_volume_profile(intra_df)
+        else:
+            iter_summary = {}
+        iv_info = compute_iv_proxies(daily_df)
+        prev_close = float(daily_df['close'].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2) else None
+        ltp = iter_summary.get('LTP') if isinstance(iter_summary, dict) else None
+        pct_change = ((ltp - prev_close) / prev_close * 100) if (ltp is not None and prev_close and prev_close != 0) else 0.0
+        rows.append({
+            'Symbol': sym,
+            'LTP': ltp,
+            'Change': pct_change,
+            'IVP': iv_info.get('IVP'),
+            'Volatility State': iv_info.get('Volatility State'),
+            'Last Iteration Time': iter_summary.get('Last Iteration Time', '') if isinstance(iter_summary, dict) else '',
+            'Cumulative KER': iter_summary.get('Cumulative KER', float('nan')) if isinstance(iter_summary, dict) else float('nan'),
+            'Cumulative DI': iter_summary.get('Cumulative DI', iter_summary.get('Cumulative +DI', float('nan'))) if isinstance(iter_summary, dict) else float('nan'),
+            'Cumulative -DI': iter_summary.get('Cumulative -DI', float('nan')) if isinstance(iter_summary, dict) else float('nan'),
+            'Cumulative ADX': iter_summary.get('Cumulative ADX', float('nan')) if isinstance(iter_summary, dict) else float('nan'),
+            'SurvivalNum': iter_summary.get('SurvivalNum', iter_summary.get('Survival_Num', 0.0)) if isinstance(iter_summary, dict) else 0.0,
+        })
+    df = pd.DataFrame(rows)
+    if not df.empty and 'derive_rank_columns' in globals():
+        df = derive_rank_columns(_ensure_required_columns(df))
+    if not df.empty and 'add_signal_columns' in globals():
+        df = add_signal_columns(_ensure_required_columns(df))
+    return _ensure_required_columns(df)
+
+
+def load_fno_symbols_for_indices(active_index_symbols: List[str]) -> List[str]:
+    csv_path = resolve_universe_csv() if 'resolve_universe_csv' in globals() else 'fno_stock_list.csv'
+    return load_fno_symbols_from_csv(csv_path)
+
+
+def scan_symbol_universe(symbols: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if not symbols:
+        return pd.DataFrame(), pd.DataFrame()
+    rows, iteration_rows = [], []
+    total = len(symbols)
+    for idx, sym in enumerate(symbols, start=1):
+        logger.info(f'CORE [{idx}/{total}] Processing {sym}')
+        fyers_sym = format_fyers_symbol(sym)
+        daily_df = get_fyers_history(fyers_sym, resolution='D', days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
+        intra_df = get_fyers_history(fyers_sym, resolution='5', days_back=INTRADAY_LOOKBACK_DAYS)
+        if 'compute_iteration_volume_profile' in globals():
+            iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
+        else:
+            iter_summary, iter_detail = {}, pd.DataFrame()
+        iv_info = compute_iv_proxies(daily_df)
+        prev_close = float(daily_df['close'].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2) else None
+        ltp = iter_summary.get('LTP') if isinstance(iter_summary, dict) else None
+        pct_change = ((ltp - prev_close) / prev_close * 100) if (ltp is not None and prev_close and prev_close != 0) else 0.0
+        if isinstance(iter_detail, pd.DataFrame) and not iter_detail.empty:
+            iter_detail.insert(0, 'Symbol', sym)
+            iter_detail.insert(1, 'Change', pct_change)
+            iteration_rows.append(iter_detail)
+        rows.append({
+            'Symbol': sym,
+            'LTP': ltp,
+            'Change': pct_change,
+            'IVP': iv_info.get('IVP'),
+            'Volatility State': iv_info.get('Volatility State'),
+            'Last Iteration Time': iter_summary.get('Last Iteration Time', '') if isinstance(iter_summary, dict) else '',
+            'Cumulative KER': iter_summary.get('Cumulative KER', float('nan')) if isinstance(iter_summary, dict) else float('nan'),
+            'Cumulative DI': iter_summary.get('Cumulative DI', iter_summary.get('Cumulative +DI', float('nan'))) if isinstance(iter_summary, dict) else float('nan'),
+            'Cumulative -DI': iter_summary.get('Cumulative -DI', float('nan')) if isinstance(iter_summary, dict) else float('nan'),
+            'Cumulative ADX': iter_summary.get('Cumulative ADX', float('nan')) if isinstance(iter_summary, dict) else float('nan'),
+            'SurvivalNum': iter_summary.get('SurvivalNum', iter_summary.get('Survival_Num', 0.0)) if isinstance(iter_summary, dict) else 0.0,
+            'PriceLeadStatus': iter_summary.get('PriceLeadStatus', iter_summary.get('Price_Lead_Status', 'NORMAL')) if isinstance(iter_summary, dict) else 'NORMAL',
+        })
+    return _ensure_required_columns(pd.DataFrame(rows)), (pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame())
 
 
 def main_index_first():
-    logger.info("Starting Index-first FO Iteration Volume Volatility Scan")
+    logger.info('Starting Index-first FO Iteration Volume Volatility Scan')
     init_fyers()
-    if 'scan_index_universe' in globals():
-        df_indices = scan_index_universe()
-        index_long_df, index_short_df = build_candidate_tables(df_indices) if 'build_candidate_tables' in globals() else (pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS))
-        top_long_indices = index_long_df["Symbol"].head(2).tolist() if not index_long_df.empty and "Symbol" in index_long_df.columns else []
-        top_short_indices = index_short_df["Symbol"].head(2).tolist() if not index_short_df.empty and "Symbol" in index_short_df.columns else []
-        logger.info(f"Top long indices: {top_long_indices}")
-        logger.info(f"Top short indices: {top_short_indices}")
-    else:
-        logger.info("scan_index_universe missing in source file")
+    df_indices = scan_index_universe()
+    index_long_df, index_short_df = build_candidate_tables(df_indices)
+    top_long_indices = index_long_df['Symbol'].head(2).tolist() if not index_long_df.empty and 'Symbol' in index_long_df.columns else []
+    top_short_indices = index_short_df['Symbol'].head(2).tolist() if not index_short_df.empty and 'Symbol' in index_short_df.columns else []
+    logger.info(f'Top long indices: {top_long_indices}')
+    logger.info(f'Top short indices: {top_short_indices}')
+    long_side_symbols = load_fno_symbols_for_indices(top_long_indices)
+    short_side_symbols = load_fno_symbols_for_indices(top_short_indices)
+    df_long_all, df_long_iter = scan_symbol_universe(long_side_symbols)
+    df_short_all, df_short_iter = scan_symbol_universe(short_side_symbols)
+    if 'derive_rank_columns' in globals() and 'add_signal_columns' in globals():
+        if not df_long_all.empty:
+            df_long_all = add_signal_columns(derive_rank_columns(_ensure_required_columns(df_long_all)))
+        if not df_short_all.empty:
+            df_short_all = add_signal_columns(derive_rank_columns(_ensure_required_columns(df_short_all)))
+    long_long_df, _ = build_candidate_tables(df_long_all)
+    _, short_short_df = build_candidate_tables(df_short_all)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    summary_csv = f'fo_idx_filtered_summary_{timestamp}.csv'
+    detail_csv = f'fo_idx_filtered_details_{timestamp}.csv'
+    df_all = pd.concat([df_long_all, df_short_all], ignore_index=True) if (not df_long_all.empty or not df_short_all.empty) else pd.DataFrame()
+    df_iter = pd.concat([df_long_iter, df_short_iter], ignore_index=True) if (not df_long_iter.empty or not df_short_iter.empty) else pd.DataFrame()
+    df_all.to_csv(summary_csv, index=False)
+    df_iter.to_csv(detail_csv, index=False)
+    if 'send_email_with_tables' in globals():
+        send_email_with_tables(long_long_df, short_short_df, summary_csv, detail_csv, index_long_df=index_long_df, index_short_df=index_short_df)
+    logger.info('Index-first Scan Pipeline Completed')
 
 if __name__ == "__main__":
     main_index_first()
