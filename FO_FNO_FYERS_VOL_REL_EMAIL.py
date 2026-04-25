@@ -47,27 +47,73 @@ sender_password = os.environ.get("SENDER_PASSWORD", "password")
 recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
 EMAIL_DISPLAY_COLS = [
-    "Symbol",
-    "LTP",
-    "% Change",
-    "5m_Signal",
-    "15m_Signal",
-    "30m_Signal",
-    "60m_Signal",
-    "Bull_Signal",
-    "Bear_Signal",
-    "Overall_Signal",
-    "Price_Lead_Status",
-    "IVP",
-    "Volatility State",
-    "Cumulative KER",
-    "Cumulative ADX",
-    "Cumulative +DI",
-    "Cumulative -DI",
-    "Cumulative RSI",
-    "Last Iteration Time",
+    "Symbol", "LTP", "% Change", "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
+    "Bull_Signal", "Bear_Signal", "Overall_Signal", "Price_Lead_Status", "IVP",
+    "Volatility State", "Last Iteration Time",
 ]
 
+
+def split_market_groups(summary_df: pd.DataFrame):
+    df = summary_df.copy() if summary_df is not None else pd.DataFrame()
+    if df.empty:
+        empty = pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+        return empty, empty, empty, empty
+    symbol_col = next((c for c in ["Symbol", "symbol"] if c in df.columns), None)
+    market_col = next((c for c in ["Market", "market", "Category", "category", "Universe", "universe"] if c in df.columns), None)
+    if symbol_col is None:
+        empty = pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+        return empty, empty, empty, empty
+    if market_col is not None:
+        is_index = df[market_col].astype(str).str.lower().str.contains("index", na=False)
+    else:
+        prefixes = ("NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX")
+        is_index = df[symbol_col].astype(str).str.upper().str.startswith(prefixes)
+    stocks_df = df.loc[~is_index].copy()
+    indices_df = df.loc[is_index].copy()
+    def pick(frame, want_long):
+        if frame.empty:
+            return frame.head(0).copy()
+        sig = frame["Overall_Signal"].astype(str).str.lower() if "Overall_Signal" in frame.columns else pd.Series([""] * len(frame), index=frame.index)
+        out = frame[sig.str.contains("buy", na=False)] if want_long else frame[sig.str.contains("sell", na=False)]
+        if out.empty:
+            out = frame
+        return out.head(15).copy()
+    return pick(stocks_df, True), pick(stocks_df, False), pick(indices_df, True), pick(indices_df, False)
+
+
+def render_legacy_market_table(df: pd.DataFrame, title: str) -> str:
+    cols = [c for c in EMAIL_DISPLAY_COLS if c in df.columns]
+    if df is None or df.empty or not cols:
+        return f'<h2 style="margin:18px 0 10px;color:#fff;font:700 16px Arial;">{title}</h2><p style="margin:0 0 16px;color:#cbd5e1;font:12px Arial;">No candidates.</p>'
+    def sty(col, val):
+        s = '' if pd.isna(val) else str(val)
+        low = s.lower()
+        base = 'border:1px solid #2f3944;padding:5px 7px;text-align:center;white-space:nowrap;'
+        if col == 'Symbol': return base + 'color:#f87171;font-weight:700;'
+        if col == 'LTP': return base + 'color:#6ee7b7;font-weight:700;'
+        if col == '% Change': return base + ('color:#f87171;font-weight:700;' if s.startswith('-') else 'color:#86efac;font-weight:700;')
+        if 'signal' in col.lower():
+            if 'buy' in low: return base + 'background:#16a34a;color:#fff;font-weight:700;'
+            if 'sell' in low: return base + 'background:#dc2626;color:#fff;font-weight:700;'
+            if 'neutral' in low: return base + 'background:#6b7280;color:#fff;font-weight:700;'
+        if col == 'Volatility State':
+            if 'buyer zone' in low: return base + 'background:#166534;color:#fff;font-weight:700;'
+            if 'avoid buy premium' in low: return base + 'background:#a16207;color:#fff;font-weight:700;'
+            return base + 'background:#4b5563;color:#fff;font-weight:700;'
+        return base + 'color:#e5e7eb;'
+    html = [f'<h2 style="margin:18px 0 10px;color:#fff;font:700 16px Arial;">{title}</h2>', '<table style="width:100%;border-collapse:collapse;background:#111827;font:12px Arial;color:#e5e7eb;">', '<thead><tr>']
+    for c in cols:
+        html.append(f'<th style="border:1px solid #2f3944;padding:6px 7px;background:#1f2937;color:#f9fafb;white-space:nowrap;">{c}</th>')
+    html.append('</tr></thead><tbody>')
+    for _, r in df[cols].iterrows():
+        html.append('<tr>')
+        for c in cols:
+            v = r[c]
+            vv = '' if pd.isna(v) else v
+            html.append(f'<td style="{sty(c,v)}">{vv}</td>')
+        html.append('</tr>')
+    html.append('</tbody></table>')
+    return ''.join(html)
 
 def init_fyers():
     global fyers
@@ -464,25 +510,14 @@ def compute_iteration_volume_profile(
     curr_df.sort_values("time_only", inplace=True)
     curr_df["cum_vol"] = curr_df["volume"].cumsum()
 
-    work_df = curr_df.copy()
-    if "time" not in work_df.columns:
-        if "timestamp" in work_df.columns:
-            work_df["time"] = pd.to_datetime(work_df["timestamp"])
-        elif "date" in work_df.columns and "time_only" in work_df.columns:
-            work_df["time"] = pd.to_datetime(
-                work_df["date"].astype(str) + " " + work_df["time_only"].astype(str)
-            )
-        else:
-            work_df["time"] = pd.RangeIndex(start=0, stop=len(work_df), step=1)
-
     metric_df = compute_cumulative_directional_metrics(
-        work_df[["time", "open", "high", "low", "close", "volume"]].copy()
+        curr_df[["time", "open", "high", "low", "close", "volume"]].copy()
     )
     flow_df = compute_cumulative_flow_metrics(
-        work_df[["time", "high", "low", "close", "volume"]].copy()
+        curr_df[["time", "high", "low", "close", "volume"]].copy()
     )
     price_lead_df = compute_price_lead_metrics(
-        work_df[["time", "open", "high", "low", "close", "volume"]].copy()
+        curr_df[["time", "open", "high", "low", "close", "volume"]].copy()
     )
 
     rows = []
