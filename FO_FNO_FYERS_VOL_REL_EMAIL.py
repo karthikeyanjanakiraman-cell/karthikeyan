@@ -39,7 +39,7 @@ IVP_LOOKBACK_DAYS = 252
 
 fyers: Optional[fyersModel.FyersModel] = None
 
-# TODO: set these according to your email setup
+# Email settings (adjust to your environment)
 smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 smtp_port = int(os.environ.get("SMTP_PORT", "587"))
 sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
@@ -1131,10 +1131,8 @@ def send_email_with_tables(
 # INDEX-FIRST EXTENSIONS
 ##############################
 
-# Map indices to their F&O constituents (symbols must match your sector CSVs)
 INDEX_CONSTITUENTS = {
     "NIFTY50-INDEX": [
-        # TODO: fill with actual NIFTY 50 F&O symbols; examples:
         "RELIANCE",
         "HDFCBANK",
         "ICICIBANK",
@@ -1147,7 +1145,6 @@ INDEX_CONSTITUENTS = {
         "SBIN",
     ],
     "NIFTYBANK-INDEX": [
-        # TODO: fill BANKNIFTY basket symbols
         "HDFCBANK",
         "ICICIBANK",
         "AXISBANK",
@@ -1162,7 +1159,6 @@ INDEX_CONSTITUENTS = {
 
 
 def load_index_symbols() -> List[str]:
-    """Return index symbols to scan on Fyers."""
     return [
         "NIFTY50-INDEX",
         "NIFTYBANK-INDEX",
@@ -1170,14 +1166,12 @@ def load_index_symbols() -> List[str]:
 
 
 def format_fyers_index_symbol(symbol: str) -> str:
-    """Format index symbol for Fyers (no -EQ suffix)."""
     if symbol.startswith("NSE:"):
         return symbol
     return f"NSE:{symbol}"
 
 
 def scan_index_universe() -> pd.DataFrame:
-    """Scan configured indices using same metric stack as F&O universe."""
     symbols = load_index_symbols()
     if not symbols:
         logger.error("INDEX No index symbols configured.")
@@ -1258,7 +1252,6 @@ def scan_index_universe() -> pd.DataFrame:
 
 
 def load_fno_symbols_for_indices(active_index_symbols: List[str]) -> List[str]:
-    """Return F&O symbols that belong to any of the given indices."""
     all_fno = set(load_fno_symbols_from_sectors("sectors"))
     selected = set()
     for idx_sym in active_index_symbols:
@@ -1270,7 +1263,6 @@ def load_fno_symbols_for_indices(active_index_symbols: List[str]) -> List[str]:
 
 
 def scan_symbol_universe(symbols: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Generic scanner using existing F&O logic for a given list of symbols."""
     if not symbols:
         logger.error("CORE No symbols to scan.")
         return pd.DataFrame(), pd.DataFrame()
@@ -1356,11 +1348,9 @@ def scan_symbol_universe(symbols: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame
 
 
 def main_index_first():
-    """Entry point: index-first, direction-aligned stock selection."""
     logger.info("Starting Index-first F&O Iteration Volume Volatility Scan")
     init_fyers()
 
-    # 1) Scan indices and get top long / short
     df_indices = scan_index_universe()
     index_long_df, index_short_df = build_candidate_tables(df_indices)
 
@@ -1370,11 +1360,9 @@ def main_index_first():
     logger.info(f"Top long indices: {top_long_indices}")
     logger.info(f"Top short indices: {top_short_indices}")
 
-    # 2) Build direction-aligned F&O baskets
     long_side_symbols = load_fno_symbols_for_indices(top_long_indices)
     short_side_symbols = load_fno_symbols_for_indices(top_short_indices)
 
-    # 3) Scan long basket and keep only long candidates
     df_long_all, df_long_iter = scan_symbol_universe(long_side_symbols)
     if not df_long_all.empty:
         df_long_all = derive_rank_columns(df_long_all)
@@ -1384,7 +1372,6 @@ def main_index_first():
         long_long_df = pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
         df_long_iter = pd.DataFrame()
 
-    # 4) Scan short basket and keep only short candidates
     df_short_all, df_short_iter = scan_symbol_universe(short_side_symbols)
     if not df_short_all.empty:
         df_short_all = derive_rank_columns(df_short_all)
@@ -1398,7 +1385,6 @@ def main_index_first():
     summary_csv = f"fo_idx_filtered_summary_{timestamp}.csv"
     detail_csv = f"fo_idx_filtered_details_{timestamp}.csv"
 
-    # Merge iterations for export convenience
     df_all = pd.concat([df_long_all, df_short_all], ignore_index=True) if (
         not df_long_all.empty or not df_short_all.empty
     ) else pd.DataFrame()
@@ -1416,7 +1402,6 @@ def main_index_first():
     else:
         pd.DataFrame().to_csv(detail_csv, index=False)
 
-    # Send email including index and stock tables
     send_email_with_tables(
         long_long_df,
         short_short_df,
