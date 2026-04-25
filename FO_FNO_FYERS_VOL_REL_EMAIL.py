@@ -985,6 +985,7 @@ def send_email_with_tables(
     detail_csv_filename: str,
     index_long_df: pd.DataFrame = None,
     index_short_df: pd.DataFrame = None,
+    index_iter_csv_filename: Optional[str] = None,
 ) -> bool:
     """Send email with index and stock long/short tables and attach CSVs."""
     try:
@@ -1476,6 +1477,12 @@ def main_index_first():
     detail_csv = f'fo_idx_filtered_details_{timestamp}.csv'
     summary_df.to_csv(summary_csv, index=False)
     detail_df.to_csv(detail_csv, index=False)
+    index_iter_csv = None
+    index_iter_df = build_index_iteration_summary(detail_df) if not detail_df.empty else pd.DataFrame()
+    if isinstance(index_iter_df, pd.DataFrame) and not index_iter_df.empty:
+        index_iter_csv = f'fo_idx_iteration_summary_{timestamp}.csv'
+        index_iter_df.to_csv(index_iter_csv, index=False)
+        logger.info(f'INDEX Iteration summary saved: {index_iter_csv}')
 
     send_email_with_tables(long_df, short_df, summary_csv, detail_csv, index_long_df=index_long_df, index_short_df=index_short_df, index_iter_csv_filename=(index_iter_csv if 'index_iter_csv' in locals() else None))
     logger.info('Index-first Scan Pipeline Completed')
