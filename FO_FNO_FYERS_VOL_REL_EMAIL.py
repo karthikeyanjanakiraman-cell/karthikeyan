@@ -1093,6 +1093,79 @@ def build_legacy_email_html(index_long_df: pd.DataFrame, index_short_df: pd.Data
     )
 
 
+def load_index_symbols(csv_path: str = None) -> List[str]:
+    env_val = os.environ.get("INDEX_SYMBOLS", "")
+    if env_val:
+        syms = [s.strip() for s in env_val.split(",") if s.strip()]
+        if syms:
+            return syms
+
+    csv_path = csv_path or resolve_universe_csv()
+    index_names = set()
+    if os.path.exists(csv_path):
+        try:
+            df = pd.read_csv(csv_path)
+            idx_col = None
+            for col in df.columns:
+                low = str(col).strip().lower()
+                if low in {"belongstoindices", "belongs_to_indices"}:
+                    idx_col = col
+                    break
+            if idx_col:
+                for cell in df[idx_col].dropna().astype(str):
+                    for part in cell.split(','):
+                        name = part.strip()
+                        if name and name.upper() != 'UNMAPPEDSECTORAL':
+                            index_names.add(name)
+        except Exception as e:
+            logger.warning(f"INDEX Failed reading {csv_path}: {e}")
+
+    def map_to_fyers_index(name: str) -> str:
+        s = name.strip().upper().replace(' ', '')
+        if s.startswith('NSE:'):
+            s = s.split(':', 1)[1]
+        mapping = {
+            'NIFTY50': 'NIFTY50-INDEX',
+            'NIFTYBANK': 'NIFTYBANK-INDEX',
+            'BANKNIFTY': 'NIFTYBANK-INDEX',
+            'FINNIFTY': 'FINNIFTY-INDEX',
+            'MIDCPNIFTY': 'MIDCPNIFTY-INDEX',
+            'SENSEX': 'SENSEX-INDEX',
+            'BANKEX': 'BANKEX-INDEX',
+            'NIFTYIT': 'NIFTYIT-INDEX',
+            'NIFTYAUTO': 'NIFTYAUTO-INDEX',
+            'NIFTYFMCG': 'NIFTYFMCG-INDEX',
+            'NIFTYPHARMA': 'NIFTYPHARMA-INDEX',
+            'NIFTYREALTY': 'NIFTYREALTY-INDEX',
+            'NIFTYMETAL': 'NIFTYMETAL-INDEX',
+            'NIFTYENERGY': 'NIFTYENERGY-INDEX',
+            'NIFTYINFRASTRUCTURE': 'NIFTYINFRASTRUCTURE-INDEX',
+            'NIFTYCONSUMERDURABLES': 'NIFTYCONSUMERDURABLES-INDEX',
+            'NIFTYFINANCIALSERVICES': 'NIFTYFINANCIALSERVICES-INDEX',
+            'NIFTYPRIVATEBANK': 'NIFTYPRIVATEBANK-INDEX',
+            'NIFTYPSUBANK': 'NIFTYPSUBANK-INDEX',
+            'NIFTYSERVICESSECTOR': 'NIFTYSERVICESSECTOR-INDEX',
+            'NIFTYINDIADIGITAL': 'NIFTYINDIADIGITAL-INDEX',
+            'NIFTYINDIAMANUFACTURING': 'NIFTYINDIAMANUFACTURING-INDEX',
+            'NIFTYINDIACONSUMPTION': 'NIFTYINDIACONSUMPTION-INDEX',
+            'NIFTYCOMMODITIES': 'NIFTYCOMMODITIES-INDEX',
+            'NIFTYCPSE': 'NIFTYCPSE-INDEX',
+            'NIFTYMNC': 'NIFTYMNC-INDEX',
+            'NIFTYPSE': 'NIFTYPSE-INDEX',
+        }
+        if s in mapping:
+            return mapping[s]
+        if s.endswith('-INDEX'):
+            return s
+        if s.startswith('NIFTY') and len(s) > 5:
+            return s + '-INDEX'
+        return None
+
+    mapped = sorted(dict.fromkeys(filter(None, (map_to_fyers_index(x) for x in index_names))))
+    if mapped:
+        logger.info(f"INDEX Auto-loaded {len(mapped)} indices from {csv_path}")
+        return mapped
+    return ['NIFTY50-INDEX', 'NIFTYBANK-INDEX']
 
 
 
@@ -1147,6 +1220,13 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     return long_df, short_df
 
 
+def load_index_symbols() -> List[str]:
+    env_val = os.environ.get('INDEX_SYMBOLS', '')
+    if env_val:
+        vals = [s.strip() for s in env_val.split(',') if s.strip()]
+        if vals:
+            return vals
+    return ['NIFTY50-INDEX', 'NIFTYBANK-INDEX']
 
 
 def format_fyers_index_symbol(symbol: str) -> str:
@@ -1189,6 +1269,9 @@ def scan_index_universe() -> pd.DataFrame:
     return _ensure_required_columns(df)
 
 
+def load_fno_symbols_for_indices(active_index_symbols: List[str]) -> List[str]:
+    csv_path = resolve_universe_csv() if 'resolve_universe_csv' in globals() else 'fno_stock_list.csv'
+    return load_fno_symbols_from_csv(csv_path)
 
 
 def scan_symbol_universe(symbols: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -1232,56 +1315,130 @@ def scan_symbol_universe(symbols: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame
 
 
 
-
-
+def normalize_index_name(x: str) -> str:
+    s = str(x).strip().upper()
+    s = s.replace('-INDEX', '')
+    s = s.replace('&', ' AND ')
+    s = re.sub(r'\s+', ' ', s).strip()
+    compact_map = {
+        'NIFTY50': 'NIFTY 50',
+        'NIFTYBANK': 'NIFTY BANK',
+        'NIFTYAUTO': 'NIFTY AUTO',
+        'NIFTYENERGY': 'NIFTY ENERGY',
+        'NIFTYIT': 'NIFTY IT',
+        'NIFTYPHARMA': 'NIFTY PHARMA',
+        'NIFTYMETAL': 'NIFTY METAL',
+        'NIFTYFMCG': 'NIFTY FMCG',
+        'NIFTYREALTY': 'NIFTY REALTY',
+        'NIFTYPSUBANK': 'NIFTY PSU BANK',
+        'NIFTYPRIVATEBANK': 'NIFTY PRIVATE BANK',
+        'NIFTYFINANCIALSERVICES': 'NIFTY FINANCIAL SERVICES',
+        'NIFTYFINSERVICE': 'NIFTY FINANCIAL SERVICES',
+    }
+    key = s.replace(' ', '')
+    return compact_map.get(key, s)
 
 
 def load_index_symbols() -> List[str]:
-    csv_path = 'MW-All-Indices-25-Apr-2026.csv'
-    if not os.path.exists(csv_path):
-        raise FileNotFoundError(f"Required index CSV not found: {csv_path}")
-    df = pd.read_csv(csv_path)
-    cols = {str(c).strip().lower().replace(' ', '').replace('_', ''): c for c in df.columns}
-    pick_col = None
-    for key in ['indexsymbol', 'symbol', 'index', 'name']:
-        if key in cols:
-            pick_col = cols[key]
-            break
-    if pick_col is None:
-        raise ValueError(f"No valid index-name column found in {csv_path}. Columns: {list(df.columns)}")
-    vals = [str(x).strip() for x in df[pick_col].dropna().tolist() if str(x).strip()]
-    vals = list(dict.fromkeys(vals))
-    logger.info(f"INDEX Loaded indices from CSV {csv_path} ({len(vals)}): {vals}")
-    return vals
+    sector_files = []
+    if os.path.isdir('sectors'):
+        for dirpath, _, filenames in os.walk('sectors'):
+            for fname in filenames:
+                if fname.lower().endswith('.csv'):
+                    sector_files.append(os.path.join(dirpath, fname))
+    if not sector_files:
+        raise FileNotFoundError('No CSV files found inside sectors folder for index selection')
 
-
-
-def resolve_mapping_csv() -> str:
-    csv_files = []
-    for dirpath, _, filenames in os.walk('.'):
-        for fname in filenames:
-            if fname.lower().endswith('.csv'):
-                csv_files.append(os.path.join(dirpath, fname))
-    candidates = []
-    for path in csv_files:
+    collected = []
+    for path in sorted(sector_files):
         try:
             df = pd.read_csv(path)
             norm_cols = {str(c).strip().lower().replace(' ', '').replace('_', ''): c for c in df.columns}
-            if 'symbol' not in norm_cols:
+            sym_col = next((norm_cols[k] for k in ['symbol', 'symbols', 'ticker'] if k in norm_cols), None)
+            idx_col = next((norm_cols[k] for k in ['belongstoindices', 'belongstoindex', 'indices'] if k in norm_cols), None)
+            if sym_col and not idx_col:
+                vals = [str(x).strip() for x in df[sym_col].dropna().tolist() if str(x).strip()]
+                if vals:
+                    logger.info(f"INDEX Loaded {len(vals)} values from sector CSV {path}")
+                    collected.extend(vals)
+        except Exception as e:
+            logger.warning(f"INDEX Failed reading sector CSV {path}: {e}")
+    picked = [normalize_index_name(x) for x in collected if str(x).strip()]
+    picked = list(dict.fromkeys(picked))
+    if not picked:
+        raise ValueError('No index values found in sector folder CSV files')
+    logger.info(f"INDEX Final picked list from sectors CSVs ({len(picked)}): {picked}")
+    return picked
+
+
+def resolve_mapping_csv() -> str:
+    candidates = []
+    for dirpath, _, filenames in os.walk('.'):
+        for fname in filenames:
+            if not fname.lower().endswith('.csv'):
                 continue
-            idx_key = next((k for k in norm_cols if k in ['belongstoindices','belongstoindex','indices']), None)
-            if not idx_key:
-                continue
-            idx_col = norm_cols[idx_key]
-            non_empty_idx = int(df[idx_col].astype(str).str.strip().ne('').sum())
-            candidates.append((non_empty_idx, len(df), path))
-        except Exception:
-            continue
+            path = os.path.join(dirpath, fname)
+            try:
+                df = pd.read_csv(path)
+                norm_cols = {str(c).strip().lower().replace(' ', '').replace('_', ''): c for c in df.columns}
+                if 'symbol' in norm_cols and 'belongstoindices' in norm_cols:
+                    candidates.append((len(df), path))
+            except Exception:
+                pass
     if not candidates:
-        raise FileNotFoundError('No mapping CSV with Symbol and Belongs_To_Indices found in working directory')
+        raise FileNotFoundError('No mapping CSV found with Symbol and Belongs_To_Indices')
     candidates.sort(reverse=True)
-    chosen = candidates[0][2]
+    chosen = candidates[0][1]
     logger.info(f"CSV Mapping-selected file: {chosen}")
     return chosen
 
 
+def load_fno_symbols_for_indices(active_index_symbols: List[str]) -> List[str]:
+    csv_path = resolve_mapping_csv()
+    df = pd.read_csv(csv_path)
+    norm_cols = {str(c).strip().lower().replace(' ', '').replace('_', ''): c for c in df.columns}
+    symbol_col = norm_cols['symbol']
+    idx_col = norm_cols['belongstoindices']
+    wanted = {normalize_index_name(x) for x in active_index_symbols if str(x).strip()}
+    logger.info(f"FNO Matching selected indices: {sorted(wanted)}")
+    def row_matches(cell) -> bool:
+        parts = [normalize_index_name(p) for p in re.split(r'[,;/|]+', str(cell)) if str(p).strip()]
+        return any(p in wanted for p in parts)
+    filt = df[df[idx_col].apply(row_matches)].copy()
+    symbols = sorted(filt[symbol_col].dropna().astype(str).str.strip().unique())
+    logger.info(f"FNO Filtered {len(symbols)} stocks from {csv_path} using {idx_col}")
+    return symbols
+
+def main_index_first():
+    logger.info('Starting Index-first FO Iteration Volume Volatility Scan')
+    init_fyers()
+    df_indices = scan_index_universe()
+    index_long_df, index_short_df = build_candidate_tables(df_indices)
+    top_long_indices = index_long_df['Symbol'].head(2).tolist() if not index_long_df.empty and 'Symbol' in index_long_df.columns else []
+    top_short_indices = index_short_df['Symbol'].head(2).tolist() if not index_short_df.empty and 'Symbol' in index_short_df.columns else []
+    logger.info(f'Top long indices: {top_long_indices}')
+    logger.info(f'Top short indices: {top_short_indices}')
+    long_side_symbols = load_fno_symbols_for_indices(top_long_indices)
+    short_side_symbols = load_fno_symbols_for_indices(top_short_indices)
+    df_long_all, df_long_iter = scan_symbol_universe(long_side_symbols)
+    df_short_all, df_short_iter = scan_symbol_universe(short_side_symbols)
+    if 'derive_rank_columns' in globals() and 'add_signal_columns' in globals():
+        if not df_long_all.empty:
+            df_long_all = add_signal_columns(derive_rank_columns(_ensure_required_columns(df_long_all)))
+        if not df_short_all.empty:
+            df_short_all = add_signal_columns(derive_rank_columns(_ensure_required_columns(df_short_all)))
+    long_long_df, _ = build_candidate_tables(df_long_all)
+    _, short_short_df = build_candidate_tables(df_short_all)
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    summary_csv = f'fo_idx_filtered_summary_{timestamp}.csv'
+    detail_csv = f'fo_idx_filtered_details_{timestamp}.csv'
+    df_all = pd.concat([df_long_all, df_short_all], ignore_index=True) if (not df_long_all.empty or not df_short_all.empty) else pd.DataFrame()
+    df_iter = pd.concat([df_long_iter, df_short_iter], ignore_index=True) if (not df_long_iter.empty or not df_short_iter.empty) else pd.DataFrame()
+    df_all.to_csv(summary_csv, index=False)
+    df_iter.to_csv(detail_csv, index=False)
+    if 'send_email_with_tables' in globals():
+        send_email_with_tables(long_long_df, short_short_df, summary_csv, detail_csv, index_long_df=index_long_df, index_short_df=index_short_df)
+    logger.info('Index-first Scan Pipeline Completed')
+
+if __name__ == "__main__":
+    main_index_first()
