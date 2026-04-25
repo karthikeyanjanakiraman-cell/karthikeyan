@@ -37,6 +37,7 @@ logger.addHandler(ch)
 DAILY_LOOKBACK_DAYS = 60
 INTRADAY_LOOKBACK_DAYS = 20
 IVP_LOOKBACK_DAYS = 252
+INDEX_SOFT_BOOST_WEIGHT = 0.25
 
 fyers: Optional[fyersModel.FyersModel] = None
 
@@ -1225,6 +1226,83 @@ def scan_symbol_universe(symbols: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame
     return pd.DataFrame(rows), (pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame())
 
 
+def build_index_strength_maps(index_long_df: pd.DataFrame, index_short_df: pd.DataFrame) -> Tuple[Dict[str, float], Dict[str, float]]:
+    long_map, short_map = {}, {}
+    if index_long_df is not None and not index_long_df.empty and 'Symbol' in index_long_df.columns:
+        work = index_long_df.copy().reset_index(drop=True)
+        base_n = max(len(work), 1)
+        for i, row in work.iterrows():
+            sym = normalize_index_name(row.get('Symbol', ''))
+            strength = float(base_n - i)
+            if pd.notna(row.get('Bull Rank')):
+                strength += float(row.get('Bull Rank', 0))
+            if pd.notna(row.get('Rank Delta')) and float(row.get('Rank Delta', 0)) > 0:
+                strength += float(row.get('Rank Delta', 0))
+            if sym:
+                long_map[sym] = strength
+    if index_short_df is not None and not index_short_df.empty and 'Symbol' in index_short_df.columns:
+        work = index_short_df.copy().reset_index(drop=True)
+        base_n = max(len(work), 1)
+        for i, row in work.iterrows():
+            sym = normalize_index_name(row.get('Symbol', ''))
+            strength = float(base_n - i)
+            if pd.notna(row.get('Bear Rank')):
+                strength += float(row.get('Bear Rank', 0))
+            rank_delta = row.get('Rank Delta')
+            if pd.notna(rank_delta) and float(rank_delta) < 0:
+                strength += abs(float(rank_delta))
+            if sym:
+                short_map[sym] = strength
+    return long_map, short_map
+
+def apply_soft_index_boost(stock_df: pd.DataFrame, target_index_symbols: List[str], strength_map: Dict[str, float], direction: str) -> pd.DataFrame:
+    if stock_df is None or stock_df.empty:
+        return stock_df
+    out = stock_df.copy()
+    csv_path = resolve_mapping_csv()
+    map_df = pd.read_csv(csv_path)
+    norm_cols = {str(c).strip().lower().replace(' ', '').replace('_', ''): c for c in map_df.columns}
+    symbol_col = norm_cols['symbol']
+    idx_col = norm_cols['belongstoindices']
+    target_set = {normalize_index_name(x) for x in target_index_symbols if str(x).strip()}
+    symbol_to_indices = {}
+    for _, row in map_df[[symbol_col, idx_col]].dropna(subset=[symbol_col]).iterrows():
+        sym = str(row[symbol_col]).strip()
+        parts = [normalize_index_name(p) for p in re.split(r'[,;/|]+', str(row[idx_col])) if str(p).strip()]
+        symbol_to_indices[sym] = set(parts)
+    boosts = []
+    matched_indices = []
+    for sym in out['Symbol'].astype(str):
+        member_indices = symbol_to_indices.get(sym, set())
+        relevant = member_indices & target_set
+        if relevant:
+            best_idx = max(relevant, key=lambda x: strength_map.get(x, 0.0))
+            boost = float(strength_map.get(best_idx, 0.0)) * float(INDEX_SOFT_BOOST_WEIGHT)
+            matched_indices.append(best_idx)
+        else:
+            best_idx = ''
+            boost = 0.0
+            matched_indices.append(best_idx)
+        boosts.append(boost)
+    out['Mapped_Index_For_Boost'] = matched_indices
+    out['Index_Boost'] = boosts
+    if direction.lower() == 'long':
+        base_col = 'Bull Rank' if 'Bull Rank' in out.columns else None
+        boosted_col = 'Bull Rank Boosted'
+        sort_cols = [boosted_col, 'Cumulative KER', 'Survival_Num', 'Cumulative ADX', '% Change']
+        ascending = [False, False, False, False, False]
+    else:
+        base_col = 'Bear Rank' if 'Bear Rank' in out.columns else None
+        boosted_col = 'Bear Rank Boosted'
+        sort_cols = [boosted_col, 'Cumulative KER', 'Survival_Num', 'Cumulative ADX', '% Change']
+        ascending = [False, False, False, False, True]
+    if base_col is not None:
+        out[boosted_col] = pd.to_numeric(out[base_col], errors='coerce').fillna(0.0) + pd.to_numeric(out['Index_Boost'], errors='coerce').fillna(0.0)
+    else:
+        out[boosted_col] = pd.to_numeric(out['Index_Boost'], errors='coerce').fillna(0.0)
+    out = out.sort_values(by=sort_cols, ascending=ascending, na_position='last').drop_duplicates(subset=['Symbol'])
+    return out
+
 def scan_index_universe() -> pd.DataFrame:
     symbols = load_index_symbols()
     rows = []
@@ -1285,15 +1363,16 @@ def main_index_first():
 
     long_stock_source = filter_stock_df_by_index_membership(df_all, long_index_symbols)
     short_stock_source = filter_stock_df_by_index_membership(df_all, short_index_symbols)
-
-    long_df, _ = build_candidate_tables(long_stock_source) if not long_stock_source.empty else (pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame())
-    _, short_df = build_candidate_tables(short_stock_source) if not short_stock_source.empty else (pd.DataFrame(), pd.DataFrame(columns=EMAIL_DISPLAY_COLS))
-
+    index_long_strength_map, index_short_strength_map = build_index_strength_maps(index_long_df, index_short_df)
+    long_stock_source = apply_soft_index_boost(long_stock_source, long_index_symbols, index_long_strength_map, direction='long') if not long_stock_source.empty else long_stock_source
+    short_stock_source = apply_soft_index_boost(short_stock_source, short_index_symbols, index_short_strength_map, direction='short') if not short_stock_source.empty else short_stock_source
+    long_df = long_stock_source.head(15).copy() if not long_stock_source.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    short_df = short_stock_source.head(15).copy() if not short_stock_source.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     long_df = filter_stock_df_by_index_membership(long_df, long_index_symbols) if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     short_df = filter_stock_df_by_index_membership(short_df, short_index_symbols) if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-
     long_df = long_df[[c for c in EMAIL_DISPLAY_COLS if c in long_df.columns]] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     short_df = short_df[[c for c in EMAIL_DISPLAY_COLS if c in short_df.columns]] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+
     index_long_df = index_long_df[[c for c in EMAIL_DISPLAY_COLS if c in index_long_df.columns]] if not index_long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     index_short_df = index_short_df[[c for c in EMAIL_DISPLAY_COLS if c in index_short_df.columns]] if not index_short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
 
