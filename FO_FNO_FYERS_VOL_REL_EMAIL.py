@@ -1031,7 +1031,7 @@ def send_email_with_tables(
         )
         msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-        for filename in [csv_filename, detail_csv_filename]:
+        for filename in [csv_filename, detail_csv_filename, index_iter_csv_filename]:
             if os.path.exists(filename):
                 with open(filename, "rb") as f:
                     part = MIMEBase("application", "octet-stream")
@@ -1377,6 +1377,46 @@ def scan_index_universe() -> pd.DataFrame:
 
 
 
+def build_index_iteration_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
+    if detail_df is None or detail_df.empty:
+        return pd.DataFrame()
+    work = detail_df.copy()
+    if 'Bucket' not in work.columns or 'Iteration Time' not in work.columns or '% Change' not in work.columns:
+        return pd.DataFrame()
+    work['Bucket'] = work['Bucket'].astype(str).str.strip().str.upper()
+    work = work[work['Bucket'].isin(['LONGINDEXSTOCKS', 'SHORTINDEXSTOCKS'])].copy()
+    if work.empty:
+        return pd.DataFrame()
+    for c in ['% Change', '10 Day Relative Volume', '20 Day Relative Volume']:
+        if c in work.columns:
+            work[c] = pd.to_numeric(work[c], errors='coerce')
+    if 'Price_Leading_Flag' in work.columns:
+        work['Price_Leading_Flag'] = work['Price_Leading_Flag'].astype(str).str.lower().isin(['true','1','yes'])
+    agg = work.groupby(['Iteration Time', 'Bucket']).agg(
+        Symbols=('Symbol', 'nunique'),
+        Sum_Change=('% Change', 'sum'),
+        Avg_Change=('% Change', 'mean'),
+        Lead_Count=('Price_Leading_Flag', 'sum') if 'Price_Leading_Flag' in work.columns else ('Symbol','size'),
+        Avg_RVol20=('20 Day Relative Volume', 'mean') if '20 Day Relative Volume' in work.columns else ('% Change','size')
+    ).reset_index()
+    piv = agg.pivot(index='Iteration Time', columns='Bucket')
+    piv.columns = ['_'.join([str(x) for x in col if str(x) != '']) for col in piv.columns]
+    piv = piv.reset_index()
+    for c in ['Sum_Change_LONGINDEXSTOCKS','Sum_Change_SHORTINDEXSTOCKS','Lead_Count_LONGINDEXSTOCKS','Lead_Count_SHORTINDEXSTOCKS','Symbols_LONGINDEXSTOCKS','Symbols_SHORTINDEXSTOCKS','Avg_RVol20_LONGINDEXSTOCKS','Avg_RVol20_SHORTINDEXSTOCKS']:
+        if c not in piv.columns:
+            piv[c] = 0
+    piv['Index_Bias_Raw'] = piv['Sum_Change_LONGINDEXSTOCKS'].fillna(0) - piv['Sum_Change_SHORTINDEXSTOCKS'].abs().fillna(0)
+    piv['Lead_Bias'] = piv['Lead_Count_LONGINDEXSTOCKS'].fillna(0) - piv['Lead_Count_SHORTINDEXSTOCKS'].fillna(0)
+    piv['Breadth_Bias'] = piv['Symbols_LONGINDEXSTOCKS'].fillna(0) - piv['Symbols_SHORTINDEXSTOCKS'].fillna(0)
+    piv['Volume_Bias'] = piv['Avg_RVol20_LONGINDEXSTOCKS'].fillna(0) - piv['Avg_RVol20_SHORTINDEXSTOCKS'].fillna(0)
+    piv['Derived_Index_Score'] = (piv['Index_Bias_Raw'] * 0.55) + (piv['Lead_Bias'] * 1.50) + (piv['Breadth_Bias'] * 0.20) + (piv['Volume_Bias'] * 0.75)
+    piv['Derived_Index_View'] = pd.cut(
+        piv['Derived_Index_Score'],
+        bins=[-1e9, -2, -0.4, 0.4, 2, 1e9],
+        labels=['STRONG SHORT', 'SHORT', 'NEUTRAL', 'LONG', 'STRONG LONG']
+    )
+    return piv.sort_values('Iteration Time').reset_index(drop=True)
+
 def main_index_first():
     logger.info('Starting Index-first FO Iteration Volume Volatility Scan')
     init_fyers()
@@ -1428,7 +1468,7 @@ def main_index_first():
     detail_df = df_iter.copy() if isinstance(df_iter, pd.DataFrame) else pd.DataFrame()
     if not detail_df.empty:
         detail_df['Bucket'] = detail_df['Symbol'].astype(str).map(
-            lambda s: 'LONG_INDEX_STOCKS' if s in set(long_df['Symbol'].astype(str)) else ('SHORT_INDEX_STOCKS' if s in set(short_df['Symbol'].astype(str)) else 'OTHER')
+            lambda s: 'LONGINDEXSTOCKS' if s in set(long_df['Symbol'].astype(str)) else ('SHORTINDEXSTOCKS' if s in set(short_df['Symbol'].astype(str)) else 'OTHER')
         )
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -1437,7 +1477,7 @@ def main_index_first():
     summary_df.to_csv(summary_csv, index=False)
     detail_df.to_csv(detail_csv, index=False)
 
-    send_email_with_tables(long_df, short_df, summary_csv, detail_csv, index_long_df=index_long_df, index_short_df=index_short_df)
+    send_email_with_tables(long_df, short_df, summary_csv, detail_csv, index_long_df=index_long_df, index_short_df=index_short_df, index_iter_csv_filename=(index_iter_csv if 'index_iter_csv' in locals() else None))
     logger.info('Index-first Scan Pipeline Completed')
 
 if __name__ == '__main__':
