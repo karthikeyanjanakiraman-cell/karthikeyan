@@ -1220,13 +1220,29 @@ def load_index_symbols() -> List[str]:
 
 
 def resolve_mapping_csv() -> str:
+    preferred = os.environ.get('MAPPING_CSV_PATH', '').strip()
+    if preferred and os.path.exists(preferred):
+        logger.info(f"CSV Mapping-selected file from env: {preferred}")
+        return preferred
     candidates = []
     for path in discover_csv_files():
         try:
             df = pd.read_csv(path)
             norm_cols = {str(c).strip().lower().replace(' ', '').replace('_', ''): c for c in df.columns}
             if 'symbol' in norm_cols and 'belongstoindices' in norm_cols:
-                candidates.append((len(df), path))
+                score = 0
+                score += len(df)
+                lower_path = path.lower()
+                if 'mapping' in lower_path:
+                    score += 100000
+                if 'sector' in lower_path:
+                    score += 10000
+                if 'fno_stock_list' in lower_path:
+                    score -= 1000
+                sample = pd.Series(df[norm_cols['belongstoindices']].dropna().astype(str).head(50)) if norm_cols.get('belongstoindices') in df.columns else pd.Series(dtype=str)
+                nonempty_multi = sample.str.contains(r'[,;/|]|nifty', case=False, regex=True).sum()
+                score += int(nonempty_multi) * 100
+                candidates.append((score, path))
         except Exception:
             continue
     if not candidates:
@@ -1251,12 +1267,12 @@ def filter_stock_df_by_index_membership(stock_df: pd.DataFrame, index_symbols: L
 
     symbol_to_indices = {}
     for _, row in map_df[[symbol_col, idx_col]].dropna(subset=[symbol_col]).iterrows():
-        sym = str(row[symbol_col]).strip()
+        sym = str(row[symbol_col]).strip().upper()
         parts = [normalize_index_name(p) for p in re.split(r'[,;/|]+', str(row[idx_col])) if str(p).strip()]
         symbol_to_indices[sym] = set(parts)
 
     keep = []
-    for sym in stock_df['Symbol'].astype(str):
+    for sym in stock_df['Symbol'].astype(str).str.upper():
         keep.append(bool(symbol_to_indices.get(sym, set()) & wanted))
     return stock_df.loc[keep].copy()
 
@@ -1272,7 +1288,7 @@ def load_fno_symbols_for_indices(active_index_symbols: List[str]) -> List[str]:
         parts = [normalize_index_name(p) for p in re.split(r'[,;/|]+', str(cell)) if str(p).strip()]
         return any(p in wanted for p in parts)
     filt = df[df[idx_col].apply(row_matches)].copy()
-    symbols = sorted(filt[symbol_col].dropna().astype(str).str.strip().unique())
+    symbols = sorted(filt[symbol_col].dropna().astype(str).str.strip().str.upper().unique())
     logger.info(f"FNO Filtered {len(symbols)} stocks from {csv_path} using {idx_col}")
     return symbols
 
@@ -1368,12 +1384,12 @@ def apply_soft_index_boost(stock_df: pd.DataFrame, target_index_symbols: List[st
     target_set = {normalize_index_name(x) for x in target_index_symbols if str(x).strip()}
     symbol_to_indices = {}
     for _, row in map_df[[symbol_col, idx_col]].dropna(subset=[symbol_col]).iterrows():
-        sym = str(row[symbol_col]).strip()
+        sym = str(row[symbol_col]).strip().upper()
         parts = [normalize_index_name(p) for p in re.split(r'[,;/|]+', str(row[idx_col])) if str(p).strip()]
         symbol_to_indices[sym] = set(parts)
     boosts = []
     matched_indices = []
-    for sym in out['Symbol'].astype(str):
+    for sym in out['Symbol'].astype(str).str.upper():
         member_indices = symbol_to_indices.get(sym, set())
         relevant = member_indices & target_set
         if relevant:
@@ -1411,7 +1427,7 @@ def scan_index_universe() -> pd.DataFrame:
         fyers_sym = format_fyers_index_symbol(sym)
         daily_df = get_fyers_history(fyers_sym, resolution='D', days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
         intra_df = get_fyers_history(fyers_sym, resolution='5', days_back=INTRADAY_LOOKBACK_DAYS)
-        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
+        iter_summary, _ = compute_iteration_volume_profile(intra_df)
         iv_info = compute_iv_proxies(daily_df)
         ltp = iter_summary.get('LTP')
         pct_change = float(iter_summary.get('% Change', 0.0)) if pd.notna(iter_summary.get('% Change', np.nan)) else 0.0
@@ -1551,8 +1567,10 @@ def main_index_first():
     logger.info(f'Long index symbols ({len(long_index_symbols)}): {long_index_symbols}')
     logger.info(f'Short index symbols ({len(short_index_symbols)}): {short_index_symbols}')
 
-    union_stock_symbols = sorted(set(load_fno_symbols_for_indices(long_index_symbols + short_index_symbols)))
-    df_all, df_iter = scan_symbol_universe(union_stock_symbols)
+    union_stock_symbols = sorted(set(load_fno_symbols_for_indices(long_index_symbols + short_index_symbols))) if (long_index_symbols or short_index_symbols) else []
+    if not union_stock_symbols:
+        logger.info('No stock symbols matched selected indices; skipping stock universe scan')
+    df_all, df_iter = scan_symbol_universe(union_stock_symbols) if union_stock_symbols else (pd.DataFrame(), pd.DataFrame())
     if not df_all.empty:
         df_all = add_signal_columns(derive_rank_columns(df_all))
 
