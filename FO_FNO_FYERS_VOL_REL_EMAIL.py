@@ -51,9 +51,6 @@ recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 def get_ist_now() -> datetime:
     return datetime.utcnow() + timedelta(hours=5, minutes=30)
 
-def is_live_market_day(dt_obj: datetime) -> bool:
-    return dt_obj.weekday() < 5
-
 def safe_attach_file(msg, filename):
     try:
         if not filename or not isinstance(filename, (str, bytes, os.PathLike)):
@@ -519,7 +516,7 @@ def compute_price_lead_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_iteration_volume_profile(
     intra_df: Optional[pd.DataFrame],
-    allow_stale_session: bool = False,
+    allow_stale_session: bool = True,
     change_mode: str = "%change_from_915_close",
 ) -> Tuple[Dict, pd.DataFrame]:
     if intra_df is None or intra_df.empty:
@@ -689,7 +686,7 @@ def compute_iteration_volume_profile(
     adx_now = float(metric_df["Cumulative ADX"].iloc[-1]) if not metric_df.empty else float("nan")
     ker_now = float(metric_df["Cumulative KER"].iloc[-1]) if not metric_df.empty else float("nan")
 
-    final_pct_change = float(detail_df["% Change"].iloc[-1]) if (not detail_df.empty and "% Change" in detail_df.columns and pd.notna(detail_df["% Change"].iloc[-1])) else np.nan
+    final_pct_change = float(detail_df["% Change"].iloc[-1]) if (not detail_df.empty and "% Change" in detail_df.columns and pd.notna(detail_df["% Change"].iloc[-1])) else 0.0
     summary = {
         "LTP": ltp,
         "% Change": final_pct_change,
@@ -1306,10 +1303,10 @@ def scan_symbol_universe(symbols: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame
         fyers_sym = format_fyers_symbol(sym)
         daily_df = get_fyers_history(fyers_sym, resolution='D', days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
         intra_df = get_fyers_history(fyers_sym, resolution='5', days_back=INTRADAY_LOOKBACK_DAYS)
-        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
+        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df, allow_stale_session=True)
         iv_info = compute_iv_proxies(daily_df)
         ltp = iter_summary.get('LTP')
-        pct_change = float(iter_summary.get('% Change')) if pd.notna(iter_summary.get('% Change', np.nan)) else np.nan
+        pct_change = float(iter_summary.get('% Change', 0.0)) if pd.notna(iter_summary.get('% Change', 0.0)) else 0.0
         if not iter_detail.empty:
             iter_detail.insert(0, 'Symbol', sym)
             iteration_rows.append(iter_detail)
@@ -1475,7 +1472,7 @@ def build_index_iteration_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         if "% Change" in missing:
             detail_df = detail_df.copy()
-            detail_df["% Change"] = np.nan
+            detail_df["% Change"] = 0.0
             missing = [c for c in required if c not in detail_df.columns]
         logger.warning(f"INDEX Missing columns for index detail build: {missing}")
         if missing:
