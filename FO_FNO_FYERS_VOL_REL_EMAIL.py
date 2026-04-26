@@ -48,6 +48,12 @@ sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
 sender_password = os.environ.get("SENDER_PASSWORD", "password")
 recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
+def get_ist_now() -> datetime:
+    return datetime.utcnow() + timedelta(hours=5, minutes=30)
+
+def is_live_market_day(dt_obj: datetime) -> bool:
+    return dt_obj.weekday() < 5
+
 def safe_attach_file(msg, filename):
     try:
         if not filename or not isinstance(filename, (str, bytes, os.PathLike)):
@@ -513,6 +519,7 @@ def compute_price_lead_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_iteration_volume_profile(
     intra_df: Optional[pd.DataFrame],
+    allow_stale_session: bool = False,
     change_mode: str = "%change_from_915_close",
 ) -> Tuple[Dict, pd.DataFrame]:
     if intra_df is None or intra_df.empty:
@@ -543,6 +550,7 @@ def compute_iteration_volume_profile(
 
     curr_df.sort_values("time_only", inplace=True)
     curr_df["cum_vol"] = curr_df["volume"].cumsum()
+    base_open_915 = float(curr_df["open"].iloc[0]) if not curr_df.empty and pd.notna(curr_df["open"].iloc[0]) else np.nan
     base_close_915 = float(curr_df["close"].iloc[0]) if not curr_df.empty and pd.notna(curr_df["close"].iloc[0]) else np.nan
 
     work_df = curr_df.copy()
@@ -681,7 +689,7 @@ def compute_iteration_volume_profile(
     adx_now = float(metric_df["Cumulative ADX"].iloc[-1]) if not metric_df.empty else float("nan")
     ker_now = float(metric_df["Cumulative KER"].iloc[-1]) if not metric_df.empty else float("nan")
 
-    final_pct_change = float(detail_df["% Change"].iloc[-1]) if (not detail_df.empty and "% Change" in detail_df.columns and pd.notna(detail_df["% Change"].iloc[-1])) else 0.0
+    final_pct_change = float(detail_df["% Change"].iloc[-1]) if (not detail_df.empty and "% Change" in detail_df.columns and pd.notna(detail_df["% Change"].iloc[-1])) else np.nan
     summary = {
         "LTP": ltp,
         "% Change": final_pct_change,
@@ -1301,7 +1309,7 @@ def scan_symbol_universe(symbols: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame
         iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
         iv_info = compute_iv_proxies(daily_df)
         ltp = iter_summary.get('LTP')
-        pct_change = float(iter_summary.get('% Change', 0.0)) if pd.notna(iter_summary.get('% Change', np.nan)) else 0.0
+        pct_change = float(iter_summary.get('% Change')) if pd.notna(iter_summary.get('% Change', np.nan)) else np.nan
         if not iter_detail.empty:
             iter_detail.insert(0, 'Symbol', sym)
             iteration_rows.append(iter_detail)
@@ -1467,7 +1475,7 @@ def build_index_iteration_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
     if missing:
         if "% Change" in missing:
             detail_df = detail_df.copy()
-            detail_df["% Change"] = 0.0
+            detail_df["% Change"] = np.nan
             missing = [c for c in required if c not in detail_df.columns]
         logger.warning(f"INDEX Missing columns for index detail build: {missing}")
         if missing:
