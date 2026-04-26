@@ -48,6 +48,12 @@ sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
 sender_password = os.environ.get("SENDER_PASSWORD", "password")
 recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
+def safe_path_exists(path) -> bool:
+    try:
+        return bool(path) and isinstance(path, (str, bytes, os.PathLike)) and os.path.exists(path)
+    except Exception:
+        return False
+
 def safe_attach_file(msg, filename):
     try:
         if not filename or not isinstance(filename, (str, bytes, os.PathLike)):
@@ -1230,18 +1236,14 @@ def resolve_mapping_csv() -> str:
             df = pd.read_csv(path)
             norm_cols = {str(c).strip().lower().replace(' ', '').replace('_', ''): c for c in df.columns}
             if 'symbol' in norm_cols and 'belongstoindices' in norm_cols:
-                score = 0
-                score += len(df)
                 lower_path = path.lower()
+                score = len(df)
                 if 'mapping' in lower_path:
                     score += 100000
                 if 'sector' in lower_path:
                     score += 10000
                 if 'fno_stock_list' in lower_path:
                     score -= 1000
-                sample = pd.Series(df[norm_cols['belongstoindices']].dropna().astype(str).head(50)) if norm_cols.get('belongstoindices') in df.columns else pd.Series(dtype=str)
-                nonempty_multi = sample.str.contains(r'[,;/|]|nifty', case=False, regex=True).sum()
-                score += int(nonempty_multi) * 100
                 candidates.append((score, path))
         except Exception:
             continue
@@ -1429,8 +1431,9 @@ def scan_index_universe() -> pd.DataFrame:
         intra_df = get_fyers_history(fyers_sym, resolution='5', days_back=INTRADAY_LOOKBACK_DAYS)
         iter_summary, _ = compute_iteration_volume_profile(intra_df)
         iv_info = compute_iv_proxies(daily_df)
+        prev_close = float(daily_df['close'].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2) else None
         ltp = iter_summary.get('LTP')
-        pct_change = float(iter_summary.get('% Change', 0.0)) if pd.notna(iter_summary.get('% Change', np.nan)) else 0.0
+        pct_change = ((ltp - prev_close) / prev_close * 100) if (ltp is not None and prev_close and prev_close != 0) else 0.0
         rows.append({
             'Symbol': normalize_index_name(sym),
             'LTP': ltp,
@@ -1567,10 +1570,8 @@ def main_index_first():
     logger.info(f'Long index symbols ({len(long_index_symbols)}): {long_index_symbols}')
     logger.info(f'Short index symbols ({len(short_index_symbols)}): {short_index_symbols}')
 
-    union_stock_symbols = sorted(set(load_fno_symbols_for_indices(long_index_symbols + short_index_symbols))) if (long_index_symbols or short_index_symbols) else []
-    if not union_stock_symbols:
-        logger.info('No stock symbols matched selected indices; skipping stock universe scan')
-    df_all, df_iter = scan_symbol_universe(union_stock_symbols) if union_stock_symbols else (pd.DataFrame(), pd.DataFrame())
+    union_stock_symbols = sorted(set(load_fno_symbols_for_indices(long_index_symbols + short_index_symbols)))
+    df_all, df_iter = scan_symbol_universe(union_stock_symbols)
     if not df_all.empty:
         df_all = add_signal_columns(derive_rank_columns(df_all))
 
