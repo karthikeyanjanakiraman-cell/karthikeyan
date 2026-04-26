@@ -48,12 +48,6 @@ sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
 sender_password = os.environ.get("SENDER_PASSWORD", "password")
 recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
-def safe_path_exists(path) -> bool:
-    try:
-        return bool(path) and isinstance(path, (str, bytes, os.PathLike)) and os.path.exists(path)
-    except Exception:
-        return False
-
 def safe_attach_file(msg, filename):
     try:
         if not filename or not isinstance(filename, (str, bytes, os.PathLike)):
@@ -549,7 +543,6 @@ def compute_iteration_volume_profile(
 
     curr_df.sort_values("time_only", inplace=True)
     curr_df["cum_vol"] = curr_df["volume"].cumsum()
-    base_open_915 = float(curr_df["open"].iloc[0]) if not curr_df.empty and pd.notna(curr_df["open"].iloc[0]) else np.nan
     base_close_915 = float(curr_df["close"].iloc[0]) if not curr_df.empty and pd.notna(curr_df["close"].iloc[0]) else np.nan
 
     work_df = curr_df.copy()
@@ -1236,14 +1229,14 @@ def resolve_mapping_csv() -> str:
             df = pd.read_csv(path)
             norm_cols = {str(c).strip().lower().replace(' ', '').replace('_', ''): c for c in df.columns}
             if 'symbol' in norm_cols and 'belongstoindices' in norm_cols:
-                lower_path = path.lower()
                 score = len(df)
+                lower_path = path.lower()
                 if 'mapping' in lower_path:
                     score += 100000
-                if 'sector' in lower_path:
+                elif 'sector' in lower_path:
                     score += 10000
                 if 'fno_stock_list' in lower_path:
-                    score -= 1000
+                    score -= 5000
                 candidates.append((score, path))
         except Exception:
             continue
@@ -1472,8 +1465,13 @@ def build_index_iteration_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
     ]
     missing = [c for c in required if c not in work.columns]
     if missing:
+        if "% Change" in missing:
+            detail_df = detail_df.copy()
+            detail_df["% Change"] = 0.0
+            missing = [c for c in required if c not in detail_df.columns]
         logger.warning(f"INDEX Missing columns for index detail build: {missing}")
-        return pd.DataFrame()
+        if missing:
+            return pd.DataFrame()
 
     symbol_to_indices = load_symbol_to_indices_map("sectors")
     if not symbol_to_indices:
