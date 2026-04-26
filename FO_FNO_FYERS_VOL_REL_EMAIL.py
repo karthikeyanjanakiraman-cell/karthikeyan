@@ -48,26 +48,6 @@ sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
 sender_password = os.environ.get("SENDER_PASSWORD", "password")
 recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
-def get_ist_now() -> datetime:
-    return datetime.utcnow() + timedelta(hours=5, minutes=30)
-
-def safe_attach_file(msg, filename):
-    try:
-        if not filename or not isinstance(filename, (str, bytes, os.PathLike)):
-            logger.warning(f"EMAIL Skipping invalid attachment path: {filename}")
-            return
-        if not os.path.exists(filename):
-            logger.warning(f"EMAIL Attachment file not found: {filename}")
-            return
-        with open(filename, "rb") as f:
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(f.read())
-            encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(filename)}")
-            msg.attach(part)
-    except Exception as e:
-        logger.warning(f"EMAIL Failed attaching {filename}: {type(e).__name__}: {e}")
-
 EMAIL_DISPLAY_COLS = [
     "Symbol", "LTP", "% Change", "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
     "Bull_Signal", "Bear_Signal", "Overall_Signal", "Price_Lead_Status", "IVP",
@@ -516,8 +496,6 @@ def compute_price_lead_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
 
 def compute_iteration_volume_profile(
     intra_df: Optional[pd.DataFrame],
-    allow_stale_session: bool = True,
-    change_mode: str = "%change_from_915_close",
 ) -> Tuple[Dict, pd.DataFrame]:
     if intra_df is None or intra_df.empty:
         return {}, pd.DataFrame()
@@ -547,8 +525,6 @@ def compute_iteration_volume_profile(
 
     curr_df.sort_values("time_only", inplace=True)
     curr_df["cum_vol"] = curr_df["volume"].cumsum()
-    base_open_915 = float(curr_df["open"].iloc[0]) if not curr_df.empty and pd.notna(curr_df["open"].iloc[0]) else np.nan
-    base_close_915 = float(curr_df["close"].iloc[0]) if not curr_df.empty and pd.notna(curr_df["close"].iloc[0]) else np.nan
 
     work_df = curr_df.copy()
     if "time" not in work_df.columns:
@@ -686,10 +662,8 @@ def compute_iteration_volume_profile(
     adx_now = float(metric_df["Cumulative ADX"].iloc[-1]) if not metric_df.empty else float("nan")
     ker_now = float(metric_df["Cumulative KER"].iloc[-1]) if not metric_df.empty else float("nan")
 
-    final_pct_change = float(detail_df["% Change"].iloc[-1]) if (not detail_df.empty and "% Change" in detail_df.columns and pd.notna(detail_df["% Change"].iloc[-1])) else 0.0
     summary = {
         "LTP": ltp,
-        "% Change": final_pct_change,
         "Current Volume": last_cum_vol,
         "10 Day Relative Volume": last_rvol10,
         "20 Day Relative Volume": last_rvol20,
@@ -1101,6 +1075,8 @@ def send_email_with_tables(
         msg.attach(MIMEText(html_body, "html", "utf-8"))
 
         for filename in [csv_filename, detail_csv_filename, index_iter_csv_filename]:
+            if not filename or not isinstance(filename, (str, bytes, os.PathLike)):
+                continue
             if os.path.exists(filename):
                 with open(filename, "rb") as f:
                     part = MIMEBase("application", "octet-stream")
@@ -1224,25 +1200,13 @@ def load_index_symbols() -> List[str]:
 
 
 def resolve_mapping_csv() -> str:
-    preferred = os.environ.get('MAPPING_CSV_PATH', '').strip()
-    if preferred and os.path.exists(preferred):
-        logger.info(f"CSV Mapping-selected file from env: {preferred}")
-        return preferred
     candidates = []
     for path in discover_csv_files():
         try:
             df = pd.read_csv(path)
             norm_cols = {str(c).strip().lower().replace(' ', '').replace('_', ''): c for c in df.columns}
             if 'symbol' in norm_cols and 'belongstoindices' in norm_cols:
-                score = len(df)
-                lower_path = path.lower()
-                if 'mapping' in lower_path:
-                    score += 100000
-                elif 'sector' in lower_path:
-                    score += 10000
-                if 'fno_stock_list' in lower_path:
-                    score -= 5000
-                candidates.append((score, path))
+                candidates.append((len(df), path))
         except Exception:
             continue
     if not candidates:
@@ -1267,12 +1231,12 @@ def filter_stock_df_by_index_membership(stock_df: pd.DataFrame, index_symbols: L
 
     symbol_to_indices = {}
     for _, row in map_df[[symbol_col, idx_col]].dropna(subset=[symbol_col]).iterrows():
-        sym = str(row[symbol_col]).strip().upper()
+        sym = str(row[symbol_col]).strip()
         parts = [normalize_index_name(p) for p in re.split(r'[,;/|]+', str(row[idx_col])) if str(p).strip()]
         symbol_to_indices[sym] = set(parts)
 
     keep = []
-    for sym in stock_df['Symbol'].astype(str).str.upper():
+    for sym in stock_df['Symbol'].astype(str):
         keep.append(bool(symbol_to_indices.get(sym, set()) & wanted))
     return stock_df.loc[keep].copy()
 
@@ -1288,7 +1252,7 @@ def load_fno_symbols_for_indices(active_index_symbols: List[str]) -> List[str]:
         parts = [normalize_index_name(p) for p in re.split(r'[,;/|]+', str(cell)) if str(p).strip()]
         return any(p in wanted for p in parts)
     filt = df[df[idx_col].apply(row_matches)].copy()
-    symbols = sorted(filt[symbol_col].dropna().astype(str).str.strip().str.upper().unique())
+    symbols = sorted(filt[symbol_col].dropna().astype(str).str.strip().unique())
     logger.info(f"FNO Filtered {len(symbols)} stocks from {csv_path} using {idx_col}")
     return symbols
 
@@ -1303,12 +1267,14 @@ def scan_symbol_universe(symbols: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame
         fyers_sym = format_fyers_symbol(sym)
         daily_df = get_fyers_history(fyers_sym, resolution='D', days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
         intra_df = get_fyers_history(fyers_sym, resolution='5', days_back=INTRADAY_LOOKBACK_DAYS)
-        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df, allow_stale_session=True)
+        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
         iv_info = compute_iv_proxies(daily_df)
+        prev_close = float(daily_df['close'].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2 and 'close' in daily_df.columns) else None
         ltp = iter_summary.get('LTP')
-        pct_change = float(iter_summary.get('% Change', 0.0)) if pd.notna(iter_summary.get('% Change', 0.0)) else 0.0
+        pct_change = ((float(ltp) - prev_close) / prev_close * 100.0) if (ltp is not None and prev_close is not None and prev_close != 0) else 0.0
         if not iter_detail.empty:
             iter_detail.insert(0, 'Symbol', sym)
+            iter_detail.insert(1, '% Change', pct_change)
             iteration_rows.append(iter_detail)
         rows.append({
             'Symbol': sym,
@@ -1384,12 +1350,12 @@ def apply_soft_index_boost(stock_df: pd.DataFrame, target_index_symbols: List[st
     target_set = {normalize_index_name(x) for x in target_index_symbols if str(x).strip()}
     symbol_to_indices = {}
     for _, row in map_df[[symbol_col, idx_col]].dropna(subset=[symbol_col]).iterrows():
-        sym = str(row[symbol_col]).strip().upper()
+        sym = str(row[symbol_col]).strip()
         parts = [normalize_index_name(p) for p in re.split(r'[,;/|]+', str(row[idx_col])) if str(p).strip()]
         symbol_to_indices[sym] = set(parts)
     boosts = []
     matched_indices = []
-    for sym in out['Symbol'].astype(str).str.upper():
+    for sym in out['Symbol'].astype(str):
         member_indices = symbol_to_indices.get(sym, set())
         relevant = member_indices & target_set
         if relevant:
@@ -1429,9 +1395,9 @@ def scan_index_universe() -> pd.DataFrame:
         intra_df = get_fyers_history(fyers_sym, resolution='5', days_back=INTRADAY_LOOKBACK_DAYS)
         iter_summary, _ = compute_iteration_volume_profile(intra_df)
         iv_info = compute_iv_proxies(daily_df)
-        prev_close = float(daily_df['close'].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2) else None
+        prev_close = float(daily_df['close'].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2 and 'close' in daily_df.columns) else None
         ltp = iter_summary.get('LTP')
-        pct_change = ((ltp - prev_close) / prev_close * 100) if (ltp is not None and prev_close and prev_close != 0) else 0.0
+        pct_change = ((float(ltp) - prev_close) / prev_close * 100.0) if (ltp is not None and prev_close is not None and prev_close != 0) else 0.0
         rows.append({
             'Symbol': normalize_index_name(sym),
             'LTP': ltp,
@@ -1470,13 +1436,8 @@ def build_index_iteration_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
     ]
     missing = [c for c in required if c not in work.columns]
     if missing:
-        if "% Change" in missing:
-            detail_df = detail_df.copy()
-            detail_df["% Change"] = 0.0
-            missing = [c for c in required if c not in detail_df.columns]
         logger.warning(f"INDEX Missing columns for index detail build: {missing}")
-        if missing:
-            return pd.DataFrame()
+        return pd.DataFrame()
 
     symbol_to_indices = load_symbol_to_indices_map("sectors")
     if not symbol_to_indices:
