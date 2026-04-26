@@ -331,7 +331,7 @@ def compute_cumulative_directional_metrics(curr_df: pd.DataFrame) -> pd.DataFram
             )
         adx = float(np.mean(dxs)) if dxs else np.nan
 
-        if (pdi > mdi and adx >= 15) or (c[i] > c[0]):
+        if c[i] > c[i - 1]:
             qualified += 1
         length_so_far = i + 1
         survival_ratio = qualified / length_so_far if length_so_far > 0 else 0.0
@@ -969,9 +969,6 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
         return '<p style="color:#cbd5e1;font-family:Arial,sans-serif;">No candidates found.</p>'
 
     df_slice = df.head(max_rows).copy()
-    missing_display = [c for c in EMAIL_DISPLAY_COLS if c not in df_slice.columns]
-    if missing_display:
-        logger.warning(f"HTML Missing display columns: {missing_display}")
     cols = [c for c in EMAIL_DISPLAY_COLS if c in df_slice.columns]
     if not cols:
         return '<p style="color:#cbd5e1;font-family:Arial,sans-serif;">No candidates found.</p>'
@@ -1204,12 +1201,6 @@ def load_index_symbols() -> List[str]:
 
 
 def resolve_mapping_csv() -> str:
-    preferred = os.environ.get("MAPPING_CSV_PATH", "").strip()
-    if preferred:
-        if os.path.exists(preferred):
-            logger.info(f"CSV Using mapping file from MAPPING_CSV_PATH: {preferred}")
-            return preferred
-        logger.warning(f"CSV MAPPING_CSV_PATH not found: {preferred}; falling back to auto-discovery")
     candidates = []
     for path in discover_csv_files():
         try:
@@ -1241,12 +1232,12 @@ def filter_stock_df_by_index_membership(stock_df: pd.DataFrame, index_symbols: L
 
     symbol_to_indices = {}
     for _, row in map_df[[symbol_col, idx_col]].dropna(subset=[symbol_col]).iterrows():
-        sym = str(row[symbol_col]).strip().upper()
+        sym = str(row[symbol_col]).strip()
         parts = [normalize_index_name(p) for p in re.split(r'[,;/|]+', str(row[idx_col])) if str(p).strip()]
         symbol_to_indices[sym] = set(parts)
 
     keep = []
-    for sym in stock_df['Symbol'].astype(str).str.upper():
+    for sym in stock_df['Symbol'].astype(str):
         keep.append(bool(symbol_to_indices.get(sym, set()) & wanted))
     return stock_df.loc[keep].copy()
 
@@ -1276,7 +1267,8 @@ def scan_symbol_universe(symbols: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame
         logger.info(f"CORE [{idx}/{total}] Processing {sym}")
         fyers_sym = format_fyers_symbol(sym)
         daily_df = get_fyers_history(fyers_sym, resolution='D', days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
-        intra_df = get_fyers_history(fyers_sym, resolution='5', days_back=INTRADAY_LOOKBACK_DAYS)        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
+        intra_df = get_fyers_history(fyers_sym, resolution='5', days_back=INTRADAY_LOOKBACK_DAYS)
+        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
         iv_info = compute_iv_proxies(daily_df) if daily_df is not None else {"IVP": np.nan, "Volatility State": "Neutral Vol"}
         ltp = iter_summary.get('LTP')
         pct_change = float(iter_detail['% Change'].iloc[-1]) if (not iter_detail.empty and '% Change' in iter_detail.columns and pd.notna(iter_detail['% Change'].iloc[-1])) else 0.0
@@ -1357,12 +1349,12 @@ def apply_soft_index_boost(stock_df: pd.DataFrame, target_index_symbols: List[st
     target_set = {normalize_index_name(x) for x in target_index_symbols if str(x).strip()}
     symbol_to_indices = {}
     for _, row in map_df[[symbol_col, idx_col]].dropna(subset=[symbol_col]).iterrows():
-        sym = str(row[symbol_col]).strip().upper()
+        sym = str(row[symbol_col]).strip()
         parts = [normalize_index_name(p) for p in re.split(r'[,;/|]+', str(row[idx_col])) if str(p).strip()]
         symbol_to_indices[sym] = set(parts)
     boosts = []
     matched_indices = []
-    for sym in out['Symbol'].astype(str).str.upper():
+    for sym in out['Symbol'].astype(str):
         member_indices = symbol_to_indices.get(sym, set())
         relevant = member_indices & target_set
         if relevant:
