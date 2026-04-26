@@ -48,18 +48,12 @@ sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
 sender_password = os.environ.get("SENDER_PASSWORD", "password")
 recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
-def safe_path_exists(path) -> bool:
-    try:
-        return bool(path) and isinstance(path, (str, bytes, os.PathLike)) and os.path.exists(path)
-    except Exception:
-        return False
-
 def safe_attach_file(msg, filename):
     try:
         if not filename or not isinstance(filename, (str, bytes, os.PathLike)):
             logger.warning(f"EMAIL Skipping invalid attachment path: {filename}")
             return
-        if not safe_path_exists(filename):
+        if not os.path.exists(filename):
             logger.warning(f"EMAIL Attachment file not found: {filename}")
             return
         with open(filename, "rb") as f:
@@ -688,8 +682,10 @@ def compute_iteration_volume_profile(
     adx_now = float(metric_df["Cumulative ADX"].iloc[-1]) if not metric_df.empty else float("nan")
     ker_now = float(metric_df["Cumulative KER"].iloc[-1]) if not metric_df.empty else float("nan")
 
+    final_pct_change = float(detail_df["% Change"].iloc[-1]) if (not detail_df.empty and "% Change" in detail_df.columns and pd.notna(detail_df["% Change"].iloc[-1])) else 0.0
     summary = {
         "LTP": ltp,
+        "% Change": final_pct_change,
         "Current Volume": last_cum_vol,
         "10 Day Relative Volume": last_rvol10,
         "20 Day Relative Volume": last_rvol20,
@@ -1101,7 +1097,7 @@ def send_email_with_tables(
         msg.attach(MIMEText(html_body, "html", "utf-8"))
 
         for filename in [csv_filename, detail_csv_filename, index_iter_csv_filename]:
-            if safe_path_exists(filename):
+            if os.path.exists(filename):
                 with open(filename, "rb") as f:
                     part = MIMEBase("application", "octet-stream")
                     part.set_payload(f.read())
@@ -1292,9 +1288,9 @@ def scan_symbol_universe(symbols: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame
         daily_df = get_fyers_history(fyers_sym, resolution='D', days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
         intra_df = get_fyers_history(fyers_sym, resolution='5', days_back=INTRADAY_LOOKBACK_DAYS)
         iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
-        iv_info = compute_iv_proxies(daily_df) if daily_df is not None else {"IVP": np.nan, "Volatility State": "Neutral Vol"}
+        iv_info = compute_iv_proxies(daily_df)
         ltp = iter_summary.get('LTP')
-        pct_change = float(iter_detail['% Change'].iloc[-1]) if (not iter_detail.empty and '% Change' in iter_detail.columns) else 0.0
+        pct_change = float(iter_summary.get('% Change', 0.0)) if pd.notna(iter_summary.get('% Change', np.nan)) else 0.0
         if not iter_detail.empty:
             iter_detail.insert(0, 'Symbol', sym)
             iteration_rows.append(iter_detail)
@@ -1415,11 +1411,10 @@ def scan_index_universe() -> pd.DataFrame:
         fyers_sym = format_fyers_index_symbol(sym)
         daily_df = get_fyers_history(fyers_sym, resolution='D', days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
         intra_df = get_fyers_history(fyers_sym, resolution='5', days_back=INTRADAY_LOOKBACK_DAYS)
-        iter_summary, _ = compute_iteration_volume_profile(intra_df)
+        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
         iv_info = compute_iv_proxies(daily_df)
-        prev_close = float(daily_df['close'].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2) else None
         ltp = iter_summary.get('LTP')
-        pct_change = ((ltp - prev_close) / prev_close * 100) if (ltp is not None and prev_close and prev_close != 0) else 0.0
+        pct_change = float(iter_summary.get('% Change', 0.0)) if pd.notna(iter_summary.get('% Change', np.nan)) else 0.0
         rows.append({
             'Symbol': normalize_index_name(sym),
             'LTP': ltp,
@@ -1458,13 +1453,8 @@ def build_index_iteration_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
     ]
     missing = [c for c in required if c not in work.columns]
     if missing:
-        if "% Change" in missing:
-            detail_df = detail_df.copy()
-            detail_df["% Change"] = 0.0
-            missing = [c for c in required if c not in detail_df.columns]
         logger.warning(f"INDEX Missing columns for index detail build: {missing}")
-        if missing:
-            return pd.DataFrame()
+        return pd.DataFrame()
 
     symbol_to_indices = load_symbol_to_indices_map("sectors")
     if not symbol_to_indices:
