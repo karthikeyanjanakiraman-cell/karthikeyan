@@ -969,6 +969,9 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
         return '<p style="color:#cbd5e1;font-family:Arial,sans-serif;">No candidates found.</p>'
 
     df_slice = df.head(max_rows).copy()
+    missing_display = [c for c in EMAIL_DISPLAY_COLS if c not in df_slice.columns]
+    if missing_display:
+        logger.warning(f"HTML Missing display columns: {missing_display}")
     cols = [c for c in EMAIL_DISPLAY_COLS if c in df_slice.columns]
     if not cols:
         return '<p style="color:#cbd5e1;font-family:Arial,sans-serif;">No candidates found.</p>'
@@ -1201,6 +1204,12 @@ def load_index_symbols() -> List[str]:
 
 
 def resolve_mapping_csv() -> str:
+    preferred = os.environ.get("MAPPING_CSV_PATH", "").strip()
+    if preferred:
+        if os.path.exists(preferred):
+            logger.info(f"CSV Using mapping file from MAPPING_CSV_PATH: {preferred}")
+            return preferred
+        logger.warning(f"CSV MAPPING_CSV_PATH not found: {preferred}; falling back to auto-discovery")
     candidates = []
     for path in discover_csv_files():
         try:
@@ -1232,12 +1241,12 @@ def filter_stock_df_by_index_membership(stock_df: pd.DataFrame, index_symbols: L
 
     symbol_to_indices = {}
     for _, row in map_df[[symbol_col, idx_col]].dropna(subset=[symbol_col]).iterrows():
-        sym = str(row[symbol_col]).strip()
+        sym = str(row[symbol_col]).strip().upper()
         parts = [normalize_index_name(p) for p in re.split(r'[,;/|]+', str(row[idx_col])) if str(p).strip()]
         symbol_to_indices[sym] = set(parts)
 
     keep = []
-    for sym in stock_df['Symbol'].astype(str):
+    for sym in stock_df['Symbol'].astype(str).str.upper():
         keep.append(bool(symbol_to_indices.get(sym, set()) & wanted))
     return stock_df.loc[keep].copy()
 
@@ -1349,12 +1358,12 @@ def apply_soft_index_boost(stock_df: pd.DataFrame, target_index_symbols: List[st
     target_set = {normalize_index_name(x) for x in target_index_symbols if str(x).strip()}
     symbol_to_indices = {}
     for _, row in map_df[[symbol_col, idx_col]].dropna(subset=[symbol_col]).iterrows():
-        sym = str(row[symbol_col]).strip()
+        sym = str(row[symbol_col]).strip().upper()
         parts = [normalize_index_name(p) for p in re.split(r'[,;/|]+', str(row[idx_col])) if str(p).strip()]
         symbol_to_indices[sym] = set(parts)
     boosts = []
     matched_indices = []
-    for sym in out['Symbol'].astype(str):
+    for sym in out['Symbol'].astype(str).str.upper():
         member_indices = symbol_to_indices.get(sym, set())
         relevant = member_indices & target_set
         if relevant:
