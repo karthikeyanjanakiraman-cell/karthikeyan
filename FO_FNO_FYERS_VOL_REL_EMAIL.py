@@ -48,6 +48,29 @@ sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
 sender_password = os.environ.get("SENDER_PASSWORD", "password")
 recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
+def safe_path_exists(path) -> bool:
+    try:
+        return bool(path) and isinstance(path, (str, bytes, os.PathLike)) and os.path.exists(path)
+    except Exception:
+        return False
+
+def safe_attach_file(msg, filename):
+    try:
+        if not filename or not isinstance(filename, (str, bytes, os.PathLike)):
+            logger.warning(f"EMAIL Skipping invalid attachment path: {filename}")
+            return
+        if not safe_path_exists(filename):
+            logger.warning(f"EMAIL Attachment file not found: {filename}")
+            return
+        with open(filename, "rb") as f:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(filename)}")
+            msg.attach(part)
+    except Exception as e:
+        logger.warning(f"EMAIL Failed attaching {filename}: {type(e).__name__}: {e}")
+
 EMAIL_DISPLAY_COLS = [
     "Symbol", "LTP", "% Change", "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
     "Bull_Signal", "Bear_Signal", "Overall_Signal", "Price_Lead_Status", "IVP",
@@ -474,8 +497,8 @@ def compute_price_lead_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
             df["price_leading_flag"],
         ],
         [
-            "STRONG_PRICE_LEAD",
-            "PRICE_LEAD_BUILDING",
+            "STRONG_PRICE_LEAD_FADE",
+            "PRICE_LEADING_FADE_RISK",
             "EARLY_PRICE_LEAD",
         ],
         default="NORMAL",
@@ -969,9 +992,6 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
         return '<p style="color:#cbd5e1;font-family:Arial,sans-serif;">No candidates found.</p>'
 
     df_slice = df.head(max_rows).copy()
-    missing_display = [c for c in EMAIL_DISPLAY_COLS if c not in df_slice.columns]
-    if missing_display:
-        logger.warning(f"HTML Missing display columns: {missing_display}")
     cols = [c for c in EMAIL_DISPLAY_COLS if c in df_slice.columns]
     if not cols:
         return '<p style="color:#cbd5e1;font-family:Arial,sans-serif;">No candidates found.</p>'
@@ -1081,7 +1101,7 @@ def send_email_with_tables(
         msg.attach(MIMEText(html_body, "html", "utf-8"))
 
         for filename in [csv_filename, detail_csv_filename, index_iter_csv_filename]:
-            if os.path.exists(filename):
+            if safe_path_exists(filename):
                 with open(filename, "rb") as f:
                     part = MIMEBase("application", "octet-stream")
                     part.set_payload(f.read())
@@ -1204,12 +1224,6 @@ def load_index_symbols() -> List[str]:
 
 
 def resolve_mapping_csv() -> str:
-    preferred = os.environ.get("MAPPING_CSV_PATH", "").strip()
-    if preferred:
-        if os.path.exists(preferred):
-            logger.info(f"CSV Using mapping file from MAPPING_CSV_PATH: {preferred}")
-            return preferred
-        logger.warning(f"CSV MAPPING_CSV_PATH not found: {preferred}; falling back to auto-discovery")
     candidates = []
     for path in discover_csv_files():
         try:
@@ -1241,12 +1255,12 @@ def filter_stock_df_by_index_membership(stock_df: pd.DataFrame, index_symbols: L
 
     symbol_to_indices = {}
     for _, row in map_df[[symbol_col, idx_col]].dropna(subset=[symbol_col]).iterrows():
-        sym = str(row[symbol_col]).strip().upper()
+        sym = str(row[symbol_col]).strip()
         parts = [normalize_index_name(p) for p in re.split(r'[,;/|]+', str(row[idx_col])) if str(p).strip()]
         symbol_to_indices[sym] = set(parts)
 
     keep = []
-    for sym in stock_df['Symbol'].astype(str).str.upper():
+    for sym in stock_df['Symbol'].astype(str):
         keep.append(bool(symbol_to_indices.get(sym, set()) & wanted))
     return stock_df.loc[keep].copy()
 
@@ -1280,7 +1294,7 @@ def scan_symbol_universe(symbols: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame
         iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
         iv_info = compute_iv_proxies(daily_df) if daily_df is not None else {"IVP": np.nan, "Volatility State": "Neutral Vol"}
         ltp = iter_summary.get('LTP')
-        pct_change = float(iter_detail['% Change'].iloc[-1]) if (not iter_detail.empty and '% Change' in iter_detail.columns and pd.notna(iter_detail['% Change'].iloc[-1])) else 0.0
+        pct_change = float(iter_detail['% Change'].iloc[-1]) if (not iter_detail.empty and '% Change' in iter_detail.columns) else 0.0
         if not iter_detail.empty:
             iter_detail.insert(0, 'Symbol', sym)
             iteration_rows.append(iter_detail)
@@ -1358,12 +1372,12 @@ def apply_soft_index_boost(stock_df: pd.DataFrame, target_index_symbols: List[st
     target_set = {normalize_index_name(x) for x in target_index_symbols if str(x).strip()}
     symbol_to_indices = {}
     for _, row in map_df[[symbol_col, idx_col]].dropna(subset=[symbol_col]).iterrows():
-        sym = str(row[symbol_col]).strip().upper()
+        sym = str(row[symbol_col]).strip()
         parts = [normalize_index_name(p) for p in re.split(r'[,;/|]+', str(row[idx_col])) if str(p).strip()]
         symbol_to_indices[sym] = set(parts)
     boosts = []
     matched_indices = []
-    for sym in out['Symbol'].astype(str).str.upper():
+    for sym in out['Symbol'].astype(str):
         member_indices = symbol_to_indices.get(sym, set())
         relevant = member_indices & target_set
         if relevant:
@@ -1444,8 +1458,13 @@ def build_index_iteration_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
     ]
     missing = [c for c in required if c not in work.columns]
     if missing:
+        if "% Change" in missing:
+            detail_df = detail_df.copy()
+            detail_df["% Change"] = 0.0
+            missing = [c for c in required if c not in detail_df.columns]
         logger.warning(f"INDEX Missing columns for index detail build: {missing}")
-        return pd.DataFrame()
+        if missing:
+            return pd.DataFrame()
 
     symbol_to_indices = load_symbol_to_indices_map("sectors")
     if not symbol_to_indices:
