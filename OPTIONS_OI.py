@@ -1,7 +1,6 @@
 import sys
 import subprocess
 
-# --- AUTOMATIC DEPENDENCY FIX ---
 try:
     import fyersapiv3
 except ImportError:
@@ -22,9 +21,24 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 
-# --- ROBUST FUNCTION DEFINITION ---
-"))
+class UTF8Formatter(logging.Formatter):
+    def format(self, record):
+        msg = record.getMessage()
+        record.msg = msg.encode("ascii", "ignore").decode("ascii")
+        return super().format(record)
 
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+if logger.hasHandlers():
+    logger.handlers.clear()
+ch = logging.StreamHandler(sys.stdout)
+ch.setLevel(logging.INFO)
+# Single line formatter to prevent syntax errors
+formatter = UTF8Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+ch.setFormatter(formatter)
+logger.addHandler(ch)
+
+")
 
 class UTF8Formatter(logging.Formatter):
     def format(self, record):
@@ -39,7 +53,9 @@ if logger.hasHandlers():
     logger.handlers.clear()
 ch = logging.StreamHandler(sys.stdout)
 ch.setLevel(logging.INFO)
-formatter = UTF8Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+formatter = UTF8Formatter(
+    "%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+)
 ch.setFormatter(formatter)
 logger.addHandler(ch)
 
