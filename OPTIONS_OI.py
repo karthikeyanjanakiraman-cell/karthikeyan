@@ -1,6 +1,15 @@
+import sys
+import subprocess
+
+# --- AUTOMATIC DEPENDENCY FIX ---
+try:
+    import fyersapiv3
+except ImportError:
+    subprocess.check_call([sys.executable, "-m", "pip", "install", "fyers-apiv3", "pandas", "numpy"])
+    import fyersapiv3
+
 import os
 import re
-import sys
 import logging
 from datetime import datetime, timedelta, time
 from typing import List, Dict, Optional, Tuple
@@ -13,36 +22,8 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 
-# --- FUNCTION DEFINITION MOVED TO TOP SCOPE ---
-def scan_options_logic(long_symbols, short_symbols):
-    """Fetches Fyers Option Chain and logs ATM/Near-ATM Strike OI with robust key handling."""
-    global fyers
-    logger.info("=== STARTING FULL OPTIONS OI SCAN ===")
-    if fyers is None:
-        logger.error("Fyers client not initialized!")
-        return
-
-    all_syms = list(set(long_symbols + short_symbols))
-    for s in all_syms:
-        try:
-            fyers_symbol = f"NSE:{s}-EQ"
-            data = {"symbol": fyers_symbol, "strikecount": 50}
-            res = fyers.optionchain(data=data)
-
-            if res and res.get("s") == "ok":
-                chain = res.get("data", {}).get("optionsChain", [])
-                logger.info(f"Processing {len(chain)} contracts for {s}")
-                for item in chain:
-                    strike = item.get('strikePrice') or item.get('strike') or item.get('strike_price')
-                    if strike is None or strike <= 0: continue
-                    opt_type = item.get('option_type') or item.get('optionType') or 'N/A'
-                    oi = item.get('oi') or item.get('open_interest') or item.get('openInterest') or 0
-                    logger.info(f"  [{opt_type}] Strike: {strike} | OI: {oi}")
-            else:
-                logger.warning(f"Could not fetch/parse OI for {s}")
-        except Exception as e:
-            logger.error(f"Error fetching OI for {s}: {e}")
-    logger.info("=== FULL OPTIONS SCAN COMPLETE ===")
+# --- ROBUST FUNCTION DEFINITION ---
+")
 
 
 class UTF8Formatter(logging.Formatter):
