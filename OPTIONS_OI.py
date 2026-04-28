@@ -31,7 +31,7 @@ import numpy as np
 import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger()
-    def format(self, record):
+def format(self, record):
         msg = record.getMessage()
         record.msg = msg.encode("ascii", "ignore").decode("ascii")
         return super().format(record)
