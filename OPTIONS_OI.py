@@ -1,38 +1,46 @@
 import os
-import re
 import sys
 import logging
 from datetime import datetime, timedelta, time
 from typing import List, Dict, Optional, Tuple
-
-import numpy as np
 import pandas as pd
+import numpy as np
+
+# Standard import
 from fyers_apiv3 import fyersModel
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
 
-
-class UTF8Formatter(logging.Formatter):
-    def format(self, record):
-        msg = record.getMessage()
-        record.msg = msg.encode("ascii", "ignore").decode("ascii")
-        return super().format(record)
-
-
+# Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-if logger.hasHandlers():
-    logger.handlers.clear()
-ch = logging.StreamHandler(sys.stdout)
-ch.setLevel(logging.INFO)
-formatter = UTF8Formatter(
-    "%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-)
-ch.setFormatter(formatter)
-logger.addHandler(ch)
+
+# --- DEFINE SCAN_OPTIONS_LOGIC AT THE TOP ---
+")
+
+
+def scan_options_logic(long_symbols, short_symbols):
+    global fyers
+    logger.info("=== STARTING FULL OPTIONS OI SCAN ===")
+    if 'fyers' not in globals() or fyers is None:
+        logger.error("Fyers client not initialized!")
+        return
+    all_syms = list(set(long_symbols + short_symbols))
+    for s in all_syms:
+        try:
+            fyers_symbol = f"NSE:{s}-EQ"
+            data = {"symbol": fyers_symbol, "strikecount": 50}
+            res = fyers.optionchain(data=data)
+            if res and res.get("s") == "ok":
+                chain = res.get("data", {}).get("optionsChain", [])
+                for item in chain:
+                    strike = item.get('strikePrice') or item.get('strike') or item.get('strike_price')
+                    if strike is None or strike <= 0: continue
+                    opt_type = item.get('option_type') or item.get('optionType') or 'N/A'
+                    oi = item.get('oi') or item.get('open_interest') or item.get('openInterest') or 0
+                    logger.info(f"  [{opt_type}] Strike: {strike} | OI: {oi}")
+        except Exception as e:
+            logger.error(f"Error for {s}: {e}")
+    logger.info("=== FULL OPTIONS SCAN COMPLETE ===")
+
 
 DAILY_LOOKBACK_DAYS = 60
 INTRADAY_LOOKBACK_DAYS = 20
@@ -1163,28 +1171,15 @@ def format_fyers_index_symbol(symbol: str) -> str:
     return mapped if mapped.startswith('NSE:') else f'NSE:{mapped}'
 
 
-
 def discover_csv_files() -> list:
     csvs = []
-    # Force check current directory and './sectors'
-    search_paths = [os.getcwd(), os.path.join(os.getcwd(), 'sectors')]
-
-    for base in search_paths:
+    for base in ['.', 'sectors']:
         if os.path.isdir(base):
             for dirpath, _, filenames in os.walk(base):
                 for fname in filenames:
                     if fname.lower().endswith('.csv'):
                         csvs.append(os.path.join(dirpath, fname))
-        else:
-            logger.warning(f"Directory not found: {base}")
-
-    if not csvs:
-        logger.error(f"No CSV files found in: {search_paths}")
-    else:
-        logger.info(f"Found {len(csvs)} CSV files in {search_paths}")
-
     return sorted(set(csvs))
-
 
 
 def load_index_symbols() -> List[str]:
