@@ -13,11 +13,21 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 
-# Setup basic logging
+# Setup Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger()
 
-# 2. Function definition
+# --- CONFIGURATION CONSTANTS ---
+DAILY_LOOKBACK_DAYS = 60
+INTRADAY_LOOKBACK_DAYS = 20
+IVP_LOOKBACK_DAYS = 252
+INDEX_SOFT_BOOST_WEIGHT = 0.5
+EMAIL_DISPLAY_COLS = ["Symbol", "LTP", "% Change", "IVP", "Volatility State", "Price_Lead_Status"]
+
+# --- GLOBAL VARIABLES ---
+fyers = None
+
+# --- FUNCTION DEFINITIONS ---
 def scan_options_logic(long_symbols, short_symbols):
     global fyers
     logger.info("=== STARTING FULL OPTIONS OI SCAN ===")
@@ -42,42 +52,8 @@ def scan_options_logic(long_symbols, short_symbols):
             logger.error(f"Error for {s}: {e}")
     logger.info("=== FULL OPTIONS SCAN COMPLETE ===")
 
+# --- ORIGINAL LOGIC ---
 
-smtp_port = int(os.environ.get("SMTP_PORT", "587"))
-sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
-sender_password = os.environ.get("SENDER_PASSWORD", "password")
-recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
-
-EMAIL_DISPLAY_COLS = [
-    "Symbol", "LTP", "% Change", "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
-    "Bull_Signal", "Bear_Signal", "Overall_Signal", "Price_Lead_Status", "IVP",
-    "Volatility State", "Last Iteration Time",
-]
-
-
-def init_fyers():
-    global fyers
-    try:
-        client_id = os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID")
-        access_token = os.environ.get("ACCESS_TOKEN") or os.environ.get("ACCESSTOKEN")
-        if not client_id or not access_token:
-            logger.warning("INIT Missing Fyers credentials.")
-            fyers = None
-            return
-        fyers = fyersModel.FyersModel(
-            client_id=client_id, is_async=False, token=access_token, log_path=""
-        )
-        logger.info("INIT FyersModel initialized successfully.")
-    except Exception as e:
-        logger.warning(f"INIT Failed: {e}")
-        fyers = None
-
-
-def load_fno_symbols_from_sectors(root_dir: str = "sectors") -> List[str]:
-    symbols = set()
-    if not os.path.isdir(root_dir):
-        return []
-    for dirpath, _, filenames in os.walk(root_dir):
         for fname in filenames:
             if not fname.lower().endswith(".csv"):
                 continue
