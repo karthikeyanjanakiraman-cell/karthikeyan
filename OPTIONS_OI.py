@@ -1612,8 +1612,12 @@ def get_option_chain_for_symbol(symbol: str) -> pd.DataFrame:
             for type_ in ["CE", "PE"]:
                 # Construct Fyers standard option symbol: NSE:SYMBOL-YYYYMMDD-STRIKE-CE
                 sym_str = f"NSE:{sym_clean}-{exp_str}-{strike}-{type_}"
+                logger.info(f"Trying to build symbol: {sym_str}")
                 quote = fyers.quotes({"symbols": sym_str})
                 if quote.get('s') == 'ok' and 'd' in quote and len(quote['d']) > 0:
+                    logger.info(f"Found quote for {sym_str}")
+                else:
+                    logger.warning(f"No quote for {sym_str}, response: {quote}")
                     val = quote['d'][0]['v']
                     strikes.append({
                         "Strike": strike, "Type": type_, "LTP": val.get('lp', 0),
