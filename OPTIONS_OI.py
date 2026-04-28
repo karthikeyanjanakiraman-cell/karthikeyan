@@ -4,34 +4,31 @@ import re
 import logging
 import pandas as pd
 import numpy as np
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
 from datetime import datetime, timedelta, time
 from typing import List, Dict, Optional, Tuple
 
-# 1. Force the Fyers import
+# Try Fyers import
 try:
     from fyers_apiv3 import fyersModel
-except:
-    from fyersapiv3 import fyersModel
+except ImportError:
+    try:
+        from fyersapiv3 import fyersModel
+    except:
+        pass
 
-# 2. Setup Logging
+# Logging setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger()
 
-# 3. Globals (Ensure they are initialized)
+# Globals
 fyers = None
 
-# 4. Define All Functions First
-def discover_csv_files() -> list:
-    csvs = []
-    # Look in root and /sectors
-    dirs = [os.getcwd(), os.path.join(os.getcwd(), 'sectors')]
-    for d in dirs:
-        if os.path.isdir(d):
-            for f in os.listdir(d):
-                if f.lower().endswith('.csv'):
-                    csvs.append(os.path.join(d, f))
-    return sorted(set(csvs))
-
+# Function Definitions
 def scan_options_logic(long_symbols, short_symbols):
     global fyers
     logger.info("=== STARTING FULL OPTIONS OI SCAN ===")
@@ -56,9 +53,15 @@ def scan_options_logic(long_symbols, short_symbols):
             logger.error(f"Error for {s}: {e}")
     logger.info("=== FULL OPTIONS SCAN COMPLETE ===")
 
-# 5. Bring in user variables and logic.
-# I will use the file content (file:76) to find where variables start.
-# This part of the code is huge, I will preserve it carefully.
+def discover_csv_files() -> list:
+    csvs = []
+    dirs = [os.getcwd(), os.path.join(os.getcwd(), 'sectors')]
+    for d in dirs:
+        if os.path.isdir(d):
+            for f in os.listdir(d):
+                if f.lower().endswith('.csv'):
+                    csvs.append(os.path.join(d, f))
+    return sorted(set(csvs))
 
 DAILY_LOOKBACK_DAYS = 60
 INTRADAY_LOOKBACK_DAYS = 20
