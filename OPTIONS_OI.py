@@ -54,7 +54,7 @@ def scan_options_logic(long_symbols, short_symbols):
 
 # --- ORIGINAL LOGIC ---
 
-        for fname in filenames:
+    for fname in filenames:
             if not fname.lower().endswith(".csv"):
                 continue
             try:
