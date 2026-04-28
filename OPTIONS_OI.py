@@ -14,7 +14,7 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(
 logger = logging.getLogger()
 
 # --- DEFINE SCAN_OPTIONS_LOGIC AT THE TOP ---
-")
+
 
 
 def scan_options_logic(long_symbols, short_symbols):
