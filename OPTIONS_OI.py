@@ -35,6 +35,35 @@ ch.setFormatter(formatter)
 logger.addHandler(ch)
 
 DAILY_LOOKBACK_DAYS = 60
+
+
+def scan_options_logic(long_symbols, short_symbols):
+    """Processes Fyers Option Chain and logs ATM/Near-ATM Strike OI."""
+    global fyers
+    logger.info("=== STARTING REAL OPTIONS OI SCAN ===")
+    if fyers is None:
+        logger.error("Fyers client not initialized!")
+        return
+
+    all_syms = list(set(long_symbols + short_symbols))
+    for s in all_syms[:5]:
+        try:
+            fyers_symbol = f"NSE:{s}-EQ"
+            data = {"symbol": fyers_symbol, "strikecount": 5}
+            res = fyers.optionchain(data=data)
+
+            if res and res.get("s") == "ok":
+                chain = res.get("data", {}).get("optionsChain", [])
+                logger.info(f"Processing {len(chain)} contracts for {s}")
+                for item in chain:
+                    logger.info(f"  [{item.get('option_type')}] Strike: {item.get('strike')} | OI: {item.get('oi')}")
+            else:
+                logger.warning(f"Could not fetch OI for {s}")
+        except Exception as e:
+            logger.error(f"Error fetching OI for {s}: {e}")
+    logger.info("=== REAL OPTIONS SCAN COMPLETE ===")
+
+
 INTRADAY_LOOKBACK_DAYS = 20
 IVP_LOOKBACK_DAYS = 252
 INDEX_SOFT_BOOST_WEIGHT = 0.25
