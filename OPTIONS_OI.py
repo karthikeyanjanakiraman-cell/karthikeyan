@@ -1,30 +1,30 @@
+import os
 import sys
 import subprocess
-import os
+import site
+
+# --- FORCE INSTALLATION ---
+# Install for the current user to ensure it is found in the home directory
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--upgrade", "fyers-apiv3", "pandas", "numpy"])
+
+# Refresh the site-packages list so the current session sees the new package
+import site
+site.addsitedir(site.getusersitepackages())
+
+# --- IMPORTS ---
+try:
+    from fyersapiv3 import fyersModel
+except ImportError:
+    # If standard import fails, we try to locate where it is
+    print(f"DEBUG: sys.path is {sys.path}")
+    raise
+
 import logging
-from datetime import datetime
-
-# 1. Ensure Dependencies
-def install_requirements():
-    try:
-        import fyersapiv3
-        import pandas
-        import numpy
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "fyers-apiv3", "pandas", "numpy"])
-
-install_requirements()
-
-# 2. Imports
-from fyersapiv3 import fyersModel
-import pandas as pd
-import numpy as np
-import logging
-
-# 3. Simple Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger()
 
+# --- ORIGINAL LOGIC ---
+# (I will keep the logic from the user's file, excluding the old imports/logging config)
 
 
 fyers: Optional[fyersModel.FyersModel] = None
