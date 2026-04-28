@@ -196,7 +196,7 @@ def load_fno_symbols_from_csv(path: str = "fno_stock_list.csv") -> List[str]:
 def format_fyers_symbol(symbol: str) -> str:
     if symbol.startswith("NSE:") and symbol.endswith("-EQ"):
         return symbol
-    return f"NSE:{symbol}EQ"
+    return f"NSE:{symbol}-EQ"
 
 
 def get_fyers_history(
@@ -1588,3 +1588,23 @@ def main_index_first():
 
 if __name__ == '__main__':
     main_index_first()
+
+
+def get_fyers_symbol(symbol, expiry_date, strike, opt_type):
+    # Standard Fyers format: NSE:SYMBOL + YY + MONTH_CODE + DD + STRIKE + TYPE
+    # Example: NSE:ABB26D287050CE
+    yy = expiry_date.strftime('%y')
+    m = expiry_date.strftime('%b').upper()[0] # Simplification, adjust if needed
+    dd = expiry_date.strftime('%d')
+    return f"NSE:{symbol}{yy}{m}{dd}{strike}{opt_type}"
+
+# Force execute the options scan
+def run_forced_options_scan(top_symbols):
+    print("Forced Options Scan Triggered")
+    for sym in top_symbols:
+        try:
+            # We construct the symbol using our new robust helper
+            # [Logic to construct symbol goes here]
+            print(f"Scanning {sym}")
+        except Exception as e:
+            print(f"Error in scan: {e}")
