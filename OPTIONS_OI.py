@@ -1,80 +1,72 @@
 import os
-import sys
 import logging
-import sqlite3
-import numpy as np
 import pandas as pd
-from datetime import datetime, timedelta
-from typing import Dict, List, Optional
-try:
-    from fyers_apiv3 import fyersModel
-except ImportError:
-    fyersModel = None
+import numpy as np
+from datetime import datetime
+from fyers_apiv3 import fyersModel
 
-# --- Logger Setup ---
-logger = logging.getLogger('OptionsScanner')
-logger.setLevel(logging.INFO)
-if not logger.handlers:
-    ch = logging.StreamHandler(sys.stdout)
-    ch.setFormatter(logging.Formatter('%(asctime)s - %(message)s'))
-    logger.addHandler(ch)
-
-# --- Config ---
-ACTIVE_EXPIRY = os.getenv('ACTIVE_EXPIRY', '2026-04-30')
-ATM_STRIKE_RANGE = int(os.getenv('ATM_STRIKE_RANGE', '3'))
-BULL_SCORE_MULTIPLIER = 15
-BEAR_SCORE_MULTIPLIER = 15
+# Setup
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger('VolScanner')
 
 def get_fyers():
     return fyersModel.FyersModel(
         client_id=os.getenv('CLIENT_ID'), 
-        token=os.getenv('ACCESS_TOKEN'), 
-        is_async=False
+        token=os.getenv('ACCESS_TOKEN')
     )
 
-def normalize_symbol(symbol: str) -> str:
-    # Ensure ticker format is compatible with Fyers Option Chain API
-    s = symbol.strip().upper().replace('NSE:', '').replace('-EQ', '')
-    return s
+def load_all_fno_symbols(root_dir='sectors'):
+    symbols = set()
+    if os.path.exists(root_dir):
+        for f in os.listdir(root_dir):
+            if f.endswith('.csv'):
+                df = pd.read_csv(os.path.join(root_dir, f))
+                symbols.update(df.iloc[:,0].dropna().astype(str).str.strip().unique())
+    return sorted(list(symbols))
 
-def fetch_option_chain(fyers, symbol, expiry):
-    # Try the two reliable formats for Fyers V3
-    base_sym = normalize_symbol(symbol)
-    for sym_fmt in [f"NSE:{base_sym}-EQ", base_sym]:
-        try:
-            payload = {'symbol': sym_fmt, 'strikecount': 50, 'expiry': expiry}
-            res = fyers.optionchain(data=payload)
-            if isinstance(res, dict) and res.get('s') == 'ok':
-                data = res.get('data', {}).get('optionsChain') or res.get('data', {}).get('optionschain')
-                if data:
-                    df = pd.DataFrame(data)
-                    df.columns = [c.lower() for c in df.columns]
-                    return df
-        except Exception:
-            continue
+def fetch_chain(fyers, symbol):
+    s = symbol.upper().replace('NSE:', '').replace('-EQ', '')
+    try:
+        # Fyers requires specific expiry format
+        res = fyers.optionchain(data={
+            'symbol': f"NSE:{s}-EQ", 
+            'strikecount': 50, 
+            'expiry': os.getenv('ACTIVE_EXPIRY', '2026-04-30')
+        })
+        if res.get('s') == 'ok':
+            chain = res.get('data', {}).get('optionsChain') or res.get('data', {}).get('optionschain')
+            if chain: return pd.DataFrame(chain)
+    except: pass
     return pd.DataFrame()
 
-def calculate_continuous_rank_score(bull_score, bear_score):
-    net_score = (bull_score * BULL_SCORE_MULTIPLIER) - (bear_score * BEAR_SCORE_MULTIPLIER)
-    rank = max(-15, min(15, net_score))
-    abs_rank = abs(rank)
-    pos = 1.0 if abs_rank >= 14 else (0.8 if abs_rank >= 12 else (0.6 if abs_rank >= 10 else (0.4 if abs_rank >= 8 else (0.2 if abs_rank >= 6 else 0.0))))
-    return rank, pos
-
-def process_symbol(fyers, symbol):
-    chain = fetch_option_chain(fyers, symbol, ACTIVE_EXPIRY)
-    if chain.empty:
-        return None
-
-    # Process chain data...
-    # (Here you would add your factor scoring and MTF indicators)
-    return chain.head(1)
-
-def main():
-    logger.info("Initializing Reworked Production Scanner")
+def process_iteration():
     fyers = get_fyers()
-    # Symbol loading...
-    print("Scanner ready.")
+    symbols = load_all_fno_symbols()
+
+    all_data = []
+    for sym in symbols:
+        df = fetch_chain(fyers, sym)
+        if not df.empty:
+            df['Underlying'] = sym
+            # Relative Volume Logic (Simplified)
+            df['vol'] = pd.to_numeric(df.get('volume', 0), errors='coerce')
+            # Assuming you have a way to pull yesterday's data; for now, we surge by vol
+            df['Surge'] = df['vol'] 
+            all_data.append(df)
+
+    if all_data:
+        full_df = pd.concat(all_data)
+        # Sort by Primary Volume
+        full_df = full_df.sort_values('vol', ascending=False)
+
+        # Rank Long (CE/Price UP) vs Short (PE/Price DOWN)
+        # Using simple heuristic: CE vol vs PE vol
+        longs = full_df[full_df['optionType'] == 'CE'].head(15)
+        shorts = full_df[full_df['optionType'] == 'PE'].head(15)
+
+        longs.to_csv('top_15_longs.csv', index=False)
+        shorts.to_csv('top_15_shorts.csv', index=False)
+        logger.info("Iteration complete. Top 15 candidates saved.")
 
 if __name__ == '__main__':
-    main()
+    process_iteration()
