@@ -1590,7 +1590,37 @@ OPTION_STRIKE_STEP = int(os.environ.get("OPTION_STRIKE_STEP", 50))
 ACTIVE_EXPIRY = os.environ.get("ACTIVE_EXPIRY", "2026-04-30")
 
 def get_option_chain_for_symbol(symbol: str) -> pd.DataFrame:
+    """Fetch option quotes with rate limiting."""
     if not fyers: return pd.DataFrame()
+    try:
+        d = datetime.strptime(ACTIVE_EXPIRY, "%Y-%m-%d")
+        exp_str = d.strftime("%Y%m%d")
+
+        fyers_sym = format_fyers_symbol(symbol)
+        df = get_fyers_history(fyers_sym, "5", 1)
+        ltp = float(df['close'].iloc[-1]) if df is not None and not df.empty else 0
+        atm = round(ltp / OPTION_STRIKE_STEP) * OPTION_STRIKE_STEP
+
+        strikes = []
+        sym_clean = symbol.replace('NSE:', '').replace('-EQ', '')
+        for offset in range(-ATM_STRIKE_RANGE, ATM_STRIKE_RANGE + 1):
+            strike = atm + offset * OPTION_STRIKE_STEP
+            for type_ in ["CE", "PE"]:
+                time.sleep(0.5) # RATE LIMITER: 0.5s pause
+                sym_str = f"NSE:{sym_clean}-{exp_str}-{strike}-{type_}"
+                quote = fyers.quotes({"symbols": sym_str})
+                if quote.get('s') == 'ok' and 'd' in quote and isinstance(quote['d'], list) and len(quote['d']) > 0:
+                    val = quote['d'][0].get('v', {})
+                    strikes.append({
+                        "Strike": strike, "Type": type_, "LTP": val.get('lp', 0),
+                        "OI": val.get('oi', 0), "Underlying": symbol
+                    })
+                else:
+                    logger.warning(f"No valid quote for {sym_str}")
+        return pd.DataFrame(strikes)
+    except Exception as e:
+        logger.error(f"Error for {symbol}: {e}")
+        return pd.DataFrame()
     try:
         d = datetime.strptime(ACTIVE_EXPIRY, "%Y-%m-%d")
         exp_str = d.strftime("%Y%m%d")
