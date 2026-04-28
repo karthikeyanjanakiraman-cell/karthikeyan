@@ -1,35 +1,33 @@
 import sys
 import subprocess
-
-# --- INSTALL DEPENDENCIES ---
-try:
-    import fyersapiv3
-except ImportError:
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "fyers-apiv3", "pandas", "numpy"])
-    import fyersapiv3
-
 import os
 import re
 import logging
 from datetime import datetime, timedelta, time
 from typing import List, Dict, Optional, Tuple
-import numpy as np
-import pandas as pd
+
+def check_dependencies():
+    try:
+        import fyersapiv3
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "fyers-apiv3", "pandas", "numpy"])
+
+check_dependencies()
+
 from fyersapiv3 import fyersModel
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
+import pandas as pd
+import numpy as np
+
+# Simple logging configuration
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+logger = logging.getLogger()
 
 class UTF8Formatter(logging.Formatter):
     def format(self, record):
-        try:
-            msg = record.getMessage()
-            record.msg = msg.encode("ascii", "ignore").decode("ascii")
-        except:
-            pass
+        msg = record.getMessage()
+        record.msg = msg.encode("ascii", "ignore").decode("ascii")
         return super().format(record)
+
 
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -37,33 +35,11 @@ if logger.hasHandlers():
     logger.handlers.clear()
 ch = logging.StreamHandler(sys.stdout)
 ch.setLevel(logging.INFO)
-formatter = UTF8Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
+formatter = UTF8Formatter(
+    "%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+)
 ch.setFormatter(formatter)
 logger.addHandler(ch)
-
-def scan_options_logic(long_symbols, short_symbols):
-    global fyers
-    logger.info("=== STARTING FULL OPTIONS OI SCAN ===")
-    if fyers is None:
-        logger.error("Fyers client not initialized!")
-        return
-    all_syms = list(set(long_symbols + short_symbols))
-    for s in all_syms:
-        try:
-            fyers_symbol = f"NSE:{s}-EQ"
-            data = {"symbol": fyers_symbol, "strikecount": 50}
-            res = fyers.optionchain(data=data)
-            if res and res.get("s") == "ok":
-                chain = res.get("data", {}).get("optionsChain", [])
-                for item in chain:
-                    strike = item.get('strikePrice') or item.get('strike') or item.get('strike_price')
-                    if strike is None or strike <= 0: continue
-                    opt_type = item.get('option_type') or item.get('optionType') or 'N/A'
-                    oi = item.get('oi') or item.get('open_interest') or item.get('openInterest') or 0
-                    logger.info(f"  [{opt_type}] Strike: {strike} | OI: {oi}")
-        except Exception as e:
-            logger.error(f"Error for {s}: {e}")
-    logger.info("=== FULL OPTIONS SCAN COMPLETE ===")
 
 DAILY_LOOKBACK_DAYS = 60
 INTRADAY_LOOKBACK_DAYS = 20
