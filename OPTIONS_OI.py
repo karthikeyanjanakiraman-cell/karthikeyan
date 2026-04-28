@@ -1538,7 +1538,7 @@ def get_option_chain_for_symbol(symbol: str) -> pd.DataFrame:
         for offset in range(-ATM_STRIKE_RANGE, ATM_STRIKE_RANGE + 1):
             strike = atm + offset * OPTION_STRIKE_STEP
             for type_ in ["CE", "PE"]:
-                time.sleep(0.3)
+                time.sleep(0.1)
                 sym_str = f"NSE:{sym_clean}-{exp_str}-{strike}-{type_}"
                 quote = fyers.quotes({"symbols": sym_str})
                 if quote.get('s') == 'ok' and 'd' in quote and isinstance(quote['d'], list) and len(quote['d']) > 0:
@@ -1550,7 +1550,10 @@ def get_option_chain_for_symbol(symbol: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 def scan_options_for_top_symbols(top_symbols: List[str]) -> pd.DataFrame:
-    opt_rows = [get_option_chain_for_symbol(sym) for sym in top_symbols]
+    opt_rows = []
+    for sym in top_symbols:
+        logger.info(f"Scanning options for {sym}")
+        opt_rows.append(get_option_chain_for_symbol(sym))
     return pd.concat(opt_rows, ignore_index=True) if opt_rows else pd.DataFrame()
 
 def main():
