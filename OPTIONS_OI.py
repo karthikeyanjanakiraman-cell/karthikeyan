@@ -38,8 +38,6 @@ formatter = UTF8Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="
 ch.setFormatter(formatter)
 logger.addHandler(ch)
 
-")
-
 class UTF8Formatter(logging.Formatter):
     def format(self, record):
         msg = record.getMessage()
