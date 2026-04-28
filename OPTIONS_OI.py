@@ -23,7 +23,7 @@ from email.mime.base import MIMEBase
 from email import encoders
 
 # --- ROBUST FUNCTION DEFINITION ---
-")
+"))
 
 
 class UTF8Formatter(logging.Formatter):
