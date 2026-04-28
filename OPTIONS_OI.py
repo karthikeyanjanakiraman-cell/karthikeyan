@@ -1644,13 +1644,14 @@ def scan_options_for_top_symbols(top_symbols: List[str]) -> pd.DataFrame:
 
 # Modified main - replace stock listing with options
 def main():
+    logger.info("Initializing Scanner")
     init_fyers()
-    # Original index scan
+
+    # 1. Original scan & ranking
     df_indices = scan_index_universe()
     df_indices = add_signal_columns(derive_rank_columns(df_indices))
     index_long_df, index_short_df = build_candidate_tables(df_indices)
 
-    # Original stock scan for selected indices
     long_map, short_map = build_index_strength_maps(index_long_df, index_short_df)
     long_symbols = load_fno_symbols_for_indices(index_long_df["Symbol"].tolist())
     short_symbols = load_fno_symbols_for_indices(index_short_df["Symbol"].tolist())
@@ -1658,7 +1659,6 @@ def main():
     df_long, long_detail = scan_symbol_universe(long_symbols)
     df_short, short_detail = scan_symbol_universe(short_symbols)
 
-    # Apply soft boost
     df_long = apply_soft_index_boost(df_long, index_long_df["Symbol"].tolist(), long_map, "long")
     df_short = apply_soft_index_boost(df_short, index_short_df["Symbol"].tolist(), short_map, "short")
 
@@ -1666,24 +1666,25 @@ def main():
     df_short = add_signal_columns(derive_rank_columns(df_short))
 
     long_df, short_df = build_candidate_tables(df_long)
-    top_long_symbols = long_df["Symbol"].tolist()
-    top_short_symbols = short_df["Symbol"].tolist()
 
-    # NEW: Pick options strikes instead of stocks
-    opt_long_df = scan_options_for_top_symbols(top_long_symbols)
-    opt_short_df = scan_options_for_top_symbols(top_short_symbols)
+    # 2. OPTION SCAN
+    logger.info("Scanning Option Chains for top candidates")
+    opt_long_df = scan_options_for_top_symbols(long_df["Symbol"].tolist())
+    opt_short_df = scan_options_for_top_symbols(short_df["Symbol"].tolist())
 
-    # Save CSVs
+    # 3. Save & Email
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     csv_filename = f"vol_rel_options_summary_{timestamp}.csv"
     detail_csv_filename = f"vol_rel_options_detail_{timestamp}.csv"
 
     opt_long_df.to_csv(csv_filename, index=False)
+    # Combining details for CSV
     pd.concat([long_detail, short_detail], ignore_index=True).to_csv(detail_csv_filename, index=False)
 
-    # Email options tables
+    logger.info("Sending Email with Options Data")
     send_email_with_tables(opt_long_df, opt_short_df, csv_filename, detail_csv_filename,
                           index_long_df, index_short_df)
+
 
 if __name__ == "__main__":
     main()
