@@ -1,11 +1,3 @@
-#!/usr/bin/env python3
-"""
-STANDALONE Options Strike Scanner from FO_FNO_FYERS_VOL_REL_EMAIL-2.py [file:30]
-Changes:
-- Added option chain fetching for top ranked stocks
-- Main now lists ATM strikes (CE/PE) instead of stocks
-- Env: ATM_STRIKE_RANGE=3 OPTION_STRIKE_STEP=50
-"""
 import os
 import re
 import sys
@@ -1599,92 +1591,50 @@ if __name__ == '__main__':
 
 ATM_STRIKE_RANGE = int(os.environ.get("ATM_STRIKE_RANGE", 3))
 OPTION_STRIKE_STEP = int(os.environ.get("OPTION_STRIKE_STEP", 50))
+ACTIVE_EXPIRY = os.environ.get("ACTIVE_EXPIRY", "2026-04-30")
 
 def get_option_chain_for_symbol(symbol: str) -> pd.DataFrame:
-    """Fetch option chain for top symbol using Fyers."""
-    if not fyers:
-        logger.warning("Fyers not initialized")
-        return pd.DataFrame()
+    if not fyers: return pd.DataFrame()
     try:
+        d = datetime.strptime(ACTIVE_EXPIRY, "%Y-%m-%d")
+        exp_str = d.strftime("%Y%m%d")
+
+        # Get Underlying LTP from history (safe)
         fyers_sym = format_fyers_symbol(symbol)
-        logger.info(f"Fetching option chain for {fyers_sym}")
-        data = {"symbol": fyers_sym}
-        res = fyers.option_chain(data)
-        if res.get("s") != "ok":
-            logger.warning(f"Option chain request failed for {symbol}: {res}")
-            return pd.DataFrame()
-
-        chain = res.get("data", {})
-        if not chain or "CE" not in chain or not chain["CE"]:
-            logger.warning(f"No option chain data found for {symbol}")
-            return pd.DataFrame()
-
-        underlying_ltp = chain.get("LTP", 0)
-        atm = round(underlying_ltp / OPTION_STRIKE_STEP) * OPTION_STRIKE_STEP
-        strikes = []
-        for offset in range(-ATM_STRIKE_RANGE, ATM_STRIKE_RANGE + 1):
-            strike = atm + offset * OPTION_STRIKE_STEP
-            ce = next((o for o in chain.get("CE", []) if o.get("strikePrice") == strike), {})
-            pe = next((o for o in chain.get("PE", []) if o.get("strikePrice") == strike), {})
-            if ce or pe:
-                strikes.append({
-                    "Strike": strike,
-                    "CE_LTP": ce.get("LTP", 0),
-                    "CE_OI": ce.get("oi", 0),
-                    "PE_LTP": pe.get("LTP", 0),
-                    "PE_OI": pe.get("oi", 0),
-                    "PCR": pe.get("oi", 0) / max(ce.get("oi", 1), 1),
-                    "Underlying": symbol
-                })
-        logger.info(f"Found {len(strikes)} strikes for {symbol}")
-        return pd.DataFrame(strikes).sort_values("Strike")
-    except Exception as e:
-        logger.error(f"Error fetching option chain for {symbol}: {e}")
-        return pd.DataFrame()
-    try:
-        data = {"symbol": format_fyers_symbol(symbol)}
-        res = fyers.option_chain(data)
-        if res.get("s") != "ok":
-            return pd.DataFrame()
-        chain = res["data"]
-        ltp = chain.get("LTP", 0)
+        df = get_fyers_history(fyers_sym, "5", 1)
+        ltp = float(df['close'].iloc[-1]) if df is not None and not df.empty else 0
         atm = round(ltp / OPTION_STRIKE_STEP) * OPTION_STRIKE_STEP
+
         strikes = []
+        sym_clean = symbol.replace('NSE:', '').replace('-EQ', '')
         for offset in range(-ATM_STRIKE_RANGE, ATM_STRIKE_RANGE + 1):
             strike = atm + offset * OPTION_STRIKE_STEP
-            ce = next((o for o in chain.get("CE", []) if o.get("strikePrice") == strike), {})
-            pe = next((o for o in chain.get("PE", []) if o.get("strikePrice") == strike), {})
-            strikes.append({
-                "Strike": strike,
-                "CE_LTP": ce.get("LTP", 0),
-                "CE_OI": ce.get("oi", 0),
-                "PE_LTP": pe.get("LTP", 0),
-                "PE_OI": pe.get("oi", 0),
-                "PCR": pe.get("oi", 0) / max(ce.get("oi", 1), 1),
-                "Underlying": symbol
-            })
-        return pd.DataFrame(strikes).sort_values("Strike")
-    except:
+            for type_ in ["CE", "PE"]:
+                # Construct Fyers standard option symbol: NSE:SYMBOL-YYYYMMDD-STRIKE-CE
+                sym_str = f"NSE:{sym_clean}-{exp_str}-{strike}-{type_}"
+                quote = fyers.quotes({"symbols": sym_str})
+                if quote.get('s') == 'ok' and 'd' in quote and len(quote['d']) > 0:
+                    val = quote['d'][0]['v']
+                    strikes.append({
+                        "Strike": strike, "Type": type_, "LTP": val.get('lp', 0),
+                        "OI": val.get('oi', 0), "Underlying": symbol
+                    })
+        return pd.DataFrame(strikes)
+    except Exception as e:
+        logger.error(f"Error for {symbol}: {e}")
         return pd.DataFrame()
 
 def scan_options_for_top_symbols(top_symbols: List[str]) -> pd.DataFrame:
-    """Get options for top long/short symbols."""
     opt_rows = []
     for sym in top_symbols[:10]:
         opt_df = get_option_chain_for_symbol(sym)
-        if not opt_df.empty:
-            # Add underlying rank/IVP from scan
-            opt_df["IVP"] = 50  # From underlying scan
-            opt_df["Volatility State"] = "Neutral"
-            opt_rows.append(opt_df)
+        opt_rows.append(opt_df)
     return pd.concat(opt_rows, ignore_index=True) if opt_rows else pd.DataFrame()
 
-# Modified main - replace stock listing with options
-def main():
-    logger.info("Initializing Scanner")
-    init_fyers()
 
-    # 1. Original scan & ranking
+def main():
+    logger.info("Initializing Scanner (V7)")
+    init_fyers()
     df_indices = scan_index_universe()
     df_indices = add_signal_columns(derive_rank_columns(df_indices))
     index_long_df, index_short_df = build_candidate_tables(df_indices)
@@ -1704,24 +1654,16 @@ def main():
 
     long_df, short_df = build_candidate_tables(df_long)
 
-    # 2. OPTION SCAN
-    logger.info("Scanning Option Chains for top candidates")
+    logger.info("Scanning Option Chains")
     opt_long_df = scan_options_for_top_symbols(long_df["Symbol"].tolist())
     opt_short_df = scan_options_for_top_symbols(short_df["Symbol"].tolist())
 
-    # 3. Save & Email
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    csv_filename = f"vol_rel_options_summary_{timestamp}.csv"
-    detail_csv_filename = f"vol_rel_options_detail_{timestamp}.csv"
+    csv_filename = f"options_summary_{timestamp}.csv"
+    detail_csv_filename = f"options_detail_{timestamp}.csv"
 
     opt_long_df.to_csv(csv_filename, index=False)
-    # Combining details for CSV
-    pd.concat([long_detail, short_detail], ignore_index=True).to_csv(detail_csv_filename, index=False)
-
-    logger.info("Sending Email with Options Data")
-    send_email_with_tables(opt_long_df, opt_short_df, csv_filename, detail_csv_filename,
-                          index_long_df, index_short_df)
-
+    send_email_with_tables(opt_long_df, opt_short_df, csv_filename, detail_csv_filename)
 
 if __name__ == "__main__":
     main()
