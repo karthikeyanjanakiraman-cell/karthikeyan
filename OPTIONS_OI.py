@@ -1517,6 +1517,70 @@ def build_index_iteration_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
     out = out[final_cols].sort_values(["Index Name", "Iteration No", "Iteration Minutes"]).reset_index(drop=True)
     return out
 
+def get_next_thursday() -> str:
+    today = datetime.now().date()
+    days_ahead = (3 - today.weekday()) % 7
+    if days_ahead == 0:
+        days_ahead = 7
+    return (today + timedelta(days=days_ahead)).strftime('%Y-%m-%d')
+
+
+def scan_options_logic(long_symbols, short_symbols):
+    global fyers
+    logger.info(">>> STARTING FORCED OPTIONS SCAN <<<")
+    if fyers is None:
+        logger.error("Fyers client not initialized!")
+        return
+
+    symbols = []
+    for s in list(long_symbols) + list(short_symbols):
+        s = str(s).strip().upper()
+        if s and s not in symbols:
+            symbols.append(s)
+
+    if not symbols:
+        logger.info("No symbols available for options scan")
+        logger.info(">>> OPTIONS SCAN COMPLETE <<<")
+        return
+
+    expiry_date = get_next_thursday()
+    logger.info(f"Using expiry_date={expiry_date} for options scan")
+
+    for s in symbols:
+        try:
+            fyers_symbol = f"NSE:{s}-EQ"
+            data = {"symbol": fyers_symbol, "strikecount": 20, "expiry_date": expiry_date}
+            res = fyers.optionchain(data=data)
+
+            if not res:
+                logger.warning(f"OPTIONS Empty response for {s}")
+                continue
+
+            if res.get("s") != "ok":
+                logger.warning(f"OPTIONS API error for {s}: {res.get('message') or res}")
+                continue
+
+            chain = res.get("data", {}).get("optionsChain", [])
+            if not chain:
+                logger.warning(f"OPTIONS No chain returned for {s} on {expiry_date}")
+                continue
+
+            logger.info(f"OPTIONS {s} contracts fetched: {len(chain)}")
+            for item in chain:
+                strike = item.get("strikePrice") or item.get("strike") or item.get("strike_price")
+                opt_type = str(item.get("optionType") or item.get("option_type") or "").upper()
+                oi = item.get("oi")
+                if oi is None:
+                    oi = item.get("openInterest")
+                if oi is None:
+                    oi = item.get("open_interest", 0)
+                if strike is not None:
+                    logger.info(f"  [{s}] [{opt_type}] Strike: {strike} | OI: {oi}")
+        except Exception as e:
+            logger.error(f"Scan Error for {s}: {e}")
+
+    logger.info(">>> OPTIONS SCAN COMPLETE <<<")
+
 def main_index_first():
     logger.info('Starting Index-first FO Iteration Volume Volatility Scan')
     init_fyers()
@@ -1592,45 +1656,5 @@ def main_index_first():
 if __name__ == '__main__':
     main_index_first()
 
-
-
-def get_next_thursday():
-    today = datetime.now()
-    days_ahead = 3 - today.weekday() # Thursday is 3
-    if days_ahead <= 0: days_ahead += 7
-    return (today + timedelta(days=days_ahead)).strftime('%Y-%m-%d')
-
-def scan_options_logic(long_symbols, short_symbols):
-    global fyers
-    logger.info(">>> STARTING FORCED OPTIONS SCAN <<<")
-    if fyers is None:
-        logger.error("Fyers client not initialized!")
-        return
-
-    next_expiry = get_next_thursday()
-    logger.info(f"Scanning for expiry: {next_expiry}")
-
-    all_syms = list(set(long_symbols + short_symbols))
-    for s in all_syms:
-        try:
-            fyers_symbol = f"NSE:{s}-EQ"
-            # Request with explicit expiry
-            data = {"symbol": fyers_symbol, "strikecount": 20, "expiry_date": next_expiry}
-            res = fyers.optionchain(data=data)
-
-            if res and res.get("s") == "ok":
-                chain = res.get("data", {}).get("optionsChain", [])
-                if not chain:
-                    logger.warning(f"No chain returned for {s} on {next_expiry}")
-                for item in chain:
-                    strike = item.get('strikePrice') or item.get('strike')
-                    oi = item.get('oi') or item.get('openInterest') or 0
-                    if strike:
-                        logger.info(f"  [Symbol: {s}] Strike: {strike} | OI: {oi}")
-            else:
-                logger.warning(f"API Error for {s}: {res.get('message', 'Unknown')}")
-
-        except Exception as e:
-            logger.error(f"Scan Error for {s}: {e}")
-    logger.info(">>> OPTIONS SCAN COMPLETE <<<")
-
+if __name__ == "__main__":
+    main_index_first()
