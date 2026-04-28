@@ -1603,6 +1603,43 @@ OPTION_STRIKE_STEP = int(os.environ.get("OPTION_STRIKE_STEP", 50))
 def get_option_chain_for_symbol(symbol: str) -> pd.DataFrame:
     """Fetch option chain for top symbol using Fyers."""
     if not fyers:
+        logger.warning("Fyers not initialized")
+        return pd.DataFrame()
+    try:
+        fyers_sym = format_fyers_symbol(symbol)
+        logger.info(f"Fetching option chain for {fyers_sym}")
+        data = {"symbol": fyers_sym}
+        res = fyers.option_chain(data)
+        if res.get("s") != "ok":
+            logger.warning(f"Option chain request failed for {symbol}: {res}")
+            return pd.DataFrame()
+
+        chain = res.get("data", {})
+        if not chain or "CE" not in chain or not chain["CE"]:
+            logger.warning(f"No option chain data found for {symbol}")
+            return pd.DataFrame()
+
+        underlying_ltp = chain.get("LTP", 0)
+        atm = round(underlying_ltp / OPTION_STRIKE_STEP) * OPTION_STRIKE_STEP
+        strikes = []
+        for offset in range(-ATM_STRIKE_RANGE, ATM_STRIKE_RANGE + 1):
+            strike = atm + offset * OPTION_STRIKE_STEP
+            ce = next((o for o in chain.get("CE", []) if o.get("strikePrice") == strike), {})
+            pe = next((o for o in chain.get("PE", []) if o.get("strikePrice") == strike), {})
+            if ce or pe:
+                strikes.append({
+                    "Strike": strike,
+                    "CE_LTP": ce.get("LTP", 0),
+                    "CE_OI": ce.get("oi", 0),
+                    "PE_LTP": pe.get("LTP", 0),
+                    "PE_OI": pe.get("oi", 0),
+                    "PCR": pe.get("oi", 0) / max(ce.get("oi", 1), 1),
+                    "Underlying": symbol
+                })
+        logger.info(f"Found {len(strikes)} strikes for {symbol}")
+        return pd.DataFrame(strikes).sort_values("Strike")
+    except Exception as e:
+        logger.error(f"Error fetching option chain for {symbol}: {e}")
         return pd.DataFrame()
     try:
         data = {"symbol": format_fyers_symbol(symbol)}
