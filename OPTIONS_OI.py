@@ -3,13 +3,15 @@ import logging
 import pandas as pd
 from fyers_apiv3 import fyersModel
 
+# Setup Logger
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 
 def run():
     client_id = os.getenv('CLIENT_ID')
     token = os.getenv('ACCESS_TOKEN')
+
     if not client_id or not token:
-        print("Credentials missing")
+        print("Credentials (CLIENT_ID/ACCESS_TOKEN) are missing.")
         return
 
     fyers = fyersModel.FyersModel(client_id=client_id, token=token)
@@ -23,24 +25,35 @@ def run():
                 symbols.extend(df.iloc[:, 0].dropna().astype(str).tolist())
 
     all_chains = []
+    # Deduplicate symbols and iterate
     for sym in list(set(symbols)):
         try:
             s = sym.strip().upper().replace('NSE:', '').replace('-EQ', '')
             res = fyers.optionchain(data={'symbol': f"NSE:{s}-EQ", 'strikecount': 50, 'expiry': expiry})
+
             if res.get('s') == 'ok':
                 data = res.get('data', {}).get('optionsChain') or res.get('data', {}).get('optionschain')
                 if data:
                     df = pd.DataFrame(data)
                     df['Underlying'] = s
                     all_chains.append(df)
-        except Exception: continue
+        except Exception:
+            continue
 
     if all_chains:
-        df = pd.concat(all_chains)
-        df['volume'] = pd.to_numeric(df.get('volume', 0), errors='coerce')
-        df[df['optionType'] == 'CE'].sort_values('volume', ascending=False).head(15).to_csv('top_15_longs.csv', index=False)
-        df[df['optionType'] == 'PE'].sort_values('volume', ascending=False).head(15).to_csv('top_15_shorts.csv', index=False)
-        print("Done.")
+        full_df = pd.concat(all_chains)
+        # Ensure volume is numeric for sorting
+        full_df['volume'] = pd.to_numeric(full_df.get('volume', 0), errors='coerce')
+
+        # Rank by volume desc
+        longs = full_df[full_df['optionType'] == 'CE'].sort_values('volume', ascending=False).head(15)
+        shorts = full_df[full_df['optionType'] == 'PE'].sort_values('volume', ascending=False).head(15)
+
+        longs.to_csv('top_15_longs.csv', index=False)
+        shorts.to_csv('top_15_shorts.csv', index=False)
+        print("Successfully generated top_15_longs.csv and top_15_shorts.csv.")
+    else:
+        print("No option chain data retrieved.")
 
 if __name__ == '__main__':
     run()
