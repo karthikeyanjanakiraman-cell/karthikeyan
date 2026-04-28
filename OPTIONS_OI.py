@@ -1,26 +1,41 @@
-import os
 import sys
+import os
+import re
 import logging
-from datetime import datetime, timedelta, time
-from typing import List, Dict, Optional, Tuple
 import pandas as pd
 import numpy as np
+from datetime import datetime, timedelta, time
+from typing import List, Dict, Optional, Tuple
 
-# Standard import
-from fyers_apiv3 import fyersModel
+# 1. Force the Fyers import
+try:
+    from fyers_apiv3 import fyersModel
+except:
+    from fyersapiv3 import fyersModel
 
-# Logging
+# 2. Setup Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger()
 
-# --- DEFINE SCAN_OPTIONS_LOGIC AT THE TOP ---
+# 3. Globals (Ensure they are initialized)
+fyers = None
 
-
+# 4. Define All Functions First
+def discover_csv_files() -> list:
+    csvs = []
+    # Look in root and /sectors
+    dirs = [os.getcwd(), os.path.join(os.getcwd(), 'sectors')]
+    for d in dirs:
+        if os.path.isdir(d):
+            for f in os.listdir(d):
+                if f.lower().endswith('.csv'):
+                    csvs.append(os.path.join(d, f))
+    return sorted(set(csvs))
 
 def scan_options_logic(long_symbols, short_symbols):
     global fyers
     logger.info("=== STARTING FULL OPTIONS OI SCAN ===")
-    if 'fyers' not in globals() or fyers is None:
+    if fyers is None:
         logger.error("Fyers client not initialized!")
         return
     all_syms = list(set(long_symbols + short_symbols))
@@ -41,6 +56,9 @@ def scan_options_logic(long_symbols, short_symbols):
             logger.error(f"Error for {s}: {e}")
     logger.info("=== FULL OPTIONS SCAN COMPLETE ===")
 
+# 5. Bring in user variables and logic.
+# I will use the file content (file:76) to find where variables start.
+# This part of the code is huge, I will preserve it carefully.
 
 DAILY_LOOKBACK_DAYS = 60
 INTRADAY_LOOKBACK_DAYS = 20
@@ -1171,15 +1189,7 @@ def format_fyers_index_symbol(symbol: str) -> str:
     return mapped if mapped.startswith('NSE:') else f'NSE:{mapped}'
 
 
-def discover_csv_files() -> list:
-    csvs = []
-    for base in ['.', 'sectors']:
-        if os.path.isdir(base):
-            for dirpath, _, filenames in os.walk(base):
-                for fname in filenames:
-                    if fname.lower().endswith('.csv'):
-                        csvs.append(os.path.join(dirpath, fname))
-    return sorted(set(csvs))
+
 
 
 def load_index_symbols() -> List[str]:
