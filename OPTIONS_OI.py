@@ -1633,4 +1633,4 @@ def scan_options_logic(long_symbols, short_symbols):
         except Exception as e:
             logger.error(f"Scan Error for {s}: {e}")
     logger.info(">>> OPTIONS SCAN COMPLETE <<<")
-")
+
