@@ -27,7 +27,7 @@ def init_fyers():
         # Assuming you have logic in here to initialize fyers, 
         # I'll include a placeholder or try to extract your existing logic.
                 global fyers
-        try:
+    try:
             client_id = os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID")
             access_token = os.environ.get("ACCESS_TOKEN") or os.environ.get("ACCESSTOKEN")
             if not client_id or not access_token:
