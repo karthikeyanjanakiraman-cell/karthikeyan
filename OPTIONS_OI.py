@@ -1,30 +1,37 @@
 import sys
 import subprocess
 import os
-
-# --- INSTALL & CONFIGURE ---
-# Force install in the user directory and add it to path
-subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "fyers-apiv3", "pandas", "numpy"])
-
-# Add user site-packages to path
 import site
-sys.path.append(site.getusersitepackages())
 
-# Now proceed with imports
+# --- INSTALL ---
+subprocess.check_call([sys.executable, "-m", "pip", "install", "fyers-apiv3", "pandas", "numpy"])
+
+# --- DEBUG & FIX PATH ---
+# Force add all possible site-packages directories
+for site_package in site.getsitepackages():
+    if site_package not in sys.path:
+        sys.path.append(site_package)
+
+# --- IMPORT WITH FALLBACK ---
 try:
+    # Try the most common import
     from fyersapiv3 import fyersModel
-    import pandas as pd
-    import numpy as np
-    import logging
-except ImportError as e:
-    print(f"FAILED TO IMPORT AFTER INSTALL: {e}")
-    sys.exit(1)
+except ImportError:
+    try:
+        # Try the underscored version
+        from fyers_apiv3 import fyersModel
+    except ImportError:
+        print("CRITICAL: Neither 'fyersapiv3' nor 'fyers_apiv3' can be imported.")
+        # List what is in the site-packages to debug
+        print("Available path:", sys.path)
+        sys.exit(1)
 
-# Simple logging configuration
+import pandas as pd
+import numpy as np
+import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger()
-
-def format(self, record):
+    def format(self, record):
         msg = record.getMessage()
         record.msg = msg.encode("ascii", "ignore").decode("ascii")
         return super().format(record)
