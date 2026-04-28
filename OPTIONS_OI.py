@@ -3,6 +3,8 @@ import re
 import sys
 import logging
 from datetime import datetime, timedelta
+import datetime as dt_lib
+import time
 import time
 from typing import List, Dict, Optional, Tuple
 
@@ -569,7 +571,7 @@ def compute_iteration_volume_profile(
         rvol20 = cum_vol / avg_cum_20 if avg_cum_20 > 0 else 0
 
         dt_time = datetime.combine(current_date, t)
-        market_open = datetime.combine(current_date, time(9, 15))
+        market_open = datetime.combine(current_date, dt_lib.time(9, 15))
         iter_mins = int((dt_time - market_open).total_seconds() / 60)
 
         rows.append(
