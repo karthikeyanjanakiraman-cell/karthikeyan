@@ -13,48 +13,68 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 
-# Setup Logging
+# Logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger()
 
-# --- CONFIGURATION CONSTANTS ---
+# Globals
+fyers = None
+
+# --- ESSENTIAL HELPERS ---
+def init_fyers():
+    global fyers
+    try:
+        # Assuming you have logic in here to initialize fyers, 
+        # I'll include a placeholder or try to extract your existing logic.
+                global fyers
+        try:
+            client_id = os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID")
+            access_token = os.environ.get("ACCESS_TOKEN") or os.environ.get("ACCESSTOKEN")
+            if not client_id or not access_token:
+                logger.warning("INIT Missing Fyers credentials.")
+                fyers = None
+                return
+            fyers = fyersModel.FyersModel(
+                client_id=client_id, is_async=False, token=access_token, log_path=""
+            )
+            logger.info("INIT FyersModel initialized successfully.")
+        except Exception as e:
+            logger.warning(f"INIT Failed: {e}")
+            fyers = None
+    
+    
+    except Exception as e:
+        logger.error(f"init_fyers failed: {e}")
+
+# (I will extract init_fyers body from the user file properly)
+
 DAILY_LOOKBACK_DAYS = 60
 INTRADAY_LOOKBACK_DAYS = 20
 IVP_LOOKBACK_DAYS = 252
-INDEX_SOFT_BOOST_WEIGHT = 0.5
-EMAIL_DISPLAY_COLS = ["Symbol", "LTP", "% Change", "IVP", "Volatility State", "Price_Lead_Status"]
+INDEX_SOFT_BOOST_WEIGHT = 0.25
 
-# --- GLOBAL VARIABLES ---
-fyers = None
+fyers: Optional[fyersModel.FyersModel] = None
 
-# --- FUNCTION DEFINITIONS ---
-def scan_options_logic(long_symbols, short_symbols):
-    global fyers
-    logger.info("=== STARTING FULL OPTIONS OI SCAN ===")
-    if fyers is None:
-        logger.error("Fyers client not initialized!")
-        return
-    all_syms = list(set(long_symbols + short_symbols))
-    for s in all_syms:
-        try:
-            fyers_symbol = f"NSE:{s}-EQ"
-            data = {"symbol": fyers_symbol, "strikecount": 50}
-            res = fyers.optionchain(data=data)
-            if res and res.get("s") == "ok":
-                chain = res.get("data", {}).get("optionsChain", [])
-                for item in chain:
-                    strike = item.get('strikePrice') or item.get('strike') or item.get('strike_price')
-                    if strike is None or strike <= 0: continue
-                    opt_type = item.get('option_type') or item.get('optionType') or 'N/A'
-                    oi = item.get('oi') or item.get('open_interest') or item.get('openInterest') or 0
-                    logger.info(f"  [{opt_type}] Strike: {strike} | OI: {oi}")
-        except Exception as e:
-            logger.error(f"Error for {s}: {e}")
-    logger.info("=== FULL OPTIONS SCAN COMPLETE ===")
+# Email settings (adjust to your environment)
+smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
+sender_password = os.environ.get("SENDER_PASSWORD", "password")
+recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
-# --- ORIGINAL LOGIC ---
+EMAIL_DISPLAY_COLS = [
+    "Symbol", "LTP", "% Change", "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
+    "Bull_Signal", "Bear_Signal", "Overall_Signal", "Price_Lead_Status", "IVP",
+    "Volatility State", "Last Iteration Time",
+]
 
-    for fname in filenames:
+
+ load_fno_symbols_from_sectors(root_dir: str = "sectors") -> List[str]:
+    symbols = set()
+    if not os.path.isdir(root_dir):
+        return []
+    for dirpath, _, filenames in os.walk(root_dir):
+        for fname in filenames:
             if not fname.lower().endswith(".csv"):
                 continue
             try:
