@@ -39,9 +39,7 @@ if logger.hasHandlers():
     logger.handlers.clear()
 ch = logging.StreamHandler(sys.stdout)
 ch.setLevel(logging.INFO)
-formatter = UTF8Formatter(
-    "%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-)
+formatter = UTF8Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 ch.setFormatter(formatter)
 logger.addHandler(ch)
 
