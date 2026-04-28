@@ -1564,8 +1564,8 @@ def main():
     # 2. Stock scan
     long_symbols = load_fno_symbols_for_indices(index_long_df["Symbol"].tolist())
     short_symbols = load_fno_symbols_for_indices(index_short_df["Symbol"].tolist())
-    df_long, long_detail = scansymboluniverse(long_symbols)
-    df_short, short_detail = scansymboluniverse(short_symbols)
+    df_long, long_detail = scan_symbol_universe(long_symbols)
+    df_short, short_detail = scan_symbol_universe(short_symbols)
 
     # 3. Options Scan
     logger.info("Running Options Scan")
