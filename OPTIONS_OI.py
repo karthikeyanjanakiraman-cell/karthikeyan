@@ -5,7 +5,6 @@ import logging
 from datetime import datetime, timedelta
 import datetime as dt_lib
 import time
-import time
 from typing import List, Dict, Optional, Tuple
 
 import numpy as np
@@ -51,7 +50,11 @@ sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
 sender_password = os.environ.get("SENDER_PASSWORD", "password")
 recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
-EMAIL_DISPLAY_COLS = ["Symbol", "Underlying", "Strike", "Type", "LTP", "OI"]
+EMAIL_DISPLAY_COLS = [
+    "Symbol", "LTP", "% Change", "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
+    "Bull_Signal", "Bear_Signal", "Overall_Signal", "Price_Lead_Status", "IVP",
+    "Volatility State", "Last Iteration Time",
+]
 
 
 def init_fyers():
@@ -570,7 +573,7 @@ def compute_iteration_volume_profile(
         )
         rvol20 = cum_vol / avg_cum_20 if avg_cum_20 > 0 else 0
 
-        dt_time = datetime.combine(current_date, t)
+        dt_time = dt_lib.datetime.combine(current_date, t)
         market_open = datetime.combine(current_date, dt_lib.time(9, 15))
         iter_mins = int((dt_time - market_open).total_seconds() / 60)
 
@@ -1587,116 +1590,3 @@ def main_index_first():
 
 if __name__ == '__main__':
     main_index_first()
-
-ATM_STRIKE_RANGE = int(os.environ.get("ATM_STRIKE_RANGE", 3))
-OPTION_STRIKE_STEP = int(os.environ.get("OPTION_STRIKE_STEP", 50))
-ACTIVE_EXPIRY = os.environ.get("ACTIVE_EXPIRY", "2026-04-30")
-
-def get_option_chain_for_symbol(symbol: str) -> pd.DataFrame:
-    """Fetch option quotes with rate limiting."""
-    if not fyers: return pd.DataFrame()
-    try:
-        d = datetime.strptime(ACTIVE_EXPIRY, "%Y-%m-%d")
-        exp_str = d.strftime("%Y%m%d")
-
-        fyers_sym = format_fyers_symbol(symbol)
-        df = get_fyers_history(fyers_sym, "5", 1)
-        ltp = float(df['close'].iloc[-1]) if df is not None and not df.empty else 0
-        atm = round(ltp / OPTION_STRIKE_STEP) * OPTION_STRIKE_STEP
-
-        strikes = []
-        sym_clean = symbol.replace('NSE:', '').replace('-EQ', '')
-        for offset in range(-ATM_STRIKE_RANGE, ATM_STRIKE_RANGE + 1):
-            strike = atm + offset * OPTION_STRIKE_STEP
-            for type_ in ["CE", "PE"]:
-                time.sleep(0.5) # RATE LIMITER: 0.5s pause
-                sym_str = f"NSE:{sym_clean}-{exp_str}-{strike}-{type_}"
-                quote = fyers.quotes({"symbols": sym_str})
-                if quote.get('s') == 'ok' and 'd' in quote and isinstance(quote['d'], list) and len(quote['d']) > 0:
-                    val = quote['d'][0].get('v', {})
-                    strikes.append({
-                        "Strike": strike, "Type": type_, "LTP": val.get('lp', 0),
-                        "OI": val.get('oi', 0), "Underlying": symbol
-                    })
-                else:
-                    logger.warning(f"No valid quote for {sym_str}")
-        return pd.DataFrame(strikes)
-    except Exception as e:
-        logger.error(f"Error for {symbol}: {e}")
-        return pd.DataFrame()
-    try:
-        d = datetime.strptime(ACTIVE_EXPIRY, "%Y-%m-%d")
-        exp_str = d.strftime("%Y%m%d")
-
-        # Get Underlying LTP from history (safe)
-        fyers_sym = format_fyers_symbol(symbol)
-        df = get_fyers_history(fyers_sym, "5", 1)
-        ltp = float(df['close'].iloc[-1]) if df is not None and not df.empty else 0
-        atm = round(ltp / OPTION_STRIKE_STEP) * OPTION_STRIKE_STEP
-
-        strikes = []
-        sym_clean = symbol.replace('NSE:', '').replace('-EQ', '')
-        for offset in range(-ATM_STRIKE_RANGE, ATM_STRIKE_RANGE + 1):
-            strike = atm + offset * OPTION_STRIKE_STEP
-            for type_ in ["CE", "PE"]:
-                # Construct Fyers standard option symbol: NSE:SYMBOL-YYYYMMDD-STRIKE-CE
-                sym_str = f"NSE:{sym_clean}-{exp_str}-{strike}-{type_}"
-                logger.info(f"Trying to build symbol: {sym_str}")
-                quote = fyers.quotes({"symbols": sym_str})
-                if quote.get('s') == 'ok' and 'd' in quote and len(quote['d']) > 0:
-                    logger.info(f"Found quote for {sym_str}")
-                else:
-                    logger.warning(f"No quote for {sym_str}, response: {quote}")
-                    val = quote['d'][0]['v']
-                    strikes.append({
-                        "Strike": strike, "Type": type_, "LTP": val.get('lp', 0),
-                        "OI": val.get('oi', 0), "Underlying": symbol
-                    })
-        return pd.DataFrame(strikes)
-    except Exception as e:
-        logger.error(f"Error for {symbol}: {e}")
-        return pd.DataFrame()
-
-def scan_options_for_top_symbols(top_symbols: List[str]) -> pd.DataFrame:
-    opt_rows = []
-    for sym in top_symbols[:10]:
-        opt_df = get_option_chain_for_symbol(sym)
-        opt_rows.append(opt_df)
-    return pd.concat(opt_rows, ignore_index=True) if opt_rows else pd.DataFrame()
-
-
-def main():
-    logger.info("Initializing Scanner (V7)")
-    init_fyers()
-    df_indices = scan_index_universe()
-    df_indices = add_signal_columns(derive_rank_columns(df_indices))
-    index_long_df, index_short_df = build_candidate_tables(df_indices)
-
-    long_map, short_map = build_index_strength_maps(index_long_df, index_short_df)
-    long_symbols = load_fno_symbols_for_indices(index_long_df["Symbol"].tolist())
-    short_symbols = load_fno_symbols_for_indices(index_short_df["Symbol"].tolist())
-
-    df_long, long_detail = scan_symbol_universe(long_symbols)
-    df_short, short_detail = scan_symbol_universe(short_symbols)
-
-    df_long = apply_soft_index_boost(df_long, index_long_df["Symbol"].tolist(), long_map, "long")
-    df_short = apply_soft_index_boost(df_short, index_short_df["Symbol"].tolist(), short_map, "short")
-
-    df_long = add_signal_columns(derive_rank_columns(df_long))
-    df_short = add_signal_columns(derive_rank_columns(df_short))
-
-    long_df, short_df = build_candidate_tables(df_long)
-
-    logger.info("Scanning Option Chains")
-    opt_long_df = scan_options_for_top_symbols(long_df["Symbol"].tolist())
-    opt_short_df = scan_options_for_top_symbols(short_df["Symbol"].tolist())
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    csv_filename = f"options_summary_{timestamp}.csv"
-    detail_csv_filename = f"options_detail_{timestamp}.csv"
-
-    opt_long_df.to_csv(csv_filename, index=False)
-    send_email_with_tables(opt_long_df, opt_short_df, csv_filename, detail_csv_filename)
-
-if __name__ == "__main__":
-    main()
