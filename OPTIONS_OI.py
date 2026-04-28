@@ -196,7 +196,7 @@ def load_fno_symbols_from_csv(path: str = "fno_stock_list.csv") -> List[str]:
 def format_fyers_symbol(symbol: str) -> str:
     if symbol.startswith("NSE:") and symbol.endswith("-EQ"):
         return symbol
-    return f"NSE:{symbol}-EQ"
+    return f"NSE:{symbol}EQ"
 
 
 def get_fyers_history(
