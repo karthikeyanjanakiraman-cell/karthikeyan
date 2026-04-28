@@ -1,6 +1,7 @@
 import sys
 import subprocess
 
+# --- INSTALL DEPENDENCIES ---
 try:
     import fyersapiv3
 except ImportError:
@@ -23,8 +24,11 @@ from email import encoders
 
 class UTF8Formatter(logging.Formatter):
     def format(self, record):
-        msg = record.getMessage()
-        record.msg = msg.encode("ascii", "ignore").decode("ascii")
+        try:
+            msg = record.getMessage()
+            record.msg = msg.encode("ascii", "ignore").decode("ascii")
+        except:
+            pass
         return super().format(record)
 
 logger = logging.getLogger()
@@ -33,29 +37,33 @@ if logger.hasHandlers():
     logger.handlers.clear()
 ch = logging.StreamHandler(sys.stdout)
 ch.setLevel(logging.INFO)
-# Single line formatter to prevent syntax errors
 formatter = UTF8Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 ch.setFormatter(formatter)
 logger.addHandler(ch)
 
-class UTF8Formatter(logging.Formatter):
-    def format(self, record):
-        msg = record.getMessage()
-        record.msg = msg.encode("ascii", "ignore").decode("ascii")
-        return super().format(record)
-
-
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-if logger.hasHandlers():
-    logger.handlers.clear()
-ch = logging.StreamHandler(sys.stdout)
-ch.setLevel(logging.INFO)
-formatter = UTF8Formatter(
-    "%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-)
-ch.setFormatter(formatter)
-logger.addHandler(ch)
+def scan_options_logic(long_symbols, short_symbols):
+    global fyers
+    logger.info("=== STARTING FULL OPTIONS OI SCAN ===")
+    if fyers is None:
+        logger.error("Fyers client not initialized!")
+        return
+    all_syms = list(set(long_symbols + short_symbols))
+    for s in all_syms:
+        try:
+            fyers_symbol = f"NSE:{s}-EQ"
+            data = {"symbol": fyers_symbol, "strikecount": 50}
+            res = fyers.optionchain(data=data)
+            if res and res.get("s") == "ok":
+                chain = res.get("data", {}).get("optionsChain", [])
+                for item in chain:
+                    strike = item.get('strikePrice') or item.get('strike') or item.get('strike_price')
+                    if strike is None or strike <= 0: continue
+                    opt_type = item.get('option_type') or item.get('optionType') or 'N/A'
+                    oi = item.get('oi') or item.get('open_interest') or item.get('openInterest') or 0
+                    logger.info(f"  [{opt_type}] Strike: {strike} | OI: {oi}")
+        except Exception as e:
+            logger.error(f"Error for {s}: {e}")
+    logger.info("=== FULL OPTIONS SCAN COMPLETE ===")
 
 DAILY_LOOKBACK_DAYS = 60
 INTRADAY_LOOKBACK_DAYS = 20
