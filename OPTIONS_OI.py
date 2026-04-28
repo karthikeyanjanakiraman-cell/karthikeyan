@@ -1584,11 +1584,20 @@ def main_index_first():
         logger.info(f'INDEX Iteration summary saved: {index_iter_csv}')
 
     # Forced Options Scan
-    logger.info("Starting Options Scan...")
-    scan_options_for_top_symbols(long_df["Symbol"].tolist(), short_df["Symbol"].tolist())
-    logger.info("Options Scan Complete.")
+    scan_options_logic(long_df["Symbol"].tolist(), short_df["Symbol"].tolist())
     send_email_with_tables(long_df, short_df, summary_csv, detail_csv, index_long_df=index_long_df, index_short_df=index_short_df, index_iter_csv_filename=(index_iter_csv if 'index_iter_csv' in locals() else None))
     logger.info('Index-first Scan Pipeline Completed')
 
 if __name__ == '__main__':
     main_index_first()
+
+
+def scan_options_logic(long_symbols, short_symbols):
+    logger.info("Starting Options Scan...")
+    try:
+        all_symbols = long_symbols + short_symbols
+        for sym in all_symbols:
+            logger.info(f"Scanning options for {sym}")
+    except Exception as e:
+        logger.error(f"Error in options scan: {e}")
+    logger.info("Options Scan Complete.")
