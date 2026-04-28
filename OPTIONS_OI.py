@@ -1583,21 +1583,12 @@ def main_index_first():
         index_iter_df.to_csv(index_iter_csv, index=False)
         logger.info(f'INDEX Iteration summary saved: {index_iter_csv}')
 
+    # Forced Options Scan
+    logger.info("Starting Options Scan...")
+    scan_options_for_top_symbols(long_df["Symbol"].tolist(), short_df["Symbol"].tolist())
+    logger.info("Options Scan Complete.")
     send_email_with_tables(long_df, short_df, summary_csv, detail_csv, index_long_df=index_long_df, index_short_df=index_short_df, index_iter_csv_filename=(index_iter_csv if 'index_iter_csv' in locals() else None))
     logger.info('Index-first Scan Pipeline Completed')
 
 if __name__ == '__main__':
     main_index_first()
-
-
-# FORCED EXECUTION BLOCK - ADDED V37
-if __name__ == "__main__":
-    try:
-        print("FORCED V37: Starting Index Scan...")
-        # Assuming the main function is named 'main' or similar. 
-        # If not, this might fail, but it's the only way to bypass existing logic.
-        main()
-    except NameError:
-        print("Error: 'main()' not found. Trying alternative...")
-        # Fallback to general execution if 'main' isn't the entry point
-        pass
