@@ -34,37 +34,6 @@ formatter = UTF8Formatter(
 ch.setFormatter(formatter)
 logger.addHandler(ch)
 
-
-
-def scan_options_logic(long_symbols, short_symbols):
-    global fyers
-    logger.info(">>> STARTING FORCED OPTIONS SCAN <<<")
-    if fyers is None:
-        logger.error("Fyers client not initialized!")
-        return
-
-    all_syms = list(set(long_symbols + short_symbols))
-    for s in all_syms:
-        try:
-            # Fyers requires 'NSE:SYMBOL-EQ'
-            fyers_symbol = f"NSE:{s}-EQ"
-            # Actual API request
-            res = fyers.optionchain(data={"symbol": fyers_symbol, "strikecount": 20})
-
-            if res and res.get("s") == "ok":
-                chain = res.get("data", {}).get("optionsChain", [])
-                for item in chain:
-                    strike = item.get('strikePrice') or item.get('strike')
-                    oi = item.get('oi') or item.get('openInterest') or 0
-                    if strike:
-                        logger.info(f"  [Symbol: {s}] Strike: {strike} | OI: {oi}")
-            else:
-                logger.warning(f"No valid option chain data for {s}")
-
-        except Exception as e:
-            logger.error(f"Scan Error for {s}: {e}")
-    logger.info(">>> OPTIONS SCAN COMPLETE <<<")
-
 DAILY_LOOKBACK_DAYS = 60
 INTRADAY_LOOKBACK_DAYS = 20
 IVP_LOOKBACK_DAYS = 252
@@ -1625,3 +1594,43 @@ if __name__ == '__main__':
 
 
 
+def get_next_thursday():
+    today = datetime.now()
+    days_ahead = 3 - today.weekday() # Thursday is 3
+    if days_ahead <= 0: days_ahead += 7
+    return (today + timedelta(days=days_ahead)).strftime('%Y-%m-%d')
+
+def scan_options_logic(long_symbols, short_symbols):
+    global fyers
+    logger.info(">>> STARTING FORCED OPTIONS SCAN <<<")
+    if fyers is None:
+        logger.error("Fyers client not initialized!")
+        return
+
+    next_expiry = get_next_thursday()
+    logger.info(f"Scanning for expiry: {next_expiry}")
+
+    all_syms = list(set(long_symbols + short_symbols))
+    for s in all_syms:
+        try:
+            fyers_symbol = f"NSE:{s}-EQ"
+            # Request with explicit expiry
+            data = {"symbol": fyers_symbol, "strikecount": 20, "expiry_date": next_expiry}
+            res = fyers.optionchain(data=data)
+
+            if res and res.get("s") == "ok":
+                chain = res.get("data", {}).get("optionsChain", [])
+                if not chain:
+                    logger.warning(f"No chain returned for {s} on {next_expiry}")
+                for item in chain:
+                    strike = item.get('strikePrice') or item.get('strike')
+                    oi = item.get('oi') or item.get('openInterest') or 0
+                    if strike:
+                        logger.info(f"  [Symbol: {s}] Strike: {strike} | OI: {oi}")
+            else:
+                logger.warning(f"API Error for {s}: {res.get('message', 'Unknown')}")
+
+        except Exception as e:
+            logger.error(f"Scan Error for {s}: {e}")
+    logger.info(">>> OPTIONS SCAN COMPLETE <<<")
+")
