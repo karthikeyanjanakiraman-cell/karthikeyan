@@ -1,21 +1,14 @@
-
 import os
 import sys
 import logging
 import sqlite3
-import smtplib
-from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple
 import numpy as np
 import pandas as pd
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
-
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional
 try:
     from fyers_apiv3 import fyersModel
-except Exception:
+except ImportError:
     fyersModel = None
 
 # --- Logger Setup ---
@@ -29,52 +22,59 @@ if not logger.handlers:
 # --- Config ---
 ACTIVE_EXPIRY = os.getenv('ACTIVE_EXPIRY', '2026-04-30')
 ATM_STRIKE_RANGE = int(os.getenv('ATM_STRIKE_RANGE', '3'))
+BULL_SCORE_MULTIPLIER = 15
+BEAR_SCORE_MULTIPLIER = 15
 
-def format_equity_symbol(symbol: str) -> str:
-    s = str(symbol).strip().upper()
-    return s if s.startswith('NSE:') else f'NSE:{s}-EQ'
+def get_fyers():
+    return fyersModel.FyersModel(
+        client_id=os.getenv('CLIENT_ID'), 
+        token=os.getenv('ACCESS_TOKEN'), 
+        is_async=False
+    )
 
-# --- FIXED API CALL ---
-def fetch_option_chain_equity(fyers, symbol, expiry):
-    # Fyers API V3 Option Chain payload requirements:
-    # 1. symbol: Underlying equity symbol (e.g., NSE:RELIANCE-EQ)
-    # 2. strikecount: integer (e.g., 50)
-    # 3. expiry: date string (YYYY-MM-DD)
+def normalize_symbol(symbol: str) -> str:
+    # Ensure ticker format is compatible with Fyers Option Chain API
+    s = symbol.strip().upper().replace('NSE:', '').replace('-EQ', '')
+    return s
 
-    # Try the two most common formats to resolve "valid inputs" errors
-    possible_syms = [format_equity_symbol(symbol), symbol.strip().upper()]
-
-    for sym in possible_syms:
+def fetch_option_chain(fyers, symbol, expiry):
+    # Try the two reliable formats for Fyers V3
+    base_sym = normalize_symbol(symbol)
+    for sym_fmt in [f"NSE:{base_sym}-EQ", base_sym]:
         try:
-            payload = {
-                'symbol': sym,
-                'strikecount': 50,
-                'expiry': expiry
-            }
+            payload = {'symbol': sym_fmt, 'strikecount': 50, 'expiry': expiry}
             res = fyers.optionchain(data=payload)
-
-            # Check for API success
             if isinstance(res, dict) and res.get('s') == 'ok':
-                data = res.get('data', {})
-                chain = data.get('optionsChain', []) or data.get('optionschain', []) or []
-                if chain:
-                    logger.info(f'[OK] Chain found for {sym}')
-                    df = pd.DataFrame(chain)
-                    df.columns = [c.lower().replace(' ', '_') for c in df.columns]
+                data = res.get('data', {}).get('optionsChain') or res.get('data', {}).get('optionschain')
+                if data:
+                    df = pd.DataFrame(data)
+                    df.columns = [c.lower() for c in df.columns]
                     return df
-
-            # Log failure details for debugging
-            msg = res.get("message", "No message") if isinstance(res, dict) else "Non-dict response"
-            logger.info(f'[DEBUG] Empty/Failed chain for {sym}: {msg}')
-
-        except Exception as e:
-            logger.warning(f'[WARN] API call failed for {sym}: {e}')
-
+        except Exception:
+            continue
     return pd.DataFrame()
 
+def calculate_continuous_rank_score(bull_score, bear_score):
+    net_score = (bull_score * BULL_SCORE_MULTIPLIER) - (bear_score * BEAR_SCORE_MULTIPLIER)
+    rank = max(-15, min(15, net_score))
+    abs_rank = abs(rank)
+    pos = 1.0 if abs_rank >= 14 else (0.8 if abs_rank >= 12 else (0.6 if abs_rank >= 10 else (0.4 if abs_rank >= 8 else (0.2 if abs_rank >= 6 else 0.0))))
+    return rank, pos
+
+def process_symbol(fyers, symbol):
+    chain = fetch_option_chain(fyers, symbol, ACTIVE_EXPIRY)
+    if chain.empty:
+        return None
+
+    # Process chain data...
+    # (Here you would add your factor scoring and MTF indicators)
+    return chain.head(1)
+
 def main():
-    # Placeholder for the rest of your logic...
-    print("Pipeline ready with corrected API parameters.")
+    logger.info("Initializing Reworked Production Scanner")
+    fyers = get_fyers()
+    # Symbol loading...
+    print("Scanner ready.")
 
 if __name__ == '__main__':
     main()
