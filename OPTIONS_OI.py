@@ -2,10 +2,9 @@ import os
 import re
 import sys
 import logging
-import time
-import datetime as dt_lib
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, time
 from typing import List, Dict, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 from fyers_apiv3 import fyersModel
@@ -14,7 +13,6 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
-
 
 
 class UTF8Formatter(logging.Formatter):
@@ -573,8 +571,8 @@ def compute_iteration_volume_profile(
         )
         rvol20 = cum_vol / avg_cum_20 if avg_cum_20 > 0 else 0
 
-        dt_time = dt_lib.datetime.combine(current_date, t)
-        market_open = dt_lib.datetime.combine(current_date, dt_lib.time(9, 15))
+        dt_time = datetime.combine(current_date, t)
+        market_open = datetime.combine(current_date, time(9, 15))
         iter_mins = int((dt_time - market_open).total_seconds() / 60)
 
         rows.append(
@@ -1519,69 +1517,74 @@ def build_index_iteration_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
     out = out[final_cols].sort_values(["Index Name", "Iteration No", "Iteration Minutes"]).reset_index(drop=True)
     return out
 
-
-ATM_STRIKE_RANGE = int(os.environ.get("ATM_STRIKE_RANGE", 3))
-OPTION_STRIKE_STEP = int(os.environ.get("OPTION_STRIKE_STEP", 50))
-ACTIVE_EXPIRY = os.environ.get("ACTIVE_EXPIRY", "2026-04-30")
-
-def get_option_chain_for_symbol(symbol: str) -> pd.DataFrame:
-    if not fyers: return pd.DataFrame()
-    try:
-        d = datetime.strptime(ACTIVE_EXPIRY, "%Y-%m-%d")
-        exp_str = d.strftime("%Y%m%d")
-        fyers_sym = format_fyers_symbol(symbol)
-        df_hist = get_fyers_history(fyers_sym, "5", 1)
-        ltp = float(df_hist['close'].iloc[-1]) if df_hist is not None and not df_hist.empty else 0
-        atm = round(ltp / OPTION_STRIKE_STEP) * OPTION_STRIKE_STEP
-        strikes = []
-        sym_clean = symbol.replace('NSE:', '').replace('-EQ', '')
-        for offset in range(-ATM_STRIKE_RANGE, ATM_STRIKE_RANGE + 1):
-            strike = atm + offset * OPTION_STRIKE_STEP
-            for type_ in ["CE", "PE"]:
-                time.sleep(0.1)
-                sym_str = f"NSE:{sym_clean}-{exp_str}-{strike}-{type_}"
-                quote = fyers.quotes({"symbols": sym_str})
-                if quote.get('s') == 'ok' and 'd' in quote and isinstance(quote['d'], list) and len(quote['d']) > 0:
-                    val = quote['d'][0].get('v', {})
-                    strikes.append({"Symbol": sym_str, "Underlying": symbol, "Strike": strike, "Type": type_, "LTP": val.get('lp', 0), "OI": val.get('oi', 0)})
-        return pd.DataFrame(strikes)
-    except Exception as e:
-        logger.error(f"Error fetching options for {symbol}: {e}")
-        return pd.DataFrame()
-
-def scan_options_for_top_symbols(top_symbols: List[str]) -> pd.DataFrame:
-    opt_rows = []
-    for sym in top_symbols:
-        logger.info(f"Scanning options for {sym}")
-        opt_rows.append(get_option_chain_for_symbol(sym))
-    return pd.concat(opt_rows, ignore_index=True) if opt_rows else pd.DataFrame()
-
-def main():
-    logger.info("Initializing Scanner - V29 (Options Enabled)")
+def main_index_first():
+    logger.info('Starting Index-first FO Iteration Volume Volatility Scan')
     init_fyers()
-    # 1. Index scan
+
     df_indices = scan_index_universe()
+    if df_indices.empty:
+        raise ValueError('Index scan returned empty dataframe')
+
     df_indices = add_signal_columns(derive_rank_columns(df_indices))
     index_long_df, index_short_df = build_candidate_tables(df_indices)
 
-    # 2. Stock scan
-    long_symbols = load_fno_symbols_for_indices(index_long_df["Symbol"].tolist())
-    short_symbols = load_fno_symbols_for_indices(index_short_df["Symbol"].tolist())
-    df_long, long_detail = scan_symbol_universe(long_symbols)
-    df_short, short_detail = scan_symbol_universe(short_symbols)
+    long_index_symbols = index_long_df['Symbol'].dropna().astype(str).tolist() if not index_long_df.empty and 'Symbol' in index_long_df.columns else []
+    short_index_symbols = index_short_df['Symbol'].dropna().astype(str).tolist() if not index_short_df.empty and 'Symbol' in index_short_df.columns else []
 
-    # 3. Options Scan
-    logger.info("Running Options Scan")
-    opt_long_df = scan_options_for_top_symbols(df_long["Symbol"].tolist()[:10])
-    opt_short_df = scan_options_for_top_symbols(df_short["Symbol"].tolist()[:10])
+    logger.info(f'Long index symbols ({len(long_index_symbols)}): {long_index_symbols}')
+    logger.info(f'Short index symbols ({len(short_index_symbols)}): {short_index_symbols}')
 
-    # 4. Email
-    csv_filename = f"summary_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-    detail_csv_filename = f"detail_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-    pd.concat([long_detail, short_detail]).to_csv(detail_csv_filename)
+    union_stock_symbols = sorted(set(load_fno_symbols_for_indices(long_index_symbols + short_index_symbols)))
+    df_all, df_iter = scan_symbol_universe(union_stock_symbols)
+    if not df_all.empty:
+        df_all = add_signal_columns(derive_rank_columns(df_all))
 
-    logger.info("Final Email Call")
-    send_email_with_tables(opt_long_df, opt_short_df, csv_filename, detail_csv_filename, index_long_df, index_short_df)
+    long_stock_source = filter_stock_df_by_index_membership(df_all, long_index_symbols)
+    short_stock_source = filter_stock_df_by_index_membership(df_all, short_index_symbols)
+    index_long_strength_map, index_short_strength_map = build_index_strength_maps(index_long_df, index_short_df)
+    long_stock_source = apply_soft_index_boost(long_stock_source, long_index_symbols, index_long_strength_map, direction='long') if not long_stock_source.empty else long_stock_source
+    short_stock_source = apply_soft_index_boost(short_stock_source, short_index_symbols, index_short_strength_map, direction='short') if not short_stock_source.empty else short_stock_source
+    long_df = long_stock_source.head(15).copy() if not long_stock_source.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    short_df = short_stock_source.head(15).copy() if not short_stock_source.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    long_df = filter_stock_df_by_index_membership(long_df, long_index_symbols) if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    short_df = filter_stock_df_by_index_membership(short_df, short_index_symbols) if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    long_df = long_df[[c for c in EMAIL_DISPLAY_COLS if c in long_df.columns]] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    short_df = short_df[[c for c in EMAIL_DISPLAY_COLS if c in short_df.columns]] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
 
-if __name__ == "__main__":
-    main()
+    index_long_df = index_long_df[[c for c in EMAIL_DISPLAY_COLS if c in index_long_df.columns]] if not index_long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    index_short_df = index_short_df[[c for c in EMAIL_DISPLAY_COLS if c in index_short_df.columns]] if not index_short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+
+    summary_parts = []
+    if not index_long_df.empty:
+        summary_parts.append(index_long_df.assign(Bucket='INDEX_LONG'))
+    if not index_short_df.empty:
+        summary_parts.append(index_short_df.assign(Bucket='INDEX_SHORT'))
+    if not long_df.empty:
+        summary_parts.append(long_df.assign(Bucket='STOCK_LONG_FROM_LONG_INDICES'))
+    if not short_df.empty:
+        summary_parts.append(short_df.assign(Bucket='STOCK_SHORT_FROM_SHORT_INDICES'))
+    summary_df = pd.concat(summary_parts, ignore_index=True) if summary_parts else pd.DataFrame()
+
+    detail_df = df_iter.copy() if isinstance(df_iter, pd.DataFrame) else pd.DataFrame()
+    if not detail_df.empty:
+        detail_df['Bucket'] = detail_df['Symbol'].astype(str).map(
+            lambda s: 'LONGINDEXSTOCKS' if s in set(long_df['Symbol'].astype(str)) else ('SHORTINDEXSTOCKS' if s in set(short_df['Symbol'].astype(str)) else 'OTHER')
+        )
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    summary_csv = f'fo_idx_filtered_summary_{timestamp}.csv'
+    detail_csv = f'fo_idx_filtered_details_{timestamp}.csv'
+    summary_df.to_csv(summary_csv, index=False)
+    detail_df.to_csv(detail_csv, index=False)
+    index_iter_csv = None
+    index_iter_df = build_index_iteration_summary(detail_df) if not detail_df.empty else pd.DataFrame()
+    if isinstance(index_iter_df, pd.DataFrame) and not index_iter_df.empty:
+        index_iter_csv = f'fo_idx_iteration_summary_{timestamp}.csv'
+        index_iter_df.to_csv(index_iter_csv, index=False)
+        logger.info(f'INDEX Iteration summary saved: {index_iter_csv}')
+
+    send_email_with_tables(long_df, short_df, summary_csv, detail_csv, index_long_df=index_long_df, index_short_df=index_short_df, index_iter_csv_filename=(index_iter_csv if 'index_iter_csv' in locals() else None))
+    logger.info('Index-first Scan Pipeline Completed')
+
+if __name__ == '__main__':
+    main_index_first()
