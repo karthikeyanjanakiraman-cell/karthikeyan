@@ -33,18 +33,6 @@ formatter = UTF8Formatter(
 )
 ch.setFormatter(formatter)
 logger.addHandler(ch)
-def scan_options_logic(long_symbols, short_symbols):
-    """Placeholder for options OI scan to fix NameError."""
-    logger.info("=== OPTIONS OI SCAN START ===")
-    try:
-        all_syms = list(set(long_symbols + short_symbols))
-        for s in all_syms[:10]:
-            logger.info(f"Options OI analysis for {s}")
-    except Exception as e:
-        logger.error(f"Options Scan Error: {e}")
-    logger.info("OPTIONS SCAN COMPLETE")
-
-
 
 DAILY_LOOKBACK_DAYS = 60
 INTRADAY_LOOKBACK_DAYS = 20
