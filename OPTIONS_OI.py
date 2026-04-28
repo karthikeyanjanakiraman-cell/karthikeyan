@@ -2,10 +2,11 @@ import os
 import re
 import sys
 import logging
-import time
-import datetime as dt_lib
 from datetime import datetime, timedelta
+import datetime as dt_lib
+import time
 from typing import List, Dict, Optional, Tuple
+
 import numpy as np
 import pandas as pd
 from fyers_apiv3 import fyersModel
@@ -14,6 +15,47 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
+
+
+class UTF8Formatter(logging.Formatter):
+    def format(self, record):
+        msg = record.getMessage()
+        record.msg = msg.encode("ascii", "ignore").decode("ascii")
+        return super().format(record)
+
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+if logger.hasHandlers():
+    logger.handlers.clear()
+ch = logging.StreamHandler(sys.stdout)
+ch.setLevel(logging.INFO)
+formatter = UTF8Formatter(
+    "%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+)
+ch.setFormatter(formatter)
+logger.addHandler(ch)
+
+DAILY_LOOKBACK_DAYS = 60
+INTRADAY_LOOKBACK_DAYS = 20
+IVP_LOOKBACK_DAYS = 252
+INDEX_SOFT_BOOST_WEIGHT = 0.25
+
+fyers: Optional[fyersModel.FyersModel] = None
+
+# Email settings (adjust to your environment)
+smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
+sender_password = os.environ.get("SENDER_PASSWORD", "password")
+recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
+
+EMAIL_DISPLAY_COLS = [
+    "Symbol", "LTP", "% Change", "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
+    "Bull_Signal", "Bear_Signal", "Overall_Signal", "Price_Lead_Status", "IVP",
+    "Volatility State", "Last Iteration Time",
+]
+
 
 def init_fyers():
     global fyers
@@ -1528,65 +1570,23 @@ def main_index_first():
     detail_df = df_iter.copy() if isinstance(df_iter, pd.DataFrame) else pd.DataFrame()
     if not detail_df.empty:
         detail_df['Bucket'] = detail_df['Symbol'].astype(str).map(
-ATM_STRIKE_RANGE = int(os.environ.get("ATM_STRIKE_RANGE", 3))
-OPTION_STRIKE_STEP = int(os.environ.get("OPTION_STRIKE_STEP", 50))
-ACTIVE_EXPIRY = os.environ.get("ACTIVE_EXPIRY", "2026-04-30")
+            lambda s: 'LONGINDEXSTOCKS' if s in set(long_df['Symbol'].astype(str)) else ('SHORTINDEXSTOCKS' if s in set(short_df['Symbol'].astype(str)) else 'OTHER')
+        )
 
-def get_option_chain_for_symbol(symbol: str) -> pd.DataFrame:
-    if not fyers: return pd.DataFrame()
-    try:
-        d = datetime.strptime(ACTIVE_EXPIRY, "%Y-%m-%d")
-        exp_str = d.strftime("%Y%m%d")
-        fyers_sym = format_fyers_symbol(symbol)
-        df_hist = get_fyers_history(fyers_sym, "5", 1)
-        ltp = float(df_hist['close'].iloc[-1]) if df_hist is not None and not df_hist.empty else 0
-        atm = round(ltp / OPTION_STRIKE_STEP) * OPTION_STRIKE_STEP
-        strikes = []
-        sym_clean = symbol.replace('NSE:', '').replace('-EQ', '')
-        for offset in range(-ATM_STRIKE_RANGE, ATM_STRIKE_RANGE + 1):
-            strike = atm + offset * OPTION_STRIKE_STEP
-            for type_ in ["CE", "PE"]:
-                time.sleep(0.3)
-                sym_str = f"NSE:{sym_clean}-{exp_str}-{strike}-{type_}"
-                quote = fyers.quotes({"symbols": sym_str})
-                if quote.get('s') == 'ok' and 'd' in quote and isinstance(quote['d'], list) and len(quote['d']) > 0:
-                    val = quote['d'][0].get('v', {})
-                    strikes.append({
-                        "Symbol": sym_str, "Underlying": symbol, "Strike": strike, 
-                        "Type": type_, "LTP": val.get('lp', 0), "OI": val.get('oi', 0)
-                    })
-        return pd.DataFrame(strikes)
-    except Exception as e:
-        logger.error(f"Error for {symbol}: {e}")
-        return pd.DataFrame()
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    summary_csv = f'fo_idx_filtered_summary_{timestamp}.csv'
+    detail_csv = f'fo_idx_filtered_details_{timestamp}.csv'
+    summary_df.to_csv(summary_csv, index=False)
+    detail_df.to_csv(detail_csv, index=False)
+    index_iter_csv = None
+    index_iter_df = build_index_iteration_summary(detail_df) if not detail_df.empty else pd.DataFrame()
+    if isinstance(index_iter_df, pd.DataFrame) and not index_iter_df.empty:
+        index_iter_csv = f'fo_idx_iteration_summary_{timestamp}.csv'
+        index_iter_df.to_csv(index_iter_csv, index=False)
+        logger.info(f'INDEX Iteration summary saved: {index_iter_csv}')
 
-def scan_options_for_top_symbols(top_symbols: List[str]) -> pd.DataFrame:
-    return pd.concat([get_option_chain_for_symbol(sym) for sym in top_symbols], ignore_index=True) if top_symbols else pd.DataFrame()
+    send_email_with_tables(long_df, short_df, summary_csv, detail_csv, index_long_df=index_long_df, index_short_df=index_short_df, index_iter_csv_filename=(index_iter_csv if 'index_iter_csv' in locals() else None))
+    logger.info('Index-first Scan Pipeline Completed')
 
-def main():
-    logger.info("Initializing Scanner - V26")
-    init_fyers()
-    # 1. Index scan
-    df_indices = scan_index_universe()
-    df_indices = add_signal_columns(derive_rank_columns(df_indices))
-    index_long_df, index_short_df = build_candidate_tables(df_indices)
-
-    # 2. Stock scan
-    long_symbols = load_fno_symbols_for_indices(index_long_df["Symbol"].tolist())
-    short_symbols = load_fno_symbols_for_indices(index_short_df["Symbol"].tolist())
-    df_long, long_detail = scansymboluniverse(long_symbols)
-    df_short, short_detail = scansymboluniverse(short_symbols)
-
-    # 3. Options Scan
-    logger.info("Running Options Scan")
-    opt_long_df = scan_options_for_top_symbols(df_long["Symbol"].tolist()[:10])
-    opt_short_df = scan_options_for_top_symbols(df_short["Symbol"].tolist()[:10])
-
-    # 4. Email
-    csv_filename = f"summary_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-    detail_csv_filename = f"detail_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
-    send_email_with_tables(opt_long_df, opt_short_df, csv_filename, detail_csv_filename, index_long_df, index_short_df)
-    logger.info("Pipeline Completed")
-
-if __name__ == "__main__":
-    main()
+if __name__ == '__main__':
+    main_index_first()
