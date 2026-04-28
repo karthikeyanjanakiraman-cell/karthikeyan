@@ -15,47 +15,6 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 
-
-class UTF8Formatter(logging.Formatter):
-    def format(self, record):
-        msg = record.getMessage()
-        record.msg = msg.encode("ascii", "ignore").decode("ascii")
-        return super().format(record)
-
-
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-if logger.hasHandlers():
-    logger.handlers.clear()
-ch = logging.StreamHandler(sys.stdout)
-ch.setLevel(logging.INFO)
-formatter = UTF8Formatter(
-    "%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-)
-ch.setFormatter(formatter)
-logger.addHandler(ch)
-
-DAILY_LOOKBACK_DAYS = 60
-INTRADAY_LOOKBACK_DAYS = 20
-IVP_LOOKBACK_DAYS = 252
-INDEX_SOFT_BOOST_WEIGHT = 0.25
-
-fyers: Optional[fyersModel.FyersModel] = None
-
-# Email settings (adjust to your environment)
-smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-smtp_port = int(os.environ.get("SMTP_PORT", "587"))
-sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
-sender_password = os.environ.get("SENDER_PASSWORD", "password")
-recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
-
-EMAIL_DISPLAY_COLS = [
-    "Symbol", "LTP", "% Change", "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
-    "Bull_Signal", "Bear_Signal", "Overall_Signal", "Price_Lead_Status", "IVP",
-    "Volatility State", "Last Iteration Time",
-]
-
-
 def init_fyers():
     global fyers
     try:
@@ -1569,27 +1528,6 @@ def main_index_first():
     detail_df = df_iter.copy() if isinstance(df_iter, pd.DataFrame) else pd.DataFrame()
     if not detail_df.empty:
         detail_df['Bucket'] = detail_df['Symbol'].astype(str).map(
-            lambda s: 'LONGINDEXSTOCKS' if s in set(long_df['Symbol'].astype(str)) else ('SHORTINDEXSTOCKS' if s in set(short_df['Symbol'].astype(str)) else 'OTHER')
-        )
-
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    summary_csv = f'fo_idx_filtered_summary_{timestamp}.csv'
-    detail_csv = f'fo_idx_filtered_details_{timestamp}.csv'
-    summary_df.to_csv(summary_csv, index=False)
-    detail_df.to_csv(detail_csv, index=False)
-    index_iter_csv = None
-    index_iter_df = build_index_iteration_summary(detail_df) if not detail_df.empty else pd.DataFrame()
-    if isinstance(index_iter_df, pd.DataFrame) and not index_iter_df.empty:
-        index_iter_csv = f'fo_idx_iteration_summary_{timestamp}.csv'
-        index_iter_df.to_csv(index_iter_csv, index=False)
-        logger.info(f'INDEX Iteration summary saved: {index_iter_csv}')
-
-    send_email_with_tables(long_df, short_df, summary_csv, detail_csv, index_long_df=index_long_df, index_short_df=index_short_df, index_iter_csv_filename=(index_iter_csv if 'index_iter_csv' in locals() else None))
-    logger.info('Index-first Scan Pipeline Completed')
-
-if __name__ == '__main__':
-    main_index_first()
-
 ATM_STRIKE_RANGE = int(os.environ.get("ATM_STRIKE_RANGE", 3))
 OPTION_STRIKE_STEP = int(os.environ.get("OPTION_STRIKE_STEP", 50))
 ACTIVE_EXPIRY = os.environ.get("ACTIVE_EXPIRY", "2026-04-30")
@@ -1623,5 +1561,32 @@ def get_option_chain_for_symbol(symbol: str) -> pd.DataFrame:
         return pd.DataFrame()
 
 def scan_options_for_top_symbols(top_symbols: List[str]) -> pd.DataFrame:
-    opt_rows = [get_option_chain_for_symbol(sym) for sym in top_symbols]
-    return pd.concat(opt_rows, ignore_index=True) if opt_rows else pd.DataFrame()
+    return pd.concat([get_option_chain_for_symbol(sym) for sym in top_symbols], ignore_index=True) if top_symbols else pd.DataFrame()
+
+def main():
+    logger.info("Initializing Scanner - V26")
+    init_fyers()
+    # 1. Index scan
+    df_indices = scan_index_universe()
+    df_indices = add_signal_columns(derive_rank_columns(df_indices))
+    index_long_df, index_short_df = build_candidate_tables(df_indices)
+
+    # 2. Stock scan
+    long_symbols = load_fno_symbols_for_indices(index_long_df["Symbol"].tolist())
+    short_symbols = load_fno_symbols_for_indices(index_short_df["Symbol"].tolist())
+    df_long, long_detail = scansymboluniverse(long_symbols)
+    df_short, short_detail = scansymboluniverse(short_symbols)
+
+    # 3. Options Scan
+    logger.info("Running Options Scan")
+    opt_long_df = scan_options_for_top_symbols(df_long["Symbol"].tolist()[:10])
+    opt_short_df = scan_options_for_top_symbols(df_short["Symbol"].tolist()[:10])
+
+    # 4. Email
+    csv_filename = f"summary_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    detail_csv_filename = f"detail_{datetime.now().strftime('%Y%m%d_%H%M')}.csv"
+    send_email_with_tables(opt_long_df, opt_short_df, csv_filename, detail_csv_filename, index_long_df, index_short_df)
+    logger.info("Pipeline Completed")
+
+if __name__ == "__main__":
+    main()
