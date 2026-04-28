@@ -1583,7 +1583,8 @@ def main_index_first():
         index_iter_df.to_csv(index_iter_csv, index=False)
         logger.info(f'INDEX Iteration summary saved: {index_iter_csv}')
 
-    # Forced Options Scan
+
+    # Forced Scan Injection
     scan_options_logic(long_df["Symbol"].tolist(), short_df["Symbol"].tolist())
     send_email_with_tables(long_df, short_df, summary_csv, detail_csv, index_long_df=index_long_df, index_short_df=index_short_df, index_iter_csv_filename=(index_iter_csv if 'index_iter_csv' in locals() else None))
     logger.info('Index-first Scan Pipeline Completed')
@@ -1593,11 +1594,12 @@ if __name__ == '__main__':
 
 
 def scan_options_logic(long_symbols, short_symbols):
-    logger.info("Starting Options Scan...")
+    logger.info(">>> STARTING FORCED OPTIONS SCAN <<<")
     try:
-        all_symbols = long_symbols + short_symbols
-        for sym in all_symbols:
-            logger.info(f"Scanning options for {sym}")
+        all_syms = long_symbols + short_symbols
+        for s in all_syms:
+            logger.info(f"Scanning options for {s}")
+            # Placeholder for your Fyers API call logic
     except Exception as e:
-        logger.error(f"Error in options scan: {e}")
-    logger.info("Options Scan Complete.")
+        logger.error(f"Scan Error: {e}")
+    logger.info(">>> OPTIONS SCAN COMPLETE <<<")
