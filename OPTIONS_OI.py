@@ -1,28 +1,29 @@
 import sys
 import subprocess
 import os
-import re
-import logging
-from datetime import datetime, timedelta, time
-from typing import List, Dict, Optional, Tuple
 
-def check_dependencies():
-    try:
-        import fyersapiv3
-    except ImportError:
-        subprocess.check_call([sys.executable, "-m", "pip", "install", "fyers-apiv3", "pandas", "numpy"])
+# --- INSTALL & CONFIGURE ---
+# Force install in the user directory and add it to path
+subprocess.check_call([sys.executable, "-m", "pip", "install", "--user", "fyers-apiv3", "pandas", "numpy"])
 
-check_dependencies()
+# Add user site-packages to path
+import site
+sys.path.append(site.getusersitepackages())
 
-from fyersapiv3 import fyersModel
-import pandas as pd
-import numpy as np
+# Now proceed with imports
+try:
+    from fyersapiv3 import fyersModel
+    import pandas as pd
+    import numpy as np
+    import logging
+except ImportError as e:
+    print(f"FAILED TO IMPORT AFTER INSTALL: {e}")
+    sys.exit(1)
 
 # Simple logging configuration
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger()
 
-class UTF8Formatter(logging.Formatter):
     def format(self, record):
         msg = record.getMessage()
         record.msg = msg.encode("ascii", "ignore").decode("ascii")
