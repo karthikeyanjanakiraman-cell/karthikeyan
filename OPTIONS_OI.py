@@ -1,13 +1,12 @@
+
 import os
 import logging
 import pandas as pd
 import numpy as np
-from datetime import datetime
 from fyers_apiv3 import fyersModel
 
-# Setup
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
-logger = logging.getLogger('VolScanner')
+logger = logging.getLogger('Scanner')
 
 def get_fyers():
     return fyersModel.FyersModel(
@@ -15,7 +14,7 @@ def get_fyers():
         token=os.getenv('ACCESS_TOKEN')
     )
 
-def load_all_fno_symbols(root_dir='sectors'):
+def load_fno_symbols(root_dir='sectors'):
     symbols = set()
     if os.path.exists(root_dir):
         for f in os.listdir(root_dir):
@@ -24,49 +23,36 @@ def load_all_fno_symbols(root_dir='sectors'):
                 symbols.update(df.iloc[:,0].dropna().astype(str).str.strip().unique())
     return sorted(list(symbols))
 
-def fetch_chain(fyers, symbol):
-    s = symbol.upper().replace('NSE:', '').replace('-EQ', '')
-    try:
-        # Fyers requires specific expiry format
-        res = fyers.optionchain(data={
-            'symbol': f"NSE:{s}-EQ", 
-            'strikecount': 50, 
-            'expiry': os.getenv('ACTIVE_EXPIRY', '2026-04-30')
-        })
-        if res.get('s') == 'ok':
-            chain = res.get('data', {}).get('optionsChain') or res.get('data', {}).get('optionschain')
-            if chain: return pd.DataFrame(chain)
-    except: pass
-    return pd.DataFrame()
-
-def process_iteration():
+def run_standalone_scanner():
     fyers = get_fyers()
-    symbols = load_all_fno_symbols()
+    expiry = os.getenv('ACTIVE_EXPIRY', '2026-04-30')
+    symbols = load_fno_symbols()
+    current_data = []
 
-    all_data = []
     for sym in symbols:
-        df = fetch_chain(fyers, sym)
-        if not df.empty:
-            df['Underlying'] = sym
-            # Relative Volume Logic (Simplified)
-            df['vol'] = pd.to_numeric(df.get('volume', 0), errors='coerce')
-            # Assuming you have a way to pull yesterday's data; for now, we surge by vol
-            df['Surge'] = df['vol'] 
-            all_data.append(df)
+        try:
+            s = sym.upper().replace('NSE:', '').replace('-EQ', '')
+            res = fyers.optionchain(data={'symbol': f"NSE:{s}-EQ", 'strikecount': 50, 'expiry': expiry})
+            if res.get('s') == 'ok':
+                data = res.get('data', {}).get('optionsChain') or res.get('data', {}).get('optionschain')
+                if data:
+                    df = pd.DataFrame(data)
+                    df['Underlying'] = sym
+                    current_data.append(df)
+        except Exception:
+            continue
 
-    if all_data:
-        full_df = pd.concat(all_data)
-        # Sort by Primary Volume
-        full_df = full_df.sort_values('vol', ascending=False)
+    if current_data:
+        full_df = pd.concat(current_data)
+        full_df['volume'] = pd.to_numeric(full_df.get('volume', 0), errors='coerce')
+        full_df = full_df.sort_values('volume', ascending=False)
 
-        # Rank Long (CE/Price UP) vs Short (PE/Price DOWN)
-        # Using simple heuristic: CE vol vs PE vol
         longs = full_df[full_df['optionType'] == 'CE'].head(15)
         shorts = full_df[full_df['optionType'] == 'PE'].head(15)
 
         longs.to_csv('top_15_longs.csv', index=False)
         shorts.to_csv('top_15_shorts.csv', index=False)
-        logger.info("Iteration complete. Top 15 candidates saved.")
+        logger.info("Top 15 candidates calculated and saved.")
 
 if __name__ == '__main__':
-    process_iteration()
+    run_standalone_scanner()
