@@ -1,59 +1,31 @@
 import sys
 import subprocess
 import os
-import site
 import logging
-from datetime import datetime, timedelta, time
-from typing import List, Dict, Optional, Tuple
+from datetime import datetime
 
-# Install deps
-subprocess.check_call([sys.executable, "-m", "pip", "install", "fyers-apiv3", "pandas", "numpy"])
+# 1. Ensure Dependencies
+def install_requirements():
+    try:
+        import fyersapiv3
+        import pandas
+        import numpy
+    except ImportError:
+        subprocess.check_call([sys.executable, "-m", "pip", "install", "fyers-apiv3", "pandas", "numpy"])
 
-# Path fixes
-for site_package in site.getsitepackages():
-    if site_package not in sys.path:
-        sys.path.append(site_package)
+install_requirements()
 
-# Import Fyers
-try:
-    from fyersapiv3 import fyersModel
-except ImportError:
-    from fyers_apiv3 import fyersModel
-
+# 2. Imports
+from fyersapiv3 import fyersModel
 import pandas as pd
 import numpy as np
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
+import logging
 
-# Setup Logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+# 3. Simple Logging
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger()
 
-def format(self, record):
-        msg = record.getMessage()
-        record.msg = msg.encode("ascii", "ignore").decode("ascii")
-        return super().format(record)
 
-
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-if logger.hasHandlers():
-    logger.handlers.clear()
-ch = logging.StreamHandler(sys.stdout)
-ch.setLevel(logging.INFO)
-formatter = UTF8Formatter(
-    "%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-)
-ch.setFormatter(formatter)
-logger.addHandler(ch)
-
-DAILY_LOOKBACK_DAYS = 60
-INTRADAY_LOOKBACK_DAYS = 20
-IVP_LOOKBACK_DAYS = 252
-INDEX_SOFT_BOOST_WEIGHT = 0.25
 
 fyers: Optional[fyersModel.FyersModel] = None
 
