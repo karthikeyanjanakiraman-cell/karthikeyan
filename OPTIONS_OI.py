@@ -4,49 +4,25 @@ import re
 import logging
 import pandas as pd
 import numpy as np
+import smtplib
 from datetime import datetime, timedelta, time
 from typing import List, Dict, Optional, Tuple
-from fyers_apiv3 import fyersModel
-import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 
-# Logging
+try:
+    from fyers_apiv3 import fyersModel
+except ImportError:
+    from fyersapiv3 import fyersModel
+
+# Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger()
 
-# Globals
+# Global
 fyers = None
-
-# --- ESSENTIAL HELPERS ---
-def init_fyers():
-    global fyers
-    try:
-        # Assuming you have logic in here to initialize fyers, 
-        # I'll include a placeholder or try to extract your existing logic.
-                global fyers
-    try:
-            client_id = os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID")
-            access_token = os.environ.get("ACCESS_TOKEN") or os.environ.get("ACCESSTOKEN")
-            if not client_id or not access_token:
-                logger.warning("INIT Missing Fyers credentials.")
-                fyers = None
-                return
-            fyers = fyersModel.FyersModel(
-                client_id=client_id, is_async=False, token=access_token, log_path=""
-            )
-            logger.info("INIT FyersModel initialized successfully.")
-        except Exception as e:
-            logger.warning(f"INIT Failed: {e}")
-            fyers = None
-    
-    
-    except Exception as e:
-        logger.error(f"init_fyers failed: {e}")
-
-# (I will extract init_fyers body from the user file properly)
 
 DAILY_LOOKBACK_DAYS = 60
 INTRADAY_LOOKBACK_DAYS = 20
@@ -69,7 +45,25 @@ EMAIL_DISPLAY_COLS = [
 ]
 
 
- load_fno_symbols_from_sectors(root_dir: str = "sectors") -> List[str]:
+def init_fyers():
+    global fyers
+    try:
+        client_id = os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID")
+        access_token = os.environ.get("ACCESS_TOKEN") or os.environ.get("ACCESSTOKEN")
+        if not client_id or not access_token:
+            logger.warning("INIT Missing Fyers credentials.")
+            fyers = None
+            return
+        fyers = fyersModel.FyersModel(
+            client_id=client_id, is_async=False, token=access_token, log_path=""
+        )
+        logger.info("INIT FyersModel initialized successfully.")
+    except Exception as e:
+        logger.warning(f"INIT Failed: {e}")
+        fyers = None
+
+
+def load_fno_symbols_from_sectors(root_dir: str = "sectors") -> List[str]:
     symbols = set()
     if not os.path.isdir(root_dir):
         return []
