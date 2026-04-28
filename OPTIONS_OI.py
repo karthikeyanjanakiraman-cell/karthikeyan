@@ -35,44 +35,6 @@ ch.setFormatter(formatter)
 logger.addHandler(ch)
 
 DAILY_LOOKBACK_DAYS = 60
-
-
-def scan_options_logic(long_symbols, short_symbols):
-    """Fetches Fyers Option Chain and logs ATM/Near-ATM Strike OI with robust key handling."""
-    global fyers
-    logger.info("=== STARTING REAL OPTIONS OI SCAN ===")
-    if fyers is None:
-        logger.error("Fyers client not initialized!")
-        return
-
-    all_syms = list(set(long_symbols + short_symbols))
-    for s in all_syms[:5]:
-        try:
-            fyers_symbol = f"NSE:{s}-EQ"
-            # Getting full chain for index/stock
-            data = {"symbol": fyers_symbol, "strikecount": 5}
-            res = fyers.optionchain(data=data)
-
-            if res and res.get("s") == "ok":
-                # Fyers V3 data is typically in res['data']['optionsChain']
-                data_obj = res.get("data", {})
-                chain = data_obj.get("optionsChain", [])
-                logger.info(f"Processing {len(chain)} contracts for {s}")
-
-                for item in chain:
-                    # Robust key lookup
-                    opt_type = item.get('option_type') or item.get('optionType') or 'N/A'
-                    # Fyers usually uses 'strikePrice' or 'strike'
-                    strike = item.get('strikePrice') or item.get('strike') or item.get('strike_price') or 'N/A'
-                    oi = item.get('oi') or item.get('open_interest') or item.get('openInterest') or 0
-
-                    logger.info(f"  [{opt_type}] Strike: {strike} | OI: {oi}")
-            else:
-                logger.warning(f"Could not fetch/parse OI for {s}")
-        except Exception as e:
-            logger.error(f"Error fetching OI for {s}: {e}")
-    logger.info("=== REAL OPTIONS SCAN COMPLETE ===")
-
 INTRADAY_LOOKBACK_DAYS = 20
 IVP_LOOKBACK_DAYS = 252
 INDEX_SOFT_BOOST_WEIGHT = 0.25
