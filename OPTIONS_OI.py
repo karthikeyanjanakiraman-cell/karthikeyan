@@ -29,6 +29,6 @@ def fetch_data_direct(symbol, expiry):
         return {"error": str(e)}
 
 if __name__ == "__main__":
-    # Test for a common symbol to verify connectivity
-    res = fetch_data_direct("RELIANCE", os.getenv('ACTIVE_EXPIRY', '2026-04-28'))
+    # Test for a common symbol to verify 
+    res = fyers.optionchain({'symbol': f"NSE:{s}-EQ", 'strikecount': 50, 'expiry': expiry})
     print(json.dumps(res, indent=2))
