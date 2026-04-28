@@ -2,11 +2,10 @@ import os
 import re
 import sys
 import logging
-from datetime import datetime, timedelta
-import datetime as dt_lib
 import time
+import datetime as dt_lib
+from datetime import datetime, timedelta
 from typing import List, Dict, Optional, Tuple
-
 import numpy as np
 import pandas as pd
 from fyers_apiv3 import fyersModel
@@ -574,7 +573,7 @@ def compute_iteration_volume_profile(
         rvol20 = cum_vol / avg_cum_20 if avg_cum_20 > 0 else 0
 
         dt_time = dt_lib.datetime.combine(current_date, t)
-        market_open = datetime.combine(current_date, dt_lib.time(9, 15))
+        market_open = dt_lib.datetime.combine(current_date, dt_lib.time(9, 15))
         iter_mins = int((dt_time - market_open).total_seconds() / 60)
 
         rows.append(
@@ -1590,3 +1589,39 @@ def main_index_first():
 
 if __name__ == '__main__':
     main_index_first()
+
+ATM_STRIKE_RANGE = int(os.environ.get("ATM_STRIKE_RANGE", 3))
+OPTION_STRIKE_STEP = int(os.environ.get("OPTION_STRIKE_STEP", 50))
+ACTIVE_EXPIRY = os.environ.get("ACTIVE_EXPIRY", "2026-04-30")
+
+def get_option_chain_for_symbol(symbol: str) -> pd.DataFrame:
+    if not fyers: return pd.DataFrame()
+    try:
+        d = datetime.strptime(ACTIVE_EXPIRY, "%Y-%m-%d")
+        exp_str = d.strftime("%Y%m%d")
+        fyers_sym = format_fyers_symbol(symbol)
+        df_hist = get_fyers_history(fyers_sym, "5", 1)
+        ltp = float(df_hist['close'].iloc[-1]) if df_hist is not None and not df_hist.empty else 0
+        atm = round(ltp / OPTION_STRIKE_STEP) * OPTION_STRIKE_STEP
+        strikes = []
+        sym_clean = symbol.replace('NSE:', '').replace('-EQ', '')
+        for offset in range(-ATM_STRIKE_RANGE, ATM_STRIKE_RANGE + 1):
+            strike = atm + offset * OPTION_STRIKE_STEP
+            for type_ in ["CE", "PE"]:
+                time.sleep(0.3)
+                sym_str = f"NSE:{sym_clean}-{exp_str}-{strike}-{type_}"
+                quote = fyers.quotes({"symbols": sym_str})
+                if quote.get('s') == 'ok' and 'd' in quote and isinstance(quote['d'], list) and len(quote['d']) > 0:
+                    val = quote['d'][0].get('v', {})
+                    strikes.append({
+                        "Symbol": sym_str, "Underlying": symbol, "Strike": strike, 
+                        "Type": type_, "LTP": val.get('lp', 0), "OI": val.get('oi', 0)
+                    })
+        return pd.DataFrame(strikes)
+    except Exception as e:
+        logger.error(f"Error for {symbol}: {e}")
+        return pd.DataFrame()
+
+def scan_options_for_top_symbols(top_symbols: List[str]) -> pd.DataFrame:
+    opt_rows = [get_option_chain_for_symbol(sym) for sym in top_symbols]
+    return pd.concat(opt_rows, ignore_index=True) if opt_rows else pd.DataFrame()
