@@ -4,25 +4,97 @@ import re
 import logging
 import pandas as pd
 import numpy as np
-import smtplib
 from datetime import datetime, timedelta, time
 from typing import List, Dict, Optional, Tuple
+from fyers_apiv3 import fyersModel
+import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 
-try:
-    from fyers_apiv3 import fyersModel
-except ImportError:
-    from fyersapiv3 import fyersModel
-
-# Setup logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger()
-
-# Global
 fyers = None
+
+
+def scan_options_logic(long_symbols, short_symbols):
+    logger.info(">>> STARTING FORCED OPTIONS SCAN <<<")
+    try:
+        all_syms = long_symbols + short_symbols
+        for s in all_syms:
+            logger.info(f"Scanning options for {s}")
+            # Placeholder for your Fyers API call logic
+    except Exception as e:
+        logger.error(f"Scan Error: {e}")
+    logger.info(">>> OPTIONS SCAN COMPLETE <<<")
+
+
+def discover_csv_files() -> list:
+    csvs = []
+    for base in ['.', 'sectors']:
+        if os.path.isdir(base):
+            for dirpath, _, filenames in os.walk(base):
+                for fname in filenames:
+                    if fname.lower().endswith('.csv'):
+                        csvs.append(os.path.join(dirpath, fname))
+    return sorted(set(csvs))
+
+
+
+def init_fyers():
+    global fyers
+    try:
+        client_id = os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID")
+        access_token = os.environ.get("ACCESS_TOKEN") or os.environ.get("ACCESSTOKEN")
+        if not client_id or not access_token:
+            logger.warning("INIT Missing Fyers credentials.")
+            fyers = None
+            return
+        fyers = fyersModel.FyersModel(
+            client_id=client_id, is_async=False, token=access_token, log_path=""
+        )
+        logger.info("INIT FyersModel initialized successfully.")
+    except Exception as e:
+        logger.warning(f"INIT Failed: {e}")
+        fyers = None
+
+
+import os
+import re
+import sys
+import logging
+from datetime import datetime, timedelta, time
+from typing import List, Dict, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+from fyers_apiv3 import fyersModel
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.base import MIMEBase
+from email import encoders
+
+
+class UTF8Formatter(logging.Formatter):
+    def format(self, record):
+        msg = record.getMessage()
+        record.msg = msg.encode("ascii", "ignore").decode("ascii")
+        return super().format(record)
+
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+if logger.hasHandlers():
+    logger.handlers.clear()
+ch = logging.StreamHandler(sys.stdout)
+ch.setLevel(logging.INFO)
+formatter = UTF8Formatter(
+    "%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
+)
+ch.setFormatter(formatter)
+logger.addHandler(ch)
 
 DAILY_LOOKBACK_DAYS = 60
 INTRADAY_LOOKBACK_DAYS = 20
@@ -44,23 +116,6 @@ EMAIL_DISPLAY_COLS = [
     "Volatility State", "Last Iteration Time",
 ]
 
-
-def init_fyers():
-    global fyers
-    try:
-        client_id = os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID")
-        access_token = os.environ.get("ACCESS_TOKEN") or os.environ.get("ACCESSTOKEN")
-        if not client_id or not access_token:
-            logger.warning("INIT Missing Fyers credentials.")
-            fyers = None
-            return
-        fyers = fyersModel.FyersModel(
-            client_id=client_id, is_async=False, token=access_token, log_path=""
-        )
-        logger.info("INIT FyersModel initialized successfully.")
-    except Exception as e:
-        logger.warning(f"INIT Failed: {e}")
-        fyers = None
 
 
 def load_fno_symbols_from_sectors(root_dir: str = "sectors") -> List[str]:
@@ -1153,16 +1208,6 @@ def format_fyers_index_symbol(symbol: str) -> str:
     return mapped if mapped.startswith('NSE:') else f'NSE:{mapped}'
 
 
-def discover_csv_files() -> list:
-    csvs = []
-    for base in ['.', 'sectors']:
-        if os.path.isdir(base):
-            for dirpath, _, filenames in os.walk(base):
-                for fname in filenames:
-                    if fname.lower().endswith('.csv'):
-                        csvs.append(os.path.join(dirpath, fname))
-    return sorted(set(csvs))
-
 
 def load_index_symbols() -> List[str]:
     csv_files = discover_csv_files()
@@ -1582,14 +1627,3 @@ def main_index_first():
 if __name__ == '__main__':
     main_index_first()
 
-
-def scan_options_logic(long_symbols, short_symbols):
-    logger.info(">>> STARTING FORCED OPTIONS SCAN <<<")
-    try:
-        all_syms = long_symbols + short_symbols
-        for s in all_syms:
-            logger.info(f"Scanning options for {s}")
-            # Placeholder for your Fyers API call logic
-    except Exception as e:
-        logger.error(f"Scan Error: {e}")
-    logger.info(">>> OPTIONS SCAN COMPLETE <<<")
