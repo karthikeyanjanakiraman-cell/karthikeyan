@@ -26,7 +26,9 @@ DAILY_LOOKBACK_DAYS = 90
 INTRADAY_LOOKBACK_DAYS = 20
 IVP_LOOKBACK_DAYS = 252
 OPTION_PAIRS_TO_KEEP = 5
-SIGNAL_WINDOW_MINUTES = 15  # configurable: 5, 15, 30, 60
+SIGNAL_WINDOW_MINUTES = 5  # configurable: 5, 15, 30, 60
+ITERATIONS_TO_KEEP = 75
+ITERATION_INTERVAL_MINUTES = 5
 SECTORS_DIR = os.environ.get("SECTORS_DIR", "sectors")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 
@@ -293,6 +295,42 @@ def compare_window_signal(current_score: float, previous_score: float) -> Tuple[
     if delta <= -0.05:
         return delta, "Sell"
     return delta, "Neutral"
+def build_iteration_history(df: pd.DataFrame, window_minutes: int = None, iterations: int = None) -> pd.DataFrame:
+    if window_minutes is None:
+        window_minutes = SIGNAL_WINDOW_MINUTES
+    if iterations is None:
+        iterations = ITERATIONS_TO_KEEP
+    if df is None or df.empty:
+        return pd.DataFrame()
+    d = df.copy().sort_values("timestamp").reset_index(drop=True)
+    rows = []
+    for i in range(len(d)):
+        end_ts = pd.to_datetime(d.loc[i, "timestamp"])
+        start_ts = end_ts - timedelta(minutes=window_minutes)
+        cur = d[(d["timestamp"] > start_ts) & (d["timestamp"] <= end_ts)]
+        if cur.empty or len(cur) < 2:
+            continue
+        first_close = safe_float(cur["close"].iloc[0])
+        last_close = safe_float(cur["close"].iloc[-1])
+        if pd.isna(first_close) or first_close == 0:
+            continue
+        current_score = round(((last_close - first_close) / first_close) * 100.0, 2)
+        prev_score = previous_same_time_score(d.iloc[: i + 1].copy(), window_minutes)
+        delta, signal = compare_window_signal(current_score, prev_score)
+        rows.append({
+            "timestamp": end_ts,
+            "window_minutes": window_minutes,
+            "current_window_score": current_score,
+            "previous_same_time_score": prev_score,
+            "window_delta": delta,
+            "window_signal": signal,
+            "close": last_close,
+        })
+    out = pd.DataFrame(rows)
+    if out.empty:
+        return out
+    return out.tail(iterations).reset_index(drop=True)
+
 
 def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Dict[str, object]:
     if intra_df is None or intra_df.empty:
@@ -354,6 +392,7 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
     current_win = intraday_window_score(df)
     previous_win = previous_same_time_score(df)
     win_delta, win_signal = compare_window_signal(current_win, previous_win)
+    iteration_history = build_iteration_history(df)
 
     bull = 0
     bear = 0
