@@ -651,12 +651,11 @@ def format_cell(col: str, val) -> str:
         return f"{float(val):.2f}"
     return str(val)
 
-
 def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html = [f"<div class='card'><h3>{title}</h3>"]
     if df is None or df.empty:
         html.append("<p class='muted'>No data found.</p></div>")
-        return
+        return "
 ".join(html)
     view = df[[c for c in columns if c in df.columns]].copy()
     html.append("<div class='table-wrap'><table><thead><tr>" + "".join([f"<th>{c}</th>" for c in view.columns]) + "</tr></thead><tbody>")
@@ -665,6 +664,7 @@ def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html.append("</tbody></table></div></div>")
     return "
 ".join(html)
+
 
 
 def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFrame, pe_df: pd.DataFrame, attachments: List[str]) -> bool:
