@@ -296,7 +296,6 @@ def compare_window_signal(current_score: float, previous_score: float) -> Tuple[
         return delta, "Sell"
     return delta, "Neutral"
 
-
 def build_iteration_history(df: pd.DataFrame, window_minutes: int = None, iterations: int = None) -> pd.DataFrame:
     if window_minutes is None:
         window_minutes = SIGNAL_WINDOW_MINUTES
@@ -309,7 +308,7 @@ def build_iteration_history(df: pd.DataFrame, window_minutes: int = None, iterat
     for i in range(len(d)):
         end_ts = pd.to_datetime(d.loc[i, "timestamp"])
         start_ts = end_ts - timedelta(minutes=window_minutes)
-        cur = d[(d["timestamp"] > start_ts) & (d["timestamp"] <= end_ts)]
+        cur = d[(d["timestamp"] >= start_ts) & (d["timestamp"] <= end_ts)]
         if cur.empty or len(cur) < 2:
             continue
         first_close = safe_float(cur["close"].iloc[0])
@@ -320,9 +319,11 @@ def build_iteration_history(df: pd.DataFrame, window_minutes: int = None, iterat
         prev_score = previous_same_time_score(d.iloc[: i + 1].copy(), window_minutes)
         delta, signal = compare_window_signal(current_score, prev_score)
         rows.append({
+            "iteration": len(rows) + 1,
             "timestamp": end_ts,
-            "iteration_no": len(rows) + 1,
             "window_minutes": window_minutes,
+            "window_start": start_ts,
+            "window_end": end_ts,
             "current_window_score": current_score,
             "previous_same_time_score": prev_score,
             "window_delta": delta,
@@ -332,9 +333,7 @@ def build_iteration_history(df: pd.DataFrame, window_minutes: int = None, iterat
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    out = out.tail(iterations).reset_index(drop=True)
-    out["iteration_no"] = range(1, len(out) + 1)
-    return out
+    return out.tail(iterations).reset_index(drop=True)
 
 
 def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Dict[str, object]:
@@ -455,7 +454,7 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
     }
 
 
-def choose_top_candidates(summary_df: pd.DataFrame, top_n: int = 10) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def choose_top_candidates(summary_df: pd.DataFrame, top_n: int = 100) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if summary_df is None or summary_df.empty:
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     base = summary_df.copy()
