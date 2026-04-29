@@ -26,51 +26,22 @@ DAILY_LOOKBACK_DAYS = 90
 INTRADAY_LOOKBACK_DAYS = 20
 IVP_LOOKBACK_DAYS = 252
 OPTION_PAIRS_TO_KEEP = 5
-SIGNAL_WINDOW_MINUTES = 5  # configurable: 5, 15, 30, 60
+SIGNAL_WINDOW_MINUTES = 5
 ITERATIONS_TO_KEEP = 75
 ITERATION_INTERVAL_MINUTES = 5
 SECTORS_DIR = os.environ.get("SECTORS_DIR", "sectors")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 
 EMAIL_DISPLAY_COLS = [
-    "Symbol",
-    "LTP",
-    "% Change",
-    "5m_Signal",
-    "15m_Signal",
-    "30m_Signal",
-    "60m_Signal",
-    "Bull_Signal",
-    "Bear_Signal",
-    "Overall_Signal",
-    "Price_Lead_Status",
-    "IVP",
-    "Volatility State",
-    "Last Iteration Time",
+    "Symbol", "LTP", "% Change", "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
+    "Bull_Signal", "Bear_Signal", "Overall_Signal", "Price_Lead_Status", "IVP",
+    "Volatility State", "Last Iteration Time",
 ]
 
 OPTION_EMAIL_COLS = [
-    "Underlying",
-    "Option Type",
-    "Option Symbol",
-    "Strike",
-    "LTP",
-    "% Change",
-    "OI",
-    "Volume",
-    "OBV",
-    "OI+Volume+OBV Score",
-    "5m_Signal",
-    "15m_Signal",
-    "30m_Signal",
-    "60m_Signal",
-    "Bull_Signal",
-    "Bear_Signal",
-    "Overall_Signal",
-    "Price_Lead_Status",
-    "IVP",
-    "Volatility State",
-    "Last Iteration Time",
+    "Underlying", "Option Type", "Option Symbol", "Strike", "LTP", "% Change", "OI", "Volume", "OBV",
+    "OI+Volume+OBV Score", "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal", "Bull_Signal",
+    "Bear_Signal", "Overall_Signal", "Price_Lead_Status", "IVP", "Volatility State", "Last Iteration Time",
 ]
 
 fyers = None
@@ -250,25 +221,18 @@ def previous_same_time_score(df: pd.DataFrame, window_minutes: int = None) -> fl
         return np.nan
     d = df.copy().sort_values("timestamp").reset_index(drop=True)
     end_ts = pd.to_datetime(d["timestamp"].iloc[-1])
-    cur_start = end_ts - timedelta(minutes=window_minutes)
-
-    # Find previous trading day data (before today 9:15 AM)
     today_start = end_ts.replace(hour=9, minute=15, second=0, microsecond=0)
     prev_data = d[d["timestamp"] < today_start].copy()
     if prev_data.empty:
         return np.nan
-
-    # Match same time-of-day window in previous session
     cur_hour, cur_minute = end_ts.hour, end_ts.minute
     prev_data["time_score"] = abs(prev_data["timestamp"].dt.hour - cur_hour) * 60 + abs(prev_data["timestamp"].dt.minute - cur_minute)
     best_idx = prev_data["time_score"].idxmin()
     if pd.isna(best_idx):
         return np.nan
-
     prev_end = pd.to_datetime(prev_data.loc[best_idx, "timestamp"])
     prev_start = prev_end - timedelta(minutes=window_minutes)
     prev_window = prev_data[(prev_data["timestamp"] >= prev_start) & (prev_data["timestamp"] <= prev_end)]
-
     if prev_window.empty or len(prev_window) < 2:
         return np.nan
     first_close = safe_float(prev_window["close"].iloc[0])
@@ -295,6 +259,8 @@ def compare_window_signal(current_score: float, previous_score: float) -> Tuple[
     if delta <= -0.05:
         return delta, "Sell"
     return delta, "Neutral"
+
+
 def build_iteration_history(df: pd.DataFrame, window_minutes: int = None, iterations: int = None) -> pd.DataFrame:
     if window_minutes is None:
         window_minutes = SIGNAL_WINDOW_MINUTES
@@ -392,7 +358,7 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
     current_win = intraday_window_score(df)
     previous_win = previous_same_time_score(df)
     win_delta, win_signal = compare_window_signal(current_win, previous_win)
-    iteration_history = build_iteration_history(df)
+    _iteration_history = build_iteration_history(df)
 
     bull = 0
     bear = 0
@@ -415,7 +381,6 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
         bull += 1
     if safe_float(rsi.iloc[-1], 50) <= 45:
         bear += 1
-
     if win_signal.startswith("Buy"):
         bull += 2
     elif win_signal.startswith("Sell"):
@@ -449,16 +414,15 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
         "VWAP Z-Score": round(safe_float(vwap_z.iloc[-1], 0.0), 2),
     }
 
+
 def choose_top_candidates(summary_df: pd.DataFrame, top_n: int = 10) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if summary_df is None or summary_df.empty:
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     base = summary_df.copy()
     long_df = base[pd.to_numeric(base["Rank Delta"], errors="coerce") > 0].copy()
     short_df = base[pd.to_numeric(base["Rank Delta"], errors="coerce") < 0].copy()
-
     long_df = long_df.sort_values(["Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False]).head(top_n)
     short_df = short_df.sort_values(["Rank Delta", "Cumulative ADX", "% Change"], ascending=[True, False, True]).head(top_n)
-
     keep_cols = [c for c in EMAIL_DISPLAY_COLS if c in base.columns]
     return long_df[keep_cols].reset_index(drop=True), short_df[keep_cols].reset_index(drop=True)
 
@@ -521,33 +485,17 @@ def fetch_underlying_quote(symbol: str) -> float:
 
 def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> pd.DataFrame:
     if fyers is None:
-        return pd.DataFrame(columns=[
-            "Underlying", "Underlying LTP", "ATM Strike", "Strike",
-            "CE Symbol", "CE LTP", "CE OI", "CE Volume",
-            "PE Symbol", "PE LTP", "PE OI", "PE Volume"
-        ])
-
+        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "CE OI", "CE Volume", "PE Symbol", "PE LTP", "PE OI", "PE Volume"])
     eq_symbol = format_eq_symbol(symbol)
     ltp = fetch_underlying_quote(symbol)
-
     try:
         chain_res = fyers.optionchain(data={"symbol": eq_symbol, "strikecount": 50})
     except Exception as exc:
         logger.warning("Option chain failed for %s: %s", symbol, exc)
-        return pd.DataFrame(columns=[
-            "Underlying", "Underlying LTP", "ATM Strike", "Strike",
-            "CE Symbol", "CE LTP", "CE OI", "CE Volume",
-            "PE Symbol", "PE LTP", "PE OI", "PE Volume"
-        ])
-
+        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "CE OI", "CE Volume", "PE Symbol", "PE LTP", "PE OI", "PE Volume"])
     chain = ((chain_res or {}).get("data") or {}).get("optionsChain", [])
     if not chain:
-        return pd.DataFrame(columns=[
-            "Underlying", "Underlying LTP", "ATM Strike", "Strike",
-            "CE Symbol", "CE LTP", "CE OI", "CE Volume",
-            "PE Symbol", "PE LTP", "PE OI", "PE Volume"
-        ])
-
+        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "CE OI", "CE Volume", "PE Symbol", "PE LTP", "PE OI", "PE Volume"])
     rows = []
     for item in chain:
         strike = strike_of(item)
@@ -562,20 +510,13 @@ def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> p
             "OI": safe_float(item.get("oi", item.get("open_interest", np.nan)), np.nan),
             "Volume": safe_float(item.get("volume", np.nan), np.nan),
         })
-
     if not rows:
-        return pd.DataFrame(columns=[
-            "Underlying", "Underlying LTP", "ATM Strike", "Strike",
-            "CE Symbol", "CE LTP", "CE OI", "CE Volume",
-            "PE Symbol", "PE LTP", "PE OI", "PE Volume"
-        ])
-
+        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "CE OI", "CE Volume", "PE Symbol", "PE LTP", "PE OI", "PE Volume"])
     oc = pd.DataFrame(rows)
     step = nearest_step(ltp if pd.notna(ltp) else oc["Strike"].median())
     atm = round(ltp / step) * step if pd.notna(ltp) else oc["Strike"].median()
     strikes = sorted(oc["Strike"].dropna().unique(), key=lambda x: abs(x - atm))[:pair_count]
     strikes = sorted(strikes)
-
     final_rows = []
     for strike in strikes:
         sub = oc[oc["Strike"] == strike]
@@ -614,32 +555,14 @@ def scan_single_option(option_symbol: str, option_type: str, strike: float, unde
         return None
     obv_val = compute_obv(intra_df)
     return {
-        "Underlying": underlying,
-        "Option Type": option_type,
-        "Option Symbol": option_symbol,
-        "Strike": strike,
-        "LTP": summary.get("LTP"),
-        "% Change": summary.get("% Change"),
-        "5m_Signal": summary.get("5m_Signal"),
-        "15m_Signal": summary.get("15m_Signal"),
-        "30m_Signal": summary.get("30m_Signal"),
-        "60m_Signal": summary.get("60m_Signal"),
-        "Bull_Signal": summary.get("Bull_Signal"),
-        "Bear_Signal": summary.get("Bear_Signal"),
-        "Overall_Signal": summary.get("Overall_Signal"),
-        "Price_Lead_Status": summary.get("Price_Lead_Status"),
-        "IVP": summary.get("IVP"),
-        "Volatility State": summary.get("Volatility State"),
-        "Last Iteration Time": summary.get("Last Iteration Time"),
-        "Bull Rank": summary.get("Bull Rank"),
-        "Bear Rank": summary.get("Bear Rank"),
-        "Rank Delta": summary.get("Rank Delta"),
-        "Cumulative +DI": summary.get("Cumulative +DI"),
-        "Cumulative -DI": summary.get("Cumulative -DI"),
-        "Cumulative ADX": summary.get("Cumulative ADX"),
-        "Cumulative RSI": summary.get("Cumulative RSI"),
-        "VWAP Z-Score": summary.get("VWAP Z-Score"),
-        "OBV": obv_val,
+        "Underlying": underlying, "Option Type": option_type, "Option Symbol": option_symbol, "Strike": strike,
+        "LTP": summary.get("LTP"), "% Change": summary.get("% Change"), "5m_Signal": summary.get("5m_Signal"),
+        "15m_Signal": summary.get("15m_Signal"), "30m_Signal": summary.get("30m_Signal"), "60m_Signal": summary.get("60m_Signal"),
+        "Bull_Signal": summary.get("Bull_Signal"), "Bear_Signal": summary.get("Bear_Signal"), "Overall_Signal": summary.get("Overall_Signal"),
+        "Price_Lead_Status": summary.get("Price_Lead_Status"), "IVP": summary.get("IVP"), "Volatility State": summary.get("Volatility State"),
+        "Last Iteration Time": summary.get("Last Iteration Time"), "Bull Rank": summary.get("Bull Rank"), "Bear Rank": summary.get("Bear Rank"),
+        "Rank Delta": summary.get("Rank Delta"), "Cumulative +DI": summary.get("Cumulative +DI"), "Cumulative -DI": summary.get("Cumulative -DI"),
+        "Cumulative ADX": summary.get("Cumulative ADX"), "Cumulative RSI": summary.get("Cumulative RSI"), "VWAP Z-Score": summary.get("VWAP Z-Score"), "OBV": obv_val,
     }
 
 
@@ -647,23 +570,12 @@ def option_liquidity_score(oi, volume, obv) -> float:
     oi = safe_float(oi, 0.0)
     volume = safe_float(volume, 0.0)
     obv = abs(safe_float(obv, 0.0))
-    return round(
-        (np.log1p(max(oi, 0.0)) * 0.45) +
-        (np.log1p(max(volume, 0.0)) * 0.35) +
-        (np.log1p(max(obv, 0.0)) * 0.20),
-        4
-    )
+    return round((np.log1p(max(oi, 0.0)) * 0.45) + (np.log1p(max(volume, 0.0)) * 0.35) + (np.log1p(max(obv, 0.0)) * 0.20), 4)
 
 
 def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> pd.DataFrame:
-    """
-    Scans BOTH CE and PE for every candidate symbol.
-    Long = option contract price rising (Rank Delta > 0), can be CE or PE.
-    Short = option contract price falling (Rank Delta < 0), can be CE or PE.
-    """
     if candidates_df is None or candidates_df.empty or "Symbol" not in candidates_df.columns:
         return pd.DataFrame(columns=OPTION_EMAIL_COLS)
-
     rows = []
     for underlying in candidates_df["Symbol"].dropna().astype(str):
         pair_df = fetch_option_pairs(underlying)
@@ -677,36 +589,19 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> pd.DataFr
                     continue
                 scanned = scan_single_option(option_symbol, opt_type, strike, underlying)
                 if scanned:
-                    scanned["OI+Volume+OBV Score"] = option_liquidity_score(
-                        scanned.get("OI"),
-                        scanned.get("Volume"),
-                        scanned.get("OBV")
-                    )
+                    scanned["OI+Volume+OBV Score"] = option_liquidity_score(scanned.get("OI"), scanned.get("Volume"), scanned.get("OBV"))
                     rows.append(scanned)
-
     if not rows:
         return pd.DataFrame(columns=OPTION_EMAIL_COLS)
-
     out = pd.DataFrame(rows)
-    out["OI+Volume+OBV Score"] = out.apply(
-        lambda r: option_liquidity_score(r.get("OI"), r.get("Volume"), r.get("OBV")),
-        axis=1
-    )
+    out["OI+Volume+OBV Score"] = out.apply(lambda r: option_liquidity_score(r.get("OI"), r.get("Volume"), r.get("OBV")), axis=1)
     rank_delta = pd.to_numeric(out["Rank Delta"], errors="coerce")
-
     if str(side).lower() == "long":
         out = out[rank_delta > 0].copy()
-        out = out.sort_values(
-            ["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"],
-            ascending=[False, False, False, False]
-        )
+        out = out.sort_values(["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False, False])
     else:
         out = out[rank_delta < 0].copy()
-        out = out.sort_values(
-            ["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"],
-            ascending=[False, True, False, True]
-        )
-
+        out = out.sort_values(["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, True, False, True])
     keep_cols = [c for c in OPTION_EMAIL_COLS if c in out.columns]
     return out[keep_cols].reset_index(drop=True)
 
@@ -722,16 +617,15 @@ def format_cell(col: str, val) -> str:
 
 
 def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
-    html = [f"<h3>{title}</h3>"]
+    html = [f"<div class='card'><h3>{title}</h3>"]
     if df is None or df.empty:
-        html.append("<p>No data found.</p>")
+        html.append("<p class='muted'>No data found.</p></div>")
         return "\n".join(html)
     view = df[[c for c in columns if c in df.columns]].copy()
-    html.append("<table border='1' cellspacing='0' cellpadding='6' style='border-collapse:collapse;font-family:Arial,sans-serif;font-size:12px;'>")
-    html.append("<tr>" + "".join([f"<th style='background:#f2f2f2'>{c}</th>" for c in view.columns]) + "</tr>")
+    html.append("<div class='table-wrap'><table><thead><tr>" + "".join([f"<th>{c}</th>" for c in view.columns]) + "</tr></thead><tbody>")
     for _, row in view.iterrows():
         html.append("<tr>" + "".join([f"<td>{format_cell(c, row[c])}</td>" for c in view.columns]) + "</tr>")
-    html.append("</table>")
+    html.append("</tbody></table></div></div>")
     return "\n".join(html)
 
 
@@ -741,7 +635,6 @@ def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFram
     sender_email = os.environ.get("SENDER_EMAIL")
     sender_password = os.environ.get("SENDER_PASSWORD")
     recipient_email = os.environ.get("RECIPIENT_EMAIL")
-
     if not sender_email or not sender_password or not recipient_email:
         logger.warning("Email env vars missing. Skipping email.")
         return False
@@ -749,27 +642,47 @@ def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFram
     scan_time = datetime.now().strftime("%d %b %Y, %H:%M")
     html = f"""
     <html>
+    <head>
+    <style>
+      body {{ background:#0f1115; color:#e5e7eb; font-family:Arial,sans-serif; margin:0; padding:20px; }}
+      .container {{ max-width:1400px; margin:0 auto; }}
+      .header {{ background:linear-gradient(135deg,#111827,#1f2937); padding:18px 20px; border:1px solid #334155; border-radius:14px; margin-bottom:18px; }}
+      h2,h3 {{ margin:0 0 10px 0; color:#f9fafb; }}
+      p {{ color:#cbd5e1; }}
+      .muted {{ color:#94a3b8; }}
+      .card {{ background:#111827; border:1px solid #334155; border-radius:14px; padding:16px; margin-bottom:18px; box-shadow:0 10px 30px rgba(0,0,0,.25); }}
+      .table-wrap {{ overflow-x:auto; }}
+      table {{ width:100%; border-collapse:collapse; font-size:12px; min-width:980px; }}
+      th {{ background:#1f2937; color:#f8fafc; text-align:left; padding:10px 8px; border-bottom:1px solid #334155; position:sticky; top:0; }}
+      td {{ padding:9px 8px; border-bottom:1px solid #1f2937; color:#e5e7eb; white-space:nowrap; }}
+      tr:nth-child(even) td {{ background:#0b1220; }}
+      tr:hover td {{ background:#172033; }}
+      .footer {{ margin-top:10px; color:#94a3b8; font-size:12px; }}
+      .pill {{ display:inline-block; padding:4px 10px; border-radius:999px; background:#0b1220; border:1px solid #334155; color:#cbd5e1; margin-right:8px; }}
+    </style>
+    </head>
     <body>
-        <h2>Intraday Vol Iteration Alert</h2>
-        <p>Scan completed at {scan_time}.</p>
+      <div class='container'>
+        <div class='header'>
+          <h2>Intraday Vol Iteration Alert</h2>
+          <p>Scan completed at {scan_time}.</p>
+          <span class='pill'>Rank Delta = Bull Rank - Bear Rank</span>
+          <span class='pill'>OI+Volume+OBV Score = 0.45*log1p(OI) + 0.35*log1p(Volume) + 0.20*log1p(|OBV|)</span>
+        </div>
         {dataframe_to_html(long_df, EMAIL_DISPLAY_COLS, 'Stock Long Candidates')}
-        <br>
         {dataframe_to_html(short_df, EMAIL_DISPLAY_COLS, 'Stock Short Candidates')}
-        <br>
         {dataframe_to_html(ce_df, OPTION_EMAIL_COLS, 'CE Candidates from Long Stocks')}
-        <br>
         {dataframe_to_html(pe_df, OPTION_EMAIL_COLS, 'PE Candidates from Short Stocks')}
-        <p>Attached CSVs: summary, CE candidates, PE candidates.</p>
+        <div class='footer'>Attached CSVs: summary, CE candidates, PE candidates.</div>
+      </div>
     </body>
     </html>
     """
-
     msg = MIMEMultipart()
     msg["From"] = sender_email
     msg["To"] = recipient_email
     msg["Subject"] = f"Intraday Vol Iteration Alert - {datetime.now().strftime('%d %b %H:%M')}"
     msg.attach(MIMEText(html, "html", "utf-8"))
-
     for path in attachments:
         if path and os.path.exists(path):
             with open(path, "rb") as f:
@@ -778,7 +691,6 @@ def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFram
             encoders.encode_base64(part)
             part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(path)}")
             msg.attach(part)
-
     try:
         if smtp_port == 465:
             with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=40) as server:
@@ -786,11 +698,7 @@ def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFram
                 server.send_message(msg)
         else:
             with smtplib.SMTP(smtp_host, smtp_port, timeout=40) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-                server.login(sender_email, sender_password)
-                server.send_message(msg)
+                server.ehlo(); server.starttls(); server.ehlo(); server.login(sender_email, sender_password); server.send_message(msg)
         logger.info("Email sent to %s", recipient_email)
         return True
     except Exception as exc:
@@ -820,11 +728,9 @@ def main() -> None:
     init_fyers()
     if fyers is None:
         raise RuntimeError("Fyers client initialization failed.")
-
     symbols = load_fno_symbols_from_sectors(SECTORS_DIR)
     if not symbols:
         raise FileNotFoundError(f"No F&O symbols found under '{SECTORS_DIR}'.")
-
     logger.info("Loaded %s symbols from sectors folder.", len(symbols))
     rows = []
     for i, symbol in enumerate(symbols, start=1):
@@ -832,32 +738,23 @@ def main() -> None:
         row = scan_symbol(symbol)
         if row:
             rows.append(row)
-
     if not rows:
         raise RuntimeError("No symbols returned usable market data.")
-
     summary_df = pd.DataFrame(rows)
-    ordered_cols = ["Symbol"] + [c for c in EMAIL_DISPLAY_COLS if c != "Symbol"] + [
-        "Bull Rank", "Bear Rank", "Rank Delta", "Cumulative +DI", "Cumulative -DI", "Cumulative ADX", "Cumulative RSI", "VWAP Z-Score"
-    ]
+    ordered_cols = ["Symbol"] + [c for c in EMAIL_DISPLAY_COLS if c != "Symbol"] + ["Bull Rank", "Bear Rank", "Rank Delta", "Cumulative +DI", "Cumulative -DI", "Cumulative ADX", "Cumulative RSI", "VWAP Z-Score"]
     ordered_cols = [c for c in ordered_cols if c in summary_df.columns]
     summary_df = summary_df[ordered_cols].sort_values(["Rank Delta", "% Change"], ascending=[False, False]).reset_index(drop=True)
-
     long_df, short_df = choose_top_candidates(summary_df, top_n=10)
     ce_df = build_option_candidates(long_df, side="long")
     pe_df = build_option_candidates(short_df, side="short")
-
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     summary_csv = os.path.join(OUTPUT_DIR, f"fo_summary_{timestamp}.csv")
     ce_csv = os.path.join(OUTPUT_DIR, f"fo_ce_candidates_{timestamp}.csv")
     pe_csv = os.path.join(OUTPUT_DIR, f"fo_pe_candidates_{timestamp}.csv")
-
     summary_df.to_csv(summary_csv, index=False)
     ce_df.to_csv(ce_csv, index=False)
     pe_df.to_csv(pe_csv, index=False)
-
     send_email(long_df, short_df, ce_df, pe_df, [summary_csv, ce_csv, pe_csv])
-
     logger.info("Completed.")
     logger.info("Summary CSV: %s", summary_csv)
     logger.info("CE candidates CSV: %s", ce_csv)
