@@ -656,7 +656,7 @@ def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html = [f"<div class='card'><h3>{title}</h3>"]
     if df is None or df.empty:
         html.append("<p class='muted'>No data found.</p></div>")
-        return "
+        return
 ".join(html)
     view = df[[c for c in columns if c in df.columns]].copy()
     html.append("<div class='table-wrap'><table><thead><tr>" + "".join([f"<th>{c}</th>" for c in view.columns]) + "</tr></thead><tbody>")
