@@ -521,17 +521,29 @@ def fetch_underlying_quote(symbol: str) -> float:
 
 def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> pd.DataFrame:
     if fyers is None:
-        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "CE OI", "CE Volume", "PE Symbol", "PE LTP", "PE OI", "PE Volume"])
+        return pd.DataFrame(columns=[
+            "Underlying", "Underlying LTP", "ATM Strike", "Strike",
+            "CE Symbol", "CE LTP", "CE OI", "CE Volume",
+            "PE Symbol", "PE LTP", "PE OI", "PE Volume",
+        ])
     eq_symbol = format_eq_symbol(symbol)
     ltp = fetch_underlying_quote(symbol)
     try:
         chain_res = fyers.optionchain(data={"symbol": eq_symbol, "strikecount": 50})
     except Exception as exc:
         logger.warning("Option chain failed for %s: %s", symbol, exc)
-        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "CE OI", "CE Volume", "PE Symbol", "PE LTP", "PE OI", "PE Volume"])
+        return pd.DataFrame(columns=[
+            "Underlying", "Underlying LTP", "ATM Strike", "Strike",
+            "CE Symbol", "CE LTP", "CE OI", "CE Volume",
+            "PE Symbol", "PE LTP", "PE OI", "PE Volume",
+        ])
     chain = ((chain_res or {}).get("data") or {}).get("optionsChain", [])
     if not chain:
-        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "CE OI", "CE Volume", "PE Symbol", "PE LTP", "PE OI", "PE Volume"])
+        return pd.DataFrame(columns=[
+            "Underlying", "Underlying LTP", "ATM Strike", "Strike",
+            "CE Symbol", "CE LTP", "CE OI", "CE Volume",
+            "PE Symbol", "PE LTP", "PE OI", "PE Volume",
+        ])
     rows = []
     for item in chain:
         strike = strike_of(item)
@@ -547,7 +559,11 @@ def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> p
             "Volume": safe_float(item.get("volume", np.nan), np.nan),
         })
     if not rows:
-        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "CE OI", "CE Volume", "PE Symbol", "PE LTP", "PE OI", "PE Volume"])
+        return pd.DataFrame(columns=[
+            "Underlying", "Underlying LTP", "ATM Strike", "Strike",
+            "CE Symbol", "CE LTP", "CE OI", "CE Volume",
+            "PE Symbol", "PE LTP", "PE OI", "PE Volume",
+        ])
     oc = pd.DataFrame(rows)
     step = nearest_step(ltp if pd.notna(ltp) else oc["Strike"].median())
     atm = round(ltp / step) * step if pd.notna(ltp) else oc["Strike"].median()
@@ -789,7 +805,10 @@ def main() -> None:
     if not rows:
         raise RuntimeError("No symbols returned usable market data.")
     summary_df = pd.DataFrame(rows)
-    ordered_cols = ["Symbol"] + [c for c in EMAIL_DISPLAY_COLS if c != "Symbol"] + ["Bull Rank", "Bear Rank", "Rank Delta", "Cumulative +DI", "Cumulative -DI", "Cumulative ADX", "Cumulative RSI", "VWAP Z-Score"]
+    ordered_cols = ["Symbol"] + [c for c in EMAIL_DISPLAY_COLS if c != "Symbol"] + [
+        "Bull Rank", "Bear Rank", "Rank Delta", "Cumulative +DI", "Cumulative -DI",
+        "Cumulative ADX", "Cumulative RSI", "VWAP Z-Score",
+    ]
     ordered_cols = [c for c in ordered_cols if c in summary_df.columns]
     summary_df = summary_df[ordered_cols].sort_values(["Rank Delta", "% Change"], ascending=[False, False]).reset_index(drop=True)
     long_df, short_df = choose_top_candidates(summary_df, top_n=10)
