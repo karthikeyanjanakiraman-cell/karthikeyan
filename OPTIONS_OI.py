@@ -1,1093 +1,504 @@
 import os
 import re
-import sys
+import math
+import smtplib
 import logging
-from datetime import datetime, timedelta, time
-from typing import List, Dict, Optional, Tuple
+from datetime import datetime, timedelta
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-from fyers_apiv3 import fyersModel
-import smtplib
+from email.mime.base import MIMEBase
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
 from email import encoders
 
+try:
+    from fyers_apiv3 import fyersModel
+except Exception:
+    from fyersapiv3 import fyersModel
 
-class UTF8Formatter(logging.Formatter):
-    def format(self, record):
-        msg = record.getMessage()
-        record.msg = msg.encode("ascii", "ignore").decode("ascii")
-        return super().format(record)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logger = logging.getLogger(__name__)
 
-
-logger = logging.getLogger()
-logger.setLevel(logging.INFO)
-if logger.hasHandlers():
-    logger.handlers.clear()
-ch = logging.StreamHandler(sys.stdout)
-ch.setLevel(logging.INFO)
-formatter = UTF8Formatter(
-    "%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-)
-ch.setFormatter(formatter)
-logger.addHandler(ch)
-
-DAILY_LOOKBACK_DAYS = 60
+DAILY_LOOKBACK_DAYS = 90
 INTRADAY_LOOKBACK_DAYS = 20
 IVP_LOOKBACK_DAYS = 252
-INDEX_SOFT_BOOST_WEIGHT = 0.25
-
-fyers: Optional[fyersModel.FyersModel] = None
-
-# Email settings (adjust to your environment)
-smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-smtp_port = int(os.environ.get("SMTP_PORT", "587"))
-sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
-sender_password = os.environ.get("SENDER_PASSWORD", "password")
-recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
+OPTION_PAIRS_TO_KEEP = 5
+SECTORS_DIR = os.environ.get("SECTORS_DIR", "sectors")
+OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 
 EMAIL_DISPLAY_COLS = [
-    "Symbol", "LTP", "% Change", "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
-    "Bull_Signal", "Bear_Signal", "Overall_Signal", "Price_Lead_Status", "IVP",
-    "Volatility State", "Last Iteration Time",
+    "Symbol",
+    "LTP",
+    "% Change",
+    "5m_Signal",
+    "15m_Signal",
+    "30m_Signal",
+    "60m_Signal",
+    "Bull_Signal",
+    "Bear_Signal",
+    "Overall_Signal",
+    "Price_Lead_Status",
+    "IVP",
+    "Volatility State",
+    "Last Iteration Time",
 ]
 
+fyers = None
 
-def init_fyers():
+
+def init_fyers() -> Optional[object]:
     global fyers
-    try:
-        client_id = os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID")
-        access_token = os.environ.get("ACCESS_TOKEN") or os.environ.get("ACCESSTOKEN")
-        if not client_id or not access_token:
-            logger.warning("INIT Missing Fyers credentials.")
-            fyers = None
-            return
-        fyers = fyersModel.FyersModel(
-            client_id=client_id, is_async=False, token=access_token, log_path=""
-        )
-        logger.info("INIT FyersModel initialized successfully.")
-    except Exception as e:
-        logger.warning(f"INIT Failed: {e}")
+    client_id = os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID")
+    access_token = os.environ.get("ACCESS_TOKEN") or os.environ.get("ACCESSTOKEN")
+    if not client_id or not access_token:
+        logger.error("Missing CLIENT_ID / ACCESS_TOKEN environment variables.")
         fyers = None
+        return None
+    fyers = fyersModel.FyersModel(client_id=client_id, is_async=False, token=access_token, log_path="")
+    return fyers
 
 
-def load_fno_symbols_from_sectors(root_dir: str = "sectors") -> List[str]:
-    symbols = set()
+def safe_float(value, default=np.nan) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def discover_sector_csvs(root_dir: str = SECTORS_DIR) -> List[str]:
+    paths = []
     if not os.path.isdir(root_dir):
+        logger.warning("Sectors folder not found: %s", root_dir)
         return []
     for dirpath, _, filenames in os.walk(root_dir):
         for fname in filenames:
-            if not fname.lower().endswith(".csv"):
-                continue
-            try:
-                df = pd.read_csv(os.path.join(dirpath, fname))
-                col = next(
-                    (
-                        c
-                        for c in df.columns
-                        if c.lower() in ["symbol", "symbols", "ticker"]
-                    ),
-                    None,
-                )
-                if col is None:
-                    continue
-                for s in df[col].dropna().astype(str):
-                    s = s.strip()
-                    if s:
-                        symbols.add(s)
-            except Exception:
-                pass
+            if fname.lower().endswith(".csv"):
+                paths.append(os.path.join(dirpath, fname))
+    return sorted(set(paths))
+
+
+def load_fno_symbols_from_sectors(root_dir: str = SECTORS_DIR) -> List[str]:
+    symbols = set()
+    for path in discover_sector_csvs(root_dir):
+        try:
+            df = pd.read_csv(path)
+        except Exception:
+            continue
+        lowered = {str(c).strip().lower(): c for c in df.columns}
+        symbol_col = None
+        for key in ["symbol", "symbols", "ticker", "tradingsymbol"]:
+            if key in lowered:
+                symbol_col = lowered[key]
+                break
+        if symbol_col is None:
+            continue
+        for raw in df[symbol_col].dropna().astype(str):
+            sym = raw.strip().upper()
+            if sym and sym not in {"NAN", "NONE"}:
+                symbols.add(sym)
     return sorted(symbols)
 
 
-def load_symbol_to_indices_map(root_dir: str = "sectors") -> Dict[str, List[str]]:
-    mapping: Dict[str, List[str]] = {}
-    search_dirs = [root_dir, '.']
-    for base in search_dirs:
-        if not os.path.isdir(base):
-            continue
-        for dirpath, _, filenames in os.walk(base):
-            for fname in filenames:
-                if not fname.lower().endswith('.csv'):
-                    continue
-                path = os.path.join(dirpath, fname)
-                try:
-                    df = pd.read_csv(path)
-                except Exception:
-                    continue
-                cols = {str(c).strip().lower(): c for c in df.columns}
-                sym_col = None
-                for key in ['symbol', 'symbols', 'ticker']:
-                    if key in cols:
-                        sym_col = cols[key]
-                        break
-                idx_col = None
-                for key in ['belongstoindices', 'belongs_to_indices', 'index name', 'index_name', 'sector', 'indices']:
-                    if key in cols:
-                        idx_col = cols[key]
-                        break
-                if not sym_col or not idx_col:
-                    continue
-                for _, row in df[[sym_col, idx_col]].dropna().iterrows():
-                    sym = str(row[sym_col]).strip().upper()
-                    raw_idx = str(row[idx_col]).strip()
-                    if not sym or not raw_idx:
-                        continue
-                    parts = [p.strip() for p in re.split(r'[|;,/]+', raw_idx) if p.strip()]
-                    if not parts:
-                        parts = [raw_idx]
-                    current = mapping.setdefault(sym, [])
-                    for part in parts:
-                        if part not in current:
-                            current.append(part)
-    return mapping
-
-def resolve_universe_csv() -> str:
-    csv_files = []
-    for dirpath, _, filenames in os.walk('.'):
-        for fname in filenames:
-            if fname.lower().endswith('.csv'):
-                csv_files.append(os.path.join(dirpath, fname))
-
-    scored = []
-    for path in csv_files:
-        try:
-            df = pd.read_csv(path, nrows=5)
-            cols = {str(c).strip().lower() for c in df.columns}
-            score = 0
-            if 'symbol' in cols:
-                score += 5
-            if 'belongstoindices' in cols or 'belongs_to_indices' in cols:
-                score += 5
-            if 'company name' in cols or 'company_name' in cols:
-                score += 2
-            if score > 0:
-                scored.append((score, os.path.getmtime(path), path))
-        except Exception:
-            continue
-
-    if scored:
-        scored.sort(reverse=True)
-        chosen = scored[0][2]
-        logger.info(f"CSV Auto-selected universe file: {chosen}")
-        return chosen
-
-    logger.warning("CSV No matching universe CSV found; defaulting to fno_stock_list.csv")
-    return 'fno_stock_list.csv'
-
-
-def load_fno_symbols_from_csv(path: str = "fno_stock_list.csv") -> List[str]:
-    if not os.path.exists(path):
-        logger.warning(f"FNO CSV not found at {path}")
-        return []
-    try:
-        df = pd.read_csv(path)
-        if "Symbol" not in df.columns:
-            logger.warning("FNO CSV missing 'Symbol' column")
-            return []
-        return sorted(df["Symbol"].dropna().astype(str).str.strip().unique())
-    except Exception as e:
-        logger.error(f"Error reading FNO CSV {path}: {e}")
-        return []
-
-
-def format_fyers_symbol(symbol: str) -> str:
-    if symbol.startswith("NSE:") and symbol.endswith("-EQ"):
-        return symbol
+def format_eq_symbol(symbol: str) -> str:
+    symbol = str(symbol).strip().upper()
+    if symbol.startswith("NSE:"):
+        return symbol if symbol.endswith("-EQ") else f"{symbol}-EQ"
     return f"NSE:{symbol}-EQ"
 
 
-def get_fyers_history(
-    symbol: str, resolution: str, days_back: int
-) -> Optional[pd.DataFrame]:
-    if not fyers:
-        return None
-    try:
-        now = datetime.now()
-        start_date = now - timedelta(days=days_back)
-        data = {
-            "symbol": symbol,
-            "resolution": resolution,
-            "date_format": "1",
-            "range_from": start_date.strftime("%Y-%m-%d"),
-            "range_to": now.strftime("%Y-%m-%d"),
-            "cont_flag": "1",
-        }
-        res = fyers.history(data=data)
-        if res and res.get("s") == "ok" and "candles" in res and res["candles"]:
-            df = pd.DataFrame(
-                res["candles"],
-                columns=["timestamp", "open", "high", "low", "close", "volume"],
-            )
-            df["timestamp"] = (
-                pd.to_datetime(df["timestamp"], unit="s")
-                .dt.tz_localize("UTC")
-                .dt.tz_convert("Asia/Kolkata")
-                .dt.tz_localize(None)
-            )
-            df.sort_values("timestamp", inplace=True)
-            df.drop_duplicates(subset=["timestamp"], keep="last", inplace=True)
-            df.reset_index(drop=True, inplace=True)
-            return df
-    except Exception as e:
-        logger.error(f"FYERS Error fetching {resolution} data for {symbol}: {e}")
-    return None
-
-
-def compute_iv_proxies(daily_df: Optional[pd.DataFrame]) -> Dict[str, float]:
-    if daily_df is None or daily_df.empty or len(daily_df) < 30:
-        return {"IVP": np.nan, "Volatility State": "Neutral Vol"}
-
-    df = daily_df.copy().sort_values(
-        "timestamp" if "timestamp" in daily_df.columns else daily_df.columns[0]
-    ).reset_index(drop=True)
-
-    close = pd.to_numeric(df["close"], errors="coerce").astype(float)
-    high = pd.to_numeric(df["high"], errors="coerce").astype(float)
-    low = pd.to_numeric(df["low"], errors="coerce").astype(float)
-
-    iv_proxy = ((high - low) / close.replace(0, np.nan) * 100.0).replace(
-        [np.inf, -np.inf], np.nan
-    )
-    iv_proxy = iv_proxy.dropna()
-    if iv_proxy.empty:
-        return {"IVP": np.nan, "Volatility State": "Neutral Vol"}
-
-    lookback = iv_proxy.tail(min(IVP_LOOKBACK_DAYS, len(iv_proxy)))
-    current_iv = float(lookback.iloc[-1])
-    ivp = round((lookback.lt(current_iv).sum() / len(lookback)) * 100, 2)
-
-    if ivp < 30:
-        vol_state = "Buyer Zone"
-    elif ivp > 50:
-        vol_state = "Avoid Buy Premium"
-    else:
-        vol_state = "Neutral Vol"
-    return {"IVP": ivp, "Volatility State": vol_state}
-
-
-def compute_cumulative_directional_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
-    df = curr_df.copy().sort_values("time").reset_index(drop=True)
-    if df.empty:
-        return df
-
-    h = df["high"].astype(float).to_numpy()
-    l = df["low"].astype(float).to_numpy()
-    c = df["close"].astype(float).to_numpy()
-    o = df["open"].astype(float).to_numpy()
-    n = len(df)
-
-    tr = np.zeros(n)
-    plus_dm = np.zeros(n)
-    minus_dm = np.zeros(n)
-
-    tr[0] = max(h[0] - l[0], 0)
-    for i in range(1, n):
-        tr[i] = max(
-            h[i] - l[i],
-            abs(h[i] - c[i - 1]),
-            abs(l[i] - c[i - 1]),
-        )
-        up = h[i] - h[i - 1]
-        dn = l[i - 1] - l[i]
-        plus_dm[i] = up if up > dn and up > 0 else 0.0
-        minus_dm[i] = dn if dn > up and dn > 0 else 0.0
-
-    out = []
-    qualified = 0
-
-    for i in range(n):
-        if i == 0:
-            out.append([np.nan, np.nan, np.nan, np.nan, "0/0", 0.0])
-            continue
-
-        prior_kers = []
-        for j in range(1, i + 1):
-            pj = abs(c[j] - o[0])
-            wj = abs(c[0] - o[0]) + np.sum(np.abs(np.diff(c[: j + 1])))
-            prior_kers.append(pj / wj if wj > 0 else 0.0)
-        cum_ker = float(np.mean(prior_kers)) if prior_kers else np.nan
-
-        tr_sum = tr[1 : i + 1].sum()
-        plus_sum = plus_dm[1 : i + 1].sum()
-        minus_sum = minus_dm[1 : i + 1].sum()
-
-        pdi = 100 * plus_sum / tr_sum if tr_sum > 0 else 0.0
-        mdi = 100 * minus_sum / tr_sum if tr_sum > 0 else 0.0
-
-        dxs = []
-        for k in range(1, i + 1):
-            ktr = tr[1 : k + 1].sum()
-            kp = plus_dm[1 : k + 1].sum()
-            km = minus_dm[1 : k + 1].sum()
-            kpdi = 100 * kp / ktr if ktr > 0 else 0.0
-            kmdi = 100 * km / ktr if ktr > 0 else 0.0
-            dxs.append(
-                100 * abs(kpdi - kmdi) / (kpdi + kmdi)
-                if (kpdi + kmdi) > 0
-                else 0.0
-            )
-        adx = float(np.mean(dxs)) if dxs else np.nan
-
-        if c[i] > c[i - 1]:
-            qualified += 1
-        length_so_far = i + 1
-        survival_ratio = qualified / length_so_far if length_so_far > 0 else 0.0
-
-        out.append(
-            [
-                cum_ker,
-                pdi,
-                mdi,
-                adx,
-                f"{qualified}/{length_so_far}",
-                survival_ratio,
-            ]
-        )
-
-    cols = [
-        "Cumulative KER",
-        "Cumulative +DI",
-        "Cumulative -DI",
-        "Cumulative ADX",
-        "Survival Score",
-        "Survival_Num",
-    ]
-    return pd.concat([df, pd.DataFrame(out, columns=cols)], axis=1)
-
-
-def compute_cumulative_flow_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
-    df = curr_df.copy().sort_values("time").reset_index(drop=True)
-    if df.empty:
-        return df
-
-    close = pd.to_numeric(df["close"], errors="coerce").astype(float)
-    high = pd.to_numeric(df["high"], errors="coerce").astype(float)
-    low = pd.to_numeric(df["low"], errors="coerce").astype(float)
-    volume = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0).astype(float)
-
-    delta = close.diff().fillna(0.0)
-    gain = delta.clip(lower=0.0)
-    loss = (-delta).clip(lower=0.0)
-    period = 14
-    avg_gain = gain.rolling(period, min_periods=period).mean()
-    avg_loss = loss.rolling(period, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, float("nan"))
-    rsi = 100 - (100 / (1 + rs))
-    zero_loss = (avg_loss == 0) & avg_loss.notna()
-    rsi = rsi.mask(zero_loss, 100.0).fillna(0.0)
-
-    direction = close.diff().fillna(0.0).apply(
-        lambda x: 1 if x > 0 else (-1 if x < 0 else 0)
-    )
-    obv = (direction * volume).cumsum()
-
-    typical_price = (high + low + close) / 3.0
-    cum_pv = (typical_price * volume).cumsum()
-    cum_vol = volume.cumsum().replace(0, float("nan"))
-    vwap = (cum_pv / cum_vol).fillna(0.0)
-
-    vwap_variance = (volume * (typical_price - vwap) ** 2).cumsum() / cum_vol
-    vwap_std = np.sqrt(vwap_variance).fillna(0.0)
-    vwap_z_score = np.where(vwap_std > 0, (close - vwap) / vwap_std, 0.0)
-
-    out = pd.DataFrame(
-        {
-            "Cumulative RSI": rsi,
-            "Cumulative OBV": obv,
-            "Cumulative VWAP": vwap,
-            "VWAP Z-Score": pd.Series(vwap_z_score, index=df.index).fillna(0.0),
-        }
-    )
-    return pd.concat([df.reset_index(drop=True), out.reset_index(drop=True)], axis=1)
-
-
-def compute_price_lead_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
-    df = curr_df.copy().sort_values("time").reset_index(drop=True)
-    if df.empty:
-        return pd.DataFrame(
-            columns=[
-                "time",
-                "range_expansion",
-                "volume_expansion",
-                "delta_expansion",
-                "price_leading_flag",
-                "price_lead_streak",
-                "Price_Lead_Status",
-            ]
-        )
-
-    for col in ["open", "high", "low", "close", "volume"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    df["range"] = (df["high"] - df["low"]).clip(lower=0.0)
-    df["avg_range_5"] = df["range"].rolling(5, min_periods=3).mean()
-    df["range_expansion"] = np.where(
-        df["avg_range_5"] > 0,
-        df["range"] / df["avg_range_5"],
-        np.nan,
-    )
-
-    df["avg_vol_5"] = df["volume"].rolling(5, min_periods=3).mean()
-    df["volume_expansion"] = np.where(
-        df["avg_vol_5"] > 0,
-        df["volume"] / df["avg_vol_5"],
-        np.nan,
-    )
-
-    df["mid"] = (df["high"] + df["low"]) / 2.0
-    df["delta"] = np.where(
-        df["close"] > df["mid"],
-        df["volume"],
-        np.where(df["close"] < df["mid"], -df["volume"], 0.0),
-    )
-    df["cvd"] = pd.Series(df["delta"], index=df.index).cumsum()
-    df["cvd_change"] = df["cvd"].diff().abs().fillna(0.0)
-    df["avg_cvd_change_5"] = df["cvd_change"].rolling(5, min_periods=3).mean()
-    df["delta_expansion"] = np.where(
-        df["avg_cvd_change_5"] > 0,
-        df["cvd_change"] / df["avg_cvd_change_5"],
-        np.nan,
-    )
-
-    directional_bar = (df["close"] > df["open"]) | (df["close"] < df["open"])
-    df["price_leading_flag"] = (
-        (df["range_expansion"] >= 1.5)
-        & (df["volume_expansion"] <= 1.0)
-        & (df["delta_expansion"] <= 1.0)
-        & directional_bar
-    ).fillna(False)
-
-    streak = []
-    run = 0
-    for flag in df["price_leading_flag"].astype(bool):
-        run = run + 1 if flag else 0
-        streak.append(run)
-    df["price_lead_streak"] = streak
-
-    df["Price_Lead_Status"] = np.select(
-        [
-            df["price_leading_flag"] & (df["price_lead_streak"] >= 3),
-            df["price_leading_flag"] & (df["price_lead_streak"] >= 2),
-            df["price_leading_flag"],
-        ],
-        [
-            "STRONG_PRICE_LEAD_FADE",
-            "PRICE_LEADING_FADE_RISK",
-            "EARLY_PRICE_LEAD",
-        ],
-        default="NORMAL",
-    )
-
-    return df[
-        [
-            "time",
-            "range_expansion",
-            "volume_expansion",
-            "delta_expansion",
-            "price_leading_flag",
-            "price_lead_streak",
-            "Price_Lead_Status",
-        ]
-    ]
-
-
-def compute_iteration_volume_profile(
-    intra_df: Optional[pd.DataFrame],
-) -> Tuple[Dict, pd.DataFrame]:
-    if intra_df is None or intra_df.empty:
-        return {}, pd.DataFrame()
-
-    df = intra_df.copy()
-    if "timestamp" in df.columns:
-        df["date"] = pd.to_datetime(df["timestamp"]).dt.date
-        df["time_only"] = pd.to_datetime(df["timestamp"]).dt.time
-    else:
-        df["date"] = pd.to_datetime(df["time"]).dt.date
-        df["time_only"] = pd.to_datetime(df["time"]).dt.time
-
-    dates = sorted(df["date"].unique())
-    if len(dates) < 2:
-        return {}, pd.DataFrame()
-
-    current_date = dates[-1]
-    hist_dates_10 = dates[-11:-1] if len(dates) >= 11 else dates[:-1]
-    hist_dates_20 = dates[-21:-1] if len(dates) >= 21 else dates[:-1]
-
-    curr_df = df[df["date"] == current_date].copy()
-    hist_df_10 = df[df["date"].isin(hist_dates_10)].copy()
-    hist_df_20 = df[df["date"].isin(hist_dates_20)].copy()
-
-    if curr_df.empty:
-        return {}, pd.DataFrame()
-
-    curr_df.sort_values("time_only", inplace=True)
-    curr_df["cum_vol"] = curr_df["volume"].cumsum()
-
-    work_df = curr_df.copy()
-    if "time" not in work_df.columns:
-        if "timestamp" in work_df.columns:
-            work_df["time"] = pd.to_datetime(work_df["timestamp"])
-        elif "date" in work_df.columns and "time_only" in work_df.columns:
-            work_df["time"] = pd.to_datetime(
-                work_df["date"].astype(str) + " " + work_df["time_only"].astype(str)
-            )
-        else:
-            work_df["time"] = pd.RangeIndex(start=0, stop=len(work_df), step=1)
-
-    metric_df = compute_cumulative_directional_metrics(
-        work_df[["time", "open", "high", "low", "close", "volume"]].copy()
-    )
-    flow_df = compute_cumulative_flow_metrics(
-        work_df[["time", "high", "low", "close", "volume"]].copy()
-    )
-    price_lead_df = compute_price_lead_metrics(
-        work_df[["time", "open", "high", "low", "close", "volume"]].copy()
-    )
-
-    rows = []
-    total_iters = 0
-    last_iter_mins = None
-    last_iter_time = None
-    last_cum_vol = last_rvol10 = last_rvol20 = 0
-
-    for i in range(len(curr_df)):
-        total_iters += 1
-        row = curr_df.iloc[i]
-        t = row["time_only"]
-        cum_vol = float(row["cum_vol"])
-
-        h10 = hist_df_10[hist_df_10["time_only"] <= t]
-        avg_cum_10 = (
-            h10.groupby("date")["volume"].sum().mean() if not h10.empty else 0
-        )
-        rvol10 = cum_vol / avg_cum_10 if avg_cum_10 > 0 else 0
-
-        h20 = hist_df_20[hist_df_20["time_only"] <= t]
-        avg_cum_20 = (
-            h20.groupby("date")["volume"].sum().mean() if not h20.empty else 0
-        )
-        rvol20 = cum_vol / avg_cum_20 if avg_cum_20 > 0 else 0
-
-        dt_time = datetime.combine(current_date, t)
-        market_open = datetime.combine(current_date, time(9, 15))
-        iter_mins = int((dt_time - market_open).total_seconds() / 60)
-
-        rows.append(
-            {
-                "Iteration No": total_iters,
-                "Iteration Minutes": iter_mins,
-                "Iteration Time": t.strftime("%H:%M"),
-                "Current Volume": cum_vol,
-                "10 Day Relative Volume": rvol10,
-                "20 Day Relative Volume": rvol20,
-                "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i])
-                if not flow_df.empty
-                else float("nan"),
-                "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[i])
-                if not flow_df.empty
-                else float("nan"),
-                "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[i])
-                if not flow_df.empty
-                else float("nan"),
-                "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[i])
-                if not flow_df.empty
-                else float("nan"),
-                "Range_Expansion": float(
-                    price_lead_df["range_expansion"].iloc[i]
-                )
-                if not price_lead_df.empty
-                and pd.notna(price_lead_df["range_expansion"].iloc[i])
-                else float("nan"),
-                "Volume_Expansion": float(
-                    price_lead_df["volume_expansion"].iloc[i]
-                )
-                if not price_lead_df.empty
-                and pd.notna(price_lead_df["volume_expansion"].iloc[i])
-                else float("nan"),
-                "Delta_Expansion": float(
-                    price_lead_df["delta_expansion"].iloc[i]
-                )
-                if not price_lead_df.empty
-                and pd.notna(price_lead_df["delta_expansion"].iloc[i])
-                else float("nan"),
-                "Price_Leading_Flag": bool(
-                    price_lead_df["price_leading_flag"].iloc[i]
-                )
-                if not price_lead_df.empty
-                else False,
-                "Price_Lead_Streak": int(
-                    price_lead_df["price_lead_streak"].iloc[i]
-                )
-                if not price_lead_df.empty
-                else 0,
-                "Price_Lead_Status": str(
-                    price_lead_df["Price_Lead_Status"].iloc[i]
-                )
-                if not price_lead_df.empty
-                else "NORMAL",
-            }
-        )
-
-        last_cum_vol, last_rvol10, last_rvol20 = cum_vol, rvol10, rvol20
-        last_iter_mins = iter_mins
-        last_iter_time = t.strftime("%H:%M")
-
-    detail_df = pd.DataFrame(rows)
-
-    ltp = float(curr_df["close"].iloc[-1]) if not curr_df.empty else np.nan
-    hod = float(curr_df["high"].max()) if not curr_df.empty else float("nan")
-    strike_distance = (
-        (hod - ltp) / hod if hod and hod > 0 and ltp is not None else 1.0
-    )
-
-    last_5m_volume = float(curr_df["volume"].iloc[-1]) if not curr_df.empty else 0.0
-    recent_12 = curr_df["volume"].tail(12) if not curr_df.empty else pd.Series(dtype=float)
-    vol_1h_avg_5m = (
-        float(recent_12.mean()) if len(recent_12) > 0 else last_5m_volume
-    )
-
-    obv_30m_delta = 0.0
-    rsi_30m_delta = 0.0
-    if not flow_df.empty and len(flow_df) >= 7:
-        obv_30m_delta = float(flow_df["Cumulative OBV"].iloc[-1]) - float(
-            flow_df["Cumulative OBV"].iloc[-7]
-        )
-        rsi_30m_delta = float(flow_df["Cumulative RSI"].iloc[-1]) - float(
-            flow_df["Cumulative RSI"].iloc[-7]
-        )
-
-    adx_now = float(metric_df["Cumulative ADX"].iloc[-1]) if not metric_df.empty else float("nan")
-    ker_now = float(metric_df["Cumulative KER"].iloc[-1]) if not metric_df.empty else float("nan")
-
-    summary = {
-        "LTP": ltp,
-        "Current Volume": last_cum_vol,
-        "10 Day Relative Volume": last_rvol10,
-        "20 Day Relative Volume": last_rvol20,
-        "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[-1])
-        if not flow_df.empty
-        else float("nan"),
-        "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[-1])
-        if not flow_df.empty
-        else float("nan"),
-        "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[-1])
-        if not flow_df.empty
-        else float("nan"),
-        "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[-1])
-        if not flow_df.empty
-        else float("nan"),
-        "Total Iterations": total_iters,
-        "Last Iteration Minutes": last_iter_mins,
-        "Last Iteration Time": last_iter_time,
-        "Cumulative KER": float(metric_df["Cumulative KER"].iloc[-1])
-        if not metric_df.empty
-        else np.nan,
-        "Cumulative +DI": float(metric_df["Cumulative +DI"].iloc[-1])
-        if not metric_df.empty
-        else np.nan,
-        "Cumulative -DI": float(metric_df["Cumulative -DI"].iloc[-1])
-        if not metric_df.empty
-        else np.nan,
-        "Cumulative ADX": float(metric_df["Cumulative ADX"].iloc[-1])
-        if not metric_df.empty
-        else np.nan,
-        "Survival Score": str(metric_df["Survival Score"].iloc[-1])
-        if not metric_df.empty
-        else "0/0",
-        "Survival_Num": float(metric_df["Survival_Num"].iloc[-1])
-        if not metric_df.empty
-        else 0.0,
-        "HOD": hod,
-        "Strike_Distance": strike_distance,
-        "Last_5m_Volume": last_5m_volume,
-        "Volume_1h_Avg_5m": vol_1h_avg_5m,
-        "OBV_30m_Delta": obv_30m_delta,
-        "RSI_30m_Delta": rsi_30m_delta,
-        "Price_Lead_Status": str(price_lead_df["Price_Lead_Status"].iloc[-1])
-        if not price_lead_df.empty
-        else "NORMAL",
+def get_history(symbol: str, resolution: str, days_back: int) -> pd.DataFrame:
+    if fyers is None:
+        return pd.DataFrame()
+    now = datetime.now()
+    start = now - timedelta(days=days_back)
+    payload = {
+        "symbol": symbol,
+        "resolution": resolution,
+        "date_format": "1",
+        "range_from": start.strftime("%Y-%m-%d"),
+        "range_to": now.strftime("%Y-%m-%d"),
+        "cont_flag": "1",
     }
-
-    return summary, detail_df
-
-
-def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    symbols = load_fno_symbols_from_sectors("sectors")
-    if not symbols:
-        logger.error("CORE No F&O symbols found.")
-        return pd.DataFrame(), pd.DataFrame()
-
-    rows, iteration_rows = [], []
-    total = len(symbols)
-
-    for idx, sym in enumerate(symbols, start=1):
-        logger.info(f"CORE [{idx}/{total}] Processing {sym}")
-        fyers_sym = format_fyers_symbol(sym)
-
-        daily_df = get_fyers_history(
-            fyers_sym,
-            resolution="D",
-            days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS),
-        )
-        intra_df = get_fyers_history(
-            fyers_sym,
-            resolution="5",
-            days_back=INTRADAY_LOOKBACK_DAYS,
-        )
-
-        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
-        iv_info = compute_iv_proxies(daily_df)
-
-        prev_close = float(daily_df["close"].iloc[-2]) if (
-            daily_df is not None and len(daily_df) >= 2
-        ) else None
-        ltp = iter_summary.get("LTP")
-        pct_change = (
-            (ltp - prev_close) / prev_close * 100
-            if (ltp is not None and prev_close and prev_close != 0)
-            else 0.0
-        )
-
-        if not iter_detail.empty:
-            iter_detail.insert(0, "Symbol", sym)
-            iter_detail.insert(1, "% Change", pct_change)
-            iteration_rows.append(iter_detail)
-
-        rows.append(
-            {
-                "Symbol": sym,
-                "LTP": ltp,
-                "% Change": pct_change,
-                "Current Volume": iter_summary.get("Current Volume"),
-                "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"),
-                "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"),
-                "Cumulative RSI": iter_summary.get("Cumulative RSI"),
-                "Cumulative OBV": iter_summary.get("Cumulative OBV"),
-                "Cumulative VWAP": iter_summary.get("Cumulative VWAP"),
-                "VWAP Z-Score": iter_summary.get("VWAP Z-Score"),
-                "Total Iterations": iter_summary.get("Total Iterations"),
-                "Last Iteration Minutes": iter_summary.get("Last Iteration Minutes"),
-                "Last Iteration Time": iter_summary.get("Last Iteration Time"),
-                "Cumulative KER": iter_summary.get("Cumulative KER"),
-                "Cumulative +DI": iter_summary.get("Cumulative +DI"),
-                "Cumulative -DI": iter_summary.get("Cumulative -DI"),
-                "Cumulative ADX": iter_summary.get("Cumulative ADX"),
-                "Survival Score": iter_summary.get("Survival Score"),
-                "Survival_Num": iter_summary.get("Survival_Num"),
-                "HOD": iter_summary.get("HOD"),
-                "Strike_Distance": iter_summary.get("Strike_Distance"),
-                "Last_5m_Volume": iter_summary.get("Last_5m_Volume"),
-                "Volume_1h_Avg_5m": iter_summary.get("Volume_1h_Avg_5m"),
-                "OBV_30m_Delta": iter_summary.get("OBV_30m_Delta"),
-                "RSI_30m_Delta": iter_summary.get("RSI_30m_Delta"),
-                "Price_Lead_Status": iter_summary.get("Price_Lead_Status", "NORMAL"),
-                "IVP": iv_info.get("IVP"),
-                "Volatility State": iv_info.get("Volatility State"),
-            }
-        )
-
-    return (
-        pd.DataFrame(rows),
-        (pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame()),
-    )
+    try:
+        res = fyers.history(data=payload)
+    except Exception as exc:
+        logger.warning("History fetch failed for %s: %s", symbol, exc)
+        return pd.DataFrame()
+    candles = (res or {}).get("candles", [])
+    if not candles:
+        return pd.DataFrame()
+    df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
+    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+    df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
+    return df
 
 
-def rank_delta_to_label(delta: float) -> str:
+def compute_ivp(daily_df: pd.DataFrame) -> Tuple[float, str]:
+    if daily_df is None or daily_df.empty or len(daily_df) < 30:
+        return np.nan, "Neutral Vol"
+    close = pd.to_numeric(daily_df["close"], errors="coerce")
+    high = pd.to_numeric(daily_df["high"], errors="coerce")
+    low = pd.to_numeric(daily_df["low"], errors="coerce")
+    proxy = ((high - low) / close.replace(0, np.nan) * 100.0).replace([np.inf, -np.inf], np.nan).dropna()
+    if proxy.empty:
+        return np.nan, "Neutral Vol"
+    lookback = proxy.tail(min(IVP_LOOKBACK_DAYS, len(proxy)))
+    current = float(lookback.iloc[-1])
+    ivp = round((lookback.lt(current).sum() / len(lookback)) * 100, 2)
+    if ivp < 30:
+        state = "Buyer Zone"
+    elif ivp > 50:
+        state = "Avoid Buy Premium"
+    else:
+        state = "Neutral Vol"
+    return ivp, state
+
+
+def score_label(delta: float) -> str:
     if pd.isna(delta):
-        return ""
+        return "Neutral"
     if delta >= 7:
         return "Buy++"
     if delta >= 4:
         return "Buy+"
     if delta >= 1:
         return "Buy"
-    if delta == 0:
-        return "Neutral"
     if delta <= -7:
         return "Sell++"
     if delta <= -4:
         return "Sell+"
-    return "Sell"
+    if delta <= -1:
+        return "Sell"
+    return "Neutral"
 
 
-def derive_rank_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    out = df.copy()
+def summarize_intraday(intra_df: pd.DataFrame, daily_df: pd.DataFrame) -> Dict[str, object]:
+    if intra_df is None or intra_df.empty:
+        return {}
+    df = intra_df.copy().sort_values("timestamp").reset_index(drop=True)
+    close = pd.to_numeric(df["close"], errors="coerce")
+    high = pd.to_numeric(df["high"], errors="coerce")
+    low = pd.to_numeric(df["low"], errors="coerce")
+    open_ = pd.to_numeric(df["open"], errors="coerce")
+    volume = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
 
-    def score_bull(row):
-        score = 0
-        if pd.notna(row.get("% Change")) and row.get("% Change") > 0:
-            score += 2
-        if pd.notna(row.get("VWAP Z-Score")) and row.get("VWAP Z-Score") >= 0.30:
-            score += 2
-        if pd.notna(row.get("Cumulative +DI")) and pd.notna(row.get("Cumulative -DI")) and row.get("Cumulative +DI") > row.get("Cumulative -DI"):
-            score += 2
-        if pd.notna(row.get("Cumulative ADX")) and row.get("Cumulative ADX") >= 20:
-            score += 1
-        if pd.notna(row.get("Cumulative KER")) and row.get("Cumulative KER") >= 0.40:
-            score += 1
-        if pd.notna(row.get("Cumulative RSI")) and row.get("Cumulative RSI") >= 55:
-            score += 1
-        return min(score, 13)
+    delta = close.diff().fillna(0.0)
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    avg_gain = gain.rolling(14, min_periods=14).mean()
+    avg_loss = loss.rolling(14, min_periods=14).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
+    rsi = (100 - (100 / (1 + rs))).fillna(50)
 
-    def score_bear(row):
-        score = 0
-        if pd.notna(row.get("% Change")) and row.get("% Change") < 0:
-            score += 2
-        if pd.notna(row.get("VWAP Z-Score")) and row.get("VWAP Z-Score") <= -0.30:
-            score += 2
-        if pd.notna(row.get("Cumulative +DI")) and pd.notna(row.get("Cumulative -DI")) and row.get("Cumulative -DI") > row.get("Cumulative +DI"):
-            score += 2
-        if pd.notna(row.get("Cumulative ADX")) and row.get("Cumulative ADX") >= 20:
-            score += 1
-        if pd.notna(row.get("Cumulative KER")) and row.get("Cumulative KER") >= 0.40:
-            score += 1
-        if pd.notna(row.get("Cumulative RSI")) and row.get("Cumulative RSI") <= 45:
-            score += 1
-        return min(score, 13)
+    tr1 = (high - low).abs()
+    tr2 = (high - close.shift(1)).abs()
+    tr3 = (low - close.shift(1)).abs()
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    up_move = high.diff()
+    down_move = -low.diff()
+    plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
+    minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
+    atr = pd.Series(tr).rolling(14, min_periods=14).mean()
+    plus_di = 100 * pd.Series(plus_dm).rolling(14, min_periods=14).mean() / atr.replace(0, np.nan)
+    minus_di = 100 * pd.Series(minus_dm).rolling(14, min_periods=14).mean() / atr.replace(0, np.nan)
+    dx = (100 * (plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)).fillna(0)
+    adx = dx.rolling(14, min_periods=14).mean().fillna(0)
 
-    bull = out.apply(score_bull, axis=1)
-    bear = out.apply(score_bear, axis=1)
+    typical = (high + low + close) / 3.0
+    cum_vol = volume.cumsum().replace(0, np.nan)
+    vwap = ((typical * volume).cumsum() / cum_vol).fillna(method="ffill").fillna(close)
+    vwap_std = (((typical - vwap) ** 2 * volume).cumsum() / cum_vol).pow(0.5).replace(0, np.nan)
+    vwap_z = ((close - vwap) / vwap_std).replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
-    out["Bull Rank"] = bull
-    out["Bear Rank"] = bear
-    out["Rank Delta"] = bull - bear
+    range_now = (high - low).clip(lower=0)
+    avg_range5 = range_now.rolling(5, min_periods=3).mean()
+    avg_vol5 = volume.rolling(5, min_periods=3).mean()
+    price_lead_flag = ((range_now / avg_range5.replace(0, np.nan)) >= 1.5) & ((volume / avg_vol5.replace(0, np.nan)) <= 1.0)
+    streak = []
+    run = 0
+    for flag in price_lead_flag.fillna(False).astype(bool):
+        run = run + 1 if flag else 0
+        streak.append(run)
+    streak = pd.Series(streak)
+    lead_status = np.select(
+        [price_lead_flag & (streak >= 3), price_lead_flag & (streak >= 2), price_lead_flag],
+        ["STRONG_PRICE_LEAD_FADE", "PRICE_LEADING_FADE_RISK", "EARLY_PRICE_LEAD"],
+        default="NORMAL",
+    )
 
-    for tf, w in {"5m": 1.0, "15m": 0.9, "30m": 0.8, "60m": 0.7}.items():
-        out[f"{tf}BullRank"] = (bull * w).round().clip(lower=0, upper=14)
-        out[f"{tf}BearRank"] = (bear * w).round().clip(lower=0, upper=14)
-        out[f"{tf}RankDelta"] = out[f"{tf}BullRank"] - out[f"{tf}BearRank"]
+    prev_close = safe_float(daily_df["close"].iloc[-2]) if daily_df is not None and len(daily_df) >= 2 else np.nan
+    ltp = safe_float(close.iloc[-1])
+    pct_change = ((ltp - prev_close) / prev_close * 100.0) if pd.notna(prev_close) and prev_close != 0 else 0.0
 
-    return out
+    bull = 0
+    bear = 0
+    if pct_change > 0:
+        bull += 2
+    if pct_change < 0:
+        bear += 2
+    if safe_float(vwap_z.iloc[-1], 0) >= 0.30:
+        bull += 2
+    if safe_float(vwap_z.iloc[-1], 0) <= -0.30:
+        bear += 2
+    if safe_float(plus_di.iloc[-1], 0) > safe_float(minus_di.iloc[-1], 0):
+        bull += 2
+    if safe_float(minus_di.iloc[-1], 0) > safe_float(plus_di.iloc[-1], 0):
+        bear += 2
+    if safe_float(adx.iloc[-1], 0) >= 20:
+        bull += 1
+        bear += 1
+    if safe_float(rsi.iloc[-1], 50) >= 55:
+        bull += 1
+    if safe_float(rsi.iloc[-1], 50) <= 45:
+        bear += 1
+
+    rank_delta = bull - bear
+    ivp, vol_state = compute_ivp(daily_df)
+    last_ts = pd.to_datetime(df["timestamp"].iloc[-1])
+
+    return {
+        "LTP": round(ltp, 2),
+        "% Change": round(pct_change, 2),
+        "5m_Signal": score_label(rank_delta),
+        "15m_Signal": score_label(rank_delta * 0.9),
+        "30m_Signal": score_label(rank_delta * 0.8),
+        "60m_Signal": score_label(rank_delta * 0.7),
+        "Bull_Signal": score_label(bull),
+        "Bear_Signal": score_label(-bear),
+        "Overall_Signal": score_label(rank_delta),
+        "Price_Lead_Status": str(lead_status[-1]),
+        "IVP": ivp,
+        "Volatility State": vol_state,
+        "Last Iteration Time": last_ts.strftime("%H:%M"),
+        "Bull Rank": bull,
+        "Bear Rank": bear,
+        "Rank Delta": rank_delta,
+        "Cumulative +DI": round(safe_float(plus_di.iloc[-1], np.nan), 2),
+        "Cumulative -DI": round(safe_float(minus_di.iloc[-1], np.nan), 2),
+        "Cumulative ADX": round(safe_float(adx.iloc[-1], np.nan), 2),
+        "Cumulative RSI": round(safe_float(rsi.iloc[-1], np.nan), 2),
+        "VWAP Z-Score": round(safe_float(vwap_z.iloc[-1], 0.0), 2),
+    }
 
 
-def add_signal_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    for tf in ["5m", "15m", "30m", "60m"]:
-        col = f"{tf}RankDelta"
-        out[f"{tf}_Signal"] = out[col].apply(rank_delta_to_label) if col in out.columns else ""
-    out["Bull_Signal"] = out["Bull Rank"].apply(rank_delta_to_label) if "Bull Rank" in out.columns else ""
-    out["Bear_Signal"] = out["Bear Rank"].apply(lambda x: rank_delta_to_label(-x)) if "Bear Rank" in out.columns else ""
-    out["Overall_Signal"] = out["Rank Delta"].apply(rank_delta_to_label) if "Rank Delta" in out.columns else ""
-    return out
+def choose_top_candidates(summary_df: pd.DataFrame, top_n: int = 10) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    if summary_df is None or summary_df.empty:
+        return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    base = summary_df.copy()
+    long_df = base[
+        (pd.to_numeric(base["% Change"], errors="coerce") > 0) &
+        (pd.to_numeric(base["Cumulative +DI"], errors="coerce") > pd.to_numeric(base["Cumulative -DI"], errors="coerce"))
+    ].copy()
+    short_df = base[
+        (pd.to_numeric(base["% Change"], errors="coerce") < 0) &
+        (pd.to_numeric(base["Cumulative -DI"], errors="coerce") > pd.to_numeric(base["Cumulative +DI"], errors="coerce"))
+    ].copy()
+
+    long_df = long_df.sort_values(["Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False]).head(top_n)
+    short_df = short_df.sort_values(["Rank Delta", "Cumulative ADX", "% Change"], ascending=[True, False, True]).head(top_n)
+
+    keep_cols = [c for c in EMAIL_DISPLAY_COLS if c in base.columns]
+    return long_df[keep_cols].reset_index(drop=True), short_df[keep_cols].reset_index(drop=True)
 
 
-def signal_color(label: str) -> str:
-    label = str(label).strip()
-    if label == "Buy++":
-        return "#2e7d32"
-    if label == "Buy+":
-        return "#3f8f45"
-    if label == "Buy":
-        return "#5b9b5f"
-    if label == "Buyer Zone":
-        return "#33691e"
-    if label == "Neutral":
-        return "#4b5563"
-    if label == "Neutral Vol":
-        return "#4b5563"
-    if label == "Sell++":
-        return "#7f1d1d"
-    if label == "Sell+":
-        return "#a83232"
-    if label == "Sell":
-        return "#b94a48"
-    if label == "Avoid Buy Premium":
-        return "#7a5c00"
-    return "#374151"
+def nearest_step(value: float) -> int:
+    value = abs(safe_float(value, 0))
+    if value >= 20000:
+        return 100
+    if value >= 10000:
+        return 50
+    if value >= 2000:
+        return 20
+    if value >= 500:
+        return 10
+    if value >= 100:
+        return 5
+    return 1
 
-def text_color_for_bg(bg: str) -> str:
-    bg = str(bg).lower()
-    if bg in {"#4b5563", "#374151", "#7f1d1d", "#a83232", "#b94a48", "#7a5c00", "#33691e", "#2e7d32", "#3f8f45"}:
-        return "#f3f4f6"
-    return "#ffffff"
 
-def format_value(col: str, val):
+def option_type_of(item: dict) -> str:
+    raw = str(item.get("option_type") or item.get("optionType") or item.get("type") or "").upper()
+    if raw in {"CE", "CALL", "CALLS"}:
+        return "CE"
+    if raw in {"PE", "PUT", "PUTS"}:
+        return "PE"
+    symbol = str(item.get("symbol") or item.get("fyToken") or "").upper()
+    if symbol.endswith("-CE") or symbol.endswith("CE"):
+        return "CE"
+    if symbol.endswith("-PE") or symbol.endswith("PE"):
+        return "PE"
+    return ""
+
+
+def option_symbol_of(item: dict) -> str:
+    return str(item.get("symbol") or item.get("symbolName") or item.get("option_symbol") or "")
+
+
+def option_ltp_of(item: dict) -> float:
+    for key in ["ltp", "last_traded_price", "lastPrice", "lp"]:
+        if key in item:
+            return round(safe_float(item.get(key), 0.0), 2)
+    return 0.0
+
+
+def strike_of(item: dict) -> float:
+    for key in ["strikePrice", "strike_price", "strike"]:
+        if key in item:
+            return safe_float(item.get(key), np.nan)
+    return np.nan
+
+
+def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> pd.DataFrame:
+    if fyers is None:
+        return pd.DataFrame(columns=["Underlying", "Strike", "CE Symbol", "CE LTP", "PE Symbol", "PE LTP"])
+
+    eq_symbol = format_eq_symbol(symbol)
+    try:
+        quote = fyers.quotes({"symbols": eq_symbol})
+    except Exception:
+        quote = {}
+    ltp = np.nan
+    try:
+        ltp = safe_float(quote.get("d", [{}])[0].get("v", {}).get("lp"), np.nan)
+    except Exception:
+        ltp = np.nan
+
+    try:
+        chain_res = fyers.optionchain(data={"symbol": eq_symbol, "strikecount": 50})
+    except Exception as exc:
+        logger.warning("Option chain failed for %s: %s", symbol, exc)
+        return pd.DataFrame(columns=["Underlying", "Strike", "CE Symbol", "CE LTP", "PE Symbol", "PE LTP"])
+
+    chain = ((chain_res or {}).get("data") or {}).get("optionsChain", [])
+    if not chain:
+        return pd.DataFrame(columns=["Underlying", "Strike", "CE Symbol", "CE LTP", "PE Symbol", "PE LTP"])
+
+    rows = []
+    for item in chain:
+        strike = strike_of(item)
+        typ = option_type_of(item)
+        if pd.isna(strike) or typ not in {"CE", "PE"}:
+            continue
+        rows.append({
+            "Strike": strike,
+            "Type": typ,
+            "OptionSymbol": option_symbol_of(item),
+            "OptionLTP": option_ltp_of(item),
+        })
+    if not rows:
+        return pd.DataFrame(columns=["Underlying", "Strike", "CE Symbol", "CE LTP", "PE Symbol", "PE LTP"])
+
+    oc = pd.DataFrame(rows)
+    step = nearest_step(ltp if pd.notna(ltp) else oc["Strike"].median())
+    if pd.notna(ltp):
+        atm = round(ltp / step) * step
+    else:
+        atm = oc["Strike"].median()
+    strikes = sorted(oc["Strike"].dropna().unique(), key=lambda x: abs(x - atm))[:pair_count]
+    strikes = sorted(strikes)
+
+    final_rows = []
+    for strike in strikes:
+        sub = oc[oc["Strike"] == strike]
+        ce = sub[sub["Type"] == "CE"].head(1)
+        pe = sub[sub["Type"] == "PE"].head(1)
+        final_rows.append({
+            "Underlying": symbol,
+            "Underlying LTP": round(safe_float(ltp, np.nan), 2) if pd.notna(ltp) else np.nan,
+            "ATM Strike": atm,
+            "Strike": strike,
+            "CE Symbol": ce["OptionSymbol"].iloc[0] if not ce.empty else "",
+            "CE LTP": round(safe_float(ce["OptionLTP"].iloc[0], 0.0), 2) if not ce.empty else 0.0,
+            "PE Symbol": pe["OptionSymbol"].iloc[0] if not pe.empty else "",
+            "PE LTP": round(safe_float(pe["OptionLTP"].iloc[0], 0.0), 2) if not pe.empty else 0.0,
+        })
+    return pd.DataFrame(final_rows)
+
+
+def build_stock_option_lists(candidates_df: pd.DataFrame) -> pd.DataFrame:
+    if candidates_df is None or candidates_df.empty or "Symbol" not in candidates_df.columns:
+        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "PE Symbol", "PE LTP"])
+    frames = []
+    for symbol in candidates_df["Symbol"].dropna().astype(str):
+        frame = fetch_option_pairs(symbol)
+        if not frame.empty:
+            frames.append(frame)
+    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "PE Symbol", "PE LTP"])
+
+
+def format_cell(col: str, val) -> str:
     if pd.isna(val):
         return ""
     if col == "% Change":
         return f"{float(val):.2f}%"
-    if col == "IVP":
-        return f"{float(val):.2f}"
     if isinstance(val, (int, float, np.integer, np.floating)):
         return f"{float(val):.2f}"
     return str(val)
 
 
-def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
+    html = [f"<h3>{title}</h3>"]
     if df is None or df.empty:
-        return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-
-    base = df.copy()
-
-    strict_long = base[
-        (base["% Change"] > 0)
-        & (base["Cumulative +DI"] > base["Cumulative -DI"])
-    ].copy()
-    strict_short = base[
-        (base["% Change"] < 0)
-        & (base["Cumulative -DI"] > base["Cumulative +DI"])
-    ].copy()
-
-    long_df = strict_long.sort_values(
-        by=["Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
-        ascending=[False, False, False, False],
-        na_position="last",
-    ).drop_duplicates(subset=["Symbol"]).head(15)
-
-    short_df = strict_short.sort_values(
-        by=["Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
-        ascending=[False, False, False, True],
-        na_position="last",
-    ).drop_duplicates(subset=["Symbol"]).head(15)
-
-    long_df = (
-        long_df[[c for c in EMAIL_DISPLAY_COLS if c in long_df.columns]]
-        if not long_df.empty
-        else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-    )
-    short_df = (
-        short_df[[c for c in EMAIL_DISPLAY_COLS if c in short_df.columns]]
-        if not short_df.empty
-        else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-    )
-
-    return long_df, short_df
+        html.append("<p>No data found.</p>")
+        return "\n".join(html)
+    view = df[[c for c in columns if c in df.columns]].copy()
+    html.append("<table border='1' cellspacing='0' cellpadding='6' style='border-collapse:collapse;font-family:Arial,sans-serif;font-size:12px;'>")
+    html.append("<tr>" + "".join([f"<th style='background:#f2f2f2'>{c}</th>" for c in view.columns]) + "</tr>")
+    for _, row in view.iterrows():
+        html.append("<tr>" + "".join([f"<td>{format_cell(c, row[c])}</td>" for c in view.columns]) + "</tr>")
+    html.append("</table>")
+    return "\n".join(html)
 
 
-def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
-    if df is None or df.empty:
-        return '<p style="color:#cbd5e1;font-family:Arial,sans-serif;">No candidates found.</p>'
+def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, long_opt_df: pd.DataFrame, short_opt_df: pd.DataFrame, attachments: List[str]) -> bool:
+    smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+    smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+    sender_email = os.environ.get("SENDER_EMAIL")
+    sender_password = os.environ.get("SENDER_PASSWORD")
+    recipient_email = os.environ.get("RECIPIENT_EMAIL")
 
-    df_slice = df.head(max_rows).copy()
-    cols = [c for c in EMAIL_DISPLAY_COLS if c in df_slice.columns]
-    if not cols:
-        return '<p style="color:#cbd5e1;font-family:Arial,sans-serif;">No candidates found.</p>'
+    if not sender_email or not sender_password or not recipient_email:
+        logger.warning("Email env vars missing. Skipping email.")
+        return False
 
-    header_cells = ''.join(
-        f'<th style="padding:8px 10px;border:1px solid #4b5563;background:#374151;color:#f9fafb;font-size:12px;font-weight:700;text-align:center;white-space:nowrap;">{c}</th>'
-        for c in cols
-    )
+    scan_time = datetime.now().strftime("%d %b %Y, %H:%M")
+    html = f"""
+    <html>
+    <body>
+        <h2>Intraday Vol Iteration Alert</h2>
+        <p>Scan completed at {scan_time}.</p>
+        {dataframe_to_html(long_df, EMAIL_DISPLAY_COLS, 'Stock Long Candidates')}
+        <br>
+        {dataframe_to_html(short_df, EMAIL_DISPLAY_COLS, 'Stock Short Candidates')}
+        <br>
+        {dataframe_to_html(long_opt_df, ['Underlying', 'Underlying LTP', 'ATM Strike', 'Strike', 'CE Symbol', 'CE LTP', 'PE Symbol', 'PE LTP'], 'Stock Long Candidate Options (5 CE/PE strikes)')}
+        <br>
+        {dataframe_to_html(short_opt_df, ['Underlying', 'Underlying LTP', 'ATM Strike', 'Strike', 'CE Symbol', 'CE LTP', 'PE Symbol', 'PE LTP'], 'Stock Short Candidate Options (5 CE/PE strikes)')}
+        <p>Attached CSVs: summary, long options, short options.</p>
+    </body>
+    </html>
+    """
 
-    rows_html = []
-    signal_cols = {
-        '5m_Signal', '15m_Signal', '30m_Signal', '60m_Signal',
-        'Bull_Signal', 'Bear_Signal', 'Overall_Signal', 'Volatility State', 'Price_Lead_Status'
-    }
+    msg = MIMEMultipart()
+    msg["From"] = sender_email
+    msg["To"] = recipient_email
+    msg["Subject"] = f"Intraday Vol Iteration Alert - {datetime.now().strftime('%d %b %H:%M')}"
+    msg.attach(MIMEText(html, "html", "utf-8"))
 
-    for _, row in df_slice.iterrows():
-        cells = []
-        for c in cols:
-            val = format_value(c, row.get(c))
-            bg = '#2f3542'
-            fg = '#f3f4f6'
-            extra = 'text-align:center;'
-            if c in signal_cols:
-                bg = signal_color(val)
-                fg = text_color_for_bg(bg)
-            elif c == 'Symbol':
-                bg = '#374151'
-                fg = '#f9fafb'
-                extra = 'text-align:left;font-weight:700;'
-            elif c == '% Change':
-                try:
-                    num = float(str(val).replace('%', ''))
-                    if num > 0:
-                        bg = '#2e7d32'
-                        fg = '#e8f5e9'
-                    elif num < 0:
-                        bg = '#a83232'
-                        fg = '#ffebee'
-                    else:
-                        bg = '#4b5563'
-                        fg = '#f3f4f6'
-                except Exception:
-                    bg = '#4b5563'
-                    fg = '#f3f4f6'
-            elif c in {'LTP', 'IVP'}:
-                bg = '#303643'
-                fg = '#f3f4f6'
-            else:
-                bg = '#3b4252'
-                fg = '#f3f4f6'
-            cells.append(f'<td style="padding:7px 9px;border:1px solid #4b5563;background:{bg};color:{fg};font-size:12px;font-weight:600;white-space:nowrap;{extra}">{val}</td>')
-        rows_html.append('<tr>' + ''.join(cells) + '</tr>')
-    return ('<div style="overflow-x:auto;margin:10px 0 18px 0;">' '<table style="border-collapse:collapse;background:#1f2937;font-family:Arial,sans-serif;">' f'<thead><tr>{header_cells}</tr></thead>' f'<tbody>{"".join(rows_html)}</tbody>' '</table></div>')
+    for path in attachments:
+        if path and os.path.exists(path):
+            with open(path, "rb") as f:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(path)}")
+            msg.attach(part)
 
-def send_email_with_tables(
-    long_df: pd.DataFrame,
-    short_df: pd.DataFrame,
-    csv_filename: str,
-    detail_csv_filename: str,
-    index_long_df: pd.DataFrame = None,
-    index_short_df: pd.DataFrame = None,
-    index_iter_csv_filename: Optional[str] = None,
-) -> bool:
-    """Send email with index and stock long/short tables and attach CSVs."""
     try:
-        if index_long_df is None:
-            index_long_df = pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-        if index_short_df is None:
-            index_short_df = pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-
-        scan_time = datetime.now().strftime("%d %b %Y, %H:%M")
-
-        index_long_html = df_to_html_table(index_long_df)
-        index_short_html = df_to_html_table(index_short_df)
-        stock_long_html = df_to_html_table(long_df)
-        stock_short_html = df_to_html_table(short_df)
-
-        html_body = f"""
-<html>
-  <body style="font-family: Arial, sans-serif; font-size: 13px;">
-    <h2>Intraday Vol Iteration Alert</h2>
-    <p>Scan completed at {scan_time}.</p>
-
-    <h3>Index Long Candidates</h3>
-    {index_long_html}
-
-    <h3>Index Short Candidates</h3>
-    {index_short_html}
-
-    <h3>Stock Long Candidates (from long indices)</h3>
-    {stock_long_html}
-
-    <h3>Stock Short Candidates (from short indices)</h3>
-    {stock_short_html}
-
-    <p>Attached CSVs: summary &amp; intraday iterations.</p>
-  </body>
-</html>
-"""
-
-        msg = MIMEMultipart()
-        msg["From"] = sender_email
-        msg["To"] = recipient_email
-        msg["Subject"] = (
-            f"Intraday Vol Iteration Alert - {datetime.now().strftime('%d %b %H:%M')}"
-        )
-        msg.attach(MIMEText(html_body, "html", "utf-8"))
-
-        for filename in [csv_filename, detail_csv_filename, index_iter_csv_filename]:
-            if not filename or not isinstance(filename, (str, bytes, os.PathLike)):
-                continue
-            if os.path.exists(filename):
-                with open(filename, "rb") as f:
-                    part = MIMEBase("application", "octet-stream")
-                    part.set_payload(f.read())
-                encoders.encode_base64(part)
-                part.add_header(
-                    "Content-Disposition",
-                    f"attachment; filename={os.path.basename(filename)}",
-                )
-                msg.attach(part)
-
         if smtp_port == 465:
             with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=40) as server:
                 server.login(sender_email, sender_password)
@@ -1099,562 +510,78 @@ def send_email_with_tables(
                 server.ehlo()
                 server.login(sender_email, sender_password)
                 server.send_message(msg)
-
-        logger.info(f"EMAIL Sent successfully to {recipient_email}")
+        logger.info("Email sent to %s", recipient_email)
         return True
-    except Exception as e:
-        logger.error(f"EMAIL Failed to send email: {type(e).__name__}: {e}")
+    except Exception as exc:
+        logger.error("Email failed: %s", exc)
         return False
 
 
-
-##############################
-# INDEX-FIRST EXTENSIONS
-##############################
-
-def normalize_index_name(x: str) -> str:
-    s = str(x).strip().upper()
-    s = s.replace('-INDEX', '')
-    s = s.replace('&', ' AND ')
-    s = re.sub(r'\s+', ' ', s).strip()
-    compact_map = {
-        'NIFTY50': 'NIFTY 50',
-        'NIFTYNEXT50': 'NIFTY NEXT 50',
-        'NIFTYBANK': 'NIFTY BANK',
-        'NIFTYAUTO': 'NIFTY AUTO',
-        'NIFTYENERGY': 'NIFTY ENERGY',
-        'NIFTYIT': 'NIFTY IT',
-        'NIFTYPHARMA': 'NIFTY PHARMA',
-        'NIFTYMETAL': 'NIFTY METAL',
-        'NIFTYFMCG': 'NIFTY FMCG',
-        'NIFTYREALTY': 'NIFTY REALTY',
-        'NIFTYPSUBANK': 'NIFTY PSU BANK',
-        'NIFTYPRIVATEBANK': 'NIFTY PRIVATE BANK',
-        'NIFTYFINANCIALSERVICES': 'NIFTY FINANCIAL SERVICES',
-        'NIFTYFINSERVICE': 'NIFTY FINANCIAL SERVICES',
-        'NIFTYOILGAS': 'NIFTY OIL & GAS',
-    }
-    key = s.replace(' ', '')
-    return compact_map.get(key, s)
+def scan_symbol(symbol: str) -> Optional[Dict[str, object]]:
+    eq = format_eq_symbol(symbol)
+    daily_df = get_history(eq, "D", max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
+    intra_df = get_history(eq, "5", INTRADAY_LOOKBACK_DAYS)
+    if daily_df.empty or intra_df.empty:
+        return None
+    summary = summarize_intraday(intra_df, daily_df)
+    if not summary:
+        return None
+    summary["Symbol"] = symbol
+    return summary
 
 
-def format_fyers_index_symbol(symbol: str) -> str:
-    raw = str(symbol).strip()
-    if raw.startswith('NSE:'):
-        return raw
-    named = normalize_index_name(raw)
-    reverse_map = {
-        'NIFTY 50': 'NIFTY50-INDEX',
-        'NIFTY NEXT 50': 'NIFTYNEXT50-INDEX',
-        'NIFTY BANK': 'NIFTYBANK-INDEX',
-        'NIFTY AUTO': 'NIFTYAUTO-INDEX',
-        'NIFTY ENERGY': 'NIFTYENERGY-INDEX',
-        'NIFTY IT': 'NIFTYIT-INDEX',
-        'NIFTY PHARMA': 'NIFTYPHARMA-INDEX',
-        'NIFTY METAL': 'NIFTYMETAL-INDEX',
-        'NIFTY FMCG': 'NIFTYFMCG-INDEX',
-        'NIFTY REALTY': 'NIFTYREALTY-INDEX',
-        'NIFTY PSU BANK': 'NIFTYPSUBANK-INDEX',
-        'NIFTY PRIVATE BANK': 'NIFTYPVTBANK-INDEX',
-        'NIFTY FINANCIAL SERVICES': 'NIFTYFINSERVICE-INDEX',
-        'NIFTY OIL & GAS': 'NIFTYOILGAS-INDEX',
-    }
-    mapped = reverse_map.get(named, raw if raw.endswith('-INDEX') else raw)
-    return mapped if mapped.startswith('NSE:') else f'NSE:{mapped}'
+def ensure_output_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
 
 
-def discover_csv_files() -> list:
-    csvs = []
-    for base in ['.', 'sectors']:
-        if os.path.isdir(base):
-            for dirpath, _, filenames in os.walk(base):
-                for fname in filenames:
-                    if fname.lower().endswith('.csv'):
-                        csvs.append(os.path.join(dirpath, fname))
-    return sorted(set(csvs))
-
-
-def load_index_symbols() -> List[str]:
-    csv_files = discover_csv_files()
-    index_values = []
-    for path in csv_files:
-        try:
-            df = pd.read_csv(path)
-            norm_cols = {str(c).strip().lower().replace(' ', '').replace('_', ''): c for c in df.columns}
-            idx_cols = [norm_cols[k] for k in ['belongstoindices', 'belongstoindex', 'indices'] if k in norm_cols]
-            if idx_cols:
-                for col in idx_cols:
-                    for cell in df[col].dropna().astype(str):
-                        parts = [normalize_index_name(p) for p in re.split(r'[,;/|]+', cell) if str(p).strip()]
-                        index_values.extend(parts)
-            elif 'index' in norm_cols:
-                index_values.extend([normalize_index_name(x) for x in df[norm_cols['index']].dropna().astype(str)])
-        except Exception:
-            continue
-    index_values = [x for x in index_values if x and x != 'UNMAPPED SECTORAL']
-    index_values = list(dict.fromkeys(index_values))
-    if not index_values:
-        raise ValueError('No index values found in any CSV file (including sectors folder and mapping CSVs)')
-    logger.info(f"INDEX Loaded index universe from CSV content ({len(index_values)}): {index_values}")
-    return index_values
-
-
-def resolve_mapping_csv() -> str:
-    candidates = []
-    for path in discover_csv_files():
-        try:
-            df = pd.read_csv(path)
-            norm_cols = {str(c).strip().lower().replace(' ', '').replace('_', ''): c for c in df.columns}
-            if 'symbol' in norm_cols and 'belongstoindices' in norm_cols:
-                candidates.append((len(df), path))
-        except Exception:
-            continue
-    if not candidates:
-        raise FileNotFoundError('No mapping CSV found with Symbol and Belongs_To_Indices')
-    candidates.sort(reverse=True)
-    chosen = candidates[0][1]
-    logger.info(f"CSV Mapping-selected file: {chosen}")
-    return chosen
-
-
-
-
-def filter_stock_df_by_index_membership(stock_df: pd.DataFrame, index_symbols: List[str]) -> pd.DataFrame:
-    if stock_df is None or stock_df.empty or not index_symbols:
-        return stock_df.iloc[0:0].copy() if isinstance(stock_df, pd.DataFrame) else pd.DataFrame()
-    csv_path = resolve_mapping_csv()
-    map_df = pd.read_csv(csv_path)
-    norm_cols = {str(c).strip().lower().replace(' ', '').replace('_', ''): c for c in map_df.columns}
-    symbol_col = norm_cols['symbol']
-    idx_col = norm_cols['belongstoindices']
-    wanted = {normalize_index_name(x) for x in index_symbols if str(x).strip()}
-
-    symbol_to_indices = {}
-    for _, row in map_df[[symbol_col, idx_col]].dropna(subset=[symbol_col]).iterrows():
-        sym = str(row[symbol_col]).strip()
-        parts = [normalize_index_name(p) for p in re.split(r'[,;/|]+', str(row[idx_col])) if str(p).strip()]
-        symbol_to_indices[sym] = set(parts)
-
-    keep = []
-    for sym in stock_df['Symbol'].astype(str):
-        keep.append(bool(symbol_to_indices.get(sym, set()) & wanted))
-    return stock_df.loc[keep].copy()
-
-def load_fno_symbols_for_indices(active_index_symbols: List[str]) -> List[str]:
-    csv_path = resolve_mapping_csv()
-    df = pd.read_csv(csv_path)
-    norm_cols = {str(c).strip().lower().replace(' ', '').replace('_', ''): c for c in df.columns}
-    symbol_col = norm_cols['symbol']
-    idx_col = norm_cols['belongstoindices']
-    wanted = {normalize_index_name(x) for x in active_index_symbols if str(x).strip()}
-    logger.info(f"FNO Matching selected indices: {sorted(wanted)}")
-    def row_matches(cell) -> bool:
-        parts = [normalize_index_name(p) for p in re.split(r'[,;/|]+', str(cell)) if str(p).strip()]
-        return any(p in wanted for p in parts)
-    filt = df[df[idx_col].apply(row_matches)].copy()
-    symbols = sorted(filt[symbol_col].dropna().astype(str).str.strip().unique())
-    logger.info(f"FNO Filtered {len(symbols)} stocks from {csv_path} using {idx_col}")
-    return symbols
-
-
-def scan_symbol_universe(symbols: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    if not symbols:
-        return pd.DataFrame(), pd.DataFrame()
-    rows, iteration_rows = [], []
-    total = len(symbols)
-    for idx, sym in enumerate(symbols, start=1):
-        logger.info(f"CORE [{idx}/{total}] Processing {sym}")
-        fyers_sym = format_fyers_symbol(sym)
-        daily_df = get_fyers_history(fyers_sym, resolution='D', days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
-        intra_df = get_fyers_history(fyers_sym, resolution='5', days_back=INTRADAY_LOOKBACK_DAYS)
-        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
-        iv_info = compute_iv_proxies(daily_df)
-        prev_close = float(daily_df['close'].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2 and 'close' in daily_df.columns) else None
-        ltp = iter_summary.get('LTP')
-        pct_change = ((float(ltp) - prev_close) / prev_close * 100.0) if (ltp is not None and prev_close is not None and prev_close != 0) else 0.0
-        if not iter_detail.empty:
-            iter_detail.insert(0, 'Symbol', sym)
-            iter_detail.insert(1, '% Change', pct_change)
-            iteration_rows.append(iter_detail)
-        rows.append({
-            'Symbol': sym,
-            'LTP': ltp,
-            '% Change': pct_change,
-            'Current Volume': iter_summary.get('Current Volume'),
-            '10 Day Relative Volume': iter_summary.get('10 Day Relative Volume'),
-            '20 Day Relative Volume': iter_summary.get('20 Day Relative Volume'),
-            'Cumulative RSI': iter_summary.get('Cumulative RSI'),
-            'Cumulative OBV': iter_summary.get('Cumulative OBV'),
-            'Cumulative VWAP': iter_summary.get('Cumulative VWAP'),
-            'VWAP Z-Score': iter_summary.get('VWAP Z-Score'),
-            'Total Iterations': iter_summary.get('Total Iterations'),
-            'Last Iteration Minutes': iter_summary.get('Last Iteration Minutes'),
-            'Last Iteration Time': iter_summary.get('Last Iteration Time'),
-            'Cumulative KER': iter_summary.get('Cumulative KER'),
-            'Cumulative +DI': iter_summary.get('Cumulative +DI'),
-            'Cumulative -DI': iter_summary.get('Cumulative -DI'),
-            'Cumulative ADX': iter_summary.get('Cumulative ADX'),
-            'Survival Score': iter_summary.get('Survival Score'),
-            'Survival_Num': iter_summary.get('Survival_Num'),
-            'HOD': iter_summary.get('HOD'),
-            'Strike_Distance': iter_summary.get('Strike_Distance'),
-            'Last_5m_Volume': iter_summary.get('Last_5m_Volume'),
-            'Volume_1h_Avg_5m': iter_summary.get('Volume_1h_Avg_5m'),
-            'OBV_30m_Delta': iter_summary.get('OBV_30m_Delta'),
-            'RSI_30m_Delta': iter_summary.get('RSI_30m_Delta'),
-            'Price_Lead_Status': iter_summary.get('Price_Lead_Status', 'NORMAL'),
-            'IVP': iv_info.get('IVP'),
-            'Volatility State': iv_info.get('Volatility State'),
-        })
-    return pd.DataFrame(rows), (pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame())
-
-
-def build_index_strength_maps(index_long_df: pd.DataFrame, index_short_df: pd.DataFrame) -> Tuple[Dict[str, float], Dict[str, float]]:
-    long_map, short_map = {}, {}
-    if index_long_df is not None and not index_long_df.empty and 'Symbol' in index_long_df.columns:
-        work = index_long_df.copy().reset_index(drop=True)
-        base_n = max(len(work), 1)
-        for i, row in work.iterrows():
-            sym = normalize_index_name(row.get('Symbol', ''))
-            strength = float(base_n - i)
-            if pd.notna(row.get('Bull Rank')):
-                strength += float(row.get('Bull Rank', 0))
-            if pd.notna(row.get('Rank Delta')) and float(row.get('Rank Delta', 0)) > 0:
-                strength += float(row.get('Rank Delta', 0))
-            if sym:
-                long_map[sym] = strength
-    if index_short_df is not None and not index_short_df.empty and 'Symbol' in index_short_df.columns:
-        work = index_short_df.copy().reset_index(drop=True)
-        base_n = max(len(work), 1)
-        for i, row in work.iterrows():
-            sym = normalize_index_name(row.get('Symbol', ''))
-            strength = float(base_n - i)
-            if pd.notna(row.get('Bear Rank')):
-                strength += float(row.get('Bear Rank', 0))
-            rank_delta = row.get('Rank Delta')
-            if pd.notna(rank_delta) and float(rank_delta) < 0:
-                strength += abs(float(rank_delta))
-            if sym:
-                short_map[sym] = strength
-    return long_map, short_map
-
-def apply_soft_index_boost(stock_df: pd.DataFrame, target_index_symbols: List[str], strength_map: Dict[str, float], direction: str) -> pd.DataFrame:
-    if stock_df is None or stock_df.empty:
-        return stock_df
-    out = stock_df.copy()
-    csv_path = resolve_mapping_csv()
-    map_df = pd.read_csv(csv_path)
-    norm_cols = {str(c).strip().lower().replace(' ', '').replace('_', ''): c for c in map_df.columns}
-    symbol_col = norm_cols['symbol']
-    idx_col = norm_cols['belongstoindices']
-    target_set = {normalize_index_name(x) for x in target_index_symbols if str(x).strip()}
-    symbol_to_indices = {}
-    for _, row in map_df[[symbol_col, idx_col]].dropna(subset=[symbol_col]).iterrows():
-        sym = str(row[symbol_col]).strip()
-        parts = [normalize_index_name(p) for p in re.split(r'[,;/|]+', str(row[idx_col])) if str(p).strip()]
-        symbol_to_indices[sym] = set(parts)
-    boosts = []
-    matched_indices = []
-    for sym in out['Symbol'].astype(str):
-        member_indices = symbol_to_indices.get(sym, set())
-        relevant = member_indices & target_set
-        if relevant:
-            best_idx = max(relevant, key=lambda x: strength_map.get(x, 0.0))
-            boost = float(strength_map.get(best_idx, 0.0)) * float(INDEX_SOFT_BOOST_WEIGHT)
-            matched_indices.append(best_idx)
-        else:
-            best_idx = ''
-            boost = 0.0
-            matched_indices.append(best_idx)
-        boosts.append(boost)
-    out['Mapped_Index_For_Boost'] = matched_indices
-    out['Index_Boost'] = boosts
-    if direction.lower() == 'long':
-        base_col = 'Bull Rank' if 'Bull Rank' in out.columns else None
-        boosted_col = 'Bull Rank Boosted'
-        sort_cols = [boosted_col, 'Cumulative KER', 'Survival_Num', 'Cumulative ADX', '% Change']
-        ascending = [False, False, False, False, False]
-    else:
-        base_col = 'Bear Rank' if 'Bear Rank' in out.columns else None
-        boosted_col = 'Bear Rank Boosted'
-        sort_cols = [boosted_col, 'Cumulative KER', 'Survival_Num', 'Cumulative ADX', '% Change']
-        ascending = [False, False, False, False, True]
-    if base_col is not None:
-        out[boosted_col] = pd.to_numeric(out[base_col], errors='coerce').fillna(0.0) + pd.to_numeric(out['Index_Boost'], errors='coerce').fillna(0.0)
-    else:
-        out[boosted_col] = pd.to_numeric(out['Index_Boost'], errors='coerce').fillna(0.0)
-    out = out.sort_values(by=sort_cols, ascending=ascending, na_position='last').drop_duplicates(subset=['Symbol'])
-    return out
-
-def scan_index_universe() -> pd.DataFrame:
-    symbols = load_index_symbols()
-    rows = []
-    for sym in symbols:
-        fyers_sym = format_fyers_index_symbol(sym)
-        daily_df = get_fyers_history(fyers_sym, resolution='D', days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
-        intra_df = get_fyers_history(fyers_sym, resolution='5', days_back=INTRADAY_LOOKBACK_DAYS)
-        iter_summary, _ = compute_iteration_volume_profile(intra_df)
-        iv_info = compute_iv_proxies(daily_df)
-        prev_close = float(daily_df['close'].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2 and 'close' in daily_df.columns) else None
-        ltp = iter_summary.get('LTP')
-        pct_change = ((float(ltp) - prev_close) / prev_close * 100.0) if (ltp is not None and prev_close is not None and prev_close != 0) else 0.0
-        rows.append({
-            'Symbol': normalize_index_name(sym),
-            'LTP': ltp,
-            '% Change': pct_change,
-            'IVP': iv_info.get('IVP'),
-            'Volatility State': iv_info.get('Volatility State'),
-            'Last Iteration Time': iter_summary.get('Last Iteration Time', ''),
-            'Cumulative KER': iter_summary.get('Cumulative KER', np.nan),
-            'Cumulative +DI': iter_summary.get('Cumulative +DI', np.nan),
-            'Cumulative -DI': iter_summary.get('Cumulative -DI', np.nan),
-            'Cumulative ADX': iter_summary.get('Cumulative ADX', np.nan),
-            'Survival_Num': iter_summary.get('Survival_Num', 0.0),
-            'Price_Lead_Status': iter_summary.get('Price_Lead_Status', 'NORMAL'),
-        })
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df = add_signal_columns(derive_rank_columns(df))
-    return df
-
-
-
-
-
-
-def build_index_iteration_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
-    if detail_df is None or detail_df.empty:
-        return pd.DataFrame()
-
-    work = detail_df.copy()
-    required = [
-        "Symbol", "% Change", "Iteration No", "Iteration Minutes", "Iteration Time",
-        "Current Volume", "10 Day Relative Volume", "20 Day Relative Volume",
-        "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score",
-        "Range_Expansion", "Volume_Expansion", "Delta_Expansion",
-        "Price_Leading_Flag", "Price_Lead_Streak",
-    ]
-    missing = [c for c in required if c not in work.columns]
-    if missing:
-        logger.warning(f"INDEX Missing columns for index detail build: {missing}")
-        return pd.DataFrame()
-
-    symbol_to_indices = load_symbol_to_indices_map("sectors")
-    if not symbol_to_indices:
-        logger.warning("INDEX No symbol-to-index mapping found from sectors CSVs.")
-        return pd.DataFrame()
-
-    work["Symbol"] = work["Symbol"].astype(str).str.strip().str.upper()
-    work["Index Name"] = work["Symbol"].map(symbol_to_indices)
-    work = work[work["Index Name"].notna()].copy()
-    if work.empty:
-        logger.warning("INDEX No mapped symbols found for sectoral index detail build.")
-        return pd.DataFrame()
-
-    work = work.explode("Index Name").reset_index(drop=True)
-    work["Index Name"] = work["Index Name"].astype(str).str.strip()
-
-    numeric_cols = [
-        "% Change", "Iteration No", "Iteration Minutes", "Current Volume",
-        "10 Day Relative Volume", "20 Day Relative Volume", "Cumulative RSI",
-        "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score",
-        "Range_Expansion", "Volume_Expansion", "Delta_Expansion",
-        "Price_Lead_Streak",
-    ]
-    for col in numeric_cols:
-        if col in work.columns:
-            work[col] = pd.to_numeric(work[col], errors="coerce")
-
-    work["Price_Leading_Flag"] = work["Price_Leading_Flag"].astype(str).str.lower().isin(["true", "1", "yes"])
-
-    group_cols = ["Index Name", "Iteration No", "Iteration Minutes", "Iteration Time"]
-    agg_spec = {
-        "% Change": "mean",
-        "Current Volume": "sum",
-        "10 Day Relative Volume": "mean",
-        "20 Day Relative Volume": "mean",
-        "Cumulative RSI": "mean",
-        "Cumulative OBV": "sum",
-        "Cumulative VWAP": "mean",
-        "VWAP Z-Score": "mean",
-        "Range_Expansion": "mean",
-        "Volume_Expansion": "mean",
-        "Delta_Expansion": "mean",
-        "Price_Leading_Flag": "sum",
-        "Price_Lead_Streak": "max",
-    }
-    agg_spec = {k: v for k, v in agg_spec.items() if k in work.columns}
-
-    out = work.groupby(group_cols, dropna=False).agg(agg_spec).reset_index()
-    out["Symbol"] = out["Index Name"]
-    out["Bucket"] = "INDEX"
-    out["Price_Leading_Flag"] = out["Price_Leading_Flag"].fillna(0).astype(int) > 0
-
-    def _lead_status(row):
-        streak = float(row.get("Price_Lead_Streak", 0) or 0)
-        flag = bool(row.get("Price_Leading_Flag", False))
-        if flag and streak >= 3:
-            return "STRONG_PRICE_LEAD_FADE"
-        if flag and streak >= 2:
-            return "PRICE_LEADING_FADE_RISK"
-        if flag:
-            return "EARLY_PRICE_LEAD"
-        return "NORMAL"
-
-    out["Price_Lead_Status"] = out.apply(_lead_status, axis=1)
-
-    final_cols = [
-        "Symbol", "Index Name", "% Change", "Iteration No", "Iteration Minutes", "Iteration Time",
-        "Current Volume", "10 Day Relative Volume", "20 Day Relative Volume",
-        "Cumulative RSI", "Cumulative OBV", "Cumulative VWAP", "VWAP Z-Score",
-        "Range_Expansion", "Volume_Expansion", "Delta_Expansion",
-        "Price_Leading_Flag", "Price_Lead_Streak", "Price_Lead_Status", "Bucket",
-    ]
-    for col in final_cols:
-        if col not in out.columns:
-            out[col] = np.nan
-
-    out = out[final_cols].sort_values(["Index Name", "Iteration No", "Iteration Minutes"]).reset_index(drop=True)
-    return out
-
-def get_next_thursday() -> str:
-    today = datetime.now().date()
-    days_ahead = (3 - today.weekday()) % 7
-    if days_ahead == 0:
-        days_ahead = 7
-    return (today + timedelta(days=days_ahead)).strftime('%Y-%m-%d')
-
-
-def scan_options_logic(long_symbols, short_symbols):
-    global fyers
-    logger.info(">>> STARTING FORCED OPTIONS SCAN <<<")
-    if fyers is None:
-        logger.error("Fyers client not initialized!")
-        return
-
-    symbols = []
-    for s in list(long_symbols) + list(short_symbols):
-        s = str(s).strip().upper()
-        if s and s not in symbols:
-            symbols.append(s)
-
-    if not symbols:
-        logger.info("No symbols available for options scan")
-        logger.info(">>> OPTIONS SCAN COMPLETE <<<")
-        return
-
-    expiry_date = get_next_thursday()
-    logger.info(f"Using expiry_date={expiry_date} for options scan")
-
-    for s in symbols:
-        try:
-            fyers_symbol = f"NSE:{s}-EQ"
-            data = {"symbol": fyers_symbol, "strikecount": 20, "expiry_date": expiry_date}
-            res = fyers.optionchain(data=data)
-
-            if not res:
-                logger.warning(f"OPTIONS Empty response for {s}")
-                continue
-
-            if res.get("s") != "ok":
-                logger.warning(f"OPTIONS API error for {s}: {res.get('message') or res}")
-                continue
-
-            chain = res.get("data", {}).get("optionsChain", [])
-            if not chain:
-                logger.warning(f"OPTIONS No chain returned for {s} on {expiry_date}")
-                continue
-
-            logger.info(f"OPTIONS {s} contracts fetched: {len(chain)}")
-            for item in chain:
-                strike = item.get("strikePrice") or item.get("strike") or item.get("strike_price")
-                opt_type = str(item.get("optionType") or item.get("option_type") or "").upper()
-                oi = item.get("oi")
-                if oi is None:
-                    oi = item.get("openInterest")
-                if oi is None:
-                    oi = item.get("open_interest", 0)
-                if strike is not None:
-                    logger.info(f"  [{s}] [{opt_type}] Strike: {strike} | OI: {oi}")
-        except Exception as e:
-            logger.error(f"Scan Error for {s}: {e}")
-
-    logger.info(">>> OPTIONS SCAN COMPLETE <<<")
-
-def main_index_first():
-    logger.info('Starting Index-first FO Iteration Volume Volatility Scan')
+def main() -> None:
+    ensure_output_dir(OUTPUT_DIR)
     init_fyers()
+    if fyers is None:
+        raise RuntimeError("Fyers client initialization failed.")
 
-    df_indices = scan_index_universe()
-    if df_indices.empty:
-        raise ValueError('Index scan returned empty dataframe')
+    symbols = load_fno_symbols_from_sectors(SECTORS_DIR)
+    if not symbols:
+        raise FileNotFoundError(f"No F&O symbols found under '{SECTORS_DIR}'.")
 
-    df_indices = add_signal_columns(derive_rank_columns(df_indices))
-    index_long_df, index_short_df = build_candidate_tables(df_indices)
+    logger.info("Loaded %s symbols from sectors folder.", len(symbols))
+    rows = []
+    for i, symbol in enumerate(symbols, start=1):
+        logger.info("[%s/%s] Scanning %s", i, len(symbols), symbol)
+        row = scan_symbol(symbol)
+        if row:
+            rows.append(row)
 
-    long_index_symbols = index_long_df['Symbol'].dropna().astype(str).tolist() if not index_long_df.empty and 'Symbol' in index_long_df.columns else []
-    short_index_symbols = index_short_df['Symbol'].dropna().astype(str).tolist() if not index_short_df.empty and 'Symbol' in index_short_df.columns else []
+    if not rows:
+        raise RuntimeError("No symbols returned usable market data.")
 
-    logger.info(f'Long index symbols ({len(long_index_symbols)}): {long_index_symbols}')
-    logger.info(f'Short index symbols ({len(short_index_symbols)}): {short_index_symbols}')
+    summary_df = pd.DataFrame(rows)
+    ordered_cols = ["Symbol"] + [c for c in EMAIL_DISPLAY_COLS if c != "Symbol"] + [
+        "Bull Rank", "Bear Rank", "Rank Delta", "Cumulative +DI", "Cumulative -DI", "Cumulative ADX", "Cumulative RSI", "VWAP Z-Score"
+    ]
+    ordered_cols = [c for c in ordered_cols if c in summary_df.columns]
+    summary_df = summary_df[ordered_cols].sort_values(["Rank Delta", "% Change"], ascending=[False, False]).reset_index(drop=True)
 
-    union_stock_symbols = sorted(set(load_fno_symbols_for_indices(long_index_symbols + short_index_symbols)))
-    df_all, df_iter = scan_symbol_universe(union_stock_symbols)
-    if not df_all.empty:
-        df_all = add_signal_columns(derive_rank_columns(df_all))
+    long_df, short_df = choose_top_candidates(summary_df, top_n=10)
+    long_opt_df = build_stock_option_lists(long_df)
+    short_opt_df = build_stock_option_lists(short_df)
 
-    long_stock_source = filter_stock_df_by_index_membership(df_all, long_index_symbols)
-    short_stock_source = filter_stock_df_by_index_membership(df_all, short_index_symbols)
-    index_long_strength_map, index_short_strength_map = build_index_strength_maps(index_long_df, index_short_df)
-    long_stock_source = apply_soft_index_boost(long_stock_source, long_index_symbols, index_long_strength_map, direction='long') if not long_stock_source.empty else long_stock_source
-    short_stock_source = apply_soft_index_boost(short_stock_source, short_index_symbols, index_short_strength_map, direction='short') if not short_stock_source.empty else short_stock_source
-    long_df = long_stock_source.head(15).copy() if not long_stock_source.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-    short_df = short_stock_source.head(15).copy() if not short_stock_source.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-    long_df = filter_stock_df_by_index_membership(long_df, long_index_symbols) if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-    short_df = filter_stock_df_by_index_membership(short_df, short_index_symbols) if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-    long_df = long_df[[c for c in EMAIL_DISPLAY_COLS if c in long_df.columns]] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-    short_df = short_df[[c for c in EMAIL_DISPLAY_COLS if c in short_df.columns]] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    summary_csv = os.path.join(OUTPUT_DIR, f"fo_summary_{timestamp}.csv")
+    long_opt_csv = os.path.join(OUTPUT_DIR, f"fo_long_options_{timestamp}.csv")
+    short_opt_csv = os.path.join(OUTPUT_DIR, f"fo_short_options_{timestamp}.csv")
 
-    index_long_df = index_long_df[[c for c in EMAIL_DISPLAY_COLS if c in index_long_df.columns]] if not index_long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-    index_short_df = index_short_df[[c for c in EMAIL_DISPLAY_COLS if c in index_short_df.columns]] if not index_short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-
-    summary_parts = []
-    if not index_long_df.empty:
-        summary_parts.append(index_long_df.assign(Bucket='INDEX_LONG'))
-    if not index_short_df.empty:
-        summary_parts.append(index_short_df.assign(Bucket='INDEX_SHORT'))
-    if not long_df.empty:
-        summary_parts.append(long_df.assign(Bucket='STOCK_LONG_FROM_LONG_INDICES'))
-    if not short_df.empty:
-        summary_parts.append(short_df.assign(Bucket='STOCK_SHORT_FROM_SHORT_INDICES'))
-    summary_df = pd.concat(summary_parts, ignore_index=True) if summary_parts else pd.DataFrame()
-
-    detail_df = df_iter.copy() if isinstance(df_iter, pd.DataFrame) else pd.DataFrame()
-    if not detail_df.empty:
-        detail_df['Bucket'] = detail_df['Symbol'].astype(str).map(
-            lambda s: 'LONGINDEXSTOCKS' if s in set(long_df['Symbol'].astype(str)) else ('SHORTINDEXSTOCKS' if s in set(short_df['Symbol'].astype(str)) else 'OTHER')
-        )
-
-    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-    summary_csv = f'fo_idx_filtered_summary_{timestamp}.csv'
-    detail_csv = f'fo_idx_filtered_details_{timestamp}.csv'
     summary_df.to_csv(summary_csv, index=False)
-    detail_df.to_csv(detail_csv, index=False)
-    index_iter_csv = None
-    index_iter_df = build_index_iteration_summary(detail_df) if not detail_df.empty else pd.DataFrame()
-    if isinstance(index_iter_df, pd.DataFrame) and not index_iter_df.empty:
-        index_iter_csv = f'fo_idx_iteration_summary_{timestamp}.csv'
-        index_iter_df.to_csv(index_iter_csv, index=False)
-        logger.info(f'INDEX Iteration summary saved: {index_iter_csv}')
+    long_opt_df.to_csv(long_opt_csv, index=False)
+    short_opt_df.to_csv(short_opt_csv, index=False)
 
+    send_email(long_df, short_df, long_opt_df, short_opt_df, [summary_csv, long_opt_csv, short_opt_csv])
 
-    # Forced Scan Injection
-    scan_options_logic(long_df["Symbol"].tolist(), short_df["Symbol"].tolist())
-    send_email_with_tables(long_df, short_df, summary_csv, detail_csv, index_long_df=index_long_df, index_short_df=index_short_df, index_iter_csv_filename=(index_iter_csv if 'index_iter_csv' in locals() else None))
-    logger.info('Index-first Scan Pipeline Completed')
+    logger.info("Completed.")
+    logger.info("Summary CSV: %s", summary_csv)
+    logger.info("Long options CSV: %s", long_opt_csv)
+    logger.info("Short options CSV: %s", short_opt_csv)
 
-if __name__ == '__main__':
-    main_index_first()
 
 if __name__ == "__main__":
-    main_index_first()
+    main()
