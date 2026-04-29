@@ -184,20 +184,28 @@ def intraday_window_score(df: pd.DataFrame, window_minutes: int = 5) -> float:
     if pd.isna(first_close) or first_close == 0: return np.nan
     return round(((last_close - first_close) / first_close) * 100.0, 2)
 
-def previous_same_time_score(df: pd.DataFrame, window_minutes: int = 5) -> float:
+def previous_trading_day_same_time_score(df: pd.DataFrame, window_minutes: int = 5) -> float:
     if df is None or df.empty or len(df) < 4: return np.nan
     d = df.copy().sort_values("timestamp").reset_index(drop=True)
+    d["timestamp"] = pd.to_datetime(d["timestamp"])
     end_ts = pd.to_datetime(d["timestamp"].iloc[-1])
-    today_start = end_ts.replace(hour=9, minute=15, second=0, microsecond=0)
-    prev_data = d[d["timestamp"] < today_start].copy()
-    if prev_data.empty: return np.nan
-    cur_hour, cur_minute = end_ts.hour, end_ts.minute
-    prev_data["time_score"] = abs(prev_data["timestamp"].dt.hour - cur_hour) * 60 + abs(prev_data["timestamp"].dt.minute - cur_minute)
-    best_idx = prev_data["time_score"].idxmin()
-    if pd.isna(best_idx): return np.nan
-    prev_end = pd.to_datetime(prev_data.loc[best_idx, "timestamp"])
+    target_time = end_ts.time()
+    trading_days = sorted(d["timestamp"].dt.date.unique())
+    current_day = end_ts.date()
+    prev_days = [day for day in trading_days if day < current_day]
+    if not prev_days: return np.nan
+    prev_day = prev_days[-1]
+    prev_day_data = d[d["timestamp"].dt.date == prev_day].copy()
+    if prev_day_data.empty: return np.nan
+    same_time_rows = prev_day_data[(prev_day_data["timestamp"].dt.hour == target_time.hour) & (prev_day_data["timestamp"].dt.minute == target_time.minute)]
+    if same_time_rows.empty:
+        candidate_times = prev_day_data["timestamp"].sort_values()
+        if candidate_times.empty: return np.nan
+        prev_end = candidate_times.iloc[-1]
+    else:
+        prev_end = pd.to_datetime(same_time_rows.iloc[-1]["timestamp"])
     prev_start = prev_end - timedelta(minutes=window_minutes)
-    prev_window = prev_data[(prev_data["timestamp"] >= prev_start) & (prev_data["timestamp"] <= prev_end)]
+    prev_window = prev_day_data[(prev_day_data["timestamp"] >= prev_start) & (prev_day_data["timestamp"] <= prev_end)]
     if prev_window.empty or len(prev_window) < 2: return np.nan
     first_close = safe_float(prev_window["close"].iloc[0])
     last_close = safe_float(prev_window["close"].iloc[-1])
@@ -237,7 +245,7 @@ def build_iteration_history(df: pd.DataFrame, window_minutes: int = 5, iteration
         last_close = safe_float(cur["close"].iloc[-1])
         if pd.isna(first_close) or first_close == 0: continue
         current_score = round(((last_close - first_close) / first_close) * 100.0, 2)
-        prev_score = previous_same_time_score(d[d["timestamp"] <= end_ts].copy(), window_minutes)
+        prev_score = previous_trading_day_same_time_score(d[d["timestamp"] <= end_ts].copy(), window_minutes)
         delta, signal = compare_window_signal(current_score, prev_score)
         rows.append({
             "iteration": len(rows) + 1,
@@ -246,7 +254,7 @@ def build_iteration_history(df: pd.DataFrame, window_minutes: int = 5, iteration
             "window_start": start_ts.strftime("%H:%M"),
             "window_end": end_ts.strftime("%H:%M"),
             "current_window_score": current_score,
-            "previous_same_time_score": prev_score,
+            "previous_trading_day_same_time_score": prev_score,
             "window_delta": delta,
             "window_signal": signal,
             "close": last_close,
@@ -294,7 +302,7 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
     ltp = safe_float(close.iloc[-1])
     pct_change = ((ltp - prev_close) / prev_close * 100.0) if pd.notna(prev_close) and prev_close != 0 else 0.0
     current_win = intraday_window_score(df)
-    previous_win = previous_same_time_score(df)
+    previous_win = previous_trading_day_same_time_score(df)
     win_delta, win_signal = compare_window_signal(current_win, previous_win)
     iteration_history = build_iteration_history(df)
     bull = 0; bear = 0
@@ -506,7 +514,7 @@ def main() -> None:
     ce_df.to_csv(ce_csv, index=False)
     pe_df.to_csv(pe_csv, index=False)
     if iteration_df.empty:
-        iteration_df = pd.DataFrame(columns=["iteration", "Underlying", "Strike", "Strike Name", "Option Symbol", "timestamp", "window_minutes", "window_start", "window_end", "current_window_score", "previous_same_time_score", "window_delta", "window_signal", "close"])
+        iteration_df = pd.DataFrame(columns=["iteration", "Underlying", "Strike", "Strike Name", "Option Symbol", "timestamp", "window_minutes", "window_start", "window_end", "current_window_score", "previous_trading_day_same_time_score", "window_delta", "window_signal", "close"])
     iteration_df.to_csv(iter_csv, index=False)
     send_email(long_df, short_df, ce_df, pe_df, [summary_csv, ce_csv, pe_csv, iter_csv])
     logger.info("Completed.")
