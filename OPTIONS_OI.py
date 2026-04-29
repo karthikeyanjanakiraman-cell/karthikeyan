@@ -53,6 +53,10 @@ OPTION_EMAIL_COLS = [
     "Strike",
     "LTP",
     "% Change",
+    "OI",
+    "Volume",
+    "OBV",
+    "OI+Volume+OBV Score",
     "5m_Signal",
     "15m_Signal",
     "30m_Signal",
@@ -441,6 +445,8 @@ def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> p
         sub = oc[oc["Strike"] == strike]
         ce = sub[sub["Type"] == "CE"].head(1)
         pe = sub[sub["Type"] == "PE"].head(1)
+        ce_obv = compute_obv(get_history(f"NSE:{ce['OptionSymbol'].iloc[0]}", "5", INTRADAY_LOOKBACK_DAYS)) if not ce.empty and str(ce["OptionSymbol"].iloc[0]).strip() else np.nan
+        pe_obv = compute_obv(get_history(f"NSE:{pe['OptionSymbol'].iloc[0]}", "5", INTRADAY_LOOKBACK_DAYS)) if not pe.empty and str(pe["OptionSymbol"].iloc[0]).strip() else np.nan
         final_rows.append({
             "Underlying": symbol,
             "Underlying LTP": round(safe_float(ltp, np.nan), 2) if pd.notna(ltp) else np.nan,
@@ -450,12 +456,12 @@ def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> p
             "CE LTP": round(safe_float(ce["OptionLTP"].iloc[0], 0.0), 2) if not ce.empty else 0.0,
             "CE OI": round(safe_float(ce["OI"].iloc[0], np.nan), 2) if not ce.empty else np.nan,
             "CE Volume": round(safe_float(ce["Volume"].iloc[0], np.nan), 2) if not ce.empty else np.nan,
-            "CE OBV": np.nan,
+            "CE OBV": ce_obv,
             "PE Symbol": pe["OptionSymbol"].iloc[0] if not pe.empty else "",
             "PE LTP": round(safe_float(pe["OptionLTP"].iloc[0], 0.0), 2) if not pe.empty else 0.0,
             "PE OI": round(safe_float(pe["OI"].iloc[0], np.nan), 2) if not pe.empty else np.nan,
             "PE Volume": round(safe_float(pe["Volume"].iloc[0], np.nan), 2) if not pe.empty else np.nan,
-            "PE OBV": np.nan,
+            "PE OBV": pe_obv,
         })
     return pd.DataFrame(final_rows)
 
@@ -504,7 +510,20 @@ def scan_single_option(option_symbol: str, option_type: str, strike: float, unde
         "OBV": obv_val,
     }
 
+
+def option_liquidity_score(oi, volume, obv) -> float:
+    oi = safe_float(oi, 0.0)
+    volume = safe_float(volume, 0.0)
+    obv = abs(safe_float(obv, 0.0))
+    return round((np.log1p(max(oi, 0.0)) * 0.45) + (np.log1p(max(volume, 0.0)) * 0.35) + (np.log1p(max(obv, 0.0)) * 0.20), 4)
+
+
 def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> pd.DataFrame:
+    """
+    Scans BOTH CE and PE for every candidate symbol.
+    Long = option contract price rising (Rank Delta > 0), can be CE or PE.
+    Short = option contract price falling (Rank Delta < 0), can be CE or PE.
+    """
     if candidates_df is None or candidates_df.empty or "Symbol" not in candidates_df.columns:
         return pd.DataFrame(columns=OPTION_EMAIL_COLS)
 
@@ -521,6 +540,7 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> pd.DataFr
                     continue
                 scanned = scan_single_option(option_symbol, opt_type, strike, underlying)
                 if scanned:
+                    scanned["OI+Volume+OBV Score"] = option_liquidity_score(scanned.get("OI"), scanned.get("Volume"), scanned.get("OBV"))
                     rows.append(scanned)
 
     if not rows:
@@ -528,17 +548,17 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> pd.DataFr
 
     out = pd.DataFrame(rows)
     rank_delta = pd.to_numeric(out["Rank Delta"], errors="coerce")
+    liq = pd.to_numeric(out["OI+Volume+OBV Score"], errors="coerce")
 
     if str(side).lower() == "long":
         out = out[rank_delta > 0].copy()
-        out = out.sort_values(["Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False])
+        out = out.sort_values(["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False, False])
     else:
         out = out[rank_delta < 0].copy()
-        out = out.sort_values(["Rank Delta", "Cumulative ADX", "% Change"], ascending=[True, False, True])
+        out = out.sort_values(["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, True, False, True])
 
     keep_cols = [c for c in OPTION_EMAIL_COLS if c in out.columns]
     return out[keep_cols].reset_index(drop=True)
-
 
 
 def format_cell(col: str, val) -> str:
