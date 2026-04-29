@@ -666,13 +666,13 @@ def format_cell(col: str, val) -> str:
     if isinstance(val, (int, float, np.integer, np.floating)):
         return f"{float(val):.2f}"
     return str(val)
+
 def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html = [f"<div class='card'><h3>{title}</h3>"]
     if df is None or df.empty:
         html.append("<p class='muted'>No data found.</p></div>")
-        # must be ONE line
-        return "
-".join(html)
+        # chr(10) is the safe way to do a newline without quotes
+        return chr(10).join(html)
 
     view = df[[c for c in columns if c in df.columns]].copy()
     html.append(
@@ -687,10 +687,10 @@ def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
             + "</tr>"
         )
     html.append("</tbody></table></div></div>")
-    # must also be ONE line
-    return "
-".join(html)
-
+    
+    # chr(10) is the safe way to do a newline without quotes
+    return chr(10).join(html)
+    
 def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFrame, pe_df: pd.DataFrame, attachments: List[str]) -> bool:
     smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
