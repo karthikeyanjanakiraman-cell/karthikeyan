@@ -665,8 +665,6 @@ def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     return "
 ".join(html)
 
-
-
 def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFrame, pe_df: pd.DataFrame, attachments: List[str]) -> bool:
     smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
