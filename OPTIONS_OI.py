@@ -194,6 +194,42 @@ def score_label(delta: float) -> str:
     return "Neutral"
 
 
+def long_short_label(raw_label: str, side: str) -> str:
+    if side == "long":
+        mapping = {
+            "Buy": "LONG",
+            "Buy+": "LONG+",
+            "Buy++": "LONG++",
+            "Sell": "Neutral",
+            "Sell+": "Neutral",
+            "Sell++": "Neutral",
+            "Neutral": "Neutral",
+        }
+        return mapping.get(raw_label, raw_label)
+    if side == "short":
+        mapping = {
+            "Sell": "SHORT",
+            "Sell+": "SHORT+",
+            "Sell++": "SHORT++",
+            "Buy": "Neutral",
+            "Buy+": "Neutral",
+            "Buy++": "Neutral",
+            "Neutral": "Neutral",
+        }
+        return mapping.get(raw_label, raw_label)
+    return raw_label
+
+
+def apply_display_labels(df: pd.DataFrame, side: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return df
+    out = df.copy()
+    for col in ["5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal", "Bull_Signal", "Bear_Signal", "Overall_Signal"]:
+        if col in out.columns:
+            out[col] = out[col].apply(lambda x: long_short_label(str(x), side))
+    return out
+
+
 def intraday_window_score(df: pd.DataFrame, window_minutes: int = None) -> float:
     if window_minutes is None:
         window_minutes = SIGNAL_WINDOW_MINUTES
@@ -620,13 +656,15 @@ def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html = [f"<div class='card'><h3>{title}</h3>"]
     if df is None or df.empty:
         html.append("<p class='muted'>No data found.</p></div>")
-        return "\n".join(html)
+        return "
+".join(html)
     view = df[[c for c in columns if c in df.columns]].copy()
     html.append("<div class='table-wrap'><table><thead><tr>" + "".join([f"<th>{c}</th>" for c in view.columns]) + "</tr></thead><tbody>")
     for _, row in view.iterrows():
         html.append("<tr>" + "".join([f"<td>{format_cell(c, row[c])}</td>" for c in view.columns]) + "</tr>")
     html.append("</tbody></table></div></div>")
-    return "\n".join(html)
+    return "
+".join(html)
 
 
 def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFrame, pe_df: pd.DataFrame, attachments: List[str]) -> bool:
@@ -640,6 +678,11 @@ def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFram
         return False
 
     scan_time = datetime.now().strftime("%d %b %Y, %H:%M")
+    long_display = apply_display_labels(long_df, "long")
+    short_display = apply_display_labels(short_df, "short")
+    ce_display = apply_display_labels(ce_df, "long")
+    pe_display = apply_display_labels(pe_df, "short")
+
     html = f"""
     <html>
     <head>
@@ -658,7 +701,9 @@ def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFram
       tr:nth-child(even) td {{ background:#0b1220; }}
       tr:hover td {{ background:#172033; }}
       .footer {{ margin-top:10px; color:#94a3b8; font-size:12px; }}
-      .pill {{ display:inline-block; padding:4px 10px; border-radius:999px; background:#0b1220; border:1px solid #334155; color:#cbd5e1; margin-right:8px; }}
+      .pill {{ display:inline-block; padding:4px 10px; border-radius:999px; background:#0b1220; border:1px solid #334155; color:#cbd5e1; margin-right:8px; margin-bottom:6px; }}
+      .long-pill {{ color:#22c55e; border-color:#14532d; }}
+      .short-pill {{ color:#f87171; border-color:#7f1d1d; }}
     </style>
     </head>
     <body>
@@ -668,11 +713,14 @@ def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFram
           <p>Scan completed at {scan_time}.</p>
           <span class='pill'>Rank Delta = Bull Rank - Bear Rank</span>
           <span class='pill'>OI+Volume+OBV Score = 0.45*log1p(OI) + 0.35*log1p(Volume) + 0.20*log1p(|OBV|)</span>
+          <br>
+          <span class='pill long-pill'>LONG labels = green</span>
+          <span class='pill short-pill'>SHORT labels = red</span>
         </div>
-        {dataframe_to_html(long_df, EMAIL_DISPLAY_COLS, 'Stock Long Candidates')}
-        {dataframe_to_html(short_df, EMAIL_DISPLAY_COLS, 'Stock Short Candidates')}
-        {dataframe_to_html(ce_df, OPTION_EMAIL_COLS, 'CE Candidates from Long Stocks')}
-        {dataframe_to_html(pe_df, OPTION_EMAIL_COLS, 'PE Candidates from Short Stocks')}
+        {dataframe_to_html(long_display, EMAIL_DISPLAY_COLS, 'Stock Long Candidates')}
+        {dataframe_to_html(short_display, EMAIL_DISPLAY_COLS, 'Stock Short Candidates')}
+        {dataframe_to_html(ce_display, OPTION_EMAIL_COLS, 'CE Candidates from Long Stocks')}
+        {dataframe_to_html(pe_display, OPTION_EMAIL_COLS, 'PE Candidates from Short Stocks')}
         <div class='footer'>Attached CSVs: summary, CE candidates, PE candidates.</div>
       </div>
     </body>
@@ -693,73 +741,4 @@ def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFram
             msg.attach(part)
     try:
         if smtp_port == 465:
-            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=40) as server:
-                server.login(sender_email, sender_password)
-                server.send_message(msg)
-        else:
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=40) as server:
-                server.ehlo(); server.starttls(); server.ehlo(); server.login(sender_email, sender_password); server.send_message(msg)
-        logger.info("Email sent to %s", recipient_email)
-        return True
-    except Exception as exc:
-        logger.error("Email failed: %s", exc)
-        return False
-
-
-def scan_symbol(symbol: str) -> Optional[Dict[str, object]]:
-    eq = format_eq_symbol(symbol)
-    daily_df = get_history(eq, "D", max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
-    intra_df = get_history(eq, "5", INTRADAY_LOOKBACK_DAYS)
-    if daily_df.empty or intra_df.empty:
-        return None
-    summary = summarize_intraday(intra_df, daily_df)
-    if not summary:
-        return None
-    summary["Symbol"] = symbol
-    return summary
-
-
-def ensure_output_dir(path: str) -> None:
-    os.makedirs(path, exist_ok=True)
-
-
-def main() -> None:
-    ensure_output_dir(OUTPUT_DIR)
-    init_fyers()
-    if fyers is None:
-        raise RuntimeError("Fyers client initialization failed.")
-    symbols = load_fno_symbols_from_sectors(SECTORS_DIR)
-    if not symbols:
-        raise FileNotFoundError(f"No F&O symbols found under '{SECTORS_DIR}'.")
-    logger.info("Loaded %s symbols from sectors folder.", len(symbols))
-    rows = []
-    for i, symbol in enumerate(symbols, start=1):
-        logger.info("[%s/%s] Scanning %s", i, len(symbols), symbol)
-        row = scan_symbol(symbol)
-        if row:
-            rows.append(row)
-    if not rows:
-        raise RuntimeError("No symbols returned usable market data.")
-    summary_df = pd.DataFrame(rows)
-    ordered_cols = ["Symbol"] + [c for c in EMAIL_DISPLAY_COLS if c != "Symbol"] + ["Bull Rank", "Bear Rank", "Rank Delta", "Cumulative +DI", "Cumulative -DI", "Cumulative ADX", "Cumulative RSI", "VWAP Z-Score"]
-    ordered_cols = [c for c in ordered_cols if c in summary_df.columns]
-    summary_df = summary_df[ordered_cols].sort_values(["Rank Delta", "% Change"], ascending=[False, False]).reset_index(drop=True)
-    long_df, short_df = choose_top_candidates(summary_df, top_n=10)
-    ce_df = build_option_candidates(long_df, side="long")
-    pe_df = build_option_candidates(short_df, side="short")
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-    summary_csv = os.path.join(OUTPUT_DIR, f"fo_summary_{timestamp}.csv")
-    ce_csv = os.path.join(OUTPUT_DIR, f"fo_ce_candidates_{timestamp}.csv")
-    pe_csv = os.path.join(OUTPUT_DIR, f"fo_pe_candidates_{timestamp}.csv")
-    summary_df.to_csv(summary_csv, index=False)
-    ce_df.to_csv(ce_csv, index=False)
-    pe_df.to_csv(pe_csv, index=False)
-    send_email(long_df, short_df, ce_df, pe_df, [summary_csv, ce_csv, pe_csv])
-    logger.info("Completed.")
-    logger.info("Summary CSV: %s", summary_csv)
-    logger.info("CE candidates CSV: %s", ce_csv)
-    logger.info("PE candidates CSV: %s", pe_csv)
-
-
-if __name__ == "__main__":
-    main()
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=40) as se
