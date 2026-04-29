@@ -650,7 +650,7 @@ def format_cell(col: str, val) -> str:
     if isinstance(val, (int, float, np.integer, np.floating)):
         return f"{float(val):.2f}"
     return str(val)
-
+    
 def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html = [f"<div class='card'><h3>{title}</h3>"]
     if df is None or df.empty:
@@ -664,6 +664,7 @@ def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html.append("</tbody></table></div></div>")
     return "
 ".join(html)
+
 
 def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFrame, pe_df: pd.DataFrame, attachments: List[str]) -> bool:
     smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
