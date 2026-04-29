@@ -693,7 +693,7 @@ def main() -> None:
     ordered_cols = [c for c in ordered_cols if c in summary_df.columns]
     summary_df = summary_df[ordered_cols].sort_values(["Rank Delta", "% Change"], ascending=[False, False]).reset_index(drop=True)
 
-    long_df, short_df = choose_top_candidates(summary_df, top_n=200)
+    long_df, short_df = choose_top_candidates(summary_df, top_n=30)
     ce_df = build_option_candidates(long_df, side="long")
     pe_df = build_option_candidates(short_df, side="short")
 
