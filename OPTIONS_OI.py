@@ -68,6 +68,7 @@ OPTION_EMAIL_COLS = [
 
 fyers = None
 
+
 def init_fyers() -> Optional[object]:
     global fyers
     client_id = os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID")
@@ -82,6 +83,7 @@ def init_fyers() -> Optional[object]:
         fyers = fyersModel.FyersModel(client_id=client_id, token=access_token, is_async=False, log_path="")
     return fyers
 
+
 def safe_float(value, default=np.nan) -> float:
     try:
         if value is None or value == "":
@@ -89,6 +91,7 @@ def safe_float(value, default=np.nan) -> float:
         return float(value)
     except Exception:
         return default
+
 
 def discover_sector_csvs(root_dir: str = SECTORS_DIR) -> List[str]:
     paths = []
@@ -100,6 +103,7 @@ def discover_sector_csvs(root_dir: str = SECTORS_DIR) -> List[str]:
             if fname.lower().endswith(".csv"):
                 paths.append(os.path.join(dirpath, fname))
     return sorted(set(paths))
+
 
 def load_fno_symbols_from_sectors(root_dir: str = SECTORS_DIR) -> List[str]:
     symbols = set()
@@ -122,11 +126,13 @@ def load_fno_symbols_from_sectors(root_dir: str = SECTORS_DIR) -> List[str]:
                 symbols.add(sym)
     return sorted(symbols)
 
+
 def format_eq_symbol(symbol: str) -> str:
     symbol = str(symbol).strip().upper()
     if symbol.startswith("NSE:"):
         return symbol if symbol.endswith("-EQ") else f"{symbol}-EQ"
     return f"NSE:{symbol}-EQ"
+
 
 def get_history(symbol: str, resolution: str, days_back: int) -> pd.DataFrame:
     if fyers is None:
@@ -154,6 +160,7 @@ def get_history(symbol: str, resolution: str, days_back: int) -> pd.DataFrame:
     df = df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
     return df
 
+
 def compute_ivp(history_df: pd.DataFrame) -> Tuple[float, str]:
     if history_df is None or history_df.empty or len(history_df) < 30:
         return np.nan, "Neutral Vol"
@@ -174,6 +181,7 @@ def compute_ivp(history_df: pd.DataFrame) -> Tuple[float, str]:
         state = "Neutral Vol"
     return ivp, state
 
+
 def score_label(delta: float) -> str:
     if pd.isna(delta):
         return "Neutral"
@@ -190,6 +198,7 @@ def score_label(delta: float) -> str:
     if delta <= -1:
         return "Sell"
     return "Neutral"
+
 
 def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Dict[str, object]:
     if intra_df is None or intra_df.empty:
@@ -298,6 +307,7 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
         "VWAP Z-Score": round(safe_float(vwap_z.iloc[-1], 0.0), 2),
     }
 
+
 def choose_top_candidates(summary_df: pd.DataFrame, top_n: int = 10) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if summary_df is None or summary_df.empty:
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
@@ -310,6 +320,7 @@ def choose_top_candidates(summary_df: pd.DataFrame, top_n: int = 10) -> Tuple[pd
 
     keep_cols = [c for c in EMAIL_DISPLAY_COLS if c in base.columns]
     return long_df[keep_cols].reset_index(drop=True), short_df[keep_cols].reset_index(drop=True)
+
 
 def nearest_step(value: float) -> int:
     value = abs(safe_float(value, 0))
@@ -325,6 +336,7 @@ def nearest_step(value: float) -> int:
         return 5
     return 1
 
+
 def option_type_of(item: dict) -> str:
     raw = str(item.get("option_type") or item.get("optionType") or item.get("type") or "").upper()
     if raw in {"CE", "CALL", "CALLS"}:
@@ -338,8 +350,10 @@ def option_type_of(item: dict) -> str:
         return "PE"
     return ""
 
+
 def option_symbol_of(item: dict) -> str:
     return str(item.get("symbol") or item.get("symbolName") or item.get("option_symbol") or "")
+
 
 def option_ltp_of(item: dict) -> float:
     for key in ["ltp", "last_traded_price", "lastPrice", "lp"]:
@@ -347,11 +361,13 @@ def option_ltp_of(item: dict) -> float:
             return round(safe_float(item.get(key), 0.0), 2)
     return 0.0
 
+
 def strike_of(item: dict) -> float:
     for key in ["strike_price", "strikePrice", "strike"]:
         if key in item:
             return safe_float(item.get(key), np.nan)
     return np.nan
+
 
 def fetch_underlying_quote(symbol: str) -> float:
     eq_symbol = format_eq_symbol(symbol)
@@ -360,6 +376,7 @@ def fetch_underlying_quote(symbol: str) -> float:
         return safe_float(quote.get("d", [{}])[0].get("v", {}).get("lp"), np.nan)
     except Exception:
         return np.nan
+
 
 def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> pd.DataFrame:
     if fyers is None:
@@ -416,9 +433,11 @@ def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> p
         })
     return pd.DataFrame(final_rows)
 
+
 def format_option_history_symbol(raw_symbol: str) -> str:
     symbol = str(raw_symbol).strip()
     return symbol if symbol.startswith("NSE:") else f"NSE:{symbol}"
+
 
 def scan_single_option(option_symbol: str, option_type: str, strike: float, underlying: str) -> Optional[Dict[str, object]]:
     hist_symbol = format_option_history_symbol(option_symbol)
@@ -457,6 +476,7 @@ def scan_single_option(option_symbol: str, option_type: str, strike: float, unde
         "VWAP Z-Score": summary.get("VWAP Z-Score"),
     }
 
+
 def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> pd.DataFrame:
     if candidates_df is None or candidates_df.empty or "Symbol" not in candidates_df.columns:
         return pd.DataFrame(columns=OPTION_EMAIL_COLS)
@@ -490,6 +510,7 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> pd.DataFr
     keep_cols = [c for c in OPTION_EMAIL_COLS if c in out.columns]
     return out[keep_cols].reset_index(drop=True)
 
+
 def format_cell(col: str, val) -> str:
     if pd.isna(val):
         return ""
@@ -499,20 +520,20 @@ def format_cell(col: str, val) -> str:
         return f"{float(val):.2f}"
     return str(val)
 
+
 def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html = [f"<h3>{title}</h3>"]
     if df is None or df.empty:
         html.append("<p>No data found.</p>")
-        return "
-".join(html)
+        return "\n".join(html)
     view = df[[c for c in columns if c in df.columns]].copy()
     html.append("<table border='1' cellspacing='0' cellpadding='6' style='border-collapse:collapse;font-family:Arial,sans-serif;font-size:12px;'>")
     html.append("<tr>" + "".join([f"<th style='background:#f2f2f2'>{c}</th>" for c in view.columns]) + "</tr>")
     for _, row in view.iterrows():
         html.append("<tr>" + "".join([f"<td>{format_cell(c, row[c])}</td>" for c in view.columns]) + "</tr>")
     html.append("</table>")
-    return "
-".join(html)
+    return "\n".join(html)
+
 
 def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFrame, pe_df: pd.DataFrame, attachments: List[str]) -> bool:
     smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
@@ -576,6 +597,7 @@ def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFram
         logger.error("Email failed: %s", exc)
         return False
 
+
 def scan_symbol(symbol: str) -> Optional[Dict[str, object]]:
     eq = format_eq_symbol(symbol)
     daily_df = get_history(eq, "D", max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
@@ -588,8 +610,10 @@ def scan_symbol(symbol: str) -> Optional[Dict[str, object]]:
     summary["Symbol"] = symbol
     return summary
 
+
 def ensure_output_dir(path: str) -> None:
     os.makedirs(path, exist_ok=True)
+
 
 def main() -> None:
     ensure_output_dir(OUTPUT_DIR)
@@ -638,6 +662,7 @@ def main() -> None:
     logger.info("Summary CSV: %s", summary_csv)
     logger.info("CE candidates CSV: %s", ce_csv)
     logger.info("PE candidates CSV: %s", pe_csv)
+
 
 if __name__ == "__main__":
     main()
