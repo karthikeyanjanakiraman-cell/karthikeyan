@@ -1,6 +1,5 @@
 import os
 import re
-import math
 import smtplib
 import logging
 from datetime import datetime, timedelta
@@ -30,6 +29,26 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 
 EMAIL_DISPLAY_COLS = [
     "Symbol",
+    "LTP",
+    "% Change",
+    "5m_Signal",
+    "15m_Signal",
+    "30m_Signal",
+    "60m_Signal",
+    "Bull_Signal",
+    "Bear_Signal",
+    "Overall_Signal",
+    "Price_Lead_Status",
+    "IVP",
+    "Volatility State",
+    "Last Iteration Time",
+]
+
+OPTION_EMAIL_COLS = [
+    "Underlying",
+    "Option Type",
+    "Option Symbol",
+    "Strike",
     "LTP",
     "% Change",
     "5m_Signal",
@@ -137,12 +156,12 @@ def get_history(symbol: str, resolution: str, days_back: int) -> pd.DataFrame:
     return df
 
 
-def compute_ivp(daily_df: pd.DataFrame) -> Tuple[float, str]:
-    if daily_df is None or daily_df.empty or len(daily_df) < 30:
+def compute_ivp(history_df: pd.DataFrame) -> Tuple[float, str]:
+    if history_df is None or history_df.empty or len(history_df) < 30:
         return np.nan, "Neutral Vol"
-    close = pd.to_numeric(daily_df["close"], errors="coerce")
-    high = pd.to_numeric(daily_df["high"], errors="coerce")
-    low = pd.to_numeric(daily_df["low"], errors="coerce")
+    close = pd.to_numeric(history_df["close"], errors="coerce")
+    high = pd.to_numeric(history_df["high"], errors="coerce")
+    low = pd.to_numeric(history_df["low"], errors="coerce")
     proxy = ((high - low) / close.replace(0, np.nan) * 100.0).replace([np.inf, -np.inf], np.nan).dropna()
     if proxy.empty:
         return np.nan, "Neutral Vol"
@@ -176,7 +195,7 @@ def score_label(delta: float) -> str:
     return "Neutral"
 
 
-def summarize_intraday(intra_df: pd.DataFrame, daily_df: pd.DataFrame) -> Dict[str, object]:
+def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Dict[str, object]:
     if intra_df is None or intra_df.empty:
         return {}
     df = intra_df.copy().sort_values("timestamp").reset_index(drop=True)
@@ -230,7 +249,7 @@ def summarize_intraday(intra_df: pd.DataFrame, daily_df: pd.DataFrame) -> Dict[s
         default="NORMAL",
     )
 
-    prev_close = safe_float(daily_df["close"].iloc[-2]) if daily_df is not None and len(daily_df) >= 2 else np.nan
+    prev_close = safe_float(reference_df["close"].iloc[-2]) if reference_df is not None and len(reference_df) >= 2 else np.nan
     ltp = safe_float(close.iloc[-1])
     pct_change = ((ltp - prev_close) / prev_close * 100.0) if pd.notna(prev_close) and prev_close != 0 else 0.0
 
@@ -257,7 +276,7 @@ def summarize_intraday(intra_df: pd.DataFrame, daily_df: pd.DataFrame) -> Dict[s
         bear += 1
 
     rank_delta = bull - bear
-    ivp, vol_state = compute_ivp(daily_df)
+    ivp, vol_state = compute_ivp(reference_df)
     last_ts = pd.to_datetime(df["timestamp"].iloc[-1])
 
     return {
@@ -352,30 +371,31 @@ def strike_of(item: dict) -> float:
     return np.nan
 
 
-def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> pd.DataFrame:
-    if fyers is None:
-        return pd.DataFrame(columns=["Underlying", "Strike", "CE Symbol", "CE LTP", "PE Symbol", "PE LTP"])
-
+def fetch_underlying_quote(symbol: str) -> float:
     eq_symbol = format_eq_symbol(symbol)
     try:
         quote = fyers.quotes({"symbols": eq_symbol})
+        return safe_float(quote.get("d", [{}])[0].get("v", {}).get("lp"), np.nan)
     except Exception:
-        quote = {}
-    ltp = np.nan
-    try:
-        ltp = safe_float(quote.get("d", [{}])[0].get("v", {}).get("lp"), np.nan)
-    except Exception:
-        ltp = np.nan
+        return np.nan
+
+
+def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> pd.DataFrame:
+    if fyers is None:
+        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "PE Symbol", "PE LTP"])
+
+    eq_symbol = format_eq_symbol(symbol)
+    ltp = fetch_underlying_quote(symbol)
 
     try:
         chain_res = fyers.optionchain(data={"symbol": eq_symbol, "strikecount": 50})
     except Exception as exc:
         logger.warning("Option chain failed for %s: %s", symbol, exc)
-        return pd.DataFrame(columns=["Underlying", "Strike", "CE Symbol", "CE LTP", "PE Symbol", "PE LTP"])
+        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "PE Symbol", "PE LTP"])
 
     chain = ((chain_res or {}).get("data") or {}).get("optionsChain", [])
     if not chain:
-        return pd.DataFrame(columns=["Underlying", "Strike", "CE Symbol", "CE LTP", "PE Symbol", "PE LTP"])
+        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "PE Symbol", "PE LTP"])
 
     rows = []
     for item in chain:
@@ -390,14 +410,11 @@ def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> p
             "OptionLTP": option_ltp_of(item),
         })
     if not rows:
-        return pd.DataFrame(columns=["Underlying", "Strike", "CE Symbol", "CE LTP", "PE Symbol", "PE LTP"])
+        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "PE Symbol", "PE LTP"])
 
     oc = pd.DataFrame(rows)
     step = nearest_step(ltp if pd.notna(ltp) else oc["Strike"].median())
-    if pd.notna(ltp):
-        atm = round(ltp / step) * step
-    else:
-        atm = oc["Strike"].median()
+    atm = round(ltp / step) * step if pd.notna(ltp) else oc["Strike"].median()
     strikes = sorted(oc["Strike"].dropna().unique(), key=lambda x: abs(x - atm))[:pair_count]
     strikes = sorted(strikes)
 
@@ -419,15 +436,88 @@ def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> p
     return pd.DataFrame(final_rows)
 
 
-def build_stock_option_lists(candidates_df: pd.DataFrame) -> pd.DataFrame:
+def format_option_history_symbol(raw_symbol: str) -> str:
+    symbol = str(raw_symbol).strip()
+    return symbol if symbol.startswith("NSE:") else f"NSE:{symbol}"
+
+
+def scan_single_option(option_symbol: str, option_type: str, strike: float, underlying: str) -> Optional[Dict[str, object]]:
+    hist_symbol = format_option_history_symbol(option_symbol)
+    daily_df = get_history(hist_symbol, "D", max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
+    intra_df = get_history(hist_symbol, "5", INTRADAY_LOOKBACK_DAYS)
+    if daily_df.empty or intra_df.empty:
+        return None
+    summary = summarize_intraday(intra_df, daily_df)
+    if not summary:
+        return None
+    return {
+        "Underlying": underlying,
+        "Option Type": option_type,
+        "Option Symbol": option_symbol,
+        "Strike": strike,
+        **{k: summary.get(k) for k in OPTION_EMAIL_COLS if k in summary},
+        "LTP": summary.get("LTP"),
+        "% Change": summary.get("% Change"),
+        "5m_Signal": summary.get("5m_Signal"),
+        "15m_Signal": summary.get("15m_Signal"),
+        "30m_Signal": summary.get("30m_Signal"),
+        "60m_Signal": summary.get("60m_Signal"),
+        "Bull_Signal": summary.get("Bull_Signal"),
+        "Bear_Signal": summary.get("Bear_Signal"),
+        "Overall_Signal": summary.get("Overall_Signal"),
+        "Price_Lead_Status": summary.get("Price_Lead_Status"),
+        "IVP": summary.get("IVP"),
+        "Volatility State": summary.get("Volatility State"),
+        "Last Iteration Time": summary.get("Last Iteration Time"),
+        "Bull Rank": summary.get("Bull Rank"),
+        "Bear Rank": summary.get("Bear Rank"),
+        "Rank Delta": summary.get("Rank Delta"),
+        "Cumulative +DI": summary.get("Cumulative +DI"),
+        "Cumulative -DI": summary.get("Cumulative -DI"),
+        "Cumulative ADX": summary.get("Cumulative ADX"),
+        "Cumulative RSI": summary.get("Cumulative RSI"),
+        "VWAP Z-Score": summary.get("VWAP Z-Score"),
+    }
+
+
+def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> pd.DataFrame:
     if candidates_df is None or candidates_df.empty or "Symbol" not in candidates_df.columns:
-        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "PE Symbol", "PE LTP"])
-    frames = []
-    for symbol in candidates_df["Symbol"].dropna().astype(str):
-        frame = fetch_option_pairs(symbol)
-        if not frame.empty:
-            frames.append(frame)
-    return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "PE Symbol", "PE LTP"])
+        return pd.DataFrame(columns=OPTION_EMAIL_COLS)
+
+    wanted_type = "CE" if str(side).lower() == "long" else "PE"
+    rows = []
+    for underlying in candidates_df["Symbol"].dropna().astype(str):
+        pair_df = fetch_option_pairs(underlying)
+        if pair_df.empty:
+            continue
+        for _, row in pair_df.iterrows():
+            option_symbol = row.get(f"{wanted_type} Symbol", "")
+            strike = row.get("Strike", np.nan)
+            if not option_symbol:
+                continue
+            scanned = scan_single_option(option_symbol, wanted_type, strike, underlying)
+            if scanned:
+                rows.append(scanned)
+
+    if not rows:
+        return pd.DataFrame(columns=OPTION_EMAIL_COLS)
+
+    out = pd.DataFrame(rows)
+    if wanted_type == "CE":
+        out = out[
+            (pd.to_numeric(out["% Change"], errors="coerce") > 0) &
+            (pd.to_numeric(out["Cumulative +DI"], errors="coerce") > pd.to_numeric(out["Cumulative -DI"], errors="coerce"))
+        ].copy()
+        out = out.sort_values(["Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False])
+    else:
+        out = out[
+            (pd.to_numeric(out["% Change"], errors="coerce") < 0) &
+            (pd.to_numeric(out["Cumulative -DI"], errors="coerce") > pd.to_numeric(out["Cumulative +DI"], errors="coerce"))
+        ].copy()
+        out = out.sort_values(["Rank Delta", "Cumulative ADX", "% Change"], ascending=[True, False, True])
+
+    keep_cols = [c for c in OPTION_EMAIL_COLS if c in out.columns]
+    return out[keep_cols].reset_index(drop=True)
 
 
 def format_cell(col: str, val) -> str:
@@ -454,7 +544,7 @@ def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     return "\n".join(html)
 
 
-def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, long_opt_df: pd.DataFrame, short_opt_df: pd.DataFrame, attachments: List[str]) -> bool:
+def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFrame, pe_df: pd.DataFrame, attachments: List[str]) -> bool:
     smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
     sender_email = os.environ.get("SENDER_EMAIL")
@@ -475,10 +565,10 @@ def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, long_opt_df: pd.Da
         <br>
         {dataframe_to_html(short_df, EMAIL_DISPLAY_COLS, 'Stock Short Candidates')}
         <br>
-        {dataframe_to_html(long_opt_df, ['Underlying', 'Underlying LTP', 'ATM Strike', 'Strike', 'CE Symbol', 'CE LTP', 'PE Symbol', 'PE LTP'], 'Stock Long Candidate Options (5 CE/PE strikes)')}
+        {dataframe_to_html(ce_df, OPTION_EMAIL_COLS, 'CE Candidates from Long Stocks')}
         <br>
-        {dataframe_to_html(short_opt_df, ['Underlying', 'Underlying LTP', 'ATM Strike', 'Strike', 'CE Symbol', 'CE LTP', 'PE Symbol', 'PE LTP'], 'Stock Short Candidate Options (5 CE/PE strikes)')}
-        <p>Attached CSVs: summary, long options, short options.</p>
+        {dataframe_to_html(pe_df, OPTION_EMAIL_COLS, 'PE Candidates from Short Stocks')}
+        <p>Attached CSVs: summary, CE candidates, PE candidates.</p>
     </body>
     </html>
     """
@@ -563,24 +653,24 @@ def main() -> None:
     summary_df = summary_df[ordered_cols].sort_values(["Rank Delta", "% Change"], ascending=[False, False]).reset_index(drop=True)
 
     long_df, short_df = choose_top_candidates(summary_df, top_n=10)
-    long_opt_df = build_stock_option_lists(long_df)
-    short_opt_df = build_stock_option_lists(short_df)
+    ce_df = build_option_candidates(long_df, side="long")
+    pe_df = build_option_candidates(short_df, side="short")
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     summary_csv = os.path.join(OUTPUT_DIR, f"fo_summary_{timestamp}.csv")
-    long_opt_csv = os.path.join(OUTPUT_DIR, f"fo_long_options_{timestamp}.csv")
-    short_opt_csv = os.path.join(OUTPUT_DIR, f"fo_short_options_{timestamp}.csv")
+    ce_csv = os.path.join(OUTPUT_DIR, f"fo_ce_candidates_{timestamp}.csv")
+    pe_csv = os.path.join(OUTPUT_DIR, f"fo_pe_candidates_{timestamp}.csv")
 
     summary_df.to_csv(summary_csv, index=False)
-    long_opt_df.to_csv(long_opt_csv, index=False)
-    short_opt_df.to_csv(short_opt_csv, index=False)
+    ce_df.to_csv(ce_csv, index=False)
+    pe_df.to_csv(pe_csv, index=False)
 
-    send_email(long_df, short_df, long_opt_df, short_opt_df, [summary_csv, long_opt_csv, short_opt_csv])
+    send_email(long_df, short_df, ce_df, pe_df, [summary_csv, ce_csv, pe_csv])
 
     logger.info("Completed.")
     logger.info("Summary CSV: %s", summary_csv)
-    logger.info("Long options CSV: %s", long_opt_csv)
-    logger.info("Short options CSV: %s", short_opt_csv)
+    logger.info("CE candidates CSV: %s", ce_csv)
+    logger.info("PE candidates CSV: %s", pe_csv)
 
 
 if __name__ == "__main__":
