@@ -402,7 +402,7 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
     }
 
 
-def choose_top_candidates(summary_df: pd.DataFrame, top_n: int = 200) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def choose_top_candidates(summary_df: pd.DataFrame, top_n: int = 10) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if summary_df is None or summary_df.empty:
         return pd.DataFrame(), pd.DataFrame()
     long_df = summary_df[pd.to_numeric(summary_df["Rank Delta"], errors="coerce") > 0].copy()
@@ -523,6 +523,7 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
                         tmp.insert(0, "Option Symbol", sym)
                         tmp.insert(1, "Underlying", underlying)
                         tmp.insert(2, "Strike", strike)
+                        tmp.insert(3, "Strike Name", str(strike))
                         iter_rows.append(tmp)
     if not rows:
         return pd.DataFrame(), pd.DataFrame()
@@ -648,7 +649,7 @@ def main() -> None:
     ce_df.to_csv(ce_csv, index=False)
     pe_df.to_csv(pe_csv, index=False)
     if iteration_df.empty:
-        iteration_df = pd.DataFrame(columns=["iteration", "Underlying", "Strike", "Option Symbol", "timestamp", "window_minutes", "window_start", "window_end", "current_window_score", "previous_same_time_score", "window_delta", "window_signal", "close"])
+        iteration_df = pd.DataFrame(columns=["iteration", "Underlying", "Strike", "Strike Name", "Option Symbol", "timestamp", "window_minutes", "window_start", "window_end", "current_window_score", "previous_same_time_score", "window_delta", "window_signal", "close"])
     iteration_df.to_csv(iter_csv, index=False)
 
     send_email(long_df, short_df, ce_df, pe_df, [summary_csv, ce_csv, pe_csv, iter_csv])
