@@ -26,6 +26,7 @@ DAILY_LOOKBACK_DAYS = 90
 INTRADAY_LOOKBACK_DAYS = 20
 IVP_LOOKBACK_DAYS = 252
 OPTION_PAIRS_TO_KEEP = 5
+SIGNAL_WINDOW_MINUTES = 15  # configurable: 5, 15, 30, 60
 SECTORS_DIR = os.environ.get("SECTORS_DIR", "sectors")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 
@@ -220,6 +221,79 @@ def score_label(delta: float) -> str:
     return "Neutral"
 
 
+def intraday_window_score(df: pd.DataFrame, window_minutes: int = None) -> float:
+    if window_minutes is None:
+        window_minutes = SIGNAL_WINDOW_MINUTES
+    if df is None or df.empty:
+        return np.nan
+    d = df.copy().sort_values("timestamp")
+    if "timestamp" not in d.columns or len(d) < 2:
+        return np.nan
+    end_ts = pd.to_datetime(d["timestamp"].iloc[-1])
+    start_ts = end_ts - timedelta(minutes=window_minutes)
+    cur = d[(d["timestamp"] > start_ts) & (d["timestamp"] <= end_ts)]
+    if cur.empty:
+        cur = d.tail(max(2, min(len(d), window_minutes // 5)))
+    first_close = safe_float(cur["close"].iloc[0])
+    last_close = safe_float(cur["close"].iloc[-1])
+    if pd.isna(first_close) or first_close == 0:
+        return np.nan
+    return round(((last_close - first_close) / first_close) * 100.0, 2)
+
+
+def previous_same_time_score(df: pd.DataFrame, window_minutes: int = None) -> float:
+    if window_minutes is None:
+        window_minutes = SIGNAL_WINDOW_MINUTES
+    if df is None or df.empty or len(df) < 4:
+        return np.nan
+    d = df.copy().sort_values("timestamp").reset_index(drop=True)
+    end_ts = pd.to_datetime(d["timestamp"].iloc[-1])
+    cur_start = end_ts - timedelta(minutes=window_minutes)
+
+    # Find previous trading day data (before today 9:15 AM)
+    today_start = end_ts.replace(hour=9, minute=15, second=0, microsecond=0)
+    prev_data = d[d["timestamp"] < today_start].copy()
+    if prev_data.empty:
+        return np.nan
+
+    # Match same time-of-day window in previous session
+    cur_hour, cur_minute = end_ts.hour, end_ts.minute
+    prev_data["time_score"] = abs(prev_data["timestamp"].dt.hour - cur_hour) * 60 + abs(prev_data["timestamp"].dt.minute - cur_minute)
+    best_idx = prev_data["time_score"].idxmin()
+    if pd.isna(best_idx):
+        return np.nan
+
+    prev_end = pd.to_datetime(prev_data.loc[best_idx, "timestamp"])
+    prev_start = prev_end - timedelta(minutes=window_minutes)
+    prev_window = prev_data[(prev_data["timestamp"] >= prev_start) & (prev_data["timestamp"] <= prev_end)]
+
+    if prev_window.empty or len(prev_window) < 2:
+        return np.nan
+    first_close = safe_float(prev_window["close"].iloc[0])
+    last_close = safe_float(prev_window["close"].iloc[-1])
+    if pd.isna(first_close) or first_close == 0:
+        return np.nan
+    return round(((last_close - first_close) / first_close) * 100.0, 2)
+
+
+def compare_window_signal(current_score: float, previous_score: float) -> Tuple[float, str]:
+    if pd.isna(current_score) or pd.isna(previous_score):
+        return np.nan, "Neutral"
+    delta = round(current_score - previous_score, 2)
+    if delta >= 0.50:
+        return delta, "Buy++"
+    if delta >= 0.20:
+        return delta, "Buy+"
+    if delta >= 0.05:
+        return delta, "Buy"
+    if delta <= -0.50:
+        return delta, "Sell++"
+    if delta <= -0.20:
+        return delta, "Sell+"
+    if delta <= -0.05:
+        return delta, "Sell"
+    return delta, "Neutral"
+
 def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Dict[str, object]:
     if intra_df is None or intra_df.empty:
         return {}
@@ -277,20 +351,24 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
     ltp = safe_float(close.iloc[-1])
     pct_change = ((ltp - prev_close) / prev_close * 100.0) if pd.notna(prev_close) and prev_close != 0 else 0.0
 
+    current_win = intraday_window_score(df)
+    previous_win = previous_same_time_score(df)
+    win_delta, win_signal = compare_window_signal(current_win, previous_win)
+
     bull = 0
     bear = 0
     if pct_change > 0:
-        bull += 2
+        bull += 1
     if pct_change < 0:
-        bear += 2
+        bear += 1
     if safe_float(vwap_z.iloc[-1], 0) >= 0.30:
-        bull += 2
+        bull += 1
     if safe_float(vwap_z.iloc[-1], 0) <= -0.30:
-        bear += 2
+        bear += 1
     if safe_float(plus_di.iloc[-1], 0) > safe_float(minus_di.iloc[-1], 0):
-        bull += 2
+        bull += 1
     if safe_float(minus_di.iloc[-1], 0) > safe_float(plus_di.iloc[-1], 0):
-        bear += 2
+        bear += 1
     if safe_float(adx.iloc[-1], 0) >= 20:
         bull += 1
         bear += 1
@@ -298,6 +376,11 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
         bull += 1
     if safe_float(rsi.iloc[-1], 50) <= 45:
         bear += 1
+
+    if win_signal.startswith("Buy"):
+        bull += 2
+    elif win_signal.startswith("Sell"):
+        bear += 2
 
     rank_delta = bull - bear
     ivp, vol_state = compute_ivp(reference_df)
@@ -307,12 +390,12 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
         "LTP": round(ltp, 2),
         "% Change": round(pct_change, 2),
         "5m_Signal": score_label(rank_delta),
-        "15m_Signal": score_label(rank_delta * 0.9),
+        "15m_Signal": win_signal,
         "30m_Signal": score_label(rank_delta * 0.8),
         "60m_Signal": score_label(rank_delta * 0.7),
         "Bull_Signal": score_label(bull),
         "Bear_Signal": score_label(-bear),
-        "Overall_Signal": score_label(rank_delta),
+        "Overall_Signal": win_signal,
         "Price_Lead_Status": str(lead_status[-1]),
         "IVP": ivp,
         "Volatility State": vol_state,
@@ -326,7 +409,6 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
         "Cumulative RSI": round(safe_float(rsi.iloc[-1], np.nan), 2),
         "VWAP Z-Score": round(safe_float(vwap_z.iloc[-1], 0.0), 2),
     }
-
 
 def choose_top_candidates(summary_df: pd.DataFrame, top_n: int = 10) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if summary_df is None or summary_df.empty:
