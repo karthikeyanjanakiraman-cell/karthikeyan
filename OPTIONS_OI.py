@@ -402,7 +402,7 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
     }
 
 
-def choose_top_candidates(summary_df: pd.DataFrame, top_n: int = 10) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def choose_top_candidates(summary_df: pd.DataFrame, top_n: int = 200) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if summary_df is None or summary_df.empty:
         return pd.DataFrame(), pd.DataFrame()
     long_df = summary_df[pd.to_numeric(summary_df["Rank Delta"], errors="coerce") > 0].copy()
