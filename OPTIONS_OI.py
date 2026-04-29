@@ -666,15 +666,13 @@ def format_cell(col: str, val) -> str:
     if isinstance(val, (int, float, np.integer, np.floating)):
         return f"{float(val):.2f}"
     return str(val)
-
-
 def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html = [f"<div class='card'><h3>{title}</h3>"]
     if df is None or df.empty:
         html.append("<p class='muted'>No data found.</p></div>")
-        # IMPORTANT: this must be on ONE line
+        # must be ONE line
         return "
-    ".join(html)
+".join(html)
 
     view = df[[c for c in columns if c in df.columns]].copy()
     html.append(
@@ -689,7 +687,7 @@ def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
             + "</tr>"
         )
     html.append("</tbody></table></div></div>")
-    # IMPORTANT: this must also be ONE line
+    # must also be ONE line
     return "
 ".join(html)
 
