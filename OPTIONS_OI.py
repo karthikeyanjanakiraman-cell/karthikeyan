@@ -161,6 +161,24 @@ def get_history(symbol: str, resolution: str, days_back: int) -> pd.DataFrame:
     return df
 
 
+
+
+def compute_obv(df: pd.DataFrame) -> float:
+    if df is None or df.empty or len(df) < 2:
+        return np.nan
+    close = pd.to_numeric(df["close"], errors="coerce")
+    vol = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
+    obv = 0.0
+    for i in range(1, len(df)):
+        if pd.isna(close.iloc[i]) or pd.isna(close.iloc[i - 1]):
+            continue
+        if close.iloc[i] > close.iloc[i - 1]:
+            obv += vol.iloc[i]
+        elif close.iloc[i] < close.iloc[i - 1]:
+            obv -= vol.iloc[i]
+    return round(obv, 2)
+
+
 def compute_ivp(history_df: pd.DataFrame) -> Tuple[float, str]:
     if history_df is None or history_df.empty or len(history_df) < 30:
         return np.nan, "Neutral Vol"
@@ -308,7 +326,7 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
     }
 
 
-def choose_top_candidates(summary_df: pd.DataFrame, top_n: int = 200) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def choose_top_candidates(summary_df: pd.DataFrame, top_n: int = 10) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if summary_df is None or summary_df.empty:
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     base = summary_df.copy()
@@ -380,7 +398,7 @@ def fetch_underlying_quote(symbol: str) -> float:
 
 def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> pd.DataFrame:
     if fyers is None:
-        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "PE Symbol", "PE LTP"])
+        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "CE OI", "CE Volume", "CE OBV", "PE Symbol", "PE LTP", "PE OI", "PE Volume", "PE OBV"])
 
     eq_symbol = format_eq_symbol(symbol)
     ltp = fetch_underlying_quote(symbol)
@@ -389,11 +407,11 @@ def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> p
         chain_res = fyers.optionchain(data={"symbol": eq_symbol, "strikecount": 50})
     except Exception as exc:
         logger.warning("Option chain failed for %s: %s", symbol, exc)
-        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "PE Symbol", "PE LTP"])
+        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "CE OI", "CE Volume", "CE OBV", "PE Symbol", "PE LTP", "PE OI", "PE Volume", "PE OBV"])
 
     chain = ((chain_res or {}).get("data") or {}).get("optionsChain", [])
     if not chain:
-        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "PE Symbol", "PE LTP"])
+        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "CE OI", "CE Volume", "CE OBV", "PE Symbol", "PE LTP", "PE OI", "PE Volume", "PE OBV"])
 
     rows = []
     for item in chain:
@@ -406,9 +424,11 @@ def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> p
             "Type": typ,
             "OptionSymbol": option_symbol_of(item),
             "OptionLTP": option_ltp_of(item),
+            "OI": safe_float(item.get("oi", item.get("open_interest", np.nan)), np.nan),
+            "Volume": safe_float(item.get("volume", np.nan), np.nan),
         })
     if not rows:
-        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "PE Symbol", "PE LTP"])
+        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "CE OI", "CE Volume", "CE OBV", "PE Symbol", "PE LTP", "PE OI", "PE Volume", "PE OBV"])
 
     oc = pd.DataFrame(rows)
     step = nearest_step(ltp if pd.notna(ltp) else oc["Strike"].median())
@@ -428,8 +448,14 @@ def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> p
             "Strike": strike,
             "CE Symbol": ce["OptionSymbol"].iloc[0] if not ce.empty else "",
             "CE LTP": round(safe_float(ce["OptionLTP"].iloc[0], 0.0), 2) if not ce.empty else 0.0,
+            "CE OI": round(safe_float(ce["OI"].iloc[0], np.nan), 2) if not ce.empty else np.nan,
+            "CE Volume": round(safe_float(ce["Volume"].iloc[0], np.nan), 2) if not ce.empty else np.nan,
+            "CE OBV": np.nan,
             "PE Symbol": pe["OptionSymbol"].iloc[0] if not pe.empty else "",
             "PE LTP": round(safe_float(pe["OptionLTP"].iloc[0], 0.0), 2) if not pe.empty else 0.0,
+            "PE OI": round(safe_float(pe["OI"].iloc[0], np.nan), 2) if not pe.empty else np.nan,
+            "PE Volume": round(safe_float(pe["Volume"].iloc[0], np.nan), 2) if not pe.empty else np.nan,
+            "PE OBV": np.nan,
         })
     return pd.DataFrame(final_rows)
 
@@ -448,6 +474,7 @@ def scan_single_option(option_symbol: str, option_type: str, strike: float, unde
     summary = summarize_intraday(intra_df, daily_df)
     if not summary:
         return None
+    obv_val = compute_obv(intra_df)
     return {
         "Underlying": underlying,
         "Option Type": option_type,
@@ -474,6 +501,7 @@ def scan_single_option(option_symbol: str, option_type: str, strike: float, unde
         "Cumulative ADX": summary.get("Cumulative ADX"),
         "Cumulative RSI": summary.get("Cumulative RSI"),
         "VWAP Z-Score": summary.get("VWAP Z-Score"),
+        "OBV": obv_val,
     }
 
 
