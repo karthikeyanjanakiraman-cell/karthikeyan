@@ -674,7 +674,7 @@ def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
         html.append("<p class='muted'>No data found.</p></div>")
         # IMPORTANT: this must be on ONE line
         return "
-".join(html)
+        ".join(html)
 
     view = df[[c for c in columns if c in df.columns]].copy()
     html.append(
@@ -691,7 +691,7 @@ def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html.append("</tbody></table></div></div>")
     # IMPORTANT: this must also be ONE line
     return "
-".join(html)
+    ".join(html)
 
 def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFrame, pe_df: pd.DataFrame, attachments: List[str]) -> bool:
     smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
