@@ -210,7 +210,7 @@ def summarize_intraday(intra_df: pd.DataFrame, daily_df: pd.DataFrame) -> Dict[s
 
     typical = (high + low + close) / 3.0
     cum_vol = volume.cumsum().replace(0, np.nan)
-    vwap = ((typical * volume).cumsum() / cum_vol).fillna(method="ffill").fillna(close)
+    vwap = ((typical * volume).cumsum() / cum_vol).ffill().fillna(close)
     vwap_std = (((typical - vwap) ** 2 * volume).cumsum() / cum_vol).pow(0.5).replace(0, np.nan)
     vwap_z = ((close - vwap) / vwap_std).replace([np.inf, -np.inf], np.nan).fillna(0.0)
 
