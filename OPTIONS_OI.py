@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 
 DAILY_LOOKBACK_DAYS = 90
 INTRADAY_LOOKBACK_DAYS = 20
-IVP_LOOKBACK_DAYS = 1
+IVP_LOOKBACK_DAYS = 252
 OPTION_PAIRS_TO_KEEP = 5
 SIGNAL_WINDOW_MINUTES = 5
 ITERATIONS_TO_KEEP = 75
@@ -501,7 +501,7 @@ def main() -> None:
     if summary_df.empty:
         raise RuntimeError("No symbols returned usable market data.")
     summary_df = summary_df.sort_values(["Rank Delta", "% Change"], ascending=[False, False]).reset_index(drop=True)
-    long_df, short_df = choose_top_candidates(summary_df, top_n=200)
+    long_df, short_df = choose_top_candidates(summary_df, top_n=60)
     ce_df, ce_iter_df = build_option_candidates(long_df, side="long")
     pe_df, pe_iter_df = build_option_candidates(short_df, side="short")
     iteration_df = pd.concat([ce_iter_df, pe_iter_df], ignore_index=True) if not ce_iter_df.empty or not pe_iter_df.empty else pd.DataFrame()
