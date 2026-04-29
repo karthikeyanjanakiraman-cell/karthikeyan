@@ -504,39 +504,41 @@ def scan_single_option(option_symbol: str, option_type: str, strike: float, unde
         "OBV": obv_val,
     }
 
-
 def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> pd.DataFrame:
     if candidates_df is None or candidates_df.empty or "Symbol" not in candidates_df.columns:
         return pd.DataFrame(columns=OPTION_EMAIL_COLS)
 
-    wanted_type = "CE" if str(side).lower() == "long" else "PE"
     rows = []
     for underlying in candidates_df["Symbol"].dropna().astype(str):
         pair_df = fetch_option_pairs(underlying)
         if pair_df.empty:
             continue
         for _, row in pair_df.iterrows():
-            option_symbol = row.get(f"{wanted_type} Symbol", "")
-            strike = row.get("Strike", np.nan)
-            if not option_symbol:
-                continue
-            scanned = scan_single_option(option_symbol, wanted_type, strike, underlying)
-            if scanned:
-                rows.append(scanned)
+            for opt_type in ["CE", "PE"]:
+                option_symbol = row.get(f"{opt_type} Symbol", "")
+                strike = row.get("Strike", np.nan)
+                if not option_symbol:
+                    continue
+                scanned = scan_single_option(option_symbol, opt_type, strike, underlying)
+                if scanned:
+                    rows.append(scanned)
 
     if not rows:
         return pd.DataFrame(columns=OPTION_EMAIL_COLS)
 
     out = pd.DataFrame(rows)
-    if wanted_type == "CE":
-        out = out[pd.to_numeric(out["Rank Delta"], errors="coerce") > 0].copy()
+    rank_delta = pd.to_numeric(out["Rank Delta"], errors="coerce")
+
+    if str(side).lower() == "long":
+        out = out[rank_delta > 0].copy()
         out = out.sort_values(["Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False])
     else:
-        out = out[pd.to_numeric(out["Rank Delta"], errors="coerce") < 0].copy()
+        out = out[rank_delta < 0].copy()
         out = out.sort_values(["Rank Delta", "Cumulative ADX", "% Change"], ascending=[True, False, True])
 
     keep_cols = [c for c in OPTION_EMAIL_COLS if c in out.columns]
     return out[keep_cols].reset_index(drop=True)
+
 
 
 def format_cell(col: str, val) -> str:
