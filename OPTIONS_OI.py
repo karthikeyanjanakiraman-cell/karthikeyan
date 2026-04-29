@@ -741,4 +741,73 @@ def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFram
             msg.attach(part)
     try:
         if smtp_port == 465:
-            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=40) as se
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=40) as server:
+                server.login(sender_email, sender_password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=40) as server:
+                server.ehlo(); server.starttls(); server.ehlo(); server.login(sender_email, sender_password); server.send_message(msg)
+        logger.info("Email sent to %s", recipient_email)
+        return True
+    except Exception as exc:
+        logger.error("Email failed: %s", exc)
+        return False
+
+
+def scan_symbol(symbol: str) -> Optional[Dict[str, object]]:
+    eq = format_eq_symbol(symbol)
+    daily_df = get_history(eq, "D", max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
+    intra_df = get_history(eq, "5", INTRADAY_LOOKBACK_DAYS)
+    if daily_df.empty or intra_df.empty:
+        return None
+    summary = summarize_intraday(intra_df, daily_df)
+    if not summary:
+        return None
+    summary["Symbol"] = symbol
+    return summary
+
+
+def ensure_output_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def main() -> None:
+    ensure_output_dir(OUTPUT_DIR)
+    init_fyers()
+    if fyers is None:
+        raise RuntimeError("Fyers client initialization failed.")
+    symbols = load_fno_symbols_from_sectors(SECTORS_DIR)
+    if not symbols:
+        raise FileNotFoundError(f"No F&O symbols found under '{SECTORS_DIR}'.")
+    logger.info("Loaded %s symbols from sectors folder.", len(symbols))
+    rows = []
+    for i, symbol in enumerate(symbols, start=1):
+        logger.info("[%s/%s] Scanning %s", i, len(symbols), symbol)
+        row = scan_symbol(symbol)
+        if row:
+            rows.append(row)
+    if not rows:
+        raise RuntimeError("No symbols returned usable market data.")
+    summary_df = pd.DataFrame(rows)
+    ordered_cols = ["Symbol"] + [c for c in EMAIL_DISPLAY_COLS if c != "Symbol"] + ["Bull Rank", "Bear Rank", "Rank Delta", "Cumulative +DI", "Cumulative -DI", "Cumulative ADX", "Cumulative RSI", "VWAP Z-Score"]
+    ordered_cols = [c for c in ordered_cols if c in summary_df.columns]
+    summary_df = summary_df[ordered_cols].sort_values(["Rank Delta", "% Change"], ascending=[False, False]).reset_index(drop=True)
+    long_df, short_df = choose_top_candidates(summary_df, top_n=10)
+    ce_df = build_option_candidates(long_df, side="long")
+    pe_df = build_option_candidates(short_df, side="short")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    summary_csv = os.path.join(OUTPUT_DIR, f"fo_summary_{timestamp}.csv")
+    ce_csv = os.path.join(OUTPUT_DIR, f"fo_ce_candidates_{timestamp}.csv")
+    pe_csv = os.path.join(OUTPUT_DIR, f"fo_pe_candidates_{timestamp}.csv")
+    summary_df.to_csv(summary_csv, index=False)
+    ce_df.to_csv(ce_csv, index=False)
+    pe_df.to_csv(pe_csv, index=False)
+    send_email(long_df, short_df, ce_df, pe_df, [summary_csv, ce_csv, pe_csv])
+    logger.info("Completed.")
+    logger.info("Summary CSV: %s", summary_csv)
+    logger.info("CE candidates CSV: %s", ce_csv)
+    logger.info("PE candidates CSV: %s", pe_csv)
+
+
+if __name__ == "__main__":
+    main()
