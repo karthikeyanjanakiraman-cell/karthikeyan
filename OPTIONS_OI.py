@@ -321,6 +321,7 @@ def build_iteration_history(df: pd.DataFrame, window_minutes: int = None, iterat
         delta, signal = compare_window_signal(current_score, prev_score)
         rows.append({
             "timestamp": end_ts,
+            "iteration_no": len(rows) + 1,
             "window_minutes": window_minutes,
             "current_window_score": current_score,
             "previous_same_time_score": prev_score,
@@ -331,7 +332,9 @@ def build_iteration_history(df: pd.DataFrame, window_minutes: int = None, iterat
     out = pd.DataFrame(rows)
     if out.empty:
         return out
-    return out.tail(iterations).reset_index(drop=True)
+    out = out.tail(iterations).reset_index(drop=True)
+    out["iteration_no"] = range(1, len(out) + 1)
+    return out
 
 
 def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Dict[str, object]:
@@ -394,7 +397,7 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
     current_win = intraday_window_score(df)
     previous_win = previous_same_time_score(df)
     win_delta, win_signal = compare_window_signal(current_win, previous_win)
-    _iteration_history = build_iteration_history(df)
+    iteration_history = build_iteration_history(df)
 
     bull = 0
     bear = 0
@@ -448,6 +451,7 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
         "Cumulative ADX": round(safe_float(adx.iloc[-1], np.nan), 2),
         "Cumulative RSI": round(safe_float(rsi.iloc[-1], np.nan), 2),
         "VWAP Z-Score": round(safe_float(vwap_z.iloc[-1], 0.0), 2),
+        "Iteration History": iteration_history,
     }
 
 
@@ -521,29 +525,17 @@ def fetch_underlying_quote(symbol: str) -> float:
 
 def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> pd.DataFrame:
     if fyers is None:
-        return pd.DataFrame(columns=[
-            "Underlying", "Underlying LTP", "ATM Strike", "Strike",
-            "CE Symbol", "CE LTP", "CE OI", "CE Volume",
-            "PE Symbol", "PE LTP", "PE OI", "PE Volume",
-        ])
+        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "CE OI", "CE Volume", "PE Symbol", "PE LTP", "PE OI", "PE Volume"])
     eq_symbol = format_eq_symbol(symbol)
     ltp = fetch_underlying_quote(symbol)
     try:
         chain_res = fyers.optionchain(data={"symbol": eq_symbol, "strikecount": 50})
     except Exception as exc:
         logger.warning("Option chain failed for %s: %s", symbol, exc)
-        return pd.DataFrame(columns=[
-            "Underlying", "Underlying LTP", "ATM Strike", "Strike",
-            "CE Symbol", "CE LTP", "CE OI", "CE Volume",
-            "PE Symbol", "PE LTP", "PE OI", "PE Volume",
-        ])
+        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "CE OI", "CE Volume", "PE Symbol", "PE LTP", "PE OI", "PE Volume"])
     chain = ((chain_res or {}).get("data") or {}).get("optionsChain", [])
     if not chain:
-        return pd.DataFrame(columns=[
-            "Underlying", "Underlying LTP", "ATM Strike", "Strike",
-            "CE Symbol", "CE LTP", "CE OI", "CE Volume",
-            "PE Symbol", "PE LTP", "PE OI", "PE Volume",
-        ])
+        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "CE OI", "CE Volume", "PE Symbol", "PE LTP", "PE OI", "PE Volume"])
     rows = []
     for item in chain:
         strike = strike_of(item)
@@ -559,11 +551,7 @@ def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> p
             "Volume": safe_float(item.get("volume", np.nan), np.nan),
         })
     if not rows:
-        return pd.DataFrame(columns=[
-            "Underlying", "Underlying LTP", "ATM Strike", "Strike",
-            "CE Symbol", "CE LTP", "CE OI", "CE Volume",
-            "PE Symbol", "PE LTP", "PE OI", "PE Volume",
-        ])
+        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "CE OI", "CE Volume", "PE Symbol", "PE LTP", "PE OI", "PE Volume"])
     oc = pd.DataFrame(rows)
     step = nearest_step(ltp if pd.notna(ltp) else oc["Strike"].median())
     atm = round(ltp / step) * step if pd.notna(ltp) else oc["Strike"].median()
@@ -615,6 +603,7 @@ def scan_single_option(option_symbol: str, option_type: str, strike: float, unde
         "Last Iteration Time": summary.get("Last Iteration Time"), "Bull Rank": summary.get("Bull Rank"), "Bear Rank": summary.get("Bear Rank"),
         "Rank Delta": summary.get("Rank Delta"), "Cumulative +DI": summary.get("Cumulative +DI"), "Cumulative -DI": summary.get("Cumulative -DI"),
         "Cumulative ADX": summary.get("Cumulative ADX"), "Cumulative RSI": summary.get("Cumulative RSI"), "VWAP Z-Score": summary.get("VWAP Z-Score"), "OBV": obv_val,
+        "Iteration History": summary.get("Iteration History"),
     }
 
 
@@ -667,30 +656,20 @@ def format_cell(col: str, val) -> str:
         return f"{float(val):.2f}"
     return str(val)
 
+
 def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html = [f"<div class='card'><h3>{title}</h3>"]
     if df is None or df.empty:
         html.append("<p class='muted'>No data found.</p></div>")
-        # chr(10) is the safe way to do a newline without quotes
         return chr(10).join(html)
-
     view = df[[c for c in columns if c in df.columns]].copy()
-    html.append(
-        "<div class='table-wrap'><table><thead><tr>"
-        + "".join([f"<th>{c}</th>" for c in view.columns])
-        + "</tr></thead><tbody>"
-    )
+    html.append("<div class='table-wrap'><table><thead><tr>" + "".join([f"<th>{c}</th>" for c in view.columns]) + "</tr></thead><tbody>")
     for _, row in view.iterrows():
-        html.append(
-            "<tr>"
-            + "".join([f"<td>{format_cell(c, row[c])}</td>" for c in view.columns])
-            + "</tr>"
-        )
+        html.append("<tr>" + "".join([f"<td>{format_cell(c, row[c])}</td>" for c in view.columns]) + "</tr>")
     html.append("</tbody></table></div></div>")
-    
-    # chr(10) is the safe way to do a newline without quotes
     return chr(10).join(html)
-    
+
+
 def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFrame, pe_df: pd.DataFrame, attachments: List[str]) -> bool:
     smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
     smtp_port = int(os.environ.get("SMTP_PORT", "587"))
@@ -745,7 +724,7 @@ def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFram
         {dataframe_to_html(short_display, EMAIL_DISPLAY_COLS, 'Stock Short Candidates')}
         {dataframe_to_html(ce_display, OPTION_EMAIL_COLS, 'CE Candidates from Long Stocks')}
         {dataframe_to_html(pe_display, OPTION_EMAIL_COLS, 'PE Candidates from Short Stocks')}
-        <div class='footer'>Attached CSVs: summary, CE candidates, PE candidates.</div>
+        <div class='footer'>Attached CSVs: summary, iteration history, CE candidates, PE candidates.</div>
       </div>
     </body>
     </html>
@@ -805,33 +784,49 @@ def main() -> None:
         raise FileNotFoundError(f"No F&O symbols found under '{SECTORS_DIR}'.")
     logger.info("Loaded %s symbols from sectors folder.", len(symbols))
     rows = []
+    iteration_rows = []
     for i, symbol in enumerate(symbols, start=1):
         logger.info("[%s/%s] Scanning %s", i, len(symbols), symbol)
-        row = scan_symbol(symbol)
-        if row:
-            rows.append(row)
+        eq = format_eq_symbol(symbol)
+        daily_df = get_history(eq, "D", max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
+        intra_df = get_history(eq, "5", INTRADAY_LOOKBACK_DAYS)
+        if daily_df.empty or intra_df.empty:
+            continue
+        summary = summarize_intraday(intra_df, daily_df)
+        if not summary:
+            continue
+        summary["Symbol"] = symbol
+        if "Iteration History" in summary and isinstance(summary["Iteration History"], pd.DataFrame) and not summary["Iteration History"].empty:
+            hist = summary["Iteration History"].copy()
+            hist.insert(0, "Symbol", symbol)
+            iteration_rows.append(hist)
+        rows.append(summary)
     if not rows:
         raise RuntimeError("No symbols returned usable market data.")
     summary_df = pd.DataFrame(rows)
-    ordered_cols = ["Symbol"] + [c for c in EMAIL_DISPLAY_COLS if c != "Symbol"] + [
-        "Bull Rank", "Bear Rank", "Rank Delta", "Cumulative +DI", "Cumulative -DI",
-        "Cumulative ADX", "Cumulative RSI", "VWAP Z-Score",
-    ]
+    ordered_cols = ["Symbol"] + [c for c in EMAIL_DISPLAY_COLS if c != "Symbol"] + ["Bull Rank", "Bear Rank", "Rank Delta", "Cumulative +DI", "Cumulative -DI", "Cumulative ADX", "Cumulative RSI", "VWAP Z-Score"]
     ordered_cols = [c for c in ordered_cols if c in summary_df.columns]
     summary_df = summary_df[ordered_cols].sort_values(["Rank Delta", "% Change"], ascending=[False, False]).reset_index(drop=True)
     long_df, short_df = choose_top_candidates(summary_df, top_n=10)
     ce_df = build_option_candidates(long_df, side="long")
     pe_df = build_option_candidates(short_df, side="short")
+    iter_df = pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     summary_csv = os.path.join(OUTPUT_DIR, f"fo_summary_{timestamp}.csv")
+    iter_csv = os.path.join(OUTPUT_DIR, f"fo_iteration_history_{timestamp}.csv")
     ce_csv = os.path.join(OUTPUT_DIR, f"fo_ce_candidates_{timestamp}.csv")
     pe_csv = os.path.join(OUTPUT_DIR, f"fo_pe_candidates_{timestamp}.csv")
     summary_df.to_csv(summary_csv, index=False)
+    if not iter_df.empty:
+        iter_df.to_csv(iter_csv, index=False)
+    else:
+        pd.DataFrame(columns=["Symbol", "timestamp", "iteration_no", "window_minutes", "current_window_score", "previous_same_time_score", "window_delta", "window_signal", "close"]).to_csv(iter_csv, index=False)
     ce_df.to_csv(ce_csv, index=False)
     pe_df.to_csv(pe_csv, index=False)
-    send_email(long_df, short_df, ce_df, pe_df, [summary_csv, ce_csv, pe_csv])
+    send_email(long_df, short_df, ce_df, pe_df, [summary_csv, iter_csv, ce_csv, pe_csv])
     logger.info("Completed.")
     logger.info("Summary CSV: %s", summary_csv)
+    logger.info("Iteration CSV: %s", iter_csv)
     logger.info("CE candidates CSV: %s", ce_csv)
     logger.info("PE candidates CSV: %s", pe_csv)
 
