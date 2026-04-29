@@ -165,8 +165,6 @@ def get_history(symbol: str, resolution: str, days_back: int) -> pd.DataFrame:
     return df
 
 
-
-
 def compute_obv(df: pd.DataFrame) -> float:
     if df is None or df.empty or len(df) < 2:
         return np.nan
@@ -402,7 +400,11 @@ def fetch_underlying_quote(symbol: str) -> float:
 
 def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> pd.DataFrame:
     if fyers is None:
-        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "CE OI", "CE Volume", "CE OBV", "PE Symbol", "PE LTP", "PE OI", "PE Volume", "PE OBV"])
+        return pd.DataFrame(columns=[
+            "Underlying", "Underlying LTP", "ATM Strike", "Strike",
+            "CE Symbol", "CE LTP", "CE OI", "CE Volume",
+            "PE Symbol", "PE LTP", "PE OI", "PE Volume"
+        ])
 
     eq_symbol = format_eq_symbol(symbol)
     ltp = fetch_underlying_quote(symbol)
@@ -411,11 +413,19 @@ def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> p
         chain_res = fyers.optionchain(data={"symbol": eq_symbol, "strikecount": 50})
     except Exception as exc:
         logger.warning("Option chain failed for %s: %s", symbol, exc)
-        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "CE OI", "CE Volume", "CE OBV", "PE Symbol", "PE LTP", "PE OI", "PE Volume", "PE OBV"])
+        return pd.DataFrame(columns=[
+            "Underlying", "Underlying LTP", "ATM Strike", "Strike",
+            "CE Symbol", "CE LTP", "CE OI", "CE Volume",
+            "PE Symbol", "PE LTP", "PE OI", "PE Volume"
+        ])
 
     chain = ((chain_res or {}).get("data") or {}).get("optionsChain", [])
     if not chain:
-        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "CE OI", "CE Volume", "CE OBV", "PE Symbol", "PE LTP", "PE OI", "PE Volume", "PE OBV"])
+        return pd.DataFrame(columns=[
+            "Underlying", "Underlying LTP", "ATM Strike", "Strike",
+            "CE Symbol", "CE LTP", "CE OI", "CE Volume",
+            "PE Symbol", "PE LTP", "PE OI", "PE Volume"
+        ])
 
     rows = []
     for item in chain:
@@ -431,8 +441,13 @@ def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> p
             "OI": safe_float(item.get("oi", item.get("open_interest", np.nan)), np.nan),
             "Volume": safe_float(item.get("volume", np.nan), np.nan),
         })
+
     if not rows:
-        return pd.DataFrame(columns=["Underlying", "Underlying LTP", "ATM Strike", "Strike", "CE Symbol", "CE LTP", "CE OI", "CE Volume", "CE OBV", "PE Symbol", "PE LTP", "PE OI", "PE Volume", "PE OBV"])
+        return pd.DataFrame(columns=[
+            "Underlying", "Underlying LTP", "ATM Strike", "Strike",
+            "CE Symbol", "CE LTP", "CE OI", "CE Volume",
+            "PE Symbol", "PE LTP", "PE OI", "PE Volume"
+        ])
 
     oc = pd.DataFrame(rows)
     step = nearest_step(ltp if pd.notna(ltp) else oc["Strike"].median())
@@ -445,8 +460,6 @@ def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> p
         sub = oc[oc["Strike"] == strike]
         ce = sub[sub["Type"] == "CE"].head(1)
         pe = sub[sub["Type"] == "PE"].head(1)
-        ce_obv = compute_obv(get_history(f"NSE:{ce['OptionSymbol'].iloc[0]}", "5", INTRADAY_LOOKBACK_DAYS)) if not ce.empty and str(ce["OptionSymbol"].iloc[0]).strip() else np.nan
-        pe_obv = compute_obv(get_history(f"NSE:{pe['OptionSymbol'].iloc[0]}", "5", INTRADAY_LOOKBACK_DAYS)) if not pe.empty and str(pe["OptionSymbol"].iloc[0]).strip() else np.nan
         final_rows.append({
             "Underlying": symbol,
             "Underlying LTP": round(safe_float(ltp, np.nan), 2) if pd.notna(ltp) else np.nan,
@@ -456,12 +469,10 @@ def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> p
             "CE LTP": round(safe_float(ce["OptionLTP"].iloc[0], 0.0), 2) if not ce.empty else 0.0,
             "CE OI": round(safe_float(ce["OI"].iloc[0], np.nan), 2) if not ce.empty else np.nan,
             "CE Volume": round(safe_float(ce["Volume"].iloc[0], np.nan), 2) if not ce.empty else np.nan,
-            "CE OBV": ce_obv,
             "PE Symbol": pe["OptionSymbol"].iloc[0] if not pe.empty else "",
             "PE LTP": round(safe_float(pe["OptionLTP"].iloc[0], 0.0), 2) if not pe.empty else 0.0,
             "PE OI": round(safe_float(pe["OI"].iloc[0], np.nan), 2) if not pe.empty else np.nan,
             "PE Volume": round(safe_float(pe["Volume"].iloc[0], np.nan), 2) if not pe.empty else np.nan,
-            "PE OBV": pe_obv,
         })
     return pd.DataFrame(final_rows)
 
@@ -515,7 +526,12 @@ def option_liquidity_score(oi, volume, obv) -> float:
     oi = safe_float(oi, 0.0)
     volume = safe_float(volume, 0.0)
     obv = abs(safe_float(obv, 0.0))
-    return round((np.log1p(max(oi, 0.0)) * 0.45) + (np.log1p(max(volume, 0.0)) * 0.35) + (np.log1p(max(obv, 0.0)) * 0.20), 4)
+    return round(
+        (np.log1p(max(oi, 0.0)) * 0.45) +
+        (np.log1p(max(volume, 0.0)) * 0.35) +
+        (np.log1p(max(obv, 0.0)) * 0.20),
+        4
+    )
 
 
 def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> pd.DataFrame:
@@ -540,22 +556,35 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> pd.DataFr
                     continue
                 scanned = scan_single_option(option_symbol, opt_type, strike, underlying)
                 if scanned:
-                    scanned["OI+Volume+OBV Score"] = option_liquidity_score(scanned.get("OI"), scanned.get("Volume"), scanned.get("OBV"))
+                    scanned["OI+Volume+OBV Score"] = option_liquidity_score(
+                        scanned.get("OI"),
+                        scanned.get("Volume"),
+                        scanned.get("OBV")
+                    )
                     rows.append(scanned)
 
     if not rows:
         return pd.DataFrame(columns=OPTION_EMAIL_COLS)
 
     out = pd.DataFrame(rows)
+    out["OI+Volume+OBV Score"] = out.apply(
+        lambda r: option_liquidity_score(r.get("OI"), r.get("Volume"), r.get("OBV")),
+        axis=1
+    )
     rank_delta = pd.to_numeric(out["Rank Delta"], errors="coerce")
-    liq = pd.to_numeric(out["OI+Volume+OBV Score"], errors="coerce")
 
     if str(side).lower() == "long":
         out = out[rank_delta > 0].copy()
-        out = out.sort_values(["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False, False])
+        out = out.sort_values(
+            ["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"],
+            ascending=[False, False, False, False]
+        )
     else:
         out = out[rank_delta < 0].copy()
-        out = out.sort_values(["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, True, False, True])
+        out = out.sort_values(
+            ["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"],
+            ascending=[False, True, False, True]
+        )
 
     keep_cols = [c for c in OPTION_EMAIL_COLS if c in out.columns]
     return out[keep_cols].reset_index(drop=True)
@@ -575,14 +604,16 @@ def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html = [f"<h3>{title}</h3>"]
     if df is None or df.empty:
         html.append("<p>No data found.</p>")
-        return "\n".join(html)
+        return "
+".join(html)
     view = df[[c for c in columns if c in df.columns]].copy()
     html.append("<table border='1' cellspacing='0' cellpadding='6' style='border-collapse:collapse;font-family:Arial,sans-serif;font-size:12px;'>")
     html.append("<tr>" + "".join([f"<th style='background:#f2f2f2'>{c}</th>" for c in view.columns]) + "</tr>")
     for _, row in view.iterrows():
         html.append("<tr>" + "".join([f"<td>{format_cell(c, row[c])}</td>" for c in view.columns]) + "</tr>")
     html.append("</table>")
-    return "\n".join(html)
+    return "
+".join(html)
 
 
 def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFrame, pe_df: pd.DataFrame, attachments: List[str]) -> bool:
@@ -693,7 +724,7 @@ def main() -> None:
     ordered_cols = [c for c in ordered_cols if c in summary_df.columns]
     summary_df = summary_df[ordered_cols].sort_values(["Rank Delta", "% Change"], ascending=[False, False]).reset_index(drop=True)
 
-    long_df, short_df = choose_top_candidates(summary_df, top_n=30)
+    long_df, short_df = choose_top_candidates(summary_df, top_n=10)
     ce_df = build_option_candidates(long_df, side="long")
     pe_df = build_option_candidates(short_df, side="short")
 
