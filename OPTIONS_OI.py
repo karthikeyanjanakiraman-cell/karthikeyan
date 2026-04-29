@@ -604,16 +604,14 @@ def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html = [f"<h3>{title}</h3>"]
     if df is None or df.empty:
         html.append("<p>No data found.</p>")
-        return "
-".join(html)
+        return "\n".join(html)
     view = df[[c for c in columns if c in df.columns]].copy()
     html.append("<table border='1' cellspacing='0' cellpadding='6' style='border-collapse:collapse;font-family:Arial,sans-serif;font-size:12px;'>")
     html.append("<tr>" + "".join([f"<th style='background:#f2f2f2'>{c}</th>" for c in view.columns]) + "</tr>")
     for _, row in view.iterrows():
         html.append("<tr>" + "".join([f"<td>{format_cell(c, row[c])}</td>" for c in view.columns]) + "</tr>")
     html.append("</table>")
-    return "
-".join(html)
+    return "\n".join(html)
 
 
 def send_email(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFrame, pe_df: pd.DataFrame, attachments: List[str]) -> bool:
