@@ -35,7 +35,7 @@ SECTORS_DIR = os.environ.get("SECTORS_DIR", "sectors")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 MIN_OPTION_LTP = 10.0
 PER_SYMBOL_SLEEP_SEC = float(os.environ.get("PER_SYMBOL_SLEEP_SEC", "0.25"))
-MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "16"))
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "8"))
 EMAIL_MAX_ROWS_LONG = int(os.environ.get("EMAIL_MAX_ROWS_LONG", "14"))
 EMAIL_MAX_ROWS_SHORT = int(os.environ.get("EMAIL_MAX_ROWS_SHORT", "14"))
 EMAIL_SAFE_WIDTH = int(os.environ.get("EMAIL_SAFE_WIDTH", "600"))
@@ -164,7 +164,8 @@ def compute_obv(df: pd.DataFrame) -> float:
         return np.nan
     close = pd.to_numeric(df["close"], errors="coerce")
     vol = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
-    direction = np.sign(close.diff())
+    direction = np.sign(close.diff().fillna(0.0))
+    direction.iloc[0] = 0.0
     obv = (vol * direction).cumsum()
     return round(safe_float(obv.iloc[-1], np.nan), 2)
 
@@ -176,14 +177,10 @@ def compute_today_obv(df: pd.DataFrame) -> float:
     d["timestamp"] = pd.to_datetime(d["timestamp"])
     today = pd.Timestamp.now(tz=None).date()
     day_data = d[d["timestamp"].dt.date == today].copy()
-    # Fallback: if no bars for today (pre-market / holiday), use last available trading day
     if day_data.empty or len(day_data) < 2:
         last_day = d["timestamp"].dt.date.max()
         day_data = d[d["timestamp"].dt.date == last_day].copy()
     if day_data.empty or len(day_data) < 2:
-        return np.nan
-    day_data = day_data[day_data["timestamp"] >= pd.Timestamp.combine(day_data["timestamp"].dt.date.min(), dtime(9, 15))].copy()
-    if len(day_data) < 2:
         return np.nan
     return compute_obv(day_data)
 
@@ -501,7 +498,10 @@ def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> p
     except Exception:
         return pd.DataFrame()
 
-    chain = ((chain_res or {}).get("data") or {}).get("optionsChain", [])
+    data = chain_res or {}
+    chain = data.get("data", {}).get("optionsChain", [])
+    if not chain:
+        chain = data.get("optionsChain", []) or data.get("data", []) or []
     if not chain:
         return pd.DataFrame()
 
@@ -514,7 +514,7 @@ def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> p
         rows.append({
             "Strike": strike,
             "Type": typ,
-            "OptionSymbol": str(item.get("symbol", "")),
+            "OptionSymbol": str(item.get("symbol") or item.get("option_symbol") or item.get("trading_symbol") or ""),
             "OptionLTP": safe_float(item.get("ltp") or item.get("lp"), 0.0),
             "OI": safe_float(item.get("oi") or item.get("open_interest"), np.nan),
             "Volume": safe_float(item.get("volume"), np.nan),
@@ -547,7 +547,7 @@ def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> p
 
 def scan_single_option(option_symbol: str, option_type: str, strike: float, underlying: str) -> Optional[Dict]:
     hist_symbol = option_symbol if option_symbol.startswith("NSE:") else f"NSE:{option_symbol}"
-    daily_df = get_history(hist_symbol, "D", max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
+    daily_df = get_history(hist_symbol, "D", DAILY_LOOKBACK_DAYS)
     intra_df = get_history(hist_symbol, "5", INTRADAY_LOOKBACK_DAYS)
     if daily_df.empty or intra_df.empty:
         return None
@@ -607,9 +607,8 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
         return pd.DataFrame(), pd.DataFrame()
 
     rows, iter_rows = [], []
+    tasks = []
 
-    # Collect all (underlying, option_row) pairs first
-    all_tasks = []
     for underlying in candidates_df["Symbol"].dropna().astype(str):
         pair_df = fetch_option_pairs(underlying)
         if pair_df.empty:
@@ -620,7 +619,7 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
             sym = str(row.get("Option Symbol", ""))
             if not sym or opt_type not in {"CE", "PE"}:
                 continue
-            all_tasks.append((sym, opt_type, strike, underlying, dict(row)))
+            tasks.append((sym, opt_type, strike, underlying, dict(row)))
 
     def _scan_task(args):
         sym, opt_type, strike, underlying, row = args
@@ -635,7 +634,7 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
         return scanned, sym, underlying, strike, opt_type
 
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
-        for result in executor.map(_scan_task, all_tasks):
+        for result in executor.map(_scan_task, tasks):
             if result is None:
                 continue
             scanned, sym, underlying, strike, opt_type = result
@@ -659,10 +658,8 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
     pct = safe_series(out, "% Change", 0)
 
     if side == "long":
-        out = out[(rd > 0) | (pct > 0)].copy()
         out = out.sort_values(["EMAIL_RANK_SCORE", "OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False, False, False])
     else:
-        out = out[(rd < 0) | (pct < 0)].copy()
         out = out.sort_values(["EMAIL_RANK_SCORE", "OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, True, False, True])
 
     final_cols = [c for c in OPTION_EMAIL_COLS if c in out.columns]
@@ -750,10 +747,7 @@ def prepare_option_email_view(df: pd.DataFrame, side: str, max_rows: int) -> pd.
         out = out[pd.to_numeric(out["LTP"], errors="coerce") >= MIN_OPTION_LTP].copy()
     out = apply_display_labels(out, side)
     timing_cols = [c for c in ["5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal"] if c in out.columns]
-    if timing_cols:
-        neutral_like = {"", "-", "NEUTRAL", "NAN", "NONE"}
-        mask = ~out[timing_cols].apply(lambda row: all(str(v).strip().upper() in neutral_like for v in row), axis=1)
-        out = out[mask].copy()
+    # keep rows even if all signal columns are neutral so CSV/email is not empty
     out = rank_option_candidates(out, side)
     final_cols = [c for c in OPTION_EMAIL_COLS if c in out.columns]
     return out[final_cols].head(max_rows).reset_index(drop=True)
@@ -824,7 +818,7 @@ def send_direction_email(df: pd.DataFrame, direction: str, attachments: list) ->
 
 def scan_symbol(symbol: str) -> Optional[Dict]:
     eq = format_eq_symbol(symbol)
-    daily_df = get_history(eq, "D", max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
+    daily_df = get_history(eq, "D", DAILY_LOOKBACK_DAYS)
     intra_df = get_history(eq, "5", INTRADAY_LOOKBACK_DAYS)
     if daily_df.empty or intra_df.empty:
         return None
@@ -840,7 +834,7 @@ def main() -> None:
     init_fyers()
     symbols = load_fno_symbols_from_sectors(SECTORS_DIR)
 
-    logger.info("Scanning %s symbols with MAX_WORKERS=%s (parallel)", len(symbols), MAX_WORKERS)
+    logger.info("Scanning %s symbols with MAX_WORKERS=%s", len(symbols), MAX_WORKERS)
     rows = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
         futures = {executor.submit(scan_symbol, symbol): symbol for symbol in symbols}
@@ -855,7 +849,8 @@ def main() -> None:
 
     summary_df = pd.DataFrame(rows)
     if summary_df.empty:
-        logger.error("No symbols returned usable market data."); return
+        logger.error("No symbols returned usable market data.")
+        return
 
     summary_df = summary_df.sort_values(["Rank Delta", "% Change"], ascending=[False, False]).reset_index(drop=True)
     long_seed_df, short_seed_df = choose_top_candidates(summary_df, top_n=TOP_N_UNDERLYINGS)
