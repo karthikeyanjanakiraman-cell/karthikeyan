@@ -769,3 +769,13 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+
+def debug_option_chain_all():
+    if fyers is None:
+        init_fyers()
+    for sym in ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX"]:
+        df, meta = fetch_raw_option_chain(sym)
+        print(sym, "rows=", len(df), "meta=", meta)
+        if not df.empty:
+            print(df.head(5).to_string())
