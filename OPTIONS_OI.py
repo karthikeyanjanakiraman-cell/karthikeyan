@@ -537,15 +537,24 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
 
     out = pd.DataFrame(rows)
     rd = pd.to_numeric(out["Rank Delta"], errors="coerce")
+    pct = pd.to_numeric(out["% Change"], errors="coerce")
 
     if side == "long":
-        out = out[(rd > 0) & (out["Option Type"].astype(str).str.upper() == "CE")].copy()
+        out = out[
+            (rd > 0) &
+            (out["Option Type"].astype(str).str.upper() == "CE") &
+            (pct > 0)
+        ].copy()
         out = out.sort_values(
             ["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"],
             ascending=[False, False, False, False]
         )
     else:
-        out = out[(rd < 0) & (out["Option Type"].astype(str).str.upper() == "PE")].copy()
+        out = out[
+            (rd < 0) &
+            (out["Option Type"].astype(str).str.upper() == "PE") &
+            (pct < 0)
+        ].copy()
         out = out.sort_values(
             ["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"],
             ascending=[False, True, False, True]
@@ -637,6 +646,10 @@ def prepare_option_email_view(df: pd.DataFrame, side: str) -> pd.DataFrame:
     if "LTP" in out.columns:
         out = out[pd.to_numeric(out["LTP"], errors="coerce") >= MIN_OPTION_LTP].copy()
 
+    if "% Change" in out.columns:
+        pct = pd.to_numeric(out["% Change"], errors="coerce")
+        out = out[pct > 0].copy() if side == "long" else out[pct < 0].copy()
+
     out = apply_display_labels(out, side)
 
     timing_cols = [c for c in ["5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal"] if c in out.columns]
@@ -655,28 +668,83 @@ def prepare_option_email_view(df: pd.DataFrame, side: str) -> pd.DataFrame:
     return out[final_cols].reset_index(drop=True)
 
 
-def simple_table_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
-    html = [f"<p style='margin:16px 0 6px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;'><b>{title}</b></p>"]
+def _cell_bg(col: str, value: str) -> str:
+    v = str(value).strip().upper()
+    if col == "% Change":
+        try:
+            num = float(str(value).replace('%', '').strip())
+        except Exception:
+            return '#2d3651'
+        if num > 0:
+            return '#2e7d32'
+        if num < 0:
+            return '#c62828'
+        return '#546e7a'
+    if col in {"5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal", "Bull_Signal", "Bear_Signal", "Overall_Signal"}:
+        if "LONG++" in v or "BUY++" in v:
+            return '#2e7d32'
+        if "LONG+" in v or "BUY+" in v:
+            return '#388e3c'
+        if v in {"LONG", "BUY"}:
+            return '#43a047'
+        if "SHORT++" in v or "SELL++" in v:
+            return '#c62828'
+        if "SHORT+" in v or "SELL+" in v:
+            return '#d32f2f'
+        if v in {"SHORT", "SELL"}:
+            return '#e53935'
+        if "NEUTRAL" in v:
+            return '#6b7280'
+    if col == "Volatility State":
+        if "AVOID BUY PREMIUM" in v:
+            return '#fbc02d'
+        if "BUYER ZONE" in v:
+            return '#9ccc65'
+        return '#546e7a'
+    if col == "Price_Lead_Status":
+        if "EARLY_PRICE_LEAD" in v:
+            return '#00897b'
+        if "FADE" in v:
+            return '#8e24aa'
+        return '#2d3651'
+    return '#2d3651'
+
+
+def _text_color(bg: str) -> str:
+    return '#111111' if bg.lower() in {'#fbc02d', '#9ccc65'} else '#ffffff'
+
+
+def colored_table_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
+    html = [
+        f"<div style='margin:0 0 12px 0;'>",
+        f"<div style='margin:10px 0 4px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;'><b>{title}</b></div>"
+    ]
 
     if df is None or df.empty:
-        html.append("<p style='margin:4px 0 12px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;'>No data found.</p>")
-        return "".join(html)
+        html.append("<div style='font-family:Arial,Helvetica,sans-serif; font-size:12px; color:#000;'>No data found.</div></div>")
+        return ''.join(html)
 
     view = df[[c for c in columns if c in df.columns]].copy()
-    html.append("<table style='border-collapse:collapse; font-family:Arial,Helvetica,sans-serif; font-size:12px; color:#000;'>")
+    html.append("<table cellpadding='0' cellspacing='1' style='border-collapse:separate; border-spacing:1px; background:#ffffff; font-family:Arial,Helvetica,sans-serif; font-size:10px;'>")
     html.append("<tr>")
     for c in view.columns:
-        html.append(f"<th style='text-align:left; font-weight:bold; padding:0 14px 2px 0; white-space:nowrap; border:none;'>{c}</th>")
+        html.append(
+            f"<th style='background:#2f3b59; color:#ffffff; text-align:center; font-weight:bold; padding:5px 6px; white-space:nowrap; border:none;'>{c}</th>"
+        )
     html.append("</tr>")
 
     for _, row in view.iterrows():
         html.append("<tr>")
         for c in view.columns:
-            html.append(f"<td style='padding:0 14px 2px 0; white-space:nowrap; vertical-align:top; border:none;'>{format_cell(c, row[c])}</td>")
+            cell_val = format_cell(c, row[c])
+            bg = _cell_bg(c, cell_val)
+            fg = _text_color(bg)
+            html.append(
+                f"<td style='background:{bg}; color:{fg}; text-align:center; padding:4px 6px; white-space:nowrap; border:none;'>{cell_val}</td>"
+            )
         html.append("</tr>")
-
-    html.append("</table>")
-    return "".join(html)
+    html.append("</table></div>")
+    return ''.join(html)
 
 
 def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
@@ -694,12 +762,12 @@ def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
     pe_view = prepare_option_email_view(pe_df, "short")
 
     html = f"""<html>
-    <body style="margin:0; padding:0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000; background:#fff;">
-        <div style="padding:0; margin:0;">
-            <p style="margin:0 0 8px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;"><b>Intraday Vol Iteration Alert</b></p>
-            <p style="margin:0 0 14px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;">Scan completed at {scan_time}.</p>
-            {simple_table_html(ce_view, OPTION_EMAIL_COLS, "CE Candidates")}
-            {simple_table_html(pe_view, OPTION_EMAIL_COLS, "PE Candidates")}
+    <body style="margin:0; padding:8px; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000; background:#ffffff;">
+        <div style="margin:0; padding:0;">
+            <div style="margin:0 0 6px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;"><b>Intraday Vol Iteration Alert</b></div>
+            <div style="margin:0 0 10px 0; font-family:Arial,Helvetica,sans-serif; font-size:12px; color:#000;">Scan completed at {scan_time}.</div>
+            {colored_table_html(ce_view, OPTION_EMAIL_COLS, "CE Candidates")}
+            {colored_table_html(pe_view, OPTION_EMAIL_COLS, "PE Candidates")}
         </div>
     </body>
     </html>"""
