@@ -2,6 +2,8 @@ import os
 import smtplib
 import logging
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from io import StringIO
+import requests
 from datetime import datetime, timedelta, time as dtime
 from typing import Dict, List, Optional, Tuple
 
@@ -87,44 +89,29 @@ def safe_series(frame: pd.DataFrame, col: str, default: float = 0.0) -> pd.Serie
 
 
 # â”€â”€â”€ Sector / symbol loading â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-def discover_csvs(root_dir: str = CSV_DIR) -> List[str]:
-    if not os.path.isdir(root_dir):
-        return []
-    paths = []
-    for dirpath, _, filenames in os.walk(root_dir):
-        for fname in filenames:
-            if fname.lower().endswith(".csv"):
-                paths.append(os.path.join(dirpath, fname))
-    return sorted(set(paths))
-
-
-def load_fno_symbols_from_csvs(root_dir: str = CSV_DIR) -> List[str]:
-    symbols = set()
-    for path in discover_csvs(root_dir):
-        try:
-            df = pd.read_csv(path)
-        except Exception:
-            continue
-        lowered = {str(c).strip().lower(): c for c in df.columns}
-        symbol_col = None
-        for key in ["symbol","symbols","ticker","tradingsymbol"]:
-            if key in lowered:
-                symbol_col = lowered[key]
-                break
-        if symbol_col is None:
-            continue
-        for raw in df[symbol_col].dropna().astype(str):
-            sym = raw.strip().upper()
-            if sym and sym not in {"NAN","NONE"}:
-                symbols.add(sym)
-    return sorted(symbols)
-
-
-def format_eq_symbol(symbol: str) -> str:
-    symbol = str(symbol).strip().upper()
-    if symbol.startswith("NSE:"):
-        return symbol if symbol.endswith("-EQ") else f"{symbol}-EQ"
-    return f"NSE:{symbol}-EQ"
+def load_nse_underlyings() -> List[str]:
+    url = "https://www.nseindia.com/static/products-services/equity-derivatives-list-underlyings-information"
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.nseindia.com/market-data/equity-derivatives-watch",
+    }
+    try:
+        with requests.Session() as s:
+            s.headers.update(headers)
+            s.get("https://www.nseindia.com", timeout=8)
+            r = s.get(url, timeout=15)
+            r.raise_for_status()
+            tables = pd.read_html(StringIO(r.text))
+            for df in tables:
+                cols = {str(c).strip().lower(): c for c in df.columns}
+                if "symbol" in cols:
+                    sym_col = cols["symbol"]
+                    syms = [str(x).strip().upper() for x in df[sym_col].dropna().tolist()]
+                    return sorted(set(s for s in syms if s))
+    except Exception:
+        pass
+    return []
 
 
 # â”€â”€â”€ Data fetch â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
