@@ -770,6 +770,26 @@ def main() -> None:
 if __name__ == "__main__":
     main()
 
+def fetch_raw_option_chain(symbol: str):
+    if fyers is None:
+        init_fyers()
+    if fyers is None:
+        return pd.DataFrame(), None
+    try:
+        res = fyers.optionchain(data={"symbol": symbol, "strikecount": 50})
+    except Exception as e:
+        logger.exception("Option chain failed for %s: %s", symbol, e)
+        return pd.DataFrame(), {"error": str(e), "symbol": symbol}
+    data = (res or {}).get("data", {})
+    rows = []
+    if isinstance(data, dict):
+        rows = data.get("optionsChain", []) or data.get("options_chain", []) or data.get("chain", [])
+    elif isinstance(data, list):
+        rows = data
+    meta = {"symbol": symbol, "raw": res, "rowcount": len(rows)}
+    if not rows:
+        return pd.DataFrame(), meta
+    return pd.DataFrame(rows), meta
 
 def debug_option_chain_all():
     if fyers is None:
@@ -779,3 +799,4 @@ def debug_option_chain_all():
         print(sym, "rows=", len(df), "meta=", meta)
         if not df.empty:
             print(df.head(5).to_string())
+
