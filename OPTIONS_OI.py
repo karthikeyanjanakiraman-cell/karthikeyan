@@ -161,7 +161,7 @@ def compute_obv(df: pd.DataFrame) -> float:
 
 def compute_today_obv(df: pd.DataFrame) -> float:
     if df is None or df.empty or len(df) < 2:
-        return 0
+        return np.nan
     d = df.copy().sort_values("timestamp")
     d["timestamp"] = pd.to_datetime(d["timestamp"])
     today = pd.Timestamp.now(tz=None).date()
@@ -260,7 +260,7 @@ def previous_trading_day_same_time_score(full_df: pd.DataFrame, end_ts: Optional
     prev_start = prev_end - timedelta(minutes=window_minutes)
     prev_window = prev_day_data[(prev_day_data["timestamp"] >= prev_start) & (prev_day_data["timestamp"] <= prev_end)]
     if len(prev_window) < 2:
-        return 0
+        return np.nan
     first_close = safe_float(prev_window["close"].iloc[0])
     last_close = safe_float(prev_window["close"].iloc[-1])
     if pd.isna(first_close) or first_close == 0:
@@ -611,14 +611,14 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
 
 def format_cell(col: str, val) -> str:
     if pd.isna(val):
-        return "0" if col in {"OBV", "Rank", "Liq Score", "Time"} else ""
+        return ""
     if col in {"% Change", "% Chg"}:
         return f"{float(val):.2f}%"
     if col in {"OI", "Volume", "OBV"}:
         try:
             return f"{int(float(val)):,}"
         except Exception:
-            return "0"
+            return ""
     if col in {"Rank", "Liq Score", "LTP", "Strike", "IVP"}:
         try:
             return f"{float(val):.2f}"
@@ -638,9 +638,7 @@ def compact_table_html(df: pd.DataFrame, title: str, max_rows: int) -> str:
         return ''.join(html)
     view = df[cols].head(max_rows).copy().rename(columns=OPTION_EMAIL_COL_RENAME)
     if "Rank" in view.columns:
-        view["Rank"] = pd.to_numeric(view["Rank"], errors="coerce").fillna(0)
-    if "OBV" in view.columns:
-        view["OBV"] = pd.to_numeric(view["OBV"], errors="coerce").fillna(0).astype(int)
+        view["Rank"] = pd.to_numeric(view["Rank"], errors="coerce")
     html.append("<tr><td style='padding:0 12px 12px 12px;'><table width='100%' border='0' cellpadding='0' cellspacing='1' style='border-collapse:separate;background:#ffffff;'>")
     html.append("<tr>")
     for c in view.columns:
