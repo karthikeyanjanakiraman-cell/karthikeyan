@@ -603,7 +603,6 @@ def colored_table_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html.append("</table></div>")
     return ''.join(html)    
 
-
 def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
     sender_email = os.environ.get("SENDER_EMAIL")
     recipient_email = os.environ.get("RECIPIENT_EMAIL")
@@ -666,6 +665,9 @@ def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
     except Exception as e:
         logger.exception("Email send failed: %s", e)
         return False
+        
+
+    
 
 def scan_symbol(symbol: str) -> Optional[Dict]:
     hist_symbol = symbol if (symbol.startswith("NSE:") and symbol.endswith("-INDEX")) else format_eq_symbol(symbol)
