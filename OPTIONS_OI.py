@@ -490,7 +490,6 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
         return pd.DataFrame(), pd.DataFrame()
 
     rows, iter_rows = [], []
-    expected_option_type = "CE" if side == "long" else "PE"
 
     for underlying in candidates_df["Symbol"].dropna().astype(str):
         pair_df = fetch_option_pairs(underlying)
@@ -501,9 +500,6 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
             strike = row.get("Strike", np.nan)
 
             for opt_type in ["CE", "PE"]:
-                if opt_type != expected_option_type:
-                    continue
-
                 sym = row.get(f"{opt_type} Symbol", "")
                 if not sym:
                     continue
@@ -540,21 +536,13 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
     pct = pd.to_numeric(out["% Change"], errors="coerce")
 
     if side == "long":
-        out = out[
-            (rd > 0) &
-            (out["Option Type"].astype(str).str.upper() == "CE") &
-            (pct > 0)
-        ].copy()
+        out = out[(rd > 0) & (pct > 0)].copy()
         out = out.sort_values(
             ["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"],
             ascending=[False, False, False, False]
         )
     else:
-        out = out[
-            (rd < 0) &
-            (out["Option Type"].astype(str).str.upper() == "PE") &
-            (pct < 0)
-        ].copy()
+        out = out[(rd < 0) & (pct < 0)].copy()
         out = out.sort_values(
             ["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"],
             ascending=[False, True, False, True]
@@ -638,10 +626,6 @@ def prepare_option_email_view(df: pd.DataFrame, side: str) -> pd.DataFrame:
         return pd.DataFrame(columns=OPTION_EMAIL_COLS)
 
     out = df.copy()
-    expected_type = "CE" if side == "long" else "PE"
-
-    if "Option Type" in out.columns:
-        out = out[out["Option Type"].astype(str).str.upper() == expected_type].copy()
 
     if "LTP" in out.columns:
         out = out[pd.to_numeric(out["LTP"], errors="coerce") >= MIN_OPTION_LTP].copy()
@@ -716,7 +700,7 @@ def _text_color(bg: str) -> str:
 
 def colored_table_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html = [
-        f"<div style='margin:0 0 12px 0;'>",
+        "<div style='margin:0 0 12px 0;'>",
         f"<div style='margin:10px 0 4px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;'><b>{title}</b></div>"
     ]
 
@@ -728,9 +712,7 @@ def colored_table_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html.append("<table cellpadding='0' cellspacing='1' style='border-collapse:separate; border-spacing:1px; background:#ffffff; font-family:Arial,Helvetica,sans-serif; font-size:10px;'>")
     html.append("<tr>")
     for c in view.columns:
-        html.append(
-            f"<th style='background:#2f3b59; color:#ffffff; text-align:center; font-weight:bold; padding:5px 6px; white-space:nowrap; border:none;'>{c}</th>"
-        )
+        html.append(f"<th style='background:#2f3b59; color:#ffffff; text-align:center; font-weight:bold; padding:5px 6px; white-space:nowrap; border:none;'>{c}</th>")
     html.append("</tr>")
 
     for _, row in view.iterrows():
@@ -739,9 +721,7 @@ def colored_table_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
             cell_val = format_cell(c, row[c])
             bg = _cell_bg(c, cell_val)
             fg = _text_color(bg)
-            html.append(
-                f"<td style='background:{bg}; color:{fg}; text-align:center; padding:4px 6px; white-space:nowrap; border:none;'>{cell_val}</td>"
-            )
+            html.append(f"<td style='background:{bg}; color:{fg}; text-align:center; padding:4px 6px; white-space:nowrap; border:none;'>{cell_val}</td>")
         html.append("</tr>")
     html.append("</table></div>")
     return ''.join(html)
@@ -758,16 +738,16 @@ def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
     subject_time = datetime.now().strftime("%d %b %H:%M")
     scan_time = datetime.now().strftime("%d %b %Y, %H:%M")
 
-    ce_view = prepare_option_email_view(ce_df, "long")
-    pe_view = prepare_option_email_view(pe_df, "short")
+    buy_view = prepare_option_email_view(ce_df, "long")
+    short_view = prepare_option_email_view(pe_df, "short")
 
     html = f"""<html>
     <body style="margin:0; padding:8px; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000; background:#ffffff;">
         <div style="margin:0; padding:0;">
             <div style="margin:0 0 6px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;"><b>Intraday Vol Iteration Alert</b></div>
             <div style="margin:0 0 10px 0; font-family:Arial,Helvetica,sans-serif; font-size:12px; color:#000;">Scan completed at {scan_time}.</div>
-            {colored_table_html(ce_view, OPTION_EMAIL_COLS, "CE Candidates")}
-            {colored_table_html(pe_view, OPTION_EMAIL_COLS, "PE Candidates")}
+            {colored_table_html(buy_view, OPTION_EMAIL_COLS, "Buy Candidates")}
+            {colored_table_html(short_view, OPTION_EMAIL_COLS, "Short Candidates")}
         </div>
     </body>
     </html>"""
