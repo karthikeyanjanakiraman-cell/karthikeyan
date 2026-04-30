@@ -1,7 +1,8 @@
 import os
+import time
 import smtplib
 import logging
-from datetime import datetime, timedelta, time
+from datetime import datetime, timedelta, time as dtime
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -32,6 +33,7 @@ ITERATIONS_TO_KEEP = 75
 SECTORS_DIR = os.environ.get("SECTORS_DIR", "sectors")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 MIN_OPTION_LTP = 10.0
+PER_SYMBOL_SLEEP_SEC = float(os.environ.get("PER_SYMBOL_SLEEP_SEC", "0.25"))
 
 EMAIL_DISPLAY_COLS = [
     "Symbol", "LTP", "% Change", "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
@@ -142,15 +144,9 @@ def compute_obv(df: pd.DataFrame) -> float:
         return np.nan
     close = pd.to_numeric(df["close"], errors="coerce")
     vol = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
-    obv = 0.0
-    for i in range(1, len(df)):
-        if pd.isna(close.iloc[i]) or pd.isna(close.iloc[i - 1]):
-            continue
-        if close.iloc[i] > close.iloc[i - 1]:
-            obv += vol.iloc[i]
-        elif close.iloc[i] < close.iloc[i - 1]:
-            obv -= vol.iloc[i]
-    return round(obv, 2)
+    direction = np.sign(close.diff())
+    obv = (vol * direction).cumsum()
+    return round(safe_float(obv.iloc[-1], np.nan), 2)
 
 
 def compute_today_obv(df: pd.DataFrame) -> float:
@@ -162,20 +158,10 @@ def compute_today_obv(df: pd.DataFrame) -> float:
     d = d[d["timestamp"].dt.date == today].copy()
     if d.empty:
         return np.nan
-    d = d[d["timestamp"] >= pd.Timestamp.combine(today, time(9, 15))].copy()
+    d = d[d["timestamp"] >= pd.Timestamp.combine(today, dtime(9, 15))].copy()
     if len(d) < 2:
         return np.nan
-    close = pd.to_numeric(d["close"], errors="coerce")
-    vol = pd.to_numeric(d["volume"], errors="coerce").fillna(0.0)
-    obv = 0.0
-    for i in range(1, len(d)):
-        if pd.isna(close.iloc[i]) or pd.isna(close.iloc[i - 1]):
-            continue
-        if close.iloc[i] > close.iloc[i - 1]:
-            obv += vol.iloc[i]
-        elif close.iloc[i] < close.iloc[i - 1]:
-            obv -= vol.iloc[i]
-    return round(obv, 2)
+    return compute_obv(d)
 
 
 def compute_ivp(history_df: pd.DataFrame) -> Tuple[float, str]:
@@ -216,11 +202,11 @@ def score_label(delta: float) -> str:
 
 
 def long_short_label(raw_label: str, side: str) -> str:
-    raw_label = str(raw_label).strip()
+    raw_label = str(raw_label).strip().upper()
     if side == "long":
-        return {"Buy": "LONG", "Buy+": "LONG+", "Buy++": "LONG++"}.get(raw_label, raw_label)
+        return {"BUY": "LONG", "BUY+": "LONG+", "BUY++": "LONG++"}.get(raw_label, raw_label)
     if side == "short":
-        return {"Sell": "SHORT", "Sell+": "SHORT+", "Sell++": "SHORT++"}.get(raw_label, raw_label)
+        return {"SELL": "SHORT", "SELL+": "SHORT+", "SELL++": "SHORT++"}.get(raw_label, raw_label)
     return raw_label
 
 
@@ -250,12 +236,12 @@ def intraday_window_score(df: pd.DataFrame, window_minutes: int = SIGNAL_WINDOW_
     return round(((last_close - first_close) / first_close) * 100.0, 2)
 
 
-def previous_trading_day_same_time_score(df: pd.DataFrame, window_minutes: int = SIGNAL_WINDOW_MINUTES) -> float:
-    if df is None or df.empty or len(df) < 4:
+def previous_trading_day_same_time_score(full_df: pd.DataFrame, end_ts: Optional[pd.Timestamp] = None, window_minutes: int = SIGNAL_WINDOW_MINUTES) -> float:
+    if full_df is None or full_df.empty or len(full_df) < 4:
         return np.nan
-    d = df.copy().sort_values("timestamp").reset_index(drop=True)
+    d = full_df.copy().sort_values("timestamp").reset_index(drop=True)
     d["timestamp"] = pd.to_datetime(d["timestamp"])
-    end_ts = pd.to_datetime(d["timestamp"].iloc[-1])
+    end_ts = pd.to_datetime(end_ts) if end_ts is not None else pd.to_datetime(d["timestamp"].iloc[-1])
     trading_days = sorted(d["timestamp"].dt.date.unique())
     prev_days = [day for day in trading_days if day < end_ts.date()]
     if not prev_days:
@@ -264,10 +250,7 @@ def previous_trading_day_same_time_score(df: pd.DataFrame, window_minutes: int =
     prev_day_data = d[d["timestamp"].dt.date == prev_day].copy()
     if prev_day_data.empty:
         return np.nan
-    same_time_rows = prev_day_data[
-        (prev_day_data["timestamp"].dt.hour == end_ts.hour) &
-        (prev_day_data["timestamp"].dt.minute == end_ts.minute)
-    ]
+    same_time_rows = prev_day_data[(prev_day_data["timestamp"].dt.hour == end_ts.hour) & (prev_day_data["timestamp"].dt.minute == end_ts.minute)]
     prev_end = pd.to_datetime(same_time_rows.iloc[-1]["timestamp"]) if not same_time_rows.empty else prev_day_data["timestamp"].iloc[-1]
     prev_start = prev_end - timedelta(minutes=window_minutes)
     prev_window = prev_day_data[(prev_day_data["timestamp"] >= prev_start) & (prev_day_data["timestamp"] <= prev_end)]
@@ -299,17 +282,17 @@ def compare_window_signal(current_score: float, previous_score: float) -> Tuple[
     return delta, "Neutral"
 
 
-def build_iteration_history(df: pd.DataFrame, window_minutes: int = SIGNAL_WINDOW_MINUTES, iterations: int = ITERATIONS_TO_KEEP) -> pd.DataFrame:
-    if df is None or df.empty:
+def build_iteration_history(intra_df: pd.DataFrame, window_minutes: int = SIGNAL_WINDOW_MINUTES, iterations: int = ITERATIONS_TO_KEEP) -> pd.DataFrame:
+    if intra_df is None or intra_df.empty:
         return pd.DataFrame()
-    d = df.copy().sort_values("timestamp").reset_index(drop=True)
-    d["timestamp"] = pd.to_datetime(d["timestamp"])
-    last_day = d["timestamp"].dt.date.max()
-    d = d[d["timestamp"].dt.date == last_day].copy().reset_index(drop=True)
+    full_df = intra_df.copy().sort_values("timestamp").reset_index(drop=True)
+    full_df["timestamp"] = pd.to_datetime(full_df["timestamp"])
+    last_day = full_df["timestamp"].dt.date.max()
+    d = full_df[full_df["timestamp"].dt.date == last_day].copy().reset_index(drop=True)
     if d.empty:
         return pd.DataFrame()
-    start_anchor = pd.Timestamp.combine(pd.Timestamp(last_day).date(), time(9, 15))
-    end_anchor = pd.Timestamp.combine(pd.Timestamp(last_day).date(), time(15, 30))
+    start_anchor = pd.Timestamp.combine(pd.Timestamp(last_day).date(), dtime(9, 15))
+    end_anchor = pd.Timestamp.combine(pd.Timestamp(last_day).date(), dtime(15, 30))
     d = d[(d["timestamp"] >= start_anchor) & (d["timestamp"] <= end_anchor)].copy().reset_index(drop=True)
     if d.empty:
         return pd.DataFrame()
@@ -325,7 +308,7 @@ def build_iteration_history(df: pd.DataFrame, window_minutes: int = SIGNAL_WINDO
         if pd.isna(first_close) or first_close == 0:
             continue
         current_score = round(((last_close - first_close) / first_close) * 100.0, 2)
-        prev_score = previous_trading_day_same_time_score(d[d["timestamp"] <= end_ts].copy(), window_minutes)
+        prev_score = previous_trading_day_same_time_score(full_df, end_ts, window_minutes)
         delta, signal = compare_window_signal(current_score, prev_score)
         rows.append({
             "iteration": len(rows) + 1,
@@ -398,10 +381,10 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
     pct_change = ((ltp - prev_close) / prev_close * 100.0) if pd.notna(prev_close) and prev_close != 0 else 0.0
 
     current_win = intraday_window_score(df)
-    previous_win = previous_trading_day_same_time_score(df)
-    win_delta, win_signal = compare_window_signal(current_win, previous_win)
+    prev_win = previous_trading_day_same_time_score(intra_df)
+    win_delta, win_signal = compare_window_signal(current_win, prev_win)
 
-    iteration_history = build_iteration_history(df)
+    iteration_history = build_iteration_history(intra_df)
 
     bull = 0
     bear = 0
@@ -418,8 +401,10 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
     if safe_float(minus_di.iloc[-1], 0) > safe_float(plus_di.iloc[-1], 0):
         bear += 1
     if safe_float(adx.iloc[-1], 0) >= 20:
-        bull += 1
-        bear += 1
+        if safe_float(plus_di.iloc[-1], 0) > safe_float(minus_di.iloc[-1], 0):
+            bull += 1
+        elif safe_float(minus_di.iloc[-1], 0) > safe_float(plus_di.iloc[-1], 0):
+            bear += 1
     if safe_float(rsi.iloc[-1], 50) >= 55:
         bull += 1
     if safe_float(rsi.iloc[-1], 50) <= 45:
@@ -443,7 +428,7 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
         "Bull_Signal": score_label(bull),
         "Bear_Signal": score_label(-bear),
         "Overall_Signal": score_label(rank_delta),
-        "Price_Lead_Status": str(lead_status[-1]),
+        "Price_Lead_Status": str(lead_status.iloc[-1]),
         "IVP": ivp,
         "Volatility State": vol_state,
         "Last Iteration Time": last_ts.strftime("%H:%M"),
@@ -543,13 +528,13 @@ def get_today_stats(df: pd.DataFrame) -> dict:
     d = d[d["timestamp"].dt.date == today].copy()
     if d.empty:
         return {"OI": 0, "Volume": 0, "OBV": 0}
-    d = d[d["timestamp"] >= pd.Timestamp.combine(today, time(9, 15))].copy()
+    d = d[d["timestamp"] >= pd.Timestamp.combine(today, dtime(9, 15))].copy()
     if d.empty:
         return {"OI": 0, "Volume": 0, "OBV": 0}
     return {
         "OI": d["oi"].iloc[-1] if "oi" in d.columns else 0,
         "Volume": d["volume"].sum(),
-        "OBV": compute_today_obv(d),
+        "OBV": compute_obv(d),
     }
 
 
@@ -563,6 +548,11 @@ def get_prev_day_stats(df: pd.DataFrame) -> dict:
         return {"OI": 0, "Volume": 0, "OBV": 0}
     prev_day = days[-2]
     d = d[d["timestamp"].dt.date == prev_day].copy()
+    if d.empty:
+        return {"OI": 0, "Volume": 0, "OBV": 0}
+    d = d[d["timestamp"] >= pd.Timestamp.combine(prev_day, dtime(9, 15))].copy()
+    if d.empty:
+        return {"OI": 0, "Volume": 0, "OBV": 0}
     return {
         "OI": d["oi"].iloc[-1] if "oi" in d.columns else 0,
         "Volume": d["volume"].sum(),
@@ -631,8 +621,9 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
                 if not scanned:
                     continue
 
-                scanned["OI"] = row.get(f"{opt_type} OI", 0)
-                scanned["Volume"] = row.get(f"{opt_type} Volume", 0)
+                scanned["Chain_OI"] = row.get(f"{opt_type} OI", 0)
+                scanned["Chain_Volume"] = row.get(f"{opt_type} Volume", 0)
+
                 scanned["OI+Volume+OBV Score"] = option_liquidity_score(
                     scanned["OI"], scanned["Volume"], scanned["OBV"]
                 )
@@ -660,16 +651,10 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
 
     if side == "long":
         out = out[(rd > 0) & (pct > 0)].copy()
-        out = out.sort_values(
-            ["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"],
-            ascending=[False, False, False, False]
-        )
+        out = out.sort_values(["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False, False])
     else:
         out = out[(rd < 0) & (pct < 0)].copy()
-        out = out.sort_values(
-            ["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"],
-            ascending=[False, True, False, True]
-        )
+        out = out.sort_values(["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, True, False, True])
 
     final_out = out[[c for c in OPTION_EMAIL_COLS if c in out.columns]].reset_index(drop=True)
 
@@ -678,14 +663,8 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
         all_iters = pd.concat(iter_rows, ignore_index=True)
         all_iters = all_iters[all_iters["Option Symbol"].isin(final_out["Option Symbol"])].copy()
         all_iters = all_iters.sort_values(["Underlying", "Strike", "Option Symbol", "iteration"]).reset_index(drop=True)
-
         if not all_iters.empty:
-            all_iters = all_iters.groupby(
-                ["Underlying", "Strike", "Option Symbol"],
-                as_index=False,
-                group_keys=False
-            ).apply(lambda x: x.assign(iteration=range(1, min(len(x), ITERATIONS_TO_KEEP) + 1)))
-
+            all_iters["iteration"] = all_iters.groupby(["Underlying", "Strike", "Option Symbol"]).cumcount() + 1
             all_iters["iteration"] = pd.to_numeric(all_iters["iteration"], errors="coerce").astype("Int64")
             all_iters = all_iters[all_iters["iteration"].between(1, ITERATIONS_TO_KEEP)]
             iter_df = all_iters.reset_index(drop=True)
@@ -716,7 +695,7 @@ def colored_table_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
 
     if df is None or df.empty:
         html.append("<div style='font-family:Arial,Helvetica,sans-serif; font-size:12px; color:#000;'>No data found.</div></div>")
-        return ''.join(html)
+        return "".join(html)
 
     view = df[[c for c in columns if c in df.columns]].copy()
     html.append("<table cellpadding='0' cellspacing='1' style='border-collapse:separate; border-spacing:1px; background:#ffffff; font-family:Arial,Helvetica,sans-serif; font-size:10px;'>")
@@ -732,7 +711,7 @@ def colored_table_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
             html.append(f"<td style='background:#2d3651; color:#ffffff; text-align:center; padding:4px 6px; white-space:nowrap; border:none;'>{cell_val}</td>")
         html.append("</tr>")
     html.append("</table></div>")
-    return ''.join(html)
+    return "".join(html)
 
 
 def prepare_option_email_view(df: pd.DataFrame, side: str) -> pd.DataFrame:
@@ -753,7 +732,7 @@ def prepare_option_email_view(df: pd.DataFrame, side: str) -> pd.DataFrame:
     timing_cols = [c for c in ["5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal"] if c in out.columns]
     if timing_cols:
         neutral_like = {"", "-", "NEUTRAL", "NAN", "NONE"}
-        mask = ~out[timing_cols].apply(lambda row: any(str(v).strip().upper() in neutral_like for v in row), axis=1)
+        mask = ~out[timing_cols].apply(lambda row: all(str(v).strip().upper() in neutral_like for v in row), axis=1)
         out = out[mask].copy()
 
     final_cols = [c for c in OPTION_EMAIL_COLS if c in out.columns]
@@ -834,6 +813,7 @@ def main() -> None:
         row = scan_symbol(symbol)
         if row:
             rows.append(row)
+        time.sleep(PER_SYMBOL_SLEEP_SEC)
 
     summary_df = pd.DataFrame(rows)
     if summary_df.empty:
