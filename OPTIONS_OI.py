@@ -6,6 +6,10 @@ from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from email.mime.base import MIMEBase
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email import encoders
 from email.message import EmailMessage
 
 try:
@@ -23,11 +27,113 @@ DAILY_LOOKBACK_DAYS = 90
 INTRADAY_LOOKBACK_DAYS = 20
 IVP_LOOKBACK_DAYS = 252
 OPTION_PAIRS_TO_KEEP = 5
+SIGNAL_WINDOW_MINUTES = 5
 ITERATIONS_TO_KEEP = 75
 SECTORS_DIR = os.environ.get("SECTORS_DIR", "sectors")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 MIN_OPTION_LTP = 10.0
-INDEX_UNDERLYINGS = ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX"]
+
+EMAIL_CSS = """
+body{
+    margin:0;
+    padding:0;
+    background:#edf2f7;
+    font-family:Arial,Helvetica,sans-serif;
+    color:#1f2937;
+}
+.wrapper{
+    max-width:1600px;
+    margin:0 auto;
+    padding:20px 12px 32px;
+}
+.header{
+    background:linear-gradient(135deg,#0f172a,#1e3a8a);
+    color:#ffffff;
+    padding:18px 20px;
+    border-radius:14px;
+    margin-bottom:18px;
+}
+.header .eyebrow{
+    font-size:12px;
+    text-transform:uppercase;
+    letter-spacing:.8px;
+    opacity:.85;
+    margin-bottom:6px;
+}
+.header h1{
+    margin:0 0 6px 0;
+    font-size:22px;
+    line-height:1.2;
+}
+.header p{
+    margin:0;
+    font-size:13px;
+    color:#dbeafe;
+}
+.section{
+    background:#ffffff;
+    border:1px solid #dbe3ee;
+    border-radius:14px;
+    margin-bottom:16px;
+    overflow:hidden;
+    box-shadow:0 4px 14px rgba(15,23,42,.06);
+}
+.section-title{
+    background:#f8fafc;
+    color:#0f172a;
+    font-weight:700;
+    font-size:15px;
+    padding:12px 14px;
+    border-bottom:1px solid #e5e7eb;
+}
+.table-wrap{
+    overflow-x:auto;
+}
+.report-table{
+    width:100%;
+    border-collapse:collapse;
+    font-size:12px;
+}
+.report-table thead th{
+    background:#0f172a;
+    color:#ffffff;
+    padding:10px 8px;
+    text-align:left;
+    white-space:nowrap;
+}
+.report-table tbody td{
+    padding:8px 8px;
+    border-bottom:1px solid #eef2f7;
+    white-space:nowrap;
+}
+.report-table tbody tr:nth-child(even){
+    background:#f8fafc;
+}
+.empty{
+    padding:14px;
+    color:#6b7280;
+    font-size:13px;
+}
+.sig-strong{
+    font-weight:700;
+    color:#065f46;
+    background:#d1fae5;
+}
+.sig-plus{
+    font-weight:700;
+    color:#1d4ed8;
+    background:#dbeafe;
+}
+.sig-base{
+    font-weight:700;
+    color:#334155;
+    background:#e2e8f0;
+}
+.sig-neutral{
+    color:#6b7280;
+    background:#f3f4f6;
+}
+"""
 
 EMAIL_DISPLAY_COLS = [
     "Symbol", "LTP", "% Change", "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
@@ -96,16 +202,6 @@ def load_fno_symbols_from_sectors(root_dir: str = SECTORS_DIR) -> List[str]:
                 symbols.add(sym)
     return sorted(symbols)
 
-def load_scan_universe(root_dir: str = SECTORS_DIR) -> List[str]:
-    syms = load_fno_symbols_from_sectors(root_dir)
-    syms.extend(INDEX_UNDERLYINGS)
-    seen, out = set(), []
-    for s in syms:
-        if s not in seen:
-            seen.add(s)
-            out.append(s)
-    return out
-
 def format_eq_symbol(symbol: str) -> str:
     symbol = str(symbol).strip().upper()
     if symbol.startswith("NSE:"):
@@ -161,9 +257,12 @@ def compute_today_obv(df: pd.DataFrame) -> float:
     for i in range(1, len(d)):
         if pd.isna(close.iloc[i]) or pd.isna(close.iloc[i - 1]):
             continue
-        if close.iloc[i] > close.iloc[i - 1]: obv += vol.iloc[i]
-        elif close.iloc[i] < close.iloc[i - 1]: obv -= vol.iloc[i]
+        if close.iloc[i] > close.iloc[i - 1]:
+            obv += vol.iloc[i]
+        elif close.iloc[i] < close.iloc[i - 1]:
+            obv -= vol.iloc[i]
     return round(obv, 2)
+
 
 def compute_ivp(history_df: pd.DataFrame) -> Tuple[float, str]:
     if history_df is None or history_df.empty or len(history_df) < 30:
@@ -278,7 +377,18 @@ def build_iteration_history(df: pd.DataFrame, window_minutes: int = 5, iteration
         current_score = round(((last_close - first_close) / first_close) * 100.0, 2)
         prev_score = previous_trading_day_same_time_score(d[d["timestamp"] <= end_ts].copy(), window_minutes)
         delta, signal = compare_window_signal(current_score, prev_score)
-        rows.append({"iteration": len(rows) + 1, "timestamp": end_ts.strftime("%H:%M"), "window_minutes": window_minutes, "window_start": start_ts.strftime("%H:%M"), "window_end": end_ts.strftime("%H:%M"), "current_window_score": current_score, "previous_trading_day_same_time_score": prev_score, "window_delta": delta, "window_signal": signal, "close": last_close})
+        rows.append({
+            "iteration": len(rows) + 1,
+            "timestamp": end_ts.strftime("%H:%M"),
+            "window_minutes": window_minutes,
+            "window_start": start_ts.strftime("%H:%M"),
+            "window_end": end_ts.strftime("%H:%M"),
+            "current_window_score": current_score,
+            "previous_trading_day_same_time_score": prev_score,
+            "window_delta": delta,
+            "window_signal": signal,
+            "close": last_close,
+        })
         if len(rows) >= iterations: break
     return pd.DataFrame(rows)
 
@@ -351,70 +461,6 @@ def choose_top_candidates(summary_df: pd.DataFrame, top_n: int = 10) -> Tuple[pd
     short_df = short_df.sort_values(["Rank Delta", "Cumulative ADX", "% Change"], ascending=[True, False, True]).head(top_n)
     return long_df.reset_index(drop=True), short_df.reset_index(drop=True)
 
-def debug_nifty_optionchain():
-    if fyers is None:
-        init_fyers()
-    for sym in ["NSE:NIFTY50-INDEX", "NSE:NIFTY-INDEX"]:
-        try:
-            q = fyers.quotes({"symbols": sym})
-            print("QUOTE", sym, q)
-            res = fyers.optionchain(data={"symbol": sym, "strikecount": 50})
-            print("OPTIONCHAIN", sym, type(res), res)
-        except Exception as e:
-            print("ERROR", sym, e)
-
-def fetch_raw_option_chain(symbol: str) -> pd.DataFrame:
-    if fyers is None:
-        return pd.DataFrame()
-    symu = str(symbol).strip().upper()
-    if symu in {"NIFTY", "NIFTY50", "NIFTY 50", "NSE:NIFTY", "NSE:NIFTY50-INDEX", "NSE:NIFTY-INDEX"}:
-        candidates = ["NSE:NIFTY50-INDEX", "NSE:NIFTY-INDEX"]
-    elif symu in {"BANKNIFTY", "NIFTY BANK", "BANK NIFTY", "NSE:BANKNIFTY", "NSE:NIFTYBANK-INDEX"}:
-        candidates = ["NSE:NIFTYBANK-INDEX"]
-    elif symu.startswith("NSE:") and symu.endswith("-INDEX"):
-        candidates = [symu]
-    else:
-        candidates = [format_eq_symbol(symbol)]
-    for eq_symbol in candidates:
-        try:
-            quote = fyers.quotes({"symbols": eq_symbol})
-            ltp = safe_float(quote.get("d", [{}])[0].get("v", {}).get("lp"), np.nan)
-            chain_res = fyers.optionchain(data={"symbol": eq_symbol, "strikecount": 50})
-            chain = ((chain_res or {}).get("data") or {}).get("optionsChain", [])
-            if chain:
-                rows = []
-                for item in chain or []:
-                    rows.append({
-                        "Underlying": symu,
-                        "EqSymbol": eq_symbol,
-                        "UnderlyingLTP": ltp,
-                        "Strike": safe_float(item.get("strike_price") or item.get("strike"), np.nan),
-                        "Option Type": str(item.get("option_type") or item.get("type") or "").upper(),
-                        "Option Symbol": str(item.get("symbol", "")),
-                        "LTP": safe_float(item.get("ltp") or item.get("lp"), np.nan),
-                        "OI": safe_float(item.get("oi") or item.get("open_interest"), np.nan),
-                        "Volume": safe_float(item.get("volume"), np.nan),
-                    })
-                return pd.DataFrame(rows)
-        except Exception:
-            continue
-    return pd.DataFrame()
-    chain = ((chain_res or {}).get("data") or {}).get("optionsChain", [])
-    rows = []
-    for item in chain or []:
-        rows.append({
-            "Underlying": symu,
-            "EqSymbol": eq_symbol,
-            "UnderlyingLTP": ltp,
-            "Strike": safe_float(item.get("strike_price") or item.get("strike"), np.nan),
-            "Option Type": str(item.get("option_type") or item.get("type") or "").upper(),
-            "Option Symbol": str(item.get("symbol", "")),
-            "LTP": safe_float(item.get("ltp") or item.get("lp"), np.nan),
-            "OI": safe_float(item.get("oi") or item.get("open_interest"), np.nan),
-            "Volume": safe_float(item.get("volume"), np.nan),
-        })
-    return pd.DataFrame(rows)
-
 def nearest_step(value: float) -> int:
     val = abs(safe_float(value, 0))
     if val >= 20000: return 100
@@ -426,14 +472,7 @@ def nearest_step(value: float) -> int:
 
 def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> pd.DataFrame:
     if fyers is None: return pd.DataFrame()
-    if symbol in {"NIFTY", "NIFTY50", "NIFTY 50", "NIFTY50-INDEX"}:
-        eq_symbol = "NSE:NIFTY50-INDEX"
-    elif symbol in {"BANKNIFTY", "NIFTY BANK", "BANK NIFTY", "NSE:BANKNIFTY-INDEX"}:
-        eq_symbol = "NSE:NIFTYBANK-INDEX"
-    elif symbol.startswith("NSE:") and symbol.endswith("-INDEX"):
-        eq_symbol = symbol
-    else:
-        eq_symbol = format_eq_symbol(symbol)
+    eq_symbol = format_eq_symbol(symbol)
     try:
         quote = fyers.quotes({"symbols": eq_symbol})
         ltp = safe_float(quote.get("d", [{}])[0].get("v", {}).get("lp"), np.nan)
@@ -460,33 +499,48 @@ def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> p
         final_rows.append({"Strike": strike, "CE Symbol": ce["OptionSymbol"].iloc[0] if not ce.empty else "", "PE Symbol": pe["OptionSymbol"].iloc[0] if not pe.empty else "", "CE OI": ce["OI"].iloc[0] if not ce.empty else 0, "CE Volume": ce["Volume"].iloc[0] if not ce.empty else 0, "PE OI": pe["OI"].iloc[0] if not pe.empty else 0, "PE Volume": pe["Volume"].iloc[0] if not pe.empty else 0})
     return pd.DataFrame(final_rows)
 
+
 def get_today_stats(df: pd.DataFrame) -> dict:
     if df is None or df.empty: return {"OI": 0, "Volume": 0, "OBV": 0}
-    d = df.copy(); d["timestamp"] = pd.to_datetime(d["timestamp"])
-    today = pd.Timestamp.now(tz=None).date(); d = d[d["timestamp"].dt.date == today].copy()
+    d = df.copy()
+    d["timestamp"] = pd.to_datetime(d["timestamp"])
+    today = pd.Timestamp.now(tz=None).date()
+    d = d[d["timestamp"].dt.date == today].copy()
     if d.empty: return {"OI": 0, "Volume": 0, "OBV": 0}
-    start_anchor = pd.Timestamp.combine(today, time(9, 15)); d = d[d["timestamp"] >= start_anchor].copy()
+    start_anchor = pd.Timestamp.combine(today, time(9, 15))
+    d = d[d["timestamp"] >= start_anchor].copy()
     if d.empty: return {"OI": 0, "Volume": 0, "OBV": 0}
     return {"OI": d["oi"].iloc[-1] if "oi" in d.columns else 0, "Volume": d["volume"].sum(), "OBV": compute_today_obv(d)}
 
 def get_prev_day_stats(df: pd.DataFrame) -> dict:
     if df is None or df.empty: return {"OI": 0, "Volume": 0, "OBV": 0}
-    d = df.copy(); d["timestamp"] = pd.to_datetime(d["timestamp"])
+    d = df.copy()
+    d["timestamp"] = pd.to_datetime(d["timestamp"])
     days = sorted(d["timestamp"].dt.date.unique())
     if len(days) < 2: return {"OI": 0, "Volume": 0, "OBV": 0}
-    prev_day = days[-2]; d = d[d["timestamp"].dt.date == prev_day].copy()
+    prev_day = days[-2]
+    d = d[d["timestamp"].dt.date == prev_day].copy()
     return {"OI": d["oi"].iloc[-1] if "oi" in d.columns else 0, "Volume": d["volume"].sum(), "OBV": compute_obv(d)}
-
 def scan_single_option(option_symbol: str, option_type: str, strike: float, underlying: str) -> Optional[Dict]:
     hist_symbol = option_symbol if option_symbol.startswith("NSE:") else f"NSE:{option_symbol}"
     daily_df = get_history(hist_symbol, "D", max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
     intra_df = get_history(hist_symbol, "5", INTRADAY_LOOKBACK_DAYS)
     if daily_df.empty or intra_df.empty: return None
+
     today_stats = get_today_stats(intra_df)
     prev_stats = get_prev_day_stats(intra_df)
+
     summary = summarize_intraday(intra_df, daily_df)
     if not summary: return None
-    summary.update({"Underlying": underlying, "Option Type": option_type, "Option Symbol": option_symbol, "Strike": strike, "OBV": today_stats["OBV"], "OI": today_stats["OI"], "Volume": today_stats["Volume"], "OI_Delta": today_stats["OI"] - prev_stats["OI"], "Vol_Delta": today_stats["Volume"] - prev_stats["Volume"], "OBV_Delta": today_stats["OBV"] - prev_stats["OBV"]})
+    summary.update({
+        "Underlying": underlying, "Option Type": option_type, "Option Symbol": option_symbol, "Strike": strike,
+        "OBV": today_stats["OBV"],
+        "OI": today_stats["OI"],
+        "Volume": today_stats["Volume"],
+        "OI_Delta": today_stats["OI"] - prev_stats["OI"],
+        "Vol_Delta": today_stats["Volume"] - prev_stats["Volume"],
+        "OBV_Delta": today_stats["OBV"] - prev_stats["OBV"]
+    })
     return summary
 
 def option_liquidity_score(oi, volume, obv) -> float:
@@ -495,26 +549,37 @@ def option_liquidity_score(oi, volume, obv) -> float:
 def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if candidates_df.empty or "Symbol" not in candidates_df.columns:
         return pd.DataFrame(), pd.DataFrame()
+
     rows, iter_rows = [], []
+
     for underlying in candidates_df["Symbol"].dropna().astype(str):
         pair_df = fetch_option_pairs(underlying)
         if pair_df.empty:
             continue
+
         for _, row in pair_df.iterrows():
             strike = row.get("Strike", np.nan)
+
             for opt_type in ["CE", "PE"]:
                 sym = row.get(f"{opt_type} Symbol", "")
                 if not sym:
                     continue
+
                 scanned = scan_single_option(sym, opt_type, strike, underlying)
                 if not scanned:
                     continue
+
                 scanned["OI"] = row.get(f"{opt_type} OI", 0)
                 scanned["Volume"] = row.get(f"{opt_type} Volume", 0)
-                scanned["OI+Volume+OBV Score"] = option_liquidity_score(scanned["OI"], scanned["Volume"], scanned["OBV"])
+                scanned["OI+Volume+OBV Score"] = option_liquidity_score(
+                    scanned["OI"], scanned["Volume"], scanned["OBV"]
+                )
+
                 if safe_float(scanned.get("LTP"), 0.0) < MIN_OPTION_LTP:
                     continue
+
                 rows.append(scanned)
+
                 hist = scanned.get("Iteration History")
                 if isinstance(hist, pd.DataFrame) and not hist.empty:
                     tmp = hist.copy()
@@ -523,122 +588,191 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
                     tmp.insert(2, "Strike", strike)
                     tmp.insert(3, "Strike Name", str(strike))
                     iter_rows.append(tmp)
+
     if not rows:
         return pd.DataFrame(), pd.DataFrame()
+
     out = pd.DataFrame(rows)
     rd = pd.to_numeric(out["Rank Delta"], errors="coerce")
     pct = pd.to_numeric(out["% Change"], errors="coerce")
+
     if side == "long":
         out = out[(rd > 0) & (pct > 0)].copy()
-        out = out.sort_values(["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False, False])
+        out = out.sort_values(
+            ["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"],
+            ascending=[False, False, False, False]
+        )
     else:
         out = out[(rd < 0) & (pct < 0)].copy()
-        out = out.sort_values(["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, True, False, True])
+        out = out.sort_values(
+            ["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"],
+            ascending=[False, True, False, True]
+        )
+
     final_out = out[[c for c in OPTION_EMAIL_COLS if c in out.columns]].reset_index(drop=True)
+
     iter_df = pd.DataFrame()
     if iter_rows and not final_out.empty:
         all_iters = pd.concat(iter_rows, ignore_index=True)
         all_iters = all_iters[all_iters["Option Symbol"].isin(final_out["Option Symbol"])].copy()
         all_iters = all_iters.sort_values(["Underlying", "Strike", "Option Symbol", "iteration"]).reset_index(drop=True)
+
         if not all_iters.empty:
-            all_iters = all_iters.groupby(["Underlying", "Strike", "Option Symbol"], as_index=False, group_keys=False).apply(lambda x: x.assign(iteration=range(1, min(len(x), ITERATIONS_TO_KEEP) + 1)))
+            all_iters = all_iters.groupby(
+                ["Underlying", "Strike", "Option Symbol"],
+                as_index=False,
+                group_keys=False
+            ).apply(lambda x: x.assign(iteration=range(1, min(len(x), ITERATIONS_TO_KEEP) + 1)))
+
             all_iters["iteration"] = pd.to_numeric(all_iters["iteration"], errors="coerce").astype("Int64")
             all_iters = all_iters[all_iters["iteration"].between(1, ITERATIONS_TO_KEEP)]
             iter_df = all_iters.reset_index(drop=True)
+
     return final_out, iter_df
 
+
 def format_cell(col: str, val) -> str:
-    if pd.isna(val): return ""
-    if col == "% Change": return f"{float(val):.2f}%"
-    if isinstance(val, (int, float, np.integer, np.floating)): return f"{float(val):.2f}"
+    if pd.isna(val):
+        return ""
+    if col == "% Change":
+        return f"{float(val):.2f}%"
+    if isinstance(val, (int, float, np.integer, np.floating)):
+        return f"{float(val):.2f}"
     return str(val)
+
 
 def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html = [f'<div class="section"><div class="section-title">{title}</div>']
+
     if df is None or df.empty:
         html.append('<div class="empty">No data found.</div></div>')
-        return ''.join(html)
+        return "".join(html)
+
     view = df[[c for c in columns if c in df.columns]].copy()
     html.append('<div class="table-wrap"><table class="report-table"><thead><tr>')
     html.extend(f"<th>{c}</th>" for c in view.columns)
-    html.append('</tr></thead><tbody>')
-    signal_cols = {"5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal", "Bull_Signal", "Bear_Signal", "Overall_Signal"}
+    html.append("</tr></thead><tbody>")
+
+    signal_cols = {
+        "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
+        "Bull_Signal", "Bear_Signal", "Overall_Signal"
+    }
+
     for _, row in view.iterrows():
-        html.append('<tr>')
+        html.append("<tr>")
         for c in view.columns:
             cell_val = format_cell(c, row[c])
-            cls = ''
+            cls = ""
+
             if c in signal_cols:
                 sv = str(cell_val).upper()
-                if any(x in sv for x in ["LONG++", "SHORT++", "BUY++", "SELL++"]): cls = ' class="sig-strong"'
-                elif any(x in sv for x in ["LONG+", "SHORT+", "BUY+", "SELL+"]): cls = ' class="sig-plus"'
-                elif sv in {"LONG", "SHORT", "BUY", "SELL"}: cls = ' class="sig-base"'
-                elif 'NEUTRAL' in sv: cls = ' class="sig-neutral"'
-            html.append(f'<td{cls}>{cell_val}</td>')
-        html.append('</tr>')
-    html.append('</tbody></table></div></div>')
-    return ''.join(html)
+                if any(x in sv for x in ["LONG++", "SHORT++", "BUY++", "SELL++"]):
+                    cls = ' class="sig-strong"'
+                elif any(x in sv for x in ["LONG+", "SHORT+", "BUY+", "SELL+"]):
+                    cls = ' class="sig-plus"'
+                elif sv in {"LONG", "SHORT", "BUY", "SELL"}:
+                    cls = ' class="sig-base"'
+                elif "NEUTRAL" in sv:
+                    cls = ' class="sig-neutral"'
+
+            html.append(f"<td{cls}>{cell_val}</td>")
+        html.append("</tr>")
+
+    html.append("</tbody></table></div></div>")
+    return "".join(html)
+
 
 def prepare_option_email_view(df: pd.DataFrame, side: str) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=OPTION_EMAIL_COLS)
+    if df is None or df.empty: return pd.DataFrame(columns=OPTION_EMAIL_COLS)
     out = df.copy()
+    if "Option Type" in out.columns:
+        expected = "CE" if side == "long" else "PE" # wait, user wants both CE/PE in both.
+        # Actually user said "Buy Candidates of CE and PE". My build_option_candidates now allows both.
+        pass
+
     if "LTP" in out.columns:
         out = out[pd.to_numeric(out["LTP"], errors="coerce") >= MIN_OPTION_LTP].copy()
+
+    # OBV filter
     if "OBV" in out.columns:
         obv = pd.to_numeric(out["OBV"], errors="coerce")
         out = out[obv > 0].copy() if side == "long" else out[obv < 0].copy()
+
     out = apply_display_labels(out, side)
     timing_cols = [c for c in ["5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal"] if c in out.columns]
     if timing_cols:
         neutral_like = {"", "-", "NEUTRAL", "NAN", "NONE"}
         mask = ~out[timing_cols].apply(lambda row: any(str(v).strip().upper() in neutral_like for v in row), axis=1)
         out = out[mask].copy()
+
     if "Overall_Signal" in out.columns:
         out["Overall_Signal"] = "LONG++" if side == "long" else "SHORT++"
+
     final_cols = [c for c in OPTION_EMAIL_COLS if c in out.columns]
     return out[final_cols].reset_index(drop=True)
-
 def _cell_bg(col: str, value: str) -> str:
     v = str(value).strip().upper()
     if col == "% Change":
-        try: num = float(str(value).replace('%', '').strip())
-        except Exception: return '#2d3651'
-        if num > 0: return '#2e7d32'
-        if num < 0: return '#c62828'
+        try:
+            num = float(str(value).replace('%', '').strip())
+        except Exception:
+            return '#2d3651'
+        if num > 0:
+            return '#2e7d32'
+        if num < 0:
+            return '#c62828'
         return '#546e7a'
     if col in {"5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal", "Bull_Signal", "Bear_Signal", "Overall_Signal"}:
-        if "LONG++" in v or "BUY++" in v: return '#2e7d32'
-        if "LONG+" in v or "BUY+" in v: return '#388e3c'
-        if v in {"LONG", "BUY"}: return '#43a047'
-        if "SHORT++" in v or "SELL++" in v: return '#c62828'
-        if "SHORT+" in v or "SELL+" in v: return '#d32f2f'
-        if v in {"SHORT", "SELL"}: return '#e53935'
-        if "NEUTRAL" in v: return '#6b7280'
+        if "LONG++" in v or "BUY++" in v:
+            return '#2e7d32'
+        if "LONG+" in v or "BUY+" in v:
+            return '#388e3c'
+        if v in {"LONG", "BUY"}:
+            return '#43a047'
+        if "SHORT++" in v or "SELL++" in v:
+            return '#c62828'
+        if "SHORT+" in v or "SELL+" in v:
+            return '#d32f2f'
+        if v in {"SHORT", "SELL"}:
+            return '#e53935'
+        if "NEUTRAL" in v:
+            return '#6b7280'
     if col == "Volatility State":
-        if "AVOID BUY PREMIUM" in v: return '#fbc02d'
-        if "BUYER ZONE" in v: return '#9ccc65'
+        if "AVOID BUY PREMIUM" in v:
+            return '#fbc02d'
+        if "BUYER ZONE" in v:
+            return '#9ccc65'
         return '#546e7a'
     if col == "Price_Lead_Status":
-        if "EARLY_PRICE_LEAD" in v: return '#00897b'
-        if "FADE" in v: return '#8e24aa'
+        if "EARLY_PRICE_LEAD" in v:
+            return '#00897b'
+        if "FADE" in v:
+            return '#8e24aa'
         return '#2d3651'
     return '#2d3651'
+
 
 def _text_color(bg: str) -> str:
     return '#111111' if bg.lower() in {'#fbc02d', '#9ccc65'} else '#ffffff'
 
+
 def colored_table_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
-    html = ["<div style='margin:0 0 12px 0;'>", f"<div style='margin:10px 0 4px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;'><b>{title}</b></div>"]
+    html = [
+        "<div style='margin:0 0 12px 0;'>",
+        f"<div style='margin:10px 0 4px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;'><b>{title}</b></div>"
+    ]
+
     if df is None or df.empty:
         html.append("<div style='font-family:Arial,Helvetica,sans-serif; font-size:12px; color:#000;'>No data found.</div></div>")
         return ''.join(html)
+
     view = df[[c for c in columns if c in df.columns]].copy()
     html.append("<table cellpadding='0' cellspacing='1' style='border-collapse:separate; border-spacing:1px; background:#ffffff; font-family:Arial,Helvetica,sans-serif; font-size:10px;'>")
     html.append("<tr>")
     for c in view.columns:
         html.append(f"<th style='background:#2f3b59; color:#ffffff; text-align:center; font-weight:bold; padding:5px 6px; white-space:nowrap; border:none;'>{c}</th>")
     html.append("</tr>")
+
     for _, row in view.iterrows():
         html.append("<tr>")
         for c in view.columns:
@@ -650,54 +784,46 @@ def colored_table_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html.append("</table></div>")
     return ''.join(html)
 
+
 def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
     sender_email = os.environ.get("SENDER_EMAIL")
     recipient_email = os.environ.get("RECIPIENT_EMAIL")
     sender_password = os.environ.get("SENDER_PASSWORD")
+
     if not sender_email or not recipient_email or not sender_password:
-        logger.error("Missing email credentials.")
         return False
 
     subject_time = datetime.now().strftime("%d %b %H:%M")
     scan_time = datetime.now().strftime("%d %b %Y, %H:%M")
+
     buy_view = prepare_option_email_view(ce_df, "long")
     short_view = prepare_option_email_view(pe_df, "short")
 
-    html_parts = [
-        "<html>",
-        '<body style="margin:0; padding:8px; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000; background:#ffffff;">',
-        '<div style="margin:0 0 6px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;"><b>Intraday Vol Iteration Alert</b></div>',
-        '<div style="margin:0 0 10px 0; font-family:Arial,Helvetica,sans-serif; font-size:12px; color:#000;">Scan completed at ', scan_time, '.</div>',
-        colored_table_html(buy_view, OPTION_EMAIL_COLS, "Buy Candidates"),
-        colored_table_html(short_view, OPTION_EMAIL_COLS, "Short Candidates"),
-        "</body>",
-        "</html>",
-    ]
-    html = ''.join(html_parts)
+    html = f"""<html>
+    <body style="margin:0; padding:8px; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000; background:#ffffff;">
+        <div style="margin:0; padding:0;">
+            <div style="margin:0 0 6px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;"><b>Intraday Vol Iteration Alert</b></div>
+            <div style="margin:0 0 10px 0; font-family:Arial,Helvetica,sans-serif; font-size:12px; color:#000;">Scan completed at {scan_time}.</div>
+            {colored_table_html(buy_view, OPTION_EMAIL_COLS, "Buy Candidates")}
+            {colored_table_html(short_view, OPTION_EMAIL_COLS, "Short Candidates")}
+        </div>
+    </body>
+    </html>"""
 
-    text_parts = [
-        "Intraday Vol Iteration Alert",
-        "Scan completed at " + scan_time + ".",
-        "",
-        "Buy Candidates: " + str(len(buy_view) if buy_view is not None else 0),
-        "Short Candidates: " + str(len(short_view) if short_view is not None else 0),
-        "",
-    ]
-    text = chr(10).join(text_parts)
-
-    msg = EmailMessage()
+    msg = MIMEMultipart()
     msg["From"] = sender_email
     msg["To"] = recipient_email
     msg["Subject"] = f"Intraday Vol Iteration Alert - {subject_time}"
-    msg.set_content(text)
-    msg.add_alternative(html, subtype="html")
+    msg.attach(MIMEText(html, "html", "utf-8"))
 
-    for path in attachments or []:
-        if not path or not os.path.exists(path):
-            continue
-        with open(path, "rb") as f:
-            data = f.read()
-        msg.add_attachment(data, maintype="application", subtype="octet-stream", filename=os.path.basename(path))
+    for path in attachments:
+        if path and os.path.exists(path):
+            with open(path, "rb") as f:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(path)}"')
+            msg.attach(part)
 
     try:
         smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
@@ -705,14 +831,14 @@ def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
             s.login(sender_email, sender_password)
             s.send_message(msg)
         return True
-    except Exception as e:
-        logger.exception("Email send failed: %s", e)
+    except Exception:
         return False
 
+
 def scan_symbol(symbol: str) -> Optional[Dict]:
-    hist_symbol = symbol if (symbol.startswith("NSE:") and symbol.endswith("-INDEX")) else format_eq_symbol(symbol)
-    daily_df = get_history(hist_symbol, "D", max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
-    intra_df = get_history(hist_symbol, "5", INTRADAY_LOOKBACK_DAYS)
+    eq = format_eq_symbol(symbol)
+    daily_df = get_history(eq, "D", max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
+    intra_df = get_history(eq, "5", INTRADAY_LOOKBACK_DAYS)
     if daily_df.empty or intra_df.empty: return None
     summary = summarize_intraday(intra_df, daily_df)
     if not summary: return None
@@ -722,10 +848,10 @@ def scan_symbol(symbol: str) -> Optional[Dict]:
 def main() -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     init_fyers()
-    symbols = load_scan_universe(SECTORS_DIR)
+    symbols = load_fno_symbols_from_sectors(SECTORS_DIR)
     rows = []
     for i, symbol in enumerate(symbols, start=1):
-        logger.info("[%s/%s] Scanning %s", i, len(symbols), symbol)
+        logger.info("[%s/%s] Scanning Stock %s", i, len(symbols), symbol)
         row = scan_symbol(symbol)
         if row:
             rows.append(row)
@@ -734,16 +860,8 @@ def main() -> None:
         raise RuntimeError("No symbols returned usable market data.")
     summary_df = summary_df.sort_values(["Rank Delta", "% Change"], ascending=[False, False]).reset_index(drop=True)
     long_df, short_df = choose_top_candidates(summary_df, top_n=60)
-    nifty_df = pd.DataFrame({"Symbol": ["NIFTY50-INDEX"]})
-    banknifty_df = pd.DataFrame({"Symbol": ["BANKNIFTY-INDEX"]})
-    ce_df_a, ce_iter_df_a = build_option_candidates(nifty_df, side="long")
-    pe_df_a, pe_iter_df_a = build_option_candidates(nifty_df, side="short")
-    ce_df_b, ce_iter_df_b = build_option_candidates(banknifty_df, side="long")
-    pe_df_b, pe_iter_df_b = build_option_candidates(banknifty_df, side="short")
-    ce_df = pd.concat([ce_df_a, ce_df_b], ignore_index=True) if not ce_df_a.empty or not ce_df_b.empty else pd.DataFrame()
-    pe_df = pd.concat([pe_df_a, pe_df_b], ignore_index=True) if not pe_df_a.empty or not pe_df_b.empty else pd.DataFrame()
-    ce_iter_df = pd.concat([ce_iter_df_a, ce_iter_df_b], ignore_index=True) if not ce_iter_df_a.empty or not ce_iter_df_b.empty else pd.DataFrame()
-    pe_iter_df = pd.concat([pe_iter_df_a, pe_iter_df_b], ignore_index=True) if not pe_iter_df_a.empty or not pe_iter_df_b.empty else pd.DataFrame()
+    ce_df, ce_iter_df = build_option_candidates(long_df, side="long")
+    pe_df, pe_iter_df = build_option_candidates(short_df, side="short")
     iteration_df = pd.concat([ce_iter_df, pe_iter_df], ignore_index=True) if not ce_iter_df.empty or not pe_iter_df.empty else pd.DataFrame()
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
     summary_csv = os.path.join(OUTPUT_DIR, f"fo_summary_{timestamp}.csv")
@@ -753,12 +871,6 @@ def main() -> None:
     summary_df.to_csv(summary_csv, index=False)
     ce_df.to_csv(ce_csv, index=False)
     pe_df.to_csv(pe_csv, index=False)
-    nifty_option_csv = os.path.join(OUTPUT_DIR, f"nifty_option_chain_{timestamp}.csv")
-    banknifty_option_csv = os.path.join(OUTPUT_DIR, f"banknifty_option_chain_{timestamp}.csv")
-    raw_nifty = fetch_raw_option_chain("NIFTY50")
-    raw_banknifty = fetch_raw_option_chain("BANKNIFTY")
-    raw_nifty.to_csv(nifty_option_csv, index=False)
-    raw_banknifty.to_csv(banknifty_option_csv, index=False)
     if iteration_df.empty:
         iteration_df = pd.DataFrame(columns=["iteration", "Underlying", "Strike", "Strike Name", "Option Symbol", "timestamp", "window_minutes", "window_start", "window_end", "current_window_score", "previous_trading_day_same_time_score", "window_delta", "window_signal", "close"])
     iteration_df.to_csv(iter_csv, index=False)
@@ -769,34 +881,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
-def fetch_raw_option_chain(symbol: str):
-    if fyers is None:
-        init_fyers()
-    if fyers is None:
-        return pd.DataFrame(), None
-    try:
-        res = fyers.optionchain(data={"symbol": symbol, "strikecount": 50})
-    except Exception as e:
-        logger.exception("Option chain failed for %s: %s", symbol, e)
-        return pd.DataFrame(), {"error": str(e), "symbol": symbol}
-    data = (res or {}).get("data", {})
-    rows = []
-    if isinstance(data, dict):
-        rows = data.get("optionsChain", []) or data.get("options_chain", []) or data.get("chain", [])
-    elif isinstance(data, list):
-        rows = data
-    meta = {"symbol": symbol, "raw": res, "rowcount": len(rows)}
-    if not rows:
-        return pd.DataFrame(), meta
-    return pd.DataFrame(rows), meta
-
-def debug_option_chain_all():
-    if fyers is None:
-        init_fyers()
-    for sym in ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX"]:
-        df, meta = fetch_raw_option_chain(sym)
-        print(sym, "rows=", len(df), "meta=", meta)
-        if not df.empty:
-            print(df.head(5).to_string())
-
