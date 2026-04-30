@@ -30,6 +30,109 @@ SIGNAL_WINDOW_MINUTES = 5
 ITERATIONS_TO_KEEP = 75
 SECTORS_DIR = os.environ.get("SECTORS_DIR", "sectors")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
+MIN_OPTION_LTP = 10.0
+
+EMAIL_CSS = """
+body{
+    margin:0;
+    padding:0;
+    background:#edf2f7;
+    font-family:Arial,Helvetica,sans-serif;
+    color:#1f2937;
+}
+.wrapper{
+    max-width:1600px;
+    margin:0 auto;
+    padding:20px 12px 32px;
+}
+.header{
+    background:linear-gradient(135deg,#0f172a,#1e3a8a);
+    color:#ffffff;
+    padding:18px 20px;
+    border-radius:14px;
+    margin-bottom:18px;
+}
+.header .eyebrow{
+    font-size:12px;
+    text-transform:uppercase;
+    letter-spacing:.8px;
+    opacity:.85;
+    margin-bottom:6px;
+}
+.header h1{
+    margin:0 0 6px 0;
+    font-size:22px;
+    line-height:1.2;
+}
+.header p{
+    margin:0;
+    font-size:13px;
+    color:#dbeafe;
+}
+.section{
+    background:#ffffff;
+    border:1px solid #dbe3ee;
+    border-radius:14px;
+    margin-bottom:16px;
+    overflow:hidden;
+    box-shadow:0 4px 14px rgba(15,23,42,.06);
+}
+.section-title{
+    background:#f8fafc;
+    color:#0f172a;
+    font-weight:700;
+    font-size:15px;
+    padding:12px 14px;
+    border-bottom:1px solid #e5e7eb;
+}
+.table-wrap{
+    overflow-x:auto;
+}
+.report-table{
+    width:100%;
+    border-collapse:collapse;
+    font-size:12px;
+}
+.report-table thead th{
+    background:#0f172a;
+    color:#ffffff;
+    padding:10px 8px;
+    text-align:left;
+    white-space:nowrap;
+}
+.report-table tbody td{
+    padding:8px 8px;
+    border-bottom:1px solid #eef2f7;
+    white-space:nowrap;
+}
+.report-table tbody tr:nth-child(even){
+    background:#f8fafc;
+}
+.empty{
+    padding:14px;
+    color:#6b7280;
+    font-size:13px;
+}
+.sig-strong{
+    font-weight:700;
+    color:#065f46;
+    background:#d1fae5;
+}
+.sig-plus{
+    font-weight:700;
+    color:#1d4ed8;
+    background:#dbeafe;
+}
+.sig-base{
+    font-weight:700;
+    color:#334155;
+    background:#e2e8f0;
+}
+.sig-neutral{
+    color:#6b7280;
+    background:#f3f4f6;
+}
+"""
 
 EMAIL_DISPLAY_COLS = [
     "Symbol", "LTP", "% Change", "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
@@ -383,91 +486,218 @@ def option_liquidity_score(oi, volume, obv) -> float:
     return round((np.log1p(max(safe_float(oi, 0), 0)) * 0.45) + (np.log1p(max(safe_float(volume, 0), 0)) * 0.35) + (np.log1p(max(abs(safe_float(obv, 0)), 0)) * 0.20), 4)
 
 def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    if candidates_df.empty or "Symbol" not in candidates_df.columns: return pd.DataFrame(), pd.DataFrame()
+    if candidates_df.empty or "Symbol" not in candidates_df.columns:
+        return pd.DataFrame(), pd.DataFrame()
+
     rows, iter_rows = [], []
+    expected_option_type = "CE" if side == "long" else "PE"
+
     for underlying in candidates_df["Symbol"].dropna().astype(str):
         pair_df = fetch_option_pairs(underlying)
-        if pair_df.empty: continue
+        if pair_df.empty:
+            continue
+
         for _, row in pair_df.iterrows():
             strike = row.get("Strike", np.nan)
+
             for opt_type in ["CE", "PE"]:
+                if opt_type != expected_option_type:
+                    continue
+
                 sym = row.get(f"{opt_type} Symbol", "")
-                if not sym: continue
+                if not sym:
+                    continue
+
                 scanned = scan_single_option(sym, opt_type, strike, underlying)
-                if scanned:
-                    scanned["OI"] = row.get(f"{opt_type} OI", 0)
-                    scanned["Volume"] = row.get(f"{opt_type} Volume", 0)
-                    scanned["OI+Volume+OBV Score"] = option_liquidity_score(scanned["OI"], scanned["Volume"], scanned["OBV"])
-                    rows.append(scanned)
-                    hist = scanned.get("Iteration History")
-                    if isinstance(hist, pd.DataFrame) and not hist.empty:
-                        tmp = hist.copy()
-                        tmp.insert(0, "Option Symbol", sym)
-                        tmp.insert(1, "Underlying", underlying)
-                        tmp.insert(2, "Strike", strike)
-                        tmp.insert(3, "Strike Name", str(strike))
-                        iter_rows.append(tmp)
-    if not rows: return pd.DataFrame(), pd.DataFrame()
+                if not scanned:
+                    continue
+
+                scanned["OI"] = row.get(f"{opt_type} OI", 0)
+                scanned["Volume"] = row.get(f"{opt_type} Volume", 0)
+                scanned["OI+Volume+OBV Score"] = option_liquidity_score(
+                    scanned["OI"], scanned["Volume"], scanned["OBV"]
+                )
+
+                if safe_float(scanned.get("LTP"), 0.0) < MIN_OPTION_LTP:
+                    continue
+
+                rows.append(scanned)
+
+                hist = scanned.get("Iteration History")
+                if isinstance(hist, pd.DataFrame) and not hist.empty:
+                    tmp = hist.copy()
+                    tmp.insert(0, "Option Symbol", sym)
+                    tmp.insert(1, "Underlying", underlying)
+                    tmp.insert(2, "Strike", strike)
+                    tmp.insert(3, "Strike Name", str(strike))
+                    iter_rows.append(tmp)
+
+    if not rows:
+        return pd.DataFrame(), pd.DataFrame()
+
     out = pd.DataFrame(rows)
     rd = pd.to_numeric(out["Rank Delta"], errors="coerce")
-    out = out[rd > 0].copy() if side == "long" else out[rd < 0].copy()
-    out = out.sort_values(["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False, False])
+
+    if side == "long":
+        out = out[(rd > 0) & (out["Option Type"].astype(str).str.upper() == "CE")].copy()
+        out = out.sort_values(
+            ["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"],
+            ascending=[False, False, False, False]
+        )
+    else:
+        out = out[(rd < 0) & (out["Option Type"].astype(str).str.upper() == "PE")].copy()
+        out = out.sort_values(
+            ["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"],
+            ascending=[False, True, False, True]
+        )
+
     final_out = out[[c for c in OPTION_EMAIL_COLS if c in out.columns]].reset_index(drop=True)
+
     iter_df = pd.DataFrame()
     if iter_rows and not final_out.empty:
         all_iters = pd.concat(iter_rows, ignore_index=True)
         all_iters = all_iters[all_iters["Option Symbol"].isin(final_out["Option Symbol"])].copy()
         all_iters = all_iters.sort_values(["Underlying", "Strike", "Option Symbol", "iteration"]).reset_index(drop=True)
+
         if not all_iters.empty:
-            all_iters = all_iters.groupby(["Underlying", "Strike", "Option Symbol"], as_index=False, group_keys=False).apply(lambda x: x.assign(iteration=range(1, min(len(x), ITERATIONS_TO_KEEP) + 1)))
+            all_iters = all_iters.groupby(
+                ["Underlying", "Strike", "Option Symbol"],
+                as_index=False,
+                group_keys=False
+            ).apply(lambda x: x.assign(iteration=range(1, min(len(x), ITERATIONS_TO_KEEP) + 1)))
+
             all_iters["iteration"] = pd.to_numeric(all_iters["iteration"], errors="coerce").astype("Int64")
             all_iters = all_iters[all_iters["iteration"].between(1, ITERATIONS_TO_KEEP)]
             iter_df = all_iters.reset_index(drop=True)
+
     return final_out, iter_df
 
+
 def format_cell(col: str, val) -> str:
-    if pd.isna(val): return ""
-    if col == "% Change": return f"{float(val):.2f}%"
-    if isinstance(val, (int, float, np.integer, np.floating)): return f"{float(val):.2f}"
+    if pd.isna(val):
+        return ""
+    if col == "% Change":
+        return f"{float(val):.2f}%"
+    if isinstance(val, (int, float, np.integer, np.floating)):
+        return f"{float(val):.2f}"
     return str(val)
 
+
 def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
-    html = [f"<div class='card'><h3>{title}</h3>"]
+    html = [f'<div class="section"><div class="section-title">{title}</div>']
+
     if df is None or df.empty:
-        html.append("<p class='muted'>No data found.</p></div>")
-        return chr(10).join(html)
+        html.append('<div class="empty">No data found.</div></div>')
+        return "".join(html)
+
     view = df[[c for c in columns if c in df.columns]].copy()
-    html.append("<div class='table-wrap'><table><thead><tr>" + "".join([f"<th>{c}</th>" for c in view.columns]) + "</tr></thead><tbody>")
+    html.append('<div class="table-wrap"><table class="report-table"><thead><tr>')
+    html.extend(f"<th>{c}</th>" for c in view.columns)
+    html.append("</tr></thead><tbody>")
+
+    signal_cols = {
+        "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
+        "Bull_Signal", "Bear_Signal", "Overall_Signal"
+    }
+
     for _, row in view.iterrows():
-        html.append("<tr>" + "".join([f"<td>{format_cell(c, row[c])}</td>" for c in view.columns]) + "</tr>")
+        html.append("<tr>")
+        for c in view.columns:
+            cell_val = format_cell(c, row[c])
+            cls = ""
+
+            if c in signal_cols:
+                sv = str(cell_val).upper()
+                if any(x in sv for x in ["LONG++", "SHORT++", "BUY++", "SELL++"]):
+                    cls = ' class="sig-strong"'
+                elif any(x in sv for x in ["LONG+", "SHORT+", "BUY+", "SELL+"]):
+                    cls = ' class="sig-plus"'
+                elif sv in {"LONG", "SHORT", "BUY", "SELL"}:
+                    cls = ' class="sig-base"'
+                elif "NEUTRAL" in sv:
+                    cls = ' class="sig-neutral"'
+
+            html.append(f"<td{cls}>{cell_val}</td>")
+        html.append("</tr>")
+
     html.append("</tbody></table></div></div>")
-    return chr(10).join(html)
+    return "".join(html)
+
+
+def prepare_option_email_view(df: pd.DataFrame, side: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=OPTION_EMAIL_COLS)
+
+    out = df.copy()
+    expected_type = "CE" if side == "long" else "PE"
+
+    if "Option Type" in out.columns:
+        out = out[out["Option Type"].astype(str).str.upper() == expected_type].copy()
+
+    if "LTP" in out.columns:
+        out = out[pd.to_numeric(out["LTP"], errors="coerce") >= MIN_OPTION_LTP].copy()
+
+    out = apply_display_labels(out, side)
+
+    if "Overall_Signal" in out.columns:
+        out["Overall_Signal"] = "LONG++" if side == "long" else "SHORT++"
+
+    return out.reset_index(drop=True)
+
 
 def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
     sender_email = os.environ.get("SENDER_EMAIL")
     recipient_email = os.environ.get("RECIPIENT_EMAIL")
     sender_password = os.environ.get("SENDER_PASSWORD")
-    if not sender_email or not recipient_email or not sender_password: return False
+
+    if not sender_email or not recipient_email or not sender_password:
+        return False
+
     scan_time = datetime.now().strftime("%d %b %Y, %H:%M")
-    html = f"<html><body><h2>Intraday Vol Iteration Alert - {scan_time}</h2>"
-    html += dataframe_to_html(apply_display_labels(long_df, "long"), EMAIL_DISPLAY_COLS, 'Stock Long Candidates')
-    html += dataframe_to_html(apply_display_labels(short_df, "short"), EMAIL_DISPLAY_COLS, 'Stock Short Candidates')
-    html += dataframe_to_html(apply_display_labels(ce_df, "long"), OPTION_EMAIL_COLS, 'CE Candidates')
-    html += dataframe_to_html(apply_display_labels(pe_df, "short"), OPTION_EMAIL_COLS, 'PE Candidates')
-    html += "</body></html>"
+
+    long_view = apply_display_labels(long_df, "long")
+    short_view = apply_display_labels(short_df, "short")
+    ce_view = prepare_option_email_view(ce_df, "long")
+    pe_view = prepare_option_email_view(pe_df, "short")
+
+    html = f"""
+    <html>
+    <head>
+        <meta charset="utf-8">
+        <style>{EMAIL_CSS}</style>
+    </head>
+    <body>
+        <div class="wrapper">
+            <div class="header">
+                <div class="eyebrow">Intraday Vol Iteration Alert</div>
+                <h1>Intraday Alert - {scan_time}</h1>
+                <p>Scan completed at {scan_time}.</p>
+            </div>
+
+            {dataframe_to_html(long_view, EMAIL_DISPLAY_COLS, "Stock Long Candidates")}
+            {dataframe_to_html(short_view, EMAIL_DISPLAY_COLS, "Stock Short Candidates")}
+            {dataframe_to_html(ce_view, OPTION_EMAIL_COLS, "CE Candidates")}
+            {dataframe_to_html(pe_view, OPTION_EMAIL_COLS, "PE Candidates")}
+        </div>
+    </body>
+    </html>
+    """
+
     msg = MIMEMultipart()
     msg["From"] = sender_email
     msg["To"] = recipient_email
     msg["Subject"] = f"Intraday Alert - {scan_time}"
     msg.attach(MIMEText(html, "html", "utf-8"))
+
     for path in attachments:
         if path and os.path.exists(path):
             with open(path, "rb") as f:
                 part = MIMEBase("application", "octet-stream")
                 part.set_payload(f.read())
             encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(path)}")
+            part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(path)}"')
             msg.attach(part)
+
     try:
         smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
         with smtplib.SMTP_SSL(smtp_host, 465, timeout=40) as s:
@@ -476,6 +706,7 @@ def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
         return True
     except Exception:
         return False
+
 
 def scan_symbol(symbol: str) -> Optional[Dict]:
     eq = format_eq_symbol(symbol)
