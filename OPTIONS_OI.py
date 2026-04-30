@@ -102,13 +102,24 @@ def load_nse_underlyings() -> List[str]:
             s.get("https://www.nseindia.com", timeout=8)
             r = s.get(url, timeout=15)
             r.raise_for_status()
-            tables = pd.read_html(StringIO(r.text))
-            for df in tables:
-                cols = {str(c).strip().lower(): c for c in df.columns}
-                if "symbol" in cols:
-                    sym_col = cols["symbol"]
-                    syms = [str(x).strip().upper() for x in df[sym_col].dropna().tolist()]
-                    return sorted(set(s for s in syms if s))
+            try:
+                tables = pd.read_html(StringIO(r.text))
+                for df in tables:
+                    cols = {str(c).strip().lower(): c for c in df.columns}
+                    if "symbol" in cols:
+                        sym_col = cols["symbol"]
+                        syms = [str(x).strip().upper() for x in df[sym_col].dropna().tolist()]
+                        out = sorted(set(s for s in syms if s))
+                        if out:
+                            return out
+            except Exception:
+                pass
+            text = r.text.upper()
+            import re
+            syms = sorted(set(re.findall(r"[A-Z0-9-]{2,20}", text)))
+            ignore = {"NSE","HTML","TABLE","THE","AND","FOR","WITH","DATA","DERIVATIVES","UNDERLYINGS","INFORMATION","SYMBOL"}
+            out = [s for s in syms if s not in ignore and not s.isdigit()]
+            return out
     except Exception:
         pass
     return []
@@ -786,7 +797,8 @@ def main() -> None:
 
     summary_df = pd.DataFrame(rows)
     if summary_df.empty:
-        raise RuntimeError("No symbols returned usable market data.")
+        logger.error("No symbols returned usable market data.")
+        summary_df = pd.DataFrame(columns=["Symbol","Rank Delta","% Change"])
 
     summary_df   = summary_df.sort_values(["Rank Delta","% Change"],
                                             ascending=[False,False]).reset_index(drop=True)
