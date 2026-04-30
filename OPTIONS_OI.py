@@ -622,12 +622,17 @@ def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
         {colored_table_html(short_view, OPTION_EMAIL_COLS, "Short Candidates")}
     </body>
     </html>"""
-    text = f"Intraday Vol Iteration Alert
-Scan completed at {scan_time}.
-
-Buy Candidates: {len(buy_view) if buy_view is not None else 0}
-Short Candidates: {len(short_view) if short_view is not None else 0}
+   text = (
+    "Intraday Vol Iteration Alert
 "
+    f"Scan completed at {scan_time}.
+
+"
+    f"Buy Candidates: {len(buy_view) if buy_view is not None else 0}
+"
+    f"Short Candidates: {len(short_view) if short_view is not None else 0}
+"
+   ) 
     msg = EmailMessage()
     msg["From"] = sender_email
     msg["To"] = recipient_email
