@@ -639,10 +639,47 @@ def prepare_option_email_view(df: pd.DataFrame, side: str) -> pd.DataFrame:
 
     out = apply_display_labels(out, side)
 
+    timing_cols = [c for c in ["5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal"] if c in out.columns]
+    if timing_cols:
+        neutral_like = {"", "-", "NEUTRAL", "NAN", "NONE"}
+        mask = ~out[timing_cols].apply(
+            lambda row: any(str(v).strip().upper() in neutral_like for v in row),
+            axis=1
+        )
+        out = out[mask].copy()
+
     if "Overall_Signal" in out.columns:
         out["Overall_Signal"] = "LONG++" if side == "long" else "SHORT++"
 
-    return out.reset_index(drop=True)
+    final_cols = [c for c in OPTION_EMAIL_COLS if c in out.columns]
+    return out[final_cols].reset_index(drop=True)
+
+
+def simple_table_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
+    html = [f"<p><b>{title}</b></p>"]
+
+    if df is None or df.empty:
+        html.append("<p>No data found.</p>")
+        return "".join(html)
+
+    view = df[[c for c in columns if c in df.columns]].copy()
+    html.append(
+        "<table border='1' cellpadding='4' cellspacing='0' "
+        "style='border-collapse:collapse; font-family:Arial,Helvetica,sans-serif; font-size:12px;'>"
+    )
+    html.append("<tr>")
+    for c in view.columns:
+        html.append(f"<th style='text-align:left;'>{c}</th>")
+    html.append("</tr>")
+
+    for _, row in view.iterrows():
+        html.append("<tr>")
+        for c in view.columns:
+            html.append(f"<td>{format_cell(c, row[c])}</td>")
+        html.append("</tr>")
+
+    html.append("</table>")
+    return "".join(html)
 
 
 def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
@@ -653,32 +690,21 @@ def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
     if not sender_email or not recipient_email or not sender_password:
         return False
 
+    subject_time = datetime.now().strftime("%d %b %H:%M")
     scan_time = datetime.now().strftime("%d %b %Y, %H:%M")
 
-    long_view = apply_display_labels(long_df, "long")
-    short_view = apply_display_labels(short_df, "short")
     ce_view = prepare_option_email_view(ce_df, "long")
     pe_view = prepare_option_email_view(pe_df, "short")
 
     html = f"""
     <html>
-    <head>
-        <meta charset="utf-8">
-        <style>{EMAIL_CSS}</style>
-    </head>
-    <body>
-        <div class="wrapper">
-            <div class="header">
-                <div class="eyebrow">Intraday Vol Iteration Alert</div>
-                <h1>Intraday Alert - {scan_time}</h1>
-                <p>Scan completed at {scan_time}.</p>
-            </div>
+    <body style="font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000000;">
+        <p><b>Intraday Vol Iteration Alert</b></p>
+        <p>Scan completed at {scan_time}.</p>
 
-            {dataframe_to_html(long_view, EMAIL_DISPLAY_COLS, "Stock Long Candidates")}
-            {dataframe_to_html(short_view, EMAIL_DISPLAY_COLS, "Stock Short Candidates")}
-            {dataframe_to_html(ce_view, OPTION_EMAIL_COLS, "CE Candidates")}
-            {dataframe_to_html(pe_view, OPTION_EMAIL_COLS, "PE Candidates")}
-        </div>
+        {simple_table_html(ce_view, OPTION_EMAIL_COLS, "CE Candidates")}
+        <br>
+        {simple_table_html(pe_view, OPTION_EMAIL_COLS, "PE Candidates")}
     </body>
     </html>
     """
@@ -686,7 +712,7 @@ def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
     msg = MIMEMultipart()
     msg["From"] = sender_email
     msg["To"] = recipient_email
-    msg["Subject"] = f"Intraday Alert - {scan_time}"
+    msg["Subject"] = f"Intraday Vol Iteration Alert - {subject_time}"
     msg.attach(MIMEText(html, "html", "utf-8"))
 
     for path in attachments:
