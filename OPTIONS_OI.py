@@ -35,6 +35,7 @@ SECTORS_DIR = os.environ.get("SECTORS_DIR", "sectors")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 MIN_OPTION_LTP = 10.0
 PER_SYMBOL_SLEEP_SEC = float(os.environ.get("PER_SYMBOL_SLEEP_SEC", "0.25"))
+MAX_WORKERS = int(os.environ.get("MAX_WORKERS", "16"))
 EMAIL_MAX_ROWS_LONG = int(os.environ.get("EMAIL_MAX_ROWS_LONG", "14"))
 EMAIL_MAX_ROWS_SHORT = int(os.environ.get("EMAIL_MAX_ROWS_SHORT", "14"))
 EMAIL_SAFE_WIDTH = int(os.environ.get("EMAIL_SAFE_WIDTH", "600"))
@@ -174,13 +175,17 @@ def compute_today_obv(df: pd.DataFrame) -> float:
     d = df.copy().sort_values("timestamp")
     d["timestamp"] = pd.to_datetime(d["timestamp"])
     today = pd.Timestamp.now(tz=None).date()
-    d = d[d["timestamp"].dt.date == today].copy()
-    if d.empty:
+    day_data = d[d["timestamp"].dt.date == today].copy()
+    # Fallback: if no bars for today (pre-market / holiday), use last available trading day
+    if day_data.empty or len(day_data) < 2:
+        last_day = d["timestamp"].dt.date.max()
+        day_data = d[d["timestamp"].dt.date == last_day].copy()
+    if day_data.empty or len(day_data) < 2:
         return np.nan
-    d = d[d["timestamp"] >= pd.Timestamp.combine(today, dtime(9, 15))].copy()
-    if len(d) < 2:
+    day_data = day_data[day_data["timestamp"] >= pd.Timestamp.combine(day_data["timestamp"].dt.date.min(), dtime(9, 15))].copy()
+    if len(day_data) < 2:
         return np.nan
-    return compute_obv(d)
+    return compute_obv(day_data)
 
 
 def compute_ivp(history_df: pd.DataFrame, min_bars: int = 10) -> Tuple[float, str]:
@@ -603,31 +608,38 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
 
     rows, iter_rows = [], []
 
+    # Collect all (underlying, option_row) pairs first
+    all_tasks = []
     for underlying in candidates_df["Symbol"].dropna().astype(str):
         pair_df = fetch_option_pairs(underlying)
         if pair_df.empty:
             continue
-
         for _, row in pair_df.iterrows():
             strike = safe_float(row.get("Strike"), np.nan)
             opt_type = str(row.get("Option Type", "")).upper()
             sym = str(row.get("Option Symbol", ""))
             if not sym or opt_type not in {"CE", "PE"}:
                 continue
+            all_tasks.append((sym, opt_type, strike, underlying, dict(row)))
 
-            scanned = scan_single_option(sym, opt_type, strike, underlying)
-            if not scanned:
+    def _scan_task(args):
+        sym, opt_type, strike, underlying, row = args
+        scanned = scan_single_option(sym, opt_type, strike, underlying)
+        if not scanned:
+            return None
+        scanned["OI"] = safe_float(row.get("OI"), 0)
+        scanned["Chain_Volume"] = safe_float(row.get("Chain Volume"), 0)
+        scanned["OI+Volume+OBV Score"] = option_liquidity_score(scanned.get("OI", 0), scanned.get("Volume", 0), scanned.get("OBV", 0))
+        if safe_float(scanned.get("LTP"), 0.0) < MIN_OPTION_LTP:
+            return None
+        return scanned, sym, underlying, strike, opt_type
+
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        for result in executor.map(_scan_task, all_tasks):
+            if result is None:
                 continue
-
-            scanned["OI"] = safe_float(row.get("OI"), 0)
-            scanned["Chain_Volume"] = safe_float(row.get("Chain Volume"), 0)
-            scanned["OI+Volume+OBV Score"] = option_liquidity_score(scanned.get("OI", 0), scanned.get("Volume", 0), scanned.get("OBV", 0))
-
-            if safe_float(scanned.get("LTP"), 0.0) < MIN_OPTION_LTP:
-                continue
-
+            scanned, sym, underlying, strike, opt_type = result
             rows.append(scanned)
-
             hist = scanned.get("Iteration History")
             if isinstance(hist, pd.DataFrame) and not hist.empty:
                 tmp = hist.copy()
@@ -823,37 +835,27 @@ def scan_symbol(symbol: str) -> Optional[Dict]:
     return summary
 
 
-
-def scan_symbols_parallel(symbols: List[str]) -> List[Dict]:
-    rows = []
-    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
-        futures = {ex.submit(scansymbol, symbol): symbol for symbol in symbols}
-        for fut in as_completed(futures):
-            symbol = futures[fut]
-            try:
-                row = fut.result()
-                if row:
-                    rows.append(row)
-            except Exception as e:
-                logger.exception("Scan failed for %s: %s", symbol, e)
-    return rows
-
 def main() -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     init_fyers()
     symbols = load_fno_symbols_from_sectors(SECTORS_DIR)
 
+    logger.info("Scanning %s symbols with MAX_WORKERS=%s (parallel)", len(symbols), MAX_WORKERS)
     rows = []
-    for i, symbol in enumerate(symbols, start=1):
-        logger.info("[%s/%s] Scanning %s", i, len(symbols), symbol)
-        row = scan_symbol(symbol)
-        if row:
-            rows.append(row)
-        time.sleep(PER_SYMBOL_SLEEP_SEC)
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as executor:
+        futures = {executor.submit(scan_symbol, symbol): symbol for symbol in symbols}
+        for fut in as_completed(futures):
+            sym = futures[fut]
+            try:
+                row = fut.result()
+                if row:
+                    rows.append(row)
+            except Exception as e:
+                logger.error("scan_symbol failed [%s]: %s", sym, e)
 
     summary_df = pd.DataFrame(rows)
     if summary_df.empty:
-        raise RuntimeError("No symbols returned usable market data.")
+        logger.error("No symbols returned usable market data."); return
 
     summary_df = summary_df.sort_values(["Rank Delta", "% Change"], ascending=[False, False]).reset_index(drop=True)
     long_seed_df, short_seed_df = choose_top_candidates(summary_df, top_n=TOP_N_UNDERLYINGS)
