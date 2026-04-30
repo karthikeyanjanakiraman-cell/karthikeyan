@@ -29,6 +29,18 @@ OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 MIN_OPTION_LTP = 10.0
 INDEX_UNDERLYINGS = ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX"]
 
+EMAIL_DISPLAY_COLS = [
+    "Symbol", "LTP", "% Change", "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
+    "Bull_Signal", "Bear_Signal", "Overall_Signal", "Price_Lead_Status", "IVP",
+    "Volatility State", "Last Iteration Time",
+]
+
+OPTION_EMAIL_COLS = [
+    "Underlying", "Option Type", "Option Symbol", "Strike", "LTP", "% Change", "OI", "Volume", "OBV",
+    "OI+Volume+OBV Score", "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal", "Bull_Signal",
+    "Bear_Signal", "Overall_Signal", "Price_Lead_Status", "IVP", "Volatility State", "Last Iteration Time",
+]
+
 fyers = None
 
 def init_fyers() -> Optional[object]:
@@ -149,8 +161,10 @@ def compute_today_obv(df: pd.DataFrame) -> float:
     for i in range(1, len(d)):
         if pd.isna(close.iloc[i]) or pd.isna(close.iloc[i - 1]):
             continue
-        if close.iloc[i] > close.iloc[i - 1]: obv += vol.iloc[i]
-        elif close.iloc[i] < close.iloc[i - 1]: obv -= vol.iloc[i]
+        if close.iloc[i] > close.iloc[i - 1]:
+            obv += vol.iloc[i]
+        elif close.iloc[i] < close.iloc[i - 1]:
+            obv -= vol.iloc[i]
     return round(obv, 2)
 
 def compute_ivp(history_df: pd.DataFrame) -> Tuple[float, str]:
@@ -477,27 +491,31 @@ def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html = [f'<div class="section"><div class="section-title">{title}</div>']
     if df is None or df.empty:
         html.append('<div class="empty">No data found.</div></div>')
-        return ''.join(html)
+        return "".join(html)
     view = df[[c for c in columns if c in df.columns]].copy()
     html.append('<div class="table-wrap"><table class="report-table"><thead><tr>')
     html.extend(f"<th>{c}</th>" for c in view.columns)
-    html.append('</tr></thead><tbody>')
+    html.append("</tr></thead><tbody>")
     signal_cols = {"5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal", "Bull_Signal", "Bear_Signal", "Overall_Signal"}
     for _, row in view.iterrows():
-        html.append('<tr>')
+        html.append("<tr>")
         for c in view.columns:
             cell_val = format_cell(c, row[c])
-            cls = ''
+            cls = ""
             if c in signal_cols:
                 sv = str(cell_val).upper()
-                if any(x in sv for x in ["LONG++", "SHORT++", "BUY++", "SELL++"]): cls = ' class="sig-strong"'
-                elif any(x in sv for x in ["LONG+", "SHORT+", "BUY+", "SELL+"]): cls = ' class="sig-plus"'
-                elif sv in {"LONG", "SHORT", "BUY", "SELL"}: cls = ' class="sig-base"'
-                elif 'NEUTRAL' in sv: cls = ' class="sig-neutral"'
-            html.append(f'<td{cls}>{cell_val}</td>')
-        html.append('</tr>')
-    html.append('</tbody></table></div></div>')
-    return ''.join(html)
+                if any(x in sv for x in ["LONG++", "SHORT++", "BUY++", "SELL++"]):
+                    cls = ' class="sig-strong"'
+                elif any(x in sv for x in ["LONG+", "SHORT+", "BUY+", "SELL+"]):
+                    cls = ' class="sig-plus"'
+                elif sv in {"LONG", "SHORT", "BUY", "SELL"}:
+                    cls = ' class="sig-base"'
+                elif "NEUTRAL" in sv:
+                    cls = ' class="sig-neutral"'
+            html.append(f"<td{cls}>{cell_val}</td>")
+        html.append("</tr>")
+    html.append("</tbody></table></div></div>")
+    return "".join(html)
 
 def prepare_option_email_view(df: pd.DataFrame, side: str) -> pd.DataFrame:
     if df is None or df.empty:
@@ -522,26 +540,41 @@ def prepare_option_email_view(df: pd.DataFrame, side: str) -> pd.DataFrame:
 def _cell_bg(col: str, value: str) -> str:
     v = str(value).strip().upper()
     if col == "% Change":
-        try: num = float(str(value).replace('%', '').strip())
-        except Exception: return '#2d3651'
-        if num > 0: return '#2e7d32'
-        if num < 0: return '#c62828'
+        try:
+            num = float(str(value).replace('%', '').strip())
+        except Exception:
+            return '#2d3651'
+        if num > 0:
+            return '#2e7d32'
+        if num < 0:
+            return '#c62828'
         return '#546e7a'
     if col in {"5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal", "Bull_Signal", "Bear_Signal", "Overall_Signal"}:
-        if "LONG++" in v or "BUY++" in v: return '#2e7d32'
-        if "LONG+" in v or "BUY+" in v: return '#388e3c'
-        if v in {"LONG", "BUY"}: return '#43a047'
-        if "SHORT++" in v or "SELL++" in v: return '#c62828'
-        if "SHORT+" in v or "SELL+" in v: return '#d32f2f'
-        if v in {"SHORT", "SELL"}: return '#e53935'
-        if "NEUTRAL" in v: return '#6b7280'
+        if "LONG++" in v or "BUY++" in v:
+            return '#2e7d32'
+        if "LONG+" in v or "BUY+" in v:
+            return '#388e3c'
+        if v in {"LONG", "BUY"}:
+            return '#43a047'
+        if "SHORT++" in v or "SELL++" in v:
+            return '#c62828'
+        if "SHORT+" in v or "SELL+" in v:
+            return '#d32f2f'
+        if v in {"SHORT", "SELL"}:
+            return '#e53935'
+        if "NEUTRAL" in v:
+            return '#6b7280'
     if col == "Volatility State":
-        if "AVOID BUY PREMIUM" in v: return '#fbc02d'
-        if "BUYER ZONE" in v: return '#9ccc65'
+        if "AVOID BUY PREMIUM" in v:
+            return '#fbc02d'
+        if "BUYER ZONE" in v:
+            return '#9ccc65'
         return '#546e7a'
     if col == "Price_Lead_Status":
-        if "EARLY_PRICE_LEAD" in v: return '#00897b'
-        if "FADE" in v: return '#8e24aa'
+        if "EARLY_PRICE_LEAD" in v:
+            return '#00897b'
+        if "FADE" in v:
+            return '#8e24aa'
         return '#2d3651'
     return '#2d3651'
 
@@ -582,14 +615,19 @@ def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
     buy_view = prepare_option_email_view(ce_df, "long")
     short_view = prepare_option_email_view(pe_df, "short")
     html = f"""<html>
-    <body style=\"margin:0; padding:8px; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000; background:#ffffff;\">
-        <div style=\"margin:0 0 6px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;\"><b>Intraday Vol Iteration Alert</b></div>
-        <div style=\"margin:0 0 10px 0; font-family:Arial,Helvetica,sans-serif; font-size:12px; color:#000;\">Scan completed at {scan_time}.</div>
+    <body style="margin:0; padding:8px; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000; background:#ffffff;">
+        <div style="margin:0 0 6px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;"><b>Intraday Vol Iteration Alert</b></div>
+        <div style="margin:0 0 10px 0; font-family:Arial,Helvetica,sans-serif; font-size:12px; color:#000;">Scan completed at {scan_time}.</div>
         {colored_table_html(buy_view, OPTION_EMAIL_COLS, "Buy Candidates")}
         {colored_table_html(short_view, OPTION_EMAIL_COLS, "Short Candidates")}
     </body>
     </html>"""
-    text = f"Intraday Vol Iteration Alert\nScan completed at {scan_time}.\n\nBuy Candidates: {len(buy_view) if buy_view is not None else 0}\nShort Candidates: {len(short_view) if short_view is not None else 0}\n"
+    text = f"Intraday Vol Iteration Alert
+Scan completed at {scan_time}.
+
+Buy Candidates: {len(buy_view) if buy_view is not None else 0}
+Short Candidates: {len(short_view) if short_view is not None else 0}
+"
     msg = EmailMessage()
     msg["From"] = sender_email
     msg["To"] = recipient_email
@@ -616,9 +654,11 @@ def scan_symbol(symbol: str) -> Optional[Dict]:
     hist_symbol = symbol if (symbol.startswith("NSE:") and symbol.endswith("-INDEX")) else format_eq_symbol(symbol)
     daily_df = get_history(hist_symbol, "D", max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
     intra_df = get_history(hist_symbol, "5", INTRADAY_LOOKBACK_DAYS)
-    if daily_df.empty or intra_df.empty: return None
+    if daily_df.empty or intra_df.empty:
+        return None
     summary = summarize_intraday(intra_df, daily_df)
-    if not summary: return None
+    if not summary:
+        return None
     summary["Symbol"] = symbol
     return summary
 
