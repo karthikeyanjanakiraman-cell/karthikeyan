@@ -237,6 +237,32 @@ def compute_obv(df: pd.DataFrame) -> float:
         elif close.iloc[i] < close.iloc[i - 1]: obv -= vol.iloc[i]
     return round(obv, 2)
 
+def compute_today_obv(df: pd.DataFrame) -> float:
+    if df is None or df.empty or len(df) < 2:
+        return np.nan
+    d = df.copy().sort_values("timestamp")
+    d["timestamp"] = pd.to_datetime(d["timestamp"])
+    today = pd.Timestamp.now(tz=None).date()
+    d = d[d["timestamp"].dt.date == today].copy()
+    if d.empty:
+        return np.nan
+    start_anchor = pd.Timestamp.combine(today, time(9, 15))
+    d = d[d["timestamp"] >= start_anchor].copy()
+    if len(d) < 2:
+        return np.nan
+    close = pd.to_numeric(d["close"], errors="coerce")
+    vol = pd.to_numeric(d["volume"], errors="coerce").fillna(0.0)
+    obv = 0.0
+    for i in range(1, len(d)):
+        if pd.isna(close.iloc[i]) or pd.isna(close.iloc[i - 1]):
+            continue
+        if close.iloc[i] > close.iloc[i - 1]:
+            obv += vol.iloc[i]
+        elif close.iloc[i] < close.iloc[i - 1]:
+            obv -= vol.iloc[i]
+    return round(obv, 2)
+
+
 def compute_ivp(history_df: pd.DataFrame) -> Tuple[float, str]:
     if history_df is None or history_df.empty or len(history_df) < 30:
         return np.nan, "Neutral Vol"
@@ -472,14 +498,48 @@ def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> p
         final_rows.append({"Strike": strike, "CE Symbol": ce["OptionSymbol"].iloc[0] if not ce.empty else "", "PE Symbol": pe["OptionSymbol"].iloc[0] if not pe.empty else "", "CE OI": ce["OI"].iloc[0] if not ce.empty else 0, "CE Volume": ce["Volume"].iloc[0] if not ce.empty else 0, "PE OI": pe["OI"].iloc[0] if not pe.empty else 0, "PE Volume": pe["Volume"].iloc[0] if not pe.empty else 0})
     return pd.DataFrame(final_rows)
 
+
+def get_today_stats(df: pd.DataFrame) -> dict:
+    if df is None or df.empty: return {"OI": 0, "Volume": 0, "OBV": 0}
+    d = df.copy()
+    d["timestamp"] = pd.to_datetime(d["timestamp"])
+    today = pd.Timestamp.now(tz=None).date()
+    d = d[d["timestamp"].dt.date == today].copy()
+    if d.empty: return {"OI": 0, "Volume": 0, "OBV": 0}
+    start_anchor = pd.Timestamp.combine(today, time(9, 15))
+    d = d[d["timestamp"] >= start_anchor].copy()
+    if d.empty: return {"OI": 0, "Volume": 0, "OBV": 0}
+    return {"OI": d["oi"].iloc[-1] if "oi" in d.columns else 0, "Volume": d["volume"].sum(), "OBV": compute_today_obv(d)}
+
+def get_prev_day_stats(df: pd.DataFrame) -> dict:
+    if df is None or df.empty: return {"OI": 0, "Volume": 0, "OBV": 0}
+    d = df.copy()
+    d["timestamp"] = pd.to_datetime(d["timestamp"])
+    days = sorted(d["timestamp"].dt.date.unique())
+    if len(days) < 2: return {"OI": 0, "Volume": 0, "OBV": 0}
+    prev_day = days[-2]
+    d = d[d["timestamp"].dt.date == prev_day].copy()
+    return {"OI": d["oi"].iloc[-1] if "oi" in d.columns else 0, "Volume": d["volume"].sum(), "OBV": compute_obv(d)}
 def scan_single_option(option_symbol: str, option_type: str, strike: float, underlying: str) -> Optional[Dict]:
     hist_symbol = option_symbol if option_symbol.startswith("NSE:") else f"NSE:{option_symbol}"
     daily_df = get_history(hist_symbol, "D", max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
     intra_df = get_history(hist_symbol, "5", INTRADAY_LOOKBACK_DAYS)
     if daily_df.empty or intra_df.empty: return None
+
+    today_stats = get_today_stats(intra_df)
+    prev_stats = get_prev_day_stats(intra_df)
+
     summary = summarize_intraday(intra_df, daily_df)
     if not summary: return None
-    summary.update({"Underlying": underlying, "Option Type": option_type, "Option Symbol": option_symbol, "Strike": strike, "OBV": compute_obv(intra_df)})
+    summary.update({
+        "Underlying": underlying, "Option Type": option_type, "Option Symbol": option_symbol, "Strike": strike,
+        "OBV": today_stats["OBV"],
+        "OI": today_stats["OI"],
+        "Volume": today_stats["Volume"],
+        "OI_Delta": today_stats["OI"] - prev_stats["OI"],
+        "Vol_Delta": today_stats["Volume"] - prev_stats["Volume"],
+        "OBV_Delta": today_stats["OBV"] - prev_stats["OBV"]
+    })
     return summary
 
 def option_liquidity_score(oi, volume, obv) -> float:
@@ -622,27 +682,26 @@ def dataframe_to_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
 
 
 def prepare_option_email_view(df: pd.DataFrame, side: str) -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=OPTION_EMAIL_COLS)
-
+    if df is None or df.empty: return pd.DataFrame(columns=OPTION_EMAIL_COLS)
     out = df.copy()
+    if "Option Type" in out.columns:
+        expected = "CE" if side == "long" else "PE" # wait, user wants both CE/PE in both.
+        # Actually user said "Buy Candidates of CE and PE". My build_option_candidates now allows both.
+        pass
 
     if "LTP" in out.columns:
         out = out[pd.to_numeric(out["LTP"], errors="coerce") >= MIN_OPTION_LTP].copy()
 
-    if "% Change" in out.columns:
-        pct = pd.to_numeric(out["% Change"], errors="coerce")
-        out = out[pct > 0].copy() if side == "long" else out[pct < 0].copy()
+    # OBV filter
+    if "OBV" in out.columns:
+        obv = pd.to_numeric(out["OBV"], errors="coerce")
+        out = out[obv > 0].copy() if side == "long" else out[obv < 0].copy()
 
     out = apply_display_labels(out, side)
-
     timing_cols = [c for c in ["5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal"] if c in out.columns]
     if timing_cols:
         neutral_like = {"", "-", "NEUTRAL", "NAN", "NONE"}
-        mask = ~out[timing_cols].apply(
-            lambda row: any(str(v).strip().upper() in neutral_like for v in row),
-            axis=1
-        )
+        mask = ~out[timing_cols].apply(lambda row: any(str(v).strip().upper() in neutral_like for v in row), axis=1)
         out = out[mask].copy()
 
     if "Overall_Signal" in out.columns:
@@ -650,8 +709,6 @@ def prepare_option_email_view(df: pd.DataFrame, side: str) -> pd.DataFrame:
 
     final_cols = [c for c in OPTION_EMAIL_COLS if c in out.columns]
     return out[final_cols].reset_index(drop=True)
-
-
 def _cell_bg(col: str, value: str) -> str:
     v = str(value).strip().upper()
     if col == "% Change":
