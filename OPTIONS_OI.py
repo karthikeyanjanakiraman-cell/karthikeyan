@@ -745,11 +745,10 @@ def prepare_option_email_view(df: pd.DataFrame, side: str) -> pd.DataFrame:
     if "LTP" in out.columns:
         out = out[pd.to_numeric(out["LTP"], errors="coerce") >= MIN_OPTION_LTP].copy()
 
-    if "OBV" in out.columns:
-        obv = pd.to_numeric(out["OBV"], errors="coerce")
-        out = out[obv > 0].copy() if side == "long" else out[obv < 0].copy()
-
     out = apply_display_labels(out, side)
+
+    if side == "long" and "OBV" in out.columns:
+        out = out[pd.to_numeric(out["OBV"], errors="coerce") > 0].copy()
 
     timing_cols = [c for c in ["5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal"] if c in out.columns]
     if timing_cols:
@@ -865,6 +864,11 @@ def main() -> None:
             "previous_trading_day_same_time_score", "window_delta", "window_signal", "close"
         ])
     iteration_df.to_csv(iter_csv, index=False)
+
+    logger.info("CE df rows: %s", len(ce_df))
+    logger.info("PE df rows: %s", len(pe_df))
+    logger.info("CE email rows: %s", len(prepare_option_email_view(ce_df, 'long')))
+    logger.info("PE email rows: %s", len(prepare_option_email_view(pe_df, 'short')))
 
     send_email(long_df, short_df, ce_df, pe_df, [summary_csv, ce_csv, pe_csv, iter_csv])
     logger.info("Completed.")
