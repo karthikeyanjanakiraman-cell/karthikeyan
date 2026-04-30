@@ -746,6 +746,11 @@ def send_direction_email(df: pd.DataFrame, direction: str, attachments: list) ->
 
 
 # â”€â”€â”€ Underlying scan â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+
+
+def load_fno_symbols_from_csvs(root_dir: str = OUTPUT_DIR) -> List[str]:
+    return load_nse_underlyings()
+
 def scan_symbol(symbol: str) -> Optional[Dict]:
     eq       = format_eq_symbol(symbol)
     daily_df = get_history(eq, "D", max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
@@ -763,7 +768,7 @@ def scan_symbol(symbol: str) -> Optional[Dict]:
 def main() -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     init_fyers()
-    symbols = load_fno_symbols_from_csvs(CSV_DIR)
+    symbols = load_nse_underlyings()
     logger.info("Scanning %s symbols from CSVs | MAX_WORKERS=%s", len(symbols), MAX_WORKERS)
 
     rows = []
