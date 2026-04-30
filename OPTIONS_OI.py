@@ -656,26 +656,23 @@ def prepare_option_email_view(df: pd.DataFrame, side: str) -> pd.DataFrame:
 
 
 def simple_table_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
-    html = [f"<p><b>{title}</b></p>"]
+    html = [f"<p style='margin:16px 0 6px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;'><b>{title}</b></p>"]
 
     if df is None or df.empty:
-        html.append("<p>No data found.</p>")
+        html.append("<p style='margin:4px 0 12px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;'>No data found.</p>")
         return "".join(html)
 
     view = df[[c for c in columns if c in df.columns]].copy()
-    html.append(
-        "<table border='1' cellpadding='4' cellspacing='0' "
-        "style='border-collapse:collapse; font-family:Arial,Helvetica,sans-serif; font-size:12px;'>"
-    )
+    html.append("<table style='border-collapse:collapse; font-family:Arial,Helvetica,sans-serif; font-size:12px; color:#000;'>")
     html.append("<tr>")
     for c in view.columns:
-        html.append(f"<th style='text-align:left;'>{c}</th>")
+        html.append(f"<th style='text-align:left; font-weight:bold; padding:0 14px 2px 0; white-space:nowrap; border:none;'>{c}</th>")
     html.append("</tr>")
 
     for _, row in view.iterrows():
         html.append("<tr>")
         for c in view.columns:
-            html.append(f"<td>{format_cell(c, row[c])}</td>")
+            html.append(f"<td style='padding:0 14px 2px 0; white-space:nowrap; vertical-align:top; border:none;'>{format_cell(c, row[c])}</td>")
         html.append("</tr>")
 
     html.append("</table>")
@@ -696,18 +693,16 @@ def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
     ce_view = prepare_option_email_view(ce_df, "long")
     pe_view = prepare_option_email_view(pe_df, "short")
 
-    html = f"""
-    <html>
-    <body style="font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000000;">
-        <p><b>Intraday Vol Iteration Alert</b></p>
-        <p>Scan completed at {scan_time}.</p>
-
-        {simple_table_html(ce_view, OPTION_EMAIL_COLS, "CE Candidates")}
-        <br>
-        {simple_table_html(pe_view, OPTION_EMAIL_COLS, "PE Candidates")}
+    html = f"""<html>
+    <body style="margin:0; padding:0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000; background:#fff;">
+        <div style="padding:0; margin:0;">
+            <p style="margin:0 0 8px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;"><b>Intraday Vol Iteration Alert</b></p>
+            <p style="margin:0 0 14px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;">Scan completed at {scan_time}.</p>
+            {simple_table_html(ce_view, OPTION_EMAIL_COLS, "CE Candidates")}
+            {simple_table_html(pe_view, OPTION_EMAIL_COLS, "PE Candidates")}
+        </div>
     </body>
-    </html>
-    """
+    </html>"""
 
     msg = MIMEMultipart()
     msg["From"] = sender_email
