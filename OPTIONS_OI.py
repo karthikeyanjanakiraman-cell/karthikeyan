@@ -351,6 +351,18 @@ def choose_top_candidates(summary_df: pd.DataFrame, top_n: int = 10) -> Tuple[pd
     short_df = short_df.sort_values(["Rank Delta", "Cumulative ADX", "% Change"], ascending=[True, False, True]).head(top_n)
     return long_df.reset_index(drop=True), short_df.reset_index(drop=True)
 
+def debug_nifty_optionchain():
+    if fyers is None:
+        init_fyers()
+    for sym in ["NSE:NIFTY50-INDEX", "NSE:NIFTY-INDEX"]:
+        try:
+            q = fyers.quotes({"symbols": sym})
+            print("QUOTE", sym, q)
+            res = fyers.optionchain(data={"symbol": sym, "strikecount": 50})
+            print("OPTIONCHAIN", sym, type(res), res)
+        except Exception as e:
+            print("ERROR", sym, e)
+
 def fetch_raw_option_chain(symbol: str) -> pd.DataFrame:
     if fyers is None:
         return pd.DataFrame()
