@@ -823,6 +823,21 @@ def scan_symbol(symbol: str) -> Optional[Dict]:
     return summary
 
 
+
+def scan_symbols_parallel(symbols: List[str]) -> List[Dict]:
+    rows = []
+    with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
+        futures = {ex.submit(scansymbol, symbol): symbol for symbol in symbols}
+        for fut in as_completed(futures):
+            symbol = futures[fut]
+            try:
+                row = fut.result()
+                if row:
+                    rows.append(row)
+            except Exception as e:
+                logger.exception("Scan failed for %s: %s", symbol, e)
+    return rows
+
 def main() -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     init_fyers()
