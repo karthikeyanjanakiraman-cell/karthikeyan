@@ -164,8 +164,8 @@ def compute_today_obv(df: pd.DataFrame) -> float:
     return compute_obv(d)
 
 
-def compute_ivp(history_df: pd.DataFrame) -> Tuple[float, str]:
-    if history_df is None or history_df.empty or len(history_df) < 30:
+def compute_ivp(history_df: pd.DataFrame, min_bars: int = 10) -> Tuple[float, str]:
+    if history_df is None or history_df.empty or len(history_df) < min_bars:
         return np.nan, "Neutral Vol"
     close = pd.to_numeric(history_df["close"], errors="coerce")
     high = pd.to_numeric(history_df["high"], errors="coerce")
@@ -381,7 +381,6 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
         run = run + 1 if flag else 0
         streak.append(run)
     streak = pd.Series(streak, index=df.index)
-
     lead_status = pd.Series(
         np.select(
             [price_lead_flag & (streak >= 3), price_lead_flag & (streak >= 2), price_lead_flag],
@@ -430,7 +429,7 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
         bear += 2
 
     rank_delta = bull - bear
-    ivp, vol_state = compute_ivp(reference_df)
+    ivp, vol_state = compute_ivp(reference_df, min_bars=10)
     last_ts = pd.to_datetime(df["timestamp"].iloc[-1])
 
     return {
@@ -547,7 +546,7 @@ def get_today_stats(df: pd.DataFrame) -> dict:
     if d.empty:
         return {"OI": 0, "Volume": 0, "OBV": 0}
     return {
-        "OI": d["oi"].iloc[-1] if "oi" in d.columns else 0,
+        "OI": 0,
         "Volume": d["volume"].sum(),
         "OBV": compute_obv(d),
     }
@@ -569,7 +568,7 @@ def get_prev_day_stats(df: pd.DataFrame) -> dict:
     if d.empty:
         return {"OI": 0, "Volume": 0, "OBV": 0}
     return {
-        "OI": d["oi"].iloc[-1] if "oi" in d.columns else 0,
+        "OI": 0,
         "Volume": d["volume"].sum(),
         "OBV": compute_obv(d),
     }
@@ -582,9 +581,6 @@ def scan_single_option(option_symbol: str, option_type: str, strike: float, unde
     if daily_df.empty or intra_df.empty:
         return None
 
-    today_stats = get_today_stats(intra_df)
-    prev_stats = get_prev_day_stats(intra_df)
-
     summary = summarize_intraday(intra_df, daily_df)
     if not summary:
         return None
@@ -594,12 +590,12 @@ def scan_single_option(option_symbol: str, option_type: str, strike: float, unde
         "Option Type": option_type,
         "Option Symbol": option_symbol,
         "Strike": strike,
-        "OBV": today_stats["OBV"],
-        "OI": today_stats["OI"],
-        "Volume": today_stats["Volume"],
-        "OI_Delta": today_stats["OI"] - prev_stats["OI"],
-        "Vol_Delta": today_stats["Volume"] - prev_stats["Volume"],
-        "OBV_Delta": today_stats["OBV"] - prev_stats["OBV"],
+        "OBV": compute_today_obv(intra_df),
+        "OI": np.nan,
+        "Volume": intra_df["volume"].sum() if "volume" in intra_df.columns else 0,
+        "OI_Delta": np.nan,
+        "Vol_Delta": np.nan,
+        "OBV_Delta": np.nan,
     })
     return summary
 
@@ -636,8 +632,12 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
                 if not scanned:
                     continue
 
-                scanned["Chain_OI"] = row.get(f"{opt_type} OI", 0)
-                scanned["Chain_Volume"] = row.get(f"{opt_type} Volume", 0)
+                chain_oi = safe_float(row.get(f"{opt_type} OI", 0), 0)
+                chain_volume = safe_float(row.get(f"{opt_type} Volume", 0), 0)
+
+                scanned["OI"] = chain_oi
+                scanned["Chain_OI"] = chain_oi
+                scanned["Chain_Volume"] = chain_volume
 
                 scanned["OI+Volume+OBV Score"] = option_liquidity_score(
                     scanned["OI"], scanned["Volume"], scanned["OBV"]
@@ -683,14 +683,10 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
     if iter_rows and not final_out.empty:
         all_iters = pd.concat(iter_rows, ignore_index=True)
         all_iters = all_iters[all_iters["Option Symbol"].isin(final_out["Option Symbol"])].copy()
-        all_iters = all_iters.sort_values(
-            ["Underlying", "Strike", "Option Symbol", "iteration"]
-        ).reset_index(drop=True)
+        all_iters = all_iters.sort_values(["Underlying", "Strike", "Option Symbol", "iteration"]).reset_index(drop=True)
 
         if not all_iters.empty:
-            all_iters["iteration"] = all_iters.groupby(
-                ["Underlying", "Strike", "Option Symbol"]
-            ).cumcount() + 1
+            all_iters["iteration"] = all_iters.groupby(["Underlying", "Strike", "Option Symbol"]).cumcount() + 1
             all_iters["iteration"] = pd.to_numeric(all_iters["iteration"], errors="coerce").astype("Int64")
             all_iters = all_iters[all_iters["iteration"].between(1, ITERATIONS_TO_KEEP)]
             iter_df = all_iters.reset_index(drop=True)
