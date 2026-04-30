@@ -558,6 +558,89 @@ def colored_table_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html.append("</table></div>")
     return "".join(html)
 
+def _cell_bg(col: str, value: str) -> str:
+    v = str(value).strip().upper()
+    if col == "% Change":
+        try:
+            num = float(str(value).replace('%', '').strip())
+        except Exception:
+            return '#2d3651'
+        if num > 0: return '#2e7d32'
+        if num < 0: return '#c62828'
+        return '#546e7a'
+    if col in {"5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal", "Bull_Signal", "Bear_Signal", "Overall_Signal"}:
+        if "LONG++" in v or "BUY++" in v: return '#2e7d32'
+        if "LONG+" in v or "BUY+" in v: return '#388e3c'
+        if v in {"LONG", "BUY"}: return '#43a047'
+        if "SHORT++" in v or "SELL++" in v: return '#c62828'
+        if "SHORT+" in v or "SELL+" in v: return '#d32f2f'
+        if v in {"SHORT", "SELL"}: return '#e53935'
+        if "NEUTRAL" in v: return '#6b7280'
+    if col == "Volatility State":
+        if "AVOID BUY PREMIUM" in v: return '#fbc02d'
+        if "BUYER ZONE" in v: return '#9ccc65'
+        return '#546e7a'
+    if col == "Price_Lead_Status":
+        if "EARLY_PRICE_LEAD" in v: return '#00897b'
+        if "FADE" in v: return '#8e24aa'
+        return '#2d3651'
+    return '#2d3651'
+
+
+def _text_color(bg: str) -> str:
+    return '#111111' if bg.lower() in {'#fbc02d', '#9ccc65'} else '#ffffff'
+
+
+def format_cell(col: str, val) -> str:
+    if pd.isna(val): return ""
+    if col == "% Change": return f"{float(val):.2f}%"
+    if isinstance(val, (int, float, np.integer, np.floating)): return f"{float(val):.2f}"
+    return str(val)
+
+
+def colored_table_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
+    html = ["<div style='margin:0 0 12px 0;'>", f"<div style='margin:10px 0 4px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;'><b>{title}</b></div>"]
+    if df is None or df.empty:
+        html.append("<div style='font-family:Arial,Helvetica,sans-serif; font-size:12px; color:#000;'>No data found.</div></div>")
+        return "".join(html)
+    view = df[[c for c in columns if c in df.columns]].copy()
+    html.append("<table cellpadding='0' cellspacing='1' style='border-collapse:separate; border-spacing:1px; background:#ffffff; font-family:Arial,Helvetica,sans-serif; font-size:10px;'>")
+    html.append("<tr>")
+    for c in view.columns:
+        html.append(f"<th style='background:#2f3b59; color:#ffffff; text-align:center; font-weight:bold; padding:5px 6px; white-space:nowrap; border:none;'>{c}</th>")
+    html.append("</tr>")
+    for _, row in view.iterrows():
+        html.append("<tr>")
+        for c in view.columns:
+            cell_val = format_cell(c, row[c])
+            bg = _cell_bg(c, cell_val)
+            fg = _text_color(bg)
+            html.append(f"<td style='background:{bg}; color:{fg}; text-align:center; padding:4px 6px; white-space:nowrap; border:none;'>{cell_val}</td>")
+        html.append("</tr>")
+    html.append("</table></div>")
+    return "".join(html)
+
+
+def prepare_option_email_view(df: pd.DataFrame, side: str) -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=OPTION_EMAIL_COLS)
+    out = df.copy()
+    if "LTP" in out.columns:
+        out = out[pd.to_numeric(out["LTP"], errors="coerce") >= MIN_OPTION_LTP].copy()
+    if "OBV" in out.columns:
+        obv = pd.to_numeric(out["OBV"], errors="coerce")
+        out = out[obv > 0].copy() if side == "long" else out[obv < 0].copy()
+    out = apply_display_labels(out, side)
+    timing_cols = [c for c in ["5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal"] if c in out.columns]
+    if timing_cols:
+        neutral_like = {"", "-", "NEUTRAL", "NAN", "NONE"}
+        mask = ~out[timing_cols].apply(lambda row: any(str(v).strip().upper() in neutral_like for v in row), axis=1)
+        out = out[mask].copy()
+    if "Overall_Signal" in out.columns:
+        out["Overall_Signal"] = "LONG++" if side == "long" else "SHORT++"
+    final_cols = [c for c in OPTION_EMAIL_COLS if c in out.columns]
+    return out[final_cols].reset_index(drop=True)
+
 
 def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
     sender_email = os.environ.get("SENDER_EMAIL")
