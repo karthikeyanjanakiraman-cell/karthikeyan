@@ -28,7 +28,7 @@ INTRADAY_LOOKBACK_DAYS = 20
 IVP_LOOKBACK_DAYS     = 252
 OPTION_PAIRS_TO_KEEP  = 5
 ITERATIONS_TO_KEEP    = 75
-SECTORS_DIR           = os.environ.get("SECTORS_DIR", "sectors")
+CSV_DIR               = os.environ.get("CSV_DIR", "sectors")
 OUTPUT_DIR            = os.environ.get("OUTPUT_DIR", ".")
 MIN_OPTION_LTP        = 10.0
 EMAIL_MAX_ROWS_LONG   = int(os.environ.get("EMAIL_MAX_ROWS_LONG",  "14"))
@@ -87,7 +87,7 @@ def safe_series(frame: pd.DataFrame, col: str, default: float = 0.0) -> pd.Serie
 
 
 # â”€â”€â”€ Sector / symbol loading â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-def discover_sector_csvs(root_dir: str = SECTORS_DIR) -> List[str]:
+def discover_csvs(root_dir: str = CSV_DIR) -> List[str]:
     if not os.path.isdir(root_dir):
         return []
     paths = []
@@ -98,9 +98,9 @@ def discover_sector_csvs(root_dir: str = SECTORS_DIR) -> List[str]:
     return sorted(set(paths))
 
 
-def load_fno_symbols_from_sectors(root_dir: str = SECTORS_DIR) -> List[str]:
+def load_fno_symbols_from_csvs(root_dir: str = CSV_DIR) -> List[str]:
     symbols = set()
-    for path in discover_sector_csvs(root_dir):
+    for path in discover_csvs(root_dir):
         try:
             df = pd.read_csv(path)
         except Exception:
@@ -776,8 +776,8 @@ def scan_symbol(symbol: str) -> Optional[Dict]:
 def main() -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     init_fyers()
-    symbols = load_fno_symbols_from_sectors(SECTORS_DIR)
-    logger.info("Scanning %s symbols | MAX_WORKERS=%s", len(symbols), MAX_WORKERS)
+    symbols = load_fno_symbols_from_csvs(CSV_DIR)
+    logger.info("Scanning %s symbols from CSVs | MAX_WORKERS=%s", len(symbols), MAX_WORKERS)
 
     rows = []
     with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
