@@ -496,14 +496,19 @@ def scan_single_option(option_symbol: str, option_type: str,
     summary = summarize_intraday(intra_df, daily_df)
     if not summary:
         return None
+    obv_val = compute_today_obv(intra_df)
+    if pd.isna(obv_val):
+        obv_val = 0.0
     summary.update({
         "Underlying":   underlying,
         "Option Type":  option_type,
         "Option Symbol":option_symbol,
         "Strike":       strike,
-        "OBV":          compute_today_obv(intra_df),
+        "OBV":          obv_val,
         "OI":           np.nan,
         "Volume":       float(intra_df["volume"].sum()) if "volume" in intra_df.columns else 0.0,
+        "IVP":          float(summary.get("IVP", 0.0)) if pd.notna(summary.get("IVP", np.nan)) else 0.0,
+        "Volatility State": summary.get("Volatility State", "Neutral Vol") or "Neutral Vol",
     })
     return summary
 
@@ -521,15 +526,21 @@ def rank_option_candidates(df: pd.DataFrame, side: str) -> pd.DataFrame:
         return df
     out = df.copy()
     liq = safe_series(out, "OI+Volume+OBV Score", 0)
-    rd  = safe_series(out, "Rank Delta",   0)
+    rd  = safe_series(out, "Rank Delta", 0)
     adx = safe_series(out, "Cumulative ADX", 0)
-    pct = safe_series(out, "% Change",     0)
+    pct = safe_series(out, "% Change", 0)
+    out["EMAIL_RANK_SCORE"] = liq * 0.40 + rd * 0.30 + adx * 0.18 + pct * 0.12
     if side == "long":
-        out["EMAIL_RANK_SCORE"] = liq * 0.40 + rd * 0.30 + adx * 0.18 + pct * 0.12
+        out = out[out["EMAIL_RANK_SCORE"] > 0].copy()
+        out = out[out["Rank Delta"] >= 0].copy()
+        out = out[out["Overall_Signal"].astype(str).str.upper().str.contains("BUY|LONG", na=False)].copy()
         out = out.sort_values(["EMAIL_RANK_SCORE","OI+Volume+OBV Score","Rank Delta","Cumulative ADX","% Change"],
                               ascending=[False,False,False,False,False])
     else:
         out["EMAIL_RANK_SCORE"] = liq * 0.40 + (-rd) * 0.30 + adx * 0.18 + (-pct) * 0.12
+        out = out[out["EMAIL_RANK_SCORE"] > 0].copy()
+        out = out[out["Rank Delta"] <= 0].copy()
+        out = out[out["Overall_Signal"].astype(str).str.upper().str.contains("SELL|SHORT", na=False)].copy()
         out = out.sort_values(["EMAIL_RANK_SCORE","OI+Volume+OBV Score","Rank Delta","Cumulative ADX","% Change"],
                               ascending=[False,False,True,False,True])
     return out.reset_index(drop=True)
@@ -597,9 +608,11 @@ def build_option_candidates(candidates_df: pd.DataFrame,
         return pd.DataFrame(), pd.DataFrame()
     out = pd.DataFrame(rows)
     out = rank_option_candidates(out, side)
+    if out.empty:
+        return pd.DataFrame(), pd.DataFrame()
     rd  = safe_series(out, "Rank Delta", 0)
     pct = safe_series(out, "% Change",  0)
-    out = out[(rd > 0) | (pct > 0)].copy() if side == "long" else out[(rd < 0) | (pct < 0)].copy()
+    out = out[(rd > 0) & (pct >= 0)].copy() if side == "long" else out[(rd < 0) & (pct <= 0)].copy()
     final_cols = [c for c in OPTION_EMAIL_COLS if c in out.columns]
     final_out  = out[final_cols].reset_index(drop=True)
 
@@ -680,6 +693,8 @@ def prepare_option_email_view(df: pd.DataFrame, side: str, max_rows: int) -> pd.
         out = out[pd.to_numeric(out["LTP"], errors="coerce") >= MIN_OPTION_LTP].copy()
     out = apply_display_labels(out, side)
     out = rank_option_candidates(out, side)
+    if out.empty:
+        return pd.DataFrame(), pd.DataFrame()
     final_cols = [c for c in OPTION_EMAIL_COLS if c in out.columns]
     return out[final_cols].head(max_rows).reset_index(drop=True)
 
