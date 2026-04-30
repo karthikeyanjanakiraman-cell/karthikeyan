@@ -383,6 +383,40 @@ def choose_top_candidates(summary_df: pd.DataFrame, top_n: int = 10) -> Tuple[pd
     short_df = short_df.sort_values(["Rank Delta", "Cumulative ADX", "% Change"], ascending=[True, False, True]).head(top_n)
     return long_df.reset_index(drop=True), short_df.reset_index(drop=True)
 
+def fetch_raw_option_chain(symbol: str) -> pd.DataFrame:
+    if fyers is None:
+        return pd.DataFrame()
+    symu = str(symbol).strip().upper()
+    if symu in {"NIFTY", "NIFTY50", "NIFTY 50", "NSE:NIFTY", "NSE:NIFTY50-INDEX"}:
+        eq_symbol = "NSE:NIFTY50-INDEX"
+    elif symu in {"BANKNIFTY", "NIFTY BANK", "BANK NIFTY", "NSE:BANKNIFTY", "NSE:NIFTYBANK-INDEX"}:
+        eq_symbol = "NSE:NIFTYBANK-INDEX"
+    elif symu.startswith("NSE:") and symu.endswith("-INDEX"):
+        eq_symbol = symu
+    else:
+        eq_symbol = format_eq_symbol(symbol)
+    try:
+        quote = fyers.quotes({"symbols": eq_symbol})
+        ltp = safe_float(quote.get("d", [{}])[0].get("v", {}).get("lp"), np.nan)
+        chain_res = fyers.optionchain(data={"symbol": eq_symbol, "strikecount": 50})
+    except Exception:
+        return pd.DataFrame()
+    chain = ((chain_res or {}).get("data") or {}).get("optionsChain", [])
+    rows = []
+    for item in chain or []:
+        rows.append({
+            "Underlying": symu,
+            "EqSymbol": eq_symbol,
+            "UnderlyingLTP": ltp,
+            "Strike": safe_float(item.get("strike_price") or item.get("strike"), np.nan),
+            "Option Type": str(item.get("option_type") or item.get("type") or "").upper(),
+            "Option Symbol": str(item.get("symbol", "")),
+            "LTP": safe_float(item.get("ltp") or item.get("lp"), np.nan),
+            "OI": safe_float(item.get("oi") or item.get("open_interest"), np.nan),
+            "Volume": safe_float(item.get("volume"), np.nan),
+        })
+    return pd.DataFrame(rows)
+
 def nearest_step(value: float) -> int:
     val = abs(safe_float(value, 0))
     if val >= 20000: return 100
@@ -395,8 +429,13 @@ def nearest_step(value: float) -> int:
 def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> pd.DataFrame:
     if fyers is None:
         return pd.DataFrame()
-    if symbol.startswith("NSE:") and symbol.endswith("-INDEX"):
-        eq_symbol = symbol
+    symu = str(symbol).strip().upper()
+    if symu in {"NIFTY", "NIFTY50", "NIFTY 50", "NSE:NIFTY", "NSE:NIFTY50-INDEX"}:
+        eq_symbol = "NSE:NIFTY50-INDEX"
+    elif symu in {"BANKNIFTY", "NIFTY BANK", "BANK NIFTY", "NSE:BANKNIFTY", "NSE:NIFTYBANK-INDEX"}:
+        eq_symbol = "NSE:NIFTYBANK-INDEX"
+    elif symu.startswith("NSE:") and symu.endswith("-INDEX"):
+        eq_symbol = symu
     else:
         eq_symbol = format_eq_symbol(symbol)
     try:
@@ -536,28 +575,6 @@ def format_cell(col: str, val) -> str:
         return f"{float(val):.2f}"
     return str(val)
 
-def colored_table_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
-    html = ["<div style='margin:0 0 12px 0;'>", f"<div style='margin:10px 0 4px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;'><b>{title}</b></div>"]
-    if df is None or df.empty:
-        html.append("<div style='font-family:Arial,Helvetica,sans-serif; font-size:12px; color:#000;'>No data found.</div></div>")
-        return "".join(html)
-    view = df[[c for c in columns if c in df.columns]].copy()
-    html.append("<table cellpadding='0' cellspacing='1' style='border-collapse:separate; border-spacing:1px; background:#ffffff; font-family:Arial,Helvetica,sans-serif; font-size:10px;'>")
-    html.append("<tr>")
-    for c in view.columns:
-        html.append(f"<th style='background:#2f3b59; color:#ffffff; text-align:center; font-weight:bold; padding:5px 6px; white-space:nowrap; border:none;'>{c}</th>")
-    html.append("</tr>")
-    for _, row in view.iterrows():
-        html.append("<tr>")
-        for c in view.columns:
-            cell_val = format_cell(c, row[c])
-            bg = _cell_bg(c, cell_val)
-            fg = _text_color(bg)
-            html.append(f"<td style='background:{bg}; color:{fg}; text-align:center; padding:4px 6px; white-space:nowrap; border:none;'>{cell_val}</td>")
-        html.append("</tr>")
-    html.append("</table></div>")
-    return "".join(html)
-
 def _cell_bg(col: str, value: str) -> str:
     v = str(value).strip().upper()
     if col == "% Change":
@@ -565,38 +582,42 @@ def _cell_bg(col: str, value: str) -> str:
             num = float(str(value).replace('%', '').strip())
         except Exception:
             return '#2d3651'
-        if num > 0: return '#2e7d32'
-        if num < 0: return '#c62828'
+        if num > 0:
+            return '#2e7d32'
+        if num < 0:
+            return '#c62828'
         return '#546e7a'
     if col in {"5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal", "Bull_Signal", "Bear_Signal", "Overall_Signal"}:
-        if "LONG++" in v or "BUY++" in v: return '#2e7d32'
-        if "LONG+" in v or "BUY+" in v: return '#388e3c'
-        if v in {"LONG", "BUY"}: return '#43a047'
-        if "SHORT++" in v or "SELL++" in v: return '#c62828'
-        if "SHORT+" in v or "SELL+" in v: return '#d32f2f'
-        if v in {"SHORT", "SELL"}: return '#e53935'
-        if "NEUTRAL" in v: return '#6b7280'
+        if "LONG++" in v or "BUY++" in v:
+            return '#2e7d32'
+        if "LONG+" in v or "BUY+" in v:
+            return '#388e3c'
+        if v in {"LONG", "BUY"}:
+            return '#43a047'
+        if "SHORT++" in v or "SELL++" in v:
+            return '#c62828'
+        if "SHORT+" in v or "SELL+" in v:
+            return '#d32f2f'
+        if v in {"SHORT", "SELL"}:
+            return '#e53935'
+        if "NEUTRAL" in v:
+            return '#6b7280'
     if col == "Volatility State":
-        if "AVOID BUY PREMIUM" in v: return '#fbc02d'
-        if "BUYER ZONE" in v: return '#9ccc65'
+        if "AVOID BUY PREMIUM" in v:
+            return '#fbc02d'
+        if "BUYER ZONE" in v:
+            return '#9ccc65'
         return '#546e7a'
     if col == "Price_Lead_Status":
-        if "EARLY_PRICE_LEAD" in v: return '#00897b'
-        if "FADE" in v: return '#8e24aa'
+        if "EARLY_PRICE_LEAD" in v:
+            return '#00897b'
+        if "FADE" in v:
+            return '#8e24aa'
         return '#2d3651'
     return '#2d3651'
 
-
 def _text_color(bg: str) -> str:
     return '#111111' if bg.lower() in {'#fbc02d', '#9ccc65'} else '#ffffff'
-
-
-def format_cell(col: str, val) -> str:
-    if pd.isna(val): return ""
-    if col == "% Change": return f"{float(val):.2f}%"
-    if isinstance(val, (int, float, np.integer, np.floating)): return f"{float(val):.2f}"
-    return str(val)
-
 
 def colored_table_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html = ["<div style='margin:0 0 12px 0;'>", f"<div style='margin:10px 0 4px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;'><b>{title}</b></div>"]
@@ -619,7 +640,6 @@ def colored_table_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
         html.append("</tr>")
     html.append("</table></div>")
     return "".join(html)
-
 
 def prepare_option_email_view(df: pd.DataFrame, side: str) -> pd.DataFrame:
     if df is None or df.empty:
@@ -641,7 +661,6 @@ def prepare_option_email_view(df: pd.DataFrame, side: str) -> pd.DataFrame:
     final_cols = [c for c in OPTION_EMAIL_COLS if c in out.columns]
     return out[final_cols].reset_index(drop=True)
 
-
 def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
     sender_email = os.environ.get("SENDER_EMAIL")
     recipient_email = os.environ.get("RECIPIENT_EMAIL")
@@ -655,29 +674,25 @@ def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
     buy_view = prepare_option_email_view(ce_df, "long")
     short_view = prepare_option_email_view(pe_df, "short")
 
-    html_parts = [
+    html = "".join([
         "<html>",
         '<body style="margin:0; padding:8px; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000; background:#ffffff;">',
         '<div style="margin:0 0 6px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;"><b>Intraday Vol Iteration Alert</b></div>',
-        '<div style="margin:0 0 10px 0; font-family:Arial,Helvetica,sans-serif; font-size:12px; color:#000;">Scan completed at ',
-        scan_time,
-        '.</div>',
+        f'<div style="margin:0 0 10px 0; font-family:Arial,Helvetica,sans-serif; font-size:12px; color:#000;">Scan completed at {scan_time}.</div>',
         colored_table_html(buy_view, OPTION_EMAIL_COLS, "Buy Candidates"),
         colored_table_html(short_view, OPTION_EMAIL_COLS, "Short Candidates"),
         "</body>",
         "</html>",
-    ]
-    html = "".join(html_parts)
+    ])
 
-    text_parts = [
+    text = chr(10).join([
         "Intraday Vol Iteration Alert",
         "Scan completed at " + scan_time + ".",
         "",
         "Buy Candidates: " + str(len(buy_view) if buy_view is not None else 0),
         "Short Candidates: " + str(len(short_view) if short_view is not None else 0),
         "",
-    ]
-    text = chr(10).join(text_parts)
+    ])
 
     msg = EmailMessage()
     msg["From"] = sender_email
@@ -703,6 +718,19 @@ def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
         logger.exception("Email send failed: %s", e)
         return False
 
+def scan_single_option(option_symbol: str, option_type: str, strike: float, underlying: str) -> Optional[Dict]:
+    hist_symbol = option_symbol if option_symbol.startswith("NSE:") else f"NSE:{option_symbol}"
+    daily_df = get_history(hist_symbol, "D", max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
+    intra_df = get_history(hist_symbol, "5", INTRADAY_LOOKBACK_DAYS)
+    if daily_df.empty or intra_df.empty:
+        return None
+    today_stats = get_today_stats(intra_df)
+    prev_stats = get_prev_day_stats(intra_df)
+    summary = summarize_intraday(intra_df, daily_df)
+    if not summary:
+        return None
+    summary.update({"Underlying": underlying, "Option Type": option_type, "Option Symbol": option_symbol, "Strike": strike, "OBV": today_stats["OBV"], "OI": today_stats["OI"], "Volume": today_stats["Volume"], "OI_Delta": today_stats["OI"] - prev_stats["OI"], "Vol_Delta": today_stats["Volume"] - prev_stats["Volume"], "OBV_Delta": today_stats["OBV"] - prev_stats["OBV"]})
+    return summary
 
 def scan_symbol(symbol: str) -> Optional[Dict]:
     hist_symbol = symbol if (symbol.startswith("NSE:") and symbol.endswith("-INDEX")) else format_eq_symbol(symbol)
@@ -731,10 +759,30 @@ def main() -> None:
         raise RuntimeError("No symbols returned usable market data.")
     summary_df = summary_df.sort_values(["Rank Delta", "% Change"], ascending=[False, False]).reset_index(drop=True)
     long_df, short_df = choose_top_candidates(summary_df, top_n=60)
-    ce_df, ce_iter_df = build_option_candidates(long_df, side="long")
-    pe_df, pe_iter_df = build_option_candidates(short_df, side="short")
-    iteration_df = pd.concat([ce_iter_df, pe_iter_df], ignore_index=True) if not ce_iter_df.empty or not pe_iter_df.empty else pd.DataFrame()
+
     timestamp = datetime.now().strftime("%Y%m%d_%H%M")
+    nifty_option_csv = os.path.join(OUTPUT_DIR, f"nifty_option_chain_{timestamp}.csv")
+    banknifty_option_csv = os.path.join(OUTPUT_DIR, f"banknifty_option_chain_{timestamp}.csv")
+
+    raw_nifty = fetch_raw_option_chain("NIFTY50")
+    raw_banknifty = fetch_raw_option_chain("BANKNIFTY")
+    raw_nifty.to_csv(nifty_option_csv, index=False)
+    raw_banknifty.to_csv(banknifty_option_csv, index=False)
+
+    nifty_df = pd.DataFrame({"Symbol": ["NIFTY50-INDEX"]})
+    banknifty_df = pd.DataFrame({"Symbol": ["BANKNIFTY-INDEX"]})
+
+    ce_df_a, ce_iter_df_a = build_option_candidates(nifty_df, side="long")
+    pe_df_a, pe_iter_df_a = build_option_candidates(nifty_df, side="short")
+    ce_df_b, ce_iter_df_b = build_option_candidates(banknifty_df, side="long")
+    pe_df_b, pe_iter_df_b = build_option_candidates(banknifty_df, side="short")
+
+    ce_df = pd.concat([ce_df_a, ce_df_b], ignore_index=True) if not ce_df_a.empty or not ce_df_b.empty else pd.DataFrame()
+    pe_df = pd.concat([pe_df_a, pe_df_b], ignore_index=True) if not pe_df_a.empty or not pe_df_b.empty else pd.DataFrame()
+    ce_iter_df = pd.concat([ce_iter_df_a, ce_iter_df_b], ignore_index=True) if not ce_iter_df_a.empty or not ce_iter_df_b.empty else pd.DataFrame()
+    pe_iter_df = pd.concat([pe_iter_df_a, pe_iter_df_b], ignore_index=True) if not pe_iter_df_a.empty or not pe_iter_df_b.empty else pd.DataFrame()
+
+    iteration_df = pd.concat([ce_iter_df, pe_iter_df], ignore_index=True) if not ce_iter_df.empty or not pe_iter_df.empty else pd.DataFrame()
     summary_csv = os.path.join(OUTPUT_DIR, f"fo_summary_{timestamp}.csv")
     ce_csv = os.path.join(OUTPUT_DIR, f"fo_ce_candidates_{timestamp}.csv")
     pe_csv = os.path.join(OUTPUT_DIR, f"fo_pe_candidates_{timestamp}.csv")
@@ -745,7 +793,7 @@ def main() -> None:
     if iteration_df.empty:
         iteration_df = pd.DataFrame(columns=["iteration", "Underlying", "Strike", "Strike Name", "Option Symbol", "timestamp", "window_minutes", "window_start", "window_end", "current_window_score", "previous_trading_day_same_time_score", "window_delta", "window_signal", "close"])
     iteration_df.to_csv(iter_csv, index=False)
-    send_email(long_df, short_df, ce_df, pe_df, [summary_csv, ce_csv, pe_csv, iter_csv])
+    send_email(long_df, short_df, ce_df, pe_df, [summary_csv, ce_csv, pe_csv, iter_csv, nifty_option_csv, banknifty_option_csv])
     logger.info("Completed.")
     logger.info("Iteration rows: %s", len(iteration_df))
     logger.info("Iteration CSV: %s", iter_csv)
