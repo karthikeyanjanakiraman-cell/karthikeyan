@@ -601,8 +601,9 @@ def colored_table_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
             html.append(f"<td style='background:{bg}; color:{fg}; text-align:center; padding:4px 6px; white-space:nowrap; border:none;'>{cell_val}</td>")
         html.append("</tr>")
     html.append("</table></div>")
-    return ''.join(html)
-    
+    return ''.join(html)    
+
+
 def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
     sender_email = os.environ.get("SENDER_EMAIL")
     recipient_email = os.environ.get("RECIPIENT_EMAIL")
@@ -616,26 +617,26 @@ def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
     buy_view = prepare_option_email_view(ce_df, "long")
     short_view = prepare_option_email_view(pe_df, "short")
 
-    html = f"""<html>
-    <body style="margin:0; padding:8px; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000; background:#ffffff;">
-        <div style="margin:0 0 6px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;"><b>Intraday Vol Iteration Alert</b></div>
-        <div style="margin:0 0 10px 0; font-family:Arial,Helvetica,sans-serif; font-size:12px; color:#000;">Scan completed at {scan_time}.</div>
-        {colored_table_html(buy_view, OPTION_EMAIL_COLS, "Buy Candidates")}
-        {colored_table_html(short_view, OPTION_EMAIL_COLS, "Short Candidates")}
-    </body>
-    </html>"""
+    html = "".join([
+        "<html>",
+        '<body style="margin:0; padding:8px; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000; background:#ffffff;">',
+        '<div style="margin:0 0 6px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;"><b>Intraday Vol Iteration Alert</b></div>',
+        f'<div style="margin:0 0 10px 0; font-family:Arial,Helvetica,sans-serif; font-size:12px; color:#000;">Scan completed at {scan_time}.</div>',
+        colored_table_html(buy_view, OPTION_EMAIL_COLS, "Buy Candidates"),
+        colored_table_html(short_view, OPTION_EMAIL_COLS, "Short Candidates"),
+        "</body>",
+        "</html>",
+    ])
 
-    text = (
-        "Intraday Vol Iteration Alert
-"
-        f"Scan completed at {scan_time}.
-
-"
-        f"Buy Candidates: {len(buy_view) if buy_view is not None else 0}
-"
-        f"Short Candidates: {len(short_view) if short_view is not None else 0}
-"
-    )
+    text = "
+".join([
+        "Intraday Vol Iteration Alert",
+        f"Scan completed at {scan_time}.",
+        "",
+        f"Buy Candidates: {len(buy_view) if buy_view is not None else 0}",
+        f"Short Candidates: {len(short_view) if short_view is not None else 0}",
+        "",
+    ])
 
     msg = EmailMessage()
     msg["From"] = sender_email
@@ -665,7 +666,6 @@ def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
     except Exception as e:
         logger.exception("Email send failed: %s", e)
         return False
-
 
 def scan_symbol(symbol: str) -> Optional[Dict]:
     hist_symbol = symbol if (symbol.startswith("NSE:") and symbol.endswith("-INDEX")) else format_eq_symbol(symbol)
