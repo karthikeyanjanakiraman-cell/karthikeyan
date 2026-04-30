@@ -558,6 +558,7 @@ def colored_table_html(df: pd.DataFrame, columns: List[str], title: str) -> str:
     html.append("</table></div>")
     return "".join(html)
 
+
 def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
     sender_email = os.environ.get("SENDER_EMAIL")
     recipient_email = os.environ.get("RECIPIENT_EMAIL")
@@ -565,41 +566,50 @@ def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
     if not sender_email or not recipient_email or not sender_password:
         logger.error("Missing email credentials.")
         return False
+
     subject_time = datetime.now().strftime("%d %b %H:%M")
     scan_time = datetime.now().strftime("%d %b %Y, %H:%M")
     buy_view = prepare_option_email_view(ce_df, "long")
     short_view = prepare_option_email_view(pe_df, "short")
-    html = "".join([
+
+    html_parts = [
         "<html>",
         '<body style="margin:0; padding:8px; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000; background:#ffffff;">',
         '<div style="margin:0 0 6px 0; font-family:Arial,Helvetica,sans-serif; font-size:13px; color:#000;"><b>Intraday Vol Iteration Alert</b></div>',
-        f'<div style="margin:0 0 10px 0; font-family:Arial,Helvetica,sans-serif; font-size:12px; color:#000;">Scan completed at {scan_time}.</div>',
+        '<div style="margin:0 0 10px 0; font-family:Arial,Helvetica,sans-serif; font-size:12px; color:#000;">Scan completed at ',
+        scan_time,
+        '.</div>',
         colored_table_html(buy_view, OPTION_EMAIL_COLS, "Buy Candidates"),
         colored_table_html(short_view, OPTION_EMAIL_COLS, "Short Candidates"),
         "</body>",
         "</html>",
-    ])
-    text = "
-".join([
+    ]
+    html = "".join(html_parts)
+
+    text_parts = [
         "Intraday Vol Iteration Alert",
-        f"Scan completed at {scan_time}.",
+        "Scan completed at " + scan_time + ".",
         "",
-        f"Buy Candidates: {len(buy_view) if buy_view is not None else 0}",
-        f"Short Candidates: {len(short_view) if short_view is not None else 0}",
+        "Buy Candidates: " + str(len(buy_view) if buy_view is not None else 0),
+        "Short Candidates: " + str(len(short_view) if short_view is not None else 0),
         "",
-    ])
+    ]
+    text = chr(10).join(text_parts)
+
     msg = EmailMessage()
     msg["From"] = sender_email
     msg["To"] = recipient_email
     msg["Subject"] = f"Intraday Vol Iteration Alert - {subject_time}"
     msg.set_content(text)
     msg.add_alternative(html, subtype="html")
+
     for path in attachments or []:
         if not path or not os.path.exists(path):
             continue
         with open(path, "rb") as f:
             data = f.read()
         msg.add_attachment(data, maintype="application", subtype="octet-stream", filename=os.path.basename(path))
+
     try:
         smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
         with smtplib.SMTP_SSL(smtp_host, 465, timeout=40) as s:
@@ -609,6 +619,7 @@ def send_email(long_df, short_df, ce_df, pe_df, attachments) -> bool:
     except Exception as e:
         logger.exception("Email send failed: %s", e)
         return False
+
 
 def scan_symbol(symbol: str) -> Optional[Dict]:
     hist_symbol = symbol if (symbol.startswith("NSE:") and symbol.endswith("-INDEX")) else format_eq_symbol(symbol)
