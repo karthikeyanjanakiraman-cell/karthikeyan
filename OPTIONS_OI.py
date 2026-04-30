@@ -151,7 +151,7 @@ def get_history(symbol: str, resolution: str, days_back: int) -> pd.DataFrame:
 
 def compute_obv(df: pd.DataFrame) -> float:
     if df is None or df.empty or len(df) < 2:
-        return np.nan
+        return 0
     close = pd.to_numeric(df["close"], errors="coerce")
     vol = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
     direction = np.sign(close.diff())
@@ -161,7 +161,7 @@ def compute_obv(df: pd.DataFrame) -> float:
 
 def compute_today_obv(df: pd.DataFrame) -> float:
     if df is None or df.empty or len(df) < 2:
-        return np.nan
+        return 0
     d = df.copy().sort_values("timestamp")
     d["timestamp"] = pd.to_datetime(d["timestamp"])
     today = pd.Timestamp.now(tz=None).date()
@@ -227,7 +227,7 @@ def apply_display_labels(df: pd.DataFrame, side: str) -> pd.DataFrame:
 
 def intraday_window_score(df: pd.DataFrame, window_minutes: int = 5) -> float:
     if df is None or df.empty or len(df) < 2:
-        return np.nan
+        return 0
     d = df.copy().sort_values("timestamp")
     end_ts = pd.to_datetime(d["timestamp"].iloc[-1])
     start_ts = end_ts - timedelta(minutes=window_minutes)
@@ -260,7 +260,7 @@ def previous_trading_day_same_time_score(full_df: pd.DataFrame, end_ts: Optional
     prev_start = prev_end - timedelta(minutes=window_minutes)
     prev_window = prev_day_data[(prev_day_data["timestamp"] >= prev_start) & (prev_day_data["timestamp"] <= prev_end)]
     if len(prev_window) < 2:
-        return np.nan
+        return 0
     first_close = safe_float(prev_window["close"].iloc[0])
     last_close = safe_float(prev_window["close"].iloc[-1])
     if pd.isna(first_close) or first_close == 0:
@@ -500,6 +500,7 @@ def scan_single_option(option_symbol: str, option_type: str, strike: float, unde
         "OI": np.nan,
         "Volume": intra_df["volume"].sum() if "volume" in intra_df.columns else 0,
     })
+    summary["OBV"] = summary.get("OBV", np.nan)
     return summary
 
 
@@ -517,12 +518,10 @@ def rank_option_candidates(df: pd.DataFrame, side: str) -> pd.DataFrame:
     pct = safe_series(out, "% Change", 0)
     option_type = out["Option Type"].astype(str).str.upper() if "Option Type" in out.columns else pd.Series("", index=out.index)
     if side == "long":
-        type_bonus = np.where(option_type.eq("CE"), 0.30, 0.10)
-        out["EMAIL_RANK_SCORE"] = liq * 0.40 + rd * 0.30 + adx * 0.18 + pct * 0.10 + type_bonus
+        out["EMAIL_RANK_SCORE"] = liq * 0.40 + rd * 0.30 + adx * 0.18 + pct * 0.12
         out = out.sort_values(["EMAIL_RANK_SCORE", "OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False, False, False])
     else:
-        type_bonus = np.where(option_type.eq("PE"), 0.30, 0.10)
-        out["EMAIL_RANK_SCORE"] = liq * 0.40 + (-rd) * 0.30 + adx * 0.18 + (-pct) * 0.10 + type_bonus
+        out["EMAIL_RANK_SCORE"] = liq * 0.40 + (-rd) * 0.30 + adx * 0.18 + (-pct) * 0.12
         out = out.sort_values(["EMAIL_RANK_SCORE", "OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, True, False, True])
     return out.reset_index(drop=True)
 
@@ -543,7 +542,7 @@ def _scan_option_task(underlying: str, row_dict: dict) -> Optional[Tuple[dict, O
         return None
     hist = scanned.get("Iteration History")
     if isinstance(hist, pd.DataFrame) and not hist.empty:
-        tmp = hist.copy()
+        tmp = hist.tail(20).copy()
         tmp.insert(0, "Option Symbol", sym)
         tmp.insert(1, "Underlying", underlying)
         tmp.insert(2, "Strike", strike)
@@ -612,14 +611,14 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
 
 def format_cell(col: str, val) -> str:
     if pd.isna(val):
-        return ""
+        return "0" if col in {"OBV", "Rank", "Liq Score", "Time"} else ""
     if col in {"% Change", "% Chg"}:
         return f"{float(val):.2f}%"
     if col in {"OI", "Volume", "OBV"}:
         try:
             return f"{int(float(val)):,}"
         except Exception:
-            return str(val)
+            return "0"
     if col in {"Rank", "Liq Score", "LTP", "Strike", "IVP"}:
         try:
             return f"{float(val):.2f}"
@@ -638,6 +637,10 @@ def compact_table_html(df: pd.DataFrame, title: str, max_rows: int) -> str:
         html.append("<tr><td style='padding:0 12px 12px 12px;font-family:Arial,Helvetica,sans-serif;font-size:12px;color:#111;'>No data found.</td></tr>")
         return ''.join(html)
     view = df[cols].head(max_rows).copy().rename(columns=OPTION_EMAIL_COL_RENAME)
+    if "Rank" in view.columns:
+        view["Rank"] = pd.to_numeric(view["Rank"], errors="coerce").fillna(0)
+    if "OBV" in view.columns:
+        view["OBV"] = pd.to_numeric(view["OBV"], errors="coerce").fillna(0).astype(int)
     html.append("<tr><td style='padding:0 12px 12px 12px;'><table width='100%' border='0' cellpadding='0' cellspacing='1' style='border-collapse:separate;background:#ffffff;'>")
     html.append("<tr>")
     for c in view.columns:
