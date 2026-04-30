@@ -236,7 +236,11 @@ def intraday_window_score(df: pd.DataFrame, window_minutes: int = SIGNAL_WINDOW_
     return round(((last_close - first_close) / first_close) * 100.0, 2)
 
 
-def previous_trading_day_same_time_score(full_df: pd.DataFrame, end_ts: Optional[pd.Timestamp] = None, window_minutes: int = SIGNAL_WINDOW_MINUTES) -> float:
+def previous_trading_day_same_time_score(
+    full_df: pd.DataFrame,
+    end_ts: Optional[pd.Timestamp] = None,
+    window_minutes: int = SIGNAL_WINDOW_MINUTES,
+) -> float:
     if full_df is None or full_df.empty or len(full_df) < 4:
         return np.nan
     d = full_df.copy().sort_values("timestamp").reset_index(drop=True)
@@ -250,7 +254,10 @@ def previous_trading_day_same_time_score(full_df: pd.DataFrame, end_ts: Optional
     prev_day_data = d[d["timestamp"].dt.date == prev_day].copy()
     if prev_day_data.empty:
         return np.nan
-    same_time_rows = prev_day_data[(prev_day_data["timestamp"].dt.hour == end_ts.hour) & (prev_day_data["timestamp"].dt.minute == end_ts.minute)]
+    same_time_rows = prev_day_data[
+        (prev_day_data["timestamp"].dt.hour == end_ts.hour) &
+        (prev_day_data["timestamp"].dt.minute == end_ts.minute)
+    ]
     prev_end = pd.to_datetime(same_time_rows.iloc[-1]["timestamp"]) if not same_time_rows.empty else prev_day_data["timestamp"].iloc[-1]
     prev_start = prev_end - timedelta(minutes=window_minutes)
     prev_window = prev_day_data[(prev_day_data["timestamp"] >= prev_start) & (prev_day_data["timestamp"] <= prev_end)]
@@ -282,7 +289,11 @@ def compare_window_signal(current_score: float, previous_score: float) -> Tuple[
     return delta, "Neutral"
 
 
-def build_iteration_history(intra_df: pd.DataFrame, window_minutes: int = SIGNAL_WINDOW_MINUTES, iterations: int = ITERATIONS_TO_KEEP) -> pd.DataFrame:
+def build_iteration_history(
+    intra_df: pd.DataFrame,
+    window_minutes: int = SIGNAL_WINDOW_MINUTES,
+    iterations: int = ITERATIONS_TO_KEEP,
+) -> pd.DataFrame:
     if intra_df is None or intra_df.empty:
         return pd.DataFrame()
     full_df = intra_df.copy().sort_values("timestamp").reset_index(drop=True)
@@ -369,11 +380,15 @@ def summarize_intraday(intra_df: pd.DataFrame, reference_df: pd.DataFrame) -> Di
     for flag in price_lead_flag.fillna(False).astype(bool):
         run = run + 1 if flag else 0
         streak.append(run)
-    streak = pd.Series(streak)
-    lead_status = np.select(
-        [price_lead_flag & (streak >= 3), price_lead_flag & (streak >= 2), price_lead_flag],
-        ["STRONG_PRICE_LEAD_FADE", "PRICE_LEADING_FADE_RISK", "EARLY_PRICE_LEAD"],
-        default="NORMAL",
+    streak = pd.Series(streak, index=df.index)
+
+    lead_status = pd.Series(
+        np.select(
+            [price_lead_flag & (streak >= 3), price_lead_flag & (streak >= 2), price_lead_flag],
+            ["STRONG_PRICE_LEAD_FADE", "PRICE_LEADING_FADE_RISK", "EARLY_PRICE_LEAD"],
+            default="NORMAL",
+        ),
+        index=df.index,
     )
 
     prev_close = safe_float(reference_df["close"].iloc[-2]) if reference_df is not None and len(reference_df) >= 2 else np.nan
@@ -651,10 +666,16 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
 
     if side == "long":
         out = out[(rd > 0) & (pct > 0)].copy()
-        out = out.sort_values(["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False, False])
+        out = out.sort_values(
+            ["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"],
+            ascending=[False, False, False, False]
+        )
     else:
         out = out[(rd < 0) & (pct < 0)].copy()
-        out = out.sort_values(["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, True, False, True])
+        out = out.sort_values(
+            ["OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"],
+            ascending=[False, True, False, True]
+        )
 
     final_out = out[[c for c in OPTION_EMAIL_COLS if c in out.columns]].reset_index(drop=True)
 
@@ -662,9 +683,14 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
     if iter_rows and not final_out.empty:
         all_iters = pd.concat(iter_rows, ignore_index=True)
         all_iters = all_iters[all_iters["Option Symbol"].isin(final_out["Option Symbol"])].copy()
-        all_iters = all_iters.sort_values(["Underlying", "Strike", "Option Symbol", "iteration"]).reset_index(drop=True)
+        all_iters = all_iters.sort_values(
+            ["Underlying", "Strike", "Option Symbol", "iteration"]
+        ).reset_index(drop=True)
+
         if not all_iters.empty:
-            all_iters["iteration"] = all_iters.groupby(["Underlying", "Strike", "Option Symbol"]).cumcount() + 1
+            all_iters["iteration"] = all_iters.groupby(
+                ["Underlying", "Strike", "Option Symbol"]
+            ).cumcount() + 1
             all_iters["iteration"] = pd.to_numeric(all_iters["iteration"], errors="coerce").astype("Int64")
             all_iters = all_iters[all_iters["iteration"].between(1, ITERATIONS_TO_KEEP)]
             iter_df = all_iters.reset_index(drop=True)
