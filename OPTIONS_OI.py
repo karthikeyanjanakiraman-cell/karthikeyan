@@ -1,4 +1,5 @@
 import os
+from concurrent.futures import ThreadPoolExecutor
 import time
 import smtplib
 import logging
@@ -42,8 +43,8 @@ TOP_N_UNDERLYINGS = int(os.environ.get("TOP_N_UNDERLYINGS", "60"))
 # Per-run caches: keyed by underlying symbol (UPPER, no NSE: prefix)
 # Populated in scan_symbol during phase-1, reused in phase-2 for all option scans.
 # Eliminates ~1200 redundant API calls (2 calls x 60 underlyings x 10 options).
-_EQ_DAILY_CACHE: Dict[str, pd.DataFrame] = {}
-_EQ_INTRA_CACHE: Dict[str, pd.DataFrame] = {}
+
+
 
 OPTION_EMAIL_COLS = [
     "Underlying", "Option Type", "Option Symbol", "Strike", "LTP", "% Change", "OI", "Volume", "OBV",
@@ -175,24 +176,25 @@ def compute_obv(df: pd.DataFrame) -> float:
 
 def compute_today_obv(df: pd.DataFrame) -> float:
     """
-    FIX-OBV: Use last trading day in data (not clock date).
-    Original used pd.Timestamp.now().date() which returns NaN after market hours
-    and when option candles have volume=0 from Fyers API.
-    Now receives underlying equity intraday data (real volume) -> meaningful OBV.
+    Compute today's OBV from the first candle of the latest trading day.
+    This resets OBV at 9:15 of the latest available session.
     """
     if df is None or df.empty or len(df) < 2:
         return np.nan
     d = df.copy().sort_values("timestamp")
     d["timestamp"] = pd.to_datetime(d["timestamp"])
-    # Use last available trading day in data, not today's clock date
     last_day = d["timestamp"].dt.date.max()
     d = d[d["timestamp"].dt.date == last_day].copy()
     if d.empty:
         return np.nan
-    d = d[d["timestamp"] >= pd.Timestamp.combine(last_day, dtime(9, 15))].copy()
+    d = d[d["timestamp"] >= pd.Timestamp.combine(last_day, dtime(9, 15))].copy().reset_index(drop=True)
     if len(d) < 2:
         return np.nan
-    return compute_obv(d)
+    close = pd.to_numeric(d["close"], errors="coerce")
+    vol = pd.to_numeric(d["volume"], errors="coerce").fillna(0.0)
+    direction = np.sign(close.diff()).fillna(0.0)
+    obv = (vol * direction).cumsum()
+    return round(safe_float(obv.iloc[-1], np.nan), 2)
 
 
 def compute_ivp(history_df: pd.DataFrame, min_bars: int = 10) -> Tuple[float, str]:
@@ -646,11 +648,9 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
     rows, iter_rows = [], []
 
     for underlying in candidates_df["Symbol"].dropna().astype(str):
-        # Pull cached equity data fetched during phase-1 (scan_symbol).
-        # All CE/PE options of this underlying share the same reference data.
         key = str(underlying).strip().upper()
-        cached_daily = _EQ_DAILY_CACHE.get(key)
-        cached_intra = _EQ_INTRA_CACHE.get(key)
+
+
 
         pair_df = fetch_option_pairs(underlying)
         if pair_df.empty:
@@ -874,8 +874,7 @@ def scan_symbol(symbol: str) -> Optional[Dict]:
         return None
     # Cache for reuse in phase-2 (option scans) - avoids re-fetching same data
     key = str(symbol).strip().upper()
-    _EQ_DAILY_CACHE[key] = daily_df
-    _EQ_INTRA_CACHE[key] = intra_df
+
     summary = summarize_intraday(intra_df, daily_df)
     if not summary:
         return None
@@ -891,12 +890,12 @@ def main() -> None:
     symbols = load_fno_symbols_from_sectors(SECTORS_DIR)
 
     rows = []
-    for i, symbol in enumerate(symbols, start=1):
-        logger.info("[%s/%s] Scanning %s", i, len(symbols), symbol)
-        row = scan_symbol(symbol)
-        if row:
-            rows.append(row)
-        time.sleep(PER_SYMBOL_SLEEP_SEC)
+    def _safe_scan(s):
+        try: return scan_symbol(s)
+        except: return None
+    with ThreadPoolExecutor(max_workers=5) as executor:
+        rows = list(executor.map(_safe_scan, symbols))
+    rows = [r for r in rows if r]
 
     summary_df = pd.DataFrame(rows)
     if summary_df.empty:
