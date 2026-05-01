@@ -41,7 +41,7 @@ TOP_N_UNDERLYINGS = int(os.environ.get("TOP_N_UNDERLYINGS", "60"))
 
 # Per-run caches: keyed by underlying symbol (UPPER, no NSE: prefix)
 # Populated in scan_symbol during phase-1, reused in phase-2 for all option scans.
-# Eliminates ~1200 redundant API calls (2 calls Ã— 60 underlyings Ã— 10 options).
+# Eliminates ~1200 redundant API calls (2 calls x 60 underlyings x 10 options).
 _EQ_DAILY_CACHE: Dict[str, pd.DataFrame] = {}
 _EQ_INTRA_CACHE: Dict[str, pd.DataFrame] = {}
 
@@ -174,15 +174,22 @@ def compute_obv(df: pd.DataFrame) -> float:
 
 
 def compute_today_obv(df: pd.DataFrame) -> float:
+    """
+    FIX-OBV: Use last trading day in data (not clock date).
+    Original used pd.Timestamp.now().date() which returns NaN after market hours
+    and when option candles have volume=0 from Fyers API.
+    Now receives underlying equity intraday data (real volume) -> meaningful OBV.
+    """
     if df is None or df.empty or len(df) < 2:
         return np.nan
     d = df.copy().sort_values("timestamp")
     d["timestamp"] = pd.to_datetime(d["timestamp"])
-    today = pd.Timestamp.now(tz=None).date()
-    d = d[d["timestamp"].dt.date == today].copy()
+    # Use last available trading day in data, not today's clock date
+    last_day = d["timestamp"].dt.date.max()
+    d = d[d["timestamp"].dt.date == last_day].copy()
     if d.empty:
         return np.nan
-    d = d[d["timestamp"] >= pd.Timestamp.combine(today, dtime(9, 15))].copy()
+    d = d[d["timestamp"] >= pd.Timestamp.combine(last_day, dtime(9, 15))].copy()
     if len(d) < 2:
         return np.nan
     return compute_obv(d)
@@ -555,18 +562,16 @@ def scan_single_option(
 ) -> Optional[Dict]:
     """Scan one option contract.
 
-    Speed optimisation: pass the underlying equity's already-fetched
-    daily_df and intra_df so we skip 2 API calls per option contract.
-    With 60 underlyings Ã— 10 options that eliminates ~1200 API calls.
+    Speed fix: accepts underlying equity daily_df and intra_df already fetched
+    in phase-1, so we skip 2 API calls per option contract.
+    With 60 underlyings x 10 options that eliminates ~1200 API calls.
 
     OBV fix: option candles from Fyers history always have volume=0.
     We compute OBV from the underlying equity intraday data instead.
     """
     key = str(underlying).strip().upper()
 
-    # Resolve daily reference â€” prefer cached underlying equity data
     daily_df = eq_daily_df if (eq_daily_df is not None and not eq_daily_df.empty) else _EQ_DAILY_CACHE.get(key)
-    # Resolve intraday data â€” prefer cached underlying equity data
     intra_df = eq_intra_df if (eq_intra_df is not None and not eq_intra_df.empty) else _EQ_INTRA_CACHE.get(key)
 
     if daily_df is None or daily_df.empty or intra_df is None or intra_df.empty:
@@ -827,7 +832,8 @@ def send_single_email(subject: str, html_body: str, attachments: list) -> bool:
                 part = MIMEBase("application", "octet-stream")
                 part.set_payload(f.read())
             encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(path)}"')
+            part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(path)}"'
+            )
             msg.attach(part)
 
     try:
@@ -859,7 +865,7 @@ def scan_symbol(symbol: str) -> Optional[Dict]:
     intra_df = get_history(eq, "5", INTRADAY_LOOKBACK_DAYS)
     if daily_df.empty or intra_df.empty:
         return None
-    # Cache for reuse in phase-2 (option scans) â€” avoids re-fetching same data
+    # Cache for reuse in phase-2 (option scans) - avoids re-fetching same data
     key = str(symbol).strip().upper()
     _EQ_DAILY_CACHE[key] = daily_df
     _EQ_INTRA_CACHE[key] = intra_df
