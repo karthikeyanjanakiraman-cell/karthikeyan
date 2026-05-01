@@ -546,6 +546,7 @@ def fetch_option_pairs(symbol: str, pair_count: int = OPTION_PAIRS_TO_KEEP) -> p
                 "Strike": strike,
                 "Option Type": opt_type,
                 "Option Symbol": leg["OptionSymbol"].iloc[0],
+                "OptionLTP": safe_float(leg["OptionLTP"].iloc[0], np.nan),
                 "OI": safe_float(leg["OI"].iloc[0], 0),
                 "Chain Volume": safe_float(leg["Volume"].iloc[0], 0),
             })
@@ -669,6 +670,12 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
 
             scanned["OI"] = safe_float(row.get("OI"), 0)
             scanned["Chain_Volume"] = safe_float(row.get("Chain Volume"), 0)
+            # Fix: override LTP with actual option LTP from chain (not equity close)
+            option_ltp = safe_float(row.get("OptionLTP"), np.nan)
+            if pd.notna(option_ltp) and option_ltp > 0:
+                scanned["LTP"] = round(option_ltp, 2)
+            # Fix: override Volume with actual option chain volume (not equity volume)
+            scanned["Volume"] = safe_float(row.get("Chain Volume"), 0)
             scanned["OI+Volume+OBV Score"] = option_liquidity_score(scanned.get("OI", 0), scanned.get("Volume", 0), scanned.get("OBV", 0))
 
             if safe_float(scanned.get("LTP"), 0.0) < MIN_OPTION_LTP:
