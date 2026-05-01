@@ -560,8 +560,8 @@ def scan_single_option(
     option_type: str,
     strike: float,
     underlying: str,
-    eq_daily_df: Optional[pd.DataFrame] = None,
-    eq_intra_df: Optional[pd.DataFrame] = None,
+    
+    
 ) -> Optional[Dict]:
     """Scan one option contract.
 
@@ -664,7 +664,7 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
                 continue
 
             scanned = scan_single_option(sym, opt_type, strike, underlying,
-                                         eq_daily_df=cached_daily, eq_intra_df=cached_intra)
+                                         )
             if not scanned:
                 continue
 
@@ -884,6 +884,8 @@ def scan_symbol(symbol: str) -> Optional[Dict]:
 
 def main() -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
+      # reset per-run caches
+    
     init_fyers()
     symbols = load_fno_symbols_from_sectors(SECTORS_DIR)
 
