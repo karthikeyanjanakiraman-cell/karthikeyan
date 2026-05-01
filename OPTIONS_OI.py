@@ -1,6 +1,4 @@
 import os
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import ThreadPoolExecutor
 import time
 import smtplib
 import logging
@@ -41,11 +39,8 @@ EMAIL_MAX_ROWS_SHORT = int(os.environ.get("EMAIL_MAX_ROWS_SHORT", "14"))
 EMAIL_SAFE_WIDTH = int(os.environ.get("EMAIL_SAFE_WIDTH", "600"))
 TOP_N_UNDERLYINGS = int(os.environ.get("TOP_N_UNDERLYINGS", "60"))
 
-# Per-run caches: keyed by underlying symbol (UPPER, no NSE: prefix)
-# Populated in scan_symbol during phase-1, reused in phase-2 for all option scans.
-# Eliminates ~1200 redundant API calls (2 calls x 60 underlyings x 10 options).
-
-
+_EQ_DAILY_CACHE: Dict[str, pd.DataFrame] = {}
+_EQ_INTRA_CACHE: Dict[str, pd.DataFrame] = {}
 
 OPTION_EMAIL_COLS = [
     "Underlying", "Option Type", "Option Symbol", "Strike", "LTP", "% Change", "OI", "Volume", "OBV",
@@ -561,8 +556,8 @@ def scan_single_option(
     option_type: str,
     strike: float,
     underlying: str,
-    
-    
+    eq_daily_df: Optional[pd.DataFrame] = None,
+    eq_intra_df: Optional[pd.DataFrame] = None,
 ) -> Optional[Dict]:
     """Scan one option contract.
 
@@ -579,7 +574,6 @@ def scan_single_option(
     intra_df = eq_intra_df if (eq_intra_df is not None and not eq_intra_df.empty) else _EQ_INTRA_CACHE.get(key)
 
     if daily_df is None or daily_df.empty or intra_df is None or intra_df.empty:
-        # Fallback: fetch option-specific history (slow path, only if cache missed)
         hist_symbol = option_symbol if option_symbol.startswith("NSE:") else f"NSE:{option_symbol}"
         if daily_df is None or daily_df.empty:
             daily_df = get_history(hist_symbol, "D", max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
@@ -593,7 +587,6 @@ def scan_single_option(
     if not summary:
         return None
 
-    # OBV: use underlying equity intraday (has real volume); option candles have volume=0
     summary.update({
         "Underlying": underlying,
         "Option Type": option_type,
@@ -650,8 +643,8 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
 
     for underlying in candidates_df["Symbol"].dropna().astype(str):
         key = str(underlying).strip().upper()
-
-
+        eq_daily_df = _EQ_DAILY_CACHE.get(key)
+        eq_intra_df = _EQ_INTRA_CACHE.get(key)
 
         pair_df = fetch_option_pairs(underlying)
         if pair_df.empty:
@@ -664,18 +657,15 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
             if not sym or opt_type not in {"CE", "PE"}:
                 continue
 
-            scanned = scan_single_option(sym, opt_type, strike, underlying,
-                                         )
+            scanned = scan_single_option(sym, opt_type, strike, underlying, eq_daily_df=eq_daily_df, eq_intra_df=eq_intra_df)
             if not scanned:
                 continue
 
             scanned["OI"] = safe_float(row.get("OI"), 0)
             scanned["Chain_Volume"] = safe_float(row.get("Chain Volume"), 0)
-            # Fix: override LTP with actual option LTP from chain (not equity close)
             option_ltp = safe_float(row.get("OptionLTP"), np.nan)
             if pd.notna(option_ltp) and option_ltp > 0:
                 scanned["LTP"] = round(option_ltp, 2)
-            # Fix: override Volume with actual option chain volume (not equity volume)
             scanned["Volume"] = safe_float(row.get("Chain Volume"), 0)
             scanned["OI+Volume+OBV Score"] = option_liquidity_score(scanned.get("OI", 0), scanned.get("Volume", 0), scanned.get("OBV", 0))
 
@@ -840,8 +830,7 @@ def send_single_email(subject: str, html_body: str, attachments: list) -> bool:
                 part = MIMEBase("application", "octet-stream")
                 part.set_payload(f.read())
             encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(path)}"'
-            )
+            part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(path)}"')
             msg.attach(part)
 
     try:
@@ -873,9 +862,9 @@ def scan_symbol(symbol: str) -> Optional[Dict]:
     intra_df = get_history(eq, "5", INTRADAY_LOOKBACK_DAYS)
     if daily_df.empty or intra_df.empty:
         return None
-    # Cache for reuse in phase-2 (option scans) - avoids re-fetching same data
     key = str(symbol).strip().upper()
-
+    _EQ_DAILY_CACHE[key] = daily_df
+    _EQ_INTRA_CACHE[key] = intra_df
     summary = summarize_intraday(intra_df, daily_df)
     if not summary:
         return None
@@ -885,18 +874,18 @@ def scan_symbol(symbol: str) -> Optional[Dict]:
 
 def main() -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-      # reset per-run caches
-    
+    _EQ_DAILY_CACHE.clear()
+    _EQ_INTRA_CACHE.clear()
     init_fyers()
     symbols = load_fno_symbols_from_sectors(SECTORS_DIR)
 
     rows = []
-    def _safe_scan(s):
-        try: return scan_symbol(s)
-        except: return None
-    with ThreadPoolExecutor(max_workers=5) as executor:
-        rows = list(executor.map(_safe_scan, symbols))
-    rows = [r for r in rows if r]
+    for i, symbol in enumerate(symbols, start=1):
+        logger.info("[%s/%s] Scanning %s", i, len(symbols), symbol)
+        row = scan_symbol(symbol)
+        if row:
+            rows.append(row)
+        time.sleep(PER_SYMBOL_SLEEP_SEC)
 
     summary_df = pd.DataFrame(rows)
     if summary_df.empty:
