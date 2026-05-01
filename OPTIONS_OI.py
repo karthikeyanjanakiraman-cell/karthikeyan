@@ -884,8 +884,6 @@ def scan_symbol(symbol: str) -> Optional[Dict]:
 
 def main() -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    _EQ_DAILY_CACHE.clear()  # reset per-run caches
-    _EQ_INTRA_CACHE.clear()
     init_fyers()
     symbols = load_fno_symbols_from_sectors(SECTORS_DIR)
 
