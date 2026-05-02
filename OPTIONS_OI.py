@@ -2,8 +2,7 @@ import os
 import time
 import smtplib
 import logging
-from datetime import datetime, timedelta, time as dtime
-from typing import Dict, List, Optional, Tuple
+from datetime import datetime, timedelta, time as dtimefrom typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -33,7 +32,7 @@ ITERATIONS_TO_KEEP = 75
 SECTORS_DIR = os.environ.get("SECTORS_DIR", "sectors")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 MIN_OPTION_LTP = 10.0
-PER_SYMBOL_SLEEP_SEC = float(os.environ.get("PER_SYMBOL_SLEEP_SEC", "0.09"))
+PER_SYMBOL_SLEEP_SEC = float(os.environ.get("PER_SYMBOL_SLEEP_SEC", "0.15"))
 EMAIL_MAX_ROWS_LONG = int(os.environ.get("EMAIL_MAX_ROWS_LONG", "25"))
 EMAIL_MAX_ROWS_SHORT = int(os.environ.get("EMAIL_MAX_ROWS_SHORT", "25"))
 EMAIL_SAFE_WIDTH = int(os.environ.get("EMAIL_SAFE_WIDTH", "600"))
