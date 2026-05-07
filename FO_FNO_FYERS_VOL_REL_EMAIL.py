@@ -1593,76 +1593,79 @@ def main_index_first():
 
 
 def build_breakout_trade_table(df: pd.DataFrame, side: str = "bull") -> pd.DataFrame:
+    cols = ["Rk", "Symbol", "Entry", "Entry â‚¹", "Exit", "Exit â‚¹", "Points", "% Move", "Day %"]
     if df is None or df.empty:
-        return pd.DataFrame(columns=["Rk", "Symbol", "Entry", "Entry â‚¹", "Exit", "Exit â‚¹", "Points", "% Move", "Day %"])
+        return pd.DataFrame(columns=cols)
 
     work = df.copy()
-    rename_map = {}
-    for c in work.columns:
-        lc = str(c).strip().lower()
-        if lc in ["symbol", "ticker"]:
-            rename_map[c] = "Symbol"
-        elif lc in ["entry", "entry time", "entry_time"]:
-            rename_map[c] = "Entry"
-        elif lc in ["entry price", "entry_price", "entryâ‚¹", "entry rupees", "entry rs", "entry_r"]:
-            rename_map[c] = "Entry â‚¹"
-        elif lc in ["exit", "exit time", "exit_time"]:
-            rename_map[c] = "Exit"
-        elif lc in ["exit price", "exit_price", "exitâ‚¹", "exit rupees", "exit rs", "exit_r", "ltp"]:
-            rename_map[c] = "Exit â‚¹"
-        elif lc in ["points", "pnl", "profit_points"]:
-            rename_map[c] = "Points"
-        elif lc in ["% move", "pct move", "move%", "move_pct", "percent_move"]:
-            rename_map[c] = "% Move"
-        elif lc in ["day %", "day%", "change%", "% change", "pct_change"]:
-            rename_map[c] = "Day %"
-    work.rename(columns=rename_map, inplace=True)
+    if "Symbol" not in work.columns and "symbol" in work.columns:
+        work.rename(columns={"symbol": "Symbol"}, inplace=True)
+    if "Symbol" not in work.columns:
+        work["Symbol"] = ""
 
-    for req in ["Symbol", "Entry", "Entry â‚¹"]:
-        if req not in work.columns:
-            raise ValueError(f"Missing required column for breakout table: {req}")
+    if "Entry" not in work.columns:
+        fallback_entry = "09:45"
+        if "Last Iteration Time" in work.columns:
+            fallback_series = work["Last Iteration Time"].astype(str).replace({"nan": fallback_entry, "": fallback_entry})
+            work["Entry"] = fallback_series.where(fallback_series.str.len() > 0, fallback_entry)
+        else:
+            work["Entry"] = fallback_entry
+
+    if "Entry â‚¹" not in work.columns:
+        if "LTP" in work.columns:
+            work["Entry â‚¹"] = pd.to_numeric(work["LTP"], errors="coerce")
+        else:
+            work["Entry â‚¹"] = np.nan
 
     if "Exit" not in work.columns:
-        work["Exit"] = work["Entry"].apply(_compute_exit_time)
-    else:
-        work["Exit"] = work["Exit"].apply(_to_time_string)
+        def _calc_exit(t):
+            try:
+                dt = datetime.strptime(str(t)[:5], "%H:%M") + timedelta(minutes=90)
+                cap = datetime.strptime("14:45", "%H:%M")
+                if dt > cap:
+                    dt = cap
+                return dt.strftime("%H:%M")
+            except Exception:
+                return "14:45"
+        work["Exit"] = work["Entry"].apply(_calc_exit)
 
     if "Exit â‚¹" not in work.columns:
-        work["Exit â‚¹"] = work["Entry â‚¹"]
+        if "LTP" in work.columns:
+            work["Exit â‚¹"] = pd.to_numeric(work["LTP"], errors="coerce")
+        else:
+            work["Exit â‚¹"] = np.nan
+
+    if "Day %" not in work.columns:
+        if "% Change" in work.columns:
+            work["Day %"] = pd.to_numeric(work["% Change"], errors="coerce")
+        else:
+            work["Day %"] = np.nan
 
     work["Entry â‚¹"] = pd.to_numeric(work["Entry â‚¹"], errors="coerce")
     work["Exit â‚¹"] = pd.to_numeric(work["Exit â‚¹"], errors="coerce")
 
-    if "Points" not in work.columns:
-        if side.lower() == "bear":
-            work["Points"] = work["Entry â‚¹"] - work["Exit â‚¹"]
-        else:
-            work["Points"] = work["Exit â‚¹"] - work["Entry â‚¹"]
+    if side.lower() == "bear":
+        work["Points"] = work["Entry â‚¹"] - work["Exit â‚¹"]
+    else:
+        work["Points"] = work["Exit â‚¹"] - work["Entry â‚¹"]
 
-    if "% Move" not in work.columns:
-        base = work["Entry â‚¹"].replace(0, np.nan)
-        if side.lower() == "bear":
-            work["% Move"] = ((work["Entry â‚¹"] - work["Exit â‚¹"]) / base) * 100.0
-        else:
-            work["% Move"] = ((work["Exit â‚¹"] - work["Entry â‚¹"]) / base) * 100.0
+    work["% Move"] = np.where(
+        work["Entry â‚¹"].replace(0, np.nan).notna(),
+        (work["Points"] / work["Entry â‚¹"].replace(0, np.nan)) * 100.0,
+        np.nan,
+    )
 
-    if "Day %" not in work.columns:
-        if "% Change" in work.columns:
-            work["Day %"] = work["% Change"]
-        else:
-            work["Day %"] = np.nan
-
-    work = work.sort_values(["Points", "% Move"], ascending=[False, False]).reset_index(drop=True)
+    work = work.sort_values(by=["Points", "% Move"], ascending=[False, False], na_position="last").reset_index(drop=True)
     work.insert(0, "Rk", range(1, len(work) + 1))
-    work["Entry"] = work["Entry"].apply(_to_time_string)
-    work["Exit"] = work["Exit"].apply(_to_time_string)
-    work["Entry â‚¹"] = work["Entry â‚¹"].apply(_format_rupee)
-    work["Exit â‚¹"] = work["Exit â‚¹"].apply(_format_rupee)
-    work["Points"] = work["Points"].apply(_format_points)
-    work["% Move"] = work["% Move"].apply(_format_pct)
-    work["Day %"] = work["Day %"].apply(_format_pct)
-
-    return work[["Rk", "Symbol", "Entry", "Entry â‚¹", "Exit", "Exit â‚¹", "Points", "% Move", "Day %"]]
+    out = work[cols].copy()
+    out["Entry"] = out["Entry"].astype(str).str.slice(0, 5)
+    out["Exit"] = out["Exit"].astype(str).str.slice(0, 5)
+    for c in ["Entry â‚¹", "Exit â‚¹"]:
+        out[c] = out[c].map(lambda x: f"{float(x):,.0f}" if pd.notna(x) else "")
+    out["Points"] = out["Points"].map(lambda x: f"{float(x):+.2f}" if pd.notna(x) else "")
+    out["% Move"] = out["% Move"].map(lambda x: f"{float(x):.2f}%" if pd.notna(x) else "")
+    out["Day %"] = out["Day %"].map(lambda x: f"{float(x):.2f}%" if pd.notna(x) else "")
+    return out
 
 def send_breakout_candidates_email(long_df: pd.DataFrame, short_df: pd.DataFrame, trade_date: Optional[datetime] = None):
     trade_date = trade_date or datetime.now()
@@ -1783,23 +1786,7 @@ def run_and_send_breakout_email(source_df: pd.DataFrame, trade_date: Optional[da
     bull_source = source_df[source_df["Bull_Signal"].astype(str).str.contains("Buy", case=False, na=False)].copy() if "Bull_Signal" in source_df.columns else pd.DataFrame()
     bear_source = source_df[source_df["Bear_Signal"].astype(str).str.contains("Sell", case=False, na=False)].copy() if "Bear_Signal" in source_df.columns else pd.DataFrame()
 
-    for temp in [bull_source, bear_source]:
-        if not temp.empty:
-            if "Entry" not in temp.columns:
-                temp["Entry"] = "09:45"
-            if "Entry â‚¹" not in temp.columns:
-                temp["Entry â‚¹"] = pd.to_numeric(temp.get("LTP", np.nan), errors="coerce")
-            if "Exit â‚¹" not in temp.columns:
-                temp["Exit â‚¹"] = pd.to_numeric(temp.get("LTP", np.nan), errors="coerce")
-            if "Day %" not in temp.columns and "% Change" in temp.columns:
-                temp["Day %"] = temp["% Change"]
-
+    send_breakout_candidates_email(bull_source, bear_source, trade_date=trade_date or datetime.now())
     bull_breakout = build_breakout_trade_table(bull_source, side="bull") if not bull_source.empty else pd.DataFrame(columns=["Rk", "Symbol", "Entry", "Entry â‚¹", "Exit", "Exit â‚¹", "Points", "% Move", "Day %"])
     bear_breakout = build_breakout_trade_table(bear_source, side="bear") if not bear_source.empty else pd.DataFrame(columns=["Rk", "Symbol", "Entry", "Entry â‚¹", "Exit", "Exit â‚¹", "Points", "% Move", "Day %"])
-
-    bull_csv = "breakout_bull_trades.csv"
-    bear_csv = "breakout_bear_trades.csv"
-    bull_breakout.to_csv(bull_csv, index=False)
-    bear_breakout.to_csv(bear_csv, index=False)
-    send_breakout_email(bull_breakout, bear_breakout, trade_date=trade_date or datetime.now(), attachments=[bull_csv, bear_csv])
     return bull_breakout, bear_breakout
