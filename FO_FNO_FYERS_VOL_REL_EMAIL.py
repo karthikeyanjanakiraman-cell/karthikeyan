@@ -1026,7 +1026,7 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
 # BREAKOUT SCANNER â€” entry=09:15+IterationMinutes, exit=entry+90min cap 14:45
 # =============================================================================
 
-BREAKOUT_EXIT_BARS  = 18    # 18 x 5min = 90min hold (matches screenshot)
+BREAKOUT_EXIT_BARS  = 18    # 18 x 5min = 90min hold
 BREAKOUT_LOOKBACK   = 20    # prior bars to define range
 BREAKOUT_MIN_EXTRAS = 2     # minimum confirming conditions
 BREAKOUT_TOP_N      = 10    # email only top 10
@@ -1038,11 +1038,14 @@ def identify_breakout_stocks(iter_df, lookback_bars=BREAKOUT_LOOKBACK):
     Entry  = 09:15 + Iteration Minutes (clock HH:MM)
     Exit   = Entry + 90 min, hard-capped at 14:45
     Sort   = Entry time DESC (latest entry first), top 10 only
+    FIX1   : Change col = "% Change"
+    FIX2   : Expansion cols = "Range_Expansion", "Volume_Expansion"
+    FIX3   : Skip entries at or after 14:45
     """
     if iter_df is None or iter_df.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    CAP_ABS = 14 * 60 + 45
+    CAP_ABS = 14 * 60 + 45   # 14:45 in minutes from midnight
 
     def _m2t(abs_m):
         h, mn = divmod(int(abs_m), 60)
@@ -1056,17 +1059,20 @@ def identify_breakout_stocks(iter_df, lookback_bars=BREAKOUT_LOOKBACK):
             continue
 
         def _col(name, fill=0.0):
-            if name in grp.columns:
-                return pd.to_numeric(grp[name], errors="coerce").fillna(fill).values
+            """Case-insensitive column lookup with correct-length fallback."""
+            col_map = {c.lower(): c for c in grp.columns}
+            actual  = col_map.get(name.lower())
+            if actual:
+                return pd.to_numeric(grp[actual], errors="coerce").fillna(fill).values
             return np.full(len(grp), fill, dtype=float)
 
         vwap = _col("Cumulative VWAP", float("nan"))
         z    = _col("VWAP Z-Score")
         v10  = _col("10 Day Relative Volume")
         rsi  = _col("Cumulative RSI", 50)
-        chg  = _col("Change")
-        re_  = _col("RangeExpansion")
-        ve_  = _col("VolumeExpansion")
+        chg  = _col("% Change")           # FIX 1: was "Change"
+        re_  = _col("Range_Expansion")    # FIX 2: was "RangeExpansion"
+        ve_  = _col("Volume_Expansion")   # FIX 2: was "VolumeExpansion"
         mins = pd.to_numeric(grp["Iteration Minutes"], errors="coerce").values
         lead = grp.get("PriceLeadStatus", pd.Series(["NORMAL"] * len(grp))).values
 
@@ -1083,6 +1089,8 @@ def identify_breakout_stocks(iter_df, lookback_bars=BREAKOUT_LOOKBACK):
             ph, pl = float(prior.max()), float(prior.min())
 
             entry_abs = 9 * 60 + 15 + int(mins[i])
+            if entry_abs >= CAP_ABS:      # FIX 3: skip entries at/after 14:45
+                continue
             exit_abs  = min(entry_abs + BREAKOUT_EXIT_BARS * 5, CAP_ABS)
             ent_t, ext_t = _m2t(entry_abs), _m2t(exit_abs)
 
@@ -1093,7 +1101,7 @@ def identify_breakout_stocks(iter_df, lookback_bars=BREAKOUT_LOOKBACK):
                 "STRONG_PRICE_LEAD_FADE", "STRONGPRICELEADFADE",
             )
 
-            # BULL
+            # â”€â”€ BULL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             if cv > ph and symbol not in seen_bull:
                 extras = sum([
                     cz > 0.30, cv10 > 1.0, crsi > 55,
@@ -1119,10 +1127,10 @@ def identify_breakout_stocks(iter_df, lookback_bars=BREAKOUT_LOOKBACK):
                     })
                     seen_bull.add(symbol)
 
-            # BEAR
+            # â”€â”€ BEAR â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
             elif cv < pl and symbol not in seen_bear:
                 extras = sum([
-                    cz < -0.30, cv10 > 1.0, crsi < 45,
+                    cz < -0.50, cv10 > 1.0, crsi < 45,   # tightened from -0.30
                     cchg < 0, lead_hit, cve > 1.0, cre > 1.0,
                 ])
                 if extras >= BREAKOUT_MIN_EXTRAS:
@@ -1186,23 +1194,23 @@ def breakout_df_to_html(df, title=""):
     Q    = chr(34)
     cols = [c for c in _BREAKOUT_COLS if c in df.columns]
 
-    th_style = (
-        f"padding:8px 10px;border:1px solid #4b5563;"
-        f"background:#374151;color:#f9fafb;font-size:12px;"
-        f"font-weight:700;text-align:center;white-space:nowrap;"
+    th_s = (
+        "padding:8px 10px;border:1px solid #4b5563;"
+        "background:#374151;color:#f9fafb;font-size:12px;"
+        "font-weight:700;text-align:center;white-space:nowrap;"
     )
     header_cells = "".join(
-        f'<th style={Q}{th_style}{Q}>{c}</th>' for c in ["Rk"] + cols
+        f'<th style={Q}{th_s}{Q}>{c}</th>' for c in ["Rk"] + cols
     )
 
     rows_html = []
     for rk, (_, row) in enumerate(df.iterrows(), start=1):
-        rk_style = (
-            f"padding:7px 9px;border:1px solid #4b5563;"
-            f"background:#374151;color:#f9fafb;font-size:12px;"
-            f"font-weight:700;text-align:center;white-space:nowrap;"
+        rk_s = (
+            "padding:7px 9px;border:1px solid #4b5563;"
+            "background:#374151;color:#f9fafb;font-size:12px;"
+            "font-weight:700;text-align:center;white-space:nowrap;"
         )
-        cells = [f'<td style={Q}{rk_style}{Q}>{rk}</td>']
+        cells = [f'<td style={Q}{rk_s}{Q}>{rk}</td>']
 
         for c in cols:
             val     = row.get(c, "")
@@ -1240,12 +1248,12 @@ def breakout_df_to_html(df, title=""):
             else:
                 bg, fg, extra = "3b4252", "f3f4f6", "text-align:center;"
 
-            td_style = (
+            td_s = (
                 f"padding:7px 9px;border:1px solid #4b5563;"
                 f"background:#{bg};color:#{fg};font-size:12px;"
                 f"font-weight:600;white-space:nowrap;{extra}"
             )
-            cells.append(f'<td style={Q}{td_style}{Q}>{val_str}</td>')
+            cells.append(f'<td style={Q}{td_s}{Q}>{val_str}</td>')
 
         rows_html.append("<tr>" + "".join(cells) + "</tr>")
 
@@ -1833,7 +1841,7 @@ def main_index_first():
         index_iter_df.to_csv(index_iter_csv, index=False)
         logger.info(f'INDEX Iteration summary saved: {index_iter_csv}')
 
-    # â”€â”€ Identify breakouts (top 10, latest entry first) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # â”€â”€ Identify top-10 breakouts (latest entry first) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     bull_brk, bear_brk = (
         identify_breakout_stocks(detail_df)
         if detail_df is not None and not detail_df.empty
