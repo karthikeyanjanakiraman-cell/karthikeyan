@@ -1584,7 +1584,36 @@ def main_index_first():
         logger.info(f'INDEX Iteration summary saved: {index_iter_csv}')
 
     send_email_with_tables(long_df, short_df, summary_csv, detail_csv, index_long_df=index_long_df, index_short_df=index_short_df, index_iter_csv_filename=(index_iter_csv if 'index_iter_csv' in locals() else None))
+    try:
+        send_breakout_candidates_email(long_df, short_df)
+    except Exception as e:
+        logger.error(f'BREAKOUT Failed to send separate breakout email: {e}')
     logger.info('Index-first Scan Pipeline Completed')
+
+
+
+def send_breakout_candidates_email(long_df: pd.DataFrame, short_df: pd.DataFrame, trade_date: Optional[datetime] = None):
+    trade_date = trade_date or datetime.now()
+    bull_breakout = build_breakout_trade_table(long_df.copy() if isinstance(long_df, pd.DataFrame) else pd.DataFrame(), side="bull")
+    bear_breakout = build_breakout_trade_table(short_df.copy() if isinstance(short_df, pd.DataFrame) else pd.DataFrame(), side="bear")
+    bull_csv = f"breakout_bull_candidates_{trade_date.strftime('%Y%m%d_%H%M%S')}.csv"
+    bear_csv = f"breakout_bear_candidates_{trade_date.strftime('%Y%m%d_%H%M%S')}.csv"
+    bull_breakout.to_csv(bull_csv, index=False)
+    bear_breakout.to_csv(bear_csv, index=False)
+    bull_html = bull_breakout.to_html(index=False, border=0)
+    bear_html = bear_breakout.to_html(index=False, border=0)
+    html_body = f"""
+    <html><body style='font-family:Arial,sans-serif;font-size:13px'>
+    <h2>Breakout Candidates Alert</h2>
+    <h3>All {len(bull_breakout)} Bull Breakout Trades - {trade_date.strftime('%d %b %Y')}</h3>
+    {bull_html}
+    <div style='height:20px'></div>
+    <h3>All {len(bear_breakout)} Bear Breakout Trades - {trade_date.strftime('%d %b %Y')}</h3>
+    {bear_html}
+    </body></html>
+    """
+    subject = f"Gmail Breakout Alert - {trade_date.strftime('%d-%b-%H_%M')} - Bull_{len(bull_breakout)}-Bear_{len(bear_breakout)}"
+    return send_email(subject, html_body, attachments=[bull_csv, bear_csv])
 
 if __name__ == '__main__':
     main_index_first()
