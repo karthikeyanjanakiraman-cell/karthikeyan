@@ -1056,9 +1056,9 @@ def identify_breakout_stocks(iter_df, lookback_bars=BREAKOUT_LOOKBACK):
             continue
 
         def _col(name, fill=0.0):
-            return pd.to_numeric(
-                grp.get(name, pd.Series(dtype=float)), errors="coerce"
-            ).fillna(fill).values
+            if name in grp.columns:
+                return pd.to_numeric(grp[name], errors="coerce").fillna(fill).values
+            return np.full(len(grp), fill, dtype=float)
 
         vwap = _col("Cumulative VWAP", float("nan"))
         z    = _col("VWAP Z-Score")
