@@ -1591,39 +1591,52 @@ if __name__ == '__main__':
 
 
 # ==============================
-# BREAKOUT TABLE PATCH
+# BREAKOUT EMAIL PATCH
 # ==============================
-BREAKOUT_SCREENSHOT_COLS = [
-    "Rk", "Symbol", "Entry", "Entry â‚¹", "Exit", "Exit â‚¹", "Points", "% Move", "Day %"
+BREAKOUT_EMAIL_COLS = [
+    "Rk", "Symbol", "Change", "Entry", "Entry Price", "Stop Price", "Exit",
+    "VWAP Z", "Signal", "Volume Exp", "Range Exp", "20d RVOL", "Grade"
 ]
 
 
-def add_exit_time_90m(entry_hhmm: str, cap_hhmm: str = "14:45") -> str:
-    entry_dt = datetime.strptime(str(entry_hhmm), "%H:%M")
-    cap_dt = datetime.strptime(str(cap_hhmm), "%H:%M")
-    return min(entry_dt + timedelta(minutes=90), cap_dt).strftime("%H:%M")
+def _fmt_num_breakout(x, decimals=2):
+    if pd.isna(x):
+        return ""
+    return f"{float(x):,.{decimals}f}"
 
 
 
-def _fmt_rupees_breakout(x):
-    x = float(x)
-    return f"{x:,.0f}" if x.is_integer() else f"{x:,.2f}"
+def _fmt_pct_signed_breakout(x):
+    if pd.isna(x):
+        return ""
+    return f"{float(x):+,.2f}%"
 
 
 
-def _fmt_points_breakout(x):
-    return f"{float(x):+,.2f}"
+def breakout_grade(row: pd.Series, direction: str) -> str:
+    vwap_z = float(pd.to_numeric(row.get("VWAP Z-Score"), errors="coerce")) if pd.notna(pd.to_numeric(row.get("VWAP Z-Score"), errors="coerce")) else np.nan
+    vol_exp = float(pd.to_numeric(row.get("Volume_Expansion", row.get("VolumeExpansion")), errors="coerce")) if pd.notna(pd.to_numeric(row.get("Volume_Expansion", row.get("VolumeExpansion")), errors="coerce")) else np.nan
+    range_exp = float(pd.to_numeric(row.get("Range_Expansion", row.get("RangeExpansion")), errors="coerce")) if pd.notna(pd.to_numeric(row.get("Range_Expansion", row.get("RangeExpansion")), errors="coerce")) else np.nan
+    rvol20 = float(pd.to_numeric(row.get("20 Day Relative Volume"), errors="coerce")) if pd.notna(pd.to_numeric(row.get("20 Day Relative Volume"), errors="coerce")) else np.nan
+
+    if direction.lower() == "bull":
+        if pd.notna(vwap_z) and vwap_z >= 0.80 and pd.notna(range_exp) and range_exp >= 1.0:
+            return "BEST"
+        if pd.notna(vwap_z) and vwap_z >= 0.50:
+            return "STRONG"
+        return "GOOD"
+    else:
+        if pd.notna(vwap_z) and vwap_z <= -0.80 and pd.notna(range_exp) and range_exp >= 0.9:
+            return "BEST"
+        if pd.notna(vwap_z) and vwap_z < -0.50:
+            return "STRONG"
+        return "GOOD"
 
 
 
-def _fmt_pct_breakout(x):
-    return f"{float(x):.2f}%"
-
-
-
-def build_breakout_summary_from_iterations(detail_df: pd.DataFrame, direction: str = "bull") -> pd.DataFrame:
+def build_breakout_email_table(detail_df: pd.DataFrame, direction: str = "bull", top_n: int = 10) -> pd.DataFrame:
     if detail_df is None or detail_df.empty:
-        return pd.DataFrame(columns=BREAKOUT_SCREENSHOT_COLS)
+        return pd.DataFrame(columns=BREAKOUT_EMAIL_COLS)
 
     work = detail_df.copy()
     rename_map = {
@@ -1631,22 +1644,15 @@ def build_breakout_summary_from_iterations(detail_df: pd.DataFrame, direction: s
         "RangeExpansion": "Range_Expansion",
         "VolumeExpansion": "Volume_Expansion",
         "DeltaExpansion": "Delta_Expansion",
-        "PriceLeadStatus": "Price_Lead_Status",
-        "PriceLeadingFlag": "Price_Leading_Flag",
-        "PriceLeadStreak": "Price_Lead_Streak",
     }
     work.rename(columns={k: v for k, v in rename_map.items() if k in work.columns}, inplace=True)
 
     required = ["Symbol", "% Change", "Iteration Time", "LTP", "VWAP Z-Score"]
     missing = [c for c in required if c not in work.columns]
     if missing:
-        raise ValueError(f"Missing required breakout columns: {missing}")
+        raise ValueError(f"Missing required breakout email columns: {missing}")
 
-    for c in ["% Change", "LTP", "VWAP Z-Score"]:
-        work[c] = pd.to_numeric(work[c], errors="coerce")
-
-    optional_numeric = ["10 Day Relative Volume", "20 Day Relative Volume", "Range_Expansion", "Volume_Expansion"]
-    for c in optional_numeric:
+    for c in ["% Change", "LTP", "VWAP Z-Score", "20 Day Relative Volume", "Range_Expansion", "Volume_Expansion"]:
         if c in work.columns:
             work[c] = pd.to_numeric(work[c], errors="coerce")
 
@@ -1654,87 +1660,124 @@ def build_breakout_summary_from_iterations(detail_df: pd.DataFrame, direction: s
     work["Iteration Time"] = work["Iteration Time"].astype(str).str.slice(0, 5)
     work = work.dropna(subset=["Symbol", "Iteration Time", "LTP", "% Change", "VWAP Z-Score"]).copy()
     if work.empty:
-        return pd.DataFrame(columns=BREAKOUT_SCREENSHOT_COLS)
-
-    work = work.sort_values(["Symbol", "Iteration Time"]).reset_index(drop=True)
+        return pd.DataFrame(columns=BREAKOUT_EMAIL_COLS)
 
     if direction.lower() == "bull":
         filt = work[work["% Change"] > 0].copy()
         filt = filt[filt["VWAP Z-Score"] >= 0.50].copy()
+        signal = "BUY"
     else:
         filt = work[(work["% Change"] < 0) & (work["VWAP Z-Score"] < -0.50)].copy()
-    if filt.empty:
-        return pd.DataFrame(columns=BREAKOUT_SCREENSHOT_COLS)
+        signal = "SELL"
 
-    entries = (
+    if filt.empty:
+        return pd.DataFrame(columns=BREAKOUT_EMAIL_COLS)
+
+    first_hits = (
         filt.sort_values(["Symbol", "Iteration Time"])
             .groupby("Symbol", as_index=False)
-            .first()[["Symbol", "Iteration Time", "LTP", "% Change"]]
-            .rename(columns={"Iteration Time": "Entry", "LTP": "EntryPx", "% Change": "DayPct"})
+            .first()
+            .copy()
     )
 
-    rows = []
-    for _, e in entries.iterrows():
-        sym = e["Symbol"]
-        entry = e["Entry"]
-        exit_time = add_exit_time_90m(entry)
-        sub = filt[(filt["Symbol"] == sym) & (filt["Iteration Time"] <= exit_time)].copy()
-        if sub.empty:
-            continue
-        exit_row = sub.sort_values("Iteration Time").iloc[-1]
-        entry_px = float(e["EntryPx"])
-        exit_px = float(exit_row["LTP"])
-        if direction.lower() == "bull":
-            points = exit_px - entry_px
-        else:
-            points = entry_px - exit_px
-        pct_move = (points / entry_px * 100.0) if entry_px else np.nan
-        rows.append({
-            "Symbol": sym,
-            "Entry": entry,
-            "Entry â‚¹": entry_px,
-            "Exit": exit_time,
-            "Exit â‚¹": exit_px,
-            "Points": points,
-            "% Move": pct_move,
-            "Day %": float(e["DayPct"]),
-        })
+    first_hits["Entry"] = first_hits["Iteration Time"]
+    first_hits["Entry Price"] = first_hits["LTP"]
+    first_hits["Exit"] = first_hits["Entry"].apply(add_exit_time_90m)
 
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return pd.DataFrame(columns=BREAKOUT_SCREENSHOT_COLS)
+    if direction.lower() == "bull":
+        first_hits["Stop Price"] = first_hits["Entry Price"] * 0.998
+    else:
+        first_hits["Stop Price"] = first_hits["Entry Price"] * 1.003
 
-    out = out.sort_values(["Points", "% Move", "Day %"], ascending=[False, False, False]).reset_index(drop=True)
+    first_hits["VWAP Z"] = first_hits["VWAP Z-Score"]
+    first_hits["Signal"] = signal
+    first_hits["Volume Exp"] = first_hits.get("Volume_Expansion", np.nan)
+    first_hits["Range Exp"] = first_hits.get("Range_Expansion", np.nan)
+    first_hits["20d RVOL"] = first_hits.get("20 Day Relative Volume", np.nan)
+    first_hits["Change"] = first_hits["% Change"]
+    first_hits["Grade"] = first_hits.apply(lambda r: breakout_grade(r, direction), axis=1)
+
+    out = first_hits[[
+        "Symbol", "Change", "Entry", "Entry Price", "Stop Price", "Exit",
+        "VWAP Z", "Signal", "Volume Exp", "Range Exp", "20d RVOL", "Grade"
+    ]].copy()
+
+    out = out.sort_values(["Entry", "VWAP Z"], ascending=[False, False if direction.lower() == 'bull' else True]).reset_index(drop=True)
     out.insert(0, "Rk", range(1, len(out) + 1))
+    out = out.head(top_n).copy()
 
-    for c in ["Entry â‚¹", "Exit â‚¹"]:
-        out[c] = out[c].map(_fmt_rupees_breakout)
-    out["Points"] = out["Points"].map(_fmt_points_breakout)
-    out["% Move"] = out["% Move"].map(_fmt_pct_breakout)
-    out["Day %"] = out["Day %"].map(_fmt_pct_breakout)
+    out["Change"] = out["Change"].map(_fmt_pct_signed_breakout)
+    for c in ["Entry Price", "Stop Price", "VWAP Z", "Volume Exp", "Range Exp", "20d RVOL"]:
+        out[c] = out[c].map(lambda x: _fmt_num_breakout(x, 2))
 
-    return out[BREAKOUT_SCREENSHOT_COLS]
-
+    return out[BREAKOUT_EMAIL_COLS]
 
 
-def breakout_summary_to_html(df: pd.DataFrame, title: str = "All 44 Bull Breakout Trades") -> str:
+
+def breakout_email_table_to_html(df: pd.DataFrame, title: str) -> str:
     if df is None or df.empty:
         return f"<h3>{title}</h3><p>No breakout trades found.</p>"
     return f"""
-    <html>
-    <head>
-    <style>
-    body {{ font-family: Georgia, serif; background: #ffffff; color: #263238; margin: 12px; }}
-    h1 {{ font-size: 16px; font-weight: 500; margin: 0 0 10px 0; }}
-    table {{ border-collapse: collapse; width: 100%; font-size: 14px; }}
-    th, td {{ border: 1px solid #d7d7d7; padding: 7px 10px; text-align: center; white-space: nowrap; }}
-    th {{ font-weight: 600; background: #f4f4f1; }}
-    td:nth-child(2) {{ text-align: left; }}
-    </style>
-    </head>
-    <body>
-    <h1>{title}</h1>
-    {df.to_html(index=False, escape=False)}
-    </body>
-    </html>
+    <h3 style='font-family:Arial,sans-serif;color:#111827;margin:18px 0 10px 0;'>{title}</h3>
+    <div style='overflow-x:auto;margin-bottom:18px;'>
+      <table style='border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:12px;'>
+        <thead>
+          <tr>
+            {''.join([f"<th style='border:1px solid #cbd5e1;padding:7px 8px;background:#0f172a;color:#f8fafc;white-space:nowrap;'>{c}</th>" for c in df.columns])}
+          </tr>
+        </thead>
+        <tbody>
+          {''.join(['<tr>' + ''.join([f"<td style='border:1px solid #cbd5e1;padding:7px 8px;text-align:center;white-space:nowrap;'>{row[c]}</td>" for c in df.columns]) + '</tr>' for _, row in df.iterrows()])}
+        </tbody>
+      </table>
+    </div>
     """
+
+
+
+def send_breakout_email(bull_df: pd.DataFrame, bear_df: pd.DataFrame, bull_csv: str = None, bear_csv: str = None) -> bool:
+    try:
+        scan_time = datetime.now().strftime("%d %b %Y, %H:%M")
+        bull_count = 0 if bull_df is None else len(bull_df)
+        bear_count = 0 if bear_df is None else len(bear_df)
+        subject = f"Breakout Alert - {datetime.now().strftime('%d %b %H:%M')} | Bull:{bull_count} Bear:{bear_count}"
+        html_body = f"""
+        <html><body style='font-family:Arial,sans-serif;font-size:13px;color:#111827;'>
+        <h2 style='margin:0 0 12px 0;'>Intraday Breakout Alert - {scan_time}</h2>
+        {breakout_email_table_to_html(bull_df, 'Bull Breakout Trades - Top 10 (Latest Entry First)')}
+        {breakout_email_table_to_html(bear_df, 'Bear Breakout Trades - Top 10 (Latest Entry First)')}
+        <p style='margin-top:14px;color:#374151;'>Filters: Bull = positive %Change only | Bear = negative %Change only<br>Exit = Entry + 90 min capped at 14:45 | Bear VWAP Z &lt; -0.50</p>
+        </body></html>
+        """
+
+        msg = MIMEMultipart()
+        msg['From'] = sender_email
+        msg['To'] = recipient_email
+        msg['Subject'] = subject
+        msg.attach(MIMEText(html_body, 'html', 'utf-8'))
+
+        for filename in [bull_csv, bear_csv]:
+            if filename and os.path.exists(filename):
+                with open(filename, 'rb') as f:
+                    part = MIMEBase('application', 'octet-stream')
+                    part.set_payload(f.read())
+                encoders.encode_base64(part)
+                part.add_header('Content-Disposition', f'attachment; filename={os.path.basename(filename)}')
+                msg.attach(part)
+
+        if smtp_port == 465:
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=40) as server:
+                server.login(sender_email, sender_password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=40) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(sender_email, sender_password)
+                server.send_message(msg)
+        logger.info(f"BREAKOUT EMAIL sent successfully to {recipient_email}")
+        return True
+    except Exception as e:
+        logger.error(f"BREAKOUT EMAIL failed: {type(e).__name__}: {e}")
+        return False
