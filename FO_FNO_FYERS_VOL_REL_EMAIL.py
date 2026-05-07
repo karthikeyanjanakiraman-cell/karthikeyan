@@ -1592,6 +1592,78 @@ def main_index_first():
 
 
 
+def build_breakout_trade_table(df: pd.DataFrame, side: str = "bull") -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Rk", "Symbol", "Entry", "Entry â‚¹", "Exit", "Exit â‚¹", "Points", "% Move", "Day %"])
+
+    work = df.copy()
+    rename_map = {}
+    for c in work.columns:
+        lc = str(c).strip().lower()
+        if lc in ["symbol", "ticker"]:
+            rename_map[c] = "Symbol"
+        elif lc in ["entry", "entry time", "entry_time"]:
+            rename_map[c] = "Entry"
+        elif lc in ["entry price", "entry_price", "entryâ‚¹", "entry rupees", "entry rs", "entry_r"]:
+            rename_map[c] = "Entry â‚¹"
+        elif lc in ["exit", "exit time", "exit_time"]:
+            rename_map[c] = "Exit"
+        elif lc in ["exit price", "exit_price", "exitâ‚¹", "exit rupees", "exit rs", "exit_r", "ltp"]:
+            rename_map[c] = "Exit â‚¹"
+        elif lc in ["points", "pnl", "profit_points"]:
+            rename_map[c] = "Points"
+        elif lc in ["% move", "pct move", "move%", "move_pct", "percent_move"]:
+            rename_map[c] = "% Move"
+        elif lc in ["day %", "day%", "change%", "% change", "pct_change"]:
+            rename_map[c] = "Day %"
+    work.rename(columns=rename_map, inplace=True)
+
+    for req in ["Symbol", "Entry", "Entry â‚¹"]:
+        if req not in work.columns:
+            raise ValueError(f"Missing required column for breakout table: {req}")
+
+    if "Exit" not in work.columns:
+        work["Exit"] = work["Entry"].apply(_compute_exit_time)
+    else:
+        work["Exit"] = work["Exit"].apply(_to_time_string)
+
+    if "Exit â‚¹" not in work.columns:
+        work["Exit â‚¹"] = work["Entry â‚¹"]
+
+    work["Entry â‚¹"] = pd.to_numeric(work["Entry â‚¹"], errors="coerce")
+    work["Exit â‚¹"] = pd.to_numeric(work["Exit â‚¹"], errors="coerce")
+
+    if "Points" not in work.columns:
+        if side.lower() == "bear":
+            work["Points"] = work["Entry â‚¹"] - work["Exit â‚¹"]
+        else:
+            work["Points"] = work["Exit â‚¹"] - work["Entry â‚¹"]
+
+    if "% Move" not in work.columns:
+        base = work["Entry â‚¹"].replace(0, np.nan)
+        if side.lower() == "bear":
+            work["% Move"] = ((work["Entry â‚¹"] - work["Exit â‚¹"]) / base) * 100.0
+        else:
+            work["% Move"] = ((work["Exit â‚¹"] - work["Entry â‚¹"]) / base) * 100.0
+
+    if "Day %" not in work.columns:
+        if "% Change" in work.columns:
+            work["Day %"] = work["% Change"]
+        else:
+            work["Day %"] = np.nan
+
+    work = work.sort_values(["Points", "% Move"], ascending=[False, False]).reset_index(drop=True)
+    work.insert(0, "Rk", range(1, len(work) + 1))
+    work["Entry"] = work["Entry"].apply(_to_time_string)
+    work["Exit"] = work["Exit"].apply(_to_time_string)
+    work["Entry â‚¹"] = work["Entry â‚¹"].apply(_format_rupee)
+    work["Exit â‚¹"] = work["Exit â‚¹"].apply(_format_rupee)
+    work["Points"] = work["Points"].apply(_format_points)
+    work["% Move"] = work["% Move"].apply(_format_pct)
+    work["Day %"] = work["Day %"].apply(_format_pct)
+
+    return work[["Rk", "Symbol", "Entry", "Entry â‚¹", "Exit", "Exit â‚¹", "Points", "% Move", "Day %"]]
+
 def send_breakout_candidates_email(long_df: pd.DataFrame, short_df: pd.DataFrame, trade_date: Optional[datetime] = None):
     trade_date = trade_date or datetime.now()
     bull_breakout = build_breakout_trade_table(long_df.copy() if isinstance(long_df, pd.DataFrame) else pd.DataFrame(), side="bull")
@@ -1683,78 +1755,6 @@ def _compute_exit_time(entry_time_val, hold_minutes: int = 90, cap_time: str = "
         exit_dt = cap_dt
     return exit_dt.strftime("%H:%M")
 
-
-def build_breakout_trade_table(df: pd.DataFrame, side: str = "bull") -> pd.DataFrame:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=["Rk", "Symbol", "Entry", "Entry â‚¹", "Exit", "Exit â‚¹", "Points", "% Move", "Day %"])
-
-    work = df.copy()
-    rename_map = {}
-    for c in work.columns:
-        lc = str(c).strip().lower()
-        if lc in ["symbol", "ticker"]:
-            rename_map[c] = "Symbol"
-        elif lc in ["entry", "entry time", "entry_time"]:
-            rename_map[c] = "Entry"
-        elif lc in ["entry price", "entry_price", "entryâ‚¹", "entry rupees", "entry rs", "entry_r"]:
-            rename_map[c] = "Entry â‚¹"
-        elif lc in ["exit", "exit time", "exit_time"]:
-            rename_map[c] = "Exit"
-        elif lc in ["exit price", "exit_price", "exitâ‚¹", "exit rupees", "exit rs", "exit_r", "ltp"]:
-            rename_map[c] = "Exit â‚¹"
-        elif lc in ["points", "pnl", "profit_points"]:
-            rename_map[c] = "Points"
-        elif lc in ["% move", "pct move", "move%", "move_pct", "percent_move"]:
-            rename_map[c] = "% Move"
-        elif lc in ["day %", "day%", "change%", "% change", "pct_change"]:
-            rename_map[c] = "Day %"
-    work.rename(columns=rename_map, inplace=True)
-
-    for req in ["Symbol", "Entry", "Entry â‚¹"]:
-        if req not in work.columns:
-            raise ValueError(f"Missing required column for breakout table: {req}")
-
-    if "Exit" not in work.columns:
-        work["Exit"] = work["Entry"].apply(_compute_exit_time)
-    else:
-        work["Exit"] = work["Exit"].apply(_to_time_string)
-
-    if "Exit â‚¹" not in work.columns:
-        work["Exit â‚¹"] = work["Entry â‚¹"]
-
-    work["Entry â‚¹"] = pd.to_numeric(work["Entry â‚¹"], errors="coerce")
-    work["Exit â‚¹"] = pd.to_numeric(work["Exit â‚¹"], errors="coerce")
-
-    if "Points" not in work.columns:
-        if side.lower() == "bear":
-            work["Points"] = work["Entry â‚¹"] - work["Exit â‚¹"]
-        else:
-            work["Points"] = work["Exit â‚¹"] - work["Entry â‚¹"]
-
-    if "% Move" not in work.columns:
-        base = work["Entry â‚¹"].replace(0, np.nan)
-        if side.lower() == "bear":
-            work["% Move"] = ((work["Entry â‚¹"] - work["Exit â‚¹"]) / base) * 100.0
-        else:
-            work["% Move"] = ((work["Exit â‚¹"] - work["Entry â‚¹"]) / base) * 100.0
-
-    if "Day %" not in work.columns:
-        if "% Change" in work.columns:
-            work["Day %"] = work["% Change"]
-        else:
-            work["Day %"] = np.nan
-
-    work = work.sort_values(["Points", "% Move"], ascending=[False, False]).reset_index(drop=True)
-    work.insert(0, "Rk", range(1, len(work) + 1))
-    work["Entry"] = work["Entry"].apply(_to_time_string)
-    work["Exit"] = work["Exit"].apply(_to_time_string)
-    work["Entry â‚¹"] = work["Entry â‚¹"].apply(_format_rupee)
-    work["Exit â‚¹"] = work["Exit â‚¹"].apply(_format_rupee)
-    work["Points"] = work["Points"].apply(_format_points)
-    work["% Move"] = work["% Move"].apply(_format_pct)
-    work["Day %"] = work["Day %"].apply(_format_pct)
-
-    return work[["Rk", "Symbol", "Entry", "Entry â‚¹", "Exit", "Exit â‚¹", "Points", "% Move", "Day %"]]
 
 
 def build_breakout_email_html(bull_df: pd.DataFrame, bear_df: pd.DataFrame, trade_date: Optional[datetime] = None) -> str:
