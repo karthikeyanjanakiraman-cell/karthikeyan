@@ -1021,45 +1021,34 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     return ('<div style="overflow-x:auto;margin:10px 0 18px 0;">' '<table style="border-collapse:collapse;background:#1f2937;font-family:Arial,sans-serif;">' f'<thead><tr>{header_cells}</tr></thead>' f'<tbody>{"".join(rows_html)}</tbody>' '</table></div>')
 
 
-
-# =============================================================================
-# BREAKOUT SCANNER â€” entry=09:15+IterationMinutes, exit=entry+90min cap 14:45
-# =============================================================================
-
-BREAKOUT_EXIT_BARS  = 18    # 18 x 5min = 90min hold
-BREAKOUT_LOOKBACK   = 20    # prior bars to define range
-BREAKOUT_MIN_EXTRAS = 2     # minimum confirming conditions
-BREAKOUT_TOP_N      = 10    # email only top 10
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# BREAKOUT SCANNER
+# Fixes: % Change col, Range_Expansion/Volume_Expansion names,
+#        entry cap â‰¥14:45, hard Change gate (bullâ‰¥0, bearâ‰¤0),
+#        first-bar entry, bear Z < -0.50
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+BREAKOUT_EXIT_BARS  = 18    # 90 min
+BREAKOUT_LOOKBACK   = 20
+BREAKOUT_MIN_EXTRAS = 2
+BREAKOUT_TOP_N      = 10
 
 
 def identify_breakout_stocks(iter_df, lookback_bars=BREAKOUT_LOOKBACK):
-    """
-    Scan 5-min iteration rows for VWAP-range breakouts.
-    Entry  = 09:15 + Iteration Minutes (clock HH:MM)
-    Exit   = Entry + 90 min, hard-capped at 14:45
-    Sort   = Entry time DESC (latest entry first), top 10 only
-    FIX1   : Change col = "% Change"
-    FIX2   : Expansion cols = "Range_Expansion", "Volume_Expansion"
-    FIX3   : Skip entries at or after 14:45
-    """
     if iter_df is None or iter_df.empty:
         return pd.DataFrame(), pd.DataFrame()
+    CAP_ABS = 14 * 60 + 45
 
-    CAP_ABS = 14 * 60 + 45   # 14:45 in minutes from midnight
-
-    def _m2t(abs_m):
-        h, mn = divmod(int(abs_m), 60)
+    def _m2t(m):
+        h, mn = divmod(int(m), 60)
         return f"{h:02d}:{mn:02d}"
 
     bull_rows, bear_rows = [], []
-
     for symbol, grp in iter_df.groupby("Symbol", sort=False):
         grp = grp.sort_values("Iteration Minutes").reset_index(drop=True)
         if len(grp) < lookback_bars + 1:
             continue
 
         def _col(name, fill=0.0):
-            """Case-insensitive column lookup with correct-length fallback."""
             col_map = {c.lower(): c for c in grp.columns}
             actual  = col_map.get(name.lower())
             if actual:
@@ -1070,9 +1059,9 @@ def identify_breakout_stocks(iter_df, lookback_bars=BREAKOUT_LOOKBACK):
         z    = _col("VWAP Z-Score")
         v10  = _col("10 Day Relative Volume")
         rsi  = _col("Cumulative RSI", 50)
-        chg  = _col("% Change")           # FIX 1: was "Change"
-        re_  = _col("Range_Expansion")    # FIX 2: was "RangeExpansion"
-        ve_  = _col("Volume_Expansion")   # FIX 2: was "VolumeExpansion"
+        chg  = _col("% Change")           # FIX 1
+        re_  = _col("Range_Expansion")    # FIX 2
+        ve_  = _col("Volume_Expansion")   # FIX 2
         mins = pd.to_numeric(grp["Iteration Minutes"], errors="coerce").values
         lead = grp.get("PriceLeadStatus", pd.Series(["NORMAL"] * len(grp))).values
 
@@ -1089,9 +1078,9 @@ def identify_breakout_stocks(iter_df, lookback_bars=BREAKOUT_LOOKBACK):
             ph, pl = float(prior.max()), float(prior.min())
 
             entry_abs = 9 * 60 + 15 + int(mins[i])
-            if entry_abs >= CAP_ABS:      # FIX 3: skip entries at/after 14:45
+            if entry_abs >= CAP_ABS:   # FIX 3
                 continue
-            exit_abs  = min(entry_abs + BREAKOUT_EXIT_BARS * 5, CAP_ABS)
+            exit_abs = min(entry_abs + BREAKOUT_EXIT_BARS * 5, CAP_ABS)
             ent_t, ext_t = _m2t(entry_abs), _m2t(exit_abs)
 
             cz, cv10, crsi, cchg = z[i], v10[i], rsi[i], chg[i]
@@ -1101,169 +1090,168 @@ def identify_breakout_stocks(iter_df, lookback_bars=BREAKOUT_LOOKBACK):
                 "STRONG_PRICE_LEAD_FADE", "STRONGPRICELEADFADE",
             )
 
-            # â”€â”€ BULL â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            if cv > ph and symbol not in seen_bull:
-                extras = sum([
-                    cz > 0.30, cv10 > 1.0, crsi > 55,
-                    cchg > 0, lead_hit, cve > 1.0, cre > 1.0,
-                ])
+            # BULL â€” hard gate: positive Change only (FIX 4), first-bar (FIX 5)
+            if cv > ph and symbol not in seen_bull and cchg >= 0:
+                extras = sum([cz > 0.30, cv10 > 1.0, crsi > 55,
+                              cchg > 0, lead_hit, cve > 1.0, cre > 1.0])
                 if extras >= BREAKOUT_MIN_EXTRAS:
                     grade = "BEST" if extras >= 4 else ("STRONG" if extras == 3 else "GOOD")
                     bull_rows.append({
-                        "Symbol":      symbol,
-                        "Change":      round(float(cchg), 2),
-                        "Entry":       ent_t,
-                        "Entry Price": round(float(cv), 2),
-                        "Stop Price":  round(float(cv) * 0.998, 2),
-                        "Exit":        ext_t,
-                        "VWAP Z":      round(float(cz), 2),
-                        "Signal":      "BUY",
-                        "Volume Exp":  round(float(cve), 2),
-                        "Range Exp":   round(float(cre), 2),
-                        "20d RVOL":    round(float(cv10), 2),
-                        "Grade":       grade,
-                        "_entry_abs":  entry_abs,
-                        "_extras":     extras,
+                        "Symbol": symbol, "Change": round(float(cchg), 2),
+                        "Entry": ent_t, "Entry Price": round(float(cv), 2),
+                        "Stop Price": round(float(cv) * 0.998, 2), "Exit": ext_t,
+                        "VWAP Z": round(float(cz), 2), "Signal": "BUY",
+                        "Volume Exp": round(float(cve), 2), "Range Exp": round(float(cre), 2),
+                        "20d RVOL": round(float(cv10), 2), "Grade": grade,
+                        "_ea": entry_abs, "_ex": extras,
                     })
                     seen_bull.add(symbol)
 
-            # â”€â”€ BEAR â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-            elif cv < pl and symbol not in seen_bear:
-                extras = sum([
-                    cz < -0.50, cv10 > 1.0, crsi < 45,   # tightened from -0.30
-                    cchg < 0, lead_hit, cve > 1.0, cre > 1.0,
-                ])
+            # BEAR â€” hard gate: negative Change only (FIX 4), Z < -0.50 (FIX 6)
+            elif cv < pl and symbol not in seen_bear and cchg <= 0:
+                extras = sum([cz < -0.50, cv10 > 1.0, crsi < 45,
+                              cchg < 0, lead_hit, cve > 1.0, cre > 1.0])
                 if extras >= BREAKOUT_MIN_EXTRAS:
                     grade = "BEST" if extras >= 4 else ("STRONG" if extras == 3 else "GOOD")
                     bear_rows.append({
-                        "Symbol":      symbol,
-                        "Change":      round(float(cchg), 2),
-                        "Entry":       ent_t,
-                        "Entry Price": round(float(cv), 2),
-                        "Stop Price":  round(float(cv) * 1.003, 2),
-                        "Exit":        ext_t,
-                        "VWAP Z":      round(float(cz), 2),
-                        "Signal":      "SELL",
-                        "Volume Exp":  round(float(cve), 2),
-                        "Range Exp":   round(float(cre), 2),
-                        "20d RVOL":    round(float(cv10), 2),
-                        "Grade":       grade,
-                        "_entry_abs":  entry_abs,
-                        "_extras":     extras,
+                        "Symbol": symbol, "Change": round(float(cchg), 2),
+                        "Entry": ent_t, "Entry Price": round(float(cv), 2),
+                        "Stop Price": round(float(cv) * 1.003, 2), "Exit": ext_t,
+                        "VWAP Z": round(float(cz), 2), "Signal": "SELL",
+                        "Volume Exp": round(float(cve), 2), "Range Exp": round(float(cre), 2),
+                        "20d RVOL": round(float(cv10), 2), "Grade": grade,
+                        "_ea": entry_abs, "_ex": extras,
                     })
                     seen_bear.add(symbol)
 
     def _fin(rows):
         if not rows:
             return pd.DataFrame()
-        df = (
-            pd.DataFrame(rows)
-              .sort_values(["_entry_abs", "_extras"], ascending=[False, False])
-              .head(BREAKOUT_TOP_N)
-              .reset_index(drop=True)
-        )
+        df = (pd.DataFrame(rows)
+                .sort_values(["_ea", "_ex"], ascending=[False, False])
+                .head(BREAKOUT_TOP_N).reset_index(drop=True))
         df.index = df.index + 1
         return df.drop(columns=[c for c in df.columns if c.startswith("_")])
 
     return _fin(bull_rows), _fin(bear_rows)
 
 
-# =============================================================================
-# BREAKOUT HTML TABLE â€” identical dark style to df_to_html_table
-# =============================================================================
-
-_BREAKOUT_COLS = [
-    "Symbol", "Change", "Entry", "Entry Price", "Stop Price",
-    "Exit", "VWAP Z", "Signal", "Volume Exp", "Range Exp",
-    "20d RVOL", "Grade",
-]
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# BREAKOUT HTML TABLE
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+_BRK_COLS = ["Symbol","Change","Entry","Entry Price","Stop Price",
+             "Exit","VWAP Z","Signal","Volume Exp","Range Exp","20d RVOL","Grade"]
 
 
-def _grade_bg(g):
-    return {"BEST": "2e7d32", "STRONG": "3f8f45", "GOOD": "5b9b5f"}.get(
-        str(g).strip().upper(), "4b5563"
-    )
+def _gbg(g):
+    return {"BEST":"2e7d32","STRONG":"1565c0","GOOD":"6a1e9e"}.get(str(g).strip().upper(),"4b5563")
 
 
-def breakout_df_to_html(df, title=""):
-    """Render breakout DataFrame in same dark theme as df_to_html_table."""
+def breakout_df_to_html(df):
     if df is None or df.empty:
-        msg = (title + ": " if title else "") + "No breakout candidates found."
-        return f'<p style="color:#cbd5e1;font-family:Arial,sans-serif;">{msg}</p>'
-
+        return '<p style="color:#cbd5e1;font-family:Arial,sans-serif;">No breakout candidates found.</p>'
     Q    = chr(34)
-    cols = [c for c in _BREAKOUT_COLS if c in df.columns]
-
-    th_s = (
-        "padding:8px 10px;border:1px solid #4b5563;"
-        "background:#374151;color:#f9fafb;font-size:12px;"
-        "font-weight:700;text-align:center;white-space:nowrap;"
-    )
-    header_cells = "".join(
-        f'<th style={Q}{th_s}{Q}>{c}</th>' for c in ["Rk"] + cols
-    )
-
-    rows_html = []
+    cols = [c for c in _BRK_COLS if c in df.columns]
+    th_s = ("padding:8px 10px;border:1px solid #4b5563;background:#374151;"
+            "color:#f9fafb;font-size:12px;font-weight:700;text-align:center;white-space:nowrap;")
+    hdr  = "".join(f'<th style={Q}{th_s}{Q}>{c}</th>' for c in ["Rk"] + cols)
+    rows = []
     for rk, (_, row) in enumerate(df.iterrows(), start=1):
-        rk_s = (
-            "padding:7px 9px;border:1px solid #4b5563;"
-            "background:#374151;color:#f9fafb;font-size:12px;"
-            "font-weight:700;text-align:center;white-space:nowrap;"
-        )
+        rk_s = ("padding:7px 9px;border:1px solid #4b5563;background:#374151;"
+                "color:#f9fafb;font-size:12px;font-weight:700;text-align:center;white-space:nowrap;")
         cells = [f'<td style={Q}{rk_s}{Q}>{rk}</td>']
-
         for c in cols:
-            val     = row.get(c, "")
-            val_str = "" if pd.isna(val) else str(val)
-
-            if c == "Symbol":
-                bg, fg, extra = "374151", "f9fafb", "text-align:left;font-weight:700;"
+            val  = row.get(c, "")
+            vs   = "" if (isinstance(val, float) and pd.isna(val)) else str(val)
+            if   c == "Symbol":   bg,fg,ex = "374151","f9fafb","text-align:left;font-weight:700;"
             elif c == "Signal":
-                bg    = "2e7d32" if val_str == "BUY" else ("a83232" if val_str == "SELL" else "4b5563")
-                fg    = "ffffff"
-                extra = "text-align:center;"
-            elif c == "Grade":
-                bg, fg, extra = _grade_bg(val_str), "ffffff", "text-align:center;font-weight:700;"
+                bg = "2e7d32" if vs=="BUY" else ("a83232" if vs=="SELL" else "4b5563")
+                fg,ex = "ffffff","text-align:center;"
+            elif c == "Grade":    bg,fg,ex = _gbg(vs),"ffffff","text-align:center;font-weight:700;"
             elif c == "Change":
                 try:
-                    num = float(val_str)
-                    bg  = "2e7d32" if num > 0 else ("a83232" if num < 0 else "4b5563")
-                    fg  = "e8f5e9" if num > 0 else ("ffebee" if num < 0 else "f3f4f6")
-                    val_str = f"{num:+.2f}%"
-                except Exception:
-                    bg, fg = "4b5563", "f3f4f6"
-                extra = "text-align:center;"
-            elif c in ("Entry Price", "Stop Price"):
-                bg, fg, extra = "303643", "f3f4f6", "text-align:right;"
-                try:
-                    val_str = f"{float(val_str):,.2f}"
-                except Exception:
-                    pass
-            elif c in ("VWAP Z", "Volume Exp", "Range Exp", "20d RVOL"):
-                bg, fg, extra = "3b4252", "f3f4f6", "text-align:center;"
-                try:
-                    val_str = f"{float(val_str):.2f}"
-                except Exception:
-                    pass
-            else:
-                bg, fg, extra = "3b4252", "f3f4f6", "text-align:center;"
+                    n=float(vs); bg="2e7d32" if n>0 else("a83232" if n<0 else"4b5563")
+                    fg="e8f5e9" if n>0 else("ffebee" if n<0 else"f3f4f6"); vs=f"{n:+.2f}%"
+                except Exception: bg,fg="4b5563","f3f4f6"
+                ex="text-align:center;"
+            elif c in ("Entry Price","Stop Price"):
+                bg,fg,ex="303643","f3f4f6","text-align:right;"
+                try: vs=f"{float(vs):,.2f}"
+                except Exception: pass
+            elif c in ("VWAP Z","Volume Exp","Range Exp","20d RVOL"):
+                bg,fg,ex="3b4252","f3f4f6","text-align:center;"
+                try: vs=f"{float(vs):.2f}"
+                except Exception: pass
+            else: bg,fg,ex="3b4252","f3f4f6","text-align:center;"
+            td_s=(f"padding:7px 9px;border:1px solid #4b5563;background:#{bg};"
+                  f"color:#{fg};font-size:12px;font-weight:600;white-space:nowrap;{ex}")
+            cells.append(f'<td style={Q}{td_s}{Q}>{vs}</td>')
+        rows.append("<tr>"+"".join(cells)+"</tr>")
+    return ('<div style="overflow-x:auto;margin:10px 0 18px 0;">'
+            '<table style="border-collapse:collapse;background:#1f2937;font-family:Arial,sans-serif;">'
+            f'<thead><tr>{hdr}</tr></thead>'
+            f'<tbody>{"".join(rows)}</tbody>'
+            '</table></div>')
 
-            td_s = (
-                f"padding:7px 9px;border:1px solid #4b5563;"
-                f"background:#{bg};color:#{fg};font-size:12px;"
-                f"font-weight:600;white-space:nowrap;{extra}"
-            )
-            cells.append(f'<td style={Q}{td_s}{Q}>{val_str}</td>')
 
-        rows_html.append("<tr>" + "".join(cells) + "</tr>")
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# EMAIL 1 â€” BREAKOUT ALERT (separate email + breakout CSVs attached)
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+def send_breakout_email(bull_df: pd.DataFrame, bear_df: pd.DataFrame,
+                        bull_csv: str = None, bear_csv: str = None) -> bool:
+    try:
+        scan_time  = datetime.now().strftime("%d %b %Y, %H:%M")
+        bull_html  = breakout_df_to_html(bull_df)
+        bear_html  = breakout_df_to_html(bear_df)
+        bull_cnt   = len(bull_df) if bull_df is not None and not bull_df.empty else 0
+        bear_cnt   = len(bear_df) if bear_df is not None and not bear_df.empty else 0
 
-    return (
-        '<div style="overflow-x:auto;margin:10px 0 18px 0;">'
-        '<table style="border-collapse:collapse;background:#1f2937;font-family:Arial,sans-serif;">'
-        f'<thead><tr>{header_cells}</tr></thead>'
-        f'<tbody>{"".join(rows_html)}</tbody>'
-        '</table></div>'
-    )
+        html_body = f"""<html>
+  <body style="font-family:Arial,sans-serif;font-size:13px;background:#111827;color:#f3f4f6;padding:16px;">
+    <h2 style="color:#f9fafb;">&#128640; Intraday Breakout Alert &#8212; {scan_time}</h2>
+    <h3 style="color:#4ade80;">&#128640; Bull Breakout Trades &#8212; Top {bull_cnt} (Latest Entry First)</h3>
+    {bull_html}
+    <h3 style="color:#f87171;">&#128315; Bear Breakout Trades &#8212; Top {bear_cnt} (Latest Entry First)</h3>
+    {bear_html}
+    <p style="color:#9ca3af;font-size:11px;">
+      Filters: Bull = positive &#37;Change only &#124; Bear = negative &#37;Change only<br>
+      Exit = Entry + 90 min capped at 14:45 &#124; Bear VWAP Z &lt; -0.50
+    </p>
+  </body>
+</html>"""
+
+        msg = MIMEMultipart()
+        msg["From"]    = sender_email
+        msg["To"]      = recipient_email
+        msg["Subject"] = (f"Breakout Alert - {datetime.now().strftime('%d %b %H:%M')}"
+                          f" | Bull:{bull_cnt} Bear:{bear_cnt}")
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+
+        for fpath in [bull_csv, bear_csv]:
+            if not fpath or not os.path.exists(str(fpath)):
+                continue
+            with open(fpath, "rb") as fp:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(fp.read())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition",
+                            f"attachment; filename={os.path.basename(fpath)}")
+            msg.attach(part)
+
+        if smtp_port == 465:
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=40) as sv:
+                sv.login(sender_email, sender_password)
+                sv.send_message(msg)
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=40) as sv:
+                sv.ehlo(); sv.starttls(); sv.ehlo()
+                sv.login(sender_email, sender_password)
+                sv.send_message(msg)
+        logger.info(f"BREAKOUT EMAIL Sent | Bull:{bull_cnt} Bear:{bear_cnt}")
+        return True
+    except Exception as e:
+        logger.error(f"BREAKOUT EMAIL Failed: {type(e).__name__}: {e}")
+        return False
 
 def send_email_with_tables(
     long_df: pd.DataFrame,
@@ -1273,8 +1261,6 @@ def send_email_with_tables(
     index_long_df: pd.DataFrame = None,
     index_short_df: pd.DataFrame = None,
     index_iter_csv_filename: Optional[str] = None,
-    bull_breakout_df: pd.DataFrame = None,
-    bear_breakout_df: pd.DataFrame = None,
 ) -> bool:
     """Send email with index and stock long/short tables and attach CSVs."""
     try:
@@ -1285,13 +1271,6 @@ def send_email_with_tables(
 
         scan_time = datetime.now().strftime("%d %b %Y, %H:%M")
 
-        # â”€â”€ Breakout tables (top 10, latest entry first) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        bull_html = breakout_df_to_html(
-            bull_breakout_df if bull_breakout_df is not None else pd.DataFrame()
-        )
-        bear_html = breakout_df_to_html(
-            bear_breakout_df if bear_breakout_df is not None else pd.DataFrame()
-        )
         index_long_html = df_to_html_table(index_long_df)
         index_short_html = df_to_html_table(index_short_df)
         stock_long_html = df_to_html_table(long_df)
@@ -1301,10 +1280,6 @@ def send_email_with_tables(
 <html>
   <body style="font-family: Arial, sans-serif; font-size: 13px;">
     <h2>Intraday Vol Iteration Alert</h2>
-        <h3>&#128640; Bull Breakout Trades &#8212; Top 10 (Latest Entry First)</h3>
-        {bull_html}
-        <h3>&#128315; Bear Breakout Trades &#8212; Top 10 (Latest Entry First)</h3>
-        {bear_html}
     <p>Scan completed at {scan_time}.</p>
 
     <h3>Index Long Candidates</h3>
@@ -1841,14 +1816,26 @@ def main_index_first():
         index_iter_df.to_csv(index_iter_csv, index=False)
         logger.info(f'INDEX Iteration summary saved: {index_iter_csv}')
 
-    # â”€â”€ Identify top-10 breakouts (latest entry first) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    bull_brk, bear_brk = (
-        identify_breakout_stocks(detail_df)
-        if detail_df is not None and not detail_df.empty
-        else (pd.DataFrame(), pd.DataFrame())
-    )
+    
+    # â”€â”€ Breakout scan + separate breakout email â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    logger.info("BREAKOUT Scanning for breakouts...")
+    bull_df, bear_df = identify_breakout_stocks(detail_df)
 
-    send_email_with_tables(long_df, short_df, summary_csv, detail_csv, index_long_df=index_long_df, index_short_df=index_short_df, index_iter_csv_filename=(index_iter_csv if 'index_iter_csv' in locals() else None), bull_breakout_df=bull_brk, bear_breakout_df=bear_brk)
+    ts_b = datetime.now().strftime("%Y%m%d_%H%M%S")
+    bull_csv_path = bear_csv_path = None
+    if bull_df is not None and not bull_df.empty:
+        bull_csv_path = f"bull_breakout_trades_{ts_b}.csv"
+        bull_df.to_csv(bull_csv_path, index=False)
+        logger.info(f"BREAKOUT Bull CSV: {bull_csv_path}")
+    if bear_df is not None and not bear_df.empty:
+        bear_csv_path = f"bear_breakout_trades_{ts_b}.csv"
+        bear_df.to_csv(bear_csv_path, index=False)
+        logger.info(f"BREAKOUT Bear CSV: {bear_csv_path}")
+
+    send_breakout_email(bull_df, bear_df, bull_csv_path, bear_csv_path)
+
+    # â”€â”€ Candidate / index email (no breakout tables) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    send_email_with_tables(long_df, short_df, summary_csv, detail_csv, index_long_df=index_long_df, index_short_df=index_short_df, index_iter_csv_filename=(index_iter_csv if 'index_iter_csv' in locals() else None))
     logger.info('Index-first Scan Pipeline Completed')
 
 if __name__ == '__main__':
