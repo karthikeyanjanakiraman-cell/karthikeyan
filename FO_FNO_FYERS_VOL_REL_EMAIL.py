@@ -1590,194 +1590,187 @@ if __name__ == '__main__':
     main_index_first()
 
 
-# ==============================
-# BREAKOUT EMAIL PATCH
-# ==============================
-BREAKOUT_EMAIL_COLS = [
-    "Rk", "Symbol", "Change", "Entry", "Entry Price", "Stop Price", "Exit",
-    "VWAP Z", "Signal", "Volume Exp", "Range Exp", "20d RVOL", "Grade"
-]
+##############################
+# BREAKOUT EMAIL EXTENSIONS
+##############################
 
-
-def _fmt_num_breakout(x, decimals=2):
-    if pd.isna(x):
+def _to_time_string(val) -> str:
+    if pd.isna(val):
         return ""
-    return f"{float(x):,.{decimals}f}"
+    if isinstance(val, datetime):
+        return val.strftime("%H:%M")
+    s = str(val).strip()
+    for fmt in ["%H:%M:%S", "%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"]:
+        try:
+            return datetime.strptime(s, fmt).strftime("%H:%M")
+        except Exception:
+            pass
+    return s[:5]
 
 
-
-def _fmt_pct_signed_breakout(x):
-    if pd.isna(x):
-        return ""
-    return f"{float(x):+,.2f}%"
-
-
-
-def breakout_grade(row: pd.Series, direction: str) -> str:
-    vwap_z = float(pd.to_numeric(row.get("VWAP Z-Score"), errors="coerce")) if pd.notna(pd.to_numeric(row.get("VWAP Z-Score"), errors="coerce")) else np.nan
-    vol_exp = float(pd.to_numeric(row.get("Volume_Expansion", row.get("VolumeExpansion")), errors="coerce")) if pd.notna(pd.to_numeric(row.get("Volume_Expansion", row.get("VolumeExpansion")), errors="coerce")) else np.nan
-    range_exp = float(pd.to_numeric(row.get("Range_Expansion", row.get("RangeExpansion")), errors="coerce")) if pd.notna(pd.to_numeric(row.get("Range_Expansion", row.get("RangeExpansion")), errors="coerce")) else np.nan
-    rvol20 = float(pd.to_numeric(row.get("20 Day Relative Volume"), errors="coerce")) if pd.notna(pd.to_numeric(row.get("20 Day Relative Volume"), errors="coerce")) else np.nan
-
-    if direction.lower() == "bull":
-        if pd.notna(vwap_z) and vwap_z >= 0.80 and pd.notna(range_exp) and range_exp >= 1.0:
-            return "BEST"
-        if pd.notna(vwap_z) and vwap_z >= 0.50:
-            return "STRONG"
-        return "GOOD"
-    else:
-        if pd.notna(vwap_z) and vwap_z <= -0.80 and pd.notna(range_exp) and range_exp >= 0.9:
-            return "BEST"
-        if pd.notna(vwap_z) and vwap_z < -0.50:
-            return "STRONG"
-        return "GOOD"
-
-
-
-def build_breakout_email_table(detail_df: pd.DataFrame, direction: str = "bull", top_n: int = 10) -> pd.DataFrame:
-    if detail_df is None or detail_df.empty:
-        return pd.DataFrame(columns=BREAKOUT_EMAIL_COLS)
-
-    work = detail_df.copy()
-    rename_map = {
-        "Change": "% Change",
-        "RangeExpansion": "Range_Expansion",
-        "VolumeExpansion": "Volume_Expansion",
-        "DeltaExpansion": "Delta_Expansion",
-    }
-    work.rename(columns={k: v for k, v in rename_map.items() if k in work.columns}, inplace=True)
-
-    required = ["Symbol", "% Change", "Iteration Time", "LTP", "VWAP Z-Score"]
-    missing = [c for c in required if c not in work.columns]
-    if missing:
-        raise ValueError(f"Missing required breakout email columns: {missing}")
-
-    for c in ["% Change", "LTP", "VWAP Z-Score", "20 Day Relative Volume", "Range_Expansion", "Volume_Expansion"]:
-        if c in work.columns:
-            work[c] = pd.to_numeric(work[c], errors="coerce")
-
-    work["Symbol"] = work["Symbol"].astype(str).str.strip().str.upper()
-    work["Iteration Time"] = work["Iteration Time"].astype(str).str.slice(0, 5)
-    work = work.dropna(subset=["Symbol", "Iteration Time", "LTP", "% Change", "VWAP Z-Score"]).copy()
-    if work.empty:
-        return pd.DataFrame(columns=BREAKOUT_EMAIL_COLS)
-
-    if direction.lower() == "bull":
-        filt = work[work["% Change"] > 0].copy()
-        filt = filt[filt["VWAP Z-Score"] >= 0.50].copy()
-        signal = "BUY"
-    else:
-        filt = work[(work["% Change"] < 0) & (work["VWAP Z-Score"] < -0.50)].copy()
-        signal = "SELL"
-
-    if filt.empty:
-        return pd.DataFrame(columns=BREAKOUT_EMAIL_COLS)
-
-    first_hits = (
-        filt.sort_values(["Symbol", "Iteration Time"])
-            .groupby("Symbol", as_index=False)
-            .first()
-            .copy()
-    )
-
-    first_hits["Entry"] = first_hits["Iteration Time"]
-    first_hits["Entry Price"] = first_hits["LTP"]
-    first_hits["Exit"] = first_hits["Entry"].apply(add_exit_time_90m)
-
-    if direction.lower() == "bull":
-        first_hits["Stop Price"] = first_hits["Entry Price"] * 0.998
-    else:
-        first_hits["Stop Price"] = first_hits["Entry Price"] * 1.003
-
-    first_hits["VWAP Z"] = first_hits["VWAP Z-Score"]
-    first_hits["Signal"] = signal
-    first_hits["Volume Exp"] = first_hits.get("Volume_Expansion", np.nan)
-    first_hits["Range Exp"] = first_hits.get("Range_Expansion", np.nan)
-    first_hits["20d RVOL"] = first_hits.get("20 Day Relative Volume", np.nan)
-    first_hits["Change"] = first_hits["% Change"]
-    first_hits["Grade"] = first_hits.apply(lambda r: breakout_grade(r, direction), axis=1)
-
-    out = first_hits[[
-        "Symbol", "Change", "Entry", "Entry Price", "Stop Price", "Exit",
-        "VWAP Z", "Signal", "Volume Exp", "Range Exp", "20d RVOL", "Grade"
-    ]].copy()
-
-    out = out.sort_values(["Entry", "VWAP Z"], ascending=[False, False if direction.lower() == 'bull' else True]).reset_index(drop=True)
-    out.insert(0, "Rk", range(1, len(out) + 1))
-    out = out.head(top_n).copy()
-
-    out["Change"] = out["Change"].map(_fmt_pct_signed_breakout)
-    for c in ["Entry Price", "Stop Price", "VWAP Z", "Volume Exp", "Range Exp", "20d RVOL"]:
-        out[c] = out[c].map(lambda x: _fmt_num_breakout(x, 2))
-
-    return out[BREAKOUT_EMAIL_COLS]
-
-
-
-def breakout_email_table_to_html(df: pd.DataFrame, title: str) -> str:
-    if df is None or df.empty:
-        return f"<h3>{title}</h3><p>No breakout trades found.</p>"
-    return f"""
-    <h3 style='font-family:Arial,sans-serif;color:#111827;margin:18px 0 10px 0;'>{title}</h3>
-    <div style='overflow-x:auto;margin-bottom:18px;'>
-      <table style='border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:12px;'>
-        <thead>
-          <tr>
-            {''.join([f"<th style='border:1px solid #cbd5e1;padding:7px 8px;background:#0f172a;color:#f8fafc;white-space:nowrap;'>{c}</th>" for c in df.columns])}
-          </tr>
-        </thead>
-        <tbody>
-          {''.join(['<tr>' + ''.join([f"<td style='border:1px solid #cbd5e1;padding:7px 8px;text-align:center;white-space:nowrap;'>{row[c]}</td>" for c in df.columns]) + '</tr>' for _, row in df.iterrows()])}
-        </tbody>
-      </table>
-    </div>
-    """
-
-
-
-def send_breakout_email(bull_df: pd.DataFrame, bear_df: pd.DataFrame, bull_csv: str = None, bear_csv: str = None) -> bool:
+def _format_rupee(val) -> str:
     try:
-        scan_time = datetime.now().strftime("%d %b %Y, %H:%M")
-        bull_count = 0 if bull_df is None else len(bull_df)
-        bear_count = 0 if bear_df is None else len(bear_df)
-        subject = f"Breakout Alert - {datetime.now().strftime('%d %b %H:%M')} | Bull:{bull_count} Bear:{bear_count}"
-        html_body = f"""
-        <html><body style='font-family:Arial,sans-serif;font-size:13px;color:#111827;'>
-        <h2 style='margin:0 0 12px 0;'>Intraday Breakout Alert - {scan_time}</h2>
-        {breakout_email_table_to_html(bull_df, 'Bull Breakout Trades - Top 10 (Latest Entry First)')}
-        {breakout_email_table_to_html(bear_df, 'Bear Breakout Trades - Top 10 (Latest Entry First)')}
-        <p style='margin-top:14px;color:#374151;'>Filters: Bull = positive %Change only | Bear = negative %Change only<br>Exit = Entry + 90 min capped at 14:45 | Bear VWAP Z &lt; -0.50</p>
-        </body></html>
-        """
+        num = float(val)
+        if abs(num) >= 1000:
+            return f"{num:,.0f}"
+        if abs(num) >= 100:
+            return f"{num:,.0f}"
+        return f"{num:,.0f}" if float(num).is_integer() else f"{num:,.2f}"
+    except Exception:
+        return str(val)
 
-        msg = MIMEMultipart()
-        msg['From'] = sender_email
-        msg['To'] = recipient_email
-        msg['Subject'] = subject
-        msg.attach(MIMEText(html_body, 'html', 'utf-8'))
 
-        for filename in [bull_csv, bear_csv]:
-            if filename and os.path.exists(filename):
-                with open(filename, 'rb') as f:
-                    part = MIMEBase('application', 'octet-stream')
-                    part.set_payload(f.read())
-                encoders.encode_base64(part)
-                part.add_header('Content-Disposition', f'attachment; filename={os.path.basename(filename)}')
-                msg.attach(part)
+def _format_points(val) -> str:
+    try:
+        num = float(val)
+        return f"{num:+.2f}"
+    except Exception:
+        return str(val)
 
-        if smtp_port == 465:
-            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=40) as server:
-                server.login(sender_email, sender_password)
-                server.send_message(msg)
+
+def _format_pct(val) -> str:
+    try:
+        return f"{float(val):.2f}%"
+    except Exception:
+        return str(val)
+
+
+def _compute_exit_time(entry_time_val, hold_minutes: int = 90, cap_time: str = "14:45") -> str:
+    if pd.isna(entry_time_val) or str(entry_time_val).strip() == "":
+        return ""
+    s = str(entry_time_val).strip()
+    parsed = None
+    for fmt in ["%H:%M:%S", "%H:%M", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M"]:
+        try:
+            parsed = datetime.strptime(s, fmt)
+            break
+        except Exception:
+            continue
+    if parsed is None:
+        return s[:5]
+    exit_dt = parsed + timedelta(minutes=hold_minutes)
+    cap_dt = parsed.replace(hour=int(cap_time.split(':')[0]), minute=int(cap_time.split(':')[1]), second=0)
+    if exit_dt > cap_dt:
+        exit_dt = cap_dt
+    return exit_dt.strftime("%H:%M")
+
+
+def build_breakout_trade_table(df: pd.DataFrame, side: str = "bull") -> pd.DataFrame:
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Rk", "Symbol", "Entry", "Entry â‚¹", "Exit", "Exit â‚¹", "Points", "% Move", "Day %"])
+
+    work = df.copy()
+    rename_map = {}
+    for c in work.columns:
+        lc = str(c).strip().lower()
+        if lc in ["symbol", "ticker"]:
+            rename_map[c] = "Symbol"
+        elif lc in ["entry", "entry time", "entry_time"]:
+            rename_map[c] = "Entry"
+        elif lc in ["entry price", "entry_price", "entryâ‚¹", "entry rupees", "entry rs", "entry_r"]:
+            rename_map[c] = "Entry â‚¹"
+        elif lc in ["exit", "exit time", "exit_time"]:
+            rename_map[c] = "Exit"
+        elif lc in ["exit price", "exit_price", "exitâ‚¹", "exit rupees", "exit rs", "exit_r", "ltp"]:
+            rename_map[c] = "Exit â‚¹"
+        elif lc in ["points", "pnl", "profit_points"]:
+            rename_map[c] = "Points"
+        elif lc in ["% move", "pct move", "move%", "move_pct", "percent_move"]:
+            rename_map[c] = "% Move"
+        elif lc in ["day %", "day%", "change%", "% change", "pct_change"]:
+            rename_map[c] = "Day %"
+    work.rename(columns=rename_map, inplace=True)
+
+    for req in ["Symbol", "Entry", "Entry â‚¹"]:
+        if req not in work.columns:
+            raise ValueError(f"Missing required column for breakout table: {req}")
+
+    if "Exit" not in work.columns:
+        work["Exit"] = work["Entry"].apply(_compute_exit_time)
+    else:
+        work["Exit"] = work["Exit"].apply(_to_time_string)
+
+    if "Exit â‚¹" not in work.columns:
+        work["Exit â‚¹"] = work["Entry â‚¹"]
+
+    work["Entry â‚¹"] = pd.to_numeric(work["Entry â‚¹"], errors="coerce")
+    work["Exit â‚¹"] = pd.to_numeric(work["Exit â‚¹"], errors="coerce")
+
+    if "Points" not in work.columns:
+        if side.lower() == "bear":
+            work["Points"] = work["Entry â‚¹"] - work["Exit â‚¹"]
         else:
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=40) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-                server.login(sender_email, sender_password)
-                server.send_message(msg)
-        logger.info(f"BREAKOUT EMAIL sent successfully to {recipient_email}")
-        return True
-    except Exception as e:
-        logger.error(f"BREAKOUT EMAIL failed: {type(e).__name__}: {e}")
-        return False
+            work["Points"] = work["Exit â‚¹"] - work["Entry â‚¹"]
+
+    if "% Move" not in work.columns:
+        base = work["Entry â‚¹"].replace(0, np.nan)
+        if side.lower() == "bear":
+            work["% Move"] = ((work["Entry â‚¹"] - work["Exit â‚¹"]) / base) * 100.0
+        else:
+            work["% Move"] = ((work["Exit â‚¹"] - work["Entry â‚¹"]) / base) * 100.0
+
+    if "Day %" not in work.columns:
+        if "% Change" in work.columns:
+            work["Day %"] = work["% Change"]
+        else:
+            work["Day %"] = np.nan
+
+    work = work.sort_values(["Points", "% Move"], ascending=[False, False]).reset_index(drop=True)
+    work.insert(0, "Rk", range(1, len(work) + 1))
+    work["Entry"] = work["Entry"].apply(_to_time_string)
+    work["Exit"] = work["Exit"].apply(_to_time_string)
+    work["Entry â‚¹"] = work["Entry â‚¹"].apply(_format_rupee)
+    work["Exit â‚¹"] = work["Exit â‚¹"].apply(_format_rupee)
+    work["Points"] = work["Points"].apply(_format_points)
+    work["% Move"] = work["% Move"].apply(_format_pct)
+    work["Day %"] = work["Day %"].apply(_format_pct)
+
+    return work[["Rk", "Symbol", "Entry", "Entry â‚¹", "Exit", "Exit â‚¹", "Points", "% Move", "Day %"]]
+
+
+def build_breakout_email_html(bull_df: pd.DataFrame, bear_df: pd.DataFrame, trade_date: Optional[datetime] = None) -> str:
+    trade_date = trade_date or datetime.now()
+    date_str = trade_date.strftime("%d %b %Y")
+    html_parts = ["<html><body style='font-family:Georgia,serif;background:#ffffff;color:#222;padding:12px'>"]
+    html_parts.append(build_html_table(bull_df, f"All {len(bull_df)} Bull Breakout Trades - {date_str}"))
+    html_parts.append("<div style='height:18px'></div>")
+    html_parts.append(build_html_table(bear_df, f"All {len(bear_df)} Bear Breakout Trades - {date_str}"))
+    html_parts.append("</body></html>")
+    return "".join(html_parts)
+
+
+def send_breakout_email(bull_breakout_df: pd.DataFrame, bear_breakout_df: pd.DataFrame, trade_date: Optional[datetime] = None, attachments: Optional[List[str]] = None):
+    trade_date = trade_date or datetime.now()
+    subject = f"Gmail Breakout Alert - {trade_date.strftime('%d-%b-%H_%M')} - Bull_{len(bull_breakout_df)}-Bear_{len(bear_breakout_df)}"
+    html_body = build_breakout_email_html(bull_breakout_df, bear_breakout_df, trade_date)
+    send_email(subject, html_body, attachments=attachments or [])
+
+
+def run_and_send_breakout_email(source_df: pd.DataFrame, trade_date: Optional[datetime] = None):
+    if source_df is None or source_df.empty:
+        logger.warning("BREAKOUT Source dataframe empty. Skipping breakout email.")
+        return pd.DataFrame(), pd.DataFrame()
+
+    bull_source = source_df[source_df["Bull_Signal"].astype(str).str.contains("Buy", case=False, na=False)].copy() if "Bull_Signal" in source_df.columns else pd.DataFrame()
+    bear_source = source_df[source_df["Bear_Signal"].astype(str).str.contains("Sell", case=False, na=False)].copy() if "Bear_Signal" in source_df.columns else pd.DataFrame()
+
+    for temp in [bull_source, bear_source]:
+        if not temp.empty:
+            if "Entry" not in temp.columns:
+                temp["Entry"] = "09:45"
+            if "Entry â‚¹" not in temp.columns:
+                temp["Entry â‚¹"] = pd.to_numeric(temp.get("LTP", np.nan), errors="coerce")
+            if "Exit â‚¹" not in temp.columns:
+                temp["Exit â‚¹"] = pd.to_numeric(temp.get("LTP", np.nan), errors="coerce")
+            if "Day %" not in temp.columns and "% Change" in temp.columns:
+                temp["Day %"] = temp["% Change"]
+
+    bull_breakout = build_breakout_trade_table(bull_source, side="bull") if not bull_source.empty else pd.DataFrame(columns=["Rk", "Symbol", "Entry", "Entry â‚¹", "Exit", "Exit â‚¹", "Points", "% Move", "Day %"])
+    bear_breakout = build_breakout_trade_table(bear_source, side="bear") if not bear_source.empty else pd.DataFrame(columns=["Rk", "Symbol", "Entry", "Entry â‚¹", "Exit", "Exit â‚¹", "Points", "% Move", "Day %"])
+
+    bull_csv = "breakout_bull_trades.csv"
+    bear_csv = "breakout_bear_trades.csv"
+    bull_breakout.to_csv(bull_csv, index=False)
+    bear_breakout.to_csv(bear_csv, index=False)
+    send_breakout_email(bull_breakout, bear_breakout, trade_date=trade_date or datetime.now(), attachments=[bull_csv, bear_csv])
+    return bull_breakout, bear_breakout
