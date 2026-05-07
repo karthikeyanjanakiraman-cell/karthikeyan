@@ -1108,6 +1108,40 @@ def send_email_with_tables(
 
 
 
+
+
+def send_generic_email(subject: str, html_body: str, attachments: Optional[List[str]] = None) -> bool:
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = sender_email
+        msg["To"] = recipient_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+        for filename in attachments or []:
+            if not filename or not os.path.exists(filename):
+                continue
+            with open(filename, "rb") as f:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(filename)}")
+            msg.attach(part)
+        if smtp_port == 465:
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=40) as server:
+                server.login(sender_email, sender_password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=40) as server:
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
+                server.login(sender_email, sender_password)
+                server.send_message(msg)
+        logger.info(f"EMAIL Sent successfully to {recipient_email}")
+        return True
+    except Exception as e:
+        logger.error(f"EMAIL Failed to send email: {type(e).__name__}: {e}")
+        return False
 ##############################
 # INDEX-FIRST EXTENSIONS
 ##############################
@@ -1775,7 +1809,7 @@ def send_breakout_email(bull_breakout_df: pd.DataFrame, bear_breakout_df: pd.Dat
     trade_date = trade_date or datetime.now()
     subject = f"Gmail Breakout Alert - {trade_date.strftime('%d-%b-%H_%M')} - Bull_{len(bull_breakout_df)}-Bear_{len(bear_breakout_df)}"
     html_body = build_breakout_email_html(bull_breakout_df, bear_breakout_df, trade_date)
-    send_email(subject, html_body, attachments=attachments or [])
+    return send_generic_email(subject, html_body, attachments=attachments or [])
 
 
 def run_and_send_breakout_email(source_df: pd.DataFrame, trade_date: Optional[datetime] = None):
