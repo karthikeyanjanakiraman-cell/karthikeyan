@@ -1108,40 +1108,6 @@ def send_email_with_tables(
 
 
 
-
-
-def send_generic_email(subject: str, html_body: str, attachments: Optional[List[str]] = None) -> bool:
-    try:
-        msg = MIMEMultipart()
-        msg["From"] = sender_email
-        msg["To"] = recipient_email
-        msg["Subject"] = subject
-        msg.attach(MIMEText(html_body, "html", "utf-8"))
-        for filename in attachments or []:
-            if not filename or not os.path.exists(filename):
-                continue
-            with open(filename, "rb") as f:
-                part = MIMEBase("application", "octet-stream")
-                part.set_payload(f.read())
-            encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(filename)}")
-            msg.attach(part)
-        if smtp_port == 465:
-            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=40) as server:
-                server.login(sender_email, sender_password)
-                server.send_message(msg)
-        else:
-            with smtplib.SMTP(smtp_host, smtp_port, timeout=40) as server:
-                server.ehlo()
-                server.starttls()
-                server.ehlo()
-                server.login(sender_email, sender_password)
-                server.send_message(msg)
-        logger.info(f"EMAIL Sent successfully to {recipient_email}")
-        return True
-    except Exception as e:
-        logger.error(f"EMAIL Failed to send email: {type(e).__name__}: {e}")
-        return False
 ##############################
 # INDEX-FIRST EXTENSIONS
 ##############################
@@ -1551,6 +1517,256 @@ def build_index_iteration_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
     out = out[final_cols].sort_values(["Index Name", "Iteration No", "Iteration Minutes"]).reset_index(drop=True)
     return out
 
+
+
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# BREAKOUT EMAIL â€” builds and sends the "Intraday Breakout Alert" table email
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+def _smtp_send(subject: str, html_body: str, attachments=None) -> bool:
+    """Low-level SMTP sender used by ALL email paths in this script."""
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = sender_email
+        msg["To"] = recipient_email
+        msg["Subject"] = subject
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+        for filename in (attachments or []):
+            if not filename or not os.path.exists(str(filename)):
+                continue
+            with open(filename, "rb") as f:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition",
+                            f"attachment; filename={os.path.basename(filename)}")
+            msg.attach(part)
+        if smtp_port == 465:
+            with smtplib.SMTP_SSL(smtp_host, smtp_port, timeout=40) as srv:
+                srv.login(sender_email, sender_password)
+                srv.send_message(msg)
+        else:
+            with smtplib.SMTP(smtp_host, smtp_port, timeout=40) as srv:
+                srv.ehlo(); srv.starttls(); srv.ehlo()
+                srv.login(sender_email, sender_password)
+                srv.send_message(msg)
+        logger.info(f"EMAIL Sent successfully to {recipient_email}")
+        return True
+    except Exception as e:
+        logger.error(f"EMAIL Failed to send: {type(e).__name__}: {e}")
+        return False
+
+
+def _calc_stop_price(row, side: str) -> float:
+    """Entry price Â± 0.3% as stop."""
+    try:
+        price = float(row.get("LTP", 0) or 0)
+        return round(price * 0.997, 2) if side == "bull" else round(price * 1.003, 2)
+    except Exception:
+        return 0.0
+
+
+def _calc_exit_time(entry_str: str) -> str:
+    try:
+        dt = datetime.strptime(str(entry_str)[:5], "%H:%M") + timedelta(minutes=90)
+        cap = datetime.strptime("14:45", "%H:%M")
+        return min(dt, cap).strftime("%H:%M")
+    except Exception:
+        return "14:45"
+
+
+def _grade(row) -> str:
+    try:
+        vwap_z = float(row.get("VWAP Z-Score") or 0)
+        vol_exp = float(row.get("Volume_Expansion") or 0)
+        rng_exp = float(row.get("Range_Expansion") or 0)
+        score = 0
+        if abs(vwap_z) >= 1.5: score += 2
+        elif abs(vwap_z) >= 0.8: score += 1
+        if vol_exp >= 2.0: score += 2
+        elif vol_exp >= 1.0: score += 1
+        if rng_exp >= 2.0: score += 2
+        elif rng_exp >= 1.0: score += 1
+        if score >= 5: return "BEST"
+        if score >= 3: return "STRONG"
+        if score >= 1: return "GOOD"
+        return "FAIR"
+    except Exception:
+        return "FAIR"
+
+
+def _grade_color(g: str) -> str:
+    return {"BEST": "#1b7a2f", "STRONG": "#1a4a99", "GOOD": "#6a3bb5"}.get(g, "#444")
+
+
+def build_breakout_rows(df: pd.DataFrame, side: str, top_n: int = 10) -> list:
+    """Filter, sort, and return list-of-dicts for breakout table rows."""
+    if df is None or df.empty:
+        return []
+    work = df.copy()
+
+    # Ensure required columns exist
+    if "LTP" not in work.columns:
+        return []
+    work["LTP"] = pd.to_numeric(work["LTP"], errors="coerce")
+    work = work.dropna(subset=["LTP"])
+
+    if "% Change" not in work.columns:
+        work["% Change"] = 0.0
+    work["% Change"] = pd.to_numeric(work["% Change"], errors="coerce").fillna(0.0)
+
+    if "Last Iteration Time" in work.columns:
+        work["_entry"] = work["Last Iteration Time"].astype(str).str[:5].replace({"nan": "09:45", "": "09:45"})
+    else:
+        work["_entry"] = "09:45"
+
+    # Filter direction
+    if side == "bull":
+        work = work[work["% Change"] > 0].copy()
+    else:
+        work = work[work["% Change"] < 0].copy()
+        if "VWAP Z-Score" in work.columns:
+            work = work[pd.to_numeric(work["VWAP Z-Score"], errors="coerce").fillna(0) < -0.50].copy()
+
+    if work.empty:
+        return []
+
+    # Sort: latest entry first, then by VWAP Z-Score magnitude
+    work["_entry_dt"] = pd.to_datetime(work["_entry"], format="%H:%M", errors="coerce")
+    vz_col = "VWAP Z-Score" if "VWAP Z-Score" in work.columns else None
+    if vz_col:
+        work["_z_abs"] = pd.to_numeric(work[vz_col], errors="coerce").abs().fillna(0)
+    else:
+        work["_z_abs"] = 0
+    work = work.sort_values(["_entry_dt", "_z_abs"], ascending=[False, False]).reset_index(drop=True).head(top_n)
+
+    rows = []
+    for i, row in work.iterrows():
+        entry_time = row["_entry"]
+        entry_price = float(row["LTP"])
+        stop_price = _calc_stop_price(row, side)
+        exit_time = _calc_exit_time(entry_time)
+        vwap_z = float(pd.to_numeric(row.get("VWAP Z-Score", 0) or 0, errors="coerce") or 0)
+        signal = "BUY" if side == "bull" else "SELL"
+        vol_exp = float(pd.to_numeric(row.get("Volume_Expansion", 0) or 0, errors="coerce") or 0)
+        rng_exp = float(pd.to_numeric(row.get("Range_Expansion", 0) or 0, errors="coerce") or 0)
+        rvol_20 = float(pd.to_numeric(row.get("20 Day Relative Volume", 0) or 0, errors="coerce") or 0)
+        grade = _grade(row)
+        rows.append({
+            "Rk": len(rows) + 1,
+            "Symbol": str(row.get("Symbol", "")),
+            "Change": f"{float(row['% Change']):+.2f}%",
+            "Entry": entry_time,
+            "Entry Price": f"{entry_price:,.2f}",
+            "Stop Price": f"{stop_price:,.2f}",
+            "Exit": exit_time,
+            "VWAP Z": f"{vwap_z:.2f}",
+            "Signal": signal,
+            "Volume Exp": f"{vol_exp:.2f}",
+            "Range Exp": f"{rng_exp:.2f}",
+            "20d RVOL": f"{rvol_20:.2f}",
+            "Grade": grade,
+            "_side": side,
+        })
+    return rows
+
+
+def _breakout_table_html(rows: list, title: str, side: str) -> str:
+    if not rows:
+        return f"<p style=\'color:#aaa;font-size:13px\'>No {side} breakout trades found.</p>"
+    is_bull = side == "bull"
+    icon = "ðŸš€" if is_bull else "â–¼"
+    title_color = "#00e676" if is_bull else "#ff5252"
+    cols = ["Rk", "Symbol", "Change", "Entry", "Entry Price", "Stop Price", "Exit",
+            "VWAP Z", "Signal", "Volume Exp", "Range Exp", "20d RVOL", "Grade"]
+    hdr = "".join(f"<th style=\'padding:7px 10px;text-align:center;border:1px solid #333;font-size:12px\'>{c}</th>" for c in cols)
+    body = ""
+    for r in rows:
+        chg_val = float(r["Change"].replace("%","").replace("+",""))
+        chg_col = "#00e676" if chg_val >= 0 else "#ff5252"
+        sig_col = "#1b7a2f" if r["Signal"] == "BUY" else "#b71c1c"
+        grade_col = _grade_color(r["Grade"])
+        cells = ""
+        for c in cols:
+            val = str(r.get(c, ""))
+            style = "padding:7px 10px;text-align:center;border:1px solid #333;font-size:12px;color:#eee"
+            if c == "Change":
+                style += f";color:{chg_col};font-weight:bold"
+            elif c == "Signal":
+                val = f"<span style=\'background:{sig_col};color:#fff;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:bold\'>{val}</span>"
+            elif c == "Grade":
+                val = f"<span style=\'background:{grade_col};color:#fff;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:bold\'>{val}</span>"
+            cells += f"<td style=\'{style}\'>{val}</td>"
+        body += f"<tr>{cells}</tr>"
+    return f"""
+<h3 style=\'color:{title_color};font-family:Arial,sans-serif;margin:18px 0 6px\'>{icon} {title}</h3>
+<table style=\'border-collapse:collapse;width:100%;background:#1a1a2e\'>
+  <thead><tr style=\'background:#0f3460\'>{hdr}</tr></thead>
+  <tbody>{body}</tbody>
+</table>"""
+
+
+def build_and_send_breakout_email(stock_df: pd.DataFrame, trade_date=None):
+    """Build the breakout alert email matching the PDF format and send it."""
+    if stock_df is None or stock_df.empty:
+        logger.warning("BREAKOUT No stock data for breakout email.")
+        return
+
+    trade_date = trade_date or datetime.now()
+    date_str = trade_date.strftime("%d %b %Y, %H:%M")
+    timestamp = trade_date.strftime("%Y%m%d_%H%M%S")
+
+    bull_rows = build_breakout_rows(stock_df, side="bull", top_n=10)
+    bear_rows = build_breakout_rows(stock_df, side="bear", top_n=10)
+
+    if not bull_rows and not bear_rows:
+        logger.warning("BREAKOUT No bull or bear breakout candidates found.")
+        return
+
+    bull_html = _breakout_table_html(bull_rows, f"Bull Breakout Trades â€” Top {len(bull_rows)} (Latest Entry First)", "bull")
+    bear_html = _breakout_table_html(bear_rows, f"Bear Breakout Trades â€” Top {len(bear_rows)} (Latest Entry First)", "bear")
+
+    footer = """
+<p style=\'color:#aaa;font-size:11px;margin-top:12px\'>
+Filters: Bull = positive %Change only | Bear = negative %Change only<br>
+Exit = Entry + 90 min capped at 14:45 | Bear VWAP Z &lt; -0.50
+</p>"""
+
+    html = f"""<html><body style=\'background:#0d0d1a;color:#eee;font-family:Arial,sans-serif;padding:16px\'>
+<h2 style=\'color:#fff\'>ðŸš€ Intraday Breakout Alert â€” {date_str}</h2>
+{bull_html}
+<div style=\'height:20px\'></div>
+{bear_html}
+{footer}
+</body></html>"""
+
+    # Save CSVs
+    bull_csv = f"bull_breakout_trades_{timestamp}.csv"
+    bear_csv = f"bear_breakout_trades_{timestamp}.csv"
+    if bull_rows:
+        import csv as _csv
+        with open(bull_csv, "w", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=[k for k in bull_rows[0] if k != "_side"])
+            w.writeheader()
+            w.writerows([{k: v for k, v in r.items() if k != "_side"} for r in bull_rows])
+    if bear_rows:
+        import csv as _csv
+        with open(bear_csv, "w", newline="") as f:
+            w = _csv.DictWriter(f, fieldnames=[k for k in bear_rows[0] if k != "_side"])
+            w.writeheader()
+            w.writerows([{k: v for k, v in r.items() if k != "_side"} for r in bear_rows])
+
+    subject = f"Breakout Alert - {trade_date.strftime('%d %b %H:%M')} | Bull:{len(bull_rows)} Bear:{len(bear_rows)}"
+    attachments = [f for f in [bull_csv if bull_rows else None, bear_csv if bear_rows else None] if f]
+    try:
+        ok = send_generic_email(subject, html, attachments)
+        if ok:
+            logger.info(f"BREAKOUT Email sent successfully: Bull={len(bull_rows)} Bear={len(bear_rows)}")
+        else:
+            logger.error(f"BREAKOUT Email send returned False: Bull={len(bull_rows)} Bear={len(bear_rows)}")
+    except Exception as e:
+        logger.error(f"BREAKOUT Failed to send email: {type(e).__name__}: {e}")
+
 def main_index_first():
     logger.info('Starting Index-first FO Iteration Volume Volatility Scan')
     init_fyers()
@@ -1618,6 +1834,17 @@ def main_index_first():
         logger.info(f'INDEX Iteration summary saved: {index_iter_csv}')
 
     send_email_with_tables(long_df, short_df, summary_csv, detail_csv, index_long_df=index_long_df, index_short_df=index_short_df, index_iter_csv_filename=(index_iter_csv if 'index_iter_csv' in locals() else None))
+    logger.info('MAIN Primary email send attempt completed')
+
+    # â”€â”€ Breakout email â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    try:
+        combined_stock = pd.concat([s for s in [long_stock_source, short_stock_source] if isinstance(s, pd.DataFrame) and not s.empty], ignore_index=True).drop_duplicates(subset=['Symbol']) if any(isinstance(s, pd.DataFrame) and not s.empty for s in [long_stock_source, short_stock_source]) else pd.DataFrame()
+        if combined_stock.empty and not df_all.empty:
+            combined_stock = df_all.copy()
+        build_and_send_breakout_email(combined_stock, trade_date=datetime.now())
+    except Exception as _be:
+        logger.error(f'BREAKOUT Failed to send separate breakout email: {_be}')
+
     logger.info('Index-first Scan Pipeline Completed')
 
 if __name__ == '__main__':
