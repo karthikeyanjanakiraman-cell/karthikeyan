@@ -38,6 +38,9 @@ DAILY_LOOKBACK_DAYS = 60
 INTRADAY_LOOKBACK_DAYS = 20
 IVP_LOOKBACK_DAYS = 252
 INDEX_SOFT_BOOST_WEIGHT = 0.25
+BREAKOUT_EXIT_BARS  = 18          # 18 x 5min = 90-min hold
+BREAKOUT_MIN_EXTRAS = 2           # min extra confirmations
+BREAKOUT_HARD_CAP   = time(14, 45)
 
 fyers: Optional[fyersModel.FyersModel] = None
 
@@ -1022,243 +1025,188 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
 
 
 
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-#  BREAKOUT DETECTION â€” Bull + Bear â€” from iteration detail CSV
-#  Derived from NIFTY 2020-2026 data (1,573 trading days)
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+#  BREAKOUT SCANNER
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
 
 BREAKOUT_COLS = [
-    "Symbol", "% Change", "Entry Time", "Entry Price",
-    "Stop Price", "Exit Time (Bar+10)", "VWAP Z @Signal",
-    "Volume Exp", "Range Exp", "Delta Exp", "20d RVOL", "Grade",
+    "Rk", "Symbol", "Entry", "Entry \u20b9", "Exit", "Exit \u20b9",
+    "Points", "% Move", "Day %", "VWAP Z", "RVol10", "Grade",
 ]
 
+def identify_breakout_stocks(
+    iter_df: pd.DataFrame,
+    lookback_bars: int = 20,
+) -> "tuple[pd.DataFrame, pd.DataFrame]":
+    if iter_df is None or iter_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
 
-def _add_minutes(time_str: str, mins: int) -> str:
-    """Add minutes to a HH:MM string and return HH:MM."""
-    try:
-        from datetime import datetime as _dt, timedelta as _td
-        t = _dt.strptime(str(time_str).strip(), "%H:%M")
-        return (t + _td(minutes=mins)).strftime("%H:%M")
-    except Exception:
-        return ""
-
-
-def identify_breakout_stocks(detail_df: pd.DataFrame):
-    """
-    Scan iteration detail CSV and return (bull_df, bear_df).
-
-    BULL conditions (NIFTY-data-derived):
-      C1 : % Change > +0.5
-      C2 : VWAP Z-Score > 0 at 09:35, 09:40, 09:45
-      C3 : Cumulative OBV > 0 AND rising at signal bar
-      Extra: >= 2 of [Vol Exp>1, Range Exp>1, Delta Exp>1, 20d RVOL>1]
-      Entry: first qualifying bar >= iteration 7 (09:45)
-      Stop : Entry VWAP * 0.998  (-0.2%)
-      Exit : Entry bar + 10 bars = +50 min
-
-    BEAR conditions (mirror):
-      C1 : % Change < -0.5
-      C2 : VWAP Z-Score < 0 at 09:35, 09:40, 09:45
-      C3 : Cumulative OBV < 0 AND falling at signal bar
-      Extra: >= 2 of [Vol Exp>1, Range Exp>1, Delta Exp<1, 20d RVOL>1]
-      Stop : Entry VWAP * 1.003  (+0.3%)
-    """
-    if detail_df is None or detail_df.empty:
-        empty = pd.DataFrame(columns=BREAKOUT_COLS)
-        return empty, empty
-
-    df = detail_df.copy().sort_values(["Symbol", "Iteration No"]).reset_index(drop=True)
-
-    def _safe(v):
-        try:
-            f = float(v)
-            return f if not (f != f) else np.nan   # nan check
-        except Exception:
-            return np.nan
-
-    # Pivot VWAP Z at early bars
-    vz_piv = df[df["Iteration Time"].isin(["09:35", "09:40", "09:45"])].pivot_table(
-        index="Symbol", columns="Iteration Time", values="VWAP Z-Score"
-    )
-    vz_piv.columns = ["vz_0935", "vz_0940", "vz_0945"] if len(vz_piv.columns) == 3 else vz_piv.columns
-
-    # Pivot OBV at 09:40 / 09:45
-    obv_piv = df[df["Iteration Time"].isin(["09:40", "09:45"])].pivot_table(
-        index="Symbol", columns="Iteration Time", values="Cumulative OBV"
-    )
-    obv_piv.columns = ["obv_0940", "obv_0945"] if len(obv_piv.columns) == 2 else obv_piv.columns
-
+    today = datetime.now().date()
     bull_rows, bear_rows = [], []
 
-    for sym, grp in df.groupby("Symbol"):
-        grp = grp.sort_values("Iteration No").reset_index(drop=True)
-        pct = _safe(grp["% Change"].iloc[0])
-
-        def _piv_get(pivot, sym, col):
-            try:
-                return _safe(pivot.loc[sym, col]) if sym in pivot.index and col in pivot.columns else np.nan
-            except Exception:
-                return np.nan
-
-        vz5  = _piv_get(vz_piv, sym, "vz_0935")
-        vz6  = _piv_get(vz_piv, sym, "vz_0940")
-        vz7  = _piv_get(vz_piv, sym, "vz_0945")
-        obv6 = _piv_get(obv_piv, sym, "obv_0940")
-        obv7 = _piv_get(obv_piv, sym, "obv_0945")
-
-        if any(np.isnan(x) for x in [vz5, vz6, vz7, obv6, obv7]):
+    for symbol, grp in iter_df.groupby("Symbol", sort=False):
+        grp = grp.sort_values("Iteration Minutes").reset_index(drop=True)
+        if len(grp) < lookback_bars + 1:
             continue
 
-        vwap_l  = grp["Cumulative VWAP"].tolist()
-        vz_l    = grp["VWAP Z-Score"].tolist()
-        obv_l   = grp["Cumulative OBV"].tolist()
-        vol_l   = grp["Volume_Expansion"].tolist()
-        rng_l   = grp["Range_Expansion"].tolist()
-        dlt_l   = grp["Delta_Expansion"].tolist()
-        rvol_l  = grp["20 Day Relative Volume"].tolist()
-        times_l = grp["Iteration Time"].tolist()
+        for i in range(lookback_bars, len(grp)):
+            window  = grp.iloc[i - lookback_bars : i]
+            current = grp.iloc[i]
 
-        # â”€â”€ BULL â”€â”€
-        if pct > 0.5 and vz5 > 0 and vz6 > 0 and vz7 > 0 and obv7 > 0 and obv7 > obv6:
-            for i in range(6, len(grp) - 1):
-                vi = _safe(vz_l[i]);  oi = _safe(obv_l[i])
-                op = _safe(obv_l[i-1]) if i > 0 else np.nan
-                if np.isnan(vi) or np.isnan(oi): continue
-                if vi <= 0 or oi <= 0: continue
-                if not np.isnan(op) and oi <= op: continue
-                v_ = _safe(vol_l[i]); r_ = _safe(rng_l[i])
-                d_ = _safe(dlt_l[i]); rv_ = _safe(rvol_l[i])
-                extras = (
-                    (1 if (not np.isnan(v_)  and v_  > 1.0) else 0) +
-                    (1 if (not np.isnan(r_)  and r_  > 1.0) else 0) +
-                    (1 if (not np.isnan(d_)  and d_  > 1.0) else 0) +
-                    (1 if (not np.isnan(rv_) and rv_ > 1.0) else 0)
-                )
-                if extras < 2: continue
-                ep = _safe(vwap_l[i])
-                et = str(times_l[i])
-                grade = "BEST" if extras == 4 else "STRONG" if extras == 3 else "GOOD"
-                bull_rows.append({
-                    "Symbol": sym, "% Change": round(pct, 2),
-                    "Entry Time": et,
-                    "Entry Price": round(ep, 2) if not np.isnan(ep) else "",
-                    "Stop Price":  round(ep * 0.998, 2) if not np.isnan(ep) else "",
-                    "Exit Time (Bar+10)": _add_minutes(et, 50),
-                    "VWAP Z @Signal": round(vi, 2),
-                    "Volume Exp":  round(v_,  2) if not np.isnan(v_)  else "",
-                    "Range Exp":   round(r_,  2) if not np.isnan(r_)  else "",
-                    "Delta Exp":   round(d_,  2) if not np.isnan(d_)  else "",
-                    "20d RVOL":    round(rv_, 2) if not np.isnan(rv_) else "",
-                    "Grade": grade,
-                })
-                break
+            cur_vwap  = float(current.get("Cumulative VWAP",         0) or 0)
+            cur_z     = float(current.get("VWAP Z-Score",            0) or 0)
+            cur_vol10 = float(current.get("10 Day Relative Volume",  0) or 0)
+            cur_rsi   = float(current.get("Cumulative RSI",         50) or 50)
+            change    = float(current.get("Change",                  0) or 0)
+            lead      = str(current.get("PriceLeadStatus", "NORMAL"))
 
-        # â”€â”€ BEAR â”€â”€
-        if pct < -0.5 and vz5 < 0 and vz6 < 0 and vz7 < 0 and obv7 < 0 and obv7 < obv6:
-            for i in range(6, len(grp) - 1):
-                vi = _safe(vz_l[i]);  oi = _safe(obv_l[i])
-                op = _safe(obv_l[i-1]) if i > 0 else np.nan
-                if np.isnan(vi) or np.isnan(oi): continue
-                if vi >= 0 or oi >= 0: continue
-                if not np.isnan(op) and oi >= op: continue
-                v_ = _safe(vol_l[i]); r_ = _safe(rng_l[i])
-                d_ = _safe(dlt_l[i]); rv_ = _safe(rvol_l[i])
-                extras = (
-                    (1 if (not np.isnan(v_)  and v_  > 1.0) else 0) +
-                    (1 if (not np.isnan(r_)  and r_  > 1.0) else 0) +
-                    (1 if (not np.isnan(d_)  and d_  < 1.0) else 0) +
-                    (1 if (not np.isnan(rv_) and rv_ > 1.0) else 0)
-                )
-                if extras < 2: continue
-                ep = _safe(vwap_l[i])
-                et = str(times_l[i])
-                grade = "BEST" if extras == 4 else "STRONG" if extras == 3 else "GOOD"
-                bear_rows.append({
-                    "Symbol": sym, "% Change": round(pct, 2),
-                    "Entry Time": et,
-                    "Entry Price": round(ep, 2) if not np.isnan(ep) else "",
-                    "Stop Price":  round(ep * 1.003, 2) if not np.isnan(ep) else "",
-                    "Exit Time (Bar+10)": _add_minutes(et, 50),
-                    "VWAP Z @Signal": round(vi, 2),
-                    "Volume Exp":  round(v_,  2) if not np.isnan(v_)  else "",
-                    "Range Exp":   round(r_,  2) if not np.isnan(r_)  else "",
-                    "Delta Exp":   round(d_,  2) if not np.isnan(d_)  else "",
-                    "20d RVOL":    round(rv_, 2) if not np.isnan(rv_) else "",
-                    "Grade": grade,
-                })
-                break
+            prior_max = float(window["Cumulative VWAP"].max())
+            prior_min = float(window["Cumulative VWAP"].min())
 
-    bull_out = (pd.DataFrame(bull_rows).sort_values("% Change", ascending=False).reset_index(drop=True)
-                if bull_rows else pd.DataFrame(columns=BREAKOUT_COLS))
-    bear_out = (pd.DataFrame(bear_rows).sort_values("% Change").reset_index(drop=True)
-                if bear_rows else pd.DataFrame(columns=BREAKOUT_COLS))
-    return bull_out, bear_out
+            entry_mins = int(current.get("Iteration Minutes", 0) or 0)
+            entry_dt   = datetime.combine(today, time(9, 15)) + timedelta(minutes=entry_mins)
+            exit_dt    = min(
+                entry_dt + timedelta(minutes=BREAKOUT_EXIT_BARS * 5),
+                datetime.combine(today, BREAKOUT_HARD_CAP)
+            )
+            entry_str = entry_dt.strftime("%H:%M")
+            exit_str  = exit_dt.strftime("%H:%M")
+
+            if cur_vwap > prior_max and prior_max > 0:
+                extras = sum([
+                    cur_z     >  0.30,
+                    cur_vol10 >  1.0,
+                    cur_rsi   >  55,
+                    change    >  0,
+                    lead in ("EARLY_PRICE_LEAD", "STRONG_PRICE_LEAD_FADE"),
+                ])
+                if extras >= BREAKOUT_MIN_EXTRAS:
+                    pct = round((cur_vwap - prior_max) / prior_max * 100, 2)
+                    grade = "BEST" if extras >= 4 else ("STRONG" if extras == 3 else "GOOD")
+                    bull_rows.append({
+                        "Symbol":    symbol,
+                        "Entry":     entry_str,
+                        "Entry \u20b9": round(cur_vwap, 2),
+                        "Exit":      exit_str,
+                        "Exit \u20b9":  "",
+                        "Points":    "",
+                        "% Move":    f"+{pct}%",
+                        "Day %":     f"+{round(change,2)}%",
+                        "VWAP Z":   round(cur_z, 2),
+                        "RVol10":   round(cur_vol10, 2),
+                        "Grade":    grade,
+                        "Extras":   extras,
+                        "_pct":     pct,
+                    })
+
+            elif cur_vwap < prior_min and prior_min > 0:
+                extras = sum([
+                    cur_z     < -0.30,
+                    cur_vol10 >  1.0,
+                    cur_rsi   <  45,
+                    change    <  0,
+                    lead in ("EARLY_PRICE_LEAD", "STRONG_PRICE_LEAD_FADE"),
+                ])
+                if extras >= BREAKOUT_MIN_EXTRAS:
+                    pct = round((prior_min - cur_vwap) / prior_min * 100, 2)
+                    grade = "BEST" if extras >= 4 else ("STRONG" if extras == 3 else "GOOD")
+                    bear_rows.append({
+                        "Symbol":    symbol,
+                        "Entry":     entry_str,
+                        "Entry \u20b9": round(cur_vwap, 2),
+                        "Exit":      exit_str,
+                        "Exit \u20b9":  "",
+                        "Points":    "",
+                        "% Move":    f"-{pct}%",
+                        "Day %":     f"{round(change,2)}%",
+                        "VWAP Z":   round(cur_z, 2),
+                        "RVol10":   round(cur_vol10, 2),
+                        "Grade":    grade,
+                        "Extras":   extras,
+                        "_pct":     pct,
+                    })
+
+    def _finalize(rows):
+        if not rows:
+            return pd.DataFrame()
+        df = (
+            pd.DataFrame(rows)
+              .sort_values(["Extras", "_pct"], ascending=[False, False])
+              .drop_duplicates("Symbol")
+              .reset_index(drop=True)
+        )
+        df.insert(0, "Rk", range(1, len(df) + 1))
+        df.drop(columns=["Extras", "_pct"], inplace=True, errors="ignore")
+        return df
+
+    return _finalize(bull_rows), _finalize(bear_rows)
 
 
-def _grade_badge(grade: str, direction: str) -> tuple:
-    """Return (bg_color, fg_color, label) â€” plain text labels only, no emoji."""
-    g = str(grade).strip().upper()
-    if g == "BEST":
-        return "#e65100", "#ffffff", "BEST"
-    if g == "STRONG":
-        bg = "#1b5e20" if direction == "bull" else "#7f1d1d"
-        return bg, "#ffffff", "STRONG"
-    return "#1a237e", "#ffffff", "GOOD"
-
-def breakout_df_to_html(df: pd.DataFrame, direction: str = "bull") -> str:
-    """Build a clean HTML table for breakout stocks. No escaped quotes."""
+def breakout_df_to_html(df: pd.DataFrame, direction: str = "bull", max_rows: int = 60) -> str:
+    """Render breakout table with IDENTICAL style to df_to_html_table()."""
     if df is None or df.empty:
-        return "<p>No breakout stocks detected.</p>"
-
-    is_bull   = direction.lower() == "bull"
-    hdr_bg    = "#1b5e20" if is_bull else "#7f1d1d"
-    entry_bg  = "#e8f5e9" if is_bull else "#fce4ec"
-    exit_bg   = "#fff3e0"
-    pct_color = "#1b5e20" if is_bull else "#c62828"
+        return '<p style="color:#cbd5e1;font-family:Arial,sans-serif;">No breakout trades found.</p>'
 
     cols = [c for c in BREAKOUT_COLS if c in df.columns]
+    df_slice = df.head(max_rows).copy()
 
-    # Build header row
-    th_base = "padding:7px 10px;border:1px solid #bbb;font-weight:bold;white-space:nowrap;"
-    th_style = th_base + "background:" + hdr_bg + ";color:#ffffff;"
-    header = ""
-    for c in cols:
-        header += "<th style=" + chr(34) + th_style + chr(34) + ">" + c + "</th>"
+    header_cells = "".join(
+        f'<th style="padding:8px 10px;border:1px solid #4b5563;'
+        f'background:#374151;color:#f9fafb;font-size:12px;'
+        f'font-weight:700;text-align:center;white-space:nowrap;">{c}</th>'
+        for c in cols
+    )
 
-    # Build data rows
-    rows_html = ""
-    for _, row in df.iterrows():
-        cells = ""
+    rows_html = []
+    for _, row in df_slice.iterrows():
+        cells = []
         for c in cols:
-            val = row.get(c, "")
-            try:
-                val_str = "{:+.2f}%".format(float(val)) if c == "% Change" and val != "" else str(val)
-            except Exception:
-                val_str = str(val)
+            raw = row.get(c, "")
+            val = "" if (raw is None or (isinstance(raw, float) and pd.isna(raw))) else str(raw)
+            bg = "#3b4252"; fg = "#f3f4f6"; extra = "text-align:center;"
 
-            td_style = "padding:5px 9px;border:1px solid #e0e0e0;white-space:nowrap;"
-
-            if c in ("Entry Time", "Entry Price", "Stop Price"):
-                td_style += "background:" + entry_bg + ";"
-            elif c == "Exit Time (Bar+10)":
-                td_style += "background:" + exit_bg + ";font-weight:bold;"
-            elif c == "% Change":
-                td_style += "color:" + pct_color + ";font-weight:bold;"
+            if c == "Rk":
+                bg, fg = "#374151", "#9ca3af"
+            elif c == "Symbol":
+                bg = "#374151"; fg = "#f9fafb"
+                extra = "text-align:left;font-weight:700;"
             elif c == "Grade":
-                bg, fg, label = _grade_badge(val, direction)
-                td_style += "background:" + bg + ";color:" + fg + ";font-weight:bold;text-align:center;"
-                val_str = label
+                if val == "BEST":
+                    bg, fg = "#1a5c2a", "#a7f3d0"
+                elif val == "STRONG":
+                    bg, fg = "#1e3a5f", "#bfdbfe"
+                else:
+                    bg, fg = "#4b5563", "#e5e7eb"
+            elif c == "% Move":
+                bg = "#2e7d32" if direction == "bull" else "#a83232"
+                fg = "#e8f5e9" if direction == "bull" else "#ffebee"
+            elif c == "Day %":
+                try:
+                    num = float(val.replace("%","").replace("+",""))
+                    bg = "#2e7d32" if num > 0 else ("#a83232" if num < 0 else "#4b5563")
+                    fg = "#e8f5e9" if num > 0 else ("#ffebee" if num < 0 else "#f3f4f6")
+                except Exception:
+                    pass
+            elif c in ("Entry", "Exit"):
+                bg, fg = "#303643", "#f3f4f6"
+            elif "\u20b9" in c:
+                bg, fg = "#303643", "#f3f4f6"
+            elif c in ("VWAP Z", "RVol10", "Points"):
+                bg, fg = "#2f3542", "#d1d5db"
 
-            cells += "<td style=" + chr(34) + td_style + chr(34) + ">" + val_str + "</td>"
-        rows_html += "<tr>" + cells + "</tr>"
+            cells.append(
+                f'<td style="padding:7px 9px;border:1px solid #4b5563;'
+                f'background:{bg};color:{fg};font-size:12px;'
+                f'font-weight:600;white-space:nowrap;{extra}">{val}</td>'
+            )
+        rows_html.append("<tr>" + "".join(cells) + "</tr>")
 
-    table_style = "border-collapse:collapse;width:100%;font-size:12px;margin-bottom:16px;"
     return (
-        "<table style=" + chr(34) + table_style + chr(34) + ">"
-        + "<thead><tr>" + header + "</tr></thead>"
-        + "<tbody>" + rows_html + "</tbody>"
-        + "</table>"
+        '<div style="overflow-x:auto;margin:10px 0 18px 0;">'
+        '<table style="border-collapse:collapse;background:#1f2937;font-family:Arial,sans-serif;">'
+        f'<thead><tr>{header_cells}</tr></thead>'
+        f'<tbody>{"".join(rows_html)}</tbody>'
+        '</table></div>'
     )
 
 def send_email_with_tables(
@@ -1271,110 +1219,80 @@ def send_email_with_tables(
     index_iter_csv_filename: Optional[str] = None,
     bull_breakout_df: pd.DataFrame = None,
     bear_breakout_df: pd.DataFrame = None,
-    bull_breakout_csv: Optional[str] = None,
-    bear_breakout_csv: Optional[str] = None,
+    bull_csv: Optional[str] = None,
+    bear_csv: Optional[str] = None,
 ) -> bool:
-    """Send email with breakout tables (top) + index/stock tables + attach CSVs."""
+    """Send email with breakout tables + index/stock long-short tables."""
     try:
         if index_long_df is None:
             index_long_df = pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
         if index_short_df is None:
             index_short_df = pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-        if long_df is None:
-            long_df = pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-        if short_df is None:
-            short_df = pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+        if bull_breakout_df is None:
+            bull_breakout_df = pd.DataFrame()
+        if bear_breakout_df is None:
+            bear_breakout_df = pd.DataFrame()
 
-        scan_time  = datetime.now().strftime("%d %b %Y, %H:%M")
-        timestamp  = datetime.now().strftime("%Y%m%d_%H%M%S")
+        scan_time   = datetime.now().strftime("%d %b %Y, %H:%M")
+        bull_count  = len(bull_breakout_df)
+        bear_count  = len(bear_breakout_df)
 
+        bull_html        = breakout_df_to_html(bull_breakout_df, direction="bull")
+        bear_html        = breakout_df_to_html(bear_breakout_df, direction="bear")
         index_long_html  = df_to_html_table(index_long_df)
         index_short_html = df_to_html_table(index_short_df)
         stock_long_html  = df_to_html_table(long_df)
         stock_short_html = df_to_html_table(short_df)
 
-        # â”€â”€ Breakout tables â”€â”€
-        n_bull = len(bull_breakout_df) if bull_breakout_df is not None and not bull_breakout_df.empty else 0
-        n_bear = len(bear_breakout_df) if bear_breakout_df is not None and not bear_breakout_df.empty else 0
-        bull_html = breakout_df_to_html(bull_breakout_df, "bull") if n_bull > 0 else "<p>No bull breakout stocks today.</p>"
-        bear_html = breakout_df_to_html(bear_breakout_df, "bear") if n_bear > 0 else "<p>No bear breakout stocks today.</p>"
+        html_body = f"""
+<html>
+  <body style="font-family:Arial,sans-serif;font-size:13px;background:#111827;color:#f3f4f6;padding:16px;">
+    <h2 style="color:#f9fafb;">Intraday Vol Iteration Alert</h2>
+    <p style="color:#9ca3af;">Scan completed at {scan_time}</p>
 
-        # â”€â”€ Section style helpers â”€â”€
-        def section_h2(color, text):
-            q = chr(34)
-            style = (
-                "margin:18px 0 4px;color:" + color + ";"
-                "border-bottom:3px solid " + color + ";padding-bottom:5px;font-size:15px;"
-            )
-            return "<h2 style=" + q + style + q + ">" + text + "</h2>" 
-        def condition_p(text):
-            q = chr(34)
-            return "<p style=" + q + "font-size:11px;color:#555;margin:2px 0 8px;" + q + ">" + text + "</p>" 
+    <h3 style="color:#86efac;">&#128640; All {bull_count} Bull Breakout Trades &mdash; {datetime.now().strftime("%d %b %Y")}</h3>
+    {bull_html}
 
-        html_body = f"""<html>
-<head>
-  <meta charset="UTF-8">
-  <style>
-    body {{font-family:Arial,sans-serif;font-size:13px;color:#111;}}
-    h2   {{font-size:15px;}}
-    h3   {{font-size:14px;color:#1a237e;border-bottom:1px solid #c5cae9;padding-bottom:3px;}}
-    p    {{margin:4px 0;}}
-    table{{border-collapse:collapse;width:100%;margin-bottom:14px;font-size:12px;}}
-    th   {{padding:7px 10px;border:1px solid #bbb;font-weight:bold;white-space:nowrap;}}
-    td   {{padding:5px 9px;border:1px solid #e0e0e0;white-space:nowrap;}}
-  </style>
-</head>
-<body>
-  <h2 style="color:#1a237e;">Intraday Vol Iteration Alert</h2>
-  <p>Scan completed at {scan_time}.</p>
+    <h3 style="color:#fca5a5;">&#128315; All {bear_count} Bear Breakout Trades &mdash; {datetime.now().strftime("%d %b %Y")}</h3>
+    {bear_html}
 
-  {section_h2("#1b5e20", f"BULL BREAKOUT STOCKS ({n_bull}) - Entry + Exit Time (Bar+10)")}
-  {condition_p("Conditions: % Change >0.5% | VWAP Z >0 at 09:35/09:40/09:45 | OBV rising | >=2 extras | STOP = 0.2% below entry | EXIT = Entry bar + 10 bars (50 min)")}
-  {bull_html}
+    <h3 style="color:#93c5fd;">Index Long Candidates</h3>
+    {index_long_html}
 
-  {section_h2("#7f1d1d", f"BEAR BREAKOUT STOCKS ({n_bear}) - Entry + Exit Time (Bar+10)")}
-  {condition_p("Conditions: % Change <-0.5% | VWAP Z <0 at 09:35/09:40/09:45 | OBV falling | >=2 extras | STOP = 0.3% above entry | EXIT = Entry bar + 10 bars (50 min) [peak ~bar 7-10]")}
-  {bear_html}
+    <h3 style="color:#fda4af;">Index Short Candidates</h3>
+    {index_short_html}
 
-  <hr style="margin:20px 0;border:none;border-top:2px solid #e5e7eb;">
+    <h3 style="color:#6ee7b7;">Stock Long Candidates (from long indices)</h3>
+    {stock_long_html}
 
-  <h3>Index Long Candidates</h3>
-  {index_long_html}
+    <h3 style="color:#fca5a5;">Stock Short Candidates (from short indices)</h3>
+    {stock_short_html}
 
-  <h3>Index Short Candidates</h3>
-  {index_short_html}
-
-  <h3>Stock Long Candidates (from long indices)</h3>
-  {stock_long_html}
-
-  <h3>Stock Short Candidates (from short indices)</h3>
-  {stock_short_html}
-
-  <p style="color:#888;font-size:11px;margin-top:16px;">
-    Attached CSVs: summary, intraday iterations, bull breakout, bear breakout.
-  </p>
-</body>
-</html>"""
+    <p style="color:#6b7280;">Attached CSVs: summary &amp; iterations &amp; breakout trades.</p>
+  </body>
+</html>
+"""
 
         msg = MIMEMultipart()
-        msg["From"]    = sender_email
-        msg["To"]      = recipient_email
-        msg["Subject"] = f"Intraday Vol Iteration Alert - {datetime.now().strftime('%d %b %H:%M')}"
+        msg["From"] = sender_email
+        msg["To"] = recipient_email
+        msg["Subject"] = (
+            f"Intraday Vol Iteration Alert - {datetime.now().strftime('%d %b %H:%M')}"
+            f" | Bull:{bull_count} Bear:{bear_count}"
+        )
         msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-        # â”€â”€ Attach all CSVs â”€â”€
-        for filepath in [csv_filename, detail_csv_filename,
-                         index_iter_csv_filename, bull_breakout_csv, bear_breakout_csv]:
-            if not filepath or not isinstance(filepath, (str, bytes, os.PathLike)):
+        for filename in [csv_filename, detail_csv_filename, index_iter_csv_filename, bull_csv, bear_csv]:
+            if not filename or not isinstance(filename, (str, bytes, os.PathLike)):
                 continue
-            if os.path.exists(filepath):
-                with open(filepath, "rb") as f:
+            if os.path.exists(filename):
+                with open(filename, "rb") as f:
                     part = MIMEBase("application", "octet-stream")
                     part.set_payload(f.read())
                 encoders.encode_base64(part)
                 part.add_header(
                     "Content-Disposition",
-                    f"attachment; filename={os.path.basename(filepath)}",
+                    f"attachment; filename={os.path.basename(filename)}",
                 )
                 msg.attach(part)
 
@@ -1384,17 +1302,23 @@ def send_email_with_tables(
                 server.send_message(msg)
         else:
             with smtplib.SMTP(smtp_host, smtp_port, timeout=40) as server:
-                server.ehlo(); server.starttls(); server.ehlo()
+                server.ehlo()
+                server.starttls()
+                server.ehlo()
                 server.login(sender_email, sender_password)
                 server.send_message(msg)
 
         logger.info(f"EMAIL Sent successfully to {recipient_email}")
         return True
-
     except Exception as e:
         logger.error(f"EMAIL Failed to send email: {type(e).__name__}: {e}")
         return False
 
+
+
+##############################
+# INDEX-FIRST EXTENSIONS
+##############################
 
 def normalize_index_name(x: str) -> str:
     s = str(x).strip().upper()
@@ -1867,36 +1791,28 @@ def main_index_first():
         index_iter_df.to_csv(index_iter_csv, index=False)
         logger.info(f'INDEX Iteration summary saved: {index_iter_csv}')
 
-        # â”€â”€ Identify Bull / Bear breakout stocks from iteration detail â”€â”€
-    bull_bo_df, bear_bo_df = identify_breakout_stocks(detail_df)
-    logger.info(f"BREAKOUT Bull: {len(bull_bo_df)} | Bear: {len(bear_bo_df)}")
-
-    bull_bo_csv = bear_bo_csv = None
-    if not bull_bo_df.empty:
-        # Merge back with full iteration detail so CSV is iteration-based
-        bull_iter_csv = f"bull_breakout_iterations_{timestamp}.csv"
-        syms_bull = bull_bo_df["Symbol"].tolist()
-        bull_iter_df = detail_df[detail_df["Symbol"].isin(syms_bull)].copy()
-        bull_iter_df.to_csv(bull_iter_csv, index=False)
-        bull_bo_csv = bull_iter_csv
-        logger.info(f"BREAKOUT Bull CSV saved: {bull_iter_csv}")
-
-    if not bear_bo_df.empty:
-        bear_iter_csv = f"bear_breakout_iterations_{timestamp}.csv"
-        syms_bear = bear_bo_df["Symbol"].tolist()
-        bear_iter_df = detail_df[detail_df["Symbol"].isin(syms_bear)].copy()
-        bear_iter_df.to_csv(bear_iter_csv, index=False)
-        bear_bo_csv = bear_iter_csv
-        logger.info(f"BREAKOUT Bear CSV saved: {bear_iter_csv}")
+    # â”€â”€ BREAKOUT SCAN â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    bull_df_brk, bear_df_brk = pd.DataFrame(), pd.DataFrame()
+    bull_csv_path, bear_csv_path = None, None
+    if not detail_df.empty:
+        bull_df_brk, bear_df_brk = identify_breakout_stocks(detail_df)
+        logger.info(f"BREAKOUT Bull:{len(bull_df_brk)}  Bear:{len(bear_df_brk)}")
+        if not bull_df_brk.empty:
+            bull_csv_path = f'bull_breakout_iterations_{timestamp}.csv'
+            bull_df_brk.to_csv(bull_csv_path, index=False)
+        if not bear_df_brk.empty:
+            bear_csv_path = f'bear_breakout_iterations_{timestamp}.csv'
+            bear_df_brk.to_csv(bear_csv_path, index=False)
 
     send_email_with_tables(
         long_df, short_df, summary_csv, detail_csv,
-        index_long_df=index_long_df, index_short_df=index_short_df,
-        index_iter_csv_filename=(index_iter_csv if "index_iter_csv" in locals() else None),
-        bull_breakout_df=bull_bo_df,
-        bear_breakout_df=bear_bo_df,
-        bull_breakout_csv=bull_bo_csv,
-        bear_breakout_csv=bear_bo_csv,
+        index_long_df=index_long_df,
+        index_short_df=index_short_df,
+        index_iter_csv_filename=(index_iter_csv if 'index_iter_csv' in locals() else None),
+        bull_breakout_df=bull_df_brk,
+        bear_breakout_df=bear_df_brk,
+        bull_csv=bull_csv_path,
+        bear_csv=bear_csv_path,
     )
     logger.info('Index-first Scan Pipeline Completed')
 
