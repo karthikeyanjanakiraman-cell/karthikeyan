@@ -1271,7 +1271,7 @@ def scan_symbol_universe(symbols: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame
         iv_info = compute_iv_proxies(daily_df)
         prev_close = float(daily_df['close'].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2 and 'close' in daily_df.columns) else None
         ltp = iter_summary.get('LTP')
-        pct_change = ((float(ltp) - prev_close) / prev_close * 100.0) if (ltp is not None and prev_close is not None and prev_close != 0) else 0.0
+        pct_change = ((float(ltp) - prev_close) / prev_close * 100.0) if (ltp is not None and prev_close is not None and prev_close != 0 and float(ltp) > 0) else 0.0
         if not iter_detail.empty:
             iter_detail.insert(0, 'Symbol', sym)
             iter_detail.insert(1, '% Change', pct_change)
@@ -1367,7 +1367,7 @@ def scan_symbol_universe_previous_day(symbols: List[str]) -> pd.DataFrame:
         }
         prev_close = float(daily_df['close'].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2 and 'close' in daily_df.columns) else None
         ltp = iter_summary.get('LTP')
-        pct_change = ((float(ltp) - prev_close) / prev_close * 100.0) if (ltp is not None and prev_close is not None and prev_close != 0) else 0.0
+        pct_change = ((float(ltp) - prev_close) / prev_close * 100.0) if (ltp is not None and prev_close is not None and prev_close != 0 and float(ltp) > 0) else 0.0
         iv_info = compute_iv_proxies(daily_df)
         rows.append({
             'Symbol': sym,
@@ -1492,7 +1492,7 @@ def scan_index_universe() -> pd.DataFrame:
         iv_info = compute_iv_proxies(daily_df)
         prev_close = float(daily_df['close'].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2 and 'close' in daily_df.columns) else None
         ltp = iter_summary.get('LTP')
-        pct_change = ((float(ltp) - prev_close) / prev_close * 100.0) if (ltp is not None and prev_close is not None and prev_close != 0) else 0.0
+        pct_change = ((float(ltp) - prev_close) / prev_close * 100.0) if (ltp is not None and prev_close is not None and prev_close != 0 and float(ltp) > 0) else 0.0
         rows.append({
             'Symbol': normalize_index_name(sym),
             'LTP': ltp,
@@ -1773,7 +1773,7 @@ def _breakout_table_html(rows: list, title: str, side: str) -> str:
     if not rows:
         return f"<p style=\'color:#aaa;font-size:13px\'>No {side} breakout trades found.</p>"
     is_bull = side == "bull"
-    icon = "ðŸš€" if is_bull else "â–¼"
+    icon = "🚀" if is_bull else "▼"
     title_color = "#00e676" if is_bull else "#ff5252"
     cols = ["Rk", "Symbol", "Change", "Entry", "Entry Price", "Stop Price", "Exit",
             "VWAP Z", "Signal", "Volume Exp", "Range Exp", "20d RVOL", "Grade"]
