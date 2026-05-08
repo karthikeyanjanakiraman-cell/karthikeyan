@@ -1908,8 +1908,9 @@ def main_index_first():
             breakout_date = datetime.now()
             logger.info(f'BREAKOUT Using live df_all with {len(breakout_src)} rows')
         else:
-            logger.info('BREAKOUT No live data â€” fetching previous trading day from Fyers')
-            breakout_src = scan_symbol_universe_previous_day(union_stock_symbols)
+            fallback_symbols = union_stock_symbols if union_stock_symbols else load_fno_symbols_from_sectors('sectors')
+            logger.info(f'BREAKOUT No live data â€” fetching previous trading day from Fyers for {len(fallback_symbols)} symbols')
+            breakout_src = scan_symbol_universe_previous_day(fallback_symbols)
             breakout_date = datetime.now() - timedelta(days=1)
             if isinstance(breakout_src, pd.DataFrame) and not breakout_src.empty:
                 logger.info(f'BREAKOUT Previous-day Fyers fetch returned {len(breakout_src)} rows')
