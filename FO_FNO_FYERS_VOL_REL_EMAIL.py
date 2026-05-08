@@ -1557,6 +1557,9 @@ def _smtp_send(subject: str, html_body: str, attachments=None) -> bool:
         return False
 
 
+
+send_generic_email = _smtp_send  # alias so both names work
+
 def _calc_stop_price(row, side: str) -> float:
     """Entry price Â± 0.3% as stop."""
     try:
@@ -1759,7 +1762,7 @@ Exit = Entry + 90 min capped at 14:45 | Bear VWAP Z &lt; -0.50
     subject = f"Breakout Alert - {trade_date.strftime('%d %b %H:%M')} | Bull:{len(bull_rows)} Bear:{len(bear_rows)}"
     attachments = [f for f in [bull_csv if bull_rows else None, bear_csv if bear_rows else None] if f]
     try:
-        ok = send_generic_email(subject, html, attachments)
+        ok = _smtp_send(subject, html, attachments)
         if ok:
             logger.info(f"BREAKOUT Email sent successfully: Bull={len(bull_rows)} Bear={len(bear_rows)}")
         else:
