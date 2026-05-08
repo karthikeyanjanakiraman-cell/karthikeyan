@@ -1309,6 +1309,68 @@ def scan_symbol_universe(symbols: List[str]) -> Tuple[pd.DataFrame, pd.DataFrame
     return pd.DataFrame(rows), (pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame())
 
 
+
+def scan_symbol_universe_previous_day(symbols: List[str]) -> pd.DataFrame:
+    if not symbols:
+        return pd.DataFrame()
+    rows = []
+    total = len(symbols)
+    for idx, sym in enumerate(symbols, start=1):
+        logger.info(f"PREV-DAY [{idx}/{total}] Processing {sym}")
+        fyers_sym = format_fyers_symbol(sym)
+        daily_df = get_fyers_history(fyers_sym, resolution='D', days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
+        intra_df = get_fyers_history(fyers_sym, resolution='5', days_back=INTRADAY_LOOKBACK_DAYS)
+        if intra_df is None or intra_df.empty:
+            continue
+        intra_df = intra_df.copy()
+        intra_df['date'] = pd.to_datetime(intra_df['timestamp']).dt.date
+        dates = sorted(intra_df['date'].dropna().unique())
+        if len(dates) < 2:
+            continue
+        prev_date = dates[-2]
+        prev_only = intra_df[intra_df['date'] <= prev_date].copy()
+        iter_summary, _ = compute_iteration_volume_profile(prev_only)
+        if not iter_summary:
+            continue
+        prev_close = float(daily_df['close'].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2 and 'close' in daily_df.columns) else None
+        ltp = iter_summary.get('LTP')
+        pct_change = ((float(ltp) - prev_close) / prev_close * 100.0) if (ltp is not None and prev_close is not None and prev_close != 0) else 0.0
+        iv_info = compute_iv_proxies(daily_df)
+        rows.append({
+            'Symbol': sym,
+            'LTP': ltp,
+            '% Change': pct_change,
+            'Current Volume': iter_summary.get('Current Volume'),
+            '10 Day Relative Volume': iter_summary.get('10 Day Relative Volume'),
+            '20 Day Relative Volume': iter_summary.get('20 Day Relative Volume'),
+            'Cumulative RSI': iter_summary.get('Cumulative RSI'),
+            'Cumulative OBV': iter_summary.get('Cumulative OBV'),
+            'Cumulative VWAP': iter_summary.get('Cumulative VWAP'),
+            'VWAP Z-Score': iter_summary.get('VWAP Z-Score'),
+            'Total Iterations': iter_summary.get('Total Iterations'),
+            'Last Iteration Minutes': iter_summary.get('Last Iteration Minutes'),
+            'Last Iteration Time': iter_summary.get('Last Iteration Time'),
+            'Cumulative KER': iter_summary.get('Cumulative KER'),
+            'Cumulative +DI': iter_summary.get('Cumulative +DI'),
+            'Cumulative -DI': iter_summary.get('Cumulative -DI'),
+            'Cumulative ADX': iter_summary.get('Cumulative ADX'),
+            'Survival Score': iter_summary.get('Survival Score'),
+            'Survival_Num': iter_summary.get('Survival_Num'),
+            'HOD': iter_summary.get('HOD'),
+            'Strike_Distance': iter_summary.get('Strike_Distance'),
+            'Last_5m_Volume': iter_summary.get('Last_5m_Volume'),
+            'Volume_1h_Avg_5m': iter_summary.get('Volume_1h_Avg_5m'),
+            'OBV_30m_Delta': iter_summary.get('OBV_30m_Delta'),
+            'RSI_30m_Delta': iter_summary.get('RSI_30m_Delta'),
+            'Price_Lead_Status': iter_summary.get('Price_Lead_Status', 'NORMAL'),
+            'IVP': iv_info.get('IVP'),
+            'Volatility State': iv_info.get('Volatility State'),
+        })
+    out = pd.DataFrame(rows)
+    if not out.empty:
+        out = add_signal_columns(derive_rank_columns(out))
+    return out
+
 def build_index_strength_maps(index_long_df: pd.DataFrame, index_short_df: pd.DataFrame) -> Tuple[Dict[str, float], Dict[str, float]]:
     long_map, short_map = {}, {}
     if index_long_df is not None and not index_long_df.empty and 'Symbol' in index_long_df.columns:
@@ -1841,10 +1903,21 @@ def main_index_first():
 
     # â”€â”€ Breakout email â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     try:
-        # Always use full df_all â€” never filtered sources which can be empty
-        breakout_source = df_all.copy() if isinstance(df_all, pd.DataFrame) and not df_all.empty else pd.DataFrame()
-        logger.info(f'BREAKOUT Using df_all with {len(breakout_source)} rows for breakout email')
-        build_and_send_breakout_email(breakout_source, trade_date=datetime.now())
+        if isinstance(df_all, pd.DataFrame) and not df_all.empty:
+            breakout_src = df_all.copy()
+            breakout_date = datetime.now()
+            logger.info(f'BREAKOUT Using live df_all with {len(breakout_src)} rows')
+        else:
+            logger.info('BREAKOUT No live data â€” fetching previous trading day from Fyers')
+            breakout_src = scan_symbol_universe_previous_day(union_stock_symbols)
+            breakout_date = datetime.now() - timedelta(days=1)
+            if isinstance(breakout_src, pd.DataFrame) and not breakout_src.empty:
+                logger.info(f'BREAKOUT Previous-day Fyers fetch returned {len(breakout_src)} rows')
+
+        if isinstance(breakout_src, pd.DataFrame) and not breakout_src.empty:
+            build_and_send_breakout_email(breakout_src, trade_date=breakout_date)
+        else:
+            logger.warning('BREAKOUT No stock data for breakout email after previous-day Fyers fetch.')
     except Exception as _be:
         logger.error(f'BREAKOUT Failed to send separate breakout email: {type(_be).__name__}: {_be}')
 
