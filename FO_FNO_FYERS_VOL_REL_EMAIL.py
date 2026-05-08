@@ -1841,12 +1841,12 @@ def main_index_first():
 
     # â”€â”€ Breakout email â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
     try:
-        combined_stock = pd.concat([s for s in [long_stock_source, short_stock_source] if isinstance(s, pd.DataFrame) and not s.empty], ignore_index=True).drop_duplicates(subset=['Symbol']) if any(isinstance(s, pd.DataFrame) and not s.empty for s in [long_stock_source, short_stock_source]) else pd.DataFrame()
-        if combined_stock.empty and not df_all.empty:
-            combined_stock = df_all.copy()
-        build_and_send_breakout_email(combined_stock, trade_date=datetime.now())
+        # Always use full df_all â€” never filtered sources which can be empty
+        breakout_source = df_all.copy() if isinstance(df_all, pd.DataFrame) and not df_all.empty else pd.DataFrame()
+        logger.info(f'BREAKOUT Using df_all with {len(breakout_source)} rows for breakout email')
+        build_and_send_breakout_email(breakout_source, trade_date=datetime.now())
     except Exception as _be:
-        logger.error(f'BREAKOUT Failed to send separate breakout email: {_be}')
+        logger.error(f'BREAKOUT Failed to send separate breakout email: {type(_be).__name__}: {_be}')
 
     logger.info('Index-first Scan Pipeline Completed')
 
