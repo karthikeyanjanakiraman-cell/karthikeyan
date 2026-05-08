@@ -1325,13 +1325,46 @@ def scan_symbol_universe_previous_day(symbols: List[str]) -> pd.DataFrame:
         intra_df = intra_df.copy()
         intra_df['date'] = pd.to_datetime(intra_df['timestamp']).dt.date
         dates = sorted(intra_df['date'].dropna().unique())
-        if len(dates) < 2:
+        if len(dates) == 0:
             continue
-        prev_date = dates[-2]
-        prev_only = intra_df[intra_df['date'] <= prev_date].copy()
-        iter_summary, _ = compute_iteration_volume_profile(prev_only)
-        if not iter_summary:
+        target_date = dates[-1]
+        prev_only = intra_df[intra_df['date'] == target_date].copy()
+        if prev_only.empty:
             continue
+
+        prev_only = prev_only.sort_values('timestamp').copy()
+        prev_only['time'] = pd.to_datetime(prev_only['timestamp'])
+        metric_df = compute_cumulative_directional_metrics(prev_only[['time', 'open', 'high', 'low', 'close', 'volume']].copy())
+        flow_df = compute_cumulative_flow_metrics(prev_only[['time', 'high', 'low', 'close', 'volume']].copy())
+        price_lead_df = compute_price_lead_metrics(prev_only[['time', 'open', 'high', 'low', 'close', 'volume']].copy())
+        i = len(prev_only) - 1
+        last_row = prev_only.iloc[i]
+        iter_summary = {
+            'LTP': float(last_row['close']) if pd.notna(last_row['close']) else np.nan,
+            'Current Volume': float(pd.to_numeric(prev_only['volume'], errors='coerce').fillna(0).sum()),
+            '10 Day Relative Volume': np.nan,
+            '20 Day Relative Volume': np.nan,
+            'Cumulative RSI': float(flow_df['Cumulative RSI'].iloc[i]) if not flow_df.empty else np.nan,
+            'Cumulative OBV': float(flow_df['Cumulative OBV'].iloc[i]) if not flow_df.empty else np.nan,
+            'Cumulative VWAP': float(flow_df['Cumulative VWAP'].iloc[i]) if not flow_df.empty else np.nan,
+            'VWAP Z-Score': float(flow_df['VWAP Z-Score'].iloc[i]) if not flow_df.empty else np.nan,
+            'Total Iterations': len(prev_only),
+            'Last Iteration Minutes': int(((pd.to_datetime(last_row['timestamp']).hour * 60 + pd.to_datetime(last_row['timestamp']).minute) - (9 * 60 + 15))),
+            'Last Iteration Time': pd.to_datetime(last_row['timestamp']).strftime('%H:%M'),
+            'Cumulative KER': float(metric_df['Cumulative KER'].iloc[i]) if not metric_df.empty else np.nan,
+            'Cumulative +DI': float(metric_df['Cumulative +DI'].iloc[i]) if not metric_df.empty else np.nan,
+            'Cumulative -DI': float(metric_df['Cumulative -DI'].iloc[i]) if not metric_df.empty else np.nan,
+            'Cumulative ADX': float(metric_df['Cumulative ADX'].iloc[i]) if not metric_df.empty else np.nan,
+            'Survival Score': str(metric_df['Survival Score'].iloc[i]) if not metric_df.empty else '0/0',
+            'Survival_Num': float(metric_df['Survival_Num'].iloc[i]) if not metric_df.empty else 0.0,
+            'HOD': float(pd.to_numeric(prev_only['high'], errors='coerce').max()),
+            'Strike_Distance': np.nan,
+            'Last_5m_Volume': float(pd.to_numeric(prev_only['volume'], errors='coerce').fillna(0).iloc[-1]),
+            'Volume_1h_Avg_5m': float(pd.to_numeric(prev_only['volume'], errors='coerce').fillna(0).tail(12).mean()),
+            'OBV_30m_Delta': float(flow_df['Cumulative OBV'].iloc[i] - flow_df['Cumulative OBV'].iloc[max(i-6,0)]) if not flow_df.empty else 0.0,
+            'RSI_30m_Delta': float(flow_df['Cumulative RSI'].iloc[i] - flow_df['Cumulative RSI'].iloc[max(i-6,0)]) if not flow_df.empty else 0.0,
+            'Price_Lead_Status': str(price_lead_df['Price_Lead_Status'].iloc[i]) if not price_lead_df.empty else 'NORMAL',
+        }
         prev_close = float(daily_df['close'].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2 and 'close' in daily_df.columns) else None
         ltp = iter_summary.get('LTP')
         pct_change = ((float(ltp) - prev_close) / prev_close * 100.0) if (ltp is not None and prev_close is not None and prev_close != 0) else 0.0
