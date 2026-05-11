@@ -1668,7 +1668,6 @@ def _calc_exit_time(entry_str: str) -> str:
     try:
         entry_dt = datetime.strptime(str(entry_str)[:5], "%H:%M")
         cap = datetime.strptime("14:45", "%H:%M")
-        eod = datetime.strptime("15:30", "%H:%M")
         if entry_dt >= cap:
             return "15:30"
         dt = entry_dt + timedelta(minutes=90)
@@ -1740,13 +1739,10 @@ def build_breakout_rows(df: pd.DataFrame, side: str, top_n: int = 10) -> list:
         work["_z_abs"] = pd.to_numeric(work[vz_col], errors="coerce").abs().fillna(0)
     else:
         work["_z_abs"] = 0
-    work = work.sort_values(["_entry_dt", "_z_abs"], ascending=[False, False]).reset_index(drop=True).head(top_n)
 
-    # -- No. of Times: count per-symbol how many summary rows pass VWAP Z threshold --
-    # Uses Total Iterations x VWAP Z relative strength as proxy when Volume/Range Exp = 0
+    # -- No. of Times: VWAP Z magnitude x iteration depth proxy (since Vol/Range Exp = 0 in summary df)
     all_vz = pd.to_numeric(df.get("VWAP Z-Score", pd.Series(dtype=float)), errors="coerce").abs()
     max_vz = float(all_vz.max()) if not all_vz.empty and all_vz.max() > 0 else 1.0
-
     best_counts = {}
     for _, fr in df.iterrows():
         sym = str(fr.get("Symbol", ""))
@@ -1761,15 +1757,14 @@ def build_breakout_rows(df: pd.DataFrame, side: str, top_n: int = 10) -> list:
             pts += 2 if re_ > 2.0 else (1 if re_ > 1.0 else 0)
             count = pts
         else:
-            # Fallback: derive count from VWAP Z magnitude x iteration depth
             vz_score = abs(vz) / max_vz
             iter_depth = min(total_iters, 78) / 78.0 if total_iters > 0 else 0.5
             count = int(round(vz_score * iter_depth * 10))
         best_counts[sym] = count
-
     work["_best_count"] = work["Symbol"].astype(str).map(lambda s: best_counts.get(s, 0))
+
     # Sort: No. of Times DESC -> VWAP Z magnitude DESC -> latest entry first
-    work = work.sort_values(["_best_count", "_z_abs", "_entry_dt"], ascending=[False, False, False]).reset_index(drop=True)
+    work = work.sort_values(["_best_count", "_z_abs", "_entry_dt"], ascending=[False, False, False]).reset_index(drop=True).head(top_n)
 
     rows = []
     for i, row in work.iterrows():
@@ -1824,7 +1819,7 @@ def _breakout_table_html(rows: list, title: str, side: str) -> str:
             val = str(r.get(c, ""))
             style = "padding:7px 10px;text-align:center;border:1px solid #333;font-size:12px;color:#eee"
             if c == "No. of Times":
-                n_times = int(val) if str(val).isdigit() else 0
+                n_times = int(val) if str(val).lstrip('-').isdigit() else 0
                 bg_nt = "#1b5e20" if n_times >= 5 else "#2e7d32" if n_times >= 3 else "#1a237e" if n_times >= 2 else "#263238"
                 val = f"<span style='background:{bg_nt};color:#fff;padding:2px 8px;border-radius:3px;font-size:12px;font-weight:bold'>{val}</span>"
             elif c == "Change":
@@ -1866,8 +1861,7 @@ def build_and_send_breakout_email(stock_df: pd.DataFrame, trade_date=None):
     footer = """
 <p style=\'color:#aaa;font-size:11px;margin-top:12px\'>
 Filters: Bull = positive %Change only | Bear = negative %Change only<br>
-Exit = Entry + 90 min capped at 14:45 | Bear VWAP Z &lt; -0.50<br>
-<b>No. of Times</b> = count of BEST-grade breakout signals for that symbol (sorted DESC)
+Exit = Entry + 90 min capped at 14:45 | Bear VWAP Z &lt; -0.50
 </p>"""
 
     html = f"""<html><body style=\'background:#0d0d1a;color:#eee;font-family:Arial,sans-serif;padding:16px\'>
