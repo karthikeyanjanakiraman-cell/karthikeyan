@@ -1615,7 +1615,7 @@ def build_index_iteration_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
 
 
 # Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
-# BREAKOUT EMAIL - builds and sends the "Intraday Breakout Alert" table email
+# BREAKOUT EMAIL Ã¢â‚¬â€ builds and sends the "Intraday Breakout Alert" table email
 # Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 
 def _smtp_send(subject: str, html_body: str, attachments=None) -> bool:
@@ -1697,133 +1697,73 @@ def _grade_color(g: str) -> str:
     return {"BEST": "#1b7a2f", "STRONG": "#1a4a99", "GOOD": "#6a3bb5"}.get(g, "#444")
 
 
-def build_breakout_rows(summary_df: pd.DataFrame, side: str, top_n: int = 10, detail_df: Optional[pd.DataFrame] = None) -> list:
-    """Build breakout rows with real repeated BEST-hit counts from iteration-level data."""
-    if summary_df is None or summary_df.empty:
+def build_breakout_rows(df: pd.DataFrame, side: str, top_n: int = 10) -> list:
+    """Filter, sort, and return list-of-dicts for breakout table rows."""
+    if df is None or df.empty:
         return []
+    work = df.copy()
 
-    work = summary_df.copy()
-    required_cols = ["Symbol", "LTP", "% Change"]
-    if any(col not in work.columns for col in required_cols):
+    # Ensure required columns exist
+    if "LTP" not in work.columns:
         return []
-
-    work["Symbol"] = work["Symbol"].astype(str).str.strip()
     work["LTP"] = pd.to_numeric(work["LTP"], errors="coerce")
-    work["% Change"] = pd.to_numeric(work["% Change"], errors="coerce").fillna(0.0)
     work = work.dropna(subset=["LTP"])
 
+    if "% Change" not in work.columns:
+        work["% Change"] = 0.0
+    work["% Change"] = pd.to_numeric(work["% Change"], errors="coerce").fillna(0.0)
+
     if "Last Iteration Time" in work.columns:
-        work["_entry"] = work["Last Iteration Time"].astype(str).str[:5]
+        work["_entry"] = work["Last Iteration Time"].astype(str).str[:5].replace({"nan": "09:45", "": "09:45"})
     else:
         work["_entry"] = "09:45"
-    work["_entry"] = work["_entry"].replace({"nan": "09:45", "": "09:45", "None": "09:45"})
 
-    for col in ["VWAP Z-Score", "20 Day Relative Volume"]:
-        if col not in work.columns:
-            work[col] = 0.0
-        work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0.0)
-
+    # Filter direction
     if side == "bull":
         work = work[work["% Change"] > 0].copy()
     else:
         work = work[work["% Change"] < 0].copy()
-        work = work[work["VWAP Z-Score"] <= -0.50].copy()
+        if "VWAP Z-Score" in work.columns:
+            work = work[pd.to_numeric(work["VWAP Z-Score"], errors="coerce").fillna(0) < -0.50].copy()
 
     if work.empty:
         return []
 
-    count_map = {}
-    latest_map = {}
-    if detail_df is not None and not detail_df.empty and "Symbol" in detail_df.columns:
-        det = detail_df.copy()
-        det["Symbol"] = det["Symbol"].astype(str).str.strip()
-        if "% Change" not in det.columns:
-            det = det.merge(
-                work[["Symbol", "% Change"]].drop_duplicates(subset=["Symbol"]),
-                on="Symbol",
-                how="left"
-            )
-        det["% Change"] = pd.to_numeric(det.get("% Change", 0), errors="coerce").fillna(0.0)
-        for col in ["VWAP Z-Score", "Volume_Expansion", "Range_Expansion", "20 Day Relative Volume"]:
-            if col not in det.columns:
-                det[col] = 0.0
-            det[col] = pd.to_numeric(det[col], errors="coerce").fillna(0.0)
-        time_col = "Iteration Time" if "Iteration Time" in det.columns else None
-        if time_col:
-            det["_entry"] = det[time_col].astype(str).str[:5].replace({"nan": "09:45", "": "09:45", "None": "09:45"})
-        else:
-            det["_entry"] = "09:45"
-        det["_entry_dt"] = pd.to_datetime(det["_entry"], format="%H:%M", errors="coerce")
-
-        if side == "bull":
-            det = det[(det["% Change"] > 0) & (det["VWAP Z-Score"] >= 0.50)].copy()
-        else:
-            det = det[(det["% Change"] < 0) & (det["VWAP Z-Score"] <= -0.50)].copy()
-
-        if not det.empty:
-            best_score = (
-                (det["VWAP Z-Score"].abs() >= 1.5).astype(int) * 2
-                + (det["Volume_Expansion"] >= 2.0).astype(int) * 2
-                + (det["Range_Expansion"] >= 2.0).astype(int) * 2
-            )
-            det = det.assign(_best_hit=(best_score >= 4).astype(int))
-            count_map = det.groupby("Symbol")["_best_hit"].sum().astype(int).to_dict()
-            latest_candidates = det.sort_values(["Symbol", "_entry_dt", "VWAP Z-Score"], ascending=[True, False, False])
-            latest_map = latest_candidates.drop_duplicates(subset=["Symbol"], keep="first").set_index("Symbol").to_dict("index")
-
-    work["No. of Times"] = work["Symbol"].map(lambda s: int(count_map.get(s, 0)))
+    # Sort: latest entry first, then by VWAP Z-Score magnitude
     work["_entry_dt"] = pd.to_datetime(work["_entry"], format="%H:%M", errors="coerce")
-    work["_z_abs"] = work["VWAP Z-Score"].abs()
-
-    if latest_map:
-        for idx, row in work.iterrows():
-            sym = row["Symbol"]
-            if sym in latest_map:
-                src_row = latest_map[sym]
-                work.at[idx, "_entry"] = src_row.get("_entry", row["_entry"])
-                work.at[idx, "_entry_dt"] = src_row.get("_entry_dt", row["_entry_dt"])
-                work.at[idx, "VWAP Z-Score"] = float(pd.to_numeric(src_row.get("VWAP Z-Score", row["VWAP Z-Score"]), errors="coerce") or 0)
-                work.at[idx, "Volume_Expansion"] = float(pd.to_numeric(src_row.get("Volume_Expansion", row.get("Volume_Expansion", 0)), errors="coerce") or 0)
-                work.at[idx, "Range_Expansion"] = float(pd.to_numeric(src_row.get("Range_Expansion", row.get("Range_Expansion", 0)), errors="coerce") or 0)
-                work.at[idx, "20 Day Relative Volume"] = float(pd.to_numeric(src_row.get("20 Day Relative Volume", row.get("20 Day Relative Volume", 0)), errors="coerce") or 0)
-
-    for col in ["Volume_Expansion", "Range_Expansion", "20 Day Relative Volume"]:
-        if col not in work.columns:
-            work[col] = 0.0
-        work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0.0)
-
-    work = (
-        work.sort_values(["No. of Times", "_entry_dt", "_z_abs"], ascending=[False, False, False])
-        .drop_duplicates(subset=["Symbol"], keep="first")
-        .head(top_n)
-        .reset_index(drop=True)
-    )
+    vz_col = "VWAP Z-Score" if "VWAP Z-Score" in work.columns else None
+    if vz_col:
+        work["_z_abs"] = pd.to_numeric(work[vz_col], errors="coerce").abs().fillna(0)
+    else:
+        work["_z_abs"] = 0
+    work = work.sort_values(["_entry_dt", "_z_abs"], ascending=[False, False]).reset_index(drop=True).head(top_n)
 
     rows = []
-    for _, row in work.iterrows():
+    for i, row in work.iterrows():
         entry_time = row["_entry"]
         entry_price = float(row["LTP"])
         stop_price = _calc_stop_price(row, side)
         exit_time = _calc_exit_time(entry_time)
-        vwap_z = float(pd.to_numeric(row.get("VWAP Z-Score", 0), errors="coerce") or 0)
-        vol_exp = float(pd.to_numeric(row.get("Volume_Expansion", 0), errors="coerce") or 0)
-        rng_exp = float(pd.to_numeric(row.get("Range_Expansion", 0), errors="coerce") or 0)
-        rvol_20 = float(pd.to_numeric(row.get("20 Day Relative Volume", 0), errors="coerce") or 0)
+        vwap_z = float(pd.to_numeric(row.get("VWAP Z-Score", 0) or 0, errors="coerce") or 0)
+        signal = "BUY" if side == "bull" else "SELL"
+        vol_exp = float(pd.to_numeric(row.get("Volume_Expansion", 0) or 0, errors="coerce") or 0)
+        rng_exp = float(pd.to_numeric(row.get("Range_Expansion", 0) or 0, errors="coerce") or 0)
+        rvol_20 = float(pd.to_numeric(row.get("20 Day Relative Volume", 0) or 0, errors="coerce") or 0)
+        grade = _grade(row)
         rows.append({
             "Rk": len(rows) + 1,
             "Symbol": str(row.get("Symbol", "")),
-            "No. of Times": int(row.get("No. of Times", 0)),
             "Change": f"{float(row['% Change']):+.2f}%",
             "Entry": entry_time,
             "Entry Price": f"{entry_price:,.2f}",
             "Stop Price": f"{stop_price:,.2f}",
             "Exit": exit_time,
             "VWAP Z": f"{vwap_z:.2f}",
-            "Signal": "BUY" if side == "bull" else "SELL",
+            "Signal": signal,
             "Volume Exp": f"{vol_exp:.2f}",
             "Range Exp": f"{rng_exp:.2f}",
             "20d RVOL": f"{rvol_20:.2f}",
-            "Grade": _grade(row),
+            "Grade": grade,
             "_side": side,
         })
     return rows
@@ -1831,48 +1771,41 @@ def build_breakout_rows(summary_df: pd.DataFrame, side: str, top_n: int = 10, de
 
 def _breakout_table_html(rows: list, title: str, side: str) -> str:
     if not rows:
-        return f"<p style='color:#aaaaaa;font-size:13px'>No {side} breakout trades found.</p>"
-    title_color = "#00e676" if side == "bull" else "#ff5252"
-    cols = [
-        "Rk", "Symbol", "No. of Times", "Change", "Entry", "Entry Price", "Stop Price", "Exit",
-        "VWAP Z", "Signal", "Volume Exp", "Range Exp", "20d RVOL", "Grade"
-    ]
-    hdr = "".join(
-        f"<th style='padding:7px 10px;text-align:center;border:1px solid #333333;font-size:12px'>{c}</th>"
-        for c in cols
-    )
+        return f"<p style=\'color:#aaa;font-size:13px\'>No {side} breakout trades found.</p>"
+    is_bull = side == "bull"
+    icon = "ðŸš€" if is_bull else "â–¼"
+    title_color = "#00e676" if is_bull else "#ff5252"
+    cols = ["Rk", "Symbol", "Change", "Entry", "Entry Price", "Stop Price", "Exit",
+            "VWAP Z", "Signal", "Volume Exp", "Range Exp", "20d RVOL", "Grade"]
+    hdr = "".join(f"<th style=\'padding:7px 10px;text-align:center;border:1px solid #333;font-size:12px\'>{c}</th>" for c in cols)
     body = ""
     for r in rows:
-        chg_val = float(str(r["Change"]).replace("%", "").replace("+", ""))
+        chg_val = float(r["Change"].replace("%","").replace("+",""))
         chg_col = "#00e676" if chg_val >= 0 else "#ff5252"
         sig_col = "#1b7a2f" if r["Signal"] == "BUY" else "#b71c1c"
         grade_col = _grade_color(r["Grade"])
         cells = ""
         for c in cols:
             val = str(r.get(c, ""))
-            style = "padding:7px 10px;text-align:center;border:1px solid #333333;font-size:12px;color:#eeeeee"
-            if c == "Symbol":
-                style += ";text-align:left;font-weight:bold"
-            elif c == "No. of Times":
-                style += ";font-weight:bold;color:#ffd54f"
-            elif c == "Change":
+            style = "padding:7px 10px;text-align:center;border:1px solid #333;font-size:12px;color:#eee"
+            if c == "Change":
                 style += f";color:{chg_col};font-weight:bold"
             elif c == "Signal":
-                val = f"<span style='background:{sig_col};color:#ffffff;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:bold'>{val}</span>"
+                val = f"<span style=\'background:{sig_col};color:#fff;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:bold\'>{val}</span>"
             elif c == "Grade":
-                val = f"<span style='background:{grade_col};color:#ffffff;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:bold'>{val}</span>"
-            cells += f"<td style='{style}'>{val}</td>"
+                val = f"<span style=\'background:{grade_col};color:#fff;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:bold\'>{val}</span>"
+            cells += f"<td style=\'{style}\'>{val}</td>"
         body += f"<tr>{cells}</tr>"
     return f"""
-<h3 style='color:{title_color};font-family:Arial,sans-serif;margin:18px 0 6px'>{title}</h3>
-<table style='border-collapse:collapse;width:100%;background:#1a1a2e'>
-  <thead><tr style='background:#0f3460'>{hdr}</tr></thead>
+<h3 style=\'color:{title_color};font-family:Arial,sans-serif;margin:18px 0 6px\'>{icon} {title}</h3>
+<table style=\'border-collapse:collapse;width:100%;background:#1a1a2e\'>
+  <thead><tr style=\'background:#0f3460\'>{hdr}</tr></thead>
   <tbody>{body}</tbody>
 </table>"""
 
 
-def build_and_send_breakout_email(stock_df: pd.DataFrame, trade_date=None, detail_df: Optional[pd.DataFrame] = None):
-    """Build the breakout alert email and send it."""
+def build_and_send_breakout_email(stock_df: pd.DataFrame, trade_date=None):
+    """Build the breakout alert email matching the PDF format and send it."""
     if stock_df is None or stock_df.empty:
         logger.warning("BREAKOUT No stock data for breakout email.")
         return
@@ -1881,60 +1814,56 @@ def build_and_send_breakout_email(stock_df: pd.DataFrame, trade_date=None, detai
     date_str = trade_date.strftime("%d %b %Y, %H:%M")
     timestamp = trade_date.strftime("%Y%m%d_%H%M%S")
 
-    bull_rows = build_breakout_rows(stock_df, side="bull", top_n=10, detail_df=detail_df)
-    bear_rows = build_breakout_rows(stock_df, side="bear", top_n=10, detail_df=detail_df)
+    bull_rows = build_breakout_rows(stock_df, side="bull", top_n=10)
+    bear_rows = build_breakout_rows(stock_df, side="bear", top_n=10)
 
     if not bull_rows and not bear_rows:
         logger.warning("BREAKOUT No bull or bear breakout candidates found.")
         return
 
-    bull_html = _breakout_table_html(
-        bull_rows,
-        f"BULL Breakout Trades - Top {len(bull_rows)} (Sorted by No. of Times)",
-        "bull",
-    )
-    bear_html = _breakout_table_html(
-        bear_rows,
-        f"BEAR Breakout Trades - Top {len(bear_rows)} (Sorted by No. of Times)",
-        "bear",
-    )
+    bull_html = _breakout_table_html(bull_rows, f"Bull Breakout Trades Ã¢â‚¬â€ Top {len(bull_rows)} (Latest Entry First)", "bull")
+    bear_html = _breakout_table_html(bear_rows, f"Bear Breakout Trades Ã¢â‚¬â€ Top {len(bear_rows)} (Latest Entry First)", "bear")
 
     footer = """
-<p style='color:#aaaaaa;font-size:11px;margin-top:12px'>
-Filters: Bull = positive % Change only | Bear = negative % Change only<br>
-Exit = Entry + 90 min capped at 15:30 | Bear VWAP Z <= -0.50<br>
-No. of Times = count of BEST breakout hits for that symbol, sorted descending
+<p style=\'color:#aaa;font-size:11px;margin-top:12px\'>
+Filters: Bull = positive %Change only | Bear = negative %Change only<br>
+Exit = Entry + 90 min capped at 14:45 | Bear VWAP Z &lt; -0.50
 </p>"""
 
-    html = f"""<html><body style='background:#0d0d1a;color:#eeeeee;font-family:Arial,sans-serif;padding:16px'>
-<h2 style='color:#ffffff'>Intraday Breakout Alert - {date_str}</h2>
+    html = f"""<html><body style=\'background:#0d0d1a;color:#eee;font-family:Arial,sans-serif;padding:16px\'>
+<h2 style=\'color:#fff\'>Ã°Å¸Å¡â‚¬ Intraday Breakout Alert Ã¢â‚¬â€ {date_str}</h2>
 {bull_html}
-<div style='height:20px'></div>
+<div style=\'height:20px\'></div>
 {bear_html}
 {footer}
 </body></html>"""
 
+    # Save CSVs
     bull_csv = f"bull_breakout_trades_{timestamp}.csv"
     bear_csv = f"bear_breakout_trades_{timestamp}.csv"
     if bull_rows:
         import csv as _csv
-        with open(bull_csv, "w", newline="", encoding="utf-8") as f:
+        with open(bull_csv, "w", newline="") as f:
             w = _csv.DictWriter(f, fieldnames=[k for k in bull_rows[0] if k != "_side"])
             w.writeheader()
-            for r in bull_rows:
-                w.writerow({k: v for k, v in r.items() if k != "_side"})
+            w.writerows([{k: v for k, v in r.items() if k != "_side"} for r in bull_rows])
     if bear_rows:
         import csv as _csv
-        with open(bear_csv, "w", newline="", encoding="utf-8") as f:
+        with open(bear_csv, "w", newline="") as f:
             w = _csv.DictWriter(f, fieldnames=[k for k in bear_rows[0] if k != "_side"])
             w.writeheader()
-            for r in bear_rows:
-                w.writerow({k: v for k, v in r.items() if k != "_side"})
+            w.writerows([{k: v for k, v in r.items() if k != "_side"} for r in bear_rows])
 
-    subject = f"Breakout Alert - {trade_date.strftime('%d %b %H:%M')} - Bull {len(bull_rows)} Bear {len(bear_rows)}"
-    attachments = [x for x in [bull_csv if bull_rows else None, bear_csv if bear_rows else None] if x]
-    _smtp_send(subject=subject, html_body=html, attachments=attachments)
-
+    subject = f"Breakout Alert - {trade_date.strftime('%d %b %H:%M')} | Bull:{len(bull_rows)} Bear:{len(bear_rows)}"
+    attachments = [f for f in [bull_csv if bull_rows else None, bear_csv if bear_rows else None] if f]
+    try:
+        ok = _smtp_send(subject, html, attachments)
+        if ok:
+            logger.info(f"BREAKOUT Email sent successfully: Bull={len(bull_rows)} Bear={len(bear_rows)}")
+        else:
+            logger.error(f"BREAKOUT Email send returned False: Bull={len(bull_rows)} Bear={len(bear_rows)}")
+    except Exception as e:
+        logger.error(f"BREAKOUT Failed to send email: {type(e).__name__}: {e}")
 
 def main_index_first():
     logger.info('Starting Index-first FO Iteration Volume Volatility Scan')
@@ -2013,14 +1942,14 @@ def main_index_first():
             logger.info(f'BREAKOUT Using live df_all with {len(breakout_src)} rows')
         else:
             fallback_symbols = union_stock_symbols if union_stock_symbols else load_fno_symbols_from_sectors('sectors')
-            logger.info(f'BREAKOUT No live data - fetching previous trading day from Fyers for {len(fallback_symbols)} symbols')
+            logger.info(f'BREAKOUT No live data Ã¢â‚¬â€ fetching previous trading day from Fyers for {len(fallback_symbols)} symbols')
             breakout_src = scan_symbol_universe_previous_day(fallback_symbols)
             breakout_date = datetime.now() - timedelta(days=1)
             if isinstance(breakout_src, pd.DataFrame) and not breakout_src.empty:
                 logger.info(f'BREAKOUT Previous-day Fyers fetch returned {len(breakout_src)} rows')
 
         if isinstance(breakout_src, pd.DataFrame) and not breakout_src.empty:
-            build_and_send_breakout_email(breakout_src, trade_date=breakout_date, detail_df=detail_df)
+            build_and_send_breakout_email(breakout_src, trade_date=breakout_date)
         else:
             logger.warning('BREAKOUT No stock data for breakout email after previous-day Fyers fetch.')
     except Exception as _be:
@@ -2030,3 +1959,16 @@ def main_index_first():
 
 if __name__ == '__main__':
     main_index_first()
+
+
+def build_symbol_hyperlink(symbol: str, label: str = None, color: str = "#93c5fd") -> str:
+    symbol = str(symbol or "").strip().upper()
+    label = str(label or symbol)
+    if not symbol:
+        return label
+    safe = re.sub(r"[^A-Z0-9_-]", "", symbol)
+    url = f"https://www.tradingview.com/chart/?symbol=NSE%3A{safe}"
+    return (
+        f'<a href="{url}" target="_blank" '
+        f'style="color:{color};text-decoration:none;font-weight:bold;">{label}</a>'
+    )
