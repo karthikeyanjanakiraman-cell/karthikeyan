@@ -1666,11 +1666,15 @@ def _calc_stop_price(row, side: str) -> float:
 
 def _calc_exit_time(entry_str: str) -> str:
     try:
-        dt = datetime.strptime(str(entry_str)[:5], "%H:%M") + timedelta(minutes=90)
+        entry_dt = datetime.strptime(str(entry_str)[:5], "%H:%M")
         cap = datetime.strptime("14:45", "%H:%M")
+        eod = datetime.strptime("15:30", "%H:%M")
+        if entry_dt >= cap:
+            return "15:30"
+        dt = entry_dt + timedelta(minutes=90)
         return min(dt, cap).strftime("%H:%M")
     except Exception:
-        return "14:45"
+        return "15:30"
 
 
 def _grade(row) -> str:
