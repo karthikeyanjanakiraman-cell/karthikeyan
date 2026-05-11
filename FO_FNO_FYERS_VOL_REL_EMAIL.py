@@ -1614,9 +1614,9 @@ def build_index_iteration_summary(detail_df: pd.DataFrame) -> pd.DataFrame:
 
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# BREAKOUT EMAIL â€” builds and sends the "Intraday Breakout Alert" table email
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+# BREAKOUT EMAIL Ã¢â‚¬â€ builds and sends the "Intraday Breakout Alert" table email
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 
 def _smtp_send(subject: str, html_body: str, attachments=None) -> bool:
     """Low-level SMTP sender used by ALL email paths in this script."""
@@ -1656,7 +1656,7 @@ def _smtp_send(subject: str, html_body: str, attachments=None) -> bool:
 send_generic_email = _smtp_send  # alias so both names work
 
 def _calc_stop_price(row, side: str) -> float:
-    """Entry price Â± 0.3% as stop."""
+    """Entry price Ã‚Â± 0.3% as stop."""
     try:
         price = float(row.get("LTP", 0) or 0)
         return round(price * 0.997, 2) if side == "bull" else round(price * 1.003, 2)
@@ -1738,6 +1738,37 @@ def build_breakout_rows(df: pd.DataFrame, side: str, top_n: int = 10) -> list:
         work["_z_abs"] = 0
     work = work.sort_values(["_entry_dt", "_z_abs"], ascending=[False, False]).reset_index(drop=True).head(top_n)
 
+    # â”€â”€ No. of Times: count BEST-grade occurrences per symbol across all rows â”€â”€
+    def _count_best(r):
+        vz = float(pd.to_numeric(r.get("VWAP Z-Score", 0) or 0, errors="coerce") or 0)
+        ve = float(pd.to_numeric(r.get("Volume_Expansion", 0) or 0, errors="coerce") or 0)
+        re_ = float(pd.to_numeric(r.get("Range_Expansion", 0) or 0, errors="coerce") or 0)
+        pts = 0
+        pts += 2 if abs(vz) > 1.5 else (1 if abs(vz) > 0.8 else 0)
+        pts += 2 if ve > 2.0 else (1 if ve > 1.0 else 0)
+        pts += 2 if re_ > 2.0 else (1 if re_ > 1.0 else 0)
+        return pts >= 5  # BEST threshold
+
+    # Use full (untruncated) work df to count BEST signals per symbol
+    full_work = df.copy()
+    if "% Change" in full_work.columns:
+        full_work["% Change"] = pd.to_numeric(full_work["% Change"], errors="coerce").fillna(0.0)
+    if side == "bull":
+        full_work = full_work[full_work.get("% Change", pd.Series([0]*len(full_work))) > 0] if "% Change" in full_work.columns else full_work
+    else:
+        full_work = full_work[full_work.get("% Change", pd.Series([0]*len(full_work))) < 0] if "% Change" in full_work.columns else full_work
+
+    best_counts = {}
+    for _, fr in full_work.iterrows():
+        sym = str(fr.get("Symbol", ""))
+        if _count_best(fr):
+            best_counts[sym] = best_counts.get(sym, 0) + 1
+
+    work["_best_count"] = work["Symbol"].astype(str).map(lambda s: best_counts.get(s, 0))
+
+    # Re-sort: No. of Times DESC â†’ VWAP Z-Score magnitude DESC â†’ latest entry first
+    work = work.sort_values(["_best_count", "_z_abs", "_entry_dt"], ascending=[False, False, False]).reset_index(drop=True)
+
     rows = []
     for i, row in work.iterrows():
         entry_time = row["_entry"]
@@ -1750,9 +1781,11 @@ def build_breakout_rows(df: pd.DataFrame, side: str, top_n: int = 10) -> list:
         rng_exp = float(pd.to_numeric(row.get("Range_Expansion", 0) or 0, errors="coerce") or 0)
         rvol_20 = float(pd.to_numeric(row.get("20 Day Relative Volume", 0) or 0, errors="coerce") or 0)
         grade = _grade(row)
+        best_count = int(row.get("_best_count", 0))
         rows.append({
             "Rk": len(rows) + 1,
             "Symbol": str(row.get("Symbol", "")),
+            "No. of Times": best_count,
             "Change": f"{float(row['% Change']):+.2f}%",
             "Entry": entry_time,
             "Entry Price": f"{entry_price:,.2f}",
@@ -1773,9 +1806,9 @@ def _breakout_table_html(rows: list, title: str, side: str) -> str:
     if not rows:
         return f"<p style=\'color:#aaa;font-size:13px\'>No {side} breakout trades found.</p>"
     is_bull = side == "bull"
-    icon = "🚀" if is_bull else "▼"
+    icon = "ðŸš€" if is_bull else "â–¼"
     title_color = "#00e676" if is_bull else "#ff5252"
-    cols = ["Rk", "Symbol", "Change", "Entry", "Entry Price", "Stop Price", "Exit",
+    cols = ["Rk", "Symbol", "No. of Times", "Change", "Entry", "Entry Price", "Stop Price", "Exit",
             "VWAP Z", "Signal", "Volume Exp", "Range Exp", "20d RVOL", "Grade"]
     hdr = "".join(f"<th style=\'padding:7px 10px;text-align:center;border:1px solid #333;font-size:12px\'>{c}</th>" for c in cols)
     body = ""
@@ -1788,7 +1821,11 @@ def _breakout_table_html(rows: list, title: str, side: str) -> str:
         for c in cols:
             val = str(r.get(c, ""))
             style = "padding:7px 10px;text-align:center;border:1px solid #333;font-size:12px;color:#eee"
-            if c == "Change":
+            if c == "No. of Times":
+                n_times = int(val) if val.isdigit() else 0
+                bg_nt = "#1b5e20" if n_times >= 5 else "#2e7d32" if n_times >= 3 else "#1a237e" if n_times >= 2 else "#263238"
+                val = f"<span style='background:{bg_nt};color:#fff;padding:2px 8px;border-radius:3px;font-size:12px;font-weight:bold'>{val}</span>"
+            elif c == "Change":
                 style += f";color:{chg_col};font-weight:bold"
             elif c == "Signal":
                 val = f"<span style=\'background:{sig_col};color:#fff;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:bold\'>{val}</span>"
@@ -1821,17 +1858,18 @@ def build_and_send_breakout_email(stock_df: pd.DataFrame, trade_date=None):
         logger.warning("BREAKOUT No bull or bear breakout candidates found.")
         return
 
-    bull_html = _breakout_table_html(bull_rows, f"Bull Breakout Trades â€” Top {len(bull_rows)} (Latest Entry First)", "bull")
-    bear_html = _breakout_table_html(bear_rows, f"Bear Breakout Trades â€” Top {len(bear_rows)} (Latest Entry First)", "bear")
+    bull_html = _breakout_table_html(bull_rows, f"Bull Breakout Trades Ã¢â‚¬â€ Top {len(bull_rows)} (Latest Entry First)", "bull")
+    bear_html = _breakout_table_html(bear_rows, f"Bear Breakout Trades Ã¢â‚¬â€ Top {len(bear_rows)} (Latest Entry First)", "bear")
 
     footer = """
 <p style=\'color:#aaa;font-size:11px;margin-top:12px\'>
 Filters: Bull = positive %Change only | Bear = negative %Change only<br>
-Exit = Entry + 90 min capped at 14:45 | Bear VWAP Z &lt; -0.50
+Exit = Entry + 90 min capped at 14:45 | Bear VWAP Z &lt; -0.50<br>
+<b>No. of Times</b> = count of BEST-grade breakout signals for that symbol (sorted DESC)
 </p>"""
 
     html = f"""<html><body style=\'background:#0d0d1a;color:#eee;font-family:Arial,sans-serif;padding:16px\'>
-<h2 style=\'color:#fff\'>ðŸš€ Intraday Breakout Alert â€” {date_str}</h2>
+<h2 style=\'color:#fff\'>Ã°Å¸Å¡â‚¬ Intraday Breakout Alert Ã¢â‚¬â€ {date_str}</h2>
 {bull_html}
 <div style=\'height:20px\'></div>
 {bear_html}
@@ -1934,7 +1972,7 @@ def main_index_first():
     send_email_with_tables(long_df, short_df, summary_csv, detail_csv, index_long_df=index_long_df, index_short_df=index_short_df, index_iter_csv_filename=(index_iter_csv if 'index_iter_csv' in locals() else None))
     logger.info('MAIN Primary email send attempt completed')
 
-    # â”€â”€ Breakout email â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬ Breakout email Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     try:
         if isinstance(df_all, pd.DataFrame) and not df_all.empty:
             breakout_src = df_all.copy()
@@ -1942,7 +1980,7 @@ def main_index_first():
             logger.info(f'BREAKOUT Using live df_all with {len(breakout_src)} rows')
         else:
             fallback_symbols = union_stock_symbols if union_stock_symbols else load_fno_symbols_from_sectors('sectors')
-            logger.info(f'BREAKOUT No live data â€” fetching previous trading day from Fyers for {len(fallback_symbols)} symbols')
+            logger.info(f'BREAKOUT No live data Ã¢â‚¬â€ fetching previous trading day from Fyers for {len(fallback_symbols)} symbols')
             breakout_src = scan_symbol_universe_previous_day(fallback_symbols)
             breakout_date = datetime.now() - timedelta(days=1)
             if isinstance(breakout_src, pd.DataFrame) and not breakout_src.empty:
