@@ -1072,7 +1072,9 @@ def send_email_with_tables(
         msg["Subject"] = (
             f"Intraday Vol Iteration Alert - {datetime.now().strftime('%d %b %H:%M')}"
         )
-        msg.attach(MIMEText(html_body, "html", "utf-8"))
+        html_part = MIMEText(html_body, "html", "utf-8")
+        html_part.set_charset("utf-8")
+        msg.attach(html_part)
 
         for filename in [csv_filename, detail_csv_filename, index_iter_csv_filename]:
             if not filename or not isinstance(filename, (str, bytes, os.PathLike)):
@@ -1624,8 +1626,11 @@ def _smtp_send(subject: str, html_body: str, attachments=None) -> bool:
         msg = MIMEMultipart()
         msg["From"] = sender_email
         msg["To"] = recipient_email
-        msg["Subject"] = subject
-        msg.attach(MIMEText(html_body, "html", "utf-8"))
+        from email.header import Header
+    msg["Subject"] = Header(subject, "utf-8")
+        html_part = MIMEText(html_body, "html", "utf-8")
+        html_part.set_charset("utf-8")
+        msg.attach(html_part)
         for filename in (attachments or []):
             if not filename or not os.path.exists(str(filename)):
                 continue
@@ -1675,21 +1680,23 @@ def _calc_exit_time(entry_str: str) -> str:
 
 def _grade(row) -> str:
     try:
-        vwap_z    = float(row.get("VWAP Z-Score")    or 0)
-        vol_exp   = float(row.get("Volume_Expansion") or 0)
-        rng_exp   = float(row.get("Range_Expansion")  or 0)
-        survival  = float(row.get("SurvivalNum")      or 0)
-        adx       = float(row.get("Cumulative ADX")   or 0)
+        vwap_z   = float(row.get("VWAP Z-Score",    0) or 0)
+        vol_exp  = float(row.get("VolumeExpansion",  0) or 0)
+        rng_exp  = float(row.get("RangeExpansion",   0) or 0)
+        survival = float(row.get("SurvivalNum",      0) or 0)
+        adx      = float(row.get("Cumulative ADX",   0) or 0)
         score = 0
-        if abs(vwap_z) >= 2.0:  score += 3
-        elif abs(vwap_z) >= 1.5: score += 2
-        elif abs(vwap_z) >= 0.8: score += 1
-        if vol_exp >= 2.0:  score += 2
+        az = abs(vwap_z)
+        if az >= 2.5: score += 4
+        elif az >= 2.0: score += 3
+        elif az >= 1.5: score += 2
+        elif az >= 0.8: score += 1
+        if vol_exp >= 2.0: score += 2
         elif vol_exp >= 1.0: score += 1
-        if rng_exp >= 2.0:  score += 2
+        if rng_exp >= 2.0: score += 2
         elif rng_exp >= 1.0: score += 1
         if survival >= 0.75: score += 2
-        elif survival >= 0.5: score += 1
+        elif survival >= 0.50: score += 1
         if adx >= 35: score += 1
         if score >= 9: return "Bullish Persistence"
         if score >= 6: return "BEST"
@@ -1700,111 +1707,164 @@ def _grade(row) -> str:
         return "WEAK"
 
 
-def _grade_color(grade: str) -> str:
-    g = str(grade or "").strip()
+def grade(row) -> str:
+    return _grade(row)
+
+
+def _grade_color(g: str) -> str:
+    g = str(g or "").strip()
     if g == "Bullish Persistence": return "#064e3b"
     if g == "BEST":                return "#14532d"
     if g == "STRONG":              return "#1e3a5f"
-    if g == "GOOD":                return "#374151"
+    if g == "GOOD":                return "#4c1d95"
     if g == "WEAK":                return "#4b2020"
     return "#1f2937"
 
 
-def build_breakout_rows(df: pd.DataFrame, side: str, top_n: int = 10) -> list:
-    """Filter, sort by No. of Times DESC, return list-of-dicts for breakout table."""
-    if df is None or df.empty:
-        return []
-    work = df.copy()
+def grade_color(g: str) -> str:
+    return _grade_color(g)
 
-    if "LTP" not in work.columns:
+
+def build_breakout_rows(summary_df: pd.DataFrame, side: str, top_n: int = 10,
+                        detail_df: Optional[pd.DataFrame] = None) -> list:
+    """Build breakout rows. No. of Times = BEST hits across full iteration history."""
+    if summary_df is None or summary_df.empty:
         return []
-    work["LTP"] = pd.to_numeric(work["LTP"], errors="coerce")
+    work = summary_df.copy()
+    required_cols = ["Symbol", "LTP", "% Change"]
+    if any(c not in work.columns for c in required_cols):
+        return []
+
+    work["Symbol"]   = work["Symbol"].astype(str).str.strip()
+    work["LTP"]      = pd.to_numeric(work["LTP"],       errors="coerce")
+    work["% Change"] = pd.to_numeric(work["% Change"],  errors="coerce").fillna(0.0)
     work = work.dropna(subset=["LTP"])
 
-    if "% Change" not in work.columns:
-        work["% Change"] = 0.0
-    work["% Change"] = pd.to_numeric(work["% Change"], errors="coerce").fillna(0.0)
-
     if "Last Iteration Time" in work.columns:
-        work["_entry"] = work["Last Iteration Time"].astype(str).str[:5].replace({"nan": "09:45", "": "09:45"})
+        work["_entry"] = work["Last Iteration Time"].astype(str).str[:5].replace(
+            {"nan": "09:45", "": "09:45"}, regex=False
+        )
     else:
         work["_entry"] = "09:45"
 
-    # Filter direction
+    for col in ["VWAP Z-Score", "VolumeExpansion", "RangeExpansion",
+                "20 Day Relative Volume", "SurvivalNum", "Cumulative ADX"]:
+        if col not in work.columns:
+            work[col] = 0.0
+        work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0.0)
+
+    # Direction filter
     if side == "bull":
         work = work[work["% Change"] > 0].copy()
     else:
         work = work[work["% Change"] < 0].copy()
-        if "VWAP Z-Score" in work.columns:
-            work = work[pd.to_numeric(work["VWAP Z-Score"], errors="coerce").fillna(0) < -0.50].copy()
+        work = work[work["VWAP Z-Score"] < -0.50].copy()
 
     if work.empty:
         return []
 
-    work["_entry_dt"] = pd.to_datetime(work["_entry"], format="%H:%M", errors="coerce")
-    vz_col = "VWAP Z-Score" if "VWAP Z-Score" in work.columns else None
-    work["_z_abs"] = pd.to_numeric(work[vz_col], errors="coerce").abs().fillna(0) if vz_col else 0
-
-    # â”€â”€ Count BEST/Bullish-Persistence hits per symbol â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    def _is_best(row) -> bool:
-        az   = abs(float(row.get("VWAP Z-Score")    or 0))
-        vexp = float(row.get("Volume_Expansion") or 0)
-        rexp = float(row.get("Range_Expansion")  or 0)
-        surv = float(row.get("SurvivalNum")      or 0)
-        adxv = float(row.get("Cumulative ADX")   or 0)
-        score  = (3 if az >= 2.0 else 2 if az >= 1.5 else 1 if az >= 0.8 else 0)
-        score += (2 if vexp >= 2.0 else 1 if vexp >= 1.0 else 0)
-        score += (2 if rexp >= 2.0 else 1 if rexp >= 1.0 else 0)
-        score += (2 if surv >= 0.75 else 1 if surv >= 0.5 else 0)
-        score += (1 if adxv >= 35 else 0)
-        return score >= 6  # BEST or Bullish Persistence
+    # â”€â”€ No. of Times: count BEST-tier hits from iteration history â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    def _is_best_iter(row) -> bool:
+        """Score a single iteration row; returns True if BEST or higher."""
+        az   = abs(float(row.get("VWAP Z-Score",    0) or 0))
+        vexp = float(row.get("VolumeExpansion",  0) or 0)
+        rexp = float(row.get("RangeExpansion",   0) or 0)
+        surv = float(row.get("SurvivalNum",      0) or 0)
+        adxv = float(row.get("Cumulative ADX",   0) or 0)
+        score = 0
+        if az >= 2.5: score += 4
+        elif az >= 2.0: score += 3
+        elif az >= 1.5: score += 2
+        elif az >= 0.8: score += 1
+        if vexp >= 2.0: score += 2
+        elif vexp >= 1.0: score += 1
+        if rexp >= 2.0: score += 2
+        elif rexp >= 1.0: score += 1
+        if surv >= 0.75: score += 2
+        elif surv >= 0.50: score += 1
+        if adxv >= 35: score += 1
+        # Fallback for EOD scans: Z-score alone qualifies
+        if score == 0 and az >= 1.5:
+            score = 6
+        return score >= 6
 
     best_counts: dict = {}
-    for _, row in work.iterrows():
-        if _is_best(row):
-            sym = str(row.get("Symbol", "")).strip()
-            if sym:
-                best_counts[sym] = best_counts.get(sym, 0) + 1
+    # Prefer full iteration history (multiple rows per symbol â†’ real repeat count)
+    iter_source = None
+    if detail_df is not None and not detail_df.empty and "Symbol" in detail_df.columns:
+        iter_source = detail_df.copy()
+        iter_source["Symbol"] = iter_source["Symbol"].astype(str).str.strip()
+        for col in ["VWAP Z-Score", "VolumeExpansion", "RangeExpansion",
+                    "SurvivalNum", "Cumulative ADX"]:
+            if col not in iter_source.columns:
+                iter_source[col] = 0.0
+            iter_source[col] = pd.to_numeric(iter_source[col], errors="coerce").fillna(0.0)
 
-    work["_best_count"] = (
-        work["Symbol"].astype(str).map(lambda s: best_counts.get(s.strip(), 0)).fillna(0).astype(int)
-    )
+        if side == "bull":
+            chg_col = "Change" if "Change" in iter_source.columns else "% Change"
+            if chg_col in iter_source.columns:
+                iter_source[chg_col] = pd.to_numeric(iter_source[chg_col], errors="coerce").fillna(0.0)
+                iter_source = iter_source[iter_source[chg_col] > 0]
+        else:
+            chg_col = "Change" if "Change" in iter_source.columns else "% Change"
+            if chg_col in iter_source.columns:
+                iter_source[chg_col] = pd.to_numeric(iter_source[chg_col], errors="coerce").fillna(0.0)
+                iter_source = iter_source[iter_source[chg_col] < 0]
 
-    # â”€â”€ Sort: No. of Times DESC â†’ VWAP-Z DESC â†’ Entry time DESC â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-    work = work.sort_values(
-        by=["_best_count", "_z_abs", "_entry_dt"],
-        ascending=[False, False, False],
-        na_position="last",
-    ).reset_index(drop=True).head(top_n)
+        for _, row in iter_source.iterrows():
+            if _is_best_iter(row):
+                sym = str(row.get("Symbol", "")).strip()
+                if sym:
+                    best_counts[sym] = best_counts.get(sym, 0) + 1
+
+    # Fallback: use summary df (1 row per symbol â†’ max count = 1)
+    if not best_counts:
+        for _, row in work.iterrows():
+            if _is_best_iter(row):
+                sym = str(row.get("Symbol", "")).strip()
+                if sym:
+                    best_counts[sym] = best_counts.get(sym, 0) + 1
+
+    work["No. of Times"] = work["Symbol"].map(lambda s: best_counts.get(s, 0)).fillna(0).astype(int)
+    work["_entry_dt"]    = pd.to_datetime(work["_entry"], format="%H:%M", errors="coerce")
+    work["_z_abs"]       = work["VWAP Z-Score"].abs()
+
+    # Sort: No. of Times DESC â†’ VWAP Z DESC â†’ Entry time DESC
+    work = (work
+            .sort_values(["No. of Times", "_z_abs", "_entry_dt"],
+                         ascending=[False, False, False], na_position="last")
+            .drop_duplicates(subset=["Symbol"], keep="first")
+            .head(top_n)
+            .reset_index(drop=True))
 
     rows = []
-    for i, row in work.iterrows():
+    for _, row in work.iterrows():
         entry_time  = row["_entry"]
         entry_price = float(row["LTP"])
         stop_price  = _calc_stop_price(row, side)
         exit_time   = _calc_exit_time(entry_time)
-        vwap_z      = float(pd.to_numeric(row.get("VWAP Z-Score",  0) or 0, errors="coerce") or 0)
-        signal      = "BUY" if side == "bull" else "SELL"
-        vol_exp     = float(pd.to_numeric(row.get("Volume_Expansion", 0) or 0, errors="coerce") or 0)
-        rng_exp     = float(pd.to_numeric(row.get("Range_Expansion",  0) or 0, errors="coerce") or 0)
-        rvol_20     = float(pd.to_numeric(row.get("20 Day Relative Volume", 0) or 0, errors="coerce") or 0)
-        grade       = _grade(row)
-        best_count  = int(row.get("_best_count") or 0)
+        vwap_z      = float(row.get("VWAP Z-Score", 0) or 0)
+        vol_exp     = float(row.get("VolumeExpansion", 0) or 0)
+        rng_exp     = float(row.get("RangeExpansion", 0) or 0)
+        rvol_20     = float(row.get("20 Day Relative Volume", 0) or 0)
+        chg         = float(row["% Change"])
+        best_count  = int(row.get("No. of Times") or 0)
+        grade_val   = _grade(row)
         rows.append({
             "Rk":           len(rows) + 1,
             "Symbol":       str(row.get("Symbol", "")),
             "No. of Times": best_count,
-            "Change":       f"{float(row['% Change']):+.2f}%",
+            "Change":       f"{chg:+.2f}%",
             "Entry":        entry_time,
             "Entry Price":  f"{entry_price:,.2f}",
             "Stop Price":   f"{stop_price:,.2f}",
             "Exit":         exit_time,
             "VWAP Z":       f"{vwap_z:.2f}",
-            "Signal":       signal,
+            "Signal":       "BUY" if side == "bull" else "SELL",
             "Volume Exp":   f"{vol_exp:.2f}",
             "Range Exp":    f"{rng_exp:.2f}",
             "20d RVOL":     f"{rvol_20:.2f}",
-            "Grade":        grade,
+            "Grade":        grade_val,
             "_side":        side,
         })
     return rows
@@ -1812,69 +1872,37 @@ def build_breakout_rows(df: pd.DataFrame, side: str, top_n: int = 10) -> list:
 
 def _breakout_table_html(rows: list, title: str, side: str) -> str:
     if not rows:
-        return f'<p style="color:#aaa;font-size:13px">No {side} breakout trades found.</p>'
-    is_bull     = side == "bull"
-    icon        = "ðŸš€" if is_bull else "â–¼"
+        return f"<p style=\'color:#aaa;font-size:13px\'>No {side} breakout trades found.</p>"
+    is_bull = side == "bull"
+    icon = "" if is_bull else ""
     title_color = "#00e676" if is_bull else "#ff5252"
-
-    cols = ["Rk", "Symbol", "No. of Times", "Change", "Entry", "Entry Price",
-            "Stop Price", "Exit", "VWAP Z", "Signal", "Volume Exp",
-            "Range Exp", "20d RVOL", "Grade"]
-
-    hdr = "".join(
-        f'<th style="padding:7px 10px;text-align:center;border:1px solid #333;'
-        f'font-size:12px;background:#0f3460;color:#f9fafb;white-space:nowrap">{c}</th>'
-        for c in cols
-    )
-
+    cols = ["Rk", "Symbol", "Change", "Entry", "Entry Price", "Stop Price", "Exit",
+            "VWAP Z", "Signal", "Volume Exp", "Range Exp", "20d RVOL", "Grade"]
+    hdr = "".join(f"<th style=\'padding:7px 10px;text-align:center;border:1px solid #333;font-size:12px\'>{c}</th>" for c in cols)
     body = ""
     for r in rows:
-        try:
-            chg_val = float(r["Change"].replace("%", "").replace("+", ""))
-        except Exception:
-            chg_val = 0.0
-        chg_col  = "#00e676" if chg_val >= 0 else "#ff5252"
-        sig_col  = "#1b7a2f" if r["Signal"] == "BUY" else "#b71c1c"
+        chg_val = float(r["Change"].replace("%","").replace("+",""))
+        chg_col = "#00e676" if chg_val >= 0 else "#ff5252"
+        sig_col = "#1b7a2f" if r["Signal"] == "BUY" else "#b71c1c"
         grade_col = _grade_color(r["Grade"])
-
         cells = ""
         for c in cols:
-            val   = str(r.get(c, ""))
-            style = ("padding:7px 10px;text-align:center;border:1px solid #333;"
-                     "font-size:12px;color:#eee;background:#1a1a2e;")
-
-            if c == "No. of Times":
-                try:
-                    nt = int(val.strip())
-                except Exception:
-                    nt = 0
-                ntbg = ("#064e3b" if nt >= 5 else
-                        "#14532d" if nt >= 3 else
-                        "#1e3a8a" if nt >= 2 else "#334155")
-                val = (f'<span style="background:{ntbg};color:#fff;padding:3px 10px;'
-                       f'border-radius:4px;font-size:12px;font-weight:bold">{nt}</span>')
-            elif c == "Change":
-                style += f"color:{chg_col};font-weight:bold;"
+            val = str(r.get(c, ""))
+            style = "padding:7px 10px;text-align:center;border:1px solid #333;font-size:12px;color:#eee"
+            if c == "Change":
+                style += f";color:{chg_col};font-weight:bold"
             elif c == "Signal":
-                val = (f'<span style="background:{sig_col};color:#fff;padding:2px 8px;'
-                       f'border-radius:3px;font-size:11px;font-weight:bold">{val}</span>')
+                val = f"<span style=\'background:{sig_col};color:#fff;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:bold\'>{val}</span>"
             elif c == "Grade":
-                val = (f'<span style="background:{grade_col};color:#fff;padding:2px 8px;'
-                       f'border-radius:3px;font-size:11px;font-weight:bold">{val}</span>')
-            cells += f'<td style="{style}">{val}</td>'
+                val = f"<span style=\'background:{grade_col};color:#fff;padding:2px 8px;border-radius:3px;font-size:11px;font-weight:bold\'>{val}</span>"
+            cells += f"<td style=\'{style}\'>{val}</td>"
         body += f"<tr>{cells}</tr>"
-
-    return (
-        f'<h3 style="color:{title_color};font-family:Arial,sans-serif;margin:18px 0 6px">'
-        f'{icon} {title}</h3>'
-        f'<table style="border-collapse:collapse;width:100%;background:#1a1a2e">'
-        f'  <thead><tr style="background:#0f3460">{hdr}</tr></thead>'
-        f'  <tbody>{body}</tbody>'
-        f'</table>'
-        f'<p style="margin:6px 0 18px 0;color:#9ca3af;font-size:11px;font-family:Arial,sans-serif">'
-        f'No. of Times = BEST/Bullish-Persistence signals fired for this symbol (sorted DESC).'
-        f'</p>'
-    )
+    return f"""
+<h3 style=\'color:{title_color};font-family:Arial,sans-serif;margin:18px 0 6px\'>{icon} {title}</h3>
+<table style=\'border-collapse:collapse;width:100%;background:#1a1a2e\'>
+  <thead><tr style=\'background:#0f3460\'>{hdr}</tr></thead>
+  <tbody>{body}</tbody>
+</table>"""
 
 
 def build_and_send_breakout_email(stock_df: pd.DataFrame, trade_date=None):
@@ -1887,8 +1915,8 @@ def build_and_send_breakout_email(stock_df: pd.DataFrame, trade_date=None):
     date_str = trade_date.strftime("%d %b %Y, %H:%M")
     timestamp = trade_date.strftime("%Y%m%d_%H%M%S")
 
-    bull_rows = build_breakout_rows(stock_df, side="bull", top_n=10)
-    bear_rows = build_breakout_rows(stock_df, side="bear", top_n=10)
+    bull_rows = build_breakout_rows(stock_df, side="bull", top_n=10, detail_df=detail_df, top_n=10)
+    bear_rows = build_breakout_rows(stock_df, side="bear", top_n=10, detail_df=detail_df, top_n=10)
 
     if not bull_rows and not bear_rows:
         logger.warning("BREAKOUT No bull or bear breakout candidates found.")
