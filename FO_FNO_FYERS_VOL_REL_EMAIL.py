@@ -1768,7 +1768,6 @@ def build_breakout_rows(summary_df: pd.DataFrame, side: str, top_n: int = 10, de
             )
             det = det.assign(_best_hit=(best_score >= 4).astype(int))
             count_map = det.groupby("Symbol")["_best_hit"].sum().astype(int).to_dict()
-
             latest_candidates = det.sort_values(["Symbol", "_entry_dt", "VWAP Z-Score"], ascending=[True, False, False])
             latest_map = latest_candidates.drop_duplicates(subset=["Symbol"], keep="first").set_index("Symbol").to_dict("index")
 
@@ -1784,12 +1783,9 @@ def build_breakout_rows(summary_df: pd.DataFrame, side: str, top_n: int = 10, de
                 work.at[idx, "_entry"] = src_row.get("_entry", row["_entry"])
                 work.at[idx, "_entry_dt"] = src_row.get("_entry_dt", row["_entry_dt"])
                 work.at[idx, "VWAP Z-Score"] = float(pd.to_numeric(src_row.get("VWAP Z-Score", row["VWAP Z-Score"]), errors="coerce") or 0)
-                if "Volume_Expansion" in work.columns or "Volume_Expansion" in src_row:
-                    work.at[idx, "Volume_Expansion"] = float(pd.to_numeric(src_row.get("Volume_Expansion", row.get("Volume_Expansion", 0)), errors="coerce") or 0)
-                if "Range_Expansion" in work.columns or "Range_Expansion" in src_row:
-                    work.at[idx, "Range_Expansion"] = float(pd.to_numeric(src_row.get("Range_Expansion", row.get("Range_Expansion", 0)), errors="coerce") or 0)
-                if "20 Day Relative Volume" in work.columns or "20 Day Relative Volume" in src_row:
-                    work.at[idx, "20 Day Relative Volume"] = float(pd.to_numeric(src_row.get("20 Day Relative Volume", row.get("20 Day Relative Volume", 0)), errors="coerce") or 0)
+                work.at[idx, "Volume_Expansion"] = float(pd.to_numeric(src_row.get("Volume_Expansion", row.get("Volume_Expansion", 0)), errors="coerce") or 0)
+                work.at[idx, "Range_Expansion"] = float(pd.to_numeric(src_row.get("Range_Expansion", row.get("Range_Expansion", 0)), errors="coerce") or 0)
+                work.at[idx, "20 Day Relative Volume"] = float(pd.to_numeric(src_row.get("20 Day Relative Volume", row.get("20 Day Relative Volume", 0)), errors="coerce") or 0)
 
     for col in ["Volume_Expansion", "Range_Expansion", "20 Day Relative Volume"]:
         if col not in work.columns:
@@ -1926,16 +1922,14 @@ No. of Times = count of BEST breakout hits for that symbol, sorted descending
             w = _csv.DictWriter(f, fieldnames=[k for k in bull_rows[0] if k != "_side"])
             w.writeheader()
             for r in bull_rows:
-                rr = {k: v for k, v in r.items() if k != "_side"}
-                w.writerow(rr)
+                w.writerow({k: v for k, v in r.items() if k != "_side"})
     if bear_rows:
         import csv as _csv
         with open(bear_csv, "w", newline="", encoding="utf-8") as f:
             w = _csv.DictWriter(f, fieldnames=[k for k in bear_rows[0] if k != "_side"])
             w.writeheader()
             for r in bear_rows:
-                rr = {k: v for k, v in r.items() if k != "_side"}
-                w.writerow(rr)
+                w.writerow({k: v for k, v in r.items() if k != "_side"})
 
     subject = f"Breakout Alert - {trade_date.strftime('%d %b %H:%M')} - Bull {len(bull_rows)} Bear {len(bear_rows)}"
     attachments = [x for x in [bull_csv if bull_rows else None, bear_csv if bear_rows else None] if x]
@@ -2026,7 +2020,7 @@ def main_index_first():
                 logger.info(f'BREAKOUT Previous-day Fyers fetch returned {len(breakout_src)} rows')
 
         if isinstance(breakout_src, pd.DataFrame) and not breakout_src.empty:
-            build_and_send_breakout_email(breakout_src, trade_date=breakout_date)
+            build_and_send_breakout_email(breakout_src, trade_date=breakout_date, detail_df=detail_df)
         else:
             logger.warning('BREAKOUT No stock data for breakout email after previous-day Fyers fetch.')
     except Exception as _be:
