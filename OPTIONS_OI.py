@@ -50,6 +50,7 @@ OPTION_EMAIL_COLS = [
 OPTION_EMAIL_COL_RENAME = {
     "OI+Volume+OBV Score": "Liq Score",
     "EMAIL_RANK_SCORE": "Rank",
+    "No. of Times": "No. of Times",
     "% Change": "% Chg",
     "Last Iteration Time": "Time",
     "Price_Lead_Status": "Lead",
@@ -224,6 +225,18 @@ def directional_label(raw_label: str, side: str) -> str:
     if side == "long":
         return {"BUY": "LONG", "BUY+": "LONG+", "BUY++": "LONG++", "SELL": "SHORT", "SELL+": "SHORT+", "SELL++": "SHORT++"}.get(raw, raw)
     return {"SELL": "SHORT", "SELL+": "SHORT+", "SELL++": "SHORT++", "BUY": "LONG", "BUY+": "LONG+", "BUY++": "LONG++"}.get(raw, raw)
+
+
+def count_signal_occurrences(iter_hist: pd.DataFrame, side: str) -> int:
+    if iter_hist is None or not isinstance(iter_hist, pd.DataFrame) or iter_hist.empty:
+        return 0
+    signal_col = "window_signal" if "window_signal" in iter_hist.columns else None
+    if signal_col is None:
+        return 0
+    sig = iter_hist[signal_col].astype(str).str.strip().str.upper()
+    if side == "long":
+        return int(sig.isin(["BUY", "BUY+", "BUY++"]).sum())
+    return int(sig.isin(["SELL", "SELL+", "SELL++"]).sum())
 
 
 def apply_display_labels(df: pd.DataFrame, side: str) -> pd.DataFrame:
@@ -577,99 +590,89 @@ def rank_option_candidates(df: pd.DataFrame, side: str) -> pd.DataFrame:
     rd = safe_series(out, "Rank Delta", 0)
     adx = safe_series(out, "Cumulative ADX", 0)
     pct = safe_series(out, "% Change", 0)
+    times_seen = safe_series(out, "No. of Times", 0)
     option_type = out["Option Type"].astype(str).str.upper() if "Option Type" in out.columns else pd.Series("", index=out.index)
-
     out["Liq"] = liq
     out["RD"] = rd
     out["ADX"] = adx
     out["PCT"] = pct
-
+    out["TIMES"] = times_seen
     if side == "long":
         type_bonus = np.where(option_type.eq("CE"), 0.30, 0.10)
-        out["EMAIL_RANK_SCORE"] = liq * 0.40 + rd * 0.30 + adx * 0.18 + pct * 0.10 + type_bonus
-        out = out.sort_values(["EMAIL_RANK_SCORE", "Liq", "RD", "ADX", "PCT"], ascending=[False, False, False, False, False])
+        out["EMAIL_RANK_SCORE"] = liq * 0.34 + rd * 0.24 + adx * 0.16 + pct * 0.08 + times_seen * 0.15 + type_bonus
+        out = out.sort_values(["TIMES", "EMAIL_RANK_SCORE", "Liq", "RD", "ADX", "PCT"], ascending=[False, False, False, False, False, False])
     else:
         type_bonus = np.where(option_type.eq("PE"), 0.30, 0.10)
-        out["EMAIL_RANK_SCORE"] = liq * 0.40 + (-rd) * 0.30 + adx * 0.18 + (-pct) * 0.10 + type_bonus
-        out = out.sort_values(["EMAIL_RANK_SCORE", "Liq", "RD", "ADX", "PCT"], ascending=[False, False, True, False, True])
-
+        out["EMAIL_RANK_SCORE"] = liq * 0.34 + (-rd) * 0.24 + adx * 0.16 + (-pct) * 0.08 + times_seen * 0.15 + type_bonus
+        out = out.sort_values(["TIMES", "EMAIL_RANK_SCORE", "Liq", "RD", "ADX", "PCT"], ascending=[False, False, False, True, False, True])
     return out.reset_index(drop=True)
 
 
 def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if candidates_df is None or candidates_df.empty or "Symbol" not in candidates_df.columns:
         return pd.DataFrame(), pd.DataFrame()
-
     rows, iter_rows = [], []
-
     for underlying in candidates_df["Symbol"].dropna().astype(str):
         pair_df = fetch_option_pairs(underlying)
         if pair_df.empty:
             continue
-
         for _, row in pair_df.iterrows():
             strike = safe_float(row.get("Strike"), np.nan)
             opt_type = str(row.get("Option Type", "")).upper()
             sym = str(row.get("Option Symbol", ""))
             if not sym or opt_type not in {"CE", "PE"}:
                 continue
-
             scanned = scan_single_option(sym, opt_type, strike, underlying)
             if not scanned:
                 continue
-
             scanned["OI"] = safe_float(row.get("OI"), 0)
             scanned["Chain_Volume"] = safe_float(row.get("Chain Volume"), 0)
             scanned["OI+Volume+OBV Score"] = option_liquidity_score(scanned.get("OI", 0), scanned.get("Volume", 0), scanned.get("OBV", 0))
-
+            hist = scanned.get("Iteration History")
+            scanned["No. of Times"] = count_signal_occurrences(hist, side)
             if safe_float(scanned.get("LTP"), 0.0) < MIN_OPTION_LTP:
                 continue
-
             rows.append(scanned)
-
-            hist = scanned.get("Iteration History")
             if isinstance(hist, pd.DataFrame) and not hist.empty:
                 tmp = hist.copy()
                 tmp.insert(0, "Option Symbol", sym)
                 tmp.insert(1, "Underlying", underlying)
                 tmp.insert(2, "Strike", strike)
                 tmp.insert(3, "Option Type", opt_type)
+                tmp.insert(4, "No. of Times", int(scanned.get("No. of Times", 0)))
                 iter_rows.append(tmp)
-
     if not rows:
         return pd.DataFrame(), pd.DataFrame()
-
     out = pd.DataFrame(rows)
+    if "No. of Times" not in out.columns:
+        out["No. of Times"] = 0
+    out["No. of Times"] = pd.to_numeric(out["No. of Times"], errors="coerce").fillna(0).astype(int)
     out = rank_option_candidates(out, side)
-
     rd = safe_series(out, "Rank Delta", 0)
     pct = safe_series(out, "% Change", 0)
-
     if side == "long":
         out = out[(rd > 0) | (pct > 0)].copy()
-        out = out.sort_values(["EMAIL_RANK_SCORE", "OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False, False, False])
+        out = out.sort_values(["No. of Times", "EMAIL_RANK_SCORE", "OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False, False, False, False])
     else:
         out = out[(rd < 0) | (pct < 0)].copy()
-        out = out.sort_values(["EMAIL_RANK_SCORE", "OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, True, False, True])
-
+        out = out.sort_values(["No. of Times", "EMAIL_RANK_SCORE", "OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False, True, False, True])
     final_cols = [c for c in OPTION_EMAIL_COLS if c in out.columns]
     final_out = out[final_cols].reset_index(drop=True)
-
     iter_df = pd.DataFrame()
     if iter_rows and not final_out.empty:
         all_iters = pd.concat(iter_rows, ignore_index=True)
         all_iters = all_iters[all_iters["Option Symbol"].isin(final_out["Option Symbol"])].copy()
-        sort_cols = [c for c in ["Underlying", "Option Type", "Strike", "Option Symbol", "iteration"] if c in all_iters.columns]
+        sort_cols = [c for c in ["No. of Times", "Underlying", "Option Type", "Strike", "Option Symbol", "iteration"] if c in all_iters.columns]
         if sort_cols:
-            all_iters = all_iters.sort_values(sort_cols).reset_index(drop=True)
+            ascending = [False] + [True] * (len(sort_cols) - 1) if sort_cols[0] == "No. of Times" else [True] * len(sort_cols)
+            all_iters = all_iters.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
         group_cols = [c for c in ["Underlying", "Option Type", "Strike", "Option Symbol"] if c in all_iters.columns]
         if group_cols and not all_iters.empty:
             all_iters["iteration"] = all_iters.groupby(group_cols).cumcount() + 1
         if "iteration" in all_iters.columns:
             all_iters["iteration"] = pd.to_numeric(all_iters["iteration"], errors="coerce").astype("Int64")
-            all_iters = all_iters[all_iters["iteration"].between(1, ITERATIONS_TO_KEEP)]
+        all_iters = all_iters[all_iters["iteration"].between(1, ITERATIONS_TO_KEEP)]
         iter_df = all_iters.reset_index(drop=True)
-
     return final_out, iter_df
 
 
