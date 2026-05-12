@@ -865,7 +865,12 @@ def _obv_color(bias: str) -> str:
     }.get(bias, "#9E9E9E")
 
 
-def compute_obv_buildup_from_iter(iter_df: pd.DataFrame) -> pd.DataFrame:
+def compute_obv_buildup_from_iter(
+    iter_df: pd.DataFrame,
+    candidates_df: pd.DataFrame = None,
+    min_ltp: float = 20.0,
+    min_underlying_volume: float = 100_000.0,
+) -> pd.DataFrame:
     """
     Compute OBV-based buildup classification from fo_iteration_history CSV.
     Returns one summary row per option symbol.
@@ -913,6 +918,22 @@ def compute_obv_buildup_from_iter(iter_df: pd.DataFrame) -> pd.DataFrame:
         .str.replace("NSE:", "", regex=False)
         .str.replace(_re.compile(r"\d{2}(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)"), "", regex=True)
     )
+
+    # â”€â”€ Filter 1: option LTP >= min_ltp (default Rs.20) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    last = last[pd.to_numeric(last["close"], errors="coerce").fillna(0) >= min_ltp].copy()
+
+    # â”€â”€ Filter 2: underlying volume >= min_underlying_volume (default 1L) â”€
+    if candidates_df is not None and not candidates_df.empty:
+        _vc = next((c for c in ["Volume", "volume", "Chain Volume", "Chain_Volume"]
+                    if c in candidates_df.columns), None)
+        _sc = next((c for c in ["Underlying", "Symbol", "symbol"]
+                    if c in candidates_df.columns), None)
+        if _vc and _sc:
+            _vmap = (candidates_df.groupby(_sc)[_vc].max()
+                     .apply(lambda x: pd.to_numeric(x, errors="coerce")))
+            last["_uvol"] = last["Underlying"].map(_vmap).fillna(0)
+            last = last[last["_uvol"] >= min_underlying_volume].copy()
+            last = last.drop(columns=["_uvol"], errors="ignore")
 
     keep = [c for c in [
         "Option Symbol", "short_sym", "Underlying", "Option Type", "Strike",
@@ -998,12 +1019,14 @@ def build_obv_email_html(buildup_df: pd.DataFrame, scan_time: str) -> str:
         buildup_df[buildup_df["bias"] == "Long Buildup"]
         .copy()
         .sort_values("obv_chg_cum", ascending=False)   # strongest OBV buildup first
+        .head(50)                                       # top 50 only
         .reset_index(drop=True)
     )
     short_df = (
         buildup_df[buildup_df["bias"] == "Short Buildup"]
         .copy()
         .sort_values("obv_chg_cum", ascending=True)    # most negative OBV first
+        .head(50)                                       # top 50 only
         .reset_index(drop=True)
     )
 
@@ -1081,7 +1104,7 @@ def build_obv_email_html(buildup_df: pd.DataFrame, scan_time: str) -> str:
     )
 
 
-def send_obv_buildup_email(iter_df: pd.DataFrame, attachments: list = None) -> bool:
+def send_obv_buildup_email(iter_df: pd.DataFrame, candidates_df: pd.DataFrame = None, attachments: list = None) -> bool:
     """
     Compute OBV buildup from iteration history and send a SEPARATE dedicated email.
     Called from main() after existing LONG/SHORT emails.
@@ -1091,7 +1114,7 @@ def send_obv_buildup_email(iter_df: pd.DataFrame, attachments: list = None) -> b
         logger.warning("OBV buildup email skipped: iteration_df is empty.")
         return False
 
-    buildup_df = compute_obv_buildup_from_iter(iter_df)
+    buildup_df = compute_obv_buildup_from_iter(iter_df, candidates_df=candidates_df)
     if buildup_df.empty:
         logger.warning("OBV buildup email skipped: compute_obv_buildup_from_iter returned empty.")
         return False
@@ -1158,7 +1181,11 @@ def main() -> None:
     send_direction_email(short_df, "SHORT", attachments)
 
     # â”€â”€ OBV Buildup email â€” separate standalone email, no existing logic touched â”€â”€
-    send_obv_buildup_email(iteration_df, attachments=[iter_csv])
+    _all_candidates = pd.concat(
+        [df for df in [long_df, short_df] if df is not None and not df.empty],
+        ignore_index=True,
+    ) if (not long_df.empty or not short_df.empty) else pd.DataFrame()
+    send_obv_buildup_email(iteration_df, candidates_df=_all_candidates, attachments=[iter_csv])
 
     logger.info("Iteration rows: %s", len(iteration_df))
     logger.info("Iteration CSV: %s", iter_csv)
