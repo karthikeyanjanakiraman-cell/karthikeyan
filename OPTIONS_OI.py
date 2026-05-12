@@ -825,6 +825,288 @@ def scan_symbol(symbol: str) -> Optional[Dict]:
     return summary
 
 
+
+
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+# OBV BUILDUP EMAIL  â”€â”€ separate standalone email, zero impact on existing code
+# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Logic:
+#   proxy_obv      = cumsum(current_window_score) per symbol (no raw volume needed)
+#   price_chg_cum  = (close_now - close_first) / close_first * 100  â† from open
+#   obv_chg_cum    = proxy_obv_now - proxy_obv_first                 â† from open
+#
+#   Quadrant classification:
+#     priceâ†‘ + OBVâ†‘  â†’  Long Buildup    ðŸŸ¢
+#     priceâ†“ + OBVâ†“  â†’  Short Buildup   ðŸ”´
+#     priceâ†“ + OBVâ†‘  â†’  Long Unwinding  ðŸŸ¡
+#     priceâ†‘ + OBVâ†“  â†’  Short Covering  ðŸŸ 
+#     otherwise      â†’  Neutral          âšª
+# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+
+def _obv_classify(price_chg: float, obv_chg: float) -> str:
+    if price_chg > 0 and obv_chg > 0:
+        return "Long Buildup"
+    if price_chg < 0 and obv_chg < 0:
+        return "Short Buildup"
+    if price_chg < 0 and obv_chg > 0:
+        return "Long Unwinding"
+    if price_chg > 0 and obv_chg < 0:
+        return "Short Covering"
+    return "Neutral"
+
+
+def _obv_color(bias: str) -> str:
+    return {
+        "Long Buildup":   "#00C853",
+        "Short Buildup":  "#D50000",
+        "Long Unwinding": "#FF6D00",
+        "Short Covering": "#FFD600",
+        "Neutral":        "#9E9E9E",
+    }.get(bias, "#9E9E9E")
+
+
+def compute_obv_buildup_from_iter(iter_df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Compute OBV-based buildup classification from fo_iteration_history CSV.
+    Returns one summary row per option symbol.
+    """
+    if iter_df is None or iter_df.empty:
+        return pd.DataFrame()
+
+    df = iter_df.copy()
+    df["current_window_score"] = pd.to_numeric(
+        df["current_window_score"] if "current_window_score" in df.columns else 0,
+        errors="coerce"
+    ).fillna(0)
+    df["close"] = pd.to_numeric(df["close"] if "close" in df.columns else np.nan, errors="coerce")
+    df["iteration"] = pd.to_numeric(df["iteration"] if "iteration" in df.columns else 0, errors="coerce").fillna(0)
+    df = df.sort_values(["Option Symbol", "iteration"]).reset_index(drop=True)
+
+    # Proxy OBV = running cumsum of window score per symbol
+    df["proxy_obv"] = df.groupby("Option Symbol")["current_window_score"].cumsum()
+
+    # Baselines from first iteration per symbol
+    df["first_close"] = df.groupby("Option Symbol")["close"].transform("first")
+    df["first_obv"]   = df.groupby("Option Symbol")["proxy_obv"].transform("first")
+
+    # Final state = last iteration per symbol
+    last = (
+        df.sort_values("iteration")
+          .groupby("Option Symbol", as_index=False)
+          .last()
+    )
+
+    first_close_safe = last["first_close"].replace(0, np.nan)
+    last["price_chg_cum"] = ((last["close"] - last["first_close"]) / first_close_safe * 100).round(2)
+    last["obv_chg_cum"]   = (last["proxy_obv"] - last["first_obv"]).round(2)
+    last["bias"]          = last.apply(
+        lambda r: _obv_classify(
+            safe_float(r["price_chg_cum"], 0),
+            safe_float(r["obv_chg_cum"], 0)
+        ), axis=1
+    )
+
+    # Clean display symbol (strip exchange prefix + common expiry month tags)
+    import re as _re
+    last["short_sym"] = (
+        last["Option Symbol"]
+        .str.replace("NSE:", "", regex=False)
+        .str.replace(_re.compile(r"\d{2}(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)"), "", regex=True)
+    )
+
+    keep = [c for c in [
+        "Option Symbol", "short_sym", "Underlying", "Option Type", "Strike",
+        "price_chg_cum", "obv_chg_cum", "bias", "close", "first_close"
+    ] if c in last.columns]
+    return last[keep].reset_index(drop=True)
+
+
+def _obv_rows_html(df: pd.DataFrame) -> str:
+    if df is None or df.empty:
+        return (
+            "<tr><td colspan='6' style='padding:6px 8px;color:#888;"
+            "font-family:Arial,Helvetica,sans-serif;font-size:10px;'>"
+            "No symbols in this category.</td></tr>"
+        )
+    parts = []
+    for _, r in df.iterrows():
+        opt_type  = str(r.get("Option Type", "")).strip().upper()
+        type_bg   = "#003c00" if opt_type == "CE" else "#3c0020"
+        pct       = safe_float(r.get("price_chg_cum"), 0)
+        obv       = safe_float(r.get("obv_chg_cum"), 0)
+        pct_col   = "#00E676" if pct >= 0 else "#FF5252"
+        obv_col   = "#00E676" if obv >= 0 else "#FF5252"
+        strike    = r.get("Strike", "")
+        try:
+            ltp = f"{float(r.get('close', '')):.2f}"
+        except Exception:
+            ltp = str(r.get("close", ""))
+        parts.append(
+            "<tr>"
+            f"<td style='padding:4px 8px;white-space:nowrap;'>{r.get('short_sym','')}</td>"
+            f"<td style='padding:4px 8px;background:{type_bg};text-align:center;'>{opt_type}</td>"
+            f"<td style='padding:4px 8px;text-align:right;'>{strike}</td>"
+            f"<td style='padding:4px 8px;text-align:right;'>{ltp}</td>"
+            f"<td style='padding:4px 8px;text-align:right;color:{pct_col};'>{pct:+.2f}%</td>"
+            f"<td style='padding:4px 8px;text-align:right;color:{obv_col};'>{obv:+.2f}</td>"
+            "</tr>"
+        )
+    return "".join(parts)
+
+
+def _obv_section_html(title: str, bg_color: str, emoji: str, df: pd.DataFrame) -> str:
+    count = len(df) if df is not None else 0
+    header_row = (
+        "<tr style='background:#2f3b59;color:#fff;'>"
+        "<th style='padding:4px 8px;text-align:left;'>Symbol</th>"
+        "<th style='padding:4px 8px;'>Type</th>"
+        "<th style='padding:4px 8px;text-align:right;'>Strike</th>"
+        "<th style='padding:4px 8px;text-align:right;'>LTP</th>"
+        "<th style='padding:4px 8px;text-align:right;'>Price%</th>"
+        "<th style='padding:4px 8px;text-align:right;'>OBV Chg</th>"
+        "</tr>"
+    )
+    return (
+        "<tr><td style='padding:0 0 14px 0;'>"
+        "<table width='100%' border='0' cellpadding='0' cellspacing='0'>"
+        "<tr><td style='"
+        f"padding:6px 8px 4px 8px;"
+        f"font-family:Arial,Helvetica,sans-serif;font-size:12px;"
+        f"color:#fff;background:{bg_color};font-weight:bold;'>"
+        f"{emoji} {title} "
+        f"<span style='font-weight:normal;font-size:11px;'>({count} symbols)</span>"
+        "</td></tr>"
+        "<tr><td>"
+        "<table width='100%' border='0' cellpadding='0' cellspacing='0' "
+        "style='font-family:Arial,Helvetica,sans-serif;font-size:10px;"
+        "border-collapse:separate;border-spacing:1px;background:#111;color:#fff;'>"
+        + header_row
+        + _obv_rows_html(df)
+        + "</table></td></tr></table></td></tr>"
+    )
+
+
+def build_obv_email_html(buildup_df: pd.DataFrame, scan_time: str) -> str:
+    """
+    Build the OBV email HTML.
+    Two sections only:
+      1. LONG BUILDUP  (Priceâ†‘ + OBVâ†‘) â€” sorted by obv_chg_cum DESC
+      2. SHORT BUILDUP (Priceâ†“ + OBVâ†“) â€” sorted by obv_chg_cum ASC (most negative first)
+    Rows within each section are ordered by strongest OBV move first.
+    """
+    long_df  = (
+        buildup_df[buildup_df["bias"] == "Long Buildup"]
+        .copy()
+        .sort_values("obv_chg_cum", ascending=False)   # strongest OBV buildup first
+        .reset_index(drop=True)
+    )
+    short_df = (
+        buildup_df[buildup_df["bias"] == "Short Buildup"]
+        .copy()
+        .sort_values("obv_chg_cum", ascending=True)    # most negative OBV first
+        .reset_index(drop=True)
+    )
+
+    lb = len(long_df)
+    sb = len(short_df)
+    total = max(lb + sb, 1)
+
+    if lb > sb:
+        bias_label = "\U0001f402 BULL DOMINANT"
+        bias_color = "#00C853"
+    elif sb > lb:
+        bias_label = "\U0001f43b BEAR DOMINANT"
+        bias_color = "#D50000"
+    else:
+        bias_label = "\u2696\ufe0f NEUTRAL"
+        bias_color = "#9E9E9E"
+
+    lb_pct = int(lb / total * 100)
+    sb_pct = 100 - lb_pct
+
+    sections = (
+        _obv_section_html("LONG BUILDUP",  "#005c2e", "\U0001f7e2", long_df)
+        + _obv_section_html("SHORT BUILDUP", "#7a0000", "\U0001f534", short_df)
+    )
+
+    return (
+        "<html><head><style>body{margin:0;padding:0;background:#1a1a1a;}</style></head>"
+        "<body style='margin:0;padding:0;background:#1a1a1a;'>"
+        "<table width='100%' border='0' cellpadding='0' cellspacing='0' style='background:#1a1a1a;'>"
+        "<tr><td align='center' style='padding:12px;'>"
+        "<table width='600' border='0' cellpadding='0' cellspacing='0' "
+        "style='width:600px;max-width:600px;background:#1e1e1e;color:#fff;"
+        "border-collapse:collapse;font-family:Arial,Helvetica,sans-serif;'>"
+
+        # â”€â”€ Header
+        "<tr><td style='padding:14px 16px 6px 16px;font-size:15px;font-weight:bold;"
+        "color:#fff;border-bottom:2px solid #333;'>"
+        "\U0001f4ca OBV Buildup &mdash; Long &amp; Short Strikes"
+        f"<div style='font-size:11px;font-weight:normal;color:#aaa;margin-top:2px;'>"
+        f"Scan: {scan_time}</div>"
+        "</td></tr>"
+
+        # â”€â”€ Market bias banner
+        "<tr><td style='padding:8px 16px;background:#222;'>"
+        "<table width='100%' border='0' cellpadding='0' cellspacing='0'><tr>"
+        f"<td style='font-size:12px;color:{bias_color};font-weight:bold;'>{bias_label}</td>"
+        "<td align='right' style='font-size:10px;color:#aaa;'>"
+        f"\U0001f7e2 Long Buildup: {lb} &nbsp;&nbsp; \U0001f534 Short Buildup: {sb}"
+        "</td></tr></table>"
+        "<table width='100%' border='0' cellpadding='0' cellspacing='1' "
+        "style='margin-top:6px;'><tr>"
+        f"<td width='{lb_pct}%' style='background:#00C853;height:6px;font-size:0;'></td>"
+        f"<td width='{sb_pct}%' style='background:#D50000;height:6px;font-size:0;'></td>"
+        "</tr></table>"
+        "</td></tr>"
+
+        # â”€â”€ Legend
+        "<tr><td style='padding:5px 16px 2px 16px;font-size:9px;color:#888;'>"
+        "\U0001f7e2 Long Buildup = Price&uarr; + OBV&uarr; (sorted: strongest OBV first) &nbsp;|&nbsp; "
+        "\U0001f534 Short Buildup = Price&darr; + OBV&darr; (sorted: most negative OBV first)"
+        "</td></tr>"
+
+        # â”€â”€ Two sections
+        "<tr><td style='padding:10px 16px 0 16px;'>"
+        "<table width='100%' border='0' cellpadding='0' cellspacing='0'>"
+        + sections
+        + "</table></td></tr>"
+
+        # â”€â”€ Footer
+        "<tr><td style='padding:8px 16px;font-size:9px;color:#555;border-top:1px solid #333;'>"
+        "Proxy OBV = cumsum(current_window_score) from market open. "
+        "Rows sorted by OBV change magnitude (descending strength)."
+        "</td></tr>"
+        "</table></td></tr></table></body></html>"
+    )
+
+
+def send_obv_buildup_email(iter_df: pd.DataFrame, attachments: list = None) -> bool:
+    """
+    Compute OBV buildup from iteration history and send a SEPARATE dedicated email.
+    Called from main() after existing LONG/SHORT emails.
+    Zero side-effects on any existing email or data pipeline.
+    """
+    if iter_df is None or iter_df.empty:
+        logger.warning("OBV buildup email skipped: iteration_df is empty.")
+        return False
+
+    buildup_df = compute_obv_buildup_from_iter(iter_df)
+    if buildup_df.empty:
+        logger.warning("OBV buildup email skipped: compute_obv_buildup_from_iter returned empty.")
+        return False
+
+    scan_time    = datetime.now().strftime("%d %b %Y, %H:%M")
+    subject_time = datetime.now().strftime("%d %b %H:%M")
+    html_body    = build_obv_email_html(buildup_df, scan_time)
+    subject      = f"OBV Buildup \u2014 CE/PE Strikes {subject_time}"
+
+    ok = send_single_email(subject, html_body, attachments or [])
+    if ok:
+        logger.info("OBV buildup email sent. Symbols classified: %s", len(buildup_df))
+    return ok
+
+
 def main() -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     init_fyers()
@@ -874,6 +1156,9 @@ def main() -> None:
     attachments = [summary_csv, long_csv, short_csv, iter_csv]
     send_direction_email(long_df, "LONG", attachments)
     send_direction_email(short_df, "SHORT", attachments)
+
+    # â”€â”€ OBV Buildup email â€” separate standalone email, no existing logic touched â”€â”€
+    send_obv_buildup_email(iteration_df, attachments=[iter_csv])
 
     logger.info("Iteration rows: %s", len(iteration_df))
     logger.info("Iteration CSV: %s", iter_csv)
