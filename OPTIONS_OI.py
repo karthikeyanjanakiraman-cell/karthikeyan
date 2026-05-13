@@ -827,21 +827,21 @@ def scan_symbol(symbol: str) -> Optional[Dict]:
 
 
 
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
-# OBV BUILDUP EMAIL  â”€â”€ separate standalone email, zero impact on existing code
-# â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
+# OBV BUILDUP EMAIL  Ã¢â€â‚¬Ã¢â€â‚¬ separate standalone email, zero impact on existing code
+# Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 # Logic:
 #   proxy_obv      = cumsum(current_window_score) per symbol (no raw volume needed)
-#   price_chg_cum  = (close_now - close_first) / close_first * 100  â† from open
-#   obv_chg_cum    = proxy_obv_now - proxy_obv_first                 â† from open
+#   price_chg_cum  = (close_now - close_first) / close_first * 100  Ã¢â€ Â from open
+#   obv_chg_cum    = proxy_obv_now - proxy_obv_first                 Ã¢â€ Â from open
 #
 #   Quadrant classification:
-#     priceâ†‘ + OBVâ†‘  â†’  Long Buildup    ðŸŸ¢
-#     priceâ†“ + OBVâ†“  â†’  Short Buildup   ðŸ”´
-#     priceâ†“ + OBVâ†‘  â†’  Long Unwinding  ðŸŸ¡
-#     priceâ†‘ + OBVâ†“  â†’  Short Covering  ðŸŸ 
-#     otherwise      â†’  Neutral          âšª
-# â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•â•
+#     priceÃ¢â€ â€˜ + OBVÃ¢â€ â€˜  Ã¢â€ â€™  Long Buildup    Ã°Å¸Å¸Â¢
+#     priceÃ¢â€ â€œ + OBVÃ¢â€ â€œ  Ã¢â€ â€™  Short Buildup   Ã°Å¸â€Â´
+#     priceÃ¢â€ â€œ + OBVÃ¢â€ â€˜  Ã¢â€ â€™  Long Unwinding  Ã°Å¸Å¸Â¡
+#     priceÃ¢â€ â€˜ + OBVÃ¢â€ â€œ  Ã¢â€ â€™  Short Covering  Ã°Å¸Å¸ 
+#     otherwise      Ã¢â€ â€™  Neutral          Ã¢Å¡Âª
+# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
 
 def _obv_classify(price_chg: float, obv_chg: float) -> str:
     if price_chg > 0 and obv_chg > 0:
@@ -919,19 +919,23 @@ def compute_obv_buildup_from_iter(
         .str.replace(_re.compile(r"\d{2}(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)"), "", regex=True)
     )
 
-    # â”€â”€ Filter 1: option LTP >= min_ltp (default Rs.20) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬ Filter 1: option LTP >= min_ltp (default Rs.20) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
     last = last[pd.to_numeric(last["close"], errors="coerce").fillna(0) >= min_ltp].copy()
 
-    # â”€â”€ Filter 2: underlying volume >= min_underlying_volume (default 1L) â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬ Filter 2: underlying volume >= min_underlying_volume (default 1L) Ã¢â€â‚¬
     if candidates_df is not None and not candidates_df.empty:
-        _vc = next((c for c in ["Volume", "volume", "Chain Volume", "Chain_Volume"]
+        _vc = next((c for c in ["Chain Volume", "Chain_Volume", "Volume", "volume"]
                     if c in candidates_df.columns), None)
-        _sc = next((c for c in ["Underlying", "Symbol", "symbol"]
+        _sc = next((c for c in ["Option Symbol", "OptionSymbol", "symbol"]
                     if c in candidates_df.columns), None)
         if _vc and _sc:
-            _vmap = (candidates_df.groupby(_sc)[_vc].max()
-                     .apply(lambda x: pd.to_numeric(x, errors="coerce")))
-            last["_uvol"] = last["Underlying"].map(_vmap).fillna(0)
+            # Fixed: map volume per Option Symbol (per strike), not groupby underlying max
+            _vmap = (
+                candidates_df.drop_duplicates(subset=[_sc])
+                .set_index(_sc)[_vc]
+                .apply(lambda x: pd.to_numeric(x, errors="coerce"))
+            )
+            last["_uvol"] = last["Option Symbol"].map(_vmap).fillna(0)
             last = last[last["_uvol"] >= min_underlying_volume].copy()
             last = last.drop(columns=["_uvol"], errors="ignore")
 
@@ -1011,8 +1015,8 @@ def build_obv_email_html(buildup_df: pd.DataFrame, scan_time: str) -> str:
     """
     Build the OBV email HTML.
     Two sections only:
-      1. LONG BUILDUP  (Priceâ†‘ + OBVâ†‘) â€” sorted by obv_chg_cum DESC
-      2. SHORT BUILDUP (Priceâ†“ + OBVâ†“) â€” sorted by obv_chg_cum ASC (most negative first)
+      1. LONG BUILDUP  (PriceÃ¢â€ â€˜ + OBVÃ¢â€ â€˜) Ã¢â‚¬â€ sorted by obv_chg_cum DESC
+      2. SHORT BUILDUP (PriceÃ¢â€ â€œ + OBVÃ¢â€ â€œ) Ã¢â‚¬â€ sorted by obv_chg_cum ASC (most negative first)
     Rows within each section are ordered by strongest OBV move first.
     """
     long_df  = (
@@ -1061,7 +1065,7 @@ def build_obv_email_html(buildup_df: pd.DataFrame, scan_time: str) -> str:
         "style='width:600px;max-width:600px;background:#1e1e1e;color:#fff;"
         "border-collapse:collapse;font-family:Arial,Helvetica,sans-serif;'>"
 
-        # â”€â”€ Header
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Header
         "<tr><td style='padding:14px 16px 6px 16px;font-size:15px;font-weight:bold;"
         "color:#fff;border-bottom:2px solid #333;'>"
         "\U0001f4ca OBV Buildup &mdash; Long &amp; Short Strikes"
@@ -1069,7 +1073,7 @@ def build_obv_email_html(buildup_df: pd.DataFrame, scan_time: str) -> str:
         f"Scan: {scan_time}</div>"
         "</td></tr>"
 
-        # â”€â”€ Market bias banner
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Market bias banner
         "<tr><td style='padding:8px 16px;background:#222;'>"
         "<table width='100%' border='0' cellpadding='0' cellspacing='0'><tr>"
         f"<td style='font-size:12px;color:{bias_color};font-weight:bold;'>{bias_label}</td>"
@@ -1083,19 +1087,19 @@ def build_obv_email_html(buildup_df: pd.DataFrame, scan_time: str) -> str:
         "</tr></table>"
         "</td></tr>"
 
-        # â”€â”€ Legend
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Legend
         "<tr><td style='padding:5px 16px 2px 16px;font-size:9px;color:#888;'>"
         "\U0001f7e2 Long Buildup = Price&uarr; + OBV&uarr; (sorted: strongest OBV first) &nbsp;|&nbsp; "
         "\U0001f534 Short Buildup = Price&darr; + OBV&darr; (sorted: most negative OBV first)"
         "</td></tr>"
 
-        # â”€â”€ Two sections
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Two sections
         "<tr><td style='padding:10px 16px 0 16px;'>"
         "<table width='100%' border='0' cellpadding='0' cellspacing='0'>"
         + sections
         + "</table></td></tr>"
 
-        # â”€â”€ Footer
+        # Ã¢â€â‚¬Ã¢â€â‚¬ Footer
         "<tr><td style='padding:8px 16px;font-size:9px;color:#555;border-top:1px solid #333;'>"
         "Proxy OBV = cumsum(current_window_score) from market open. "
         "Rows sorted by OBV change magnitude (descending strength)."
@@ -1180,7 +1184,7 @@ def main() -> None:
     send_direction_email(long_df, "LONG", attachments)
     send_direction_email(short_df, "SHORT", attachments)
 
-    # â”€â”€ OBV Buildup email â€” separate standalone email, no existing logic touched â”€â”€
+    # Ã¢â€â‚¬Ã¢â€â‚¬ OBV Buildup email Ã¢â‚¬â€ separate standalone email, no existing logic touched Ã¢â€â‚¬Ã¢â€â‚¬
     _all_candidates = pd.concat(
         [df for df in [long_df, short_df] if df is not None and not df.empty],
         ignore_index=True,
