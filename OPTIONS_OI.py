@@ -33,6 +33,7 @@ ITERATIONS_TO_KEEP = 75
 SECTORS_DIR = os.environ.get("SECTORS_DIR", "sectors")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 MIN_OPTION_LTP = 10.0
+MIN_ATM_CHAIN_VOLUME = int(os.environ.get("MIN_ATM_CHAIN_VOLUME", "100000"))  # 1 lakh contracts
 PER_SYMBOL_SLEEP_SEC = float(os.environ.get("PER_SYMBOL_SLEEP_SEC", "0.25"))
 EMAIL_MAX_ROWS_LONG = int(os.environ.get("EMAIL_MAX_ROWS_LONG", "25"))
 EMAIL_MAX_ROWS_SHORT = int(os.environ.get("EMAIL_MAX_ROWS_SHORT", "25"))
@@ -50,7 +51,6 @@ OPTION_EMAIL_COLS = [
 OPTION_EMAIL_COL_RENAME = {
     "OI+Volume+OBV Score": "Liq Score",
     "EMAIL_RANK_SCORE": "Rank",
-    "No. of Times": "No. of Times",
     "% Change": "% Chg",
     "Last Iteration Time": "Time",
     "Price_Lead_Status": "Lead",
@@ -225,18 +225,6 @@ def directional_label(raw_label: str, side: str) -> str:
     if side == "long":
         return {"BUY": "LONG", "BUY+": "LONG+", "BUY++": "LONG++", "SELL": "SHORT", "SELL+": "SHORT+", "SELL++": "SHORT++"}.get(raw, raw)
     return {"SELL": "SHORT", "SELL+": "SHORT+", "SELL++": "SHORT++", "BUY": "LONG", "BUY+": "LONG+", "BUY++": "LONG++"}.get(raw, raw)
-
-
-def count_signal_occurrences(iter_hist: pd.DataFrame, side: str) -> int:
-    if iter_hist is None or not isinstance(iter_hist, pd.DataFrame) or iter_hist.empty:
-        return 0
-    signal_col = "window_signal" if "window_signal" in iter_hist.columns else None
-    if signal_col is None:
-        return 0
-    sig = iter_hist[signal_col].astype(str).str.strip().str.upper()
-    if side == "long":
-        return int(sig.isin(["BUY", "BUY+", "BUY++"]).sum())
-    return int(sig.isin(["SELL", "SELL+", "SELL++"]).sum())
 
 
 def apply_display_labels(df: pd.DataFrame, side: str) -> pd.DataFrame:
@@ -590,89 +578,109 @@ def rank_option_candidates(df: pd.DataFrame, side: str) -> pd.DataFrame:
     rd = safe_series(out, "Rank Delta", 0)
     adx = safe_series(out, "Cumulative ADX", 0)
     pct = safe_series(out, "% Change", 0)
-    times_seen = safe_series(out, "No. of Times", 0)
     option_type = out["Option Type"].astype(str).str.upper() if "Option Type" in out.columns else pd.Series("", index=out.index)
+
     out["Liq"] = liq
     out["RD"] = rd
     out["ADX"] = adx
     out["PCT"] = pct
-    out["TIMES"] = times_seen
+
     if side == "long":
         type_bonus = np.where(option_type.eq("CE"), 0.30, 0.10)
-        out["EMAIL_RANK_SCORE"] = liq * 0.34 + rd * 0.24 + adx * 0.16 + pct * 0.08 + times_seen * 0.15 + type_bonus
-        out = out.sort_values(["TIMES", "EMAIL_RANK_SCORE", "Liq", "RD", "ADX", "PCT"], ascending=[False, False, False, False, False, False])
+        out["EMAIL_RANK_SCORE"] = liq * 0.40 + rd * 0.30 + adx * 0.18 + pct * 0.10 + type_bonus
+        out = out.sort_values(["EMAIL_RANK_SCORE", "Liq", "RD", "ADX", "PCT"], ascending=[False, False, False, False, False])
     else:
         type_bonus = np.where(option_type.eq("PE"), 0.30, 0.10)
-        out["EMAIL_RANK_SCORE"] = liq * 0.34 + (-rd) * 0.24 + adx * 0.16 + (-pct) * 0.08 + times_seen * 0.15 + type_bonus
-        out = out.sort_values(["TIMES", "EMAIL_RANK_SCORE", "Liq", "RD", "ADX", "PCT"], ascending=[False, False, False, True, False, True])
+        out["EMAIL_RANK_SCORE"] = liq * 0.40 + (-rd) * 0.30 + adx * 0.18 + (-pct) * 0.10 + type_bonus
+        out = out.sort_values(["EMAIL_RANK_SCORE", "Liq", "RD", "ADX", "PCT"], ascending=[False, False, True, False, True])
+
     return out.reset_index(drop=True)
 
 
 def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if candidates_df is None or candidates_df.empty or "Symbol" not in candidates_df.columns:
         return pd.DataFrame(), pd.DataFrame()
+
     rows, iter_rows = [], []
+
     for underlying in candidates_df["Symbol"].dropna().astype(str):
         pair_df = fetch_option_pairs(underlying)
         if pair_df.empty:
             continue
+
+        # â”€â”€ ATM volume gate: skip if ATM CE (long) or PE (short) < MIN_ATM_CHAIN_VOLUME â”€â”€
+        atm_strike = pair_df["Strike"].iloc[0]
+        req_type   = "CE" if side == "long" else "PE"
+        atm_rows   = pair_df[(pair_df["Strike"] == atm_strike) & (pair_df["Option Type"] == req_type)]
+        atm_vol    = safe_float(atm_rows["Chain Volume"].iloc[0] if not atm_rows.empty else 0, 0)
+        if atm_vol < MIN_ATM_CHAIN_VOLUME:
+            logger.debug("SKIP %s: ATM %s Chain Volume %.0f < %d",
+                         underlying, req_type, atm_vol, MIN_ATM_CHAIN_VOLUME)
+            continue
+
         for _, row in pair_df.iterrows():
             strike = safe_float(row.get("Strike"), np.nan)
             opt_type = str(row.get("Option Type", "")).upper()
             sym = str(row.get("Option Symbol", ""))
             if not sym or opt_type not in {"CE", "PE"}:
                 continue
+
             scanned = scan_single_option(sym, opt_type, strike, underlying)
             if not scanned:
                 continue
+
             scanned["OI"] = safe_float(row.get("OI"), 0)
             scanned["Chain_Volume"] = safe_float(row.get("Chain Volume"), 0)
             scanned["OI+Volume+OBV Score"] = option_liquidity_score(scanned.get("OI", 0), scanned.get("Volume", 0), scanned.get("OBV", 0))
-            hist = scanned.get("Iteration History")
-            scanned["No. of Times"] = count_signal_occurrences(hist, side)
+
             if safe_float(scanned.get("LTP"), 0.0) < MIN_OPTION_LTP:
                 continue
+
             rows.append(scanned)
+
+            hist = scanned.get("Iteration History")
             if isinstance(hist, pd.DataFrame) and not hist.empty:
                 tmp = hist.copy()
                 tmp.insert(0, "Option Symbol", sym)
                 tmp.insert(1, "Underlying", underlying)
                 tmp.insert(2, "Strike", strike)
                 tmp.insert(3, "Option Type", opt_type)
-                tmp.insert(4, "No. of Times", int(scanned.get("No. of Times", 0)))
                 iter_rows.append(tmp)
+
     if not rows:
         return pd.DataFrame(), pd.DataFrame()
+
     out = pd.DataFrame(rows)
-    if "No. of Times" not in out.columns:
-        out["No. of Times"] = 0
-    out["No. of Times"] = pd.to_numeric(out["No. of Times"], errors="coerce").fillna(0).astype(int)
     out = rank_option_candidates(out, side)
+
     rd = safe_series(out, "Rank Delta", 0)
     pct = safe_series(out, "% Change", 0)
+
     if side == "long":
         out = out[(rd > 0) | (pct > 0)].copy()
-        out = out.sort_values(["No. of Times", "EMAIL_RANK_SCORE", "OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False, False, False, False])
+        out = out.sort_values(["EMAIL_RANK_SCORE", "OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False, False, False])
     else:
         out = out[(rd < 0) | (pct < 0)].copy()
-        out = out.sort_values(["No. of Times", "EMAIL_RANK_SCORE", "OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False, True, False, True])
+        out = out.sort_values(["EMAIL_RANK_SCORE", "OI+Volume+OBV Score", "Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, True, False, True])
+
     final_cols = [c for c in OPTION_EMAIL_COLS if c in out.columns]
     final_out = out[final_cols].reset_index(drop=True)
+
     iter_df = pd.DataFrame()
     if iter_rows and not final_out.empty:
         all_iters = pd.concat(iter_rows, ignore_index=True)
         all_iters = all_iters[all_iters["Option Symbol"].isin(final_out["Option Symbol"])].copy()
-        sort_cols = [c for c in ["No. of Times", "Underlying", "Option Type", "Strike", "Option Symbol", "iteration"] if c in all_iters.columns]
+        sort_cols = [c for c in ["Underlying", "Option Type", "Strike", "Option Symbol", "iteration"] if c in all_iters.columns]
         if sort_cols:
-            ascending = [False] + [True] * (len(sort_cols) - 1) if sort_cols[0] == "No. of Times" else [True] * len(sort_cols)
-            all_iters = all_iters.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
+            all_iters = all_iters.sort_values(sort_cols).reset_index(drop=True)
         group_cols = [c for c in ["Underlying", "Option Type", "Strike", "Option Symbol"] if c in all_iters.columns]
         if group_cols and not all_iters.empty:
             all_iters["iteration"] = all_iters.groupby(group_cols).cumcount() + 1
         if "iteration" in all_iters.columns:
             all_iters["iteration"] = pd.to_numeric(all_iters["iteration"], errors="coerce").astype("Int64")
-        all_iters = all_iters[all_iters["iteration"].between(1, ITERATIONS_TO_KEEP)]
+            all_iters = all_iters[all_iters["iteration"].between(1, ITERATIONS_TO_KEEP)]
         iter_df = all_iters.reset_index(drop=True)
+
     return final_out, iter_df
 
 
@@ -825,315 +833,6 @@ def scan_symbol(symbol: str) -> Optional[Dict]:
     return summary
 
 
-
-
-# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
-# OBV BUILDUP EMAIL  Ã¢â€â‚¬Ã¢â€â‚¬ separate standalone email, zero impact on existing code
-# Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-# Logic:
-#   proxy_obv      = cumsum(current_window_score) per symbol (no raw volume needed)
-#   price_chg_cum  = (close_now - close_first) / close_first * 100  Ã¢â€ Â from open
-#   obv_chg_cum    = proxy_obv_now - proxy_obv_first                 Ã¢â€ Â from open
-#
-#   Quadrant classification:
-#     priceÃ¢â€ â€˜ + OBVÃ¢â€ â€˜  Ã¢â€ â€™  Long Buildup    Ã°Å¸Å¸Â¢
-#     priceÃ¢â€ â€œ + OBVÃ¢â€ â€œ  Ã¢â€ â€™  Short Buildup   Ã°Å¸â€Â´
-#     priceÃ¢â€ â€œ + OBVÃ¢â€ â€˜  Ã¢â€ â€™  Long Unwinding  Ã°Å¸Å¸Â¡
-#     priceÃ¢â€ â€˜ + OBVÃ¢â€ â€œ  Ã¢â€ â€™  Short Covering  Ã°Å¸Å¸ 
-#     otherwise      Ã¢â€ â€™  Neutral          Ã¢Å¡Âª
-# Ã¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢ÂÃ¢â€¢Â
-
-def _obv_classify(price_chg: float, obv_chg: float) -> str:
-    if price_chg > 0 and obv_chg > 0:
-        return "Long Buildup"
-    if price_chg < 0 and obv_chg < 0:
-        return "Short Buildup"
-    if price_chg < 0 and obv_chg > 0:
-        return "Long Unwinding"
-    if price_chg > 0 and obv_chg < 0:
-        return "Short Covering"
-    return "Neutral"
-
-
-def _obv_color(bias: str) -> str:
-    return {
-        "Long Buildup":   "#00C853",
-        "Short Buildup":  "#D50000",
-        "Long Unwinding": "#FF6D00",
-        "Short Covering": "#FFD600",
-        "Neutral":        "#9E9E9E",
-    }.get(bias, "#9E9E9E")
-
-
-def compute_obv_buildup_from_iter(
-    iter_df: pd.DataFrame,
-    candidates_df: pd.DataFrame = None,
-    min_ltp: float = 20.0,
-    min_underlying_volume: float = 100_000.0,
-) -> pd.DataFrame:
-    """
-    Compute OBV-based buildup classification from fo_iteration_history CSV.
-    Returns one summary row per option symbol.
-    """
-    if iter_df is None or iter_df.empty:
-        return pd.DataFrame()
-
-    df = iter_df.copy()
-    df["current_window_score"] = pd.to_numeric(
-        df["current_window_score"] if "current_window_score" in df.columns else 0,
-        errors="coerce"
-    ).fillna(0)
-    df["close"] = pd.to_numeric(df["close"] if "close" in df.columns else np.nan, errors="coerce")
-    df["iteration"] = pd.to_numeric(df["iteration"] if "iteration" in df.columns else 0, errors="coerce").fillna(0)
-    df = df.sort_values(["Option Symbol", "iteration"]).reset_index(drop=True)
-
-    # Proxy OBV = running cumsum of window score per symbol
-    df["proxy_obv"] = df.groupby("Option Symbol")["current_window_score"].cumsum()
-
-    # Baselines from first iteration per symbol
-    df["first_close"] = df.groupby("Option Symbol")["close"].transform("first")
-    df["first_obv"]   = df.groupby("Option Symbol")["proxy_obv"].transform("first")
-
-    # Final state = last iteration per symbol
-    last = (
-        df.sort_values("iteration")
-          .groupby("Option Symbol", as_index=False)
-          .last()
-    )
-
-    first_close_safe = last["first_close"].replace(0, np.nan)
-    last["price_chg_cum"] = ((last["close"] - last["first_close"]) / first_close_safe * 100).round(2)
-    last["obv_chg_cum"]   = (last["proxy_obv"] - last["first_obv"]).round(2)
-    last["bias"]          = last.apply(
-        lambda r: _obv_classify(
-            safe_float(r["price_chg_cum"], 0),
-            safe_float(r["obv_chg_cum"], 0)
-        ), axis=1
-    )
-
-    # Clean display symbol (strip exchange prefix + common expiry month tags)
-    import re as _re
-    last["short_sym"] = (
-        last["Option Symbol"]
-        .str.replace("NSE:", "", regex=False)
-        .str.replace(_re.compile(r"\d{2}(JAN|FEB|MAR|APR|MAY|JUN|JUL|AUG|SEP|OCT|NOV|DEC)"), "", regex=True)
-    )
-
-    # Ã¢â€â‚¬Ã¢â€â‚¬ Filter 1: option LTP >= min_ltp (default Rs.20) Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
-    last = last[pd.to_numeric(last["close"], errors="coerce").fillna(0) >= min_ltp].copy()
-
-    # Ã¢â€â‚¬Ã¢â€â‚¬ Filter 2: underlying volume >= min_underlying_volume (default 1L) Ã¢â€â‚¬
-    if candidates_df is not None and not candidates_df.empty:
-        _vc = next((c for c in ["Chain Volume", "Chain_Volume", "Volume", "volume"]
-                    if c in candidates_df.columns), None)
-        _sc = next((c for c in ["Option Symbol", "OptionSymbol", "symbol"]
-                    if c in candidates_df.columns), None)
-        if _vc and _sc:
-            # Fixed: map volume per Option Symbol (per strike), not groupby underlying max
-            _vmap = (
-                candidates_df.drop_duplicates(subset=[_sc])
-                .set_index(_sc)[_vc]
-                .apply(lambda x: pd.to_numeric(x, errors="coerce"))
-            )
-            last["_uvol"] = last["Option Symbol"].map(_vmap).fillna(0)
-            last = last[last["_uvol"] >= min_underlying_volume].copy()
-            last = last.drop(columns=["_uvol"], errors="ignore")
-
-    keep = [c for c in [
-        "Option Symbol", "short_sym", "Underlying", "Option Type", "Strike",
-        "price_chg_cum", "obv_chg_cum", "bias", "close", "first_close"
-    ] if c in last.columns]
-    return last[keep].reset_index(drop=True)
-
-
-def _obv_rows_html(df: pd.DataFrame) -> str:
-    if df is None or df.empty:
-        return (
-            "<tr><td colspan='6' style='padding:6px 8px;color:#888;"
-            "font-family:Arial,Helvetica,sans-serif;font-size:10px;'>"
-            "No symbols in this category.</td></tr>"
-        )
-    parts = []
-    for _, r in df.iterrows():
-        opt_type  = str(r.get("Option Type", "")).strip().upper()
-        type_bg   = "#003c00" if opt_type == "CE" else "#3c0020"
-        pct       = safe_float(r.get("price_chg_cum"), 0)
-        obv       = safe_float(r.get("obv_chg_cum"), 0)
-        pct_col   = "#00E676" if pct >= 0 else "#FF5252"
-        obv_col   = "#00E676" if obv >= 0 else "#FF5252"
-        strike    = r.get("Strike", "")
-        try:
-            ltp = f"{float(r.get('close', '')):.2f}"
-        except Exception:
-            ltp = str(r.get("close", ""))
-        parts.append(
-            "<tr>"
-            f"<td style='padding:4px 8px;white-space:nowrap;'>{r.get('short_sym','')}</td>"
-            f"<td style='padding:4px 8px;background:{type_bg};text-align:center;'>{opt_type}</td>"
-            f"<td style='padding:4px 8px;text-align:right;'>{strike}</td>"
-            f"<td style='padding:4px 8px;text-align:right;'>{ltp}</td>"
-            f"<td style='padding:4px 8px;text-align:right;color:{pct_col};'>{pct:+.2f}%</td>"
-            f"<td style='padding:4px 8px;text-align:right;color:{obv_col};'>{obv:+.2f}</td>"
-            "</tr>"
-        )
-    return "".join(parts)
-
-
-def _obv_section_html(title: str, bg_color: str, emoji: str, df: pd.DataFrame) -> str:
-    count = len(df) if df is not None else 0
-    header_row = (
-        "<tr style='background:#2f3b59;color:#fff;'>"
-        "<th style='padding:4px 8px;text-align:left;'>Symbol</th>"
-        "<th style='padding:4px 8px;'>Type</th>"
-        "<th style='padding:4px 8px;text-align:right;'>Strike</th>"
-        "<th style='padding:4px 8px;text-align:right;'>LTP</th>"
-        "<th style='padding:4px 8px;text-align:right;'>Price%</th>"
-        "<th style='padding:4px 8px;text-align:right;'>OBV Chg</th>"
-        "</tr>"
-    )
-    return (
-        "<tr><td style='padding:0 0 14px 0;'>"
-        "<table width='100%' border='0' cellpadding='0' cellspacing='0'>"
-        "<tr><td style='"
-        f"padding:6px 8px 4px 8px;"
-        f"font-family:Arial,Helvetica,sans-serif;font-size:12px;"
-        f"color:#fff;background:{bg_color};font-weight:bold;'>"
-        f"{emoji} {title} "
-        f"<span style='font-weight:normal;font-size:11px;'>({count} symbols)</span>"
-        "</td></tr>"
-        "<tr><td>"
-        "<table width='100%' border='0' cellpadding='0' cellspacing='0' "
-        "style='font-family:Arial,Helvetica,sans-serif;font-size:10px;"
-        "border-collapse:separate;border-spacing:1px;background:#111;color:#fff;'>"
-        + header_row
-        + _obv_rows_html(df)
-        + "</table></td></tr></table></td></tr>"
-    )
-
-
-def build_obv_email_html(buildup_df: pd.DataFrame, scan_time: str) -> str:
-    """
-    Build the OBV email HTML.
-    Two sections only:
-      1. LONG BUILDUP  (PriceÃ¢â€ â€˜ + OBVÃ¢â€ â€˜) Ã¢â‚¬â€ sorted by obv_chg_cum DESC
-      2. SHORT BUILDUP (PriceÃ¢â€ â€œ + OBVÃ¢â€ â€œ) Ã¢â‚¬â€ sorted by obv_chg_cum ASC (most negative first)
-    Rows within each section are ordered by strongest OBV move first.
-    """
-    long_df  = (
-        buildup_df[buildup_df["bias"] == "Long Buildup"]
-        .copy()
-        .sort_values("obv_chg_cum", ascending=False)   # strongest OBV buildup first
-        .head(50)                                       # top 50 only
-        .reset_index(drop=True)
-    )
-    short_df = (
-        buildup_df[buildup_df["bias"] == "Short Buildup"]
-        .copy()
-        .sort_values("obv_chg_cum", ascending=True)    # most negative OBV first
-        .head(50)                                       # top 50 only
-        .reset_index(drop=True)
-    )
-
-    lb = len(long_df)
-    sb = len(short_df)
-    total = max(lb + sb, 1)
-
-    if lb > sb:
-        bias_label = "\U0001f402 BULL DOMINANT"
-        bias_color = "#00C853"
-    elif sb > lb:
-        bias_label = "\U0001f43b BEAR DOMINANT"
-        bias_color = "#D50000"
-    else:
-        bias_label = "\u2696\ufe0f NEUTRAL"
-        bias_color = "#9E9E9E"
-
-    lb_pct = int(lb / total * 100)
-    sb_pct = 100 - lb_pct
-
-    sections = (
-        _obv_section_html("LONG BUILDUP",  "#005c2e", "\U0001f7e2", long_df)
-        + _obv_section_html("SHORT BUILDUP", "#7a0000", "\U0001f534", short_df)
-    )
-
-    return (
-        "<html><head><style>body{margin:0;padding:0;background:#1a1a1a;}</style></head>"
-        "<body style='margin:0;padding:0;background:#1a1a1a;'>"
-        "<table width='100%' border='0' cellpadding='0' cellspacing='0' style='background:#1a1a1a;'>"
-        "<tr><td align='center' style='padding:12px;'>"
-        "<table width='600' border='0' cellpadding='0' cellspacing='0' "
-        "style='width:600px;max-width:600px;background:#1e1e1e;color:#fff;"
-        "border-collapse:collapse;font-family:Arial,Helvetica,sans-serif;'>"
-
-        # Ã¢â€â‚¬Ã¢â€â‚¬ Header
-        "<tr><td style='padding:14px 16px 6px 16px;font-size:15px;font-weight:bold;"
-        "color:#fff;border-bottom:2px solid #333;'>"
-        "\U0001f4ca OBV Buildup &mdash; Long &amp; Short Strikes"
-        f"<div style='font-size:11px;font-weight:normal;color:#aaa;margin-top:2px;'>"
-        f"Scan: {scan_time}</div>"
-        "</td></tr>"
-
-        # Ã¢â€â‚¬Ã¢â€â‚¬ Market bias banner
-        "<tr><td style='padding:8px 16px;background:#222;'>"
-        "<table width='100%' border='0' cellpadding='0' cellspacing='0'><tr>"
-        f"<td style='font-size:12px;color:{bias_color};font-weight:bold;'>{bias_label}</td>"
-        "<td align='right' style='font-size:10px;color:#aaa;'>"
-        f"\U0001f7e2 Long Buildup: {lb} &nbsp;&nbsp; \U0001f534 Short Buildup: {sb}"
-        "</td></tr></table>"
-        "<table width='100%' border='0' cellpadding='0' cellspacing='1' "
-        "style='margin-top:6px;'><tr>"
-        f"<td width='{lb_pct}%' style='background:#00C853;height:6px;font-size:0;'></td>"
-        f"<td width='{sb_pct}%' style='background:#D50000;height:6px;font-size:0;'></td>"
-        "</tr></table>"
-        "</td></tr>"
-
-        # Ã¢â€â‚¬Ã¢â€â‚¬ Legend
-        "<tr><td style='padding:5px 16px 2px 16px;font-size:9px;color:#888;'>"
-        "\U0001f7e2 Long Buildup = Price&uarr; + OBV&uarr; (sorted: strongest OBV first) &nbsp;|&nbsp; "
-        "\U0001f534 Short Buildup = Price&darr; + OBV&darr; (sorted: most negative OBV first)"
-        "</td></tr>"
-
-        # Ã¢â€â‚¬Ã¢â€â‚¬ Two sections
-        "<tr><td style='padding:10px 16px 0 16px;'>"
-        "<table width='100%' border='0' cellpadding='0' cellspacing='0'>"
-        + sections
-        + "</table></td></tr>"
-
-        # Ã¢â€â‚¬Ã¢â€â‚¬ Footer
-        "<tr><td style='padding:8px 16px;font-size:9px;color:#555;border-top:1px solid #333;'>"
-        "Proxy OBV = cumsum(current_window_score) from market open. "
-        "Rows sorted by OBV change magnitude (descending strength)."
-        "</td></tr>"
-        "</table></td></tr></table></body></html>"
-    )
-
-
-def send_obv_buildup_email(iter_df: pd.DataFrame, candidates_df: pd.DataFrame = None, attachments: list = None) -> bool:
-    """
-    Compute OBV buildup from iteration history and send a SEPARATE dedicated email.
-    Called from main() after existing LONG/SHORT emails.
-    Zero side-effects on any existing email or data pipeline.
-    """
-    if iter_df is None or iter_df.empty:
-        logger.warning("OBV buildup email skipped: iteration_df is empty.")
-        return False
-
-    buildup_df = compute_obv_buildup_from_iter(iter_df, candidates_df=candidates_df)
-    if buildup_df.empty:
-        logger.warning("OBV buildup email skipped: compute_obv_buildup_from_iter returned empty.")
-        return False
-
-    scan_time    = datetime.now().strftime("%d %b %Y, %H:%M")
-    subject_time = datetime.now().strftime("%d %b %H:%M")
-    html_body    = build_obv_email_html(buildup_df, scan_time)
-    subject      = f"OBV Buildup \u2014 CE/PE Strikes {subject_time}"
-
-    ok = send_single_email(subject, html_body, attachments or [])
-    if ok:
-        logger.info("OBV buildup email sent. Symbols classified: %s", len(buildup_df))
-    return ok
-
-
 def main() -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     init_fyers()
@@ -1183,13 +882,6 @@ def main() -> None:
     attachments = [summary_csv, long_csv, short_csv, iter_csv]
     send_direction_email(long_df, "LONG", attachments)
     send_direction_email(short_df, "SHORT", attachments)
-
-    # Ã¢â€â‚¬Ã¢â€â‚¬ OBV Buildup email Ã¢â‚¬â€ separate standalone email, no existing logic touched Ã¢â€â‚¬Ã¢â€â‚¬
-    _all_candidates = pd.concat(
-        [df for df in [long_df, short_df] if df is not None and not df.empty],
-        ignore_index=True,
-    ) if (not long_df.empty or not short_df.empty) else pd.DataFrame()
-    send_obv_buildup_email(iteration_df, candidates_df=_all_candidates, attachments=[iter_csv])
 
     logger.info("Iteration rows: %s", len(iteration_df))
     logger.info("Iteration CSV: %s", iter_csv)
