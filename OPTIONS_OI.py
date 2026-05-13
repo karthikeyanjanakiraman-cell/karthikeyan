@@ -608,7 +608,7 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
         if pair_df.empty:
             continue
 
-        # Ã¢â€â‚¬Ã¢â€â‚¬ ATM volume gate: skip if ATM CE (long) or PE (short) < MIN_ATM_CHAIN_VOLUME Ã¢â€â‚¬Ã¢â€â‚¬
+        # --"-----"--- ATM volume gate: skip if ATM CE (long) or PE (short) < MIN_ATM_CHAIN_VOLUME --"-----"---
         atm_strike = pair_df["Strike"].iloc[0]
         req_type   = "CE" if side == "long" else "PE"
         atm_rows   = pair_df[(pair_df["Strike"] == atm_strike) & (pair_df["Option Type"] == req_type)]
