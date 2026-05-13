@@ -39,6 +39,7 @@ EMAIL_MAX_ROWS_LONG = int(os.environ.get("EMAIL_MAX_ROWS_LONG", "25"))
 EMAIL_MAX_ROWS_SHORT = int(os.environ.get("EMAIL_MAX_ROWS_SHORT", "25"))
 EMAIL_SAFE_WIDTH = int(os.environ.get("EMAIL_SAFE_WIDTH", "600"))
 TOP_N_UNDERLYINGS = int(os.environ.get("TOP_N_UNDERLYINGS", "60"))
+OBV_BREAKOUT_WINDOW = int(os.environ.get("OBV_BREAKOUT_WINDOW", "5"))
 
 OPTION_EMAIL_COLS = [
     "Underlying", "Option Type", "Option Symbol", "Strike", "LTP", "% Change", "OI", "Volume", "OBV",
@@ -174,12 +175,12 @@ def compute_today_obv(df: pd.DataFrame) -> float:
     d = df.copy().sort_values("timestamp")
     d["timestamp"] = pd.to_datetime(d["timestamp"])
     today = pd.Timestamp.now(tz=None).date()
-    d = d[d["timestamp"].dt.date == today].copy()
-    if d.empty:
-        return np.nan
-    d = d[d["timestamp"] >= pd.Timestamp.combine(today, dtime(9, 15))].copy()
-    if len(d) < 2:
-        return np.nan
+    today_df = d[d["timestamp"].dt.date == today].copy()
+    if not today_df.empty:
+        today_df = today_df[today_df["timestamp"] >= pd.Timestamp.combine(today, dtime(9, 15))].copy()
+    if len(today_df) >= 2:
+        return compute_obv(today_df)
+    # Proxy fallback: not enough today bars â€” use full intraday dataset
     return compute_obv(d)
 
 
@@ -608,7 +609,7 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
         if pair_df.empty:
             continue
 
-        # --"-----"--- ATM volume gate: skip if ATM CE (long) or PE (short) < MIN_ATM_CHAIN_VOLUME --"-----"---
+        # Ã¢â€â‚¬Ã¢â€â‚¬ ATM volume gate: skip if ATM CE (long) or PE (short) < MIN_ATM_CHAIN_VOLUME Ã¢â€â‚¬Ã¢â€â‚¬
         atm_strike = pair_df["Strike"].iloc[0]
         req_type   = "CE" if side == "long" else "PE"
         atm_rows   = pair_df[(pair_df["Strike"] == atm_strike) & (pair_df["Option Type"] == req_type)]
@@ -634,6 +635,12 @@ def build_option_candidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.
             scanned["OI+Volume+OBV Score"] = option_liquidity_score(scanned.get("OI", 0), scanned.get("Volume", 0), scanned.get("OBV", 0))
 
             if safe_float(scanned.get("LTP"), 0.0) < MIN_OPTION_LTP:
+                continue
+
+            # Per-option volume gate: skip CE/PE with intraday volume < 1 lakh
+            opt_vol = safe_float(scanned.get("Volume"), 0)
+            if opt_vol < MIN_ATM_CHAIN_VOLUME:
+                logger.debug("SKIP option %s: Volume %.0f < %d", sym, opt_vol, MIN_ATM_CHAIN_VOLUME)
                 continue
 
             rows.append(scanned)
@@ -809,6 +816,38 @@ def send_single_email(subject: str, html_body: str, attachments: list) -> bool:
         return False
 
 
+
+def detect_obv_breakout(df: pd.DataFrame, window: int = OBV_BREAKOUT_WINDOW) -> pd.DataFrame:
+    """Return rows where OBV is above its rolling mean (breakout signal)."""
+    if df is None or df.empty or "OBV" not in df.columns:
+        return pd.DataFrame()
+    out = df.copy()
+    obv = pd.to_numeric(out["OBV"], errors="coerce")
+    obv_mean = obv.shift(1).rolling(window, min_periods=1).mean()
+    mask = (obv > obv_mean) & (obv > 0)
+    return out[mask].reset_index(drop=True)
+
+
+def send_obv_breakout_email(long_df: pd.DataFrame, short_df: pd.DataFrame, attachments: list) -> bool:
+    """Send a dedicated OBV Breakout email combining long + short breakout candidates."""
+    long_brk = detect_obv_breakout(long_df)
+    short_brk = detect_obv_breakout(short_df)
+    combined = pd.concat([long_brk, short_brk], ignore_index=True)
+    if combined.empty:
+        logger.info("OBV Breakout email: no breakout candidates found, skipping.")
+        return False
+    subject_time = datetime.now().strftime("%d %b %H:%M")
+    scan_time = datetime.now().strftime("%d %b %Y, %H:%M")
+    view = combined.copy()
+    if "OI+Volume+OBV Score" in view.columns:
+        view = view.sort_values("OI+Volume+OBV Score", ascending=False)
+    view = apply_display_labels(view, "long")
+    final_cols = [c for c in OPTION_EMAIL_COLS if c in view.columns]
+    view = view[final_cols].head(EMAIL_MAX_ROWS_LONG).reset_index(drop=True)
+    html = build_email_html(view, "OBV Breakout Candidates", scan_time, EMAIL_MAX_ROWS_LONG)
+    return send_single_email(f"OBV Breakout - {subject_time}", html, attachments)
+
+
 def send_direction_email(df: pd.DataFrame, direction: str, attachments: list) -> bool:
     subject_time = datetime.now().strftime("%d %b %H:%M")
     scan_time = datetime.now().strftime("%d %b %Y, %H:%M")
@@ -882,6 +921,7 @@ def main() -> None:
     attachments = [summary_csv, long_csv, short_csv, iter_csv]
     send_direction_email(long_df, "LONG", attachments)
     send_direction_email(short_df, "SHORT", attachments)
+    send_obv_breakout_email(long_df, short_df, attachments)
 
     logger.info("Iteration rows: %s", len(iteration_df))
     logger.info("Iteration CSV: %s", iter_csv)
