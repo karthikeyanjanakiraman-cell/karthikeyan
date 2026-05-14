@@ -612,32 +612,29 @@ def option_liquidity_score(oi, volume, obv) -> float:
 def rank_option_candidates(df: pd.DataFrame, side: str) -> pd.DataFrame:
     if df is None or df.empty:
         return df
-    out  = df.copy()
-    liq  = safe_series(out, "OI+Volume+OBV Score", 0)
-    rd   = safe_series(out, "Rank Delta",    0)
-    adx  = safe_series(out, "Cumulative ADX", 0)
-    pct  = safe_series(out, "% Change",      0)
-    otyp = (
-        out["Option Type"].astype(str).str.upper()
-        if "Option Type" in out.columns
-        else pd.Series("", index=out.index)
-    )
-    out["Liq"] = liq; out["RD"] = rd; out["ADX"] = adx; out["PCT"] = pct
+    out = df.copy()
+    liq = safe_series(out, "OI+Volume+OBV Score", 0)
+    rd = safe_series(out, "Rank Delta", 0)
+    adx = safe_series(out, "Cumulative ADX", 0)
+    pct = safe_series(out, "% Change", 0)
+    out["Liq"] = liq
+    out["RD"] = rd
+    out["ADX"] = adx
+    out["PCT"] = pct
     if side == "long":
-        type_bonus = np.where(otyp.eq("CE"), 0.30, 0.10)
-        out["EMAIL_RANK_SCORE"] = liq * 0.40 + rd * 0.30 + adx * 0.18 + pct * 0.10 + type_bonus
+        out["EMAIL_RANK_SCORE"] = liq * 0.42 + rd * 0.30 + adx * 0.18 + pct * 0.10
         out = out.sort_values(
             ["EMAIL_RANK_SCORE", "Liq", "RD", "ADX", "PCT"],
             ascending=[False, False, False, False, False],
         )
     else:
-        type_bonus = np.where(otyp.eq("PE"), 0.30, 0.10)
-        out["EMAIL_RANK_SCORE"] = liq * 0.40 + (-rd) * 0.30 + adx * 0.18 + (-pct) * 0.10 + type_bonus
+        out["EMAIL_RANK_SCORE"] = liq * 0.42 + (-rd) * 0.30 + adx * 0.18 + (-pct) * 0.10
         out = out.sort_values(
             ["EMAIL_RANK_SCORE", "Liq", "RD", "ADX", "PCT"],
             ascending=[False, False, True, False, True],
         )
     return out.reset_index(drop=True)
+
 
 
 def build_option_candidates(
@@ -1066,8 +1063,8 @@ def build_chain_email_html(long_rows: List[Dict], short_rows: List[Dict]) -> str
     ts = datetime.now().strftime("%d %b %Y  %H:%M")
     max_long = int(os.environ.get("EMAIL_MAX_ROWS_LONG", "10"))
     max_short = int(os.environ.get("EMAIL_MAX_ROWS_SHORT", "10"))
-    long_table = build_chain_table_html(long_rows[:max_long], "LONG LONG CANDIDATES (CE/PE)", "long_head")
-    short_table = build_chain_table_html(short_rows[:max_short], "SHORT SHORT CANDIDATES (CE/PE)", "short_head")
+    long_table = build_chain_table_html(long_rows[:max_long], "LONG LONG CANDIDATES (BEST CE/PE)", "long_head")
+    short_table = build_chain_table_html(short_rows[:max_short], "SHORT SHORT CANDIDATES (BEST CE/PE)", "short_head")
     return (
         "<html><head>" + EMAIL_STYLE + "</head><body>"
         '<p class="ts">Chain Signal Report ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â ' + ts + "</p>"
