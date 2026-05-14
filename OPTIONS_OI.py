@@ -45,7 +45,7 @@ OBV_BREAKOUT_WINDOW     = int(os.environ.get("OBV_BREAKOUT_WINDOW", "5"))
 # â”€â”€ Chain Signal Constants â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Entry : 5m CONFIRMED + 30m CONFIRMED + T30 >= T30_MIN
 # Exit  : 30m BROKEN   OR  T30 < T30_MIN
-T30_MIN          = int(os.environ.get("T30_MIN", "10"))
+T30_MIN          = int(os.environ.get("T30_MIN", "3"))
 DAILY_STATE_FILE = os.path.join(OUTPUT_DIR, "chain_signal_state.json")
 
 OPTION_EMAIL_COLS = [
