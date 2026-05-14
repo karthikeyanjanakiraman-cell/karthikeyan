@@ -1096,9 +1096,9 @@ def build_email_html(view_df: pd.DataFrame, title: str,
 # Ã¢â€â‚¬Ã¢â€â‚¬ Email send Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 def send_single_email(subject: str, html_body: str,
                       attachments: list = None) -> bool:
-    sender          = os.environ.get("EMAIL_SENDER", "")
-    password        = os.environ.get("EMAIL_PASSWORD", "")
-    recipients_raw  = os.environ.get("EMAIL_RECIPIENTS", "")
+    sender          = os.environ.get("SENDER_EMAIL", "")
+    password        = os.environ.get("SENDER_PASSWORD", "")
+    recipients_raw  = os.environ.get("RECIPIENT_EMAIL", "")
     recipients      = [r.strip() for r in recipients_raw.split(",") if r.strip()]
     if not sender or not password or not recipients:
         logger.warning("Email credentials/recipients not configured; skipping.")
