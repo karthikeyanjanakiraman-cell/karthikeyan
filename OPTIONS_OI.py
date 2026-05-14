@@ -1421,6 +1421,10 @@ def run_chain_from_csv(iter_csv_path: str,
     logger.info("Chain LONG: %d | Chain SHORT: %d", len(long_merged), len(short_merged))
     send_chain_signal_email(long_merged, short_merged)
 
+    combined_options_df = pd.concat([long_df, short_df], ignore_index=True) if (not long_df.empty or not short_df.empty) else pd.DataFrame()
+    ce_buy_rows, pe_buy_rows = build_ce_pe_buy_rows(combined_options_df, iteration_df)
+    send_ce_pe_buy_email(ce_buy_rows, pe_buy_rows, attachments)
+
 
 def main() -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
