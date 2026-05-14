@@ -1266,6 +1266,10 @@ def run_chain_from_csv(iter_csv_path: str,
     logger.info("Chain LONG: %d | Chain SHORT: %d", len(long_merged), len(short_merged))
     send_chain_signal_email(long_merged, short_merged)
 
+    combined_options_df = pd.concat([long_df, short_df], ignore_index=True) if (not long_df.empty or not short_df.empty) else pd.DataFrame()
+    ce_buy_rows, pe_buy_rows = build_ce_pe_buy_rows(combined_options_df, iteration_df)
+    send_ce_pe_buy_email(ce_buy_rows, pe_buy_rows, attachments)
+
 
 def main() -> None:
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -1408,6 +1412,150 @@ def main() -> None:
     send_chain_signal_email(long_merged, short_merged, attachments)
 
 
+
+
+# --- Optional CE BUY / PE BUY momentum email (non-breaking) ---
+def _momentum_signal_column(iteration_df: pd.DataFrame) -> str:
+    if iteration_df is None or iteration_df.empty:
+        return "window_signal"
+    if "window_signal" in iteration_df.columns:
+        return "window_signal"
+    if "windowsignal" in iteration_df.columns:
+        return "windowsignal"
+    return "window_signal"
+
+
+def _clean_momentum_signals(values: List[object]) -> List[str]:
+    out = []
+    for v in values:
+        s = str(v).strip().title()
+        if s.startswith("Buy"):
+            out.append("Buy")
+        elif s.startswith("Sell"):
+            out.append("Sell")
+        elif s.startswith("Neutral"):
+            out.append("Neutral")
+    return out
+
+
+def _momentum_trade_from_signals(signals: List[str], option_type: str) -> str:
+    if len(signals) < 11:
+        return ""
+    last5 = signals[-5:]
+    last11 = signals[-11:]
+    if any(s == "Neutral" for s in last11):
+        return ""
+    start_buy = len(last5) == 5 and all(s == "Buy" for s in last5)
+    start_sell = len(last5) == 5 and all(s == "Sell" for s in last5)
+    buy11 = sum(s == "Buy" for s in last11)
+    sell11 = sum(s == "Sell" for s in last11)
+    final_buy = buy11 >= 8
+    final_sell = sell11 >= 8
+    opt = str(option_type).strip().upper()
+    if opt == "CE" and start_buy and final_buy:
+        return "CE BUY"
+    if opt == "PE" and start_sell and final_sell:
+        return "PE BUY"
+    return ""
+
+
+def build_ce_pe_buy_rows(options_df: pd.DataFrame, iteration_df: pd.DataFrame) -> Tuple[List[Dict], List[Dict]]:
+    if options_df is None or options_df.empty or iteration_df is None or iteration_df.empty:
+        return [], []
+    signal_col = _momentum_signal_column(iteration_df)
+    if signal_col not in iteration_df.columns or "Option Symbol" not in iteration_df.columns:
+        return [], []
+
+    ce_rows, pe_rows = [], []
+    iter_map = {
+        str(sym): grp.sort_values("iteration") if "iteration" in grp.columns else grp
+        for sym, grp in iteration_df.groupby("Option Symbol")
+    }
+
+    for _, row in options_df.iterrows():
+        option_symbol = str(row.get("Option Symbol", "")).strip()
+        if not option_symbol or option_symbol not in iter_map:
+            continue
+        grp = iter_map[option_symbol]
+        signals = _clean_momentum_signals(grp[signal_col].tolist())
+        trade_signal = _momentum_trade_from_signals(signals, row.get("Option Type", ""))
+        if not trade_signal:
+            continue
+        last11 = signals[-11:]
+        out = {
+            "Underlying": row.get("Underlying", ""),
+            "Option Type": row.get("Option Type", ""),
+            "Option Symbol": option_symbol,
+            "Strike": row.get("Strike", ""),
+            "LTP": row.get("LTP", ""),
+            "% Change": row.get("% Change", row.get("Change", "")),
+            "Rank Delta": row.get("Rank Delta", ""),
+            "Last Iteration Time": row.get("Last Iteration Time", row.get("Time", "")),
+            "Trade Signal": trade_signal,
+            "Buy Count": sum(s == "Buy" for s in last11),
+            "Sell Count": sum(s == "Sell" for s in last11),
+        }
+        if trade_signal == "CE BUY":
+            ce_rows.append(out)
+        elif trade_signal == "PE BUY":
+            pe_rows.append(out)
+    return ce_rows, pe_rows
+
+
+def _ce_pe_buy_table_html(rows: List[Dict], title: str, css_class: str) -> str:
+    cols = [
+        "Underlying", "Option Type", "Option Symbol", "Strike", "LTP",
+        "% Change", "Rank Delta", "Last Iteration Time", "Trade Signal",
+        "Buy Count", "Sell Count",
+    ]
+    header = "".join(f"<th>{c}</th>" for c in cols)
+    html_rows = []
+    for row in rows:
+        cells = []
+        for c in cols:
+            val = row.get(c, "")
+            if c == "Trade Signal":
+                css = "enter" if "BUY" in str(val).upper() else "wait"
+                cells.append(f'<td class="{css}">{val}</td>')
+            else:
+                cells.append(f'<td>{val}</td>')
+        html_rows.append("<tr>" + "".join(cells) + "</tr>")
+    if not html_rows:
+        html_rows.append(f'<tr><td colspan="{len(cols)}" style="color:#999;text-align:center;">No momentum buy signals</td></tr>')
+    ts = datetime.now().strftime("%H:%M")
+    return (
+        f'<h3 class="{css_class}">{title} <span class="ts">{ts}</span></h3>'
+        '<div style="overflow-x:auto;"><table>'
+        f'<thead><tr>{header}</tr></thead>'
+        f'<tbody>{"".join(html_rows)}</tbody>'
+        '</table></div><br>'
+    )
+
+
+def build_ce_pe_buy_email_html(ce_rows: List[Dict], pe_rows: List[Dict]) -> str:
+    ts = datetime.now().strftime("%d %b %Y  %H:%M")
+    ce_table = _ce_pe_buy_table_html(ce_rows, "CE BUY MOMENTUM SIGNALS", "long_head")
+    pe_table = _ce_pe_buy_table_html(pe_rows, "PE BUY MOMENTUM SIGNALS", "short_head")
+    return (
+        "<html><head>" + EMAIL_STYLE + "</head><body>"
+        + f'<p class="ts">CE / PE Momentum Buy Report - {ts}</p>'
+        + '<p style="font-size:11px;color:#555;">'
+        + '<b>Rule:</b> 5 consecutive same-direction signals to start momentum; '
+        + '8 of last 11 same-direction signals to confirm; mixed chains ignored.'
+        + '</p>'
+        + ce_table + pe_table
+        + "</body></html>"
+    )
+
+
+def send_ce_pe_buy_email(ce_rows: List[Dict], pe_rows: List[Dict], attachments: list = None) -> bool:
+    if not ce_rows and not pe_rows:
+        logger.info("CE BUY: 0 | PE BUY: 0")
+        return False
+    logger.info("CE BUY: %d | PE BUY: %d", len(ce_rows), len(pe_rows))
+    subject_time = datetime.now().strftime("%d %b %H:%M")
+    html = build_ce_pe_buy_email_html(ce_rows, pe_rows)
+    return send_single_email(f"CE / PE Momentum Buy Report - {subject_time}", html, attachments)
 if __name__ == "__main__":
     import sys
     args = sys.argv[1:]
@@ -1423,20 +1571,3 @@ if __name__ == "__main__":
         run_chain_from_csv(iter_csv, long_csv, short_csv)
     else:
         main()
-
-
-# --- Optional integration hook (non-breaking) ---
-def build_momentum_buy_rows(summarydf, itermap):
-    rows = []
-    if summarydf is None or summarydf.empty:
-        return rows
-    for _, row in summarydf.iterrows():
-        sym = str(row.get("Option Symbol", "")).strip()
-        opttype = str(row.get("Option Type", "")).strip().upper()
-        strike = row.get("Strike", np.nan)
-        underlying = row.get("Underlying", "")
-        iterdf = itermap.get(sym) if isinstance(itermap, dict) else None
-        out = build_ce_pe_buy_email(iterdf, underlying, opttype, strike, sym)
-        if out:
-            rows.append(out)
-    return rows
