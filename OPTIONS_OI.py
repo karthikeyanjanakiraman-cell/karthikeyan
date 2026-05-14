@@ -16,7 +16,7 @@ from email import encoders
 try:
   from fyers_apiv3 import fyersModel
 except Exception:
-  try:
+try:
   import fyersModel
   except Exception:
   from fyersapi import fyersModel
