@@ -1361,8 +1361,8 @@ def main() -> None:
             ltp = np.nan
         candidate_side = str(keymap.get("Candidate Side", "")).upper()
         src_df = long_df if candidate_side == "LONG" else short_df if candidate_side == "SHORT" else pd.DataFrame()
-            if not src_df.empty and "Option Symbol" in src_df.columns:
-                match = src_df[src_df["Option Symbol"] == key_map.get("Option Symbol", "")]
+                if not src_df.empty and "Option Symbol" in src_df.columns:
+                    match = src_df[src_df["Option Symbol"] == key_map.get("Option Symbol", "")]
                 if not match.empty and "LTP" in match.columns:
                     ltp = safe_float(match["LTP"].iloc[0])
 
