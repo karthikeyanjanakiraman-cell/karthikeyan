@@ -45,7 +45,7 @@ OBV_BREAKOUT_WINDOW     = int(os.environ.get("OBV_BREAKOUT_WINDOW", "5"))
 # Ã¢â€â‚¬Ã¢â€â‚¬ Chain Signal Constants Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 # Entry : 5m CONFIRMED + 30m CONFIRMED + T30 >= T30_MIN
 # Exit  : 30m BROKEN   OR  T30 < T30_MIN
-T30_MIN          = int(os.environ.get("T30_MIN", "2"))
+T30_MIN          = int(os.environ.get("T30_MIN", "10"))
 DAILY_STATE_FILE = os.path.join(OUTPUT_DIR, "chain_signal_state.json")
 
 OPTION_EMAIL_COLS = [
@@ -624,14 +624,14 @@ def rank_option_candidates(df: pd.DataFrame, side: str) -> pd.DataFrame:
     )
     out["Liq"] = liq; out["RD"] = rd; out["ADX"] = adx; out["PCT"] = pct
     if side == "long":
-        type_bonus = np.where(otyp.eq("CE"), 0.30, 0.10)
+        type_bonus = np.where(otyp.ne(""), 0.10, 0.10)
         out["EMAIL_RANK_SCORE"] = liq * 0.40 + rd * 0.30 + adx * 0.18 + pct * 0.10 + type_bonus
         out = out.sort_values(
             ["EMAIL_RANK_SCORE", "Liq", "RD", "ADX", "PCT"],
             ascending=[False, False, False, False, False],
         )
     else:
-        type_bonus = np.where(otyp.eq("PE"), 0.30, 0.10)
+        type_bonus = np.where(otyp.ne(""), 0.10, 0.10)
         out["EMAIL_RANK_SCORE"] = liq * 0.40 + (-rd) * 0.30 + adx * 0.18 + (-pct) * 0.10 + type_bonus
         out = out.sort_values(
             ["EMAIL_RANK_SCORE", "Liq", "RD", "ADX", "PCT"],
@@ -651,7 +651,7 @@ def build_option_candidates(
         if pair_df.empty:
             continue
         atm_strike = pair_df["Strike"].iloc[0]
-        req_type   = "CE" if side == "long" else "PE"
+        req_type   = None
         atm_rows   = pair_df[
             (pair_df["Strike"] == atm_strike) & (pair_df["Option Type"] == req_type)
         ]
@@ -747,9 +747,9 @@ def compute_chain_status(window_signals: list) -> Tuple[str, int, int, int]:
     returns (chain_status, buy_count, sell_count, total_count).
 
     chain_status:
-      CONFIRMED  â€ >= 65% Buy signals in the block
-      BROKEN     â€ <= 35% Buy signals (mostly Sell)
-      MIXED      â€ in between
+      CONFIRMED  Ã¢â‚¬â€ >= 65% Buy signals in the block
+      BROKEN     Ã¢â‚¬â€ <= 35% Buy signals (mostly Sell)
+      MIXED      Ã¢â‚¬â€ in between
     """
     b = sum(1 for s in window_signals if str(s).startswith("Buy"))
     s = sum(1 for s in window_signals if str(s).startswith("Sell"))
@@ -804,11 +804,11 @@ def scan_option_chain_signals(option_symbol: str, option_type: str,
     exit_signal  = (c30 == "BROKEN"   or  t30 < T30_MIN)
 
     chain_signal = (
-        "ENTER ENTER" if entry_signal else
-        "EXIT EXIT"  if exit_signal  else
-        "Ã¢ÂÂ³ WAIT"
+        "ENTER" if entry_signal else
+        "EXIT"  if exit_signal  else
+        "WAIT"
     )
-    exit_label = "X EXIT NOW" if exit_signal else "OK HOLD"
+    exit_label = "EXIT NOW" if exit_signal else "HOLD"
 
     return {
         "Underlying":    underlying,
@@ -1032,7 +1032,7 @@ def build_chain_table_html(rows: List[Dict], title: str, css_class: str) -> str:
         html_rows.append("<tr>" + "".join(cells) + "</tr>")
     no_data = (
         f'<tr><td colspan="{len(_CHAIN_COLS)}" '
-        'style="color:#999;text-align:center;">â€ No signals yet â€</td></tr>'
+        'style="color:#999;text-align:center;">Ã¢â‚¬â€ No signals yet Ã¢â‚¬â€</td></tr>'
     )
     body = "".join(html_rows) if html_rows else no_data
     ts   = datetime.now().strftime("%H:%M")
@@ -1048,11 +1048,11 @@ def build_chain_table_html(rows: List[Dict], title: str, css_class: str) -> str:
 
 def build_chain_email_html(long_rows: List[Dict], short_rows: List[Dict]) -> str:
     ts          = datetime.now().strftime("%d %b %Y  %H:%M")
-    long_table  = build_chain_table_html(long_rows,  "LONG LONG  CANDIDATES (CE)", "long_head")
-    short_table = build_chain_table_html(short_rows, "SHORT SHORT CANDIDATES (PE)", "short_head")
+    long_table  = build_chain_table_html(long_rows,  "Ã°Å¸â€œË† LONG  CANDIDATES (CE)", "long_head")
+    short_table = build_chain_table_html(short_rows, "Ã°Å¸â€œâ€° SHORT CANDIDATES (PE)", "short_head")
     return (
         "<html><head>" + EMAIL_STYLE + "</head><body>"
-        '<p class="ts">Chain Signal Report â€ ' + ts + "</p>"
+        '<p class="ts">Chain Signal Report Ã¢â‚¬â€ ' + ts + "</p>"
         '<p style="font-size:11px;color:#555;">'
         "<b>Entry:</b> 5m CONFIRMED + 30m CONFIRMED + T30 &ge; " + str(T30_MIN) + "&nbsp;|&nbsp;"
         "<b>Exit:</b> 30m BROKEN OR T30 &lt; " + str(T30_MIN) + "&nbsp;|&nbsp;"
@@ -1096,9 +1096,9 @@ def build_email_html(view_df: pd.DataFrame, title: str,
 # Ã¢â€â‚¬Ã¢â€â‚¬ Email send Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬Ã¢â€â‚¬
 def send_single_email(subject: str, html_body: str,
                       attachments: list = None) -> bool:
-    sender          = os.environ.get("SENDER_EMAIL", "")
-    password        = os.environ.get("SENDER_PASSWORD", "")
-    recipients_raw  = os.environ.get("RECIPIENT_EMAIL", "")
+    sender          = os.environ.get("EMAIL_SENDER", "")
+    password        = os.environ.get("EMAIL_PASSWORD", "")
+    recipients_raw  = os.environ.get("EMAIL_RECIPIENTS", "")
     recipients      = [r.strip() for r in recipients_raw.split(",") if r.strip()]
     if not sender or not password or not recipients:
         logger.warning("Email credentials/recipients not configured; skipping.")
@@ -1181,7 +1181,7 @@ def run_chain_from_csv(iter_csv_path: str,
                        short_csv_path: str = None) -> None:
     """
     Rebuild chain signals from a saved iteration history CSV.
-    No Fyers API call needed â€ works entirely from disk.
+    No Fyers API call needed Ã¢â‚¬â€ works entirely from disk.
     """
     if not os.path.isfile(iter_csv_path):
         logger.error("Iteration CSV not found: %s", iter_csv_path)
@@ -1334,7 +1334,7 @@ def main() -> None:
     chain_rows  = []
 
     if not iteration_df.empty and "Option Symbol" in iteration_df.columns:
-        # group by option â€ compute chain status per option
+        # group by option Ã¢â‚¬â€ compute chain status per option
         group_cols = ["Underlying", "Option Type", "Strike", "Option Symbol"]
         for keys, grp in iteration_df.groupby(
             [c for c in group_cols if c in iteration_df.columns]
