@@ -1,4 +1,3 @@
-
 #!/usr/bin/env python3
 # CEPEBUY.py - CE/PE Buy Momentum with 5-start/8-of-11 chain logic
 # Bullish chain -> CE Buy, Bearish chain -> PE Buy
@@ -10,6 +9,7 @@ import sys
 import json
 import smtplib
 import logging
+import warnings
 from datetime import datetime, date
 from pathlib import Path
 from email.mime.multipart import MIMEMultipart
@@ -121,7 +121,7 @@ def _direction(signal_str):
     return 0
 
 def check_chain(signals, timestamps):
-    if not signals or not timestamps:
+    if not signals or len(timestamps) == 0:
         return 0, None
     dirs = [_direction(s) for s in signals]
     non_zero = [d for d in dirs if d != 0]
@@ -139,7 +139,7 @@ def check_chain(signals, timestamps):
             if start_idx < len(timestamps):
                 five_start = str(timestamps.iloc[start_idx])
             else:
-                five_start = str(timestamps.iloc[-1])
+                five_start = str(timestamps.iloc[-1]) if len(timestamps) > 0 else None
             return direction, five_start
     return 0, None
 
@@ -181,7 +181,9 @@ def evaluate_chain_from_iteration(iter_df):
     if c_timestamp:
         try:
             iter_df = iter_df.copy()
-            iter_df[c_timestamp] = pd.to_datetime(iter_df[c_timestamp], errors='coerce')
+            with warnings.catch_warnings():
+                warnings.simplefilter('ignore')
+                iter_df[c_timestamp] = pd.to_datetime(iter_df[c_timestamp], errors='coerce')
             iter_df = iter_df.sort_values(c_timestamp)
         except Exception:
             pass
