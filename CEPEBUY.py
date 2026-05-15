@@ -1,4 +1,8 @@
+
 #!/usr/bin/env python3
+# CEPEBUY.py — CE/PE Momentum Buy Email with 5-start / 8-of-11 chain logic
+# Signal column: window_signal (values like Buy++, Buy+, Sell--, Sell-, Neutral)
+
 import os
 import sys
 import json
@@ -8,7 +12,6 @@ from datetime import datetime, date
 from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from typing import Dict, List, Optional, Tuple
 
 import pandas as pd
 
@@ -105,10 +108,12 @@ def _save_state(state):
         logger.warning('Could not save state: %s', exc)
 
 def _direction(signal_str):
-    s = str(signal_str).upper()
-    if any(k in s for k in ('BUY', 'BULL', 'ENTER', 'CONFIRM', 'LONG')):
+    s = str(signal_str).strip().upper()
+    if s in ('', 'NAN', 'NONE', 'NEUTRAL', 'HOLD'):
+        return 0
+    if s.startswith('BUY') or 'BULL' in s or 'ENTER' in s or 'LONG' in s or 'CONFIRM' in s:
         return 1
-    if any(k in s for k in ('SELL', 'BEAR', 'EXIT', 'SHORT')):
+    if s.startswith('SELL') or 'BEAR' in s or 'EXIT' in s or 'SHORT' in s:
         return -1
     return 0
 
@@ -122,8 +127,8 @@ def check_chain(signals):
     recent = non_zero[-CONSEC_START:]
     if len(set(recent)) == 1 and recent[0] != 0:
         direction = recent[0]
-        last11 = non_zero[-CONFIRM_WINDOW:]
-        count_same = sum(1 for d in last11 if d == direction)
+        last_n = non_zero[-CONFIRM_WINDOW:]
+        count_same = sum(1 for d in last_n if d == direction)
         if count_same >= CONFIRM_OF:
             return direction
     return 0
@@ -141,8 +146,10 @@ def evaluate_chain_from_iteration(iter_df):
         return None
     c_underlying = _col(['underlying', 'symbol', 'stock'])
     c_opt_type   = _col(['option type', 'option_type', 'otype', 'type'])
-    c_signal     = _col(['window_signal', 'window signal', 'signal', '5m_signal', 'chain_signal', 'chain signal'])
+    c_signal     = _col(['window_signal', 'window signal', 'signal', 'chain_signal', 'chain signal'])
     c_timestamp  = _col(['timestamp', 'time', 'datetime', 'ts'])
+    c_close      = _col(['close', 'ltp', 'last'])
+    c_strike     = _col(['strike', 'strike_price'])
     if any(v is None for v in (c_underlying, c_opt_type, c_signal)):
         logger.warning('Iteration CSV missing required columns. Available: %s', list(iter_df.columns))
         return ce_qualify, pe_qualify
@@ -156,11 +163,20 @@ def evaluate_chain_from_iteration(iter_df):
     for (underlying, opt_type), grp in iter_df.groupby([c_underlying, c_opt_type]):
         signals = grp[c_signal].tolist()
         result = check_chain(signals)
-        latest_row = grp.iloc[-1].to_dict()
+        latest = grp.iloc[-1]
+        row_data = {
+            'Underlying': underlying,
+            'Option Type': str(opt_type).upper(),
+            'Strike': latest[c_strike] if c_strike else '',
+            'Close': latest[c_close] if c_close else '',
+            'Last Signal': latest[c_signal],
+            'Timestamp': str(latest[c_timestamp]) if c_timestamp else '',
+            'iteration': latest.get('iteration', ''),
+        }
         if result == 1 and str(opt_type).upper() == 'CE':
-            ce_qualify[underlying] = latest_row
+            ce_qualify[underlying] = row_data
         elif result == -1 and str(opt_type).upper() == 'PE':
-            pe_qualify[underlying] = latest_row
+            pe_qualify[underlying] = row_data
     logger.info('Chain evaluation: CE qualify=%d | PE qualify=%d', len(ce_qualify), len(pe_qualify))
     return ce_qualify, pe_qualify
 
@@ -178,7 +194,7 @@ def evaluate_chain_from_candidates(long_df, short_df):
         return None
     u  = _col(['underlying', 'symbol', 'stock'])
     t  = _col(['option type', 'option_type', 'otype', 'type'])
-    cs = _col(['chain signal', 'chain_signal', 'signal'])
+    cs = _col(['chain signal', 'chain_signal', 'signal', 'window_signal'])
     es = _col(['exit signal', 'exit_signal', 'exit'])
     if any(v is None for v in (u, t, cs, es)):
         logger.warning('Candidates CSV missing columns. Available: %s', list(combined.columns))
@@ -214,7 +230,7 @@ def _build_table(rows_dict, title):
     df = pd.DataFrame(list(rows_dict.values()))
     out = '<h3>' + title + '</h3>'
     out += '<table border="1" cellspacing="0" cellpadding="4" style="border-collapse:collapse;">'
-    out += '<tr style="background:#f0f0f0;">' + ''.join('<th>' + c + '</th>' for c in df.columns) + '</tr>'
+    out += '<tr style="background:#dce8f7;">' + ''.join('<th>' + str(c) + '</th>' for c in df.columns) + '</tr>'
     for _, r in df.iterrows():
         out += '<tr>' + ''.join('<td>' + str(r[c]) + '</td>' for c in df.columns) + '</tr>'
     out += '</table>'
@@ -249,10 +265,10 @@ def main():
     state = _load_state()
     iter_df = _load_any(['fo_iteration_history_*.csv', 'iteration_history_*.csv', 'fo_iteration_history.csv', 'iteration_history.csv'])
     if not iter_df.empty:
-        logger.info('Using iteration history for 5-start / 8-of-11 chain evaluation.')
+        logger.info('Using iteration history with window_signal column.')
         ce_qualify, pe_qualify = evaluate_chain_from_iteration(iter_df)
     else:
-        logger.warning('Iteration history not found. Falling back to candidate CSVs (ENTER + OK HOLD filter).')
+        logger.warning('Iteration history not found. Falling back to candidate CSVs.')
         long_df = _load_any(['fo_long_candidates_*.csv', 'long_candidates_*.csv', 'fo_long_candidates.csv', 'long_candidates.csv'])
         short_df = _load_any(['fo_short_candidates_*.csv', 'short_candidates_*.csv', 'fo_short_candidates.csv', 'short_candidates.csv'])
         if long_df.empty and short_df.empty:
@@ -264,15 +280,13 @@ def main():
     if not ce_today and not pe_today:
         logger.info('No CE/PE BUY signals today. No email sent.')
         return
-
-    # Build HTML using only single-line string concatenation — no multi-line strings that can break
-    html_body = '<html><body><h2>CE / PE Momentum Buy Report &mdash; ' + datetime.now().strftime('%d %b %Y %H:%M') + '</h2>'
-    html_body += '<p>Chain rule: ' + str(CONSEC_START) + ' consecutive + ' + str(CONFIRM_OF) + ' of ' + str(CONFIRM_WINDOW) + '. Mixed chains rejected.</p>'
+    html_body = '<html><body>'
+    html_body += '<h2>CE / PE Momentum Buy Report &mdash; ' + datetime.now().strftime('%d %b %Y %H:%M') + '</h2>'
+    html_body += '<p><b>Chain rule:</b> ' + str(CONSEC_START) + ' consecutive + ' + str(CONFIRM_OF) + ' of ' + str(CONFIRM_WINDOW) + ' signals in same direction. Mixed chains rejected.</p>'
     html_body += _build_table(ce_today, 'CE BUY (' + str(len(ce_today)) + ' stocks)')
     html_body += '<br/>'
     html_body += _build_table(pe_today, 'PE BUY (' + str(len(pe_today)) + ' stocks)')
     html_body += '</body></html>'
-
     subject = 'CE / PE Momentum Buy Report - ' + datetime.now().strftime('%d %b %H:%M')
     send_email(subject, html_body)
 
