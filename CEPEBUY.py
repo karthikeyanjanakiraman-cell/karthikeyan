@@ -401,10 +401,10 @@ def main() -> None:
         logger.info("No CE/PE BUY signals today. No email sent.")
         return
 
+    # Fixed HTML block: no line‑breaking f"..., no "return "
     html = (
         "<html><body>"
-        f"<h2>CE / PE Momentum Buy Report &mdash; {datetime.now().strftime('%d %b %Y %H:%M')}</h2>"
-        f"<p>Chain rule: {CONSEC_START} consecutive + {CONFIRM_OF} of {CONFIRM_WINDOW}. Mixed chains rejected.</p>"
+        f"CE / PE Momentum Buy Report &mdash; {datetime.now().strftime('%d %b %Y %H:%M')}"
         + _build_table(ce_today, f"CE BUY ({len(ce_today)} stocks)")
         + "<br/>"
         + _build_table(pe_today, f"PE BUY ({len(pe_today)} stocks)")
