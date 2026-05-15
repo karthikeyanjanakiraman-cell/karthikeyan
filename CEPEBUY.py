@@ -1,8 +1,6 @@
-
 #!/usr/bin/env python3
-# CEPEBUY.py - Unified single table with proper exit logic
-# Entry: checks bullish for CE, bearish for PE
-# Exit: checks OPPOSITE direction, only if after entry
+# CEPEBUY.py - Unified single table: FIRST entry + first exit after entry
+# Corrected: scans from BEGINNING of day, not end
 
 import os
 import sys
@@ -70,8 +68,8 @@ def _direction(signal_str):
     if s.startswith('SELL') or 'BEAR' in s or 'EXIT' in s or 'SHORT' in s: return -1
     return 0
 
-def check_chain(signals, timestamps, consec, confirm, window, target_dir=None):
-    """Find most recent chain matching target_dir. Returns timestamp when chain STARTED."""
+def check_chain(signals, timestamps, consec, confirm, window, target_dir=None, after_time=None):
+    """Find FIRST qualifying chain matching target_dir, starting after after_time."""
     if not signals or len(timestamps) == 0: 
         return None
     dirs = [_direction(s) for s in signals]
@@ -82,18 +80,24 @@ def check_chain(signals, timestamps, consec, confirm, window, target_dir=None):
     if len(nzd) < max(consec, window): 
         return None
     
-    recent = nzd[-consec:]
-    if len(set(recent)) == 1 and recent[0] != 0:
-        direction = recent[0]
-        if target_dir is not None and direction != target_dir:
-            return None
-        last_n = nzd[-window:]
-        if sum(1 for d in last_n if d == direction) >= confirm:
-            start_pos = len(nzd) - consec
-            ts = nzt[start_pos]
-            if pd.isna(ts):
-                return None
-            return str(ts)
+    after_ts = pd.to_datetime(after_time, errors='coerce') if after_time else pd.NaT
+    
+    # Scan from BEGINNING to find FIRST qualifying chain
+    for i in range(len(nzd) - consec + 1):
+        block = nzd[i:i+consec]
+        if len(set(block)) == 1 and block[0] != 0:
+            direction = block[0]
+            if target_dir is not None and direction != target_dir:
+                continue
+            window_start = max(0, i - (window - consec))
+            window_block = nzd[window_start:i+consec]
+            if sum(1 for d in window_block if d == direction) >= confirm:
+                ts = nzt[i]
+                if pd.isna(ts):
+                    continue
+                if not pd.isna(after_ts) and pd.to_datetime(ts) <= after_ts:
+                    continue
+                return str(ts)
     return None
 
 def evaluate(iter_df):
@@ -126,27 +130,16 @@ def evaluate(iter_df):
         timestamps = grp[c_timestamp] if c_timestamp else pd.Series([pd.NaT] * len(signals))
         latest = grp.iloc[-1]
         
-        # CE entry = bullish(+1), PE entry = bearish(-1)
         entry_dir = 1 if str(opt_type).strip().upper() == 'CE' else -1
-        exit_dir  = -1 if entry_dir == 1 else 1  # opposite
+        exit_dir  = -1 if entry_dir == 1 else 1
         
+        # Find FIRST entry (earliest in the day)
         entry_time  = check_chain(signals, timestamps, ENTRY_CONSEC, ENTRY_CONFIRM, ENTRY_WINDOW, target_dir=entry_dir)
-        exit15_time = check_chain(signals, timestamps, EXIT_15_CONSEC, EXIT_15_CONFIRM, EXIT_15_WINDOW, target_dir=exit_dir)
-        exit39_time = check_chain(signals, timestamps, EXIT_39_CONSEC, EXIT_39_CONFIRM, EXIT_39_WINDOW, target_dir=exit_dir)
         
-        # Parse for comparison
-        entry_dt  = pd.to_datetime(entry_time, errors='coerce') if entry_time else pd.NaT
-        exit15_dt = pd.to_datetime(exit15_time, errors='coerce') if exit15_time else pd.NaT
-        exit39_dt = pd.to_datetime(exit39_time, errors='coerce') if exit39_time else pd.NaT
+        # Find FIRST exit AFTER entry
+        exit15_time = check_chain(signals, timestamps, EXIT_15_CONSEC, EXIT_15_CONFIRM, EXIT_15_WINDOW, target_dir=exit_dir, after_time=entry_time)
+        exit39_time = check_chain(signals, timestamps, EXIT_39_CONSEC, EXIT_39_CONFIRM, EXIT_39_WINDOW, target_dir=exit_dir, after_time=entry_time)
         
-        # Exits only valid if AFTER entry
-        if not pd.isna(entry_dt):
-            if not pd.isna(exit15_dt) and exit15_dt <= entry_dt:
-                exit15_time = None
-            if not pd.isna(exit39_dt) and exit39_dt <= entry_dt:
-                exit39_time = None
-        
-        # Only show if entry exists
         if entry_time:
             rows.append({
                 'Stock': underlying,
@@ -193,7 +186,7 @@ def main():
     html_body = '<html><body style="font-family:sans-serif;">'
     html_body += '<h2>CE/PE Signals - ' + datetime.now().strftime('%d %b %H:%M') + '</h2>'
     html_body += '<p style="color:#666;font-size:12px;">Entry: %s consec + %s/%s | 15m Exit: %s consec + %s/%s opposite | 39m Exit: %s consec + %s/%s opposite</p>' % (ENTRY_CONSEC, ENTRY_CONFIRM, ENTRY_WINDOW, EXIT_15_CONSEC, EXIT_15_CONFIRM, EXIT_15_WINDOW, EXIT_39_CONSEC, EXIT_39_CONFIRM, EXIT_39_WINDOW)
-    html_body += '<p style="color:#666;font-size:12px;">Exit only shown if it occurred after Entry</p>'
+    html_body += '<p style="color:#666;font-size:12px;">Entry = FIRST qualifying chain of the day | Exit = first opposite chain AFTER entry</p>'
     html_body += build_html(rows) + '</body></html>'
     send_email('CE/PE Signals ' + datetime.now().strftime('%d %b %H:%M'), html_body)
 
