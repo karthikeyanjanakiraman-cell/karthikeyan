@@ -1,7 +1,7 @@
 
 #!/usr/bin/env python3
-# CEPEBUY.py — CE/PE Momentum Buy Email with 5-start / 8-of-11 chain logic
-# Signal column: window_signal (values like Buy++, Buy+, Sell--, Sell-, Neutral)
+# CEPEBUY.py — CE/PE Momentum Buy Email with 5‑start / 8‑of‑11 chain logic
+# Only 1 row per stock in email, sorted by qualify‑count + latest time
 
 import os
 import sys
@@ -14,6 +14,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 import pandas as pd
+from collections import Counter, defaultdict
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger(__name__)
@@ -94,11 +95,11 @@ def _load_state():
             with open(STATE_FILE, 'r') as f:
                 state = json.load(f)
             if state.get('date') == today:
-                logger.info('Loaded daily state: %d CE, %d PE already qualified', len(state.get('ce', {})), len(state.get('pe', {})))
+                logger.info('Loaded daily state: %d CE, %d PE already qualified', len(state.get('ce_all', [])), len(state.get('pe_all', [])))
                 return state
     except Exception:
         pass
-    return {'date': today, 'ce': {}, 'pe': {}}
+    return {'date': today, 'ce_all': [], 'pe_all': []}
 
 def _save_state(state):
     try:
@@ -133,26 +134,54 @@ def check_chain(signals):
             return direction
     return 0
 
+def keep_sorted_per_stock(rows):
+    if not rows:
+        return []
+    per_stock = defaultdict(list)
+    for r in rows:
+        per_stock[r["Underlying"]].append(r)
+
+    result = []
+    for stock, rows in per_stock.items():
+        # Latest bar for this stock
+        latest = max(rows, key=lambda x: x["Timestamp"])
+        # Number of times this stock qualified today
+        latest["Qualify Count"] = len(rows)
+        result.append(latest)
+
+    # Sort by:
+    # 1. Qualify Count (desc)  → how many times it qualified
+    # 2. Timestamp (desc)      → which is most active now
+    result.sort(key=lambda x: (x["Qualify Count"], x["Timestamp"]), reverse=True)
+    return result
+
 def evaluate_chain_from_iteration(iter_df):
-    ce_qualify = {}
-    pe_qualify = {}
+    all_ce_qualified = []
+    all_pe_qualified = []
+
     if iter_df.empty:
-        return ce_qualify, pe_qualify
+        return all_ce_qualified, all_pe_qualified
+
     cols = {c.lower().strip(): c for c in iter_df.columns}
+
     def _col(cands):
         for c in cands:
             if c.lower() in cols:
                 return cols[c.lower()]
         return None
+
     c_underlying = _col(['underlying', 'symbol', 'stock'])
     c_opt_type   = _col(['option type', 'option_type', 'otype', 'type'])
     c_signal     = _col(['window_signal', 'window signal', 'signal', 'chain_signal', 'chain signal'])
     c_timestamp  = _col(['timestamp', 'time', 'datetime', 'ts'])
     c_close      = _col(['close', 'ltp', 'last'])
     c_strike     = _col(['strike', 'strike_price'])
+    c_window_score = _col(['current_window_score', 'window_score', 'score'])
+
     if any(v is None for v in (c_underlying, c_opt_type, c_signal)):
         logger.warning('Iteration CSV missing required columns. Available: %s', list(iter_df.columns))
-        return ce_qualify, pe_qualify
+        return all_ce_qualified, all_pe_qualified
+
     if c_timestamp:
         try:
             iter_df = iter_df.copy()
@@ -160,74 +189,92 @@ def evaluate_chain_from_iteration(iter_df):
             iter_df = iter_df.sort_values(c_timestamp)
         except Exception:
             pass
+
     for (underlying, opt_type), grp in iter_df.groupby([c_underlying, c_opt_type]):
         signals = grp[c_signal].tolist()
         result = check_chain(signals)
         latest = grp.iloc[-1]
-        row_data = {
-            'Underlying': underlying,
-            'Option Type': str(opt_type).upper(),
-            'Strike': latest[c_strike] if c_strike else '',
-            'Close': latest[c_close] if c_close else '',
-            'Last Signal': latest[c_signal],
-            'Timestamp': str(latest[c_timestamp]) if c_timestamp else '',
-            'iteration': latest.get('iteration', ''),
-        }
-        if result == 1 and str(opt_type).upper() == 'CE':
-            ce_qualify[underlying] = row_data
-        elif result == -1 and str(opt_type).upper() == 'PE':
-            pe_qualify[underlying] = row_data
-    logger.info('Chain evaluation: CE qualify=%d | PE qualify=%d', len(ce_qualify), len(pe_qualify))
-    return ce_qualify, pe_qualify
+
+        if result == 1 and str(opt_type).upper() == "CE":
+            row_data = {
+                "Underlying": underlying,
+                "Option Type": str(opt_type).upper(),
+                "Strike": latest[c_strike] if c_strike else "",
+                "Close": latest[c_close] if c_close else "",
+                "Last Signal": latest[c_signal],
+                "Timestamp": str(latest[c_timestamp]) if c_timestamp else "",
+                "iteration": latest.get("iteration", ""),
+                "Window Score": latest[c_window_score] if c_window_score else 0,
+            }
+            all_ce_qualified.append(row_data)
+
+        elif result == -1 and str(opt_type).upper() == "PE":
+            row_data = {
+                "Underlying": underlying,
+                "Option Type": str(opt_type).upper(),
+                "Strike": latest[c_strike] if c_strike else "",
+                "Close": latest[c_close] if c_close else "",
+                "Last Signal": latest[c_signal],
+                "Timestamp": str(latest[c_timestamp]) if c_timestamp else "",
+                "iteration": latest.get("iteration", ""),
+                "Window Score": -latest[c_window_score] if c_window_score else 0,
+            }
+            all_pe_qualified.append(row_data)
+
+    logger.info('CE qualified total (all timestamps): %d', len(all_ce_qualified))
+    logger.info('PE qualified total (all timestamps): %d', len(all_pe_qualified))
+    return all_ce_qualified, all_pe_qualified
 
 def evaluate_chain_from_candidates(long_df, short_df):
-    ce_qualify = {}
-    pe_qualify = {}
+    ce_all = []
+    pe_all = []
+
     combined = pd.concat([long_df, short_df], ignore_index=True) if (not long_df.empty or not short_df.empty) else pd.DataFrame()
     if combined.empty:
-        return ce_qualify, pe_qualify
+        return ce_all, pe_all
+
     cols = {c.lower().strip(): c for c in combined.columns}
+
     def _col(cands):
         for c in cands:
             if c.lower() in cols:
                 return cols[c.lower()]
         return None
+
     u  = _col(['underlying', 'symbol', 'stock'])
     t  = _col(['option type', 'option_type', 'otype', 'type'])
     cs = _col(['chain signal', 'chain_signal', 'signal', 'window_signal'])
     es = _col(['exit signal', 'exit_signal', 'exit'])
+
     if any(v is None for v in (u, t, cs, es)):
         logger.warning('Candidates CSV missing columns. Available: %s', list(combined.columns))
-        return ce_qualify, pe_qualify
+        return ce_all, pe_all
+
     mask = (
         combined[cs].astype(str).str.contains('ENTER', case=False, na=False) &
         combined[es].astype(str).str.contains('OK HOLD', case=False, na=False)
     )
     filt = combined[mask].copy()
     if filt.empty:
-        return ce_qualify, pe_qualify
+        return ce_all, pe_all
+
     for _, row in filt.iterrows():
         underlying = row[u]
         opt_type = str(row[t]).upper()
-        if opt_type == 'CE' and underlying not in ce_qualify:
-            ce_qualify[underlying] = row.to_dict()
-        elif opt_type == 'PE' and underlying not in pe_qualify:
-            pe_qualify[underlying] = row.to_dict()
-    logger.info('Fallback candidate filter: CE=%d | PE=%d', len(ce_qualify), len(pe_qualify))
-    return ce_qualify, pe_qualify
+        row_data = row.to_dict()
+        row_data["Qualify Count"] = 1
+        if opt_type == "CE":
+            ce_all.append(row_data)
+        elif opt_type == "PE":
+            pe_all.append(row_data)
 
-def merge_with_state(state, ce_qualify, pe_qualify):
-    for sym, row in ce_qualify.items():
-        state['ce'][sym] = row
-    for sym, row in pe_qualify.items():
-        state['pe'][sym] = row
-    logger.info('After state merge: CE=%d | PE=%d (cumulative today)', len(state['ce']), len(state['pe']))
-    return state['ce'], state['pe']
+    logger.info('Fallback candidate filter: CE=%d | PE=%d', len(ce_all), len(pe_all))
+    return ce_all, pe_all
 
-def _build_table(rows_dict, title):
-    if not rows_dict:
+def _build_table(rows, title):
+    if not rows:
         return '<h3>' + title + '</h3><p>No signals.</p>'
-    df = pd.DataFrame(list(rows_dict.values()))
+    df = pd.DataFrame(rows)
     out = '<h3>' + title + '</h3>'
     out += '<table border="1" cellspacing="0" cellpadding="4" style="border-collapse:collapse;">'
     out += '<tr style="background:#dce8f7;">' + ''.join('<th>' + str(c) + '</th>' for c in df.columns) + '</tr>'
@@ -263,10 +310,16 @@ def send_email(subject, html_body):
 def main():
     logger.info('=== CEPEBUY starting (5-start / 8-of-11 chain logic) ===')
     state = _load_state()
-    iter_df = _load_any(['fo_iteration_history_*.csv', 'iteration_history_*.csv', 'fo_iteration_history.csv', 'iteration_history.csv'])
+
+    iter_df = _load_any([
+        'fo_iteration_history_*.csv',
+        'iteration_history_*.csv',
+        'fo_iteration_history.csv',
+        'iteration_history.csv',
+    ])
     if not iter_df.empty:
         logger.info('Using iteration history with window_signal column.')
-        ce_qualify, pe_qualify = evaluate_chain_from_iteration(iter_df)
+        ce_all, pe_all = evaluate_chain_from_iteration(iter_df)
     else:
         logger.warning('Iteration history not found. Falling back to candidate CSVs.')
         long_df = _load_any(['fo_long_candidates_*.csv', 'long_candidates_*.csv', 'fo_long_candidates.csv', 'long_candidates.csv'])
@@ -274,19 +327,36 @@ def main():
         if long_df.empty and short_df.empty:
             logger.error('No data source available. Abort.')
             sys.exit(1)
-        ce_qualify, pe_qualify = evaluate_chain_from_candidates(long_df, short_df)
-    ce_today, pe_today = merge_with_state(state, ce_qualify, pe_qualify)
+        ce_all, pe_all = evaluate_chain_from_candidates(long_df, short_df)
+
+    # Attach qualify count separately (for sorting)
+    ce_count = Counter(r["Underlying"] for r in ce_all)
+    pe_count = Counter(r["Underlying"] for r in pe_all)
+    for r in ce_all:
+        r["Qualify Count"] = ce_count[r["Underlying"]]
+    for r in pe_all:
+        r["Qualify Count"] = pe_count[r["Underlying"]]
+    state['ce_all'] = ce_all
+    state['pe_all'] = pe_all
     _save_state(state)
+
+    # Only 1 row per stock, sorted by count + latest time
+    ce_today = keep_sorted_per_stock(ce_all)
+    pe_today = keep_sorted_per_stock(pe_all)
+
     if not ce_today and not pe_today:
         logger.info('No CE/PE BUY signals today. No email sent.')
         return
+
     html_body = '<html><body>'
     html_body += '<h2>CE / PE Momentum Buy Report &mdash; ' + datetime.now().strftime('%d %b %Y %H:%M') + '</h2>'
     html_body += '<p><b>Chain rule:</b> ' + str(CONSEC_START) + ' consecutive + ' + str(CONFIRM_OF) + ' of ' + str(CONFIRM_WINDOW) + ' signals in same direction. Mixed chains rejected.</p>'
-    html_body += _build_table(ce_today, 'CE BUY (' + str(len(ce_today)) + ' stocks)')
+    html_body += '<p><b>Scope:</b> All CE/PE that ever passed 5‑start / 8‑of‑11 chain from morning till now, only 1 row per stock, sorted by how many times it qualified + most recent qualification.</p>'
+    html_body += _build_table(ce_today, 'CE BUY (sorted by qualify count + time)')
     html_body += '<br/>'
-    html_body += _build_table(pe_today, 'PE BUY (' + str(len(pe_today)) + ' stocks)')
+    html_body += _build_table(pe_today, 'PE BUY (sorted by qualify count + time)')
     html_body += '</body></html>'
+
     subject = 'CE / PE Momentum Buy Report - ' + datetime.now().strftime('%d %b %H:%M')
     send_email(subject, html_body)
 
