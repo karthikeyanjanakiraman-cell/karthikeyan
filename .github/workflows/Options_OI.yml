@@ -42,3 +42,4 @@ jobs:
           TZ: Asia/Kolkata
         run: |
           python OPTIONS_OI.py
+          python CEPEBUY.py
