@@ -13,6 +13,18 @@ jobs:
   run-options-oi-rank-scanner:
     runs-on: ubuntu-latest
 
+    # Env moved to JOB level so both steps inherit secrets
+    env:
+      CLIENT_ID: ${{ secrets.CLIENT_ID }}
+      ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+      SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+      SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+      RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      ACTIVE_EXPIRY: ${{ secrets.ACTIVE_EXPIRY }}
+      ATM_STRIKE_RANGE: ${{ secrets.ATM_STRIKE_RANGE }}
+      TZ: Asia/Kolkata
+
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -29,17 +41,10 @@ jobs:
           python -m pip install --upgrade pip
           pip install pandas numpy fyers-apiv3 scipy
 
-      - name: Run Options OI Asit-style Rank scanner
-        env:
-          CLIENT_ID: ${{ secrets.CLIENT_ID }}
-          ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
-          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
-          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
-          SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          ACTIVE_EXPIRY: ${{ secrets.ACTIVE_EXPIRY }}
-          ATM_STRIKE_RANGE: ${{ secrets.ATM_STRIKE_RANGE }}
-          TZ: Asia/Kolkata
-        run: |
-          python OPTIONS_OI.py
-          python CEPEBUY.py
+      - name: Run Options OI scanner
+        run: python OPTIONS_OI.py
+        # Writes output/fo_long_candidates_YYYYMMDD_HHMM.csv etc.
+
+      - name: Send CE/PE Momentum Buy Email
+        run: python CEPEBUY.py
+        # Finds the latest CSVs automatically and sends CE BUY / PE BUY email
