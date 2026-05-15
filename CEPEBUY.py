@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-# CEPEBUY.py - Price-based direction: close[i] vs close[i-1]
-# Direction = +1 if price went UP, -1 if DOWN. No signal text parsing.
+# CEPEBUY.py - Price-based direction + Entry Price column
+# Direction from close[i] vs close[i-1]
+# New column: EntryPrice = close at the moment the entry chain started
 
 import os
 import sys
@@ -24,17 +25,17 @@ RECIPIENT_EMAIL = os.environ.get('RECIPIENT_EMAIL')
 SMTP_HOST       = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
 SMTP_PORT       = int(os.environ.get('SMTP_PORT', '587'))
 
-ENTRY_CONSEC   = int(os.environ.get('ENTRY_CONSEC', '5'))
-ENTRY_CONFIRM  = int(os.environ.get('ENTRY_CONFIRM', '8'))
-ENTRY_WINDOW   = int(os.environ.get('ENTRY_WINDOW', '11'))
+ENTRY_CONSEC   = int(os.environ.get('ENTRY_CONSEC', '3'))
+ENTRY_CONFIRM  = int(os.environ.get('ENTRY_CONFIRM', '6'))
+ENTRY_WINDOW   = int(os.environ.get('ENTRY_WINDOW', '6'))
 
 EXIT_15_CONSEC  = int(os.environ.get('EXIT_15_CONSEC', '5'))
-EXIT_15_CONFIRM = int(os.environ.get('EXIT_15_CONFIRM', '10'))
-EXIT_15_WINDOW  = int(os.environ.get('EXIT_15_WINDOW', '15'))
+EXIT_15_CONFIRM = int(os.environ.get('EXIT_15_CONFIRM', '5'))
+EXIT_15_WINDOW  = int(os.environ.get('EXIT_15_WINDOW', '5'))
 
 EXIT_39_CONSEC  = int(os.environ.get('EXIT_39_CONSEC', '5'))
-EXIT_39_CONFIRM = int(os.environ.get('EXIT_39_CONFIRM', '25'))
-EXIT_39_WINDOW  = int(os.environ.get('EXIT_39_WINDOW', '39'))
+EXIT_39_CONFIRM = int(os.environ.get('EXIT_39_CONFIRM', '5'))
+EXIT_39_WINDOW  = int(os.environ.get('EXIT_39_WINDOW', '5'))
 
 def _find_latest(pattern):
     matches = []; seen = set()
@@ -62,32 +63,32 @@ def _load_any(patterns):
     return pd.DataFrame()
 
 def _direction_from_price(prev_close, curr_close):
-    """Compare current close with previous close."""
     if pd.isna(prev_close) or pd.isna(curr_close): return 0
     if curr_close > prev_close: return 1
     if curr_close < prev_close: return -1
     return 0
 
 def check_chain(closes, timestamps, consec, confirm, window, target_dir=None, after_time=None):
-    """Find FIRST qualifying chain where price direction matches target_dir."""
+    """Find FIRST qualifying chain. Returns (timestamp_str, entry_price) or (None, None)."""
     if not closes or len(timestamps) == 0 or len(closes) < 2:
-        return None
-    
+        return None, None
+
     dirs = []
     for i in range(len(closes)):
         prev = closes[i-1] if i > 0 else closes[i]
         curr = closes[i]
         dirs.append(_direction_from_price(prev, curr))
-    
+
     nzi = [i for i, d in enumerate(dirs) if d != 0]
     nzd = [dirs[i] for i in nzi]
     nzt = [timestamps.iloc[i] for i in nzi]
-    
+    nzp = [closes[i] for i in nzi]
+
     if len(nzd) < max(consec, window):
-        return None
-    
+        return None, None
+
     after_ts = pd.to_datetime(after_time, errors='coerce') if after_time else pd.NaT
-    
+
     for i in range(len(nzd) - consec + 1):
         block = nzd[i:i+consec]
         if len(set(block)) == 1 and block[0] != 0:
@@ -98,12 +99,13 @@ def check_chain(closes, timestamps, consec, confirm, window, target_dir=None, af
             window_block = nzd[window_start:i+consec]
             if sum(1 for d in window_block if d == direction) >= confirm:
                 ts = nzt[i]
+                price = nzp[i]
                 if pd.isna(ts):
                     continue
                 if not pd.isna(after_ts) and pd.to_datetime(ts) <= after_ts:
                     continue
-                return str(ts)
-    return None
+                return str(ts), price
+    return None, None
 
 def evaluate(iter_df):
     rows = []
@@ -122,7 +124,7 @@ def evaluate(iter_df):
     if any(v is None for v in (c_underlying, c_close, c_timestamp)):
         logger.warning('Missing required columns: underlying, close, timestamp')
         return rows
-    
+
     if c_timestamp:
         try:
             iter_df = iter_df.copy()
@@ -130,25 +132,26 @@ def evaluate(iter_df):
             iter_df[c_timestamp] = pd.to_datetime(iter_df[c_timestamp], errors='coerce')
             iter_df = iter_df.sort_values(c_timestamp)
         except Exception: pass
-    
+
     for (underlying, opt_type), grp in iter_df.groupby([c_underlying, c_opt_type]):
         closes = grp[c_close].tolist()
         timestamps = grp[c_timestamp]
         latest = grp.iloc[-1]
-        
+
         entry_dir = 1 if str(opt_type).strip().upper() == 'CE' else -1
         exit_dir  = -1 if entry_dir == 1 else 1
-        
-        entry_time  = check_chain(closes, timestamps, ENTRY_CONSEC, ENTRY_CONFIRM, ENTRY_WINDOW, target_dir=entry_dir)
-        exit15_time = check_chain(closes, timestamps, EXIT_15_CONSEC, EXIT_15_CONFIRM, EXIT_15_WINDOW, target_dir=exit_dir, after_time=entry_time)
-        exit39_time = check_chain(closes, timestamps, EXIT_39_CONSEC, EXIT_39_CONFIRM, EXIT_39_WINDOW, target_dir=exit_dir, after_time=entry_time)
-        
+
+        entry_time, entry_price  = check_chain(closes, timestamps, ENTRY_CONSEC, ENTRY_CONFIRM, ENTRY_WINDOW, target_dir=entry_dir)
+        exit15_time, _ = check_chain(closes, timestamps, EXIT_15_CONSEC, EXIT_15_CONFIRM, EXIT_15_WINDOW, target_dir=exit_dir, after_time=entry_time)
+        exit39_time, _ = check_chain(closes, timestamps, EXIT_39_CONSEC, EXIT_39_CONFIRM, EXIT_39_WINDOW, target_dir=exit_dir, after_time=entry_time)
+
         if entry_time:
             rows.append({
                 'Stock': underlying,
                 'Type': opt_type,
                 'Signal': 'BUY CE' if entry_dir == 1 else 'BUY PE',
                 'Strike': latest[c_strike] if c_strike else '',
+                'EntryPrice': round(entry_price, 2) if entry_price else '',
                 'LTP': latest[c_close] if c_close else '',
                 'Entry': entry_time,
                 'Exit15': exit15_time or '-',
@@ -181,7 +184,7 @@ def send_email(subject, html_body):
     except Exception as exc: logger.exception('SMTP failed: %s', exc); return False
 
 def main():
-    logger.info('=== CEPEBUY (price-based direction) starting ===')
+    logger.info('=== CEPEBUY (price-based + EntryPrice) starting ===')
     iter_df = _load_any(['fo_iteration_history_*.csv', 'iteration_history_*.csv', 'fo_iteration_history.csv', 'iteration_history.csv'])
     if iter_df.empty: logger.error('No iteration CSV found'); sys.exit(1)
     rows = evaluate(iter_df)
@@ -189,7 +192,7 @@ def main():
     html_body = '<html><body style="font-family:sans-serif;">'
     html_body += '<h2>CE/PE Signals - ' + datetime.now().strftime('%d %b %H:%M') + '</h2>'
     html_body += '<p style="color:#666;font-size:12px;">Direction = close[i] vs close[i-1]. Entry: %s consec + %s/%s | 15m Exit: %s consec + %s/%s opposite | 39m Exit: %s consec + %s/%s opposite</p>' % (ENTRY_CONSEC, ENTRY_CONFIRM, ENTRY_WINDOW, EXIT_15_CONSEC, EXIT_15_CONFIRM, EXIT_15_WINDOW, EXIT_39_CONSEC, EXIT_39_CONFIRM, EXIT_39_WINDOW)
-    html_body += '<p style="color:#666;font-size:12px;">Entry = FIRST qualifying chain | Exit = first opposite chain AFTER entry</p>'
+    html_body += '<p style="color:#666;font-size:12px;">EntryPrice = close at the moment the 5-consecutive chain started</p>'
     html_body += build_html(rows) + '</body></html>'
     send_email('CE/PE Signals ' + datetime.now().strftime('%d %b %H:%M'), html_body)
 
