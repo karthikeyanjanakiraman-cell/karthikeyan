@@ -21,6 +21,8 @@ import pandas as pd
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 
+# === CONFIG =========================================================================================
+
 # user config
 EMAIL_USER = os.getenv("EMAIL_USER")
 EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD")
@@ -34,8 +36,10 @@ HISTORY_DIR = PROJECT_DIR
 CEPEBUY_STATE_FILE = PROJECT_DIR / "cepebuy_state.json"
 STATE_DATE = datetime.now().strftime("%Y-%m-%d")
 
-c_timestamp = "timestamp"
+# Column name for timestamp in CSV
+c_timestamp = "timestamp"   # must match your CSV header
 
+# === READING DATA ================================================================================
 
 def read_iteration_history() -> Optional[pd.DataFrame]:
     """Read fo_iteration_history_*.csv if available."""
@@ -52,7 +56,8 @@ def read_iteration_history() -> Optional[pd.DataFrame]:
     # Ensure c_timestamp is in the columns
     if c_timestamp not in df.columns:
         if "timestamp" in df.columns:
-            c_timestamp = "timestamp"
+            # Use the default column name if it exists
+            pass
         else:
             logging.error(f"Column {c_timestamp} not found in iteration history.")
             return None
@@ -104,6 +109,8 @@ def read_candidates() -> pd.DataFrame:
 
     return pd.concat([long_df, short_df], ignore_index=True)
 
+
+# === CHAIN LOGIC ===================================================================================
 
 def check_chain(signals, timestamps) -> Tuple[int, Optional[datetime]]:
     """
@@ -172,6 +179,8 @@ def evaluate_chain_from_iteration(iter_df: pd.DataFrame) -> Tuple[List[str], Lis
 
     return list(set(ce_all)), list(set(pe_all))
 
+
+# === STATE (cepebuy_state.json) ====================================================================
 
 def load_state() -> Dict[str, List[str]]:
     """
@@ -263,6 +272,8 @@ def update_state_from_candidates(state: Dict[str, List[str]], cand_df: pd.DataFr
     save_state(state)
 
 
+# === EMAIL BUILDING ===============================================================================
+
 def build_html_table(df: pd.DataFrame, title: str) -> str:
     if df.empty:
         return f"<h3>{title}</h3><p>No stocks today.</p>"
@@ -328,6 +339,8 @@ def send_email(subject: str, html_body: str) -> None:
         logging.error(f"Failed to send email: {e}")
 
 
+# === MAIN ENTRY ===================================================================================
+
 def main() -> None:
     # Read iteration history (preferred)
     iter_df = read_iteration_history()
@@ -338,7 +351,7 @@ def main() -> None:
             logging.info("No candidates files found; exiting.")
             return
 
-        # Just load existing state, don't add new logic
+        # Just load existing state, don't add new logic from chain
         state = load_state()
         update_state_from_candidates(state, cand_df)
         ce_today = state["ce_buy"]
