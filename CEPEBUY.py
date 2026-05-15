@@ -1,7 +1,8 @@
 
 #!/usr/bin/env python3
-# CEPEBUY.py - Single table: Entry | Exit15 | Exit39 as columns
-# No JSON state. Reads iteration CSV fresh every run.
+# CEPEBUY.py - Unified single table with proper exit logic
+# Entry: checks bullish for CE, bearish for PE
+# Exit: checks OPPOSITE direction, only if after entry
 
 import os
 import sys
@@ -38,8 +39,7 @@ EXIT_39_CONFIRM = int(os.environ.get('EXIT_39_CONFIRM', '25'))
 EXIT_39_WINDOW  = int(os.environ.get('EXIT_39_WINDOW', '39'))
 
 def _find_latest(pattern):
-    matches = []
-    seen = set()
+    matches = []; seen = set()
     for root in [Path.cwd(), Path.cwd()/'output', Path(__file__).parent, Path(__file__).parent/'output']:
         if not root.exists(): continue
         for match in root.rglob(pattern):
@@ -66,28 +66,40 @@ def _load_any(patterns):
 def _direction(signal_str):
     s = str(signal_str).strip().upper()
     if s in ('', 'NAN', 'NONE', 'NEUTRAL', 'HOLD'): return 0
-    if s.startswith('BUY') or 'BULL' in s or 'ENTER' in s or 'LONG' in s: return 1
+    if s.startswith('BUY') or 'BULL' in s or 'ENTER' in s or 'LONG' in s or 'CONFIRM' in s: return 1
     if s.startswith('SELL') or 'BEAR' in s or 'EXIT' in s or 'SHORT' in s: return -1
     return 0
 
-def check_chain(signals, timestamps, consec, confirm, window):
-    if not signals or len(timestamps) == 0: return 0, None
+def check_chain(signals, timestamps, consec, confirm, window, target_dir=None):
+    """Find most recent chain matching target_dir. Returns timestamp when chain STARTED."""
+    if not signals or len(timestamps) == 0: 
+        return None
     dirs = [_direction(s) for s in signals]
-    non_zero_indices = [i for i, d in enumerate(dirs) if d != 0]
-    non_zero_dirs = [dirs[i] for i in non_zero_indices]
-    if len(non_zero_dirs) < max(consec, window): return 0, None
-    recent = non_zero_dirs[-consec:]
+    nzi = [i for i, d in enumerate(dirs) if d != 0]
+    nzd = [dirs[i] for i in nzi]
+    nzt = [timestamps.iloc[i] for i in nzi]
+    
+    if len(nzd) < max(consec, window): 
+        return None
+    
+    recent = nzd[-consec:]
     if len(set(recent)) == 1 and recent[0] != 0:
         direction = recent[0]
-        last_n = non_zero_dirs[-window:]
+        if target_dir is not None and direction != target_dir:
+            return None
+        last_n = nzd[-window:]
         if sum(1 for d in last_n if d == direction) >= confirm:
-            return direction, str(timestamps.iloc[non_zero_indices[-consec]])
-    return 0, None
+            start_pos = len(nzd) - consec
+            ts = nzt[start_pos]
+            if pd.isna(ts):
+                return None
+            return str(ts)
+    return None
 
-def evaluate_all(df):
-    results = {}
-    if df.empty: return results
-    cols = {c.lower().strip(): c for c in df.columns}
+def evaluate(iter_df):
+    rows = []
+    if iter_df.empty: return rows
+    cols = {c.lower().strip(): c for c in iter_df.columns}
     def _col(cands):
         for c in cands:
             if c.lower() in cols: return cols[c.lower()]
@@ -99,55 +111,63 @@ def evaluate_all(df):
     c_close      = _col(['close', 'ltp', 'last'])
     c_strike     = _col(['strike', 'strike_price'])
     c_score      = _col(['current_window_score', 'window_score', 'score'])
-    if any(v is None for v in (c_underlying, c_signal)): return results
+    if any(v is None for v in (c_underlying, c_signal)): return rows
+    
     if c_timestamp:
         try:
-            df = df.copy()
+            iter_df = iter_df.copy()
             with warnings.catch_warnings(): warnings.simplefilter('ignore')
-            df[c_timestamp] = pd.to_datetime(df[c_timestamp], errors='coerce')
-            df = df.sort_values(c_timestamp)
+            iter_df[c_timestamp] = pd.to_datetime(iter_df[c_timestamp], errors='coerce')
+            iter_df = iter_df.sort_values(c_timestamp)
         except Exception: pass
-    for (underlying, opt_type), grp in df.groupby([c_underlying, c_opt_type]):
+    
+    for (underlying, opt_type), grp in iter_df.groupby([c_underlying, c_opt_type]):
         signals = grp[c_signal].tolist()
-        timestamps = grp[c_timestamp] if c_timestamp else pd.Series([None] * len(signals))
+        timestamps = grp[c_timestamp] if c_timestamp else pd.Series([pd.NaT] * len(signals))
         latest = grp.iloc[-1]
-        entry_dir, entry_time = check_chain(signals, timestamps, ENTRY_CONSEC, ENTRY_CONFIRM, ENTRY_WINDOW)
-        exit15_dir, exit15_time = check_chain(signals, timestamps, EXIT_15_CONSEC, EXIT_15_CONFIRM, EXIT_15_WINDOW)
-        exit39_dir, exit39_time = check_chain(signals, timestamps, EXIT_39_CONSEC, EXIT_39_CONFIRM, EXIT_39_WINDOW)
-        if entry_dir != 0 or exit15_dir != 0 or exit39_dir != 0:
-            signal_type = ''
-            if entry_dir == 1: signal_type = 'BUY CE'
-            elif entry_dir == -1: signal_type = 'BUY PE'
-            results[(underlying, opt_type)] = {
-                'Stock': underlying, 'Type': opt_type,
+        
+        # CE entry = bullish(+1), PE entry = bearish(-1)
+        entry_dir = 1 if str(opt_type).strip().upper() == 'CE' else -1
+        exit_dir  = -1 if entry_dir == 1 else 1  # opposite
+        
+        entry_time  = check_chain(signals, timestamps, ENTRY_CONSEC, ENTRY_CONFIRM, ENTRY_WINDOW, target_dir=entry_dir)
+        exit15_time = check_chain(signals, timestamps, EXIT_15_CONSEC, EXIT_15_CONFIRM, EXIT_15_WINDOW, target_dir=exit_dir)
+        exit39_time = check_chain(signals, timestamps, EXIT_39_CONSEC, EXIT_39_CONFIRM, EXIT_39_WINDOW, target_dir=exit_dir)
+        
+        # Parse for comparison
+        entry_dt  = pd.to_datetime(entry_time, errors='coerce') if entry_time else pd.NaT
+        exit15_dt = pd.to_datetime(exit15_time, errors='coerce') if exit15_time else pd.NaT
+        exit39_dt = pd.to_datetime(exit39_time, errors='coerce') if exit39_time else pd.NaT
+        
+        # Exits only valid if AFTER entry
+        if not pd.isna(entry_dt):
+            if not pd.isna(exit15_dt) and exit15_dt <= entry_dt:
+                exit15_time = None
+            if not pd.isna(exit39_dt) and exit39_dt <= entry_dt:
+                exit39_time = None
+        
+        # Only show if entry exists
+        if entry_time:
+            rows.append({
+                'Stock': underlying,
+                'Type': opt_type,
+                'Signal': 'BUY CE' if entry_dir == 1 else 'BUY PE',
                 'Strike': latest[c_strike] if c_strike else '',
                 'LTP': latest[c_close] if c_close else '',
-                'Signal': signal_type,
-                'Entry': entry_time if entry_time else '',
-                'Exit15': exit15_time if exit15_time else '',
-                'Exit39': exit39_time if exit39_time else '',
+                'Entry': entry_time,
+                'Exit15': exit15_time or '-',
+                'Exit39': exit39_time or '-',
                 'Score': latest[c_score] if c_score else 0,
-            }
-    return results
-
-def build_rows(results):
-    rows = list(results.values())
-    if not rows: return []
-    def sort_key(r):
-        has_entry = 1 if r['Entry'] else 0
-        return (has_entry, r['Exit15'], r['Exit39'])
-    rows.sort(key=sort_key, reverse=True)
+            })
     return rows
 
 def build_html(rows):
     if not rows: return '<p>No signals today.</p>'
     df = pd.DataFrame(rows)
-    preferred = ['Stock', 'Type', 'Signal', 'Strike', 'LTP', 'Entry', 'Exit15', 'Exit39', 'Score']
-    df = df[[c for c in preferred if c in df.columns]]
     out = '<table border="1" cellspacing="0" cellpadding="4" style="border-collapse:collapse;font-family:monospace;font-size:13px;">'
     out += '<tr style="background:#2c3e50;color:white;">' + ''.join('<th>'+c+'</th>' for c in df.columns) + '</tr>'
     for _, r in df.iterrows():
-        out += '<tr>' + ''.join('<td>'+(str(r[c]) if pd.notna(r[c]) and str(r[c]) not in ('None','') else '-')+'</td>' for c in df.columns) + '</tr>'
+        out += '<tr>' + ''.join('<td>'+str(r[c])+'</td>' for c in df.columns) + '</tr>'
     out += '</table>'
     return out
 
@@ -168,16 +188,12 @@ def main():
     logger.info('=== CEPEBUY starting ===')
     iter_df = _load_any(['fo_iteration_history_*.csv', 'iteration_history_*.csv', 'fo_iteration_history.csv', 'iteration_history.csv'])
     if iter_df.empty: logger.error('No iteration CSV found'); sys.exit(1)
-    results = evaluate_all(iter_df)
-    rows = build_rows(results)
-    if not rows: logger.info('No signals today'); return
+    rows = evaluate(iter_df)
+    if not rows: logger.info('No entry signals today'); return
     html_body = '<html><body style="font-family:sans-serif;">'
     html_body += '<h2>CE/PE Signals - ' + datetime.now().strftime('%d %b %H:%M') + '</h2>'
-    html_body += '<p style="color:#666;font-size:12px;">Entry: %s consec + %s/%s | Exit15: opposite %s/%s | Exit39: opposite %s/%s</p>' % (
-        ENTRY_CONSEC, ENTRY_CONFIRM, ENTRY_WINDOW,
-        EXIT_15_CONFIRM, EXIT_15_WINDOW,
-        EXIT_39_CONFIRM, EXIT_39_WINDOW)
-    html_body += '<p style="color:#666;font-size:12px;">Entry = when 5-start triggered | Exit15/Exit39 = when opposite reversal occurred</p>'
+    html_body += '<p style="color:#666;font-size:12px;">Entry: %s consec + %s/%s | 15m Exit: %s consec + %s/%s opposite | 39m Exit: %s consec + %s/%s opposite</p>' % (ENTRY_CONSEC, ENTRY_CONFIRM, ENTRY_WINDOW, EXIT_15_CONSEC, EXIT_15_CONFIRM, EXIT_15_WINDOW, EXIT_39_CONSEC, EXIT_39_CONFIRM, EXIT_39_WINDOW)
+    html_body += '<p style="color:#666;font-size:12px;">Exit only shown if it occurred after Entry</p>'
     html_body += build_html(rows) + '</body></html>'
     send_email('CE/PE Signals ' + datetime.now().strftime('%d %b %H:%M'), html_body)
 
