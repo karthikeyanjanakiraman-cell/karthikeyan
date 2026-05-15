@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-# CEPEBUY.py - Unified single table: FIRST entry + first exit after entry
-# Corrected: scans from BEGINNING of day, not end
+# CEPEBUY.py - Price-based direction: close[i] vs close[i-1]
+# Direction = +1 if price went UP, -1 if DOWN. No signal text parsing.
 
 import os
 import sys
@@ -61,28 +61,33 @@ def _load_any(patterns):
             except Exception: pass
     return pd.DataFrame()
 
-def _direction(signal_str):
-    s = str(signal_str).strip().upper()
-    if s in ('', 'NAN', 'NONE', 'NEUTRAL', 'HOLD'): return 0
-    if s.startswith('BUY') or 'BULL' in s or 'ENTER' in s or 'LONG' in s or 'CONFIRM' in s: return 1
-    if s.startswith('SELL') or 'BEAR' in s or 'EXIT' in s or 'SHORT' in s: return -1
+def _direction_from_price(prev_close, curr_close):
+    """Compare current close with previous close."""
+    if pd.isna(prev_close) or pd.isna(curr_close): return 0
+    if curr_close > prev_close: return 1
+    if curr_close < prev_close: return -1
     return 0
 
-def check_chain(signals, timestamps, consec, confirm, window, target_dir=None, after_time=None):
-    """Find FIRST qualifying chain matching target_dir, starting after after_time."""
-    if not signals or len(timestamps) == 0: 
+def check_chain(closes, timestamps, consec, confirm, window, target_dir=None, after_time=None):
+    """Find FIRST qualifying chain where price direction matches target_dir."""
+    if not closes or len(timestamps) == 0 or len(closes) < 2:
         return None
-    dirs = [_direction(s) for s in signals]
+    
+    dirs = []
+    for i in range(len(closes)):
+        prev = closes[i-1] if i > 0 else closes[i]
+        curr = closes[i]
+        dirs.append(_direction_from_price(prev, curr))
+    
     nzi = [i for i, d in enumerate(dirs) if d != 0]
     nzd = [dirs[i] for i in nzi]
     nzt = [timestamps.iloc[i] for i in nzi]
     
-    if len(nzd) < max(consec, window): 
+    if len(nzd) < max(consec, window):
         return None
     
     after_ts = pd.to_datetime(after_time, errors='coerce') if after_time else pd.NaT
     
-    # Scan from BEGINNING to find FIRST qualifying chain
     for i in range(len(nzd) - consec + 1):
         block = nzd[i:i+consec]
         if len(set(block)) == 1 and block[0] != 0:
@@ -110,12 +115,13 @@ def evaluate(iter_df):
         return None
     c_underlying = _col(['underlying', 'symbol', 'stock'])
     c_opt_type   = _col(['option type', 'option_type', 'otype', 'type'])
-    c_signal     = _col(['window_signal', 'window signal', 'signal', 'chain_signal', 'chain signal'])
     c_timestamp  = _col(['timestamp', 'time', 'datetime', 'ts'])
     c_close      = _col(['close', 'ltp', 'last'])
     c_strike     = _col(['strike', 'strike_price'])
     c_score      = _col(['current_window_score', 'window_score', 'score'])
-    if any(v is None for v in (c_underlying, c_signal)): return rows
+    if any(v is None for v in (c_underlying, c_close, c_timestamp)):
+        logger.warning('Missing required columns: underlying, close, timestamp')
+        return rows
     
     if c_timestamp:
         try:
@@ -126,19 +132,16 @@ def evaluate(iter_df):
         except Exception: pass
     
     for (underlying, opt_type), grp in iter_df.groupby([c_underlying, c_opt_type]):
-        signals = grp[c_signal].tolist()
-        timestamps = grp[c_timestamp] if c_timestamp else pd.Series([pd.NaT] * len(signals))
+        closes = grp[c_close].tolist()
+        timestamps = grp[c_timestamp]
         latest = grp.iloc[-1]
         
         entry_dir = 1 if str(opt_type).strip().upper() == 'CE' else -1
         exit_dir  = -1 if entry_dir == 1 else 1
         
-        # Find FIRST entry (earliest in the day)
-        entry_time  = check_chain(signals, timestamps, ENTRY_CONSEC, ENTRY_CONFIRM, ENTRY_WINDOW, target_dir=entry_dir)
-        
-        # Find FIRST exit AFTER entry
-        exit15_time = check_chain(signals, timestamps, EXIT_15_CONSEC, EXIT_15_CONFIRM, EXIT_15_WINDOW, target_dir=exit_dir, after_time=entry_time)
-        exit39_time = check_chain(signals, timestamps, EXIT_39_CONSEC, EXIT_39_CONFIRM, EXIT_39_WINDOW, target_dir=exit_dir, after_time=entry_time)
+        entry_time  = check_chain(closes, timestamps, ENTRY_CONSEC, ENTRY_CONFIRM, ENTRY_WINDOW, target_dir=entry_dir)
+        exit15_time = check_chain(closes, timestamps, EXIT_15_CONSEC, EXIT_15_CONFIRM, EXIT_15_WINDOW, target_dir=exit_dir, after_time=entry_time)
+        exit39_time = check_chain(closes, timestamps, EXIT_39_CONSEC, EXIT_39_CONFIRM, EXIT_39_WINDOW, target_dir=exit_dir, after_time=entry_time)
         
         if entry_time:
             rows.append({
@@ -178,15 +181,15 @@ def send_email(subject, html_body):
     except Exception as exc: logger.exception('SMTP failed: %s', exc); return False
 
 def main():
-    logger.info('=== CEPEBUY starting ===')
+    logger.info('=== CEPEBUY (price-based direction) starting ===')
     iter_df = _load_any(['fo_iteration_history_*.csv', 'iteration_history_*.csv', 'fo_iteration_history.csv', 'iteration_history.csv'])
     if iter_df.empty: logger.error('No iteration CSV found'); sys.exit(1)
     rows = evaluate(iter_df)
     if not rows: logger.info('No entry signals today'); return
     html_body = '<html><body style="font-family:sans-serif;">'
     html_body += '<h2>CE/PE Signals - ' + datetime.now().strftime('%d %b %H:%M') + '</h2>'
-    html_body += '<p style="color:#666;font-size:12px;">Entry: %s consec + %s/%s | 15m Exit: %s consec + %s/%s opposite | 39m Exit: %s consec + %s/%s opposite</p>' % (ENTRY_CONSEC, ENTRY_CONFIRM, ENTRY_WINDOW, EXIT_15_CONSEC, EXIT_15_CONFIRM, EXIT_15_WINDOW, EXIT_39_CONSEC, EXIT_39_CONFIRM, EXIT_39_WINDOW)
-    html_body += '<p style="color:#666;font-size:12px;">Entry = FIRST qualifying chain of the day | Exit = first opposite chain AFTER entry</p>'
+    html_body += '<p style="color:#666;font-size:12px;">Direction = close[i] vs close[i-1]. Entry: %s consec + %s/%s | 15m Exit: %s consec + %s/%s opposite | 39m Exit: %s consec + %s/%s opposite</p>' % (ENTRY_CONSEC, ENTRY_CONFIRM, ENTRY_WINDOW, EXIT_15_CONSEC, EXIT_15_CONFIRM, EXIT_15_WINDOW, EXIT_39_CONSEC, EXIT_39_CONFIRM, EXIT_39_WINDOW)
+    html_body += '<p style="color:#666;font-size:12px;">Entry = FIRST qualifying chain | Exit = first opposite chain AFTER entry</p>'
     html_body += build_html(rows) + '</body></html>'
     send_email('CE/PE Signals ' + datetime.now().strftime('%d %b %H:%M'), html_body)
 
