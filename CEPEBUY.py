@@ -30,13 +30,13 @@ ENTRY_CONSEC   = int(os.environ.get('ENTRY_CONSEC', '3'))
 ENTRY_CONFIRM  = int(os.environ.get('ENTRY_CONFIRM', '3'))
 ENTRY_WINDOW   = int(os.environ.get('ENTRY_WINDOW', '3'))
 
-EXIT_15_CONSEC  = int(os.environ.get('EXIT_15_CONSEC', '5'))
-EXIT_15_CONFIRM = int(os.environ.get('EXIT_15_CONFIRM', '5'))
-EXIT_15_WINDOW  = int(os.environ.get('EXIT_15_WINDOW', '5'))
+EXIT_15_CONSEC  = int(os.environ.get('EXIT_15_CONSEC', '2'))
+EXIT_15_CONFIRM = int(os.environ.get('EXIT_15_CONFIRM', '2'))
+EXIT_15_WINDOW  = int(os.environ.get('EXIT_15_WINDOW', '2'))
 
-EXIT_39_CONSEC  = int(os.environ.get('EXIT_39_CONSEC', '5'))
-EXIT_39_CONFIRM = int(os.environ.get('EXIT_39_CONFIRM', '5'))
-EXIT_39_WINDOW  = int(os.environ.get('EXIT_39_WINDOW', '5'))
+EXIT_39_CONSEC  = int(os.environ.get('EXIT_39_CONSEC', '2'))
+EXIT_39_CONFIRM = int(os.environ.get('EXIT_39_CONFIRM', '2'))
+EXIT_39_WINDOW  = int(os.environ.get('EXIT_39_WINDOW', '2'))
 
 def _find_latest(pattern):
     matches = []
