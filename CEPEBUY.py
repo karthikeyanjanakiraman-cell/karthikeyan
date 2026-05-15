@@ -1,7 +1,6 @@
-
 #!/usr/bin/env python3
-# CEPEBUY.py — CE/PE Momentum Buy Email with 5‑start / 8‑of‑11 chain logic
-# Only 1 row per stock in email, sorted by qualify‑count + latest time
+# CEPEBUY.py — CE/PE Buy Momentum (Bullish=CE Buy, Bearish=PE Buy)
+# Only 1 row per stock in email, sorted by qualify count + time
 
 import os
 import sys
@@ -95,7 +94,8 @@ def _load_state():
             with open(STATE_FILE, 'r') as f:
                 state = json.load(f)
             if state.get('date') == today:
-                logger.info('Loaded daily state: %d CE, %d PE already qualified', len(state.get('ce_all', [])), len(state.get('pe_all', [])))
+                logger.info('Loaded daily state: %d CE Buy, %d PE Buy', 
+                          len(state.get('ce_all', [])), len(state.get('pe_all', [])))
                 return state
     except Exception:
         pass
@@ -178,7 +178,7 @@ def evaluate_chain_from_iteration(iter_df):
     c_strike     = _col(['strike', 'strike_price'])
     c_window_score = _col(['current_window_score', 'window_score', 'score'])
 
-    if any(v is None for v in (c_underlying, c_opt_type, c_signal)):
+    if any(v is None for v in (c_underlying, c_signal)):
         logger.warning('Iteration CSV missing required columns. Available: %s', list(iter_df.columns))
         return all_ce_qualified, all_pe_qualified
 
@@ -195,10 +195,12 @@ def evaluate_chain_from_iteration(iter_df):
         result = check_chain(signals)
         latest = grp.iloc[-1]
 
-        if result == 1 and str(opt_type).upper() == "CE":
+        # Bullish chain → CE Buy
+        if result == 1:
             row_data = {
                 "Underlying": underlying,
-                "Option Type": str(opt_type).upper(),
+                "Option Type": "CE",
+                "Direction": "Bullish",
                 "Strike": latest[c_strike] if c_strike else "",
                 "Close": latest[c_close] if c_close else "",
                 "Last Signal": latest[c_signal],
@@ -208,10 +210,12 @@ def evaluate_chain_from_iteration(iter_df):
             }
             all_ce_qualified.append(row_data)
 
-        elif result == -1 and str(opt_type).upper() == "PE":
+        # Bearish chain → PE Buy
+        elif result == -1:
             row_data = {
                 "Underlying": underlying,
-                "Option Type": str(opt_type).upper(),
+                "Option Type": "PE",
+                "Direction": "Bearish",
                 "Strike": latest[c_strike] if c_strike else "",
                 "Close": latest[c_close] if c_close else "",
                 "Last Signal": latest[c_signal],
@@ -221,8 +225,8 @@ def evaluate_chain_from_iteration(iter_df):
             }
             all_pe_qualified.append(row_data)
 
-    logger.info('CE qualified total (all timestamps): %d', len(all_ce_qualified))
-    logger.info('PE qualified total (all timestamps): %d', len(all_pe_qualified))
+    logger.info('CE Buy qualified total (all timestamps): %d', len(all_ce_qualified))
+    logger.info('PE Buy qualified total (all timestamps): %d', len(all_pe_qualified))
     return all_ce_qualified, all_pe_qualified
 
 def evaluate_chain_from_candidates(long_df, short_df):
@@ -242,33 +246,54 @@ def evaluate_chain_from_candidates(long_df, short_df):
         return None
 
     u  = _col(['underlying', 'symbol', 'stock'])
-    t  = _col(['option type', 'option_type', 'otype', 'type'])
     cs = _col(['chain signal', 'chain_signal', 'signal', 'window_signal'])
-    es = _col(['exit signal', 'exit_signal', 'exit'])
 
-    if any(v is None for v in (u, t, cs, es)):
+    if any(v is None for v in (u, cs)):
         logger.warning('Candidates CSV missing columns. Available: %s', list(combined.columns))
         return ce_all, pe_all
 
-    mask = (
+    # Bullish entries (CE Buy)
+    bull_mask = (
         combined[cs].astype(str).str.contains('ENTER', case=False, na=False) &
-        combined[es].astype(str).str.contains('OK HOLD', case=False, na=False)
+        combined[cs].astype(str).str.contains('BUY', case=False, na=False)
     )
-    filt = combined[mask].copy()
-    if filt.empty:
-        return ce_all, pe_all
+    bull_df = combined[bull_mask].copy()
+    for _, row in bull_df.iterrows():
+        row_data = {
+            "Underlying": row[u],
+            "Option Type": "CE",
+            "Direction": "Bullish",
+            "Strike": row.get('strike', ''),
+            "Close": row.get('close', ''),
+            "Last Signal": row[cs],
+            "Timestamp": str(row.get('timestamp', '')),
+            "iteration": row.get('iteration', ''),
+            "Window Score": row.get('window_score', 0),
+        }
+        ce_all.append(row_data)
 
-    for _, row in filt.iterrows():
-        underlying = row[u]
-        opt_type = str(row[t]).upper()
-        row_data = row.to_dict()
-        row_data["Qualify Count"] = 1
-        if opt_type == "CE":
-            ce_all.append(row_data)
-        elif opt_type == "PE":
-            pe_all.append(row_data)
+    # Bearish entries (PE Buy)
+    bear_mask = (
+        combined[cs].astype(str).str.contains('ENTER', case=False, na=False) &
+        combined[cs].astype(str).str.contains('SELL', case=False, na=False)
+    )
+    bear_df = combined[bear_mask].copy()
+    for _, row in bear_df.iterrows():
+        row_data = {
+            "Underlying": row[u],
+            "Option Type": "PE",
+            "Direction": "Bearish",
+            "Strike": row.get('strike', ''),
+            "Close": row.get('close', ''),
+            "Last Signal": row[cs],
+            "Timestamp": str(row.get('timestamp', '')),
+            "iteration": row.get('iteration', ''),
+            "Window Score": -row.get('window_score', 0),
+        }
+        pe_all.append(row_data)
 
-    logger.info('Fallback candidate filter: CE=%d | PE=%d', len(ce_all), len(pe_all))
+    logger.info('Fallback CE Buy entries: %d', len(ce_all))
+    logger.info('Fallback PE Buy entries: %d', len(pe_all))
     return ce_all, pe_all
 
 def _build_table(rows, title):
@@ -336,6 +361,7 @@ def main():
         r["Qualify Count"] = ce_count[r["Underlying"]]
     for r in pe_all:
         r["Qualify Count"] = pe_count[r["Underlying"]]
+    
     state['ce_all'] = ce_all
     state['pe_all'] = pe_all
     _save_state(state)
@@ -345,19 +371,26 @@ def main():
     pe_today = keep_sorted_per_stock(pe_all)
 
     if not ce_today and not pe_today:
-        logger.info('No CE/PE BUY signals today. No email sent.')
+        logger.info('No CE/PE Buy signals today. No email sent.')
         return
 
     html_body = '<html><body>'
-    html_body += '<h2>CE / PE Momentum Buy Report &mdash; ' + datetime.now().strftime('%d %b %Y %H:%M') + '</h2>'
+    html_body += '<h2>CE / PE Buy Momentum Report &mdash; ' + datetime.now().strftime('%d %b %Y %H:%M') + '</h2>'
     html_body += '<p><b>Chain rule:</b> ' + str(CONSEC_START) + ' consecutive + ' + str(CONFIRM_OF) + ' of ' + str(CONFIRM_WINDOW) + ' signals in same direction. Mixed chains rejected.</p>'
-    html_body += '<p><b>Scope:</b> All CE/PE that ever passed 5‑start / 8‑of‑11 chain from morning till now, only 1 row per stock, sorted by how many times it qualified + most recent qualification.</p>'
-    html_body += _build_table(ce_today, 'CE BUY (sorted by qualify count + time)')
-    html_body += '<br/>'
-    html_body += _build_table(pe_today, 'PE BUY (sorted by qualify count + time)')
+    html_body += '<p><b>Logic:</b> Bullish chains → CE Buy (calls), Bearish chains → PE Buy (puts).</p>'
+    
+    if ce_today:
+        html_body += '<p><b>CE Buy Signals</b> (bullish momentum):</p>'
+        html_body += _build_table(ce_today, 'CE Buy (bullish chains)')
+        html_body += '<br/>'
+    
+    if pe_today:
+        html_body += '<p><b>PE Buy Signals</b> (bearish momentum):</p>'
+        html_body += _build_table(pe_today, 'PE Buy (bearish chains)')
+    
     html_body += '</body></html>'
 
-    subject = 'CE / PE Momentum Buy Report - ' + datetime.now().strftime('%d %b %H:%M')
+    subject = 'CE / PE Buy Momentum Report - ' + datetime.now().strftime('%d %b %H:%M')
     send_email(subject, html_body)
 
 if __name__ == '__main__':
