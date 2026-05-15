@@ -1,6 +1,7 @@
+
 #!/usr/bin/env python3
-# CEPEBUY.py — CE/PE Buy Momentum (Bullish=CE Buy, Bearish=PE Buy)
-# Only 1 row per stock in email, sorted by qualify count + time
+# CEPEBUY.py — CE / PE Buy Momentum: 5‑start timestamp, CE = Bullish, PE = Bearish
+# Only 1 row per stock in email, sorted by qualify count + latest qualifying time
 
 import os
 import sys
@@ -118,21 +119,28 @@ def _direction(signal_str):
         return -1
     return 0
 
-def check_chain(signals):
-    if not signals:
-        return 0
+def check_chain(signals, timestamps):
+    if not signals or not timestamps:
+        return 0, None
     dirs = [_direction(s) for s in signals]
     non_zero = [d for d in dirs if d != 0]
     if len(non_zero) < max(CONSEC_START, CONFIRM_WINDOW):
-        return 0
+        return 0, None
+
     recent = non_zero[-CONSEC_START:]
     if len(set(recent)) == 1 and recent[0] != 0:
         direction = recent[0]
         last_n = non_zero[-CONFIRM_WINDOW:]
         count_same = sum(1 for d in last_n if d == direction)
         if count_same >= CONFIRM_OF:
-            return direction
-    return 0
+            # 5‑consecutive start time (5‑start)
+            start_idx = -CONSEC_START
+            if 0 <= start_idx < len(timestamps):
+                five_start = str(timestamps.iloc[start_idx])
+            else:
+                five_start = str(timestamps.iloc[0])
+            return direction, five_start
+    return 0, None
 
 def keep_sorted_per_stock(rows):
     if not rows:
@@ -143,15 +151,13 @@ def keep_sorted_per_stock(rows):
 
     result = []
     for stock, rows in per_stock.items():
-        # Latest bar for this stock
+        # Latest qualifying bar for this stock (for freshness, not for timestamp in table)
         latest = max(rows, key=lambda x: x["Timestamp"])
         # Number of times this stock qualified today
         latest["Qualify Count"] = len(rows)
         result.append(latest)
 
-    # Sort by:
-    # 1. Qualify Count (desc)  → how many times it qualified
-    # 2. Timestamp (desc)      → which is most active now
+    # Sort by: 1) count, 2) latest 5‑start time (most active first)
     result.sort(key=lambda x: (x["Qualify Count"], x["Timestamp"]), reverse=True)
     return result
 
@@ -192,10 +198,15 @@ def evaluate_chain_from_iteration(iter_df):
 
     for (underlying, opt_type), grp in iter_df.groupby([c_underlying, c_opt_type]):
         signals = grp[c_signal].tolist()
-        result = check_chain(signals)
+        if c_timestamp:
+            timestamps = grp[c_timestamp]
+        else:
+            timestamps = pd.Series([None] * len(signals))
+
+        result, five_start_time = check_chain(signals, timestamps)
         latest = grp.iloc[-1]
 
-        # Bullish chain → CE Buy
+        # Bullish 5‑chain → CE Buy
         if result == 1:
             row_data = {
                 "Underlying": underlying,
@@ -204,13 +215,13 @@ def evaluate_chain_from_iteration(iter_df):
                 "Strike": latest[c_strike] if c_strike else "",
                 "Close": latest[c_close] if c_close else "",
                 "Last Signal": latest[c_signal],
-                "Timestamp": str(latest[c_timestamp]) if c_timestamp else "",
+                "Timestamp": five_start_time,
                 "iteration": latest.get("iteration", ""),
                 "Window Score": latest[c_window_score] if c_window_score else 0,
             }
             all_ce_qualified.append(row_data)
 
-        # Bearish chain → PE Buy
+        # Bearish 5‑chain → PE Buy
         elif result == -1:
             row_data = {
                 "Underlying": underlying,
@@ -219,7 +230,7 @@ def evaluate_chain_from_iteration(iter_df):
                 "Strike": latest[c_strike] if c_strike else "",
                 "Close": latest[c_close] if c_close else "",
                 "Last Signal": latest[c_signal],
-                "Timestamp": str(latest[c_timestamp]) if c_timestamp else "",
+                "Timestamp": five_start_time,
                 "iteration": latest.get("iteration", ""),
                 "Window Score": -latest[c_window_score] if c_window_score else 0,
             }
@@ -247,12 +258,13 @@ def evaluate_chain_from_candidates(long_df, short_df):
 
     u  = _col(['underlying', 'symbol', 'stock'])
     cs = _col(['chain signal', 'chain_signal', 'signal', 'window_signal'])
+    ts = _col(['timestamp', 'time', 'datetime'])
 
     if any(v is None for v in (u, cs)):
         logger.warning('Candidates CSV missing columns. Available: %s', list(combined.columns))
         return ce_all, pe_all
 
-    # Bullish entries (CE Buy)
+    # Bullish entries → CE Buy
     bull_mask = (
         combined[cs].astype(str).str.contains('ENTER', case=False, na=False) &
         combined[cs].astype(str).str.contains('BUY', case=False, na=False)
@@ -266,13 +278,13 @@ def evaluate_chain_from_candidates(long_df, short_df):
             "Strike": row.get('strike', ''),
             "Close": row.get('close', ''),
             "Last Signal": row[cs],
-            "Timestamp": str(row.get('timestamp', '')),
+            "Timestamp": str(row.get(ts, '')),
             "iteration": row.get('iteration', ''),
             "Window Score": row.get('window_score', 0),
         }
         ce_all.append(row_data)
 
-    # Bearish entries (PE Buy)
+    # Bearish entries → PE Buy
     bear_mask = (
         combined[cs].astype(str).str.contains('ENTER', case=False, na=False) &
         combined[cs].astype(str).str.contains('SELL', case=False, na=False)
@@ -286,7 +298,7 @@ def evaluate_chain_from_candidates(long_df, short_df):
             "Strike": row.get('strike', ''),
             "Close": row.get('close', ''),
             "Last Signal": row[cs],
-            "Timestamp": str(row.get('timestamp', '')),
+            "Timestamp": str(row.get(ts, '')),
             "iteration": row.get('iteration', ''),
             "Window Score": -row.get('window_score', 0),
         }
@@ -366,7 +378,7 @@ def main():
     state['pe_all'] = pe_all
     _save_state(state)
 
-    # Only 1 row per stock, sorted by count + latest time
+    # Only 1 row per stock, sorted by count + 5‑start timestamp
     ce_today = keep_sorted_per_stock(ce_all)
     pe_today = keep_sorted_per_stock(pe_all)
 
@@ -377,16 +389,15 @@ def main():
     html_body = '<html><body>'
     html_body += '<h2>CE / PE Buy Momentum Report &mdash; ' + datetime.now().strftime('%d %b %Y %H:%M') + '</h2>'
     html_body += '<p><b>Chain rule:</b> ' + str(CONSEC_START) + ' consecutive + ' + str(CONFIRM_OF) + ' of ' + str(CONFIRM_WINDOW) + ' signals in same direction. Mixed chains rejected.</p>'
-    html_body += '<p><b>Logic:</b> Bullish chains → CE Buy (calls), Bearish chains → PE Buy (puts).</p>'
+    html_body += '<p><b>Logic:</b> Bullish 5‑start chains → CE Buy (bullish momentum), Bearish 5‑start chains → PE Buy (bearish momentum).</p>'
+    html_body += '<p><b>Timestamp:</b> Time when the 5‑consecutive 5‑start chain was first completed, not the current run time.</p>'
     
     if ce_today:
-        html_body += '<p><b>CE Buy Signals</b> (bullish momentum):</p>'
-        html_body += _build_table(ce_today, 'CE Buy (bullish chains)')
+        html_body += _build_table(ce_today, 'CE Buy (bullish 5‑start)')
         html_body += '<br/>'
     
     if pe_today:
-        html_body += '<p><b>PE Buy Signals</b> (bearish momentum):</p>'
-        html_body += _build_table(pe_today, 'PE Buy (bearish chains)')
+        html_body += _build_table(pe_today, 'PE Buy (bearish 5‑start)')
     
     html_body += '</body></html>'
 
