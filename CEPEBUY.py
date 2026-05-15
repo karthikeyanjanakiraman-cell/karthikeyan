@@ -27,16 +27,16 @@ SMTP_HOST       = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
 SMTP_PORT       = int(os.environ.get('SMTP_PORT', '587'))
 
 ENTRY_CONSEC   = int(os.environ.get('ENTRY_CONSEC', '3'))
-ENTRY_CONFIRM  = int(os.environ.get('ENTRY_CONFIRM', '6'))
-ENTRY_WINDOW   = int(os.environ.get('ENTRY_WINDOW', '6'))
+ENTRY_CONFIRM  = int(os.environ.get('ENTRY_CONFIRM', '3'))
+ENTRY_WINDOW   = int(os.environ.get('ENTRY_WINDOW', '3'))
 
-EXIT_15_CONSEC  = int(os.environ.get('EXIT_15_CONSEC', '5'))
-EXIT_15_CONFIRM = int(os.environ.get('EXIT_15_CONFIRM', '5'))
-EXIT_15_WINDOW  = int(os.environ.get('EXIT_15_WINDOW', '5'))
+EXIT_15_CONSEC  = int(os.environ.get('EXIT_15_CONSEC', '2'))
+EXIT_15_CONFIRM = int(os.environ.get('EXIT_15_CONFIRM', '2'))
+EXIT_15_WINDOW  = int(os.environ.get('EXIT_15_WINDOW', '2'))
 
-EXIT_39_CONSEC  = int(os.environ.get('EXIT_39_CONSEC', '5'))
-EXIT_39_CONFIRM = int(os.environ.get('EXIT_39_CONFIRM', '5'))
-EXIT_39_WINDOW  = int(os.environ.get('EXIT_39_WINDOW', '5'))
+EXIT_39_CONSEC  = int(os.environ.get('EXIT_39_CONSEC', '2'))
+EXIT_39_CONFIRM = int(os.environ.get('EXIT_39_CONFIRM', '2'))
+EXIT_39_WINDOW  = int(os.environ.get('EXIT_39_WINDOW', '2'))
 
 def _find_latest(pattern):
     matches = []
@@ -129,6 +129,27 @@ def eval_exit_chain(window_df, close_col, ts_col, exit_consec, exit_confirm, exi
         after_time=entry_time,
     )
 
+
+def is_continuation_before_entry(window_df, close_col, ts_col, strikes_col, entry_time, consec=3, confirm=3, lookback=6):
+    if window_df.empty or len(window_df) < 2:
+        return False
+    w=window_df.copy()
+    w[ts_col]=pd.to_datetime(w[ts_col], errors='coerce')
+    w=w[w[ts_col] < pd.to_datetime(entry_time, errors='coerce')]
+    if w.empty:
+        return False
+    pivot=w.pivot_table(index=ts_col, columns=strikes_col, values=close_col, aggfunc='last').sort_index()
+    if pivot.empty or len(pivot) < 2:
+        return False
+    mean_series=pivot.mean(axis=1).dropna()
+    if len(mean_series) < 2:
+        return False
+    diffs=mean_series.diff().dropna()
+    if len(diffs) < 1:
+        return False
+    recent=diffs.tail(lookback)
+    pos=(recent>0).sum()
+    return pos >= confirm and recent.iloc[-1] > 0
 def evaluate(iter_df):
     rows = []
     if iter_df.empty:
