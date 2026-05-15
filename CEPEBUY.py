@@ -1,160 +1,230 @@
+
 #!/usr/bin/env python3
-# cepebuy.py  â€”  Full rewrite with CSV-based Exit15 / Exit39
-# Run at 09:35, 10:00, 10:15, etc.  Auto-fills exits from history CSV.
-# No threads. No timers. No API calls at minute 15 or 39.
+# CEPEBUY.py - Price-based direction + Entry Price column
+# Direction from close[i] vs close[i-1]
+# New column: EntryPrice = close at the moment the entry chain started
+#
+# FIX: Exit15/Exit39 evaluated ONLY on windowed post-entry slices.
+# On rerun at 10:00, history CSV has full 09:35-09:50 data.
+# Pre-entry bars are sliced away before chain detection.
+
+import os
+import sys
+import logging
+import warnings
+from datetime import datetime, timedelta
+from pathlib import Path
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+import smtplib
 
 import pandas as pd
-import glob
-import os
-import json
-import threading
-from datetime import datetime, timedelta
-from typing import Dict, Tuple, Optional, List
+from collections import defaultdict
 
-HISTORY_DIR = "."
-SIGNALS_JSON = "active_signals.json"
-OUTPUT_CSV = "cepebuy_signals.csv"
-HISTORY_TIME_COL = "datetime"
-HISTORY_STOCK_COL = "Stock"
-HISTORY_TYPE_COL = "Type"
-HISTORY_STRIKE_COL = "Strike"
-HISTORY_LTP_COL = "LTP"
-_lock = threading.Lock()
-SignalKey = Tuple[str, float, str]
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
+logger = logging.getLogger(__name__)
 
-def load_signals(path: str = SIGNALS_JSON) -> Dict[SignalKey, dict]:
-    if not os.path.exists(path):
-        return {}
-    with open(path, "r", encoding="utf-8") as f:
-        raw = json.load(f)
-    out = {}
-    for k, v in raw.items():
-        parts = k.split("|")
-        out[(parts[0], float(parts[1]), parts[2])] = v
+SENDER_EMAIL    = os.environ.get('SENDER_EMAIL')
+SENDER_PASSWORD = os.environ.get('SENDER_PASSWORD')
+RECIPIENT_EMAIL = os.environ.get('RECIPIENT_EMAIL')
+SMTP_HOST       = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
+SMTP_PORT       = int(os.environ.get('SMTP_PORT', '587'))
+
+ENTRY_CONSEC   = int(os.environ.get('ENTRY_CONSEC', '3'))
+ENTRY_CONFIRM  = int(os.environ.get('ENTRY_CONFIRM', '6'))
+ENTRY_WINDOW   = int(os.environ.get('ENTRY_WINDOW', '6'))
+
+EXIT_15_CONSEC  = int(os.environ.get('EXIT_15_CONSEC', '5'))
+EXIT_15_CONFIRM = int(os.environ.get('EXIT_15_CONFIRM', '5'))
+EXIT_15_WINDOW  = int(os.environ.get('EXIT_15_WINDOW', '5'))
+
+EXIT_39_CONSEC  = int(os.environ.get('EXIT_39_CONSEC', '5'))
+EXIT_39_CONFIRM = int(os.environ.get('EXIT_39_CONFIRM', '5'))
+EXIT_39_WINDOW  = int(os.environ.get('EXIT_39_WINDOW', '5'))
+
+def _find_latest(pattern):
+    matches = []; seen = set()
+    for root in [Path.cwd(), Path.cwd()/'output', Path(__file__).parent, Path(__file__).parent/'output']:
+        if not root.exists(): continue
+        for match in root.rglob(pattern):
+            ap = str(match.resolve())
+            if ap not in seen:
+                seen.add(ap)
+                try: matches.append((os.path.getmtime(ap), ap))
+                except OSError: pass
+    if not matches: return None
+    matches.sort(reverse=True, key=lambda x: x[0])
+    return matches[0][1]
+
+def _load_any(patterns):
+    for pat in patterns:
+        path = _find_latest(pat)
+        if path:
+            try:
+                df = pd.read_csv(path)
+                logger.info('Loaded %s: %d rows', os.path.basename(path), len(df))
+                return df
+            except Exception: pass
+    return pd.DataFrame()
+
+def _direction_from_price(prev_close, curr_close):
+    if pd.isna(prev_close) or pd.isna(curr_close): return 0
+    if curr_close > prev_close: return 1
+    if curr_close < prev_close: return -1
+    return 0
+
+def check_chain(closes, timestamps, consec, confirm, window, target_dir=None, after_time=None):
+    """Find FIRST qualifying chain. Returns (timestamp_str, entry_price) or (None, None)."""
+    if not closes or len(timestamps) == 0 or len(closes) < 2:
+        return None, None
+
+    dirs = []
+    for i in range(len(closes)):
+        prev = closes[i-1] if i > 0 else closes[i]
+        curr = closes[i]
+        dirs.append(_direction_from_price(prev, curr))
+
+    nzi = [i for i, d in enumerate(dirs) if d != 0]
+    nzd = [dirs[i] for i in nzi]
+    nzt = [timestamps.iloc[i] for i in nzi]
+    nzp = [closes[i] for i in nzi]
+
+    if len(nzd) < max(consec, window):
+        return None, None
+
+    after_ts = pd.to_datetime(after_time, errors='coerce') if after_time else pd.NaT
+
+    for i in range(len(nzd) - consec + 1):
+        block = nzd[i:i+consec]
+        if len(set(block)) == 1 and block[0] != 0:
+            direction = block[0]
+            if target_dir is not None and direction != target_dir:
+                continue
+            window_start = max(0, i - (window - consec))
+            window_block = nzd[window_start:i+consec]
+            if sum(1 for d in window_block if d == direction) >= confirm:
+                ts = nzt[i]
+                price = nzp[i]
+                if pd.isna(ts):
+                    continue
+                if not pd.isna(after_ts) and pd.to_datetime(ts) <= after_ts:
+                    continue
+                return str(ts), price
+    return None, None
+
+def evaluate(iter_df):
+    rows = []
+    if iter_df.empty: return rows
+    cols = {c.lower().strip(): c for c in iter_df.columns}
+    def _col(cands):
+        for c in cands:
+            if c.lower() in cols: return cols[c.lower()]
+        return None
+    c_underlying = _col(['underlying', 'symbol', 'stock'])
+    c_opt_type   = _col(['option type', 'option_type', 'otype', 'type'])
+    c_timestamp  = _col(['timestamp', 'time', 'datetime', 'ts'])
+    c_close      = _col(['close', 'ltp', 'last'])
+    c_strike     = _col(['strike', 'strike_price'])
+    c_score      = _col(['current_window_score', 'window_score', 'score'])
+    if any(v is None for v in (c_underlying, c_close, c_timestamp)):
+        logger.warning('Missing required columns: underlying, close, timestamp')
+        return rows
+
+    if c_timestamp:
+        try:
+            iter_df = iter_df.copy()
+            with warnings.catch_warnings(): warnings.simplefilter('ignore')
+            iter_df[c_timestamp] = pd.to_datetime(iter_df[c_timestamp], errors='coerce')
+            iter_df = iter_df.sort_values(c_timestamp)
+        except Exception: pass
+
+    for (underlying, opt_type), grp in iter_df.groupby([c_underlying, c_opt_type]):
+        closes = grp[c_close].tolist()
+        timestamps = grp[c_timestamp]
+        latest = grp.iloc[-1]
+
+        entry_dir = 1 if str(opt_type).strip().upper() == 'CE' else -1
+        exit_dir  = -1 if entry_dir == 1 else 1
+
+        entry_time, entry_price = check_chain(closes, timestamps, ENTRY_CONSEC, ENTRY_CONFIRM, ENTRY_WINDOW, target_dir=entry_dir)
+
+        if entry_time:
+            entry_dt = pd.to_datetime(entry_time)
+
+            # --- FIX: windowed post-entry slices so pre-entry bars cannot pollute ---
+            post = grp[grp[c_timestamp] > entry_dt]
+
+            # Exit15: chain evaluated only on bars within first 15 minutes after entry
+            win15 = post[post[c_timestamp] <= entry_dt + timedelta(minutes=15)]
+            if not win15.empty and len(win15) >= 2:
+                exit15_time, _ = check_chain(
+                    win15[c_close].tolist(), win15[c_timestamp],
+                    EXIT_15_CONSEC, EXIT_15_CONFIRM, EXIT_15_WINDOW,
+                    target_dir=exit_dir, after_time=entry_time
+                )
+            else:
+                exit15_time = None
+
+            # Exit39: chain evaluated only on bars within first 39 minutes after entry
+            win39 = post[post[c_timestamp] <= entry_dt + timedelta(minutes=39)]
+            if not win39.empty and len(win39) >= 2:
+                exit39_time, _ = check_chain(
+                    win39[c_close].tolist(), win39[c_timestamp],
+                    EXIT_39_CONSEC, EXIT_39_CONFIRM, EXIT_39_WINDOW,
+                    target_dir=exit_dir, after_time=entry_time
+                )
+            else:
+                exit39_time = None
+
+            rows.append({
+                'Stock': underlying,
+                'Type': opt_type,
+                'Signal': 'BUY CE' if entry_dir == 1 else 'BUY PE',
+                'Strike': latest[c_strike] if c_strike else '',
+                'EntryPrice': round(entry_price, 2) if entry_price else '',
+                'LTP': latest[c_close] if c_close else '',
+                'Entry': entry_time,
+                'Exit15': exit15_time or '-',
+                'Exit39': exit39_time or '-',
+                'Score': latest[c_score] if c_score else 0,
+            })
+    return rows
+
+def build_html(rows):
+    if not rows: return '<p>No signals today.</p>'
+    df = pd.DataFrame(rows)
+    out = '<table border="1" cellspacing="0" cellpadding="4" style="border-collapse:collapse;font-family:monospace;font-size:13px;">'
+    out += '<tr style="background:#2c3e50;color:white;">' + ''.join('<th>'+c+'</th>' for c in df.columns) + '</tr>'
+    for _, r in df.iterrows():
+        out += '<tr>' + ''.join('<td>'+str(r[c])+'</td>' for c in df.columns) + '</tr>'
+    out += '</table>'
     return out
 
-def save_signals(signals: Dict[SignalKey, dict], path: str = SIGNALS_JSON) -> None:
-    out = {}
-    for k, v in signals.items():
-        out[f"{k[0]}|{k[1]}|{k[2]}"] = v
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(out, f, indent=2, default=str)
-
-def get_today_history_path(directory: str = HISTORY_DIR) -> str:
-    today = datetime.now().strftime("%Y%m%d")
-    pattern = os.path.join(directory, f"fo_iteration_history_{today}_*.csv")
-    files = glob.glob(pattern)
-    if not files:
-        raise FileNotFoundError(f"No history CSV found for pattern: {pattern}")
-    return max(files, key=os.path.getmtime)
-
-def read_history(csv_path: str) -> pd.DataFrame:
-    df = pd.read_csv(csv_path, parse_dates=[HISTORY_TIME_COL])
-    df[HISTORY_STRIKE_COL] = df[HISTORY_STRIKE_COL].astype(float)
-    df[HISTORY_STOCK_COL] = df[HISTORY_STOCK_COL].str.upper().str.strip()
-    df[HISTORY_TYPE_COL] = df[HISTORY_TYPE_COL].str.upper().str.strip()
-    return df
-
-def get_exit_from_csv(df, entry_time_str, stock, opt_type, strike, exit_minutes):
-    entry_dt = pd.to_datetime(entry_time_str)
-    target = entry_dt + timedelta(minutes=exit_minutes)
-    mask = (
-        (df[HISTORY_TIME_COL] >= target) &
-        (df[HISTORY_STOCK_COL] == stock.upper().strip()) &
-        (df[HISTORY_TYPE_COL] == opt_type.upper().strip()) &
-        (df[HISTORY_STRIKE_COL] == float(strike))
-    )
-    hit = df.loc[mask].head(1)
-    if not hit.empty:
-        return float(hit[HISTORY_LTP_COL].iloc[0])
-    return None
-
-def fill_pending_exits(signals, df, lock):
-    filled = 0
-    with lock:
-        for key, row in signals.items():
-            stock, strike, opt_type = key
-            entry = row.get("Entry")
-            if not entry:
-                continue
-            val15 = row.get("Exit15")
-            if val15 in (None, "", "-", "PENDING", 0.0, "0.0"):
-                ltp15 = get_exit_from_csv(df, entry, stock, opt_type, strike, 15)
-                if ltp15 is not None:
-                    row["Exit15"] = ltp15
-                    filled += 1
-                else:
-                    row["Exit15"] = "PENDING"
-            val39 = row.get("Exit39")
-            if val39 in (None, "", "-", "PENDING", 0.0, "0.0"):
-                ltp39 = get_exit_from_csv(df, entry, stock, opt_type, strike, 39)
-                if ltp39 is not None:
-                    row["Exit39"] = ltp39
-                    filled += 1
-                else:
-                    row["Exit39"] = "PENDING"
-            if isinstance(row.get("Exit15"), (int, float)):
-                row["LTP"] = row["Exit15"]
-    print(f"[EXIT FILL] Filled {filled} exit values")
-    return filled
-
-def scanner_get_new_signals():
-    # TODO: paste your real scanner logic here
-    # Return list of dicts with keys: Stock, Type, Signal, Strike, EntryPrice, LTP, Entry, Score
-    return []
+def send_email(subject, html_body):
+    if not all((SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL)):
+        logger.warning('Email credentials missing'); return False
+    recipients = [a.strip() for a in RECIPIENT_EMAIL.replace(';', ',').split(',') if a.strip()]
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = subject; msg['From'] = SENDER_EMAIL; msg['To'] = ','.join(recipients)
+    msg.attach(MIMEText(html_body, 'html', 'utf-8'))
+    try:
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+            s.starttls(); s.login(SENDER_EMAIL, SENDER_PASSWORD); s.sendmail(SENDER_EMAIL, recipients, msg.as_string())
+        logger.info('Email sent: %s', subject); return True
+    except Exception as exc: logger.exception('SMTP failed: %s', exc); return False
 
 def main():
-    signals = load_signals(SIGNALS_JSON)
-    print(f"[STATE] Loaded {len(signals)} signals")
-    history_path = get_today_history_path(HISTORY_DIR)
-    print(f"[HISTORY] {history_path}")
-    df_hist = read_history(history_path)
-    fill_pending_exits(signals, df_hist, _lock)
-    new_raw = scanner_get_new_signals()
-    added = 0
-    for raw in new_raw:
-        stock = str(raw["Stock"]).upper().strip()
-        opt_type = str(raw["Type"]).upper().strip()
-        strike = float(raw["Strike"])
-        key = (stock, strike, opt_type)
-        row = {
-            "Stock": stock,
-            "Type": opt_type,
-            "Signal": raw.get("Signal"),
-            "Strike": strike,
-            "EntryPrice": float(raw.get("EntryPrice", 0)),
-            "LTP": float(raw.get("LTP", 0)),
-            "Entry": raw.get("Entry"),
-            "Score": float(raw.get("Score", 0)),
-            "Exit15": "PENDING",
-            "Exit39": "PENDING",
-        }
-        with _lock:
-            signals[key] = row
-        added += 1
-        print(f"[NEW] {key} Entry={row[chr(39)+chr(39)]Entry{chr(39)+chr(39)]} Score={row[chr(39)+chr(39)]Score{chr(39)+chr(39)]}")
-    print(f"[SCAN] Added {added}; total={len(signals)}")
-    save_signals(signals, SIGNALS_JSON)
-    rows = []
-    with _lock:
-        for key, row in signals.items():
-            rows.append(row)
-    if rows:
-        df_out = pd.DataFrame(rows)
-        cols = ["Stock","Type","Signal","Strike","EntryPrice","LTP","Entry","Exit15","Exit39","Score"]
-        cols = [c for c in cols if c in df_out.columns]
-        df_out = df_out[cols]
-        df_out.to_csv(OUTPUT_CSV, index=False)
-        print(f"[OUT] {OUTPUT_CSV} ({len(df_out)} rows)")
-    print("\n" + "="*70)
-    print(f"{'Stock':<12} {'Type':<4} {'Strike':<8} {'Entry':<20} {'Exit15':<10} {'Score':<6}")
-    print("-"*70)
-    with _lock:
-        for key, row in signals.items():
-            print(f"{row[chr(39)+chr(39)]Stock{chr(39)+chr(39)]:<12} {row[chr(39)+chr(39)]Type{chr(39)+chr(39)]:<4} "
-                  f"{row[chr(39)+chr(39)]Strike{chr(39)+chr(39)]:<8} {str(row.get(chr(39)+chr(39)]Entry{chr(39)+chr(39),chr(39)+chr(39)):<20} "
-                  f"{str(row.get(chr(39)+chr(39)]Exit15{chr(39)+chr(39),chr(39)+chr(39)):<10} {row.get(chr(39)+chr(39)]Score{chr(39)+chr(39),chr(39)+chr(39)):<6}")
-    print("="*70)
+    logger.info('=== CEPEBUY (price-based + EntryPrice + windowed exits) starting ===')
+    iter_df = _load_any(['fo_iteration_history_*.csv', 'iteration_history_*.csv', 'fo_iteration_history.csv', 'iteration_history.csv'])
+    if iter_df.empty: logger.error('No iteration CSV found'); sys.exit(1)
+    rows = evaluate(iter_df)
+    if not rows: logger.info('No entry signals today'); return
+    html_body = '<html><body style="font-family:sans-serif;">'
+    html_body += '<h2>CE/PE Signals - ' + datetime.now().strftime('%d %b %H:%M') + '</h2>'
+    html_body += '<p style="color:#666;font-size:12px;">Direction = close[i] vs close[i-1]. Entry: %s consec + %s/%s | 15m Exit: %s consec + %s/%s opposite (post-entry window) | 39m Exit: %s consec + %s/%s opposite (post-entry window)</p>' % (ENTRY_CONSEC, ENTRY_CONFIRM, ENTRY_WINDOW, EXIT_15_CONSEC, EXIT_15_CONFIRM, EXIT_15_WINDOW, EXIT_39_CONSEC, EXIT_39_CONFIRM, EXIT_39_WINDOW)
+    html_body += '<p style="color:#666;font-size:12px;">EntryPrice = close at the moment the entry chain started</p>'
+    html_body += build_html(rows) + '</body></html>'
+    send_email('CE/PE Signals ' + datetime.now().strftime('%d %b %H:%M'), html_body)
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
