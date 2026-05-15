@@ -27,8 +27,8 @@ SMTP_HOST       = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
 SMTP_PORT       = int(os.environ.get('SMTP_PORT', '587'))
 
 ENTRY_CONSEC   = int(os.environ.get('ENTRY_CONSEC', '3'))
-ENTRY_CONFIRM  = int(os.environ.get('ENTRY_CONFIRM', '6'))
-ENTRY_WINDOW   = int(os.environ.get('ENTRY_WINDOW', '6'))
+ENTRY_CONFIRM  = int(os.environ.get('ENTRY_CONFIRM', '3'))
+ENTRY_WINDOW   = int(os.environ.get('ENTRY_WINDOW', '3'))
 
 EXIT_15_CONSEC  = int(os.environ.get('EXIT_15_CONSEC', '5'))
 EXIT_15_CONFIRM = int(os.environ.get('EXIT_15_CONFIRM', '5'))
