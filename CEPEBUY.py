@@ -1,453 +1,359 @@
+
 #!/usr/bin/env python3
+# CEPEBUY.py - CE/PE Buy Momentum with 5-start/8-of-11 chain logic
+# Bullish chain -> CE Buy, Bearish chain -> PE Buy
+# Timestamp shows when 5-consecutive chain started
+# Only 1 row per stock in email, sorted by Qualify Count + Timestamp
+
 import os
+import sys
 import json
-import time
 import smtplib
 import logging
-from datetime import datetime, timedelta, time as dtime
-from typing import Dict, List, Optional, Tuple
-
-import numpy as np
-import pandas as pd
-from email.mime.base import MIMEBase
+from datetime import datetime, date
+from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from email import encoders
 
-try:
-    from fyers_apiv3 import fyersModel
-except Exception:
-    try:
-        import fyersModel
-    except Exception:
-        from fyersapi import fyersModel
+import pandas as pd
+from collections import Counter, defaultdict
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
+logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger(__name__)
 
-# Fyers global
-fyers = None
+SENDER_EMAIL    = os.environ.get('SENDER_EMAIL')
+SENDER_PASSWORD = os.environ.get('SENDER_PASSWORD')
+RECIPIENT_EMAIL = os.environ.get('RECIPIENT_EMAIL')
+SMTP_HOST       = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
+SMTP_PORT       = int(os.environ.get('SMTP_PORT', '587'))
 
-# Col name for timestamps in CSV
-c_timestamp = "timestamp"
+CONSEC_START   = int(os.environ.get('CONSEC_START', '5'))
+CONFIRM_OF     = int(os.environ.get('CONFIRM_OF', '8'))
+CONFIRM_WINDOW = int(os.environ.get('CONFIRM_WINDOW', '11'))
+STATE_FILE     = os.environ.get('CEPE_STATE_FILE', '/tmp/cepebuy_state.json')
 
-# === Chain Signal Constants ===
-# Entry: 5m CONFIRMED + 30m CONFIRMED + T30 >= T30_MIN
-# Exit : 30m BROKEN  OR  T30 < T30_MIN
-T30_MIN = int(os.environ.get("T30_MIN", "2"))
-DAILY_LOOKBACK_DAYS = 252
-INTRADAY_LOOKBACK_DAYS = 20
-IVP_LOOKBACK_DAYS = 252
-OPTION_PAIRS_TO_KEEP = 5
-SIGNAL_WINDOW_MINUTES = 5
-ITERATIONS_TO_KEEP = 75
-SECTORS_DIR = os.environ.get("SECTORS_DIR", "sectors")
-OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
-MIN_OPTION_LTP = 10.0
-MIN_ATM_CHAIN_VOLUME = int(os.environ.get("MIN_ATM_CHAIN_VOLUME", "100000"))
-EMAIL_MAX_ROWS_LONG = int(os.environ.get("EMAIL_MAX_ROWS_LONG", "25"))
-EMAIL_MAX_ROWS_SHORT = int(os.environ.get("EMAIL_MAX_ROWS_SHORT", "25"))
-TOP_N_UNDERLYINGS = int(os.environ.get("TOP_N_UNDERLYINGS", "60"))
-OBV_BREAKOUT_WINDOW = int(os.environ.get("OBV_BREAKOUT_WINDOW", "5"))
-
-OPTION_EMAIL_COLS = [
-    "Underlying", "Option Type", "Option Symbol", "Strike", "LTP", "% Change",
-    "OI", "Volume", "OBV", "OI+Volume+OBV Score", "EMAIL_RANK_SCORE",
-    "Rank Delta", "Cumulative ADX", "5m_Signal", "15m_Signal", "30m_Signal",
-    "60m_Signal", "Bull_Signal", "Bear_Signal", "Overall_Signal",
-    "Price_Lead_Status", "IVP", "Volatility State", "Last Iteration Time",
-]
-
-OPTION_EMAIL_COL_RENAME = {
-    "OI+Volume+OBV Score": "Liq Score",
-    "EMAIL_RANK_SCORE": "Rank",
-    "% Change": "% Chg",
-    "Last Iteration Time": "Time",
-    "Price_Lead_Status": "Lead",
-    "Volatility State": "Vol State",
-    "Option Symbol": "Opt Symbol",
-}
-
-# Safe float helpers
-def safe_float(value, default=np.nan) -> float:
+def _search_roots():
+    roots = set()
+    roots.add(Path.cwd().resolve())
+    roots.add((Path.cwd() / 'output').resolve())
     try:
-        if value is None or value == "":
-            return default
-        return float(value)
+        sd = Path(__file__).parent.resolve()
+        roots.add(sd)
+        roots.add((sd / 'output').resolve())
+        for p in sd.parents[:4]:
+            roots.add(p.resolve())
+            roots.add((p / 'output').resolve())
     except Exception:
-        return default
+        pass
+    for ev in ('GITHUB_WORKSPACE', 'RUNNER_WORKSPACE', 'HOME', 'CI_WORKSPACE'):
+        v = os.environ.get(ev)
+        if v:
+            roots.add(Path(v).resolve())
+            roots.add((Path(v) / 'output').resolve())
+    for fb in ('/github/workspace', '/home/runner/work', '/workspace', '/mnt/data', '/tmp'):
+        if os.path.isdir(fb):
+            roots.add(Path(fb).resolve())
+    return roots
 
-
-def safe_series(frame: pd.DataFrame, col: str, default: float = 0.0) -> pd.Series:
-    if frame is not None and col in frame.columns:
-        return pd.to_numeric(frame[col], errors="coerce").fillna(default)
-    if frame is None:
-        return pd.Series(dtype=float)
-    return pd.Series(default, index=frame.index, dtype=float)
-
-
-def safe_pd_timestamp(df: pd.DataFrame, col: str) -> pd.Series:
-    if col not in df.columns:
-        return pd.Series(dtype="datetime64[ns]")
-    return pd.to_datetime(df[col], errors="coerce").dropna()
-
-
-# === Fyers helpers ===
-def init_fyers():
-    global fyers
-    client_id = os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID")
-    access_token = os.environ.get("ACCESS_TOKEN") or os.environ.get("ACCESSTOKEN")
-    if not client_id or not access_token:
-        logger.error("Missing CLIENT_ID / ACCESS_TOKEN; cannot init Fyers.")
+def _find_latest(pattern):
+    matches = []
+    seen = set()
+    for root in _search_roots():
+        if not root.exists():
+            continue
+        for match in root.rglob(pattern):
+            ap = str(match.resolve())
+            if ap in seen:
+                continue
+            seen.add(ap)
+            try:
+                matches.append((os.path.getmtime(ap), ap))
+            except OSError:
+                pass
+    if not matches:
         return None
-    try:
-        fyers = fyersModel.FyersModel(
-            client_id=client_id, token=access_token, is_async=False, log_path=""
-        )
-    except Exception as e:
-        logger.error(f"Failed to init FyersModel: {e}")
-        fyers = None
-    return fyers
+    matches.sort(reverse=True, key=lambda x: x[0])
+    best = matches[0][1]
+    logger.info('Selected %s (mtime=%s)', best, datetime.fromtimestamp(matches[0][0]).strftime('%Y-%m-%d %H:%M:%S'))
+    return best
 
+def _load_any(patterns):
+    for pat in patterns:
+        path = _find_latest(pat)
+        if not path:
+            continue
+        try:
+            df = pd.read_csv(path)
+            logger.info('Loaded %s: %d rows x %d cols', os.path.basename(path), len(df), len(df.columns))
+            return df
+        except Exception as exc:
+            logger.exception('Failed to read %s: %s', path, exc)
+    return pd.DataFrame()
 
-def get_history(symbol: str, resolution: str, days_back: int) -> pd.DataFrame:
-    if fyers is None:
-        return pd.DataFrame()
-    now = datetime.now()
-    start = now - timedelta(days=days_back)
-    payload = {
-        "symbol": symbol,
-        "resolution": resolution,
-        "date_format": "1",
-        "range_from": start.strftime("%Y-%m-%d"),
-        "range_to": now.strftime("%Y-%m-%d"),
-        "cont_flag": "1",
-    }
+def _load_state():
+    today = str(date.today())
     try:
-        res = fyers.history(data=payload)
+        if os.path.exists(STATE_FILE):
+            with open(STATE_FILE, 'r') as f:
+                state = json.load(f)
+            if state.get('date') == today:
+                logger.info('Loaded daily state: %d CE Buy, %d PE Buy', len(state.get('ce_all', [])), len(state.get('pe_all', [])))
+                return state
     except Exception:
-        return pd.DataFrame()
-    candles = (res or {}).get("candles", [])
-    if not candles:
-        return pd.DataFrame()
-    df = pd.DataFrame(
-        candles, columns=["timestamp", "open", "high", "low", "close", "volume"]
-    )
-    df["timestamp"] = (
-        pd.to_datetime(df["timestamp"], unit="s", utc=True)
-        .dt.tz_convert("Asia/Kolkata")
-        .dt.tz_localize(None)
-    )
-    return df.sort_values("timestamp").reset_index(drop=True)
+        pass
+    return {'date': today, 'ce_all': [], 'pe_all': []}
 
+def _save_state(state):
+    try:
+        with open(STATE_FILE, 'w') as f:
+            json.dump(state, f, indent=2, default=str)
+    except Exception as exc:
+        logger.warning('Could not save state: %s', exc)
 
-# === OBV helper ===
-def compute_obv(df: pd.DataFrame) -> float:
-    if df is None or df.empty or len(df) < 2:
-        return np.nan
-    close = pd.to_numeric(df["close"], errors="coerce")
-    vol = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
-    direction = np.sign(close.diff())
-    obv = (vol * direction).cumsum()
-    return round(safe_float(obv.iloc[-1], np.nan), 2)
+def _direction(signal_str):
+    s = str(signal_str).strip().upper()
+    if s in ('', 'NAN', 'NONE', 'NEUTRAL', 'HOLD'):
+        return 0
+    if s.startswith('BUY') or 'BULL' in s or 'ENTER' in s or 'LONG' in s or 'CONFIRM' in s:
+        return 1
+    if s.startswith('SELL') or 'BEAR' in s or 'EXIT' in s or 'SHORT' in s:
+        return -1
+    return 0
 
-
-def compute_today_obv(df: pd.DataFrame) -> float:
-    if df is None or df.empty or len(df) < 2:
-        return np.nan
-    d = df.copy().sort_values("timestamp")
-    d["timestamp"] = pd.to_datetime(d["timestamp"])
-    today = pd.Timestamp.now(tz=None).date()
-    today_df = d[d["timestamp"].dt.date == today].copy()
-    if not today_df.empty:
-        today_df = today_df[
-            today_df["timestamp"] >= pd.Timestamp.combine(today, dtime(9, 15))
-        ].copy()
-        if len(today_df) >= 2:
-            return compute_obv(today_df)
-    return compute_obv(d)
-
-
-# === CHAIN SIGNAL LOGIC (5-start + 8-of-11) ===
-def read_iteration_history() -> Optional[pd.DataFrame]:
-    """Read fo_iteration_history_*.csv if available."""
-    history_dir = Path(OUTPUT_DIR).expanduser()
-    csv_files = list(history_dir.glob("fo_iteration_history_*.csv"))
-    if not csv_files:
-        logger.info("No fo_iteration_history_*.csv found; falling back to old CSVs.")
-        return None
-
-    latest_csv = max(csv_files, key=os.path.getmtime)
-    logger.info(f"INFO | Using iteration history {latest_csv.name} with window_signal column.")
-
-    df = pd.read_csv(latest_csv, parse_dates=False)
-
-    # Use timestamps col (or standardize)
-    if c_timestamp not in df.columns:
-        for alt in ["timestamp", "time"]:
-            if alt in df.columns:
-                df.rename(columns={alt: c_timestamp}, inplace=True)
-                break
-        else:
-            logger.error(f"Column '{c_timestamp}' not found in iteration history CSV.")
-            return None
-
-    # Parse with explicit format
-    df[c_timestamp] = pd.to_datetime(
-        df[c_timestamp],
-        format="%Y-%m-%d %H:%M:%S",  # adjust if needed
-        errors="coerce",
-    )
-
-    # Drop rows where timestamp is NaT
-    df = df.dropna(subset=[c_timestamp]).reset_index(drop=True)
-
-    # Keep required cols; if any missing, skip
-    keep_cols = [
-        c_timestamp,
-        "underlying",
-        "option_type",
-        "strike",
-        "window_signal",
-    ]
-    missing = [c for c in keep_cols if c not in df.columns]
-    if missing:
-        logger.error(f"Missing required columns in iteration history: {missing}; skipping.")
-        return None
-
-    return df[keep_cols]
-
-
-def check_chain(signals, timestamps) -> Tuple[int, Optional[datetime]]:
-    """signals, timestamps: Series of 1=BUY, -1=SELL, 0=NEUTRAL."""
-    signal_vals = signals.values
-    time_vals = timestamps.values
-
-    if len(signal_vals) == 0 or len(time_vals) == 0:
+def check_chain(signals, timestamps):
+    if not signals or not timestamps:
         return 0, None
-
-    # Remove zeros (neutral)
-    non_zero_signal = []
-    non_zero_time = []
-    for s, t in zip(signal_vals, time_vals):
-        if s != 0:
-            non_zero_signal.append(s)
-            non_zero_time.append(t)
-
-    if len(non_zero_signal) < 5:
+    dirs = [_direction(s) for s in signals]
+    non_zero = [d for d in dirs if d != 0]
+    if len(non_zero) < max(CONSEC_START, CONFIRM_WINDOW):
         return 0, None
-
-    # 1. Check 5 consecutive same direction
-    last_5 = non_zero_signal[-5:]
-    if not all(x == last_5[0] for x in last_5):
-        return 0, None
-
-    # 2. Check 8 of last 11 same direction
-    last_11 = non_zero_signal[-11:]
-    if len(last_11) < 8:
-        return 0, None
-
-    direction = last_11[0]
-    same_count = sum(1 for x in last_11 if x == direction)
-
-    if same_count >= 8:
-        return direction, non_zero_time[-5]  # BUY / SELL and 5th‑start time
+    recent = non_zero[-CONSEC_START:]
+    if len(set(recent)) == 1 and recent[0] != 0:
+        direction = recent[0]
+        last_n = non_zero[-CONFIRM_WINDOW:]
+        count_same = sum(1 for d in last_n if d == direction)
+        if count_same >= CONFIRM_OF:
+            start_idx = len(dirs) - CONSEC_START
+            if start_idx < 0:
+                start_idx = 0
+            if start_idx < len(timestamps):
+                five_start = str(timestamps.iloc[start_idx])
+            else:
+                five_start = str(timestamps.iloc[-1])
+            return direction, five_start
     return 0, None
 
+def keep_sorted_per_stock(rows):
+    if not rows:
+        return []
+    per_stock = defaultdict(list)
+    for r in rows:
+        per_stock[r["Underlying"]].append(r)
+    result = []
+    for stock, rows in per_stock.items():
+        latest = max(rows, key=lambda x: x["Timestamp"])
+        latest["Qualify Count"] = len(rows)
+        result.append(latest)
+    result.sort(key=lambda x: (x["Qualify Count"], x["Timestamp"]), reverse=True)
+    return result
 
-def evaluate_chain_from_iteration(iter_df: pd.DataFrame) -> Tuple[List[str], List[str]]:
-    ce_candidates = []
-    pe_candidates = []
-
-    for (underlying, opt_type), group in iter_df.groupby(["underlying", "option_type"]):
-        signals = group["window_signal"]
-        timestamps = group[c_timestamp]
-
-        result, _ = check_chain(signals, timestamps)
-
-        if result == +1:
-            ce_candidates.append(underlying)
+def evaluate_chain_from_iteration(iter_df):
+    all_ce_qualified = []
+    all_pe_qualified = []
+    if iter_df.empty:
+        return all_ce_qualified, all_pe_qualified
+    cols = {c.lower().strip(): c for c in iter_df.columns}
+    def _col(cands):
+        for c in cands:
+            if c.lower() in cols:
+                return cols[c.lower()]
+        return None
+    c_underlying = _col(['underlying', 'symbol', 'stock'])
+    c_opt_type   = _col(['option type', 'option_type', 'otype', 'type'])
+    c_signal     = _col(['window_signal', 'window signal', 'signal', 'chain_signal', 'chain signal'])
+    c_timestamp  = _col(['timestamp', 'time', 'datetime', 'ts'])
+    c_close      = _col(['close', 'ltp', 'last'])
+    c_strike     = _col(['strike', 'strike_price'])
+    c_window_score = _col(['current_window_score', 'window_score', 'score'])
+    if any(v is None for v in (c_underlying, c_signal)):
+        logger.warning('Iteration CSV missing required columns. Available: %s', list(iter_df.columns))
+        return all_ce_qualified, all_pe_qualified
+    if c_timestamp:
+        try:
+            iter_df = iter_df.copy()
+            iter_df[c_timestamp] = pd.to_datetime(iter_df[c_timestamp], errors='coerce')
+            iter_df = iter_df.sort_values(c_timestamp)
+        except Exception:
+            pass
+    for (underlying, opt_type), grp in iter_df.groupby([c_underlying, c_opt_type]):
+        signals = grp[c_signal].tolist()
+        if c_timestamp:
+            timestamps = grp[c_timestamp]
+        else:
+            timestamps = pd.Series([None] * len(signals))
+        result, five_start_time = check_chain(signals, timestamps)
+        latest = grp.iloc[-1]
+        if result == 1:
+            row_data = {
+                "Underlying": underlying,
+                "Option Type": "CE",
+                "Direction": "Bullish",
+                "Strike": latest[c_strike] if c_strike else "",
+                "Close": latest[c_close] if c_close else "",
+                "Last Signal": latest[c_signal],
+                "Timestamp": five_start_time,
+                "iteration": latest.get("iteration", ""),
+                "Window Score": latest[c_window_score] if c_window_score else 0,
+            }
+            all_ce_qualified.append(row_data)
         elif result == -1:
-            pe_candidates.append(underlying)
+            row_data = {
+                "Underlying": underlying,
+                "Option Type": "PE",
+                "Direction": "Bearish",
+                "Strike": latest[c_strike] if c_strike else "",
+                "Close": latest[c_close] if c_close else "",
+                "Last Signal": latest[c_signal],
+                "Timestamp": five_start_time,
+                "iteration": latest.get("iteration", ""),
+                "Window Score": -latest[c_window_score] if c_window_score else 0,
+            }
+            all_pe_qualified.append(row_data)
+    logger.info('CE Buy qualified total: %d | PE Buy qualified total: %d', len(all_ce_qualified), len(all_pe_qualified))
+    return all_ce_qualified, all_pe_qualified
 
-    return list(set(ce_candidates)), list(set(pe_candidates))
+def evaluate_chain_from_candidates(long_df, short_df):
+    ce_all = []
+    pe_all = []
+    combined = pd.concat([long_df, short_df], ignore_index=True) if (not long_df.empty or not short_df.empty) else pd.DataFrame()
+    if combined.empty:
+        return ce_all, pe_all
+    cols = {c.lower().strip(): c for c in combined.columns}
+    def _col(cands):
+        for c in cands:
+            if c.lower() in cols:
+                return cols[c.lower()]
+        return None
+    u  = _col(['underlying', 'symbol', 'stock'])
+    cs = _col(['chain signal', 'chain_signal', 'signal', 'window_signal'])
+    ts = _col(['timestamp', 'time', 'datetime'])
+    if any(v is None for v in (u, cs)):
+        logger.warning('Candidates CSV missing columns. Available: %s', list(combined.columns))
+        return ce_all, pe_all
+    bull_mask = combined[cs].astype(str).str.contains('ENTER', case=False, na=False) & combined[cs].astype(str).str.contains('BUY', case=False, na=False)
+    bull_df = combined[bull_mask].copy()
+    for _, row in bull_df.iterrows():
+        ce_all.append({
+            "Underlying": row[u],
+            "Option Type": "CE",
+            "Direction": "Bullish",
+            "Strike": row.get('strike', ''),
+            "Close": row.get('close', ''),
+            "Last Signal": row[cs],
+            "Timestamp": str(row.get(ts, '')),
+            "iteration": row.get('iteration', ''),
+            "Window Score": row.get('window_score', 0),
+        })
+    bear_mask = combined[cs].astype(str).str.contains('ENTER', case=False, na=False) & combined[cs].astype(str).str.contains('SELL', case=False, na=False)
+    bear_df = combined[bear_mask].copy()
+    for _, row in bear_df.iterrows():
+        pe_all.append({
+            "Underlying": row[u],
+            "Option Type": "PE",
+            "Direction": "Bearish",
+            "Strike": row.get('strike', ''),
+            "Close": row.get('close', ''),
+            "Last Signal": row[cs],
+            "Timestamp": str(row.get(ts, '')),
+            "iteration": row.get('iteration', ''),
+            "Window Score": -row.get('window_score', 0),
+        })
+    logger.info('Fallback CE Buy: %d | PE Buy: %d', len(ce_all), len(pe_all))
+    return ce_all, pe_all
 
+def _build_table(rows, title):
+    if not rows:
+        return '<h3>' + title + '</h3><p>No signals.</p>'
+    df = pd.DataFrame(rows)
+    out = '<h3>' + title + '</h3>'
+    out += '<table border="1" cellspacing="0" cellpadding="4" style="border-collapse:collapse;">'
+    out += '<tr style="background:#dce8f7;">' + ''.join('<th>' + str(c) + '</th>' for c in df.columns) + '</tr>'
+    for _, r in df.iterrows():
+        out += '<tr>' + ''.join('<td>' + str(r[c]) + '</td>' for c in df.columns) + '</tr>'
+    out += '</table>'
+    return out
 
-# === STATE PERSISTENCE (cepebuy_state.json) ===
-DAILY_STATE_FILE = os.path.join(OUTPUT_DIR, "cepebuy_state.json")
-
-def load_state() -> Dict[str, List[str]]:
-    today = datetime.now().strftime("%Y-%m-%d")
-    if not os.path.isfile(DAILY_STATE_FILE):
-        return {"date": today, "ce_buy": [], "pe_buy": []}
-
+def send_email(subject, html_body):
+    if not all((SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL)):
+        logger.warning('Email credentials missing; skipping.')
+        return False
+    recipients = [a.strip() for a in RECIPIENT_EMAIL.replace(';', ',').split(',') if a.strip()]
+    if not recipients:
+        return False
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = subject
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = ','.join(recipients)
+    msg.attach(MIMEText(html_body, 'html', 'utf-8'))
     try:
-        with open(DAILY_STATE_FILE, "r") as f:
-            state = json.load(f)
-        if state.get("date") != today:
-            logger.info("New day detected; resetting state.")
-            return {"date": today, "ce_buy": [], "pe_buy": []}
-        return state
-    except Exception as e:
-        logger.error(f"Error reading state {DAILY_STATE_FILE}: {e}")
-        return {"date": today, "ce_buy": [], "pe_buy": []}
+        logger.info('Connecting %s:%d ...', SMTP_HOST, SMTP_PORT)
+        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=30) as s:
+            s.starttls()
+            s.login(SENDER_EMAIL, SENDER_PASSWORD)
+            s.sendmail(SENDER_EMAIL, recipients, msg.as_string())
+        logger.info('Email sent: %s', subject)
+        return True
+    except Exception as exc:
+        logger.exception('SMTP failed: %s', exc)
+        return False
 
-
-def save_state(state: Dict[str, List[str]]) -> None:
-    today = datetime.now().strftime("%Y-%m-%d")
-    state["date"] = today
-    with open(DAILY_STATE_FILE, "w") as f:
-        json.dump(state, f, indent=2)
-    logger.info(f"State saved; {len(state['ce_buy'])} CE BUY, {len(state['pe_buy'])} PE BUY")
-
-
-# === CANDIDATE CSV FALLBACK (safe) ===
-def read_candidates() -> pd.DataFrame:
-    long_csvs = list(Path(OUTPUT_DIR).glob("fo_long_candidates_*.csv"))
-    if long_csvs:
-        long_df = pd.read_csv(max(long_csvs, key=os.path.getmtime))
-        long_df["candidate_type"] = "long"
-    else:
-        long_df = pd.DataFrame()
-
-    short_csvs = list(Path(OUTPUT_DIR).glob("fo_short_candidates_*.csv"))
-    if short_csvs:
-        short_df = pd.read_csv(max(short_csvs, key=os.path.getmtime))
-        short_df["candidate_type"] = "short"
-    else:
-        short_df = pd.DataFrame()
-
-    if long_df.empty and short_df.empty:
-        return pd.DataFrame()
-
-    return pd.concat([long_df, short_df], ignore_index=True)
-
-
-def update_state_from_candidates(state: Dict[str, List[str]], cand_df: pd.DataFrame) -> None:
-    if cand_df.empty:
-        logger.info("Candidate DataFrame empty; skipping fallback integration.")
-        return
-
-    required_cols = ["underlying", "option_type", "strike", "strike_diff"]
-    missing = [c for c in required_cols if c not in cand_df.columns]
-    if missing:
-        logger.warning(
-            f"Missing candidate cols {missing}; "
-            "skipping fallback candidate integration from old CSVs."
-        )
-        return
-
-    for (underlying, opt_type), group in cand_df.groupby(
-        ["underlying", "option_type"]
-    ):
-        if group.empty:
-            continue
-        idx = group["strike_diff"].abs().idxmin()
-        atm_strike = group.loc[idx, "strike"]
-        # Just add underlying to state
-        if opt_type == "CE":
-            state["ce_buy"] = sorted(list(set(state["ce_buy"] + [underlying])))
-        elif opt_type == "PE":
-            state["pe_buy"] = sorted(list(set(state["pe_buy"] + [underlying])))
-
-
-# === EMAIL ===
-def build_html_table(df: pd.DataFrame, title: str) -> str:
-    if df.empty:
-        return f"<h3>{title}</h3><p>No stocks today.</p>"
-
-    header = "".join(f"<th>{c}</th>" for c in df.columns)
-    rows = ""
-    for _, row in df.iterrows():
-        tds = "".join(f"<td>{value}</td>" for value in row)
-        rows += f"<tr>{tds}</tr>"
-    return f"<h3>{title}</h3><table border='1'><tr>{header}</tr>{rows}</table>"
-
-
-def build_html_body(ce_today: List[str], pe_today: List[str]) -> str:
-    ce_count = len(ce_today)
-    pe_count = len(pe_today)
-
-    ce_df = pd.DataFrame({"CE BUY today": ce_today})
-    pe_df = pd.DataFrame({"PE BUY today": pe_today})
-
-    ce_table = build_html_table(ce_df, f"CE BUY ({ce_count} stocks today)")
-    pe_table = build_html_table(pe_df, f"PE BUY ({pe_count} stocks today)")
-
-    html_body = (
-        "<html><body>"
-        "<h2>CE / PE Momentum Buy Report</h2>"
-        f"<p>Generated at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>"
-        "<p>Chain rules: 5‑start + 8‑of‑11 same‑direction signals. Mixed chains rejected.</p>"
-        f"{ce_table}<br/>{pe_table}"
-        "</body></html>"
-    )
-    return html_body
-
-
-def send_email(subject: str, html_body: str) -> None:
-    user = os.getenv("EMAIL_USER")
-    pwd = os.getenv("EMAIL_PASSWORD")
-    if not user or not pwd:
-        logger.error("Missing EMAIL_USER / EMAIL_PASSWORD; skipping email.")
-        return
-
-    smtp_host = os.getenv("SMTP_HOST", "smtp.gmail.com")
-    smtp_port = int(os.getenv("SMTP_PORT", "587"))
-
-    msg = MIMEMultipart("alternative")
-    msg["Subject"] = subject
-    msg["From"] = user
-    msg["To"] = os.getenv("TO_EMAILS", "admin@example.com")
-
-    part = MIMEText(html_body, "html")
-    msg.attach(part)
-
-    try:
-        server = smtplib.SMTP(smtp_host, smtp_port)
-        server.starttls()
-        server.login(user, pwd)
-        server.send_message(msg)
-        server.quit()
-        logger.info(f"Email sent to {msg['To']}")
-    except Exception as e:
-        logger.error(f"Failed to send email: {e}")
-
-
-# === MAIN LOGIC ===
 def main():
-    init_fyers()
-
-    # 1. Read iteration history (preferred)
-    iter_df = read_iteration_history()
-    if iter_df is None:
-        cand_df = read_candidates()
-        if cand_df.empty:
-            logger.info("No candidates files found; exiting.")
-            return
-        state = load_state()
-        update_state_from_candidates(state, cand_df)
-        ce_today = state["ce_buy"]
-        pe_today = state["pe_buy"]
+    logger.info('=== CEPEBUY starting (5-start / 8-of-11 chain logic) ===')
+    state = _load_state()
+    iter_df = _load_any([
+        'fo_iteration_history_*.csv',
+        'iteration_history_*.csv',
+        'fo_iteration_history.csv',
+        'iteration_history.csv',
+    ])
+    if not iter_df.empty:
+        logger.info('Using iteration history with window_signal column.')
+        ce_all, pe_all = evaluate_chain_from_iteration(iter_df)
     else:
-        ce_iter, pe_iter = evaluate_chain_from_iteration(iter_df)
-        state = load_state()
-        # Add this day's iteration signals
-        state["ce_buy"] = sorted(list(set(state["ce_buy"] + ce_iter)))
-        state["pe_buy"] = sorted(list(set(state["pe_buy"] + pe_iter)))
-
-        cand_df = read_candidates()
-        update_state_from_candidates(state, cand_df)
-        save_state(state)
-
-        ce_today = ce_iter
-        pe_today = pe_iter
-
-    # 2. Build & send email
-    html_body = build_html_body(ce_today, pe_today)
-    subject = f"CE / PE Momentum Buy Report - {datetime.now().strftime('%d %b %H:%M')}"
+        logger.warning('Iteration history not found. Falling back to candidate CSVs.')
+        long_df = _load_any(['fo_long_candidates_*.csv', 'long_candidates_*.csv', 'fo_long_candidates.csv', 'long_candidates.csv'])
+        short_df = _load_any(['fo_short_candidates_*.csv', 'short_candidates_*.csv', 'fo_short_candidates.csv', 'short_candidates.csv'])
+        if long_df.empty and short_df.empty:
+            logger.error('No data source available. Abort.')
+            sys.exit(1)
+        ce_all, pe_all = evaluate_chain_from_candidates(long_df, short_df)
+    ce_count = Counter(r["Underlying"] for r in ce_all)
+    pe_count = Counter(r["Underlying"] for r in pe_all)
+    for r in ce_all:
+        r["Qualify Count"] = ce_count[r["Underlying"]]
+    for r in pe_all:
+        r["Qualify Count"] = pe_count[r["Underlying"]]
+    state['ce_all'] = ce_all
+    state['pe_all'] = pe_all
+    _save_state(state)
+    ce_today = keep_sorted_per_stock(ce_all)
+    pe_today = keep_sorted_per_stock(pe_all)
+    if not ce_today and not pe_today:
+        logger.info('No CE/PE Buy signals today. No email sent.')
+        return
+    html_body = '<html><body>'
+    html_body += '<h2>CE / PE Buy Momentum Report - ' + datetime.now().strftime('%d %b %Y %H:%M') + '</h2>'
+    html_body += '<p><b>Chain rule:</b> ' + str(CONSEC_START) + ' consecutive + ' + str(CONFIRM_OF) + ' of ' + str(CONFIRM_WINDOW) + ' signals in same direction. Mixed chains rejected.</p>'
+    html_body += '<p><b>Logic:</b> Bullish 5-start chains -> CE Buy. Bearish 5-start chains -> PE Buy.</p>'
+    html_body += '<p><b>Timestamp:</b> When the 5-consecutive chain first started (5-start), not current run time.</p>'
+    if ce_today:
+        html_body += _build_table(ce_today, 'CE Buy (bullish 5-start)')
+        html_body += '<br/>'
+    if pe_today:
+        html_body += _build_table(pe_today, 'PE Buy (bearish 5-start)')
+    html_body += '</body></html>'
+    subject = 'CE / PE Buy Momentum Report - ' + datetime.now().strftime('%d %b %H:%M')
     send_email(subject, html_body)
 
-
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()
