@@ -375,6 +375,7 @@ def process_cepebuy() -> Tuple[pd.DataFrame, pd.DataFrame]:
         logger.info("Missing status summary: %s", missing_df["Status"].value_counts().to_dict())
 
     return out_df, missing_df
+
 def build_iteration_history_from_asit_csv(asit_csv_path: str, output_csv_path: str = None):
     if output_csv_path is None:
         output_csv_path = os.path.join(
@@ -386,10 +387,7 @@ def build_iteration_history_from_asit_csv(asit_csv_path: str, output_csv_path: s
     df = normalize_columns(df)
     cols = {c.lower().strip(): c for c in df.columns}
 
-    sym_col = next(
-        (cols[k] for k in ['symbol', 'underlying', 'ticker', 'tradingsymbol', 'name'] if k in cols),
-        None
-    )
+    sym_col = next((cols[k] for k in ["symbol", "underlying", "ticker", "tradingsymbol", "name"] if k in cols), None)
     if sym_col is None:
         raise ValueError("No symbol column found in asit csv")
 
@@ -402,7 +400,7 @@ def build_iteration_history_from_asit_csv(asit_csv_path: str, output_csv_path: s
             continue
 
         hist_symbol = symbol if symbol.startswith("NSE:") else f"NSE:{symbol}"
-        intradf = gethistory(hist_symbol, '5', INTRADAY_LOOKBACK_DAYS)
+        intradf = gethistory(hist_symbol, "5", INTRADAY_LOOKBACK_DAYS)
         if intradf is None or intradf.empty:
             continue
 
@@ -426,17 +424,16 @@ def build_iteration_history_from_asit_csv(asit_csv_path: str, output_csv_path: s
 
 def main():
     try:
-        out_df, missing_df = process_cepebuy()
-
         asit_files = sorted(
             Path(".").glob("asit*.csv"),
             key=lambda p: p.stat().st_mtime,
             reverse=True
         )
         if asit_files:
-            asit_out, asit_path = build_iteration_history_from_asit_csv(str(asit_files[0]))
+            _, asit_path = build_iteration_history_from_asit_csv(str(asit_files[0]))
             logger.info("Saved ASIT iteration history: %s", asit_path)
 
+        out_df, missing_df = process_cepebuy()
     except Exception as e:
         logger.exception("CEPEBUY failed: %s", e)
         raise
