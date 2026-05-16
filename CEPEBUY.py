@@ -77,10 +77,8 @@ def normalize_symbol(s):
     if pd.isna(s):
         return ''
     s = str(s).upper().strip()
-    s = s.replace('NSE:', '')
-    s = s.replace('.NS', '')
-    s = s.replace('-EQ', '')
-    s = s.replace(' EQ', '')
+    s = s.replace('NSE:', '').replace('.NS', '')
+    s = s.replace('-EQ', '').replace(' EQ', '')
     s = s.replace('NSE', '')
     return s.strip()
 
@@ -145,7 +143,7 @@ def eval_exit_chain(window_df, close_col, ts_col, exit_consec, exit_confirm, exi
     )
 
 def load_asit_top20():
-    df, path = _load_any(['asit*.csv'])
+    df, _ = _load_any(['asit*.csv'])
     if df.empty:
         return pd.DataFrame(), None
 
@@ -190,22 +188,29 @@ def load_asit_top20():
 
     bull['Side'] = 'CE'
     bear['Side'] = 'PE'
-
     bull.columns = ['Stock'] + ([ 'RankScore15Tier' ] if c_rank else []) + ['Side']
     bear.columns = ['Stock'] + ([ 'RankScore15Tier' ] if c_rank else []) + ['Side']
 
-    out = pd.concat([bull, bear], ignore_index=True)
-    logger.info('Top bullish: %d, top bearish: %d', len(bull), len(bear))
-    return out, path
+    return pd.concat([bull, bear], ignore_index=True), None
 
-def nearest_atm_strike_from_ltp(grp, close_col, strike_col, ltp_value):
+def nearest_atm_strike(grp, close_col, strike_col, ltp_value):
     if strike_col is None or ltp_value is None or pd.isna(ltp_value):
         return None
     strikes = pd.to_numeric(grp[strike_col], errors='coerce').dropna().unique().tolist()
     if not strikes:
         return None
-    price = float(ltp_value)
-    return min(strikes, key=lambda x: abs(float(x) - price))
+    return min(strikes, key=lambda x: abs(float(x) - float(ltp_value)))
+
+def pick_symbol_rows(iter_df, c_underlying, stock):
+    s = iter_df[c_underlying].astype(str).str.upper().str.strip()
+    exact = iter_df[s == stock].copy()
+    if not exact.empty:
+        return exact
+    prefix = iter_df[s.str.startswith(stock)].copy()
+    if not prefix.empty:
+        return prefix
+    contains = iter_df[s.str.contains(stock, na=False)].copy()
+    return contains
 
 def evaluate(iter_df, top_df):
     rows = []
@@ -227,17 +232,14 @@ def evaluate(iter_df, top_df):
         warnings.simplefilter('ignore')
         iter_df[c_timestamp] = pd.to_datetime(iter_df[c_timestamp], errors='coerce')
     iter_df = iter_df.sort_values(c_timestamp)
-
     iter_df['NormUnderlying'] = iter_df[c_underlying].map(normalize_symbol)
     iter_df[c_opt_type] = iter_df[c_opt_type].astype(str).str.upper().str.strip()
-
-    top_df['Stock'] = top_df['Stock'].astype(str).str.upper().str.strip()
 
     for _, sel in top_df.iterrows():
         stock = sel['Stock']
         side = str(sel['Side']).upper().strip()
 
-        grp = iter_df[iter_df['NormUnderlying'] == stock].copy()
+        grp = pick_symbol_rows(iter_df, 'NormUnderlying', stock)
         if grp.empty:
             logger.info('No iteration rows for %s', stock)
             continue
@@ -251,7 +253,7 @@ def evaluate(iter_df, top_df):
         latest = grp.iloc[-1]
         ltp_val = pd.to_numeric(latest[c_close], errors='coerce')
 
-        atm_strike = nearest_atm_strike_from_ltp(grp, c_close, c_strike, ltp_val)
+        atm_strike = nearest_atm_strike(grp, c_close, c_strike, ltp_val)
         if atm_strike is not None and c_strike is not None:
             strike_series = pd.to_numeric(grp[c_strike], errors='coerce')
             sub = grp[strike_series == float(atm_strike)].copy()
@@ -265,9 +267,7 @@ def evaluate(iter_df, top_df):
         exit_dir = -1 if entry_dir == 1 else 1
 
         entry_time, entry_price = check_chain(
-            closes, timestamps,
-            ENTRY_CONSEC, ENTRY_CONFIRM, ENTRY_WINDOW,
-            target_dir=entry_dir
+            closes, timestamps, ENTRY_CONSEC, ENTRY_CONFIRM, ENTRY_WINDOW, target_dir=entry_dir
         )
         if not entry_time:
             logger.info('No entry chain for %s %s', stock, side)
@@ -280,20 +280,12 @@ def evaluate(iter_df, top_df):
         exit15_time = None
         if pd.notna(last_ts) and (last_ts - entry_dt) >= timedelta(minutes=15):
             w15 = post[post[c_timestamp] > (last_ts - timedelta(minutes=15))]
-            exit15_time, _ = eval_exit_chain(
-                w15, c_close, c_timestamp,
-                EXIT_15_CONSEC, EXIT_15_CONFIRM, EXIT_15_WINDOW,
-                exit_dir, entry_time
-            )
+            exit15_time, _ = eval_exit_chain(w15, c_close, c_timestamp, EXIT_15_CONSEC, EXIT_15_CONFIRM, EXIT_15_WINDOW, exit_dir, entry_time)
 
         exit39_time = None
         if pd.notna(last_ts) and (last_ts - entry_dt) >= timedelta(minutes=39):
             w39 = post[post[c_timestamp] > (last_ts - timedelta(minutes=39))]
-            exit39_time, _ = eval_exit_chain(
-                w39, c_close, c_timestamp,
-                EXIT_39_CONSEC, EXIT_39_CONFIRM, EXIT_39_WINDOW,
-                exit_dir, entry_time
-            )
+            exit39_time, _ = eval_exit_chain(w39, c_close, c_timestamp, EXIT_39_CONSEC, EXIT_39_CONFIRM, EXIT_39_WINDOW, exit_dir, entry_time)
 
         rows.append({
             'Stock': stock,
@@ -309,9 +301,26 @@ def evaluate(iter_df, top_df):
 
     return rows
 
-def build_html(rows):
+def main():
+    logger.info('=== CEPEBUY starting ===')
+    top_df, _ = load_asit_top20()
+    iter_df, _ = _load_any(['iteration_history*.csv', 'fo_iteration_history*.csv'])
+
+    if top_df.empty or iter_df.empty:
+        logger.error('Required CSVs not found')
+        sys.exit(1)
+
+    rows = evaluate(iter_df, top_df)
     if not rows:
-        return '<p>No signals today.</p>'
+        logger.info('No matching signals')
+        return
+
+    html = '<html><body style="font-family:sans-serif;"><h2>CE/PE Near ATM Signals</h2>'
+    html += build_html(rows)
+    html += '</body></html>'
+    send_email('CE/PE Near ATM Signals ' + datetime.now().strftime('%d %b %H:%M'), html)
+
+def build_html(rows):
     df = pd.DataFrame(rows)
     out = '<table border="1" cellspacing="0" cellpadding="4" style="border-collapse:collapse;font-family:monospace;font-size:13px;">'
     out += '<tr style="background:#2c3e50;color:white;">' + ''.join('<th>' + c + '</th>' for c in df.columns) + '</tr>'
@@ -322,7 +331,6 @@ def build_html(rows):
 
 def send_email(subject, html_body):
     if not all((SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL)):
-        logger.warning('Email credentials missing')
         return False
     recipients = [a.strip() for a in RECIPIENT_EMAIL.replace(';', ',').split(',') if a.strip()]
     msg = MIMEMultipart('alternative')
@@ -340,29 +348,6 @@ def send_email(subject, html_body):
     except Exception as exc:
         logger.exception('SMTP failed: %s', exc)
         return False
-
-def main():
-    logger.info('=== CEPEBUY starting ===')
-    top_df, _ = load_asit_top20()
-    if top_df.empty:
-        logger.error('No bullish/bearish rows found in asit CSV')
-        sys.exit(1)
-
-    iter_df, _ = _load_any(['iteration_history*.csv', 'fo_iteration_history*.csv'])
-    if iter_df.empty:
-        logger.error('No iteration history CSV found')
-        sys.exit(1)
-
-    rows = evaluate(iter_df, top_df)
-    if not rows:
-        logger.info('No matching signals')
-        return
-
-    html_body = '<html><body style="font-family:sans-serif;">'
-    html_body += '<h2>CE/PE Near ATM Signals</h2>'
-    html_body += '<p style="color:#666;font-size:12px;">Top bullish names from asit map to CE and bearish names map to PE. Matching uses normalized symbols.</p>'
-    html_body += build_html(rows) + '</body></html>'
-    send_email('CE/PE Near ATM Signals ' + datetime.now().strftime('%d %b %H:%M'), html_body)
 
 if __name__ == '__main__':
     main()
