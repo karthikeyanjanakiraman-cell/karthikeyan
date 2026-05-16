@@ -73,6 +73,17 @@ def _col(df, candidates):
             return cols[c.lower()]
     return None
 
+def normalize_symbol(s):
+    if pd.isna(s):
+        return ''
+    s = str(s).upper().strip()
+    s = s.replace('NSE:', '')
+    s = s.replace('.NS', '')
+    s = s.replace('-EQ', '')
+    s = s.replace(' EQ', '')
+    s = s.replace('NSE', '')
+    return s.strip()
+
 def _direction_from_price(prev_close, curr_close):
     if pd.isna(prev_close) or pd.isna(curr_close):
         return 0
@@ -149,6 +160,7 @@ def load_asit_top20():
         raise ValueError('asit CSV missing Symbol column')
 
     work = df.copy()
+    work['NormSymbol'] = work[c_symbol].map(normalize_symbol)
 
     if c_can:
         can = work[c_can].astype(str).str.upper().isin(['TRUE', '1', 'YES', 'Y'])
@@ -173,8 +185,8 @@ def load_asit_top20():
         bull = bull.sort_values(c_rank, ascending=False)
         bear = bear.sort_values(c_rank, ascending=False)
 
-    bull = bull[[c_symbol] + ([c_rank] if c_rank else [])].drop_duplicates(subset=[c_symbol]).head(TOP_N).copy()
-    bear = bear[[c_symbol] + ([c_rank] if c_rank else [])].drop_duplicates(subset=[c_symbol]).head(TOP_N).copy()
+    bull = bull[['NormSymbol'] + ([c_rank] if c_rank else [])].drop_duplicates(subset=['NormSymbol']).head(TOP_N).copy()
+    bear = bear[['NormSymbol'] + ([c_rank] if c_rank else [])].drop_duplicates(subset=['NormSymbol']).head(TOP_N).copy()
 
     bull['Side'] = 'CE'
     bear['Side'] = 'PE'
@@ -216,15 +228,16 @@ def evaluate(iter_df, top_df):
         iter_df[c_timestamp] = pd.to_datetime(iter_df[c_timestamp], errors='coerce')
     iter_df = iter_df.sort_values(c_timestamp)
 
-    iter_df[c_underlying] = iter_df[c_underlying].astype(str).str.upper().str.strip()
+    iter_df['NormUnderlying'] = iter_df[c_underlying].map(normalize_symbol)
     iter_df[c_opt_type] = iter_df[c_opt_type].astype(str).str.upper().str.strip()
+
     top_df['Stock'] = top_df['Stock'].astype(str).str.upper().str.strip()
 
     for _, sel in top_df.iterrows():
         stock = sel['Stock']
         side = str(sel['Side']).upper().strip()
 
-        grp = iter_df[iter_df[c_underlying] == stock].copy()
+        grp = iter_df[iter_df['NormUnderlying'] == stock].copy()
         if grp.empty:
             logger.info('No iteration rows for %s', stock)
             continue
@@ -347,7 +360,7 @@ def main():
 
     html_body = '<html><body style="font-family:sans-serif;">'
     html_body += '<h2>CE/PE Near ATM Signals</h2>'
-    html_body += '<p style="color:#666;font-size:12px;">Top bullish names from asit map to CE and bearish names map to PE. Chain validation uses price only.</p>'
+    html_body += '<p style="color:#666;font-size:12px;">Top bullish names from asit map to CE and bearish names map to PE. Matching uses normalized symbols.</p>'
     html_body += build_html(rows) + '</body></html>'
     send_email('CE/PE Near ATM Signals ' + datetime.now().strftime('%d %b %H:%M'), html_body)
 
