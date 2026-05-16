@@ -110,11 +110,15 @@ def fetch_option_chain(underlying: str) -> pd.DataFrame:
             fyers = None
     if fyers is None:
         try:
-            import fyersModel
-            fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=False, log_path="")
-        except Exception as e:
-            logger.warning("Fyers client not available: %s", e)
-            return pd.DataFrame()
+            from fyersapiv3 import fyersModel as fm
+            fyers = fm.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=False, log_path="")
+        except Exception:
+            try:
+                import fyersModel as fm
+                fyers = fm.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=False, log_path="")
+            except Exception as e:
+                logger.warning("Fyers client not available: %s", e)
+                return pd.DataFrame()
     eqsymbol = formateqsymbol(underlying)
     logger.info("API chain fetch underlying=%s eqsymbol=%s client=%s token=%s", underlying, eqsymbol, bool(CLIENT_ID), bool(ACCESS_TOKEN))
     try:
