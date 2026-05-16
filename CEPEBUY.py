@@ -98,19 +98,28 @@ def build_top_lists(asit_path: Path, top_n: int = TOP_N) -> Tuple[pd.DataFrame, 
 
 
 def fetch_option_chain(underlying: str) -> pd.DataFrame:
-    if gethistory is None:
-        return pd.DataFrame()
     if initfyers is not None:
         try:
             initfyers()
         except Exception:
             pass
-    if 'fyers' not in globals() or globals().get('fyers') is None:
+    fy = globals().get('fyers')
+    if fy is None:
+        try:
+            import OPTIONS_OI as opt
+            fy = getattr(opt, 'fyers', None)
+            if fy is None and hasattr(opt, 'initfyers'):
+                fy = opt.initfyers()
+        except Exception:
+            fy = None
+    if fy is None:
+        logger.warning("Fyers client not available")
         return pd.DataFrame()
     eqsymbol = formateqsymbol(underlying)
     try:
-        chainres = fyers.optionchain({"symbol": eqsymbol, "strikecount": 50})
-    except Exception:
+        chainres = fy.optionchain({"symbol": eqsymbol, "strikecount": 50})
+    except Exception as e:
+        logger.warning("optionchain failed for %s: %s", underlying, e)
         return pd.DataFrame()
     chain = (chainres or {}).get("data") or (chainres or {}).get("optionsChain") or []
     rows = []
@@ -132,13 +141,30 @@ def fetch_option_chain(underlying: str) -> pd.DataFrame:
 
 
 def fetch_iteration_history(option_symbol: str) -> pd.DataFrame:
-    if gethistory is None or builditerationhistory is None:
+    if builditerationhistory is None:
+        try:
+            import OPTIONS_OI as opt
+            build_hist = getattr(opt, 'builditerationhistory', None)
+            get_hist = getattr(opt, 'gethistory', None)
+            win = getattr(opt, 'SIGNALWINDOWMINUTES', SIGNALWINDOWMINUTES)
+            keep = getattr(opt, 'ITERATIONSTOKEEP', ITERATIONSTOKEEP)
+        except Exception:
+            build_hist = None
+            get_hist = None
+            win = SIGNALWINDOWMINUTES
+            keep = ITERATIONSTOKEEP
+    else:
+        build_hist = builditerationhistory
+        get_hist = gethistory
+        win = SIGNALWINDOWMINUTES
+        keep = ITERATIONSTOKEEP
+    if get_hist is None or build_hist is None:
         return pd.DataFrame()
     hist_symbol = option_symbol if str(option_symbol).startswith("NSE:") else f"NSE:{option_symbol}"
-    intradf = gethistory(hist_symbol, "5", INTRADAYLOOKBACKDAYS)
+    intradf = get_hist(hist_symbol, "5", INTRADAYLOOKBACKDAYS)
     if intradf is None or intradf.empty:
         return pd.DataFrame()
-    return builditerationhistory(intradf, SIGNALWINDOWMINUTES, ITERATIONSTOKEEP)
+    return build_hist(intradf, win, keep)
 
 
 def build_api_scans(seed_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
