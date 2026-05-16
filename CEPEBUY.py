@@ -45,7 +45,7 @@ def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 def standardize_text_series(series: pd.Series) -> pd.Series:
     s = series.astype(str).str.strip().str.upper()
-    s = s.replace({"": np.nan, "NAN": np.nan, "NONE": np.nan, "NULL": np.nan})
+    s = s.replace({"": np.nan, "NAN": np.nan, "NONE": np.nan, "NULL": np.nan, "NAT": np.nan})
     return s
 
 
@@ -116,15 +116,16 @@ def normalize_greeks_df(df: pd.DataFrame) -> pd.DataFrame:
             df[col] = np.nan
     df = to_numeric(df, ["Strike", "LTP"])
     if df["Option Symbol"].notna().any():
+        opt_sym = df["Option Symbol"].astype(str)
         miss_type = df["Option Type"].isna()
         if miss_type.any():
-            df.loc[miss_type, "Option Type"] = extract_option_type_from_symbol(df.loc[miss_type, "Option Symbol"])
+            df.loc[miss_type, "Option Type"] = extract_option_type_from_symbol(opt_sym[miss_type])
         miss_underlying = df["Underlying"].isna()
         if miss_underlying.any():
-            df.loc[miss_underlying, "Underlying"] = extract_underlying_from_symbol(df.loc[miss_underlying, "Option Symbol"])
+            df.loc[miss_underlying, "Underlying"] = extract_underlying_from_symbol(opt_sym[miss_underlying])
         miss_strike = df["Strike"].isna()
         if miss_strike.any():
-            df.loc[miss_strike, "Strike"] = extract_strike_from_symbol(df.loc[miss_strike, "Option Symbol"])
+            df.loc[miss_strike, "Strike"] = extract_strike_from_symbol(opt_sym[miss_strike])
     df["Option Type"] = standardize_text_series(df["Option Type"])
     df["Underlying"] = standardize_text_series(df["Underlying"])
     df["Strike"] = pd.to_numeric(df["Strike"], errors="coerce")
