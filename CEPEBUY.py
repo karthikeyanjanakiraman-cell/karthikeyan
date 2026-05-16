@@ -100,29 +100,31 @@ def build_top_lists(asit_path: Path, top_n: int = TOP_N) -> Tuple[pd.DataFrame, 
     return bull_df, bear_df, combined
 
 
-def fetch_option_chain(underlying: str) -> pd.DataFrame:
+def init_client_once():
     global fyers
-    if fyers is None:
-        try:
-            if initfyers is not None:
-                fyers = initfyers()
-        except Exception:
-            fyers = None
-    if fyers is None:
-        try:
-            from fyersapiv3 import fyersModel as fm
-            fyers = fm.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=False, log_path="")
-        except Exception:
-            try:
-                import fyersModel as fm
-                fyers = fm.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=False, log_path="")
-            except Exception as e:
-                logger.warning("Fyers client not available: %s", e)
-                return pd.DataFrame()
+    if fyers is not None:
+        return fyers
+    if not CLIENT_ID or not ACCESS_TOKEN:
+        logger.warning("Missing CLIENT_ID/ACCESS_TOKEN")
+        return None
+    try:
+        from fyersapiv3 import fyersModel as fm
+        fyers = fm.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=False, log_path="")
+        logger.info("Fyers client initialized")
+        return fyers
+    except Exception as e:
+        logger.warning("Fyers client not available: %s", e)
+        return None
+
+
+def fetch_option_chain(underlying: str) -> pd.DataFrame:
+    fy = init_client_once()
+    if fy is None:
+        return pd.DataFrame()
     eqsymbol = formateqsymbol(underlying)
     logger.info("API chain fetch underlying=%s eqsymbol=%s client=%s token=%s", underlying, eqsymbol, bool(CLIENT_ID), bool(ACCESS_TOKEN))
     try:
-        chainres = fyers.optionchain({"symbol": eqsymbol, "strikecount": 50})
+        chainres = fy.optionchain({"symbol": eqsymbol, "strikecount": 50})
         logger.info("chain response keys for %s: %s", underlying, list((chainres or {}).keys()) if isinstance(chainres, dict) else type(chainres))
     except Exception as e:
         logger.warning("optionchain failed for %s: %s", underlying, e)
