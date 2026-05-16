@@ -41,8 +41,5 @@ jobs:
       - name: Run Email scanner
         run: python EMAIL.py
 
-      - name: Run Options OI scanner
-        run: python OPTIONS_OI.py
-
       - name: Send CE/PE Momentum Buy Email
         run: python CEPEBUY.py
