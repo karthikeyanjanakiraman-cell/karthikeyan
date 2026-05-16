@@ -20,6 +20,35 @@ if sys.platform == 'win32':
     sys.stdout.reconfigure(encoding='utf-8', errors='replace')
     sys.stderr.reconfigure(encoding='utf-8', errors='replace')
 
+
+DATA_CACHE = {}
+FAILED_SYMBOLS = []
+ALL_RESULTS = []
+DB_PATH = 'intraday_signals.db'
+MARKET_OPEN_TIME = datetime.strptime('09:15', '%H:%M').time()
+MARKET_CLOSE_TIME = datetime.strptime('15:30', '%H:%M').time()
+AFTERNOON_WINDOW_START = datetime.strptime('13:30', '%H:%M').time()
+AFTERNOON_WINDOW_END = datetime.strptime('14:00', '%H:%M').time()
+RISK_FREE_RATE = 0.06
+MIN_DELTA_TARGET = 0.30
+MAX_DELTA_TARGET = 0.60
+DAILY_PROFIT_TARGET = 100000
+MAX_DAILY_LOSS = 50000
+MAX_STRIKE_DISTANCE_FROM_LTP = 2.5
+DIFF_ENTRY_WEIGHT = 100
+DIFF_TREND_WEIGHT = 25
+DIFF_EXIT_PENALTY = 10
+DIFF_PULLBACK_PENALTY = 2
+EXPORT_COLUMNS = ['Symbol','RankScore15Tier','BullMultiTFScore','BearMultiTFScore','DominantTrend','TrendStrength','PositionSizeMultiplier','EntryConfidence','LTP','ExitSignalsCount','ExitReason','ShouldExit','PullbackPct','PullbackStage','IsAfternoonSweetSpot','DTEHours','ThetaDecayStage','ThetaRisk','OptionStrike','OptionDelta','OptionTheta','CanTradeToday','Sector','Diff']
+RETRY_COUNT = 3
+RETRY_SLEEP_SECONDS = 1.0
+TIMEFRAMES = {
+    '5min': {'resolution': '5', 'days': 30, 'weight': 0.10},
+    '15min': {'resolution': '15', 'days': 50, 'weight': 0.20},
+    '1hour': {'resolution': '60', 'days': 50, 'weight': 0.25},
+    '4hour': {'resolution': '240', 'days': 50, 'weight': 0.20},
+    '1day': {'resolution': 'D', 'days': 365, 'weight': 0.25},
+}
 class UTF8Formatter(logging.Formatter):
     def format(self, record):
         msg = record.getMessage()
@@ -74,34 +103,7 @@ except Exception as e:
     logger.warning(f'[WARN] Fyers auth error: {e}')
     fyers = None
 
-DATA_CACHE = {}
-FAILED_SYMBOLS = []
-ALL_RESULTS = []
-DB_PATH = 'intraday_signals.db'
-MARKET_OPEN_TIME = datetime.strptime('09:15', '%H:%M').time()
-MARKET_CLOSE_TIME = datetime.strptime('15:30', '%H:%M').time()
-AFTERNOON_WINDOW_START = datetime.strptime('13:30', '%H:%M').time()
-AFTERNOON_WINDOW_END = datetime.strptime('14:00', '%H:%M').time()
-RISK_FREE_RATE = 0.06
-MIN_DELTA_TARGET = 0.30
-MAX_DELTA_TARGET = 0.60
-DAILY_PROFIT_TARGET = 100000
-MAX_DAILY_LOSS = 50000
-MAX_STRIKE_DISTANCE_FROM_LTP = 2.5
-DIFF_ENTRY_WEIGHT = 100
-DIFF_TREND_WEIGHT = 25
-DIFF_EXIT_PENALTY = 10
-DIFF_PULLBACK_PENALTY = 2
-EXPORT_COLUMNS = ['Symbol','RankScore15Tier','BullMultiTFScore','BearMultiTFScore','DominantTrend','TrendStrength','PositionSizeMultiplier','EntryConfidence','LTP','ExitSignalsCount','ExitReason','ShouldExit','PullbackPct','PullbackStage','IsAfternoonSweetSpot','DTEHours','ThetaDecayStage','ThetaRisk','OptionStrike','OptionDelta','OptionTheta','CanTradeToday','Sector','Diff']
-RETRY_COUNT = 3
-RETRY_SLEEP_SECONDS = 1.0
-TIMEFRAMES = {
-    '5min': {'resolution': '5', 'days': 30, 'weight': 0.10},
-    '15min': {'resolution': '15', 'days': 50, 'weight': 0.20},
-    '1hour': {'resolution': '60', 'days': 50, 'weight': 0.25},
-    '4hour': {'resolution': '240', 'days': 50, 'weight': 0.20},
-    '1day': {'resolution': 'D', 'days': 365, 'weight': 0.25},
-}
+
 
 def calculate_dynamic_dte_with_decay():
     now = datetime.now()
