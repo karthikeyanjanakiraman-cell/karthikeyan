@@ -30,6 +30,8 @@ except Exception:
     INTRADAYLOOKBACKDAYS = 20
     formateqsymbol = lambda x: f"NSE:{str(x).strip().upper()}-EQ"
     safefloat = lambda v, default=np.nan: default if v is None or str(v).strip()=="" else float(v)
+CLIENT_ID = os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID")
+ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN") or os.environ.get("ACCESSTOKEN")
 
 
 def pick_latest_file(pattern: str, base_dir: Path = BASE_DIR) -> Optional[Path]:
@@ -116,8 +118,10 @@ def fetch_option_chain(underlying: str) -> pd.DataFrame:
         logger.warning("Fyers client not available")
         return pd.DataFrame()
     eqsymbol = formateqsymbol(underlying)
+    logger.info("API chain fetch underlying=%s eqsymbol=%s client=%s token=%s", underlying, eqsymbol, bool(CLIENT_ID), bool(ACCESS_TOKEN))
     try:
         chainres = fy.optionchain({"symbol": eqsymbol, "strikecount": 50})
+        logger.info("chain response keys for %s: %s", underlying, list((chainres or {}).keys()) if isinstance(chainres, dict) else type(chainres))
     except Exception as e:
         logger.warning("optionchain failed for %s: %s", underlying, e)
         return pd.DataFrame()
