@@ -18,7 +18,11 @@ MIN_REQUIRED_ITERATIONS = 5
 
 
 def pick_latest_file(pattern: str) -> Path:
-    files = sorted(BASE_DIR.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
+    files = sorted(
+        BASE_DIR.glob(pattern),
+        key=lambda p: p.stat().st_mtime,
+        reverse=True
+    )
     if not files:
         raise FileNotFoundError(f"No file found for pattern: {pattern}")
     return files[0]
@@ -43,6 +47,7 @@ def normalize_text(df: pd.DataFrame, cols) -> pd.DataFrame:
     for col in cols:
         if col in df.columns:
             df[col] = df[col].astype(str).str.strip().str.upper()
+            df.loc[df[col].isin(["", "NAN", "NONE"]), col] = np.nan
     return df
 
 
@@ -68,7 +73,31 @@ def normalize_iteration_df(df: pd.DataFrame) -> pd.DataFrame:
 
     df = df.dropna(subset=["Underlying", "Option Type", "iteration"])
     df = df.sort_values(["Underlying", "Option Type", "iteration"]).reset_index(drop=True)
+
+    logging.info(
+        "Iteration summary | rows=%s | underlyings=%s | option_symbols=%s",
+        len(df),
+        df["Underlying"].nunique(),
+        df["Option Symbol"].nunique() if "Option Symbol" in df.columns else 0
+    )
     return df
+
+
+def extract_option_type_from_symbol(series: pd.Series) -> pd.Series:
+    return (
+        series.astype(str)
+        .str.upper()
+        .str.extract(r"(CE|PE)s*$", expand=False)
+    )
+
+
+def extract_underlying_from_symbol(series: pd.Series) -> pd.Series:
+    s = series.astype(str).str.upper().str.replace("NSE:", "", regex=False)
+    extracted = s.str.extract(
+        r"^(?:NSE)?([A-Z0-9&_-]+?)(?:d{1,2}[A-Z]{3}d+(?:.d+)?(?:CE|PE))$",
+        expand=False
+    )
+    return extracted
 
 
 def normalize_greeks_df(df: pd.DataFrame) -> pd.DataFrame:
@@ -77,26 +106,56 @@ def normalize_greeks_df(df: pd.DataFrame) -> pd.DataFrame:
     rename_map = {}
     for c in df.columns:
         lc = c.lower().strip()
+
         if lc in {"symbol", "stock", "name", "underlying"}:
             rename_map[c] = "Underlying"
-        elif lc in {"option type", "option_type", "type", "cepe"}:
+        elif lc in {"option type", "option_type", "type", "cepe", "cp", "right"}:
             rename_map[c] = "Option Type"
         elif lc in {"strike", "strike price", "strike_price"}:
             rename_map[c] = "Strike"
         elif lc in {"ltp", "close", "price", "last_price"}:
             rename_map[c] = "LTP"
+        elif lc in {
+            "option symbol", "option_symbol", "tradingsymbol", "trading symbol",
+            "instrument", "instrument_name", "symbol_name"
+        }:
+            rename_map[c] = "Option Symbol"
 
     if rename_map:
         df = df.rename(columns=rename_map)
 
-    df = normalize_text(df, [c for c in ["Underlying", "Option Type"] if c in df.columns])
+    df = normalize_text(
+        df,
+        [c for c in ["Underlying", "Option Type", "Option Symbol"] if c in df.columns]
+    )
+
+    if "Option Type" not in df.columns:
+        df["Option Type"] = np.nan
+
+    if "Option Type" in df.columns and df["Option Type"].isna().any() and "Option Symbol" in df.columns:
+        fill_mask = df["Option Type"].isna()
+        df.loc[fill_mask, "Option Type"] = extract_option_type_from_symbol(
+            df.loc[fill_mask, "Option Symbol"]
+        )
+
+    if "Underlying" not in df.columns:
+        df["Underlying"] = np.nan
+
+    if df["Underlying"].isna().any() and "Option Symbol" in df.columns:
+        fill_mask = df["Underlying"].isna()
+        df.loc[fill_mask, "Underlying"] = extract_underlying_from_symbol(
+            df.loc[fill_mask, "Option Symbol"]
+        )
 
     for col in ["Strike", "LTP"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    if "Underlying" not in df.columns:
-        raise ValueError("Greeks file must contain an Underlying column")
+    if "Underlying" not in df.columns or df["Underlying"].isna().all():
+        raise ValueError("Greeks file must contain Underlying or parsable Option Symbol")
+
+    missing_opt = int(df["Option Type"].isna().sum())
+    logging.info("Greeks Option Type missing rows: %s / %s", missing_opt, len(df))
 
     return df
 
@@ -114,10 +173,18 @@ def latest_buy_entry(iter_slice: pd.DataFrame):
 
 
 def build_candidate_rows(greeks_df: pd.DataFrame) -> pd.DataFrame:
-    keep = [c for c in ["Underlying", "Option Type", "Strike", "LTP"] if c in greeks_df.columns]
+    keep = [c for c in ["Underlying", "Option Type", "Strike", "LTP", "Option Symbol"] if c in greeks_df.columns]
     if not keep:
         raise ValueError("Greeks file does not contain usable columns")
-    return greeks_df[keep].drop_duplicates().reset_index(drop=True)
+
+    candidates = greeks_df[keep].copy()
+
+    if "Option Type" in candidates.columns:
+        candidates = candidates.dropna(subset=["Option Type"])
+
+    candidates = candidates.drop_duplicates().reset_index(drop=True)
+    logging.info("Candidate rows after cleanup: %s", len(candidates))
+    return candidates
 
 
 def process_cepebuy():
@@ -133,26 +200,31 @@ def process_cepebuy():
     iter_df = normalize_iteration_df(load_csv(iteration_path))
     candidates = build_candidate_rows(greeks_df)
 
-    logging.info(
-        "Iteration summary | rows=%s | underlyings=%s | option_symbols=%s",
-        len(iter_df),
-        iter_df["Underlying"].nunique(),
-        iter_df["Option Symbol"].nunique() if "Option Symbol" in iter_df.columns else 0
-    )
-
     results = []
     missing_rows = []
 
     for _, row in candidates.iterrows():
-        underlying = row["Underlying"]
-        option_type = row["Option Type"] if "Option Type" in row.index else None
+        underlying = row["Underlying"] if "Underlying" in row.index else np.nan
+        option_type = row["Option Type"] if "Option Type" in row.index else np.nan
+        greeks_option_symbol = row["Option Symbol"] if "Option Symbol" in row.index else ""
 
-        if option_type is None or pd.isna(option_type):
+        if pd.isna(underlying):
+            missing_rows.append({
+                "Underlying": "",
+                "Option Type": option_type if pd.notna(option_type) else "",
+                "Option Symbol": greeks_option_symbol,
+                "Status": "MISSING_UNDERLYING_IN_GREEKS",
+                "Reason": "Underlying missing and could not be derived"
+            })
+            continue
+
+        if pd.isna(option_type):
             missing_rows.append({
                 "Underlying": underlying,
                 "Option Type": "",
+                "Option Symbol": greeks_option_symbol,
                 "Status": "MISSING_OPTION_TYPE_IN_GREEKS",
-                "Reason": "Option Type missing in greeks row"
+                "Reason": "Option Type missing and could not be derived"
             })
             continue
 
@@ -165,6 +237,7 @@ def process_cepebuy():
             missing_rows.append({
                 "Underlying": underlying,
                 "Option Type": option_type,
+                "Option Symbol": greeks_option_symbol,
                 "Status": "NO_ITERATION_ROWS",
                 "Reason": "No rows found in latest iteration file for this underlying/type"
             })
@@ -174,6 +247,7 @@ def process_cepebuy():
             missing_rows.append({
                 "Underlying": underlying,
                 "Option Type": option_type,
+                "Option Symbol": greeks_option_symbol,
                 "Status": "LOW_ITERATION_COUNT",
                 "Reason": f"Only {len(iter_slice)} iteration rows"
             })
@@ -184,6 +258,7 @@ def process_cepebuy():
             missing_rows.append({
                 "Underlying": underlying,
                 "Option Type": option_type,
+                "Option Symbol": greeks_option_symbol,
                 "Status": "NO_ENTRY_CHAIN",
                 "Reason": "No BUY signal present in iteration rows"
             })
@@ -192,6 +267,7 @@ def process_cepebuy():
         results.append({
             "Underlying": underlying,
             "Option Type": option_type,
+            "Greeks Option Symbol": greeks_option_symbol,
             "Entry Strike": entry["Strike"] if "Strike" in entry.index else np.nan,
             "Entry Iteration": int(entry["iteration"]) if pd.notna(entry["iteration"]) else np.nan,
             "Entry Timestamp": entry["timestamp"] if "timestamp" in entry.index else "",
