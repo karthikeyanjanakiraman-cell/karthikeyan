@@ -32,6 +32,7 @@ except Exception:
     safefloat = lambda v, default=np.nan: default if v is None or str(v).strip()=="" else float(v)
 CLIENT_ID = os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN") or os.environ.get("ACCESSTOKEN")
+fyers = None
 
 
 def pick_latest_file(pattern: str, base_dir: Path = BASE_DIR) -> Optional[Path]:
@@ -100,27 +101,24 @@ def build_top_lists(asit_path: Path, top_n: int = TOP_N) -> Tuple[pd.DataFrame, 
 
 
 def fetch_option_chain(underlying: str) -> pd.DataFrame:
-    if initfyers is not None:
+    global fyers
+    if fyers is None:
         try:
-            initfyers()
+            if initfyers is not None:
+                fyers = initfyers()
         except Exception:
-            pass
-    fy = globals().get('fyers')
-    if fy is None:
+            fyers = None
+    if fyers is None:
         try:
-            import OPTIONS_OI as opt
-            fy = getattr(opt, 'fyers', None)
-            if fy is None and hasattr(opt, 'initfyers'):
-                fy = opt.initfyers()
-        except Exception:
-            fy = None
-    if fy is None:
-        logger.warning("Fyers client not available")
-        return pd.DataFrame()
+            import fyersModel
+            fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=False, log_path="")
+        except Exception as e:
+            logger.warning("Fyers client not available: %s", e)
+            return pd.DataFrame()
     eqsymbol = formateqsymbol(underlying)
     logger.info("API chain fetch underlying=%s eqsymbol=%s client=%s token=%s", underlying, eqsymbol, bool(CLIENT_ID), bool(ACCESS_TOKEN))
     try:
-        chainres = fy.optionchain({"symbol": eqsymbol, "strikecount": 50})
+        chainres = fyers.optionchain({"symbol": eqsymbol, "strikecount": 50})
         logger.info("chain response keys for %s: %s", underlying, list((chainres or {}).keys()) if isinstance(chainres, dict) else type(chainres))
     except Exception as e:
         logger.warning("optionchain failed for %s: %s", underlying, e)
