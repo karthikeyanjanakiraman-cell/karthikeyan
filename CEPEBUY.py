@@ -205,11 +205,16 @@ def latest_buy_entry(iter_slice: pd.DataFrame) -> Optional[pd.Series]:
 def process_cepebuy() -> Tuple[pd.DataFrame, pd.DataFrame]:
     logger.info("=== CEPEBUY starting ===")
     greeks_path = pick_latest_file(GREEKS_GLOB)
-    iteration_path = pick_latest_file(ITERATION_GLOB)
     logger.info("Using greeks file: %s", greeks_path.resolve())
-    logger.info("Using iteration file: %s", iteration_path.resolve())
     greeks_df = normalize_greeks_df(load_csv(greeks_path))
-    iter_df = normalize_iteration_df(load_csv(iteration_path))
+    iter_cols = ["Underlying", "Option Type", "Strike", "iteration", "window_signal", "close", "timestamp", "Option Symbol", "current_window_score", "previous_trading_day_same_time_score", "window_delta"]
+    try:
+        iteration_path = pick_latest_file(ITERATION_GLOB)
+        logger.info("Using iteration file: %s", iteration_path.resolve())
+        iter_df = normalize_iteration_df(load_csv(iteration_path))
+    except FileNotFoundError:
+        logger.warning("No iteration history file found; using empty iteration dataframe")
+        iter_df = pd.DataFrame(columns=iter_cols)
     candidates = build_candidate_rows(greeks_df)
     results = []
     missing_rows = []
@@ -219,6 +224,9 @@ def process_cepebuy() -> Tuple[pd.DataFrame, pd.DataFrame]:
         strike = float(row["Strike"])
         greeks_ltp = row["LTP"] if "LTP" in row.index else np.nan
         greeks_option_symbol = row["Option Symbol"] if "Option Symbol" in row.index else np.nan
+        if iter_df.empty:
+            missing_rows.append({"Underlying": underlying, "Option Type": option_type, "Strike": strike, "Option Symbol": greeks_option_symbol, "Status": "NO_ITERATION_FILE", "Reason": "No iteration history file available"})
+            continue
         iter_slice = iter_df[(iter_df["Underlying"] == underlying) & (iter_df["Option Type"] == option_type) & (iter_df["Strike"] == strike)].copy()
         if iter_slice.empty:
             missing_rows.append({"Underlying": underlying, "Option Type": option_type, "Strike": strike, "Option Symbol": greeks_option_symbol, "Status": "NO_ITERATION_ROWS", "Reason": "No rows found in latest iteration file for underlying/type/strike"})
@@ -241,9 +249,9 @@ def process_cepebuy() -> Tuple[pd.DataFrame, pd.DataFrame]:
         logger.info("Saved trade output: %s | rows=%s", OUTPUT_FILE, len(out_df))
     else:
         logger.info("No trade candidates found")
+    missing_df.to_csv(MISSING_FILE, index=False)
+    logger.info("Saved missing report: %s | rows=%s", MISSING_FILE, len(missing_df))
     if not missing_df.empty:
-        missing_df.to_csv(MISSING_FILE, index=False)
-        logger.info("Saved missing report: %s | rows=%s", MISSING_FILE, len(missing_df))
         logger.info("Missing status summary: %s", missing_df["Status"].value_counts().to_dict())
     return out_df, missing_df
 
