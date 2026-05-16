@@ -376,9 +376,65 @@ def process_cepebuy() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
     return out_df, missing_df
 
+def build_iteration_history_from_asit_csv(asit_csv_path: str, output_csv_path: str = None):
+    import glob, os, pandas as pd, numpy as np
+    if output_csv_path is None:
+        output_csv_path = os.path.join(OUTPUT_DIR, f"fo_iteration_history_{datetime.now().strftime('%Y%m%d_%H%M%S')}.csv")
+    df = pd.read_csv(asit_csv_path)
+    cols = {c.lower().strip(): c for c in df.columns}
+    sym_col = next((cols[k] for k in ['symbol', 'underlying', 'ticker', 'tradingsymbol', 'name'] if k in cols), None)
+    if sym_col is None:
+        raise ValueError('No symbol column found in asit csv')
+    bull_col = next((cols[k] for k in ['bull', 'bullish', 'bull rank', 'bull_rank', 'bullsignal', 'bull signal'] if k in cols), None)
+    bear_col = next((cols[k] for k in ['bear', 'bearish', 'bear rank', 'bear_rank', 'bearsignal', 'bear signal'] if k in cols), None)
+    score_col = next((cols[k] for k in ['rank delta', 'rank_delta', 'score', 'overall', 'email_rank_score'] if k in cols), None)
+    work = df.copy()
+    if bull_col is not None:
+        work[bull_col] = pd.to_numeric(work[bull_col], errors='coerce')
+        bull_df = work.sort_values(bull_col, ascending=False).head(20)
+    else:
+        bull_df = work.head(20)
+    if bear_col is not None:
+        work[bear_col] = pd.to_numeric(work[bear_col], errors='coerce')
+        bear_df = work.sort_values(bear_col, ascending=False).head(20)
+    else:
+        bear_df = work.tail(20)
+    if score_col is not None:
+        work[score_col] = pd.to_numeric(work[score_col], errors='coerce')
+    selected = pd.concat([bull_df, bear_df], ignore_index=True).drop_duplicates(subset=[sym_col]).reset_index(drop=True)
+    all_hist = []
+    for _, row in selected.iterrows():
+        symbol = str(row[sym_col]).strip()
+        if not symbol:
+            continue
+        if not symbol.startswith('NSE:'):
+            hist_symbol = f'NSE:{symbol}'
+        else:
+            hist_symbol = symbol
+        intradf = gethistory(hist_symbol, '5', INTRADAY_LOOKBACKDAYS)
+        if intradf is None or intradf.empty:
+            continue
+        hist = builditerationhistory(intradf, SIGNALWINDOWMINUTES, ITERATIONSTOKEEP)
+        if hist is None or hist.empty:
+            continue
+        hist.insert(0, 'Source Symbol', symbol)
+        hist.insert(1, 'Source File', os.path.basename(asit_csv_path))
+        all_hist.append(hist)
+    if all_hist:
+        out = pd.concat(all_hist, ignore_index=True)
+        out.to_csv(output_csv_path, index=False)
+        return out, output_csv_path
+    empty = pd.DataFrame()
+    empty.to_csv(output_csv_path, index=False)
+    return empty, output_csv_path
 
 def main():
     try:
+        asit_files = sorted(glob.glob("asit*.csv"), key=os.path.getmtime, reverse=True)
+if asit_files:
+    asit_path = asit_files[0]
+    asit_iter_df, asit_iter_csv = build_iteration_history_from_asit_csv(asit_path)
+    logger.info(f"Saved ASIT iteration history: {asit_iter_csv}")
         process_cepebuy()
     except Exception as e:
         logger.exception("CEPEBUY failed: %s", e)
