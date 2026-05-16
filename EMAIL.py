@@ -53,9 +53,9 @@ TIMEFRAMES = {
 class UTF8Formatter(logging.Formatter):
     def format(self, record):
         msg = record.getMessage()
-        msg = msg.replace('âŒ', '[ERROR]').replace('âœ…', '[OK]')
-        msg = msg.replace('ðŸŸ¢', '[GREEN]').replace('ðŸŸ¡', '[YELLOW]').replace('ðŸ”´', '[RED]')
-        msg = msg.replace('âš ï¸', '[WARN]').replace('ðŸ“Š', '[DATA]').replace('ðŸŽ¯', '[TARGET]')
+        msg = msg.replace('Ã¢ÂÅ’', '[ERROR]').replace('Ã¢Å“â€¦', '[OK]')
+        msg = msg.replace('Ã°Å¸Å¸Â¢', '[GREEN]').replace('Ã°Å¸Å¸Â¡', '[YELLOW]').replace('Ã°Å¸â€Â´', '[RED]')
+        msg = msg.replace('Ã¢Å¡ Ã¯Â¸Â', '[WARN]').replace('Ã°Å¸â€œÅ ', '[DATA]').replace('Ã°Å¸Å½Â¯', '[TARGET]')
         record.msg = msg
         return super().format(record)
 
@@ -690,12 +690,14 @@ def get_yf_symbol(symbol):
 
 def get_stock_history(symbol, period='1y', interval='1d'):
     try:
+        import yfinance as yf
         return yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=False)
     except Exception:
         return pd.DataFrame()
 
 def get_intraday_data(symbol, period='5d', interval='5m'):
     try:
+        import yfinance as yf
         return yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=False)
     except Exception:
         return pd.DataFrame()
@@ -772,7 +774,6 @@ def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) 
         entry = df.get('EntryConfidence', 0)
         exits = df.get('ExitSignalsCount', 0)
         pullback = df.get('PullbackPct', 0)
-        # Higher is better for bullish; lower pullback and fewer exits improve score
         df['Diff'] = entry.fillna(0) * 100 + strength.fillna(0) * 25 - exits.fillna(0) * 10 - pullback.fillna(0) * 2
     if side.lower().startswith('bull'):
         df = df.sort_values(['Diff', 'RankScore15Tier'], ascending=[False, False])
@@ -801,10 +802,7 @@ def build_combined_report_df(df_side: pd.DataFrame, side: str, sector_map: dict 
     else:
         df['Score2'] = 0
     df['Combined'] = pd.to_numeric(df['Score'], errors='coerce').fillna(0) + pd.to_numeric(df['Score2'], errors='coerce').fillna(0)
-    if side.lower().startswith('bull'):
-        df = df.sort_values(['Combined', 'Diff'], ascending=[False, False])
-    else:
-        df = df.sort_values(['Combined', 'Diff'], ascending=[False, False])
+    df = df.sort_values(['Combined', 'Diff'], ascending=[False, False])
     keep_cols = [c for c in ['Symbol','Stock Chg','Sector Chg','Vol Shock','Efficiency','Score','RankScore15Tier','DominantTrend','TrendStrength','EntryConfidence','ExitSignalsCount','ExitReason','Sector','Combined'] if c in df.columns]
     return df[keep_cols].reset_index(drop=True).head(15)
 
@@ -908,4 +906,4 @@ def main():
     logger.info('[MAIN] Completed run')
 
 if __name__ == '__main__':
-    main()
+    main() 
