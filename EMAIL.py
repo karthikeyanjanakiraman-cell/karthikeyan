@@ -53,6 +53,16 @@ def get_cfg(section, key, env_name=None, default=None, is_int=False):
         return int(val) if is_int else val
     return default
 
+def retry_call(fn, *args, retries=RETRY_COUNT, sleep_s=RETRY_SLEEP_SECONDS, **kwargs):
+    last = None
+    for _ in range(retries):
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:
+            last = e
+            time.sleep(sleep_s)
+    raise last
+
 try:
     client_id = get_cfg('fyers_credentials', 'client_id', env_name='CLIENT_ID')
     token = get_cfg('fyers_credentials', 'access_token', env_name='ACCESS_TOKEN') or get_cfg('fyers_credentials', 'token', env_name='TOKEN')
@@ -78,6 +88,12 @@ MAX_DELTA_TARGET = 0.60
 DAILY_PROFIT_TARGET = 100000
 MAX_DAILY_LOSS = 50000
 MAX_STRIKE_DISTANCE_FROM_LTP = 2.5
+DIFF_ENTRY_WEIGHT = 100
+DIFF_TREND_WEIGHT = 25
+DIFF_EXIT_PENALTY = 10
+DIFF_PULLBACK_PENALTY = 2
+RETRY_COUNT = 3
+RETRY_SLEEP_SECONDS = 1.0
 TIMEFRAMES = {
     '5min': {'resolution': '5', 'days': 30, 'weight': 0.10},
     '15min': {'resolution': '15', 'days': 50, 'weight': 0.20},
@@ -144,6 +160,201 @@ class DailyPnLTracker:
         if datetime.now().date() != self.current_date:
             self._reset_daily()
         return (not self.target_achieved) and self.realized_pnl > -MAX_DAILY_LOSS
+
+class PyramidEntryTracker:
+    def __init__(self, signal_price, signal_type='bullish'):
+        self.signal_price = signal_price
+        self.signal_type = signal_type
+        self.entries = [{'price': signal_price, 'size_pct': 25, 'entry_num': 1}]
+        self.total_size = 25
+        self.avg_entry_price = signal_price
+        self.entry_history = []
+
+    def _recalc_avg_entry(self):
+        if not self.entries:
+            self.avg_entry_price = self.signal_price
+            return
+        total_value = sum(e['price'] * e['size_pct'] for e in self.entries)
+        self.avg_entry_price = total_value / self.total_size if self.total_size > 0 else self.signal_price
+
+    def add_entry(self, current_price, trigger_type):
+        if self.total_size >= 100:
+            return False
+        if self.signal_type == 'bullish':
+            pct_move = ((current_price - self.signal_price) / self.signal_price) * 100
+        else:
+            pct_move = ((self.signal_price - current_price) / self.signal_price) * 100
+        if pct_move < 2.0:
+            return False
+        self.entries.append({'price': current_price, 'size_pct': 25, 'entry_num': len(self.entries) + 1})
+        self.total_size += 25
+        self._recalc_avg_entry()
+        self.entry_history.append({'action': 'ADD', 'price': current_price, 'total_size': self.total_size, 'avg_price': self.avg_entry_price, 'move_pct': pct_move})
+        return True
+
+    def reduce_entry(self, current_price):
+        if len(self.entries) <= 1:
+            return False
+        if self.signal_type == 'bullish':
+            pct_move = ((self.signal_price - current_price) / self.signal_price) * 100
+        else:
+            pct_move = ((current_price - self.signal_price) / self.signal_price) * 100
+        if pct_move < 2.0:
+            return False
+        last_entry = self.entries.pop()
+        self.total_size -= last_entry['size_pct']
+        self._recalc_avg_entry()
+        self.entry_history.append({'action': 'REDUCE', 'price': current_price, 'total_size': self.total_size, 'avg_price': self.avg_entry_price, 'move_pct': pct_move})
+        return True
+
+    def get_improvement_pct(self):
+        if self.signal_type == 'bullish':
+            return ((self.signal_price - self.avg_entry_price) / self.signal_price) * 100
+        return ((self.avg_entry_price - self.signal_price) / self.signal_price) * 100
+
+class IVRankSystem:
+    def __init__(self, symbol):
+        self.symbol = symbol
+        self.iv_history = []
+        self.iv_52w_low = None
+        self.iv_52w_high = None
+        self.current_iv = None
+        self.iv_rank = None
+        self.iv_percentile = None
+
+    def add_iv_datapoint(self, iv_value, date=None):
+        if iv_value <= 0:
+            return
+        self.iv_history.append({'iv': iv_value, 'date': date or datetime.now()})
+        if len(self.iv_history) > 252:
+            self.iv_history = self.iv_history[-252:]
+        self.current_iv = iv_value
+        self._recalc_rank()
+
+    def _recalc_rank(self):
+        if len(self.iv_history) < 10:
+            self.iv_rank = 50
+            self.iv_percentile = 50
+            return
+        iv_values = [h['iv'] for h in self.iv_history]
+        self.iv_52w_low = min(iv_values)
+        self.iv_52w_high = max(iv_values)
+        if self.iv_52w_high == self.iv_52w_low:
+            self.iv_rank = 50
+        else:
+            self.iv_rank = ((self.current_iv - self.iv_52w_low) / (self.iv_52w_high - self.iv_52w_low)) * 100
+            self.iv_rank = max(0, min(100, self.iv_rank))
+        self.iv_percentile = percentileofscore(iv_values, self.current_iv)
+
+    def get_iv_regime(self):
+        if self.iv_rank is None:
+            return 'UNKNOWN', 50
+        if self.iv_rank < 30:
+            return 'CHEAP', self.iv_rank
+        elif self.iv_rank > 70:
+            return 'EXPENSIVE', self.iv_rank
+        return 'NORMAL', self.iv_rank
+
+    def should_buy_options(self):
+        if self.iv_rank is None:
+            return True
+        return self.iv_rank < 50
+
+    def should_sell_options(self):
+        if self.iv_rank is None:
+            return False
+        return self.iv_rank > 50
+
+class PutCallRatioFilter:
+    def __init__(self):
+        self.pcr_history = []
+
+    def add_pcr_datapoint(self, pcr_value):
+        self.pcr_history.append({'pcr': pcr_value, 'timestamp': datetime.now()})
+        if len(self.pcr_history) > 100:
+            self.pcr_history = self.pcr_history[-100:]
+
+    def get_current_pcr(self):
+        return self.pcr_history[-1]['pcr'] if self.pcr_history else 0.7
+
+    def should_buy_calls(self):
+        pcr = self.get_current_pcr()
+        if pcr < 0.5:
+            logger.info(f'[GAP#6] PCR={pcr:.2f} low')
+            return False
+        return True
+
+    def should_buy_puts(self):
+        pcr = self.get_current_pcr()
+        if pcr > 0.7:
+            logger.info(f'[GAP#6] PCR={pcr:.2f} high')
+            return False
+        return True
+
+class DailyPnLTracker:
+    def __init__(self, daily_target=DAILY_PROFIT_TARGET):
+        self.daily_target = daily_target
+        self.current_date = datetime.now().date()
+        self.realized_pnl = 0
+        self.trades_taken_today = 0
+        self.target_achieved = False
+
+    def add_trade_result(self, pnl_amount):
+        today = datetime.now().date()
+        if today != self.current_date:
+            self._reset_daily()
+        self.realized_pnl += pnl_amount
+        self.trades_taken_today += 1
+        if self.realized_pnl >= self.daily_target:
+            self.target_achieved = True
+
+    def can_trade(self):
+        if datetime.now().date() != self.current_date:
+            self._reset_daily()
+        return (not self.target_achieved) and self.realized_pnl > -MAX_DAILY_LOSS
+
+    def _reset_daily(self):
+        self.current_date = datetime.now().date()
+        self.realized_pnl = 0
+        self.trades_taken_today = 0
+        self.target_achieved = False
+
+    def get_surplus_for_scalps(self):
+        return max(0, self.realized_pnl - self.daily_target)
+
+class DynamicOptionsGreeks:
+    @staticmethod
+    def black_scholes_call(S, K, T, r, sigma):
+        if T <= 0 or sigma <= 0:
+            return max(S - K, 0)
+        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+        d2 = d1 - sigma * np.sqrt(T)
+        return S * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+
+    @staticmethod
+    def black_scholes_put(S, K, T, r, sigma):
+        if T <= 0 or sigma <= 0:
+            return max(K - S, 0)
+        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+        d2 = d1 - sigma * np.sqrt(T)
+        return K * np.exp(-r * T) * norm.cdf(-d2) - S * norm.cdf(-d1)
+
+    @staticmethod
+    def calculate_delta(S, K, T, r, sigma, option_type='call'):
+        if T <= 0:
+            return 1.0 if S > K else 0.0
+        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+        return norm.cdf(d1) if option_type == 'call' else norm.cdf(d1) - 1
+
+    @staticmethod
+    def calculate_theta(S, K, T, r, sigma, option_type='call'):
+        if T <= 0:
+            return 0
+        d1 = (np.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * np.sqrt(T))
+        d2 = d1 - sigma * np.sqrt(T)
+        term1 = -(S * norm.pdf(d1) * sigma) / (2 * np.sqrt(T))
+        term2 = (-r * K * np.exp(-r * T) * norm.cdf(d2)) if option_type == 'call' else (r * K * np.exp(-r * T) * norm.cdf(-d2))
+        return (term1 + term2) / 365
 
 def calculate_pullback_metrics(df):
     required_cols = {'high', 'close'}
@@ -269,7 +480,7 @@ def get_historical_data_with_validation(symbol, resolution, days_back):
     try:
         now = datetime.now()
         data = {'symbol': symbol, 'resolution': resolution, 'date_format': '1', 'range_from': (now - timedelta(days=days_back)).strftime('%Y-%m-%d'), 'range_to': now.strftime('%Y-%m-%d'), 'cont_flag': '1'}
-        response = fyers.history(data=data)
+        response = retry_call(fyers.history, data=data)
         if response.get('s') != 'ok' or 'candles' not in response or not response['candles']:
             return None
         df = pd.DataFrame(response['candles'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -331,6 +542,26 @@ def recommend_option_strikes_with_greeks_liquid_v30(symbol, ltp, signal_type, iv
         return None
     recs.sort(key=lambda x: abs(abs(x['delta']) - 0.50))
     return recs[0]
+
+def calculate_historical_volatility(df, window=30):
+    if df is None or len(df) < window or 'close' not in df.columns:
+        return 0.20
+    returns = np.log(df['close'] / df['close'].shift(1))
+    return returns.tail(window).std() * np.sqrt(252)
+
+def calculate_iv_skew_score(atm_iv, itm_iv, otm_iv):
+    if atm_iv <= 0:
+        return 0, 'UNKNOWN'
+    itm_skew = ((itm_iv - atm_iv) / atm_iv) * 100
+    otm_skew = ((otm_iv - atm_iv) / atm_iv) * 100
+    avg_skew = (itm_skew + otm_skew) / 2
+    if avg_skew < -5:
+        regime = 'NEGATIVE_SKEW'
+    elif avg_skew > 5:
+        regime = 'POSITIVE_SKEW'
+    else:
+        regime = 'FLAT_SKEW'
+    return avg_skew, regime
 
 def calculate_iv_percentile(current_iv, df, window=252):
     if df is None or len(df) < 20:
@@ -450,37 +681,198 @@ def store_results_in_db(df):
     x[cols].to_sql('stock_signals', conn, if_exists='append', index=False)
     conn.commit(); conn.close()
 
+def get_yf_symbol(symbol):
+    symbol = str(symbol).strip()
+    return symbol if symbol.endswith('.NS') or symbol.endswith('.BO') else f"{symbol}.NS"
+
+def get_stock_history(symbol, period='1y', interval='1d'):
+    try:
+        return yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=False)
+    except Exception:
+        return pd.DataFrame()
+
+def get_intraday_data(symbol, period='5d', interval='5m'):
+    try:
+        return yf.download(symbol, period=period, interval=interval, progress=False, auto_adjust=False)
+    except Exception:
+        return pd.DataFrame()
+
+def get_intraday_volume_shock(df, lookback=20):
+    if df is None or df.empty or 'Volume' not in df.columns:
+        return 1.0
+    avg = df['Volume'].tail(lookback).mean()
+    cur = df['Volume'].iloc[-1]
+    return cur / avg if avg and avg > 0 else 1.0
+
+def get_prev_close_from_hist(df):
+    if df is None or df.empty or 'Close' not in df.columns:
+        return None
+    return df['Close'].iloc[-2] if len(df) > 1 else df['Close'].iloc[-1]
+
+def get_volatility_from_hist(df, window=30):
+    if df is None or df.empty or 'Close' not in df.columns:
+        return 0.0
+    returns = np.log(df['Close'] / df['Close'].shift(1))
+    return returns.tail(window).std() * np.sqrt(252)
+
+def get_sector_label(symbol, sector_map=None):
+    if sector_map and symbol in sector_map:
+        return sector_map[symbol]
+    return 'Unknown'
+
+def get_sector_pct_yf(symbol):
+    return 0.0
+
+def compute_prev_intra(df):
+    if df is None or df.empty:
+        return None
+    return df.iloc[-2] if len(df) > 1 else df.iloc[-1]
+
+def create_sector_map_from_industry(sectors_folder='sectors', direct_csv='indnifty100list.csv'):
+    sector_map = {}
+    if direct_csv and os.path.exists(direct_csv):
+        try:
+            df = pd.read_csv(direct_csv)
+            for _, row in df.iterrows():
+                symbol = str(row.get('Symbol', '')).strip()
+                if symbol:
+                    sector_map[f'NSE:{symbol}-EQ'] = str(row.get('Industry', 'Unknown')).strip()
+        except Exception as e:
+            logger.warning(f'[SECTOR] direct_csv read error: {e}')
+    if os.path.exists(sectors_folder):
+        for fn in os.listdir(sectors_folder):
+            if fn.endswith('.csv'):
+                try:
+                    df = pd.read_csv(os.path.join(sectors_folder, fn))
+                    for _, row in df.iterrows():
+                        symbol = str(row.get('Symbol', '')).strip()
+                        if symbol:
+                            sector_map[f'NSE:{symbol}-EQ'] = str(row.get('Industry', 'Unknown')).strip()
+                except Exception as e:
+                    logger.warning(f'[SECTOR] {fn} error: {e}')
+    return sector_map
+
+def calculate_pcr(pcr_filter):
+    return pcr_filter.get_current_pcr() if pcr_filter else 0.7
+
+def calculate_iv_rank(iv_sys):
+    return iv_sys.iv_rank if iv_sys and iv_sys.iv_rank is not None else 50
+
 def build_display_df(df_side: pd.DataFrame, side: str, sector_map: dict = None) -> pd.DataFrame:
     if df_side is None or df_side.empty:
         return pd.DataFrame()
     df = df_side.copy()
+    if 'Sector' not in df.columns:
+        df['Sector'] = df['Symbol'].apply(lambda s: get_sector_label(s, sector_map))
     if 'Diff' not in df.columns:
-        df['Diff'] = df.get('EntryConfidence', 0).fillna(0) * 100 - df.get('ExitSignalsCount', 0).fillna(0) * 10
-    return df.sort_values('Diff', ascending=False).reset_index(drop=True)
+        strength = df.get('TrendStrength', 0)
+        entry = df.get('EntryConfidence', 0)
+        exits = df.get('ExitSignalsCount', 0)
+        pullback = df.get('PullbackPct', 0)
+        # Higher is better for bullish; lower pullback and fewer exits improve score
+        df['Diff'] = entry.fillna(0) * 100 + strength.fillna(0) * 25 - exits.fillna(0) * 10 - pullback.fillna(0) * 2
+    if side.lower().startswith('bull'):
+        df = df.sort_values(['Diff', 'RankScore15Tier'], ascending=[False, False])
+    else:
+        df = df.sort_values(['Diff', 'RankScore15Tier'], ascending=[False, True])
+    return df.reset_index(drop=True)
 
-def send_email_rank_watchlist(csvfilename, msg=None):
+def send_email_rank_watchlist(csvfilename, msg=None, bullish_df=None, bearish_df=None):
     sender_email = os.getenv('SENDER_EMAIL')
     sender_password = os.getenv('SENDER_PASSWORD')
     recipient_email = os.getenv('RECIPIENT_EMAIL')
+    smtp_server = os.getenv('SMTP_SERVER', 'smtp.gmail.com')
+    smtp_port = int(os.getenv('SMTP_PORT', 587))
     if not all([sender_email, sender_password, recipient_email]):
+        logger.error('[EMAIL] Missing SENDER_EMAIL / SENDER_PASSWORD / RECIPIENT_EMAIL')
         return False
-    msg = msg or MIMEMultipart()
-    msg['From'] = sender_email
-    msg['To'] = recipient_email
-    msg['Subject'] = f'Intraday Rank Watchlist - {datetime.now().strftime("%Y-%m-%d %H:%M")}'
-    msg.attach(MIMEText(f'<html><body><h3>Rank Watchlist</h3><p>Attached: {os.path.basename(csvfilename)}</p></body></html>', 'html'))
+    if not os.path.exists(csvfilename):
+        logger.error(f'[EMAIL] Attachment not found: {csvfilename}')
+        return False
+
+    message = msg or MIMEMultipart()
+    message['From'] = sender_email
+    message['To'] = recipient_email
+    message['Subject'] = f'Intraday Rank Watchlist - {datetime.now().strftime("%Y-%m-%d %H:%M")}'
+
+    bull_count = 0 if bullish_df is None else len(bullish_df)
+    bear_count = 0 if bearish_df is None else len(bearish_df)
+
+    bull_html = bullish_df.to_html(index=False, border=1, justify='center') if bullish_df is not None and not bullish_df.empty else '<p>No bullish entries.</p>'
+    bear_html = bearish_df.to_html(index=False, border=1, justify='center') if bearish_df is not None and not bearish_df.empty else '<p>No bearish entries.</p>'
+
+    html_body = f"""
+    <html>
+      <body style='font-family:Arial,sans-serif'>
+        <h3>Intraday Rank Watchlist</h3>
+        <p>Attached CSV: {os.path.basename(csvfilename)}</p>
+        <p><b>Bullish rows:</b> {bull_count} | <b>Bearish rows:</b> {bear_count}</p>
+        <h4>Bullish</h4>
+        {bull_html}
+        <h4>Bearish</h4>
+        {bear_html}
+      </body>
+    </html>
+    """
+    message.attach(MIMEText(html_body, 'html'))
+
     with open(csvfilename, 'rb') as f:
         part = MIMEBase('application', 'octet-stream')
         part.set_payload(f.read())
     encoders.encode_base64(part)
     part.add_header('Content-Disposition', f'attachment; filename={os.path.basename(csvfilename)}')
-    msg.attach(part)
-    server = smtplib.SMTP(os.getenv('SMTP_SERVER', 'smtp.gmail.com'), int(os.getenv('SMTP_PORT', 587)))
-    server.starttls()
-    server.login(sender_email, sender_password)
-    server.sendmail(sender_email, recipient_email, msg.as_string())
-    server.quit()
-    return True
+    message.attach(part)
+
+    try:
+        server = retry_call(smtplib.SMTP, smtp_server, smtp_port, timeout=30)
+        retry_call(server.ehlo)
+        retry_call(server.starttls)
+        retry_call(server.ehlo)
+        retry_call(server.login, sender_email, sender_password)
+        retry_call(server.sendmail, sender_email, [recipient_email], message.as_string())
+        retry_call(server.quit)
+        logger.info(f'[EMAIL] Sent to {recipient_email}')
+        return True
+    except Exception as e:
+        logger.error(f'[EMAIL] Send failed: {e}')
+        return False
+
+
+
+
+
+def main():
+    logger.info('[MAIN] Starting strategy run')
+    sector_map = create_sector_map_from_industry()
+    symbols = list(sector_map.keys())
+    if not symbols:
+        logger.error('[MAIN] No symbols loaded')
+        return
+    logger.info(f'[MAIN] Loaded {len(symbols)} symbols and {len(sector_map)} sector mappings')
+
+    init_daily_db()
+    results_df = rank_all_stocks_multitimeframe_v30(symbols)
+    if results_df.empty:
+        logger.error('[MAIN] No results generated')
+        return
+
+    results_df['Sector'] = results_df['Symbol'].apply(lambda s: get_sector_label(s, sector_map))
+    results_df['Diff'] = results_df.get('EntryConfidence', 0).fillna(0) * DIFF_ENTRY_WEIGHT + results_df.get('TrendStrength', 0).fillna(0) * DIFF_TREND_WEIGHT - results_df.get('ExitSignalsCount', 0).fillna(0) * DIFF_EXIT_PENALTY - results_df.get('PullbackPct', 0).fillna(0) * DIFF_PULLBACK_PENALTY
+
+    bullish_df = build_display_df(results_df[results_df['DominantTrend'] == 'BULLISH'].copy(), 'bullish', sector_map)
+    bearish_df = build_display_df(results_df[results_df['DominantTrend'] == 'BEARISH'].copy(), 'bearish', sector_map)
+
+    timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+    csvfilename = f'asit_intraday_greeks_v3_0_{timestamp}.csv'
+    results_df.to_csv(csvfilename, index=False)
+    store_results_in_db(results_df)
+
+    dry_run = os.getenv('DRY_RUN', '0').lower() in ('1', 'true', 'yes')
+    if dry_run:
+        logger.info('[MAIN] Dry run enabled, skipping email send')
+    else:
+        send_email_rank_watchlist(csvfilename, bullish_df=bullish_df, bearish_df=bearish_df)
+    logger.info('[MAIN] Completed run')
 
 if __name__ == '__main__':
-    print('Clean rewritten EMAIL.py ready')
+    main()
