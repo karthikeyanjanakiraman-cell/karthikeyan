@@ -1,8 +1,4 @@
 #!/usr/bin/env python3
-# CEPEBUY.py - Top 20 bullish and bearish from asit*.csv,
-# then CE for bullish and PE for bearish from iteration_history*.csv,
-# with price-only chain validation near ATM strike.
-
 import os
 import sys
 import logging
@@ -26,9 +22,9 @@ SMTP_PORT = int(os.environ.get('SMTP_PORT', '587'))
 
 TOP_N = int(os.environ.get('TOP_N', '20'))
 
-ENTRY_CONSEC = int(os.environ.get('ENTRY_CONSEC', '1'))
-ENTRY_CONFIRM = int(os.environ.get('ENTRY_CONFIRM', '1'))
-ENTRY_WINDOW = int(os.environ.get('ENTRY_WINDOW', '1'))
+ENTRY_CONSEC = int(os.environ.get('ENTRY_CONSEC', '3'))
+ENTRY_CONFIRM = int(os.environ.get('ENTRY_CONFIRM', '3'))
+ENTRY_WINDOW = int(os.environ.get('ENTRY_WINDOW', '3'))
 
 EXIT_15_CONSEC = int(os.environ.get('EXIT_15_CONSEC', '1'))
 EXIT_15_CONFIRM = int(os.environ.get('EXIT_15_CONFIRM', '1'))
@@ -87,7 +83,7 @@ def _direction_from_price(prev_close, curr_close):
     return 0
 
 def check_chain(closes, timestamps, consec, confirm, window, target_dir=None, after_time=None):
-    if not closes or len(timestamps) == 0 or len(closes) < 2:
+    if not closes or len(timestamps) < 2 or len(closes) < 2:
         return None, None
 
     dirs = []
@@ -148,22 +144,23 @@ def load_asit_top20():
     c_bear = _col(df, ['bearmultitfscore'])
     c_trend = _col(df, ['dominanttrend'])
     c_can = _col(df, ['cantradetoday'])
-    c_ltp = _col(df, ['ltp'])
+
     if c_symbol is None:
         raise ValueError('asit CSV missing Symbol column')
 
     work = df.copy()
+
     if c_can:
         can = work[c_can].astype(str).str.upper().isin(['TRUE', '1', 'YES', 'Y'])
         work = work[can | work[c_can].isna()]
 
-    for c in [c_rank, c_bull, c_bear, c_ltp]:
+    for c in [c_rank, c_bull, c_bear]:
         if c:
             work[c] = pd.to_numeric(work[c], errors='coerce')
 
     if c_bull and c_bear:
-        bull = work[(work[c_bull] >= work[c_bear])].copy()
-        bear = work[(work[c_bear] > work[c_bull])].copy()
+        bull = work[work[c_bull] >= work[c_bear]].copy()
+        bear = work[work[c_bear] > work[c_bull]].copy()
     elif c_trend:
         t = work[c_trend].astype(str).str.upper()
         bull = work[t.str.contains('BULL') | t.str.contains('UP')].copy()
@@ -181,6 +178,7 @@ def load_asit_top20():
 
     bull['Side'] = 'CE'
     bear['Side'] = 'PE'
+
     bull.columns = ['Stock'] + ([ 'RankScore15Tier' ] if c_rank else []) + ['Side']
     bear.columns = ['Stock'] + ([ 'RankScore15Tier' ] if c_rank else []) + ['Side']
 
@@ -188,16 +186,13 @@ def load_asit_top20():
     logger.info('Top bullish: %d, top bearish: %d', len(bull), len(bear))
     return out, path
 
-def nearest_atm_strike(grp, close_col, strike_col):
-    if strike_col is None:
+def nearest_atm_strike_from_ltp(grp, close_col, strike_col, ltp_value):
+    if strike_col is None or ltp_value is None or pd.isna(ltp_value):
         return None
     strikes = pd.to_numeric(grp[strike_col], errors='coerce').dropna().unique().tolist()
     if not strikes:
         return None
-    ltp = pd.to_numeric(grp[close_col], errors='coerce').dropna()
-    if ltp.empty:
-        return None
-    price = float(ltp.iloc[-1])
+    price = float(ltp_value)
     return min(strikes, key=lambda x: abs(float(x) - price))
 
 def evaluate(iter_df, top_df):
@@ -221,27 +216,34 @@ def evaluate(iter_df, top_df):
         iter_df[c_timestamp] = pd.to_datetime(iter_df[c_timestamp], errors='coerce')
     iter_df = iter_df.sort_values(c_timestamp)
 
-    for _, sel in top_df.iterrows():
-        stock = str(sel['Stock']).strip()
-        side = str(sel['Side']).strip().upper()
+    iter_df[c_underlying] = iter_df[c_underlying].astype(str).str.upper().str.strip()
+    iter_df[c_opt_type] = iter_df[c_opt_type].astype(str).str.upper().str.strip()
+    top_df['Stock'] = top_df['Stock'].astype(str).str.upper().str.strip()
 
-        grp = iter_df[iter_df[c_underlying].astype(str).str.upper() == stock.upper()].copy()
+    for _, sel in top_df.iterrows():
+        stock = sel['Stock']
+        side = str(sel['Side']).upper().strip()
+
+        grp = iter_df[iter_df[c_underlying] == stock].copy()
         if grp.empty:
+            logger.info('No iteration rows for %s', stock)
             continue
 
-        grp = grp[grp[c_opt_type].astype(str).str.upper() == side].copy()
+        grp = grp[grp[c_opt_type].str.contains(side, na=False)].copy()
         if grp.empty:
+            logger.info('No %s rows for %s', side, stock)
             continue
 
         grp = grp.sort_values(c_timestamp)
         latest = grp.iloc[-1]
+        ltp_val = pd.to_numeric(latest[c_close], errors='coerce')
 
-        atm_strike = nearest_atm_strike(grp, c_close, c_strike)
+        atm_strike = nearest_atm_strike_from_ltp(grp, c_close, c_strike, ltp_val)
         if atm_strike is not None and c_strike is not None:
             strike_series = pd.to_numeric(grp[c_strike], errors='coerce')
             sub = grp[strike_series == float(atm_strike)].copy()
             if not sub.empty:
-                grp = sub
+                grp = sub.sort_values(c_timestamp)
 
         closes = pd.to_numeric(grp[c_close], errors='coerce').tolist()
         timestamps = grp[c_timestamp]
@@ -255,6 +257,7 @@ def evaluate(iter_df, top_df):
             target_dir=entry_dir
         )
         if not entry_time:
+            logger.info('No entry chain for %s %s', stock, side)
             continue
 
         entry_dt = pd.to_datetime(entry_time)
@@ -284,8 +287,8 @@ def evaluate(iter_df, top_df):
             'Side': side,
             'Signal': 'BUY CE' if side == 'CE' else 'BUY PE',
             'ATMStrike': atm_strike if atm_strike is not None else '',
-            'EntryPrice': round(entry_price, 2) if entry_price is not None else '',
-            'LTP': latest[c_close] if c_close in latest else '',
+            'EntryPrice': round(float(entry_price), 2) if entry_price is not None else '',
+            'LTP': float(ltp_val) if pd.notna(ltp_val) else '',
             'Entry': entry_time,
             'Exit15': exit15_time or '-',
             'Exit39': exit39_time or '-',
@@ -327,12 +330,12 @@ def send_email(subject, html_body):
 
 def main():
     logger.info('=== CEPEBUY starting ===')
-    top_df, asit_path = load_asit_top20()
+    top_df, _ = load_asit_top20()
     if top_df.empty:
         logger.error('No bullish/bearish rows found in asit CSV')
         sys.exit(1)
 
-    iter_df, iter_path = _load_any(['iteration_history*.csv', 'fo_iteration_history*.csv'])
+    iter_df, _ = _load_any(['iteration_history*.csv', 'fo_iteration_history*.csv'])
     if iter_df.empty:
         logger.error('No iteration history CSV found')
         sys.exit(1)
@@ -344,7 +347,7 @@ def main():
 
     html_body = '<html><body style="font-family:sans-serif;">'
     html_body += '<h2>CE/PE Near ATM Signals</h2>'
-    html_body += '<p style="color:#666;font-size:12px;">Top 20 bullish names from asit*.csv are mapped to CE, top 20 bearish names to PE. Chain validation uses price only, and ATM is the strike nearest to LTP.</p>'
+    html_body += '<p style="color:#666;font-size:12px;">Top bullish names from asit map to CE and bearish names map to PE. Chain validation uses price only.</p>'
     html_body += build_html(rows) + '</body></html>'
     send_email('CE/PE Near ATM Signals ' + datetime.now().strftime('%d %b %H:%M'), html_body)
 
