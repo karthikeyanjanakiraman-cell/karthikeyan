@@ -1,5 +1,4 @@
 import os
-import glob
 import logging
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -13,256 +12,188 @@ logger = logging.getLogger(__name__)
 BASE_DIR = Path(os.environ.get("DATA_DIR", "."))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "."))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-
-GREEKS_GLOB = os.environ.get("GREEKS_GLOB", "asit_intraday_greeks_v3_0_*.csv")
-ITERATION_GLOB = os.environ.get("ITERATION_GLOB", "fo_iteration_history_*.csv")
-
-OUTPUT_FILE = OUTPUT_DIR / "cepebuy_output.csv"
-MISSING_FILE = OUTPUT_DIR / "cepebuy_missing_report.csv"
-
+ASIT_GLOB = os.environ.get("ASIT_GLOB", "asit*.csv")
+OUTPUT_BULL = OUTPUT_DIR / "top_10_bullish.csv"
+OUTPUT_BEAR = OUTPUT_DIR / "top_10_bearish.csv"
+OUTPUT_COMBINED = OUTPUT_DIR / "top_10_bull_bear.csv"
 MIN_OPTION_LTP = float(os.environ.get("MIN_OPTION_LTP", "10"))
-MIN_REQUIRED_ITERATIONS = int(os.environ.get("MIN_REQUIRED_ITERATIONS", "1"))
+TOP_N = int(os.environ.get("TOP_N", "10"))
+
+try:
+    from OPTIONS_OI import initfyers, gethistory, builditerationhistory, SIGNALWINDOWMINUTES, ITERATIONSTOKEEP, INTRADAYLOOKBACKDAYS, formateqsymbol, safefloat
+except Exception:
+    initfyers = None
+    gethistory = None
+    builditerationhistory = None
+    SIGNALWINDOWMINUTES = 5
+    ITERATIONSTOKEEP = 75
+    INTRADAYLOOKBACKDAYS = 20
+    formateqsymbol = lambda x: f"NSE:{str(x).strip().upper()}-EQ"
+    safefloat = lambda v, default=np.nan: default if v is None or str(v).strip()=="" else float(v)
 
 
-def pick_latest_file(pattern: str, base_dir: Path = BASE_DIR) -> Path:
+def pick_latest_file(pattern: str, base_dir: Path = BASE_DIR) -> Optional[Path]:
     files = sorted(base_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
-    if not files:
-        raise FileNotFoundError(f"No file found for pattern: {pattern} in {base_dir.resolve()}")
-    return files[0]
+    return files[0] if files else None
 
 
 def load_csv(path: Path) -> pd.DataFrame:
     df = pd.read_csv(path)
-    logger.info("Loaded %s: %s rows", path.name, len(df))
-    return df
-
-
-def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
     return df
 
 
-def standardize_text_series(series: pd.Series) -> pd.Series:
-    s = series.astype(str).str.strip().str.upper()
-    s = s.replace({"": np.nan, "NAN": np.nan, "NONE": np.nan, "NULL": np.nan, "NAT": np.nan})
-    return s
-
-
-def normalize_text(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    df = df.copy()
-    for col in cols:
-        if col in df.columns:
-            df[col] = standardize_text_series(df[col])
-    return df
-
-
-def to_numeric(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
-    df = df.copy()
-    for col in cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-    return df
-
-
-def find_first_column(df: pd.DataFrame, aliases: List[str]) -> Optional[str]:
-    lowered = {str(c).strip().lower(): c for c in df.columns}
-    for alias in aliases:
-        if alias.lower() in lowered:
-            return lowered[alias.lower()]
+def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    for c in candidates:
+        if c.lower() in cols:
+            return cols[c.lower()]
     return None
 
 
-def extract_option_type_from_symbol(series: pd.Series) -> pd.Series:
-    return standardize_text_series(series).str.extract(r"(CE|PE)\s*$", expand=False)
+def clean_text(s: pd.Series) -> pd.Series:
+    return s.astype(str).str.strip().str.upper().replace({"NAN": np.nan, "NONE": np.nan, "NULL": np.nan, "": np.nan})
 
 
-def extract_strike_from_symbol(series: pd.Series) -> pd.Series:
-    s = standardize_text_series(series).str.replace("NSE:", "", regex=False)
-    extracted = s.str.extract(r"\d{1,2}[A-Z]{3}(\d+(?:\.\d+)?)(?:CE|PE)$", expand=False)
-    return pd.to_numeric(extracted, errors="coerce")
+def score_frame(df: pd.DataFrame):
+    bull_col = find_col(df, ["BullMultiTFScore", "bull", "bullish", "buy", "long", "BullScore", "bull_score", "5min_BullScore", "15min_BullScore", "1hour_BullScore", "4hour_BullScore", "1day_BullScore"])
+    bear_col = find_col(df, ["BearMultiTFScore", "bear", "bearish", "sell", "short", "BearScore", "bear_score", "5min_BearScore", "15min_BearScore", "1hour_BearScore", "4hour_BearScore", "1day_BearScore"])
+    rank_col = find_col(df, ["RankScore15Tier", "score", "rank", "Score15Tier", "5min_Score15Tier", "15min_Score15Tier", "1hour_Score15Tier", "4hour_Score15Tier", "1day_Score15Tier"])
+    sym_col = find_col(df, ["Symbol", "symbol", "underlying", "ticker", "tradingsymbol", "name"])
+    trend_col = find_col(df, ["DominantTrend", "trend", "direction"])
+    if sym_col is None:
+        raise ValueError("No symbol column found in ASIT CSV")
+    for c in [bull_col, bear_col, rank_col]:
+        if c is not None:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+    if trend_col is not None:
+        df[trend_col] = clean_text(df[trend_col])
+    df[sym_col] = clean_text(df[sym_col])
+    return df, sym_col, bull_col, bear_col, rank_col, trend_col
 
 
-def extract_underlying_from_symbol(series: pd.Series) -> pd.Series:
-    s = standardize_text_series(series).str.replace("NSE:", "", regex=False)
-    extracted = s.str.extract(r"^([A-Z0-9&_-]+?)(?:\d{1,2}[A-Z]{3}\d+(?:\.\d+)?(?:CE|PE))$", expand=False)
-    return extracted
+def top_rows(df: pd.DataFrame, sort_col: Optional[str], n: int) -> pd.DataFrame:
+    out = df.copy()
+    if sort_col is not None:
+        out = out.sort_values(sort_col, ascending=False, na_position="last")
+    return out.head(n).reset_index(drop=True)
 
 
-def rename_greeks_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = normalize_columns(df)
-    alias_map = {
-        "Underlying": ["underlying", "symbol", "stock", "name", "ticker", "root", "base_symbol"],
-        "Option Type": ["option type", "option_type", "type", "cepe", "cp", "right", "optiontype"],
-        "Strike": ["strike", "strike price", "strike_price", "strikeprice"],
-        "LTP": ["ltp", "close", "price", "last_price", "last traded price", "last"],
-        "Option Symbol": ["option symbol", "option_symbol", "tradingsymbol", "trading symbol", "instrument", "instrument_name", "symbol_name", "contract", "contract_symbol"],
-    }
-    rename_map = {}
-    for std_col, aliases in alias_map.items():
-        found = find_first_column(df, aliases)
-        if found and found != std_col:
-            rename_map[found] = std_col
-    if rename_map:
-        df = df.rename(columns=rename_map)
-    return df
+def build_top_lists(asit_path: Path, top_n: int = TOP_N) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    df = load_csv(asit_path)
+    df, sym_col, bull_col, bear_col, rank_col, trend_col = score_frame(df)
+
+    bull_df = top_rows(df, bull_col or rank_col, top_n).copy()
+    bear_df = top_rows(df, bear_col or rank_col, top_n).copy()
+
+    bull_df["Side"] = "BULLISH"
+    bear_df["Side"] = "BEARISH"
+    bull_df["Underlying"] = bull_df[sym_col]
+    bear_df["Underlying"] = bear_df[sym_col]
+    bull_df["Option Symbol"] = bull_df[sym_col]
+    bear_df["Option Symbol"] = bear_df[sym_col]
+
+    combined = pd.concat([bull_df, bear_df], ignore_index=True)
+    return bull_df, bear_df, combined
 
 
-def normalize_greeks_df(df: pd.DataFrame) -> pd.DataFrame:
-    df = rename_greeks_columns(df)
-    df = normalize_text(df, [c for c in ["Underlying", "Option Type", "Option Symbol"] if c in df.columns])
-    for col in ["Underlying", "Option Type", "Strike", "LTP", "Option Symbol"]:
-        if col not in df.columns:
-            df[col] = np.nan
-    df = to_numeric(df, ["Strike", "LTP"])
-    if df["Option Symbol"].notna().any():
-        opt_sym = df["Option Symbol"].astype(str)
-        miss_type = df["Option Type"].isna()
-        if miss_type.any():
-            df.loc[miss_type, "Option Type"] = extract_option_type_from_symbol(opt_sym[miss_type])
-        miss_underlying = df["Underlying"].isna()
-        if miss_underlying.any():
-            df.loc[miss_underlying, "Underlying"] = extract_underlying_from_symbol(opt_sym[miss_underlying])
-        miss_strike = df["Strike"].isna()
-        if miss_strike.any():
-            df.loc[miss_strike, "Strike"] = extract_strike_from_symbol(opt_sym[miss_strike])
-    df["Option Type"] = standardize_text_series(df["Option Type"])
-    df["Underlying"] = standardize_text_series(df["Underlying"])
-    df["Strike"] = pd.to_numeric(df["Strike"], errors="coerce")
-    df["LTP"] = pd.to_numeric(df["LTP"], errors="coerce")
-    logger.info("Greeks missing summary | Underlying=%s | Option Type=%s | Strike=%s | LTP=%s | rows=%s", int(df["Underlying"].isna().sum()), int(df["Option Type"].isna().sum()), int(df["Strike"].isna().sum()), int(df["LTP"].isna().sum()), len(df))
-    return df
-
-
-def rename_iteration_columns(df: pd.DataFrame) -> pd.DataFrame:
-    df = normalize_columns(df)
-    alias_map = {
-        "Option Symbol": ["option symbol", "option_symbol"],
-        "Underlying": ["underlying"],
-        "Strike": ["strike"],
-        "Option Type": ["option type", "option_type"],
-        "iteration": ["iteration"],
-        "timestamp": ["timestamp"],
-        "current_window_score": ["current_window_score"],
-        "previous_trading_day_same_time_score": ["previous_trading_day_same_time_score"],
-        "window_delta": ["window_delta"],
-        "window_signal": ["window_signal"],
-        "close": ["close"],
-    }
-    rename_map = {}
-    for std_col, aliases in alias_map.items():
-        found = find_first_column(df, aliases)
-        if found and found != std_col:
-            rename_map[found] = std_col
-    if rename_map:
-        df = df.rename(columns=rename_map)
-    return df
-
-
-def normalize_iteration_df(df: pd.DataFrame) -> pd.DataFrame:
-    df = rename_iteration_columns(df)
-    df = normalize_text(df, ["Option Symbol", "Underlying", "Option Type", "window_signal"])
-    df = to_numeric(df, ["Strike", "iteration", "current_window_score", "previous_trading_day_same_time_score", "window_delta", "close"])
-    required = {"Underlying", "Option Type", "Strike", "iteration", "window_signal", "close"}
-    missing = required - set(df.columns)
-    if missing:
-        raise ValueError(f"Iteration file missing required columns: {sorted(missing)}")
-    df = df.dropna(subset=["Underlying", "Option Type", "Strike", "iteration"])
-    df["Option Type"] = standardize_text_series(df["Option Type"])
-    df["Underlying"] = standardize_text_series(df["Underlying"])
-    df["Strike"] = pd.to_numeric(df["Strike"], errors="coerce")
-    df["iteration"] = pd.to_numeric(df["iteration"], errors="coerce")
-    df = df.sort_values(["Underlying", "Option Type", "Strike", "iteration"]).reset_index(drop=True)
-    logger.info("Iteration summary | rows=%s | underlyings=%s | option_symbols=%s", len(df), df["Underlying"].nunique(), df["Option Symbol"].nunique() if "Option Symbol" in df.columns else 0)
-    return df
-
-
-def build_candidate_rows(greeks_df: pd.DataFrame) -> pd.DataFrame:
-    cols = [c for c in ["Underlying", "Option Type", "Strike", "LTP", "Option Symbol"] if c in greeks_df.columns]
-    candidates = greeks_df[cols].copy()
-    candidates["Underlying"] = standardize_text_series(candidates["Underlying"])
-    candidates["Option Type"] = standardize_text_series(candidates["Option Type"])
-    candidates["Strike"] = pd.to_numeric(candidates["Strike"], errors="coerce")
-    if "LTP" in candidates.columns:
-        candidates["LTP"] = pd.to_numeric(candidates["LTP"], errors="coerce")
-    candidates = candidates.dropna(subset=["Underlying", "Option Type", "Strike"])
-    if "LTP" in candidates.columns:
-        candidates = candidates[candidates["LTP"].fillna(0) >= MIN_OPTION_LTP]
-    candidates = candidates.drop_duplicates(subset=["Underlying", "Option Type", "Strike"]).reset_index(drop=True)
-    logger.info("Candidate rows after cleanup: %s", len(candidates))
-    return candidates
-
-
-def latest_buy_entry(iter_slice: pd.DataFrame) -> Optional[pd.Series]:
-    if iter_slice.empty:
-        return None
-    buy_df = iter_slice[iter_slice["window_signal"].astype(str).str.contains("BUY", case=False, na=False)].copy()
-    if buy_df.empty:
-        return None
-    buy_df = buy_df.sort_values("iteration")
-    return buy_df.iloc[-1]
-
-
-def process_cepebuy() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    logger.info("=== CEPEBUY starting ===")
-    greeks_path = pick_latest_file(GREEKS_GLOB)
-    logger.info("Using greeks file: %s", greeks_path.resolve())
-    greeks_df = normalize_greeks_df(load_csv(greeks_path))
-    iter_cols = ["Underlying", "Option Type", "Strike", "iteration", "window_signal", "close", "timestamp", "Option Symbol", "current_window_score", "previous_trading_day_same_time_score", "window_delta"]
+def fetch_option_chain(underlying: str) -> pd.DataFrame:
+    if gethistory is None:
+        return pd.DataFrame()
+    if initfyers is not None:
+        try:
+            initfyers()
+        except Exception:
+            pass
+    if 'fyers' not in globals() or globals().get('fyers') is None:
+        return pd.DataFrame()
+    eqsymbol = formateqsymbol(underlying)
     try:
-        iteration_path = pick_latest_file(ITERATION_GLOB)
-        logger.info("Using iteration file: %s", iteration_path.resolve())
-        iter_df = normalize_iteration_df(load_csv(iteration_path))
-    except FileNotFoundError:
-        logger.warning("No iteration history file found; using empty iteration dataframe")
-        iter_df = pd.DataFrame(columns=iter_cols)
-    candidates = build_candidate_rows(greeks_df)
-    results = []
-    missing_rows = []
-    for _, row in candidates.iterrows():
-        underlying = row["Underlying"]
-        option_type = row["Option Type"]
-        strike = float(row["Strike"])
-        greeks_ltp = row["LTP"] if "LTP" in row.index else np.nan
-        greeks_option_symbol = row["Option Symbol"] if "Option Symbol" in row.index else np.nan
-        if iter_df.empty:
-            missing_rows.append({"Underlying": underlying, "Option Type": option_type, "Strike": strike, "Option Symbol": greeks_option_symbol, "Status": "NO_ITERATION_FILE", "Reason": "No iteration history file available"})
+        chainres = fyers.optionchain({"symbol": eqsymbol, "strikecount": 50})
+    except Exception:
+        return pd.DataFrame()
+    chain = (chainres or {}).get("data") or (chainres or {}).get("optionsChain") or []
+    rows = []
+    for item in chain:
+        strike = safefloat(item.get("strikePrice") or item.get("strike"), np.nan)
+        typ = str(item.get("optionType") or item.get("type") or "").upper()
+        if pd.isna(strike) or typ not in ("CE", "PE"):
             continue
-        iter_slice = iter_df[(iter_df["Underlying"] == underlying) & (iter_df["Option Type"] == option_type) & (iter_df["Strike"] == strike)].copy()
-        if iter_slice.empty:
-            missing_rows.append({"Underlying": underlying, "Option Type": option_type, "Strike": strike, "Option Symbol": greeks_option_symbol, "Status": "NO_ITERATION_ROWS", "Reason": "No rows found in latest iteration file for underlying/type/strike"})
+        rows.append({
+            "Underlying": underlying,
+            "Option Type": typ,
+            "Strike": strike,
+            "Option Symbol": str(item.get("symbol") or item.get("tradingSymbol") or ""),
+            "OptionLTP": safefloat(item.get("ltp") or item.get("lp"), np.nan),
+            "OI": safefloat(item.get("oi") or item.get("openInterest"), np.nan),
+            "Volume": safefloat(item.get("volume"), np.nan),
+        })
+    return pd.DataFrame(rows)
+
+
+def fetch_iteration_history(option_symbol: str) -> pd.DataFrame:
+    if gethistory is None or builditerationhistory is None:
+        return pd.DataFrame()
+    hist_symbol = option_symbol if str(option_symbol).startswith("NSE:") else f"NSE:{option_symbol}"
+    intradf = gethistory(hist_symbol, "5", INTRADAYLOOKBACKDAYS)
+    if intradf is None or intradf.empty:
+        return pd.DataFrame()
+    return builditerationhistory(intradf, SIGNALWINDOWMINUTES, ITERATIONSTOKEEP)
+
+
+def build_api_scans(seed_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    option_rows = []
+    iter_rows = []
+    if seed_df is None or seed_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    for _, row in seed_df.iterrows():
+        underlying = str(row.get("Underlying", "")).strip()
+        side = str(row.get("Side", "")).upper()
+        req_type = "CE" if side.startswith("BULL") else "PE"
+        chain = fetch_option_chain(underlying)
+        if chain.empty:
             continue
-        if len(iter_slice) < MIN_REQUIRED_ITERATIONS:
-            missing_rows.append({"Underlying": underlying, "Option Type": option_type, "Strike": strike, "Option Symbol": greeks_option_symbol, "Status": "LOW_ITERATION_COUNT", "Reason": f"Only {len(iter_slice)} rows in iteration history"})
+        chain = chain[chain["Option Type"] == req_type].copy()
+        if chain.empty:
             continue
-        entry = latest_buy_entry(iter_slice)
-        if entry is None:
-            missing_rows.append({"Underlying": underlying, "Option Type": option_type, "Strike": strike, "Option Symbol": greeks_option_symbol, "Status": "NO_ENTRY_CHAIN", "Reason": "No BUY signal present in iteration rows"})
-            continue
-        ordered = iter_slice.sort_values("iteration")
-        last_row = ordered.iloc[-1]
-        results.append({"Underlying": underlying, "Option Type": option_type, "Strike": strike, "Greeks Option Symbol": greeks_option_symbol, "Iter Option Symbol": last_row["Option Symbol"] if "Option Symbol" in last_row.index else np.nan, "Greeks LTP": greeks_ltp, "Entry Iteration": int(entry["iteration"]) if pd.notna(entry["iteration"]) else np.nan, "Entry Timestamp": entry["timestamp"] if "timestamp" in entry.index else "", "Entry Signal": entry["window_signal"], "Entry Close": entry["close"], "Entry Score": entry["current_window_score"] if "current_window_score" in entry.index else np.nan, "Entry Delta": entry["window_delta"] if "window_delta" in entry.index else np.nan, "Last Seen Iteration": int(last_row["iteration"]) if pd.notna(last_row["iteration"]) else np.nan, "Last Seen Signal": last_row["window_signal"], "Last Seen Close": last_row["close"], "Total Iter Rows": len(iter_slice)})
-    out_df = pd.DataFrame(results)
-    missing_df = pd.DataFrame(missing_rows)
-    if not out_df.empty:
-        out_df = out_df.sort_values(["Entry Iteration", "Entry Delta", "Total Iter Rows"], ascending=[False, False, False]).reset_index(drop=True)
-        out_df.to_csv(OUTPUT_FILE, index=False)
-        logger.info("Saved trade output: %s | rows=%s", OUTPUT_FILE, len(out_df))
-    else:
-        logger.info("No trade candidates found")
-    missing_df.to_csv(MISSING_FILE, index=False)
-    logger.info("Saved missing report: %s | rows=%s", MISSING_FILE, len(missing_df))
-    if not missing_df.empty:
-        logger.info("Missing status summary: %s", missing_df["Status"].value_counts().to_dict())
-    return out_df, missing_df
+        option_rows.append(chain)
+        for _, crow in chain.iterrows():
+            hist = fetch_iteration_history(crow.get("Option Symbol", ""))
+            if hist is None or hist.empty:
+                continue
+            hist.insert(0, "Source Underlying", underlying)
+            hist.insert(1, "Source Option Symbol", crow.get("Option Symbol", ""))
+            hist.insert(2, "Source Option Type", req_type)
+            iter_rows.append(hist)
+    options_df = pd.concat(option_rows, ignore_index=True) if option_rows else pd.DataFrame()
+    iter_df = pd.concat(iter_rows, ignore_index=True) if iter_rows else pd.DataFrame()
+    return options_df, iter_df
+
+
+def save_outputs(bull_df: pd.DataFrame, bear_df: pd.DataFrame, combined: pd.DataFrame):
+    bull_df.to_csv(OUTPUT_BULL, index=False)
+    bear_df.to_csv(OUTPUT_BEAR, index=False)
+    combined.to_csv(OUTPUT_COMBINED, index=False)
+    logger.info("Saved %s, %s, %s", OUTPUT_BULL, OUTPUT_BEAR, OUTPUT_COMBINED)
 
 
 def main():
-    try:
-        process_cepebuy()
-    except Exception as e:
-        logger.exception("CEPEBUY failed: %s", e)
-        raise
+    asit_file = pick_latest_file(ASIT_GLOB)
+    if asit_file is None:
+        raise FileNotFoundError(f"No file found for pattern {ASIT_GLOB} in {BASE_DIR.resolve()}")
+    logger.info("Using ASIT file: %s", asit_file.resolve())
+    bull_df, bear_df, combined = build_top_lists(asit_file, top_n=TOP_N)
+    save_outputs(bull_df, bear_df, combined)
+    options_df, iter_df = build_api_scans(combined)
+    if not options_df.empty:
+        options_df.to_csv(OUTPUT_DIR / "api_options.csv", index=False)
+    if not iter_df.empty:
+        iter_df.to_csv(OUTPUT_DIR / "api_iteration_history.csv", index=False)
+    print(f"ASIT file: {asit_file}")
+    print(f"Top bullish: {len(bull_df)}")
+    print(f"Top bearish: {len(bear_df)}")
+    print(f"API option rows: {len(options_df)}")
+    print(f"API iteration rows: {len(iter_df)}")
 
 
 if __name__ == "__main__":
