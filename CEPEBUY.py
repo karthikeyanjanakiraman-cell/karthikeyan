@@ -429,12 +429,17 @@ def build_iteration_history_from_asit_csv(asit_csv_path: str, output_csv_path: s
     return empty, output_csv_path
 
 def main():
-    try:
-        asit_files = sorted(glob.glob("asit*.csv"), key=os.path.getmtime, reverse=True)
+    import glob
+asit_files = sorted(glob.glob("asit*.csv"), key=os.path.getmtime, reverse=True)
 if asit_files:
     asit_path = asit_files[0]
-    asit_iter_df, asit_iter_csv = build_iteration_history_from_asit_csv(asit_path)
-    logger.info(f"Saved ASIT iteration history: {asit_iter_csv}")
+    try:
+        asit_df = pd.read_csv(asit_path)
+        # your processing here
+        logger.info(f"Loaded ASIT file: {asit_path}")
+    except Exception as e:
+        logger.warning(f"Could not read asit file: {e}")
+    try:
         process_cepebuy()
     except Exception as e:
         logger.exception("CEPEBUY failed: %s", e)
