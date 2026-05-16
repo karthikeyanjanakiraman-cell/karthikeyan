@@ -1,9 +1,7 @@
 #!/usr/bin/env python3
-# CEPEBUY.py - CSV-only chain exits with runtime lookback from latest iteration time
-# Entry: chain-based on full CSV.
-# Exit15/Exit39: chain confirmations on rolling windows from the SAME CSV.
-# Rule: use last iteration time - 15/39 minutes if (last_iteration_time - entry_time) >= 15/39 minutes.
-# Then confirm opposite-direction chain inside that lookback slice.
+# CEPEBUY.py - Top 20 bullish and bearish from asit*.csv,
+# then CE for bullish and PE for bearish from iteration_history*.csv,
+# with price-only chain validation near ATM strike.
 
 import os
 import sys
@@ -20,23 +18,25 @@ import pandas as pd
 logging.basicConfig(level=logging.INFO, format='%(asctime)s | %(levelname)s | %(message)s')
 logger = logging.getLogger(__name__)
 
-SENDER_EMAIL    = os.environ.get('SENDER_EMAIL')
+SENDER_EMAIL = os.environ.get('SENDER_EMAIL')
 SENDER_PASSWORD = os.environ.get('SENDER_PASSWORD')
 RECIPIENT_EMAIL = os.environ.get('RECIPIENT_EMAIL')
-SMTP_HOST       = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
-SMTP_PORT       = int(os.environ.get('SMTP_PORT', '587'))
+SMTP_HOST = os.environ.get('SMTP_HOST', 'smtp.gmail.com')
+SMTP_PORT = int(os.environ.get('SMTP_PORT', '587'))
 
-ENTRY_CONSEC   = int(os.environ.get('ENTRY_CONSEC', '3'))
-ENTRY_CONFIRM  = int(os.environ.get('ENTRY_CONFIRM', '3'))
-ENTRY_WINDOW   = int(os.environ.get('ENTRY_WINDOW', '3'))
+TOP_N = int(os.environ.get('TOP_N', '20'))
 
-EXIT_15_CONSEC  = int(os.environ.get('EXIT_15_CONSEC', '1'))
+ENTRY_CONSEC = int(os.environ.get('ENTRY_CONSEC', '3'))
+ENTRY_CONFIRM = int(os.environ.get('ENTRY_CONFIRM', '3'))
+ENTRY_WINDOW = int(os.environ.get('ENTRY_WINDOW', '3'))
+
+EXIT_15_CONSEC = int(os.environ.get('EXIT_15_CONSEC', '1'))
 EXIT_15_CONFIRM = int(os.environ.get('EXIT_15_CONFIRM', '1'))
-EXIT_15_WINDOW  = int(os.environ.get('EXIT_15_WINDOW', '1'))
+EXIT_15_WINDOW = int(os.environ.get('EXIT_15_WINDOW', '1'))
 
-EXIT_39_CONSEC  = int(os.environ.get('EXIT_39_CONSEC', '1'))
+EXIT_39_CONSEC = int(os.environ.get('EXIT_39_CONSEC', '1'))
 EXIT_39_CONFIRM = int(os.environ.get('EXIT_39_CONFIRM', '1'))
-EXIT_39_WINDOW  = int(os.environ.get('EXIT_39_WINDOW', '1'))
+EXIT_39_WINDOW = int(os.environ.get('EXIT_39_WINDOW', '1'))
 
 def _find_latest(pattern):
     matches = []
@@ -46,15 +46,16 @@ def _find_latest(pattern):
             continue
         for match in root.rglob(pattern):
             ap = str(match.resolve())
-            if ap not in seen:
-                seen.add(ap)
-                try:
-                    matches.append((os.path.getmtime(ap), ap))
-                except OSError:
-                    pass
+            if ap in seen:
+                continue
+            seen.add(ap)
+            try:
+                matches.append((os.path.getmtime(ap), ap))
+            except OSError:
+                pass
     if not matches:
         return None
-    matches.sort(reverse=True, key=lambda x: x[0])
+    matches.sort(key=lambda x: x[0], reverse=True)
     return matches[0][1]
 
 def _load_any(patterns):
@@ -64,10 +65,17 @@ def _load_any(patterns):
             try:
                 df = pd.read_csv(path)
                 logger.info('Loaded %s: %d rows', os.path.basename(path), len(df))
-                return df
+                return df, path
             except Exception as exc:
                 logger.warning('Failed reading %s: %s', path, exc)
-    return pd.DataFrame()
+    return pd.DataFrame(), None
+
+def _col(df, candidates):
+    cols = {c.lower().strip(): c for c in df.columns}
+    for c in candidates:
+        if c.lower() in cols:
+            return cols[c.lower()]
+    return None
 
 def _direction_from_price(prev_close, curr_close):
     if pd.isna(prev_close) or pd.isna(curr_close):
@@ -129,65 +137,116 @@ def eval_exit_chain(window_df, close_col, ts_col, exit_consec, exit_confirm, exi
         after_time=entry_time,
     )
 
+def load_asit_top20():
+    df, path = _load_any(['asit*.csv'])
+    if df.empty:
+        return pd.DataFrame(), None
 
-def is_continuation_before_entry(window_df, close_col, ts_col, strikes_col, entry_time, consec=3, confirm=3, lookback=6):
-    if window_df.empty or len(window_df) < 2:
-        return False
-    w=window_df.copy()
-    w[ts_col]=pd.to_datetime(w[ts_col], errors='coerce')
-    w=w[w[ts_col] < pd.to_datetime(entry_time, errors='coerce')]
-    if w.empty:
-        return False
-    pivot=w.pivot_table(index=ts_col, columns=strikes_col, values=close_col, aggfunc='last').sort_index()
-    if pivot.empty or len(pivot) < 2:
-        return False
-    mean_series=pivot.mean(axis=1).dropna()
-    if len(mean_series) < 2:
-        return False
-    diffs=mean_series.diff().dropna()
-    if len(diffs) < 1:
-        return False
-    recent=diffs.tail(lookback)
-    pos=(recent>0).sum()
-    return pos >= confirm and recent.iloc[-1] > 0
-def evaluate(iter_df):
-    rows = []
-    if iter_df.empty:
-        return rows
+    c_symbol = _col(df, ['symbol', 'underlying', 'stock'])
+    c_rank = _col(df, ['rankscore15tier', 'score', 'rank'])
+    c_bull = _col(df, ['bullmultitfscore'])
+    c_bear = _col(df, ['bearmultitfscore'])
+    c_trend = _col(df, ['dominanttrend'])
+    c_can = _col(df, ['cantradetoday'])
+    c_ltp = _col(df, ['ltp'])
+    if c_symbol is None:
+        raise ValueError('asit CSV missing Symbol column')
 
-    cols = {c.lower().strip(): c for c in iter_df.columns}
-    def _col(cands):
-        for c in cands:
-            if c.lower() in cols:
-                return cols[c.lower()]
+    work = df.copy()
+    if c_can:
+        can = work[c_can].astype(str).str.upper().isin(['TRUE', '1', 'YES', 'Y'])
+        work = work[can | work[c_can].isna()]
+
+    for c in [c_rank, c_bull, c_bear, c_ltp]:
+        if c:
+            work[c] = pd.to_numeric(work[c], errors='coerce')
+
+    if c_bull and c_bear:
+        bull = work[(work[c_bull] >= work[c_bear])].copy()
+        bear = work[(work[c_bear] > work[c_bull])].copy()
+    elif c_trend:
+        t = work[c_trend].astype(str).str.upper()
+        bull = work[t.str.contains('BULL') | t.str.contains('UP')].copy()
+        bear = work[t.str.contains('BEAR') | t.str.contains('DOWN')].copy()
+    else:
+        bull = work.copy()
+        bear = work.copy()
+
+    if c_rank:
+        bull = bull.sort_values(c_rank, ascending=False)
+        bear = bear.sort_values(c_rank, ascending=False)
+
+    bull = bull[[c_symbol] + ([c_rank] if c_rank else [])].drop_duplicates(subset=[c_symbol]).head(TOP_N).copy()
+    bear = bear[[c_symbol] + ([c_rank] if c_rank else [])].drop_duplicates(subset=[c_symbol]).head(TOP_N).copy()
+
+    bull['Side'] = 'CE'
+    bear['Side'] = 'PE'
+    bull.columns = ['Stock'] + ([ 'RankScore15Tier' ] if c_rank else []) + ['Side']
+    bear.columns = ['Stock'] + ([ 'RankScore15Tier' ] if c_rank else []) + ['Side']
+
+    out = pd.concat([bull, bear], ignore_index=True)
+    logger.info('Top bullish: %d, top bearish: %d', len(bull), len(bear))
+    return out, path
+
+def nearest_atm_strike(grp, close_col, strike_col):
+    if strike_col is None:
         return None
+    strikes = pd.to_numeric(grp[strike_col], errors='coerce').dropna().unique().tolist()
+    if not strikes:
+        return None
+    ltp = pd.to_numeric(grp[close_col], errors='coerce').dropna()
+    if ltp.empty:
+        return None
+    price = float(ltp.iloc[-1])
+    return min(strikes, key=lambda x: abs(float(x) - price))
 
-    c_underlying = _col(['underlying', 'symbol', 'stock'])
-    c_opt_type   = _col(['option type', 'option_type', 'otype', 'type'])
-    c_timestamp   = _col(['timestamp', 'time', 'datetime', 'ts'])
-    c_close       = _col(['close', 'ltp', 'last'])
-    c_strike      = _col(['strike', 'strike_price'])
-    c_score       = _col(['current_window_score', 'window_score', 'score'])
-
-    if any(v is None for v in (c_underlying, c_close, c_timestamp)):
-        logger.warning('Missing required columns: underlying, close, timestamp')
+def evaluate(iter_df, top_df):
+    rows = []
+    if iter_df.empty or top_df.empty:
         return rows
 
-    try:
-        iter_df = iter_df.copy()
-        with warnings.catch_warnings():
-            warnings.simplefilter('ignore')
-            iter_df[c_timestamp] = pd.to_datetime(iter_df[c_timestamp], errors='coerce')
-        iter_df = iter_df.sort_values(c_timestamp)
-    except Exception as exc:
-        logger.warning('Timestamp parse/sort issue: %s', exc)
+    c_underlying = _col(iter_df, ['underlying', 'symbol', 'stock'])
+    c_opt_type = _col(iter_df, ['option type', 'option_type', 'otype', 'type'])
+    c_timestamp = _col(iter_df, ['timestamp', 'time', 'datetime', 'ts'])
+    c_close = _col(iter_df, ['close', 'ltp', 'last', 'price'])
+    c_strike = _col(iter_df, ['strike', 'strike_price'])
 
-    for (underlying, opt_type), grp in iter_df.groupby([c_underlying, c_opt_type]):
-        closes = grp[c_close].tolist()
-        timestamps = grp[c_timestamp]
+    if any(v is None for v in (c_underlying, c_opt_type, c_timestamp, c_close)):
+        logger.warning('Missing required columns in iteration history')
+        return rows
+
+    iter_df = iter_df.copy()
+    with warnings.catch_warnings():
+        warnings.simplefilter('ignore')
+        iter_df[c_timestamp] = pd.to_datetime(iter_df[c_timestamp], errors='coerce')
+    iter_df = iter_df.sort_values(c_timestamp)
+
+    for _, sel in top_df.iterrows():
+        stock = str(sel['Stock']).strip()
+        side = str(sel['Side']).strip().upper()
+
+        grp = iter_df[iter_df[c_underlying].astype(str).str.upper() == stock.upper()].copy()
+        if grp.empty:
+            continue
+
+        grp = grp[grp[c_opt_type].astype(str).str.upper() == side].copy()
+        if grp.empty:
+            continue
+
+        grp = grp.sort_values(c_timestamp)
         latest = grp.iloc[-1]
 
-        entry_dir = 1 if str(opt_type).strip().upper() == 'CE' else -1
+        atm_strike = nearest_atm_strike(grp, c_close, c_strike)
+        if atm_strike is not None and c_strike is not None:
+            strike_series = pd.to_numeric(grp[c_strike], errors='coerce')
+            sub = grp[strike_series == float(atm_strike)].copy()
+            if not sub.empty:
+                grp = sub
+
+        closes = pd.to_numeric(grp[c_close], errors='coerce').tolist()
+        timestamps = grp[c_timestamp]
+
+        entry_dir = 1 if side == 'CE' else -1
         exit_dir = -1 if entry_dir == 1 else 1
 
         entry_time, entry_price = check_chain(
@@ -195,7 +254,6 @@ def evaluate(iter_df):
             ENTRY_CONSEC, ENTRY_CONFIRM, ENTRY_WINDOW,
             target_dir=entry_dir
         )
-
         if not entry_time:
             continue
 
@@ -203,41 +261,34 @@ def evaluate(iter_df):
         post = grp[grp[c_timestamp] > entry_dt]
         last_ts = grp[c_timestamp].max()
 
-        # Exit15: use the last 15 minutes of available data, but only if runtime diff >= 15 min.
+        exit15_time = None
         if pd.notna(last_ts) and (last_ts - entry_dt) >= timedelta(minutes=15):
-            cutoff15 = last_ts - timedelta(minutes=15)
-            w15 = post[post[c_timestamp] > cutoff15]
+            w15 = post[post[c_timestamp] > (last_ts - timedelta(minutes=15))]
             exit15_time, _ = eval_exit_chain(
                 w15, c_close, c_timestamp,
                 EXIT_15_CONSEC, EXIT_15_CONFIRM, EXIT_15_WINDOW,
                 exit_dir, entry_time
             )
-        else:
-            exit15_time = None
 
-        # Exit39: use the last 39 minutes of available data, but only if runtime diff >= 39 min.
+        exit39_time = None
         if pd.notna(last_ts) and (last_ts - entry_dt) >= timedelta(minutes=39):
-            cutoff39 = last_ts - timedelta(minutes=39)
-            w39 = post[post[c_timestamp] > cutoff39]
+            w39 = post[post[c_timestamp] > (last_ts - timedelta(minutes=39))]
             exit39_time, _ = eval_exit_chain(
                 w39, c_close, c_timestamp,
                 EXIT_39_CONSEC, EXIT_39_CONFIRM, EXIT_39_WINDOW,
                 exit_dir, entry_time
             )
-        else:
-            exit39_time = None
 
         rows.append({
-            'Stock': underlying,
-            'Type': opt_type,
-            'Signal': 'BUY CE' if entry_dir == 1 else 'BUY PE',
-            'Strike': latest[c_strike] if c_strike else '',
+            'Stock': stock,
+            'Side': side,
+            'Signal': 'BUY CE' if side == 'CE' else 'BUY PE',
+            'ATMStrike': atm_strike if atm_strike is not None else '',
             'EntryPrice': round(entry_price, 2) if entry_price is not None else '',
-            'LTP': latest[c_close] if c_close else '',
+            'LTP': latest[c_close] if c_close in latest else '',
             'Entry': entry_time,
             'Exit15': exit15_time or '-',
             'Exit39': exit39_time or '-',
-            'Score': latest[c_score] if c_score else 0,
         })
 
     return rows
@@ -275,23 +326,27 @@ def send_email(subject, html_body):
         return False
 
 def main():
-    logger.info('=== CEPEBUY (CSV-only rolling exits from last runtime window) starting ===')
-    iter_df = _load_any(['fo_iteration_history_*.csv', 'iteration_history_*.csv', 'fo_iteration_history.csv', 'iteration_history.csv'])
-    if iter_df.empty:
-        logger.error('No iteration CSV found')
+    logger.info('=== CEPEBUY starting ===')
+    top_df, asit_path = load_asit_top20()
+    if top_df.empty:
+        logger.error('No bullish/bearish rows found in asit CSV')
         sys.exit(1)
 
-    rows = evaluate(iter_df)
+    iter_df, iter_path = _load_any(['iteration_history*.csv', 'fo_iteration_history*.csv'])
+    if iter_df.empty:
+        logger.error('No iteration history CSV found')
+        sys.exit(1)
+
+    rows = evaluate(iter_df, top_df)
     if not rows:
-        logger.info('No entry signals today')
+        logger.info('No matching signals')
         return
 
     html_body = '<html><body style="font-family:sans-serif;">'
-    html_body += '<h2>CE/PE Signals - ' + datetime.now().strftime('%d %b %H:%M') + '</h2>'
-    html_body += '<p style="color:#666;font-size:12px;">Entry is chain-based from CSV. Exit15/Exit39 are chain confirmations using the last 15/39 minutes available in the same CSV after the entry, only if runtime diff from entry is >= 15/39 minutes.</p>'
-    html_body += '<p style="color:#666;font-size:12px;">Entry chain: %s consec + %s/%s | Exit15: %s consec + %s/%s | Exit39: %s consec + %s/%s</p>' % (ENTRY_CONSEC, ENTRY_CONFIRM, ENTRY_WINDOW, EXIT_15_CONSEC, EXIT_15_CONFIRM, EXIT_15_WINDOW, EXIT_39_CONSEC, EXIT_39_CONFIRM, EXIT_39_WINDOW)
+    html_body += '<h2>CE/PE Near ATM Signals</h2>'
+    html_body += '<p style="color:#666;font-size:12px;">Top 20 bullish names from asit*.csv are mapped to CE, top 20 bearish names to PE. Chain validation uses price only, and ATM is the strike nearest to LTP.</p>'
     html_body += build_html(rows) + '</body></html>'
-    send_email('CE/PE Signals ' + datetime.now().strftime('%d %b %H:%M'), html_body)
+    send_email('CE/PE Near ATM Signals ' + datetime.now().strftime('%d %b %H:%M'), html_body)
 
 if __name__ == '__main__':
     main()
