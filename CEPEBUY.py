@@ -41,7 +41,7 @@ PER_SYMBOL_SLEEP_SEC = float(os.environ.get("PER_SYMBOL_SLEEP_SEC", "0.10"))
 EMAIL_MAX_ROWS_LONG = int(os.environ.get("EMAIL_MAX_ROWS_LONG", "25"))
 EMAIL_MAX_ROWS_SHORT = int(os.environ.get("EMAIL_MAX_ROWS_SHORT", "25"))
 TOP_N_UNDERLYINGS = int(os.environ.get("TOP_N_UNDERLYINGS", "20"))
-MIN_CHAIN_LEGS = int(os.environ.get("MIN_CHAIN_LEGS", "5"))
+MIN_CHAIN_LEGS = int(os.environ.get("MIN_CHAIN_LEGS", "8"))
 
 fyers = None
 
