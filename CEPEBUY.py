@@ -18,10 +18,6 @@ OUTPUT_BEAR = OUTPUT_DIR / "top_10_bearish.csv"
 OUTPUT_COMBINED = OUTPUT_DIR / "top_10_bull_bear.csv"
 TOP_N = int(os.environ.get("TOP_N", "10"))
 
-from OPTIONS_OI import gethistory, builditerationhistory, SIGNALWINDOWMINUTES, ITERATIONSTOKEEP, INTRADAYLOOKBACKDAYS, formateqsymbol, safefloat
-
-fyers = None
-
 
 def pick_latest_file(pattern: str, base_dir: Path = BASE_DIR) -> Optional[Path]:
     files = sorted(base_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -81,105 +77,11 @@ def build_top_lists(asit_path: Path, top_n: int = TOP_N) -> Tuple[pd.DataFrame, 
     return bull_df, bear_df, pd.concat([bull_df, bear_df], ignore_index=True)
 
 
-def init_client_once():
-    global fyers
-    if fyers is None:
-        fyers = initfyers()
-    return fyers
-
-
-def normalize_symbol(raw: str) -> str:
-    s = str(raw).strip().upper()
-    if s.startswith("NSE:NSE:"):
-        s = s.replace("NSE:NSE:", "NSE:", 1)
-    if s.endswith("-EQ-EQ"):
-        s = s[:-3]
-    return s if s.startswith("NSE:") else formateqsymbol(s)
-
-
-def extract_chain(resp) -> list:
-    if not isinstance(resp, dict):
-        return []
-    data = resp.get("data", resp)
-    if isinstance(data, dict):
-        for key in ("optionsChain", "optionChain", "chain", "contracts", "data"):
-            if key in data:
-                data = data[key]
-                break
-    return data if isinstance(data, list) else []
-
-
-def fetch_option_chain(underlying: str) -> pd.DataFrame:
-    client = init_client_once()
-    if client is None:
-        logger.warning("Fyers client unavailable; skipping option chain for %s", underlying)
-        return pd.DataFrame()
-    eqsymbol = normalize_symbol(underlying)
-    logger.info("API chain fetch underlying=%s eqsymbol=%s", underlying, eqsymbol)
-    try:
-        resp = client.optionchain({"symbol": eqsymbol, "strikecount": 50})
-    except Exception as e:
-        logger.warning("optionchain failed for %s: %s", underlying, e)
-        return pd.DataFrame()
-    rows = []
-    for item in extract_chain(resp):
-        if not isinstance(item, dict):
-            continue
-        typ = str(item.get("optionType") or item.get("type") or "").upper()
-        strike = safefloat(item.get("strikePrice") or item.get("strike"), np.nan)
-        if pd.isna(strike) or typ not in ("CE", "PE"):
-            continue
-        rows.append({
-            "Underlying": underlying,
-            "Option Type": typ,
-            "Strike": strike,
-            "Option Symbol": str(item.get("symbol") or item.get("tradingSymbol") or ""),
-            "OptionLTP": safefloat(item.get("ltp") or item.get("lp"), np.nan),
-            "OI": safefloat(item.get("oi") or item.get("openInterest"), np.nan),
-            "Volume": safefloat(item.get("volume"), np.nan),
-        })
-    return pd.DataFrame(rows)
-
-
-def fetch_iteration_history(option_symbol: str) -> pd.DataFrame:
-    if gethistory is None or builditerationhistory is None:
-        return pd.DataFrame()
-    hist_symbol = option_symbol if str(option_symbol).startswith("NSE:") else f"NSE:{option_symbol}"
-    try:
-        intradf = gethistory(hist_symbol, "5", INTRADAYLOOKBACKDAYS)
-        if intradf is None or intradf.empty:
-            return pd.DataFrame()
-        return builditerationhistory(intradf, SIGNALWINDOWMINUTES, ITERATIONSTOKEEP)
-    except Exception as e:
-        logger.warning("history fetch failed for %s: %s", hist_symbol, e)
-        return pd.DataFrame()
-
-
-def build_api_scans(seed_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    option_rows, iter_rows = [], []
-    if seed_df is None or seed_df.empty:
-        return pd.DataFrame(), pd.DataFrame()
-    for _, row in seed_df.iterrows():
-        underlying = str(row.get("Underlying", "")).strip()
-        side = str(row.get("Side", "")).upper()
-        req_type = "CE" if side.startswith("BULL") else "PE"
-        chain = fetch_option_chain(underlying)
-        if chain.empty:
-            continue
-        chain = chain[chain["Option Type"] == req_type].copy()
-        if chain.empty:
-            continue
-        option_rows.append(chain)
-        for _, crow in chain.iterrows():
-            hist = fetch_iteration_history(crow.get("Option Symbol", ""))
-            if hist is None or hist.empty:
-                continue
-            hist.insert(0, "Source Underlying", underlying)
-            hist.insert(1, "Source Option Symbol", crow.get("Option Symbol", ""))
-            hist.insert(2, "Source Option Type", req_type)
-            iter_rows.append(hist)
-    return (pd.concat(option_rows, ignore_index=True) if option_rows else pd.DataFrame(),
-            pd.concat(iter_rows, ignore_index=True) if iter_rows else pd.DataFrame())
+def save_outputs(bull_df: pd.DataFrame, bear_df: pd.DataFrame, combined: pd.DataFrame):
+    bull_df.to_csv(OUTPUT_BULL, index=False)
+    bear_df.to_csv(OUTPUT_BEAR, index=False)
+    combined.to_csv(OUTPUT_COMBINED, index=False)
+    logger.info("Saved %s, %s, %s", OUTPUT_BULL.name, OUTPUT_BEAR.name, OUTPUT_COMBINED.name)
 
 
 def main():
@@ -188,20 +90,11 @@ def main():
         raise FileNotFoundError(f"No file found for pattern {ASIT_GLOB} in {BASE_DIR.resolve()}")
     logger.info("Using ASIT file: %s", asit_file.resolve())
     bull_df, bear_df, combined = build_top_lists(asit_file, top_n=TOP_N)
-    bull_df.to_csv(OUTPUT_BULL, index=False)
-    bear_df.to_csv(OUTPUT_BEAR, index=False)
-    combined.to_csv(OUTPUT_COMBINED, index=False)
-    logger.info("Saved %s, %s, %s", OUTPUT_BULL.name, OUTPUT_BEAR.name, OUTPUT_COMBINED.name)
-    options_df, iter_df = build_api_scans(combined)
-    if not options_df.empty:
-        options_df.to_csv(OUTPUT_DIR / "api_options.csv", index=False)
-    if not iter_df.empty:
-        iter_df.to_csv(OUTPUT_DIR / "api_iteration_history.csv", index=False)
+    save_outputs(bull_df, bear_df, combined)
     print(f"ASIT file: {asit_file}")
     print(f"Top bullish: {len(bull_df)}")
     print(f"Top bearish: {len(bear_df)}")
-    print(f"API option rows: {len(options_df)}")
-    print(f"API iteration rows: {len(iter_df)}")
+    print(f"Combined rows: {len(combined)}")
 
 
 if __name__ == "__main__":
