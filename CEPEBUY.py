@@ -1,4 +1,5 @@
 import os
+import sys
 import logging
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -16,10 +17,6 @@ OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "."))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 ASIT_GLOB = os.environ.get("ASIT_GLOB", "asit*.csv")
 TOP_N = int(os.environ.get("TOP_N", "20"))
-CHAIN_UP = int(os.environ.get("CHAIN_UP", "5"))
-CHAIN_DOWN = int(os.environ.get("CHAIN_DOWN", "5"))
-MIN_OPTION_LTP = float(os.environ.get("MIN_OPTION_LTP", "10"))
-MIN_ATM_CHAIN_VOLUME = int(os.environ.get("MIN_ATM_CHAIN_VOLUME", "100000"))
 
 initfyers = getattr(opt, "initfyers", None)
 gethistory = getattr(opt, "gethistory", None)
@@ -65,7 +62,7 @@ def score_frame(df: pd.DataFrame):
     if sym_col is None:
         raise ValueError("No symbol column found in ASIT CSV")
     for c in [bull_col, bear_col, rank_col]:
-        if c is not None:
+        if c is not None and c in df.columns:
             df[c] = pd.to_numeric(df[c], errors="coerce")
     df[sym_col] = clean_text(df[sym_col])
     return df, sym_col, bull_col, bear_col, rank_col
@@ -87,32 +84,44 @@ def build_top_lists(asit_path: Path, top_n: int = TOP_N) -> Tuple[pd.DataFrame, 
     bear_df["Side"] = "BEARISH"
     bull_df["Underlying"] = bull_df[sym_col]
     bear_df["Underlying"] = bear_df[sym_col]
-    return bull_df, bear_df, pd.concat([bull_df, bear_df], ignore_index=True)
+    bull_df["Option Symbol"] = bull_df[sym_col]
+    bear_df["Option Symbol"] = bear_df[sym_col]
+    combined = pd.concat([bull_df, bear_df], ignore_index=True)
+    return bull_df, bear_df, combined
+
+
+def init_client_once():
+    if not callable(initfyers):
+        return None
+    try:
+        return initfyers()
+    except Exception as e:
+        logger.warning("initfyers failed: %s", e)
+        return None
 
 
 def fetch_option_chain(underlying: str) -> pd.DataFrame:
-    fy = initfyers() if callable(initfyers) else None
+    fy = init_client_once()
     if fy is None:
         return pd.DataFrame()
     eqsymbol = formateqsymbol(underlying)
     try:
-        res = fy.optionchain({"symbol": eqsymbol, "strikecount": max(CHAIN_UP, CHAIN_DOWN) * 2 + 10})
+        chainres = fy.optionchain({"symbol": eqsymbol, "strikecount": 50})
     except Exception as e:
         logger.warning("optionchain failed for %s: %s", underlying, e)
         return pd.DataFrame()
-    chain = (res or {}).get("data") or (res or {}).get("optionsChain") or []
+    chain = (chainres or {}).get("data") or (chainres or {}).get("optionsChain") or []
     rows = []
     for item in chain:
         strike = safefloat(item.get("strikePrice") or item.get("strike"), np.nan)
         typ = str(item.get("optionType") or item.get("type") or "").upper()
-        sym = str(item.get("symbol") or item.get("tradingSymbol") or item.get("optionSymbol") or "").strip()
         if pd.isna(strike) or typ not in ("CE", "PE"):
             continue
         rows.append({
             "Underlying": underlying,
             "Option Type": typ,
             "Strike": strike,
-            "Option Symbol": sym,
+            "Option Symbol": str(item.get("symbol") or item.get("tradingSymbol") or item.get("optionSymbol") or "").strip(),
             "OptionLTP": safefloat(item.get("ltp") or item.get("lp"), np.nan),
             "OI": safefloat(item.get("oi") or item.get("openInterest"), np.nan),
             "Volume": safefloat(item.get("volume"), np.nan),
@@ -120,143 +129,64 @@ def fetch_option_chain(underlying: str) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def infer_atm_from_spot(underlying: str, chain: pd.DataFrame) -> float:
-    if chain.empty:
-        return np.nan
-    fy = initfyers() if callable(initfyers) else None
-    spot = np.nan
-    if fy is not None:
-        try:
-            q = fy.quotes({"symbols": [formateqsymbol(underlying)]})
-            data = (q or {}).get("d") or (q or {}).get("data") or []
-            if data:
-                spot = safefloat(data[0].get("v", {}).get("lp") or data[0].get("lp"), np.nan)
-        except Exception:
-            spot = np.nan
-    strikes = pd.to_numeric(chain["Strike"], errors="coerce").dropna().unique()
-    if len(strikes) == 0:
-        return np.nan
-    strikes = sorted(map(float, strikes))
-    if pd.isna(spot):
-        return float(strikes[len(strikes) // 2])
-    return float(min(strikes, key=lambda x: abs(x - spot)))
-
-
-def chain_window(chain: pd.DataFrame, atm: float, up: int = CHAIN_UP, down: int = CHAIN_DOWN) -> pd.DataFrame:
-    if chain.empty or pd.isna(atm):
+def fetch_iteration_history(option_symbol: str) -> pd.DataFrame:
+    if not callable(gethistory) or not callable(builditerationhistory):
         return pd.DataFrame()
-    chain = chain.copy()
-    chain["Strike"] = pd.to_numeric(chain["Strike"], errors="coerce")
-    chain = chain.dropna(subset=["Strike"])
-    strikes = sorted(chain["Strike"].unique())
-    if not strikes:
+    hist_symbol = option_symbol if str(option_symbol).startswith("NSE:") else f"NSE:{option_symbol}"
+    try:
+        intradf = gethistory(hist_symbol, "5", INTRADAYLOOKBACKDAYS)
+        if intradf is None or intradf.empty:
+            return pd.DataFrame()
+        return builditerationhistory(intradf, SIGNALWINDOWMINUTES, ITERATIONSTOKEEP)
+    except Exception as e:
+        logger.warning("iteration history failed for %s: %s", option_symbol, e)
         return pd.DataFrame()
-    nearest = min(strikes, key=lambda x: abs(x - atm))
-    idx = strikes.index(nearest)
-    lo = max(0, idx - down)
-    hi = min(len(strikes) - 1, idx + up)
-    keep = strikes[lo:hi + 1]
-    return chain[chain["Strike"].isin(keep)].sort_values(["Strike", "Option Type"]).reset_index(drop=True)
 
 
-def build_chain_rows(seed_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    rows = []
+def build_api_scans(seed_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    option_rows = []
     iter_rows = []
     if seed_df is None or seed_df.empty:
         return pd.DataFrame(), pd.DataFrame()
     for _, row in seed_df.iterrows():
-        underlying = str(row.get("Underlying", "")).strip().upper()
+        underlying = str(row.get("Underlying", "")).strip()
         side = str(row.get("Side", "")).upper()
+        req_type = "CE" if side.startswith("BULL") else "PE"
+        logger.info("Scanning underlying=%s side=%s", underlying, side)
         chain = fetch_option_chain(underlying)
+        logger.info("chain rows for %s: %d", underlying, len(chain))
         if chain.empty:
             continue
-        atm = infer_atm_from_spot(underlying, chain)
-        win = chain_window(chain, atm, CHAIN_UP, CHAIN_DOWN)
-        if win.empty:
+        chain = chain[chain["Option Type"] == req_type].copy()
+        if chain.empty:
             continue
-        req_type = "CE" if side.startswith("BULL") else "PE"
-        leg = win[win["Option Type"] == req_type].copy()
-        if leg.empty:
-            continue
-        leg = leg.sort_values(["Strike", "OptionLTP"], ascending=[True, False])
-        atm_leg = leg.iloc[(leg["Strike"] - atm).abs().argsort().iloc[0]] if not leg.empty else None
-        if atm_leg is None:
-            continue
-        ltp = safefloat(atm_leg.get("OptionLTP"), np.nan)
-        oi = safefloat(atm_leg.get("OI"), np.nan)
-        vol = safefloat(atm_leg.get("Volume"), np.nan)
-        if pd.isna(ltp) or ltp < MIN_OPTION_LTP:
-            continue
-        if pd.notna(vol) and vol < MIN_ATM_CHAIN_VOLUME:
-            continue
-        hist = pd.DataFrame()
-        if callable(gethistory) and callable(builditerationhistory):
-            try:
-                hist = builditerationhistory(gethistory(atm_leg.get("Option Symbol"), "5", INTRADAYLOOKBACKDAYS), SIGNALWINDOWMINUTES, ITERATIONSTOKEEP)
-            except Exception:
-                hist = pd.DataFrame()
-        rows.append({
-            "Underlying": underlying,
-            "Option Type": req_type,
-            "Option Symbol": atm_leg.get("Option Symbol", ""),
-            "Strike": safefloat(atm_leg.get("Strike"), np.nan),
-            "LTP": ltp,
-            "OI": oi,
-            "Volume": vol,
-            "ATMStrike": atm,
-        })
-        if hist is not None and not hist.empty:
-            tmp = hist.copy()
-            tmp.insert(0, "Option Symbol", atm_leg.get("Option Symbol", ""))
-            tmp.insert(0, "Underlying", underlying)
-            iter_rows.append(tmp)
-    return pd.DataFrame(rows), (pd.concat(iter_rows, ignore_index=True) if iter_rows else pd.DataFrame())
+        option_rows.append(chain)
+        for _, crow in chain.iterrows():
+            hist = fetch_iteration_history(crow.get("Option Symbol", ""))
+            logger.info("history rows for %s: %d", crow.get("Option Symbol", ""), len(hist))
+            if hist is None or hist.empty:
+                continue
+            hist.insert(0, "Source Underlying", underlying)
+            hist.insert(1, "Source Option Symbol", crow.get("Option Symbol", ""))
+            hist.insert(2, "Source Option Type", req_type)
+            iter_rows.append(hist)
+    options_df = pd.concat(option_rows, ignore_index=True) if option_rows else pd.DataFrame()
+    iter_df = pd.concat(iter_rows, ignore_index=True) if iter_rows else pd.DataFrame()
+    return options_df, iter_df
 
 
-def build_ce_pe_buy_rows(options_df: pd.DataFrame, iteration_df: pd.DataFrame) -> Tuple[List[dict], List[dict]]:
-    if options_df is None or options_df.empty or iteration_df is None or iteration_df.empty:
-        return [], []
-    if "Option Symbol" not in iteration_df.columns:
-        return [], []
-    signal_col = "windowsignal" if "windowsignal" in iteration_df.columns else "WindowSignal" if "WindowSignal" in iteration_df.columns else None
-    if signal_col is None:
-        return [], []
-    itermap = {sym: grp for sym, grp in iteration_df.groupby("Option Symbol")}
-    cerows, perows = [], []
-    for _, row in options_df.iterrows():
-        sym = str(row.get("Option Symbol", "")).strip()
-        if not sym or sym not in itermap:
-            continue
-        grp = itermap[sym]
-        signals = [str(v).strip().title() for v in grp[signal_col].tolist()]
-        last11 = signals[-11:]
-        if len(last11) < 11:
-            continue
-        buycount = sum(s.startswith("Buy") for s in last11)
-        sellcount = sum(s.startswith("Sell") for s in last11)
-        optype = str(row.get("Option Type", "")).upper()
-        trade_signal = "CE BUY" if optype == "CE" and buycount >= 8 else "PE BUY" if optype == "PE" and sellcount >= 8 else ""
-        if not trade_signal:
-            continue
-        out = {
-            "Underlying": row.get("Underlying", ""),
-            "Option Type": row.get("Option Type", ""),
-            "Option Symbol": sym,
-            "Strike": row.get("Strike", np.nan),
-            "LTP": row.get("LTP", np.nan),
-            "OI": row.get("OI", np.nan),
-            "Volume": row.get("Volume", np.nan),
-            "Trade Signal": trade_signal,
-            "Buy Count": buycount,
-            "Sell Count": sellcount,
-            "Rank Delta": np.nan,
-            "Last Iteration Time": grp.iloc[-1].get("timestamp", ""),
-        }
-        if trade_signal == "CE BUY":
-            cerows.append(out)
-        else:
-            perows.append(out)
-    return cerows, perows
+def save_outputs(bull_df: pd.DataFrame, bear_df: pd.DataFrame, combined: pd.DataFrame):
+    bull_df.to_csv(OUTPUT_DIR / "top_10_bullish.csv", index=False)
+    bear_df.to_csv(OUTPUT_DIR / "top_10_bearish.csv", index=False)
+    combined.to_csv(OUTPUT_DIR / "top_10_bull_bear.csv", index=False)
+
+
+def verify_frame(name: str, df: pd.DataFrame):
+    logger.info("%s rows=%d cols=%s", name, len(df), list(df.columns)[:12])
+    if df.empty:
+        logger.info("%s is empty", name)
+        return
+    logger.info("%s head=%s", name, df.head(2).to_dict("records"))
 
 
 def main():
@@ -265,26 +195,30 @@ def main():
         raise FileNotFoundError(f"No file found for pattern {ASIT_GLOB} in {BASE_DIR.resolve()}")
     logger.info("Using ASIT file: %s", asit_file.resolve())
     bull_df, bear_df, combined = build_top_lists(asit_file, top_n=TOP_N)
-    options_df, iteration_df = build_chain_rows(combined)
-    cebuyrows, pebuyrows = build_ce_pe_buy_rows(options_df, iteration_df)
-    state = loaddailystate()
-    state["rows"] = cebuyrows + pebuyrows
-    savedailystatestate(state)
-    ts = pd.Timestamp.now().strftime("%Y%m%d_%H%M")
-    options_df.to_csv(OUTPUT_DIR / f"cepebuy_options_{ts}.csv", index=False)
-    iteration_df.to_csv(OUTPUT_DIR / f"cepebuy_iterations_{ts}.csv", index=False)
-    pd.DataFrame(cebuyrows).to_csv(OUTPUT_DIR / f"ce_buy_{ts}.csv", index=False)
-    pd.DataFrame(pebuyrows).to_csv(OUTPUT_DIR / f"pe_buy_{ts}.csv", index=False)
-    if (cebuyrows or pebuyrows) and callable(sendcepebuyemail):
-        sendcepebuyemail(cebuyrows, pebuyrows, [str(OUTPUT_DIR / f"ce_buy_{ts}.csv"), str(OUTPUT_DIR / f"pe_buy_{ts}.csv")])
+    verify_frame("bull_df", bull_df)
+    verify_frame("bear_df", bear_df)
+    save_outputs(bull_df, bear_df, combined)
+    options_df, iter_df = build_api_scans(combined)
+    verify_frame("options_df", options_df)
+    verify_frame("iter_df", iter_df)
+    if not options_df.empty:
+        options_df.to_csv(OUTPUT_DIR / "api_options.csv", index=False)
+    if not iter_df.empty:
+        iter_df.to_csv(OUTPUT_DIR / "api_iteration_history.csv", index=False)
+    if not iter_df.empty and "Option Symbol" in iter_df.columns:
+        state = loaddailystate()
+        state["rows"] = iter_df.tail(100).to_dict("records")
+        savedailystatestate(state)
     print(f"ASIT file: {asit_file.name}")
     print(f"Top bullish: {len(bull_df)}")
     print(f"Top bearish: {len(bear_df)}")
-    print(f"Option rows: {len(options_df)}")
-    print(f"Iteration rows: {len(iteration_df)}")
-    print(f"CE BUY rows: {len(cebuyrows)}")
-    print(f"PE BUY rows: {len(pebuyrows)}")
+    print(f"API option rows: {len(options_df)}")
+    print(f"API iteration rows: {len(iter_df)}")
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        logger.exception("CEPEBUY failed: %s", e)
+        sys.exit(1
