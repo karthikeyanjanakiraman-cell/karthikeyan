@@ -6,30 +6,19 @@ from typing import List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-try:
-    from OPTIONS_OI import (
-        initfyers,
-        gethistory,
-        builditerationhistory,
-        SIGNALWINDOWMINUTES,
-        ITERATIONSTOKEEP,
-        INTRADAYLOOKBACKDAYS,
-        formateqsymbol,
-        safefloat,
-        sendsingleemail,
-        sendcepebuyemail,
-    )
-except Exception:
-    initfyers = None
-    gethistory = None
-    builditerationhistory = None
-    SIGNALWINDOWMINUTES = 5
-    ITERATIONSTOKEEP = 75
-    INTRADAYLOOKBACKDAYS = 20
-    formateqsymbol = lambda x: f"NSE:{str(x).strip().upper()}-EQ"
-    safefloat = lambda v, default=np.nan: default if v is None or str(v).strip() == "" else float(v)
-    sendsingleemail = None
-    sendcepebuyemail = None
+from OPTIONS_OI import (
+    initfyers,
+    gethistory,
+    builditerationhistory,
+    SIGNALWINDOWMINUTES,
+    ITERATIONSTOKEEP,
+    INTRADAYLOOKBACKDAYS,
+    formateqsymbol,
+    safefloat,
+    loaddailystate,
+    savedailystatestate,
+    sendcepebuyemail,
+)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
@@ -39,12 +28,10 @@ OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "."))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 ASIT_GLOB = os.environ.get("ASIT_GLOB", "asit*.csv")
 TOP_N = int(os.environ.get("TOP_N", "20"))
-MIN_OPTION_LTP = float(os.environ.get("MIN_OPTION_LTP", "10"))
 CHAIN_UP = int(os.environ.get("CHAIN_UP", "5"))
 CHAIN_DOWN = int(os.environ.get("CHAIN_DOWN", "5"))
-ENTRY_THRESHOLD = float(os.environ.get("ENTRY_THRESHOLD", "0"))
-EXIT_THRESHOLD = float(os.environ.get("EXIT_THRESHOLD", "0"))
-ATTACHMENT_NAME = os.environ.get("ATTACHMENT_NAME", "near_atm_signals.csv")
+MIN_OPTION_LTP = float(os.environ.get("MIN_OPTION_LTP", "10"))
+MIN_ATM_CHAIN_VOLUME = int(os.environ.get("MIN_ATM_CHAIN_VOLUME", "100000"))
 
 
 def pick_latest_file(pattern: str, base_dir: Path = BASE_DIR) -> Optional[Path]:
@@ -75,16 +62,13 @@ def score_frame(df: pd.DataFrame):
     bear_col = find_col(df, ["BearMultiTFScore", "bear", "bearish", "sell", "short", "BearScore", "bear_score", "5min_BearScore", "15min_BearScore", "1hour_BearScore", "4hour_BearScore", "1day_BearScore"])
     rank_col = find_col(df, ["RankScore15Tier", "score", "rank", "Score15Tier", "5min_Score15Tier", "15min_Score15Tier", "1hour_Score15Tier", "4hour_Score15Tier", "1day_Score15Tier"])
     sym_col = find_col(df, ["Symbol", "symbol", "underlying", "ticker", "tradingsymbol", "name"])
-    trend_col = find_col(df, ["DominantTrend", "trend", "direction"])
     if sym_col is None:
         raise ValueError("No symbol column found in ASIT CSV")
     for c in [bull_col, bear_col, rank_col]:
         if c is not None:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    if trend_col is not None:
-        df[trend_col] = clean_text(df[trend_col])
     df[sym_col] = clean_text(df[sym_col])
-    return df, sym_col, bull_col, bear_col, rank_col, trend_col
+    return df, sym_col, bull_col, bear_col, rank_col
 
 
 def top_rows(df: pd.DataFrame, sort_col: Optional[str], n: int) -> pd.DataFrame:
@@ -96,7 +80,7 @@ def top_rows(df: pd.DataFrame, sort_col: Optional[str], n: int) -> pd.DataFrame:
 
 def build_top_lists(asit_path: Path, top_n: int = TOP_N) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     df = load_csv(asit_path)
-    df, sym_col, bull_col, bear_col, rank_col, trend_col = score_frame(df)
+    df, sym_col, bull_col, bear_col, rank_col = score_frame(df)
     bull_df = top_rows(df, bull_col or rank_col, top_n).copy()
     bear_df = top_rows(df, bear_col or rank_col, top_n).copy()
     bull_df["Side"] = "BULLISH"
@@ -107,14 +91,12 @@ def build_top_lists(asit_path: Path, top_n: int = TOP_N) -> Tuple[pd.DataFrame, 
 
 
 def fetch_option_chain(underlying: str) -> pd.DataFrame:
-    if initfyers is None:
-        return pd.DataFrame()
     fy = initfyers()
     if fy is None:
         return pd.DataFrame()
     eqsymbol = formateqsymbol(underlying)
     try:
-        res = fy.optionchain({"symbol": eqsymbol, "strikecount": max(CHAIN_UP, CHAIN_DOWN) * 2 + 5})
+        res = fy.optionchain({"symbol": eqsymbol, "strikecount": max(CHAIN_UP, CHAIN_DOWN) * 2 + 10})
     except Exception as e:
         logger.warning("optionchain failed for %s: %s", underlying, e)
         return pd.DataFrame()
@@ -141,11 +123,11 @@ def fetch_option_chain(underlying: str) -> pd.DataFrame:
 def infer_atm_from_spot(underlying: str, chain: pd.DataFrame) -> float:
     if chain.empty:
         return np.nan
-    fx = initfyers() if initfyers is not None else None
+    fy = initfyers()
     spot = np.nan
-    if fx is not None:
+    if fy is not None:
         try:
-            q = fx.quotes({"symbols": [formateqsymbol(underlying)]})
+            q = fy.quotes({"symbols": [formateqsymbol(underlying)]})
             data = (q or {}).get("d") or (q or {}).get("data") or []
             if data:
                 spot = safefloat(data[0].get("v", {}).get("lp") or data[0].get("lp"), np.nan)
@@ -177,106 +159,99 @@ def chain_window(chain: pd.DataFrame, atm: float, up: int = CHAIN_UP, down: int 
     return chain[chain["Strike"].isin(keep)].sort_values(["Strike", "Option Type"]).reset_index(drop=True)
 
 
-def tandem_status(win: pd.DataFrame) -> str:
-    if win.empty or "OptionLTP" not in win.columns:
-        return "NO_DATA"
-    df = win.copy()
-    df["OptionLTP"] = pd.to_numeric(df["OptionLTP"], errors="coerce")
-    df = df.dropna(subset=["OptionLTP"])
-    if df.empty:
-        return "NO_DATA"
-    pivot = df.pivot_table(index="Strike", columns="Option Type", values="OptionLTP", aggfunc="last").sort_index()
-    if pivot.empty or pivot.shape[0] < 2:
-        return "INCONCLUSIVE"
-    diff = pivot.ffill().bfill().diff().dropna(how="all")
-    if diff.empty:
-        return "INCONCLUSIVE"
-    ce = diff.get("CE")
-    pe = diff.get("PE")
-    if ce is None or pe is None:
-        return "INCONCLUSIVE"
-    ce_up = (ce > ENTRY_THRESHOLD).sum()
-    pe_up = (pe > ENTRY_THRESHOLD).sum()
-    ce_dn = (ce < -EXIT_THRESHOLD).sum()
-    pe_dn = (pe < -EXIT_THRESHOLD).sum()
-    total = len(diff)
-    if ce_up >= total * 0.6 and pe_up >= total * 0.6:
-        return "MOVE_UP_TOGETHER"
-    if ce_dn >= total * 0.6 and pe_dn >= total * 0.6:
-        return "MOVE_DOWN_TOGETHER"
-    return "MIXED"
-
-
-def infer_signal(side: str) -> str:
-    return "BUY CE" if str(side).upper().startswith("BULL") else "BUY PE"
-
-
-def build_report(seed_df: pd.DataFrame) -> pd.DataFrame:
-    cols = ["Stock", "Side", "Signal", "ATMStrike", "EntryPrice", "LTP", "Entry", "Exit15", "Exit39"]
-    if seed_df is None or seed_df.empty:
-        return pd.DataFrame(columns=cols)
+def build_chain_rows(seed_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     rows = []
+    iter_rows = []
+    if seed_df is None or seed_df.empty:
+        return pd.DataFrame(), pd.DataFrame()
     for _, row in seed_df.iterrows():
-        underlying = str(row.get("Underlying", row.get("Symbol", ""))).strip().upper()
+        underlying = str(row.get("Underlying", "")).strip().upper()
         side = str(row.get("Side", "")).upper()
         chain = fetch_option_chain(underlying)
         if chain.empty:
             continue
         atm = infer_atm_from_spot(underlying, chain)
         win = chain_window(chain, atm, CHAIN_UP, CHAIN_DOWN)
-        status = tandem_status(win)
-        opt_type = "CE" if side.startswith("BULL") else "PE"
-        leg = win[win["Option Type"] == opt_type].copy()
+        if win.empty:
+            continue
+        req_type = "CE" if side.startswith("BULL") else "PE"
+        leg = win[win["Option Type"] == req_type].copy()
         if leg.empty:
-            leg = win.copy()
-        leg = leg.sort_values("Strike")
-        ltp = pd.to_numeric(leg["OptionLTP"], errors="coerce").dropna()
-        ltp_val = float(ltp.iloc[0]) if not ltp.empty else np.nan
+            continue
+        leg = leg.sort_values(["Strike", "OptionLTP"], ascending=[True, False])
+        atm_leg = leg.iloc[(leg["Strike"] - atm).abs().argsort().iloc[0]] if not leg.empty else None
+        if atm_leg is None:
+            continue
+        ltp = safefloat(atm_leg.get("OptionLTP"), np.nan)
+        oi = safefloat(atm_leg.get("OI"), np.nan)
+        vol = safefloat(atm_leg.get("Volume"), np.nan)
+        if pd.isna(ltp) or ltp < MIN_OPTION_LTP:
+            continue
+        if pd.notna(vol) and vol < MIN_ATM_CHAIN_VOLUME:
+            continue
+        hist = builditerationhistory(gethistory(atm_leg.get("Option Symbol"), "5", INTRADAYLOOKBACKDAYS), SIGNALWINDOWMINUTES, ITERATIONSTOKEEP) if gethistory is not None and builditerationhistory is not None else pd.DataFrame()
         rows.append({
-            "Stock": underlying,
-            "Side": opt_type,
-            "Signal": infer_signal(side),
+            "Underlying": underlying,
+            "Option Type": req_type,
+            "Option Symbol": atm_leg.get("Option Symbol", ""),
+            "Strike": safefloat(atm_leg.get("Strike"), np.nan),
+            "LTP": ltp,
+            "OI": oi,
+            "Volume": vol,
             "ATMStrike": atm,
-            "EntryPrice": ltp_val,
-            "LTP": ltp_val,
-            "Entry": "ENTER" if status == "MOVE_UP_TOGETHER" else "WAIT",
-            "Exit15": "EXIT" if status == "MOVE_DOWN_TOGETHER" else "HOLD",
-            "Exit39": status,
         })
-    out = pd.DataFrame(rows, columns=cols)
-    if not out.empty:
-        out = out.sort_values(["Signal", "Stock"], ascending=[True, True]).reset_index(drop=True)
-    return out
+        if hist is not None and not hist.empty:
+            tmp = hist.copy()
+            tmp.insert(0, "Option Symbol", atm_leg.get("Option Symbol", ""))
+            tmp.insert(0, "Underlying", underlying)
+            iter_rows.append(tmp)
+    return pd.DataFrame(rows), (pd.concat(iter_rows, ignore_index=True) if iter_rows else pd.DataFrame())
 
 
-def build_html_report(signals: pd.DataFrame, title: str) -> str:
-    if signals.empty:
-        body = "<p>No signals generated.</p>"
-    else:
-        body = signals.to_html(index=False, border=0, classes="report")
-    return f"""
-    <html><body>
-    <h3>{title}</h3>
-    <p>Top N: {TOP_N} | Chain window: {CHAIN_DOWN} down / {CHAIN_UP} up | Entry threshold: {ENTRY_THRESHOLD} | Exit threshold: {EXIT_THRESHOLD}</p>
-    {body}
-    </body></html>
-    """
-
-
-def send_email(subject: str, html_body: str, attachments: Optional[List[str]] = None) -> bool:
-    if sendcepebuyemail is not None:
-        try:
-            # keep compatibility with existing OPTIONS_OI mailer when available
-            return bool(sendcepebuyemail([], [], attachments or []))
-        except Exception:
-            pass
-    if sendsingleemail is not None:
-        try:
-            return bool(sendsingleemail(subject, html_body, attachments or []))
-        except Exception:
-            pass
-    logger.warning("No email helper available from OPTIONS_OI")
-    return False
+def build_ce_pe_buy_rows(options_df: pd.DataFrame, iteration_df: pd.DataFrame) -> Tuple[List[dict], List[dict]]:
+    if options_df is None or options_df.empty or iteration_df is None or iteration_df.empty:
+        return [], []
+    if "Option Symbol" not in iteration_df.columns:
+        return [], []
+    signal_col = "windowsignal" if "windowsignal" in iteration_df.columns else "WindowSignal" if "WindowSignal" in iteration_df.columns else None
+    if signal_col is None:
+        return [], []
+    itermap = {sym: grp for sym, grp in iteration_df.groupby("Option Symbol")}
+    cerows, perows = [], []
+    for _, row in options_df.iterrows():
+        sym = str(row.get("Option Symbol", "")).strip()
+        if not sym or sym not in itermap:
+            continue
+        grp = itermap[sym]
+        signals = [str(v).strip().title() for v in grp[signal_col].tolist()]
+        last11 = signals[-11:]
+        if len(last11) < 11:
+            continue
+        buycount = sum(s.startswith("Buy") for s in last11)
+        sellcount = sum(s.startswith("Sell") for s in last11)
+        optype = str(row.get("Option Type", "")).upper()
+        trade_signal = "CE BUY" if optype == "CE" and buycount >= 8 else "PE BUY" if optype == "PE" and sellcount >= 8 else ""
+        if not trade_signal:
+            continue
+        out = {
+            "Underlying": row.get("Underlying", ""),
+            "Option Type": row.get("Option Type", ""),
+            "Option Symbol": sym,
+            "Strike": row.get("Strike", np.nan),
+            "LTP": row.get("LTP", np.nan),
+            "OI": row.get("OI", np.nan),
+            "Volume": row.get("Volume", np.nan),
+            "Trade Signal": trade_signal,
+            "Buy Count": buycount,
+            "Sell Count": sellcount,
+            "Rank Delta": np.nan,
+            "Last Iteration Time": grp.iloc[-1].get("timestamp", ""),
+        }
+        if trade_signal == "CE BUY":
+            cerows.append(out)
+        else:
+            perows.append(out)
+    return cerows, perows
 
 
 def main():
@@ -285,18 +260,25 @@ def main():
         raise FileNotFoundError(f"No file found for pattern {ASIT_GLOB} in {BASE_DIR.resolve()}")
     logger.info("Using ASIT file: %s", asit_file.resolve())
     bull_df, bear_df, combined = build_top_lists(asit_file, top_n=TOP_N)
-    signals = build_report(combined)
-    signals_path = OUTPUT_DIR / ATTACHMENT_NAME
-    signals.to_csv(signals_path, index=False)
-    bull_df.to_csv(OUTPUT_DIR / "top_20_bullish.csv", index=False)
-    bear_df.to_csv(OUTPUT_DIR / "top_20_bearish.csv", index=False)
-    combined.to_csv(OUTPUT_DIR / "top_20_bull_bear.csv", index=False)
-    html = build_html_report(signals, f"CEPEBUY ATM Signals - {asit_file.stem}")
-    send_email(f"CEPEBUY ATM Signals - {asit_file.stem}", html, [str(signals_path)])
+    options_df, iteration_df = build_chain_rows(combined)
+    cebuyrows, pebuyrows = build_ce_pe_buy_rows(options_df, iteration_df)
+    state = loaddailystate()
+    state["rows"] = cebuyrows + pebuyrows
+    savedailystatestate(state)
+    ts = pd.Timestamp.now().strftime("%Y%m%d_%H%M")
+    options_df.to_csv(OUTPUT_DIR / f"cepebuy_options_{ts}.csv", index=False)
+    iteration_df.to_csv(OUTPUT_DIR / f"cepebuy_iterations_{ts}.csv", index=False)
+    pd.DataFrame(cebuyrows).to_csv(OUTPUT_DIR / f"ce_buy_{ts}.csv", index=False)
+    pd.DataFrame(pebuyrows).to_csv(OUTPUT_DIR / f"pe_buy_{ts}.csv", index=False)
+    if cebuyrows or pebuyrows:
+        sendcepebuyemail(cebuyrows, pebuyrows, [str(OUTPUT_DIR / f"ce_buy_{ts}.csv"), str(OUTPUT_DIR / f"pe_buy_{ts}.csv")])
     print(f"ASIT file: {asit_file.name}")
     print(f"Top bullish: {len(bull_df)}")
     print(f"Top bearish: {len(bear_df)}")
-    print(f"Signals: {len(signals)}")
+    print(f"Option rows: {len(options_df)}")
+    print(f"Iteration rows: {len(iteration_df)}")
+    print(f"CE BUY rows: {len(cebuyrows)}")
+    print(f"PE BUY rows: {len(pebuyrows)}")
 
 
 if __name__ == "__main__":
