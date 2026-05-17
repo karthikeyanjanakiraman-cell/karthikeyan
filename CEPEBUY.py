@@ -18,6 +18,11 @@ OUTPUT_BEAR = OUTPUT_DIR / "top_10_bearish.csv"
 OUTPUT_COMBINED = OUTPUT_DIR / "top_10_bull_bear.csv"
 TOP_N = int(os.environ.get("TOP_N", "10"))
 
+try:
+    import CEPEBUY_optional_integration as fy_mod
+except Exception:
+    fy_mod = None
+
 
 def pick_latest_file(pattern: str, base_dir: Path = BASE_DIR) -> Optional[Path]:
     files = sorted(base_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
@@ -91,6 +96,18 @@ def main():
     logger.info("Using ASIT file: %s", asit_file.resolve())
     bull_df, bear_df, combined = build_top_lists(asit_file, top_n=TOP_N)
     save_outputs(bull_df, bear_df, combined)
+    if fy_mod is not None:
+        try:
+            # optional FYERS scan hook; safe to ignore if unavailable
+            fyers_options = []
+            for sym in combined["Underlying"].head(10).tolist():
+                chain = fy_mod.fetch_option_chain(sym)
+                if not chain.empty:
+                    fyers_options.append(chain)
+            if fyers_options:
+                pd.concat(fyers_options, ignore_index=True).to_csv(OUTPUT_DIR / "api_options.csv", index=False)
+        except Exception as e:
+            logger.warning("Optional FYERS scan skipped: %s", e)
     print(f"ASIT file: {asit_file}")
     print(f"Top bullish: {len(bull_df)}")
     print(f"Top bearish: {len(bear_df)}")
