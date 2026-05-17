@@ -488,19 +488,36 @@ def rank_option_candidates(df: pd.DataFrame, side: str) -> pd.DataFrame:
     out = df.copy()
 
     out["OI+Volume+OBV Score"] = pd.to_numeric(
-        out.get("OI+Volume+OBV Score"), errors="coerce"
+        out["OI+Volume+OBV Score"] if "OI+Volume+OBV Score" in out.columns else pd.Series(0, index=out.index),
+        errors="coerce"
     ).fillna(0)
 
-    out["Volume"] = pd.to_numeric(out.get("Volume"), errors="coerce").fillna(0)
-    out["OI"] = pd.to_numeric(out.get("OI"), errors="coerce").fillna(0)
-    out["Chain Legs"] = pd.to_numeric(out.get("Chain Legs"), errors="coerce").fillna(0)
+    out["Volume"] = pd.to_numeric(
+        out["Volume"] if "Volume" in out.columns else pd.Series(0, index=out.index),
+        errors="coerce"
+    ).fillna(0)
 
-    out["Chain Signal"] = out.get("Chain Signal", "WAIT").astype(str).str.upper()
+    out["OI"] = pd.to_numeric(
+        out["OI"] if "OI" in out.columns else pd.Series(0, index=out.index),
+        errors="coerce"
+    ).fillna(0)
+
+    out["Chain Legs"] = pd.to_numeric(
+        out["Chain Legs"] if "Chain Legs" in out.columns else pd.Series(0, index=out.index),
+        errors="coerce"
+    ).fillna(0)
+
+    out["Chain Signal"] = (
+        out["Chain Signal"] if "Chain Signal" in out.columns else pd.Series("WAIT", index=out.index)
+    ).astype(str).str.upper()
+
     sig_order = {"ENTER": 0, "WAIT": 1, "EXIT": 2}
     out["_sig_sort"] = out["Chain Signal"].map(sig_order).fillna(9)
 
     out["_entry_time_sort"] = pd.to_datetime(
-        out.get("Entry Time"), format="%H:%M", errors="coerce"
+        out["Entry Time"] if "Entry Time" in out.columns else pd.Series("", index=out.index),
+        format="%H:%M",
+        errors="coerce"
     )
 
     out = out.sort_values(
@@ -511,7 +528,7 @@ def rank_option_candidates(df: pd.DataFrame, side: str) -> pd.DataFrame:
     out["EMAIL_RANK_SCORE"] = np.arange(1, len(out) + 1)
 
     return out.drop(columns=["_sig_sort", "_entry_time_sort"], errors="ignore")
-
+    
 def buildoptioncandidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if candidates_df is None or candidates_df.empty or "Symbol" not in candidates_df.columns:
         return pd.DataFrame(), pd.DataFrame()
