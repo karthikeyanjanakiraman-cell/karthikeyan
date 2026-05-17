@@ -513,6 +513,7 @@ def scansingleoption(optionsymbol: str, optiontype: str, strike: float, underlyi
     dailydf = gethistory(histsymbol, "D", DAILYLOOKBACKDAYS)
     intradf = gethistory(histsymbol, "5", INTRADAYLOOKBACKDAYS)
     if dailydf.empty or intradf.empty:
+        logger.warning("HISTORY EMPTY symbol=%s daily=%d intraday=%d", histsymbol, len(dailydf), len(intradf))
         return None
     summary = summarizeintraday(intradf, dailydf)
     if not summary:
@@ -565,8 +566,9 @@ def buildoptioncandidates(candidatesdf: pd.DataFrame, side: str) -> Tuple[pd.Dat
         reqtype = "CE" if side == "long" else "PE"
         atmrows = pairdf[(pairdf["Strike"] == atmstrike) & (pairdf["Option Type"] == reqtype)]
         atmvol = safefloat(atmrows["Chain Volume"].iloc[0] if not atmrows.empty else 0, 0)
+        logger.info("ATM strike=%s reqtype=%s atmvol=%s underlying=%s", atmstrike, reqtype, atmvol, underlying)
         if atmvol < MINATMCHAINVOLUME:
-            logger.debug("SKIP %s ATM %s vol %.0f < %d", underlying, reqtype, atmvol, MINATMCHAINVOLUME)
+            logger.warning("SKIP ATM volume underlying=%s reqtype=%s atmstrike=%s atmvol=%.0f min=%d", underlying, reqtype, atmstrike, atmvol, MINATMCHAINVOLUME)
             continue
         for _, row in pairdf.iterrows():
             strike = safefloat(row.get("Strike"), np.nan)
@@ -575,12 +577,16 @@ def buildoptioncandidates(candidatesdf: pd.DataFrame, side: str) -> Tuple[pd.Dat
             if not sym or opttype not in ("CE", "PE"):
                 continue
             scanned = scansingleoption(sym, opttype, strike, underlying)
+            if scanned is None:
+                logger.warning("SKIP history/scan failed underlying=%s symbol=%s type=%s strike=%s", underlying, sym, opttype, strike)
             if not scanned:
                 continue
             scanned["OIVolumeOBV Score"] = optionliquidityscore(scanned.get("OI", 0), scanned.get("Volume", 0), scanned.get("OBV", 0))
             if safefloat(scanned.get("LTP", 0.0)) < MINOPTIONLTP:
+                logger.warning("SKIP LTP low symbol=%s ltp=%.2f min=%.2f", sym, safefloat(scanned.get("LTP", 0.0)), MINOPTIONLTP)
                 continue
             if safefloat(scanned.get("Volume", 0)) < MINATMCHAINVOLUME:
+                logger.warning("SKIP volume low symbol=%s volume=%.0f min=%d", sym, safefloat(scanned.get("Volume", 0)), MINATMCHAINVOLUME)
                 continue
             rows.append(scanned)
             hist = scanned.get("Iteration History")
