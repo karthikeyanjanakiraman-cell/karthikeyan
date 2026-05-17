@@ -1,7 +1,8 @@
+# Optional FYERS/OPTIONS_OI integration module for CEPEBUY rank-only workflow
 import os
 import logging
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -9,110 +10,153 @@ import pandas as pd
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-BASE_DIR = Path(os.environ.get("DATA_DIR", "."))
 OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "."))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-ASIT_GLOB = os.environ.get("ASIT_GLOB", "asit*.csv")
-OUTPUT_BULL = OUTPUT_DIR / "top_10_bullish.csv"
-OUTPUT_BEAR = OUTPUT_DIR / "top_10_bearish.csv"
-OUTPUT_COMBINED = OUTPUT_DIR / "top_10_bull_bear.csv"
-TOP_N = int(os.environ.get("TOP_N", "10"))
 
+# Local imports only; no missing symbols assumed
 try:
-    import CEPEBUY_optional_integration as fy_mod
-except Exception:
-    fy_mod = None
+    import OPTIONS_OI as opt
+except Exception as e:
+    opt = None
+    logger.warning("OPTIONS_OI unavailable: %s", e)
 
 
-def pick_latest_file(pattern: str, base_dir: Path = BASE_DIR) -> Optional[Path]:
-    files = sorted(base_dir.glob(pattern), key=lambda p: p.stat().st_mtime, reverse=True)
-    return files[0] if files else None
+def _safe_getattr(name, default=None):
+    return getattr(opt, name, default) if opt is not None else default
 
 
-def load_csv(path: Path) -> pd.DataFrame:
-    df = pd.read_csv(path)
-    df.columns = [str(c).strip() for c in df.columns]
-    return df
-
-
-def find_col(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    cols = {str(c).strip().lower(): c for c in df.columns}
-    for c in candidates:
-        if c.lower() in cols:
-            return cols[c.lower()]
+def get_fyers_client():
+    initfyers = _safe_getattr("initfyers")
+    if callable(initfyers):
+        try:
+            return initfyers()
+        except Exception as e:
+            logger.warning("initfyers failed: %s", e)
     return None
 
 
-def clean_text(s: pd.Series) -> pd.Series:
-    return s.astype(str).str.strip().str.upper().replace({"NAN": np.nan, "NONE": np.nan, "NULL": np.nan, "": np.nan})
+def normalize_symbol(raw: str) -> str:
+    formateqsymbol = _safe_getattr("formateqsymbol", lambda x: f"NSE:{str(x).strip().upper()}-EQ")
+    s = str(raw).strip().upper()
+    if s.startswith("NSE:NSE:"):
+        s = s.replace("NSE:NSE:", "NSE:", 1)
+    if s.endswith("-EQ-EQ"):
+        s = s[:-3]
+    return s if s.startswith("NSE:") else formateqsymbol(s)
 
 
-def score_frame(df: pd.DataFrame):
-    bull_col = find_col(df, ["BullMultiTFScore", "bull", "bullish", "buy", "long", "BullScore", "bull_score", "5min_BullScore", "15min_BullScore", "1hour_BullScore", "4hour_BullScore", "1day_BullScore"])
-    bear_col = find_col(df, ["BearMultiTFScore", "bear", "bearish", "sell", "short", "BearScore", "bear_score", "5min_BearScore", "15min_BearScore", "1hour_BearScore", "4hour_BearScore", "1day_BearScore"])
-    rank_col = find_col(df, ["RankScore15Tier", "score", "rank", "Score15Tier", "5min_Score15Tier", "15min_Score15Tier", "1hour_Score15Tier", "4hour_Score15Tier", "1day_Score15Tier"])
-    sym_col = find_col(df, ["Symbol", "symbol", "underlying", "ticker", "tradingsymbol", "name"])
-    if sym_col is None:
-        raise ValueError("No symbol column found in ASIT CSV")
-    for c in [bull_col, bear_col, rank_col]:
-        if c is not None:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-    df[sym_col] = clean_text(df[sym_col])
-    return df, sym_col, bull_col, bear_col, rank_col
+def extract_chain(resp) -> list:
+    if not isinstance(resp, dict):
+        return []
+    data = resp.get("data", resp)
+    if isinstance(data, dict):
+        for key in ("optionsChain", "optionChain", "chain", "contracts", "data"):
+            if key in data:
+                data = data[key]
+                break
+    return data if isinstance(data, list) else []
 
 
-def top_rows(df: pd.DataFrame, sort_col: Optional[str], n: int) -> pd.DataFrame:
-    out = df.copy()
-    if sort_col is not None:
-        out = out.sort_values(sort_col, ascending=False, na_position="last")
-    return out.head(n).reset_index(drop=True)
+def fetch_option_chain(underlying: str) -> pd.DataFrame:
+    fyers = get_fyers_client()
+    if fyers is None:
+        return pd.DataFrame()
+    try:
+        resp = fyers.optionchain({"symbol": normalize_symbol(underlying), "strikecount": 50})
+    except Exception as e:
+        logger.warning("optionchain failed for %s: %s", underlying, e)
+        return pd.DataFrame()
+    safefloat = _safe_getattr("safefloat", lambda v, default=np.nan: default if v is None or str(v).strip()=="" else float(v))
+    rows = []
+    for item in extract_chain(resp):
+        if not isinstance(item, dict):
+            continue
+        typ = str(item.get("optionType") or item.get("type") or "").upper()
+        strike = safefloat(item.get("strikePrice") or item.get("strike"), np.nan)
+        if pd.isna(strike) or typ not in ("CE", "PE"):
+            continue
+        rows.append({
+            "Underlying": underlying,
+            "Option Type": typ,
+            "Strike": strike,
+            "Option Symbol": str(item.get("symbol") or item.get("tradingSymbol") or ""),
+            "OptionLTP": safefloat(item.get("ltp") or item.get("lp"), np.nan),
+            "OI": safefloat(item.get("oi") or item.get("openInterest"), np.nan),
+            "Volume": safefloat(item.get("volume"), np.nan),
+        })
+    return pd.DataFrame(rows)
 
 
-def build_top_lists(asit_path: Path, top_n: int = TOP_N) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    df = load_csv(asit_path)
-    df, sym_col, bull_col, bear_col, rank_col = score_frame(df)
-    bull_df = top_rows(df, bull_col or rank_col, top_n).copy()
-    bear_df = top_rows(df, bear_col or rank_col, top_n).copy()
-    bull_df["Side"] = "BULLISH"
-    bear_df["Side"] = "BEARISH"
-    bull_df["Underlying"] = bull_df[sym_col]
-    bear_df["Underlying"] = bear_df[sym_col]
-    bull_df["Option Symbol"] = bull_df[sym_col]
-    bear_df["Option Symbol"] = bear_df[sym_col]
-    return bull_df, bear_df, pd.concat([bull_df, bear_df], ignore_index=True)
+def fetch_iteration_history(option_symbol: str) -> pd.DataFrame:
+    gethistory = _safe_getattr("gethistory")
+    builditerationhistory = _safe_getattr("builditerationhistory")
+    SIGNALWINDOWMINUTES = _safe_getattr("SIGNALWINDOWMINUTES", 5)
+    ITERATIONSTOKEEP = _safe_getattr("ITERATIONSTOKEEP", 75)
+    INTRADAYLOOKBACKDAYS = _safe_getattr("INTRADAYLOOKBACKDAYS", 20)
+    if not callable(gethistory) or not callable(builditerationhistory):
+        return pd.DataFrame()
+    try:
+        hist_symbol = option_symbol if str(option_symbol).startswith("NSE:") else f"NSE:{option_symbol}"
+        intradf = gethistory(hist_symbol, "5", INTRADAYLOOKBACKDAYS)
+        if intradf is None or intradf.empty:
+            return pd.DataFrame()
+        return builditerationhistory(intradf, SIGNALWINDOWMINUTES, ITERATIONSTOKEEP)
+    except Exception as e:
+        logger.warning("history failed for %s: %s", option_symbol, e)
+        return pd.DataFrame()
 
 
-def save_outputs(bull_df: pd.DataFrame, bear_df: pd.DataFrame, combined: pd.DataFrame):
-    bull_df.to_csv(OUTPUT_BULL, index=False)
-    bear_df.to_csv(OUTPUT_BEAR, index=False)
-    combined.to_csv(OUTPUT_COMBINED, index=False)
-    logger.info("Saved %s, %s, %s", OUTPUT_BULL.name, OUTPUT_BEAR.name, OUTPUT_COMBINED.name)
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.mime.base import MIMEBase
+from email import encoders
+from email.mime.application import MIMEApplication
 
 
-def main():
-    asit_file = pick_latest_file(ASIT_GLOB)
-    if asit_file is None:
-        raise FileNotFoundError(f"No file found for pattern {ASIT_GLOB} in {BASE_DIR.resolve()}")
-    logger.info("Using ASIT file: %s", asit_file.resolve())
-    bull_df, bear_df, combined = build_top_lists(asit_file, top_n=TOP_N)
-    save_outputs(bull_df, bear_df, combined)
-    if fy_mod is not None:
-        try:
-            # optional FYERS scan hook; safe to ignore if unavailable
-            fyers_options = []
-            for sym in combined["Underlying"].head(10).tolist():
-                chain = fy_mod.fetch_option_chain(sym)
-                if not chain.empty:
-                    fyers_options.append(chain)
-            if fyers_options:
-                pd.concat(fyers_options, ignore_index=True).to_csv(OUTPUT_DIR / "api_options.csv", index=False)
-        except Exception as e:
-            logger.warning("Optional FYERS scan skipped: %s", e)
-    print(f"ASIT file: {asit_file}")
-    print(f"Top bullish: {len(bull_df)}")
-    print(f"Top bearish: {len(bear_df)}")
-    print(f"Combined rows: {len(combined)}")
+def build_near_atm_signals(options_df: pd.DataFrame) -> pd.DataFrame:
+    if options_df is None or options_df.empty:
+        return pd.DataFrame(columns=["Stock", "Side", "Signal", "ATMStrike", "EntryPrice", "LTP", "Entry", "Exit15", "Exit39"])
+    df = options_df.copy()
+    if "Underlying" not in df.columns:
+        return pd.DataFrame(columns=["Stock", "Side", "Signal", "ATMStrike", "EntryPrice", "LTP", "Entry", "Exit15", "Exit39"])
+    df["Stock"] = df["Underlying"].astype(str).str.replace(r"^NSE:", "", regex=True).str.replace(r"-EQ$", "", regex=True)
+    df["Side"] = df["Option Type"].map({"CE": "CE", "PE": "PE"}).fillna("")
+    df["Signal"] = np.where(df["Side"] == "CE", "BUY CE", "BUY PE")
+    df["ATMStrike"] = pd.to_numeric(df.get("Strike"), errors="coerce")
+    df["EntryPrice"] = pd.to_numeric(df.get("OptionLTP"), errors="coerce")
+    df["LTP"] = pd.to_numeric(df.get("OptionLTP"), errors="coerce")
+    df["Entry"] = ""
+    df["Exit15"] = "-"
+    df["Exit39"] = "-"
+    cols = ["Stock", "Side", "Signal", "ATMStrike", "EntryPrice", "LTP", "Entry", "Exit15", "Exit39"]
+    return df[cols].drop_duplicates(subset=["Stock", "Side", "ATMStrike"]).reset_index(drop=True)
 
 
-if __name__ == "__main__":
-    main()
+def send_email_with_attachment(subject: str, body_html: str, attachment_path: str | None = None) -> bool:
+    email_address = os.environ.get("EMAIL_ADDRESS")
+    email_password = os.environ.get("EMAIL_PASSWORD")
+    email_to = os.environ.get("EMAIL_TO", email_address)
+    if not email_address or not email_password or not email_to:
+        logger.warning("Email env vars missing; skipping email")
+        return False
+    try:
+        msg = MIMEMultipart()
+        msg["From"] = email_address
+        msg["To"] = email_to
+        msg["Subject"] = subject
+        msg.attach(MIMEText(body_html, "html", "utf-8"))
+        if attachment_path and os.path.exists(attachment_path):
+            with open(attachment_path, "rb") as f:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(attachment_path)}")
+            msg.attach(part)
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(email_address, email_password)
+            server.send_message(msg)
+        return True
+    except Exception as e:
+        logger.warning("Email send failed: %s", e)
+        return False
