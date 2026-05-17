@@ -431,7 +431,7 @@ def fetch_optionpairs(symbol: str, paircount: int = OPTION_PAIRS_TO_KEEP) -> pd.
     except Exception as e:
         logger.warning("Quote fetch failed symbol=%s err=%s", symbol, e)
 
-    chain_attempts = [eqsymbol, symbol if str(symbol).startswith("NSE:") else f"NSE:{str(symbol).strip().upper()}\n"]
+    chain_attempts = [eqsymbol, symbol if str(symbol).startswith("NSE:") else f"NSE:{str(symbol).strip().upper()}"]
     chain_attempts = [str(s).strip() for s in chain_attempts]
     chain_res = None
     for chain_symbol in chain_attempts:
@@ -673,21 +673,53 @@ def _prepare_email_df(df: pd.DataFrame) -> pd.DataFrame:
 
 def compact_table_html(df: pd.DataFrame, title: str, max_rows: int) -> str:
     if df is None or df.empty:
-        return f"<h3>{title}</h3><p>No rows</p>"
+        return f"<div class="section-card"><h3>{title}</h3><p class="muted">No rows</p></div>"
     df = _prepare_email_df(df)
-    cols = [c for c in ["Underlying", "Option Type", "Opt Symbol", "Strike", "LTP", "% Chg", "OI", "Volume", "OBV", "Liq Score", "Rank", "Entry", "Entry Time", "Exit", "Exit Time", "Cumulative ADX", "5m_Signal", "15m_Signal", "Overall_Signal", "IVP", "Time"] if c in df.columns]
-    body = df[cols].head(max_rows).to_html(index=False, border=0, escape=False)
-    return f"<h3>{title}</h3>{body}"
+    if "Chain Signal" in df.columns:
+        df["Chain Signal"] = df["Chain Signal"].astype(str).map(
+            lambda x: f'<span class="badge badge-enter">{x}</span>' if x.upper() == "ENTER" else (
+                f'<span class="badge badge-exit">{x}</span>' if x.upper() == "EXIT" else f'<span class="badge badge-wait">{x}</span>'
+            )
+        )
+    cols = [c for c in ["Underlying", "Option Type", "Strike", "LTP", "% Chg", "OI", "Volume", "OBV", "Liq Score", "Rank", "Entry", "Entry Time", "Exit", "Exit Time", "Cumulative ADX", "5m_Signal", "15m_Signal", "Overall_Signal", "IVP", "Time", "Chain Signal"] if c in df.columns]
+    body = df[cols].head(max_rows).to_html(index=False, border=0, escape=False, classes="mail-table")
+    return f"<div class="section-card"><h3>{title}</h3>{body}</div>"
 
 
 def build_chain_email_html(long_rows: List[Dict], short_rows: List[Dict]) -> str:
     ts = datetime.now().strftime("%d %b %Y, %H:%M")
     return f"""
     <html>
+    <head>
+    <style>
+        body {{ font-family: Arial, sans-serif; background: #f4f7fb; color: #172033; margin: 0; padding: 20px; }}
+        .wrap {{ max-width: 1180px; margin: 0 auto; }}
+        .hero {{ background: linear-gradient(135deg, #0f172a, #1d4ed8); color: white; padding: 18px 22px; border-radius: 14px; }}
+        .hero h2 {{ margin: 0 0 6px 0; font-size: 24px; }}
+        .hero p {{ margin: 0; color: #dbeafe; }}
+        .section-card {{ background: white; border: 1px solid #dbe4f0; border-radius: 14px; padding: 14px 16px; margin-top: 16px; box-shadow: 0 6px 18px rgba(15, 23, 42, 0.06); }}
+        h3 {{ margin: 0 0 12px 0; color: #1e3a8a; }}
+        .mail-table {{ width: 100%; border-collapse: collapse; font-size: 13px; overflow: hidden; }}
+        .mail-table th {{ background: #2563eb; color: white; padding: 10px 8px; text-align: left; }}
+        .mail-table td {{ padding: 8px; border-bottom: 1px solid #e5e7eb; }}
+        .mail-table tr:nth-child(even) td {{ background: #f8fbff; }}
+        .mail-table tr:hover td {{ background: #eef6ff; }}
+        .badge {{ display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; }}
+        .badge-enter {{ background: #dcfce7; color: #166534; }}
+        .badge-exit {{ background: #fee2e2; color: #991b1b; }}
+        .badge-wait {{ background: #f3f4f6; color: #374151; }}
+        .muted {{ color: #64748b; }}
+    </style>
+    </head>
     <body>
-        <h2>Chain Signal Report - {ts}</h2>
-        {compact_table_html(pd.DataFrame(long_rows), 'LONG CANDIDATES', EMAIL_MAX_ROWS_LONG)}
-        {compact_table_html(pd.DataFrame(short_rows), 'SHORT CANDIDATES', EMAIL_MAX_ROWS_SHORT)}
+        <div class="wrap">
+            <div class="hero">
+                <h2>Chain Signal Report - {ts}</h2>
+                <p>Color-coded chain summary for long and short candidates.</p>
+            </div>
+            {compact_table_html(pd.DataFrame(long_rows), 'LONG CANDIDATES', EMAIL_MAX_ROWS_LONG)}
+            {compact_table_html(pd.DataFrame(short_rows), 'SHORT CANDIDATES', EMAIL_MAX_ROWS_SHORT)}
+        </div>
     </body>
     </html>
     """
@@ -709,11 +741,11 @@ def build_cepebuy_rows(options_df: pd.DataFrame, iteration_df: pd.DataFrame) -> 
         return [], []
 
     ce_rows, pe_rows = [], []
-    group_cols = ["Underlying", "Option Type", "Strike", "Option Symbol"]
+    group_cols = ["Underlying", "Option Type", "Strike"]
 
     for _, grp in iteration_df.groupby(group_cols):
         grp = grp.copy()
-        sort_cols = [c for c in ["iteration", "timestamp"] if c in grp.columns]
+        sort_cols = [c for c in ["iteration", "timestamp", "Option Symbol"] if c in grp.columns]
         if sort_cols:
             grp = grp.sort_values(sort_cols).reset_index(drop=True)
 
@@ -723,30 +755,39 @@ def build_cepebuy_rows(options_df: pd.DataFrame, iteration_df: pd.DataFrame) -> 
 
         first = grp.iloc[0]
         opt_type = str(first.get("Option Type", "")).upper()
-        strike = first.get("Strike", np.nan)
+        strike = safe_float(first.get("Strike", np.nan), np.nan)
         underlying = first.get("Underlying", "")
 
+        strike_series = pd.to_numeric(options_df.get("Strike"), errors="coerce") if "Strike" in options_df.columns else pd.Series(dtype=float)
         opt_match = options_df[
             (options_df["Underlying"].astype(str) == str(underlying)) &
             (options_df["Option Type"].astype(str).str.upper() == opt_type) &
-            (pd.to_numeric(options_df["Strike"], errors="coerce") == safe_float(strike, np.nan))
-        ]
+            (strike_series == strike)
+        ].copy()
         if opt_match.empty:
-            continue
-        row = opt_match.iloc[0]
+            ltp = pd.to_numeric(grp["close"], errors="coerce").dropna().iloc[-1] if pd.to_numeric(grp["close"], errors="coerce").dropna().shape[0] else np.nan
+            pct_chg = np.nan
+        else:
+            sort_pref = [c for c in ["Volume", "OI+Volume+OBV Score", "EMAIL_RANK_SCORE"] if c in opt_match.columns]
+            if sort_pref:
+                opt_match = opt_match.sort_values(sort_pref, ascending=[False] * len(sort_pref))
+            row = opt_match.iloc[0]
+            ltp = row.get("LTP", np.nan)
+            pct_chg = row.get("% Change", np.nan)
 
         out = {
             "Underlying": underlying,
             "Option Type": opt_type,
             "Strike": strike,
-            "LTP": row.get("LTP", np.nan),
-            "% Change": row.get("% Change", np.nan),
+            "LTP": ltp,
+            "% Change": pct_chg,
             "Entry Value": chain_sig.get("Entry Value", np.nan),
             "Entry Time": chain_sig.get("Entry Time", ""),
             "Exit Value": chain_sig.get("Exit Value", np.nan),
             "Exit Time": chain_sig.get("Exit Time", ""),
             "Trade Signal": f"{opt_type} CHAIN",
             "Chain Signal": chain_sig.get("Chain Signal", "WAIT"),
+            "Chain Legs": int(grp["Option Symbol"].nunique()) if "Option Symbol" in grp.columns else 0,
         }
         if opt_type == "CE":
             ce_rows.append(out)
@@ -759,20 +800,55 @@ def build_cepebuy_rows(options_df: pd.DataFrame, iteration_df: pd.DataFrame) -> 
 def build_cepebuy_email_html(ce_rows: List[Dict], pe_rows: List[Dict]) -> str:
     ts = datetime.now().strftime("%d %b %Y, %H:%M")
 
-    def table(rows, title):
+    def style_signal(val: str) -> str:
+        s = str(val).upper()
+        if s == "ENTER":
+            return f'<span class="badge badge-enter">{s}</span>'
+        if s == "EXIT":
+            return f'<span class="badge badge-exit">{s}</span>'
+        return f'<span class="badge badge-wait">{s}</span>'
+
+    def table(rows, title, accent):
         df = pd.DataFrame(rows)
         if df.empty:
-            return f"<h3>{title}</h3><p>No chain-based eligible strikes.</p>"
-        cols = [c for c in ["Underlying", "Option Type", "Strike", "LTP", "% Change", "Entry Value", "Entry Time", "Exit Value", "Exit Time", "Trade Signal", "Chain Signal"] if c in df.columns]
-        return f"<h3>{title}</h3>{df[cols].to_html(index=False, border=0, escape=False)}"
+            return f"<div class="section-card"><h3 style="color:{accent};">{title}</h3><p class="muted">No chain-based eligible strikes.</p></div>"
+        if "Chain Signal" in df.columns:
+            df["Chain Signal"] = df["Chain Signal"].map(style_signal)
+        cols = [c for c in ["Underlying", "Option Type", "Strike", "LTP", "% Change", "Entry Value", "Entry Time", "Exit Value", "Exit Time", "Trade Signal", "Chain Signal", "Chain Legs"] if c in df.columns]
+        html = df[cols].to_html(index=False, border=0, escape=False, classes="mail-table")
+        return f"<div class="section-card"><h3 style="color:{accent};">{title}</h3>{html}</div>"
 
     return f"""
     <html>
+    <head>
+    <style>
+        body {{ font-family: Arial, sans-serif; background: #f4f7fb; color: #172033; margin: 0; padding: 20px; }}
+        .wrap {{ max-width: 1180px; margin: 0 auto; }}
+        .hero {{ background: linear-gradient(135deg, #7c3aed, #2563eb); color: white; padding: 18px 22px; border-radius: 14px; }}
+        .hero h2 {{ margin: 0 0 6px 0; font-size: 24px; }}
+        .hero p {{ margin: 0; color: #ede9fe; }}
+        .section-card {{ background: white; border: 1px solid #dbe4f0; border-radius: 14px; padding: 14px 16px; margin-top: 16px; box-shadow: 0 6px 18px rgba(15, 23, 42, 0.06); }}
+        .mail-table {{ width: 100%; border-collapse: collapse; font-size: 13px; overflow: hidden; }}
+        .mail-table th {{ background: #1d4ed8; color: white; padding: 10px 8px; text-align: left; }}
+        .mail-table td {{ padding: 8px; border-bottom: 1px solid #e5e7eb; }}
+        .mail-table tr:nth-child(even) td {{ background: #f8fbff; }}
+        .mail-table tr:hover td {{ background: #eef6ff; }}
+        .badge {{ display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; }}
+        .badge-enter {{ background: #dcfce7; color: #166534; }}
+        .badge-exit {{ background: #fee2e2; color: #991b1b; }}
+        .badge-wait {{ background: #f3f4f6; color: #374151; }}
+        .muted {{ color: #64748b; }}
+    </style>
+    </head>
     <body>
-        <h2>CE PE Chain Eligibility Report - {ts}</h2>
-        <p>Rule: include strike only when chain iteration logic marks it as eligible from grouped strike movement.</p>
-        {table(ce_rows, 'CE CHAIN ELIGIBLE STRIKES')}
-        {table(pe_rows, 'PE CHAIN ELIGIBLE STRIKES')}
+        <div class="wrap">
+            <div class="hero">
+                <h2>CE PE Chain Eligibility Report - {ts}</h2>
+                <p>Strike is included only when grouped chain iteration movement marks it as eligible. Option Symbol is hidden from the email.</p>
+            </div>
+            {table(ce_rows, 'CE CHAIN ELIGIBLE STRIKES', '#2563eb')}
+            {table(pe_rows, 'PE CHAIN ELIGIBLE STRIKES', '#7c3aed')}
+        </div>
     </body>
     </html>
     """
@@ -854,11 +930,11 @@ def main():
     long_merged = []
     short_merged = []
     if not long_iter_df.empty:
-        cols = [c for c in ["Underlying", "Option Type", "Strike", "Option Symbol"] if c in long_iter_df.columns]
+        cols = [c for c in ["Underlying", "Option Type", "Strike"] if c in long_iter_df.columns]
         for _, grp in long_iter_df.groupby(cols):
             long_merged.append(chain_row_from_group(grp))
     if not short_iter_df.empty:
-        cols = [c for c in ["Underlying", "Option Type", "Strike", "Option Symbol"] if c in short_iter_df.columns]
+        cols = [c for c in ["Underlying", "Option Type", "Strike"] if c in short_iter_df.columns]
         for _, grp in short_iter_df.groupby(cols):
             short_merged.append(chain_row_from_group(grp))
 
