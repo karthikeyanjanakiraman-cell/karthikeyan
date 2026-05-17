@@ -35,14 +35,14 @@ ITERATIONS_TO_KEEP = int(os.environ.get("ITERATIONS_TO_KEEP", "75"))
 SECTORS_DIR = os.environ.get("SECTORS_DIR", "sectors")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 MIN_OPTION_LTP = float(os.environ.get("MIN_OPTION_LTP", "5"))
-MIN_ATM_CHAIN_VOLUME = int(os.environ.get("MIN_ATM_CHAIN_VOLUME", "10000"))
-MIN_OPTION_DAY_VOLUME = int(os.environ.get("MIN_OPTION_DAY_VOLUME", "10000"))
+MIN_ATM_CHAIN_VOLUME = int(os.environ.get("MIN_ATM_CHAIN_VOLUME", "100000"))
+MIN_OPTION_DAY_VOLUME = int(os.environ.get("MIN_OPTION_DAY_VOLUME", "100000"))
 PER_SYMBOL_SLEEP_SEC = float(os.environ.get("PER_SYMBOL_SLEEP_SEC", "0.10"))
 EMAIL_MAX_ROWS_LONG = int(os.environ.get("EMAIL_MAX_ROWS_LONG", "25"))
 EMAIL_MAX_ROWS_SHORT = int(os.environ.get("EMAIL_MAX_ROWS_SHORT", "25"))
 TOP_N_UNDERLYINGS = int(os.environ.get("TOP_N_UNDERLYINGS", "20"))
-MIN_CHAIN_LEGS = int(os.environ.get("MIN_CHAIN_LEGS", "3"))
-REUSE_SHORTLIST = str(os.environ.get("REUSE_SHORTLIST", "0")).strip().lower() in {"1", "true", "yes", "y"}
+MIN_CHAIN_LEGS = int(os.environ.get("MIN_CHAIN_LEGS", "4"))
+REUSE_SHORTLIST = str(os.environ.get("REUSE_SHORTLIST", "1")).strip().lower() in {"1", "true", "yes", "y"}
 TODAY_TAG = datetime.now().strftime("%Y%m%d")
 SUMMARY_PATH = os.path.join(OUTPUT_DIR, f"fo_summary_{TODAY_TAG}.csv")
 LONG_SEED_PATH = os.path.join(OUTPUT_DIR, f"fo_long_seed_{TODAY_TAG}.csv")
@@ -940,6 +940,63 @@ def load_or_build_shortlist() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
     logger.info("Fresh shortlist built and saved for %s", TODAY_TAG)
     return summary_df, long_seed_df, short_seed_df
 
+
+
+def find_latest_asit_csv(rootdir: str = ".") -> Optional[str]:
+    matches = []
+    for dirpath, _, filenames in os.walk(rootdir):
+        for fname in filenames:
+            low = fname.lower()
+            if low.startswith("asit") and low.endswith(".csv"):
+                path = os.path.join(dirpath, fname)
+                try:
+                    matches.append((os.path.getmtime(path), path))
+                except Exception:
+                    pass
+    if not matches:
+        return None
+    matches.sort(reverse=True)
+    return matches[0][1]
+
+
+def normalize_underlying_symbol(value: str) -> str:
+    s = str(value or "").strip().upper()
+    s = s.replace("NSE:", "")
+    if s.endswith("-EQ"):
+        s = s[:-3]
+    return s.strip()
+
+
+def load_asit_shortlist(path: str, topn: int = TOP_N_UNDERLYINGS) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    df = pd.read_csv(path)
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    sym_col = cols.get("symbol")
+    rank_col = cols.get("rankscore15tier") or cols.get("rank")
+    bull_col = cols.get("bullmultitfscore")
+    bear_col = cols.get("bearmultitfscore")
+    trend_col = cols.get("dominanttrend")
+    if not sym_col:
+        raise RuntimeError(f"ASIT csv missing Symbol column: {path}")
+    work = df.copy()
+    work["Symbol"] = work[sym_col].astype(str).map(normalize_underlying_symbol)
+    if rank_col and rank_col in work.columns:
+        work["__rank"] = pd.to_numeric(work[rank_col], errors="coerce").fillna(0)
+    else:
+        work["__rank"] = 0.0
+    if bull_col and bull_col in work.columns:
+        work["__bull"] = pd.to_numeric(work[bull_col], errors="coerce").fillna(0)
+    else:
+        work["__bull"] = 0.0
+    if bear_col and bear_col in work.columns:
+        work["__bear"] = pd.to_numeric(work[bear_col], errors="coerce").fillna(0)
+    else:
+        work["__bear"] = 0.0
+    trend_vals = work[trend_col].astype(str).str.upper() if trend_col and trend_col in work.columns else pd.Series("", index=work.index)
+    bull_mask = trend_vals.str.contains("BULL") | (work["__bull"] >= work["__bear"])
+    bear_mask = trend_vals.str.contains("BEAR") | (work["__bear"] > work["__bull"])
+    long_df = work[bull_mask].copy().sort_values(["__rank", "__bull", "__bear"], ascending=[False, False, True]).drop_duplicates(subset=["Symbol"]).head(topn)
+    short_df = work[bear_mask].copy().sort_values(["__rank", "__bear", "__bull"], ascending=[False, False, True]).drop_duplicates(subset=["Symbol"]).head(topn)
+    return long_df[["Symbol"]].reset_index(drop=True), short_df[["Symbol"]].reset_index(drop=True)
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
