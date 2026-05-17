@@ -112,9 +112,12 @@ def init_client_once():
         logger.warning("Missing CLIENT_ID/ACCESS_TOKEN")
         return None
     try:
-        from fyersapiv3 import fyersModel as fm
+        try:
+            from fyers_apiv3 import fyersModel as fm
+        except Exception:
+            from fyersapiv3 import fyersModel as fm
         fyers = fm.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=False, log_path="")
-        logger.info("Fyers client initialized")
+        logger.info("Fyers client initialized using %s", fm.__module__)
         return fyers
     except Exception as e:
         logger.warning("Fyers client not available: %s", e)
@@ -124,7 +127,16 @@ def init_client_once():
 def fetch_option_chain(underlying: str) -> pd.DataFrame:
     fy = init_client_once()
     if fy is None:
-        return pd.DataFrame()
+        return pd.DataFrame([{
+            "Underlying": underlying,
+            "Option Type": "CE",
+            "Strike": np.nan,
+            "Option Symbol": "",
+            "OptionLTP": np.nan,
+            "OI": np.nan,
+            "Volume": np.nan,
+            "Source": "fallback"
+        }])
     eqsymbol = formateqsymbol(underlying)
     logger.info("API chain fetch underlying=%s eqsymbol=%s", underlying, eqsymbol)
     try:
