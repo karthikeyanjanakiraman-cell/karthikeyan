@@ -673,7 +673,7 @@ def _prepare_email_df(df: pd.DataFrame) -> pd.DataFrame:
 
 def compact_table_html(df: pd.DataFrame, title: str, max_rows: int) -> str:
     if df is None or df.empty:
-        return f"<div class="section-card"><h3>{title}</h3><p class="muted">No rows</p></div>"
+        return f'<div class="section-card"><h3>{title}</h3><p class="muted">No rows</p></div>'
     df = _prepare_email_df(df)
     if "Chain Signal" in df.columns:
         df["Chain Signal"] = df["Chain Signal"].astype(str).map(
@@ -683,7 +683,7 @@ def compact_table_html(df: pd.DataFrame, title: str, max_rows: int) -> str:
         )
     cols = [c for c in ["Underlying", "Option Type", "Strike", "LTP", "% Chg", "OI", "Volume", "OBV", "Liq Score", "Rank", "Entry", "Entry Time", "Exit", "Exit Time", "Cumulative ADX", "5m_Signal", "15m_Signal", "Overall_Signal", "IVP", "Time", "Chain Signal"] if c in df.columns]
     body = df[cols].head(max_rows).to_html(index=False, border=0, escape=False, classes="mail-table")
-    return f"<div class="section-card"><h3>{title}</h3>{body}</div>"
+    return f'<div class="section-card"><h3>{title}</h3>{body}</div>'
 
 
 def build_chain_email_html(long_rows: List[Dict], short_rows: List[Dict]) -> str:
@@ -811,12 +811,12 @@ def build_cepebuy_email_html(ce_rows: List[Dict], pe_rows: List[Dict]) -> str:
     def table(rows, title, accent):
         df = pd.DataFrame(rows)
         if df.empty:
-            return f"<div class="section-card"><h3 style="color:{accent};">{title}</h3><p class="muted">No chain-based eligible strikes.</p></div>"
+            return f'<div class="section-card"><h3 style="color:{accent};">{title}</h3><p class="muted">No chain-based eligible strikes.</p></div>'
         if "Chain Signal" in df.columns:
             df["Chain Signal"] = df["Chain Signal"].map(style_signal)
         cols = [c for c in ["Underlying", "Option Type", "Strike", "LTP", "% Change", "Entry Value", "Entry Time", "Exit Value", "Exit Time", "Trade Signal", "Chain Signal", "Chain Legs"] if c in df.columns]
         html = df[cols].to_html(index=False, border=0, escape=False, classes="mail-table")
-        return f"<div class="section-card"><h3 style="color:{accent};">{title}</h3>{html}</div>"
+        return f'<div class="section-card"><h3 style="color:{accent};">{title}</h3>{html}</div>'
 
     return f"""
     <html>
