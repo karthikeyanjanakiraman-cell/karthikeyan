@@ -16,29 +16,10 @@ ASIT_GLOB = os.environ.get("ASIT_GLOB", "asit*.csv")
 OUTPUT_BULL = OUTPUT_DIR / "top_10_bullish.csv"
 OUTPUT_BEAR = OUTPUT_DIR / "top_10_bearish.csv"
 OUTPUT_COMBINED = OUTPUT_DIR / "top_10_bull_bear.csv"
-MIN_OPTION_LTP = float(os.environ.get("MIN_OPTION_LTP", "10"))
 TOP_N = int(os.environ.get("TOP_N", "10"))
 
-try:
-    from OPTIONS_OI import initfyers, gethistory, builditerationhistory, SIGNALWINDOWMINUTES, ITERATIONSTOKEEP, INTRADAYLOOKBACKDAYS, formateqsymbol, safefloat
-except Exception:
-    initfyers = None
-    gethistory = None
-    builditerationhistory = None
-    SIGNALWINDOWMINUTES = 5
-    ITERATIONSTOKEEP = 75
-    INTRADAYLOOKBACKDAYS = 20
-    formateqsymbol = lambda x: f"NSE:{str(x).strip().upper()}-EQ"
-    def safefloat(v, default=np.nan):
-        try:
-            if v is None or str(v).strip() == "":
-                return default
-            return float(v)
-        except Exception:
-            return default
+from OPTIONS_OI import initfyers, gethistory, builditerationhistory, SIGNALWINDOWMINUTES, ITERATIONSTOKEEP, INTRADAYLOOKBACKDAYS, formateqsymbol, safefloat
 
-CLIENT_ID = os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID")
-ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN") or os.environ.get("ACCESSTOKEN")
 fyers = None
 
 
@@ -70,16 +51,13 @@ def score_frame(df: pd.DataFrame):
     bear_col = find_col(df, ["BearMultiTFScore", "bear", "bearish", "sell", "short", "BearScore", "bear_score", "5min_BearScore", "15min_BearScore", "1hour_BearScore", "4hour_BearScore", "1day_BearScore"])
     rank_col = find_col(df, ["RankScore15Tier", "score", "rank", "Score15Tier", "5min_Score15Tier", "15min_Score15Tier", "1hour_Score15Tier", "4hour_Score15Tier", "1day_Score15Tier"])
     sym_col = find_col(df, ["Symbol", "symbol", "underlying", "ticker", "tradingsymbol", "name"])
-    trend_col = find_col(df, ["DominantTrend", "trend", "direction"])
     if sym_col is None:
         raise ValueError("No symbol column found in ASIT CSV")
     for c in [bull_col, bear_col, rank_col]:
         if c is not None:
             df[c] = pd.to_numeric(df[c], errors="coerce")
-    if trend_col is not None:
-        df[trend_col] = clean_text(df[trend_col])
     df[sym_col] = clean_text(df[sym_col])
-    return df, sym_col, bull_col, bear_col, rank_col, trend_col
+    return df, sym_col, bull_col, bear_col, rank_col
 
 
 def top_rows(df: pd.DataFrame, sort_col: Optional[str], n: int) -> pd.DataFrame:
@@ -91,7 +69,7 @@ def top_rows(df: pd.DataFrame, sort_col: Optional[str], n: int) -> pd.DataFrame:
 
 def build_top_lists(asit_path: Path, top_n: int = TOP_N) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     df = load_csv(asit_path)
-    df, sym_col, bull_col, bear_col, rank_col, trend_col = score_frame(df)
+    df, sym_col, bull_col, bear_col, rank_col = score_frame(df)
     bull_df = top_rows(df, bull_col or rank_col, top_n).copy()
     bear_df = top_rows(df, bear_col or rank_col, top_n).copy()
     bull_df["Side"] = "BULLISH"
@@ -100,28 +78,14 @@ def build_top_lists(asit_path: Path, top_n: int = TOP_N) -> Tuple[pd.DataFrame, 
     bear_df["Underlying"] = bear_df[sym_col]
     bull_df["Option Symbol"] = bull_df[sym_col]
     bear_df["Option Symbol"] = bear_df[sym_col]
-    combined = pd.concat([bull_df, bear_df], ignore_index=True)
-    return bull_df, bear_df, combined
+    return bull_df, bear_df, pd.concat([bull_df, bear_df], ignore_index=True)
 
 
 def init_client_once():
     global fyers
-    if fyers is not None:
-        return fyers
-    if not CLIENT_ID or not ACCESS_TOKEN:
-        logger.warning("Missing CLIENT_ID/ACCESS_TOKEN")
-        return None
-    try:
-        try:
-            from fyers_apiv3 import fyersModel as fm
-        except Exception:
-            from fyersapiv3 import fyersModel as fm
-        fyers = fm.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=False, log_path="")
-        logger.info("Fyers client initialized")
-        return fyers
-    except Exception as e:
-        logger.warning("Fyers client not available: %s", e)
-        return None
+    if fyers is None:
+        fyers = initfyers()
+    return fyers
 
 
 def normalize_symbol(raw: str) -> str:
@@ -130,35 +94,39 @@ def normalize_symbol(raw: str) -> str:
         s = s.replace("NSE:NSE:", "NSE:", 1)
     if s.endswith("-EQ-EQ"):
         s = s[:-3]
-    if s.startswith("NSE:"):
-        return s
-    return formateqsymbol(s)
+    return s if s.startswith("NSE:") else formateqsymbol(s)
+
+
+def extract_chain(resp) -> list:
+    if not isinstance(resp, dict):
+        return []
+    data = resp.get("data", resp)
+    if isinstance(data, dict):
+        for key in ("optionsChain", "optionChain", "chain", "contracts", "data"):
+            if key in data:
+                data = data[key]
+                break
+    return data if isinstance(data, list) else []
 
 
 def fetch_option_chain(underlying: str) -> pd.DataFrame:
-    fy = init_client_once()
-    if fy is None:
+    client = init_client_once()
+    if client is None:
+        logger.warning("Fyers client unavailable; skipping option chain for %s", underlying)
         return pd.DataFrame()
     eqsymbol = normalize_symbol(underlying)
     logger.info("API chain fetch underlying=%s eqsymbol=%s", underlying, eqsymbol)
     try:
-        chainres = fy.optionchain({"symbol": eqsymbol, "strikecount": 50})
+        resp = client.optionchain({"symbol": eqsymbol, "strikecount": 50})
     except Exception as e:
         logger.warning("optionchain failed for %s: %s", underlying, e)
         return pd.DataFrame()
-    chain = []
-    if isinstance(chainres, dict):
-        data = chainres.get("data") or chainres.get("optionsChain") or []
-        if isinstance(data, dict):
-            chain = data.get("optionsChain") or data.get("data") or []
-        elif isinstance(data, list):
-            chain = data
     rows = []
-    for item in chain if isinstance(chain, list) else []:
+    for item in extract_chain(resp):
         if not isinstance(item, dict):
             continue
-        strike = safefloat(item.get("strikePrice") or item.get("strike"), np.nan)
         typ = str(item.get("optionType") or item.get("type") or "").upper()
+        strike = safefloat(item.get("strikePrice") or item.get("strike"), np.nan)
         if pd.isna(strike) or typ not in ("CE", "PE"):
             continue
         rows.append({
@@ -174,18 +142,21 @@ def fetch_option_chain(underlying: str) -> pd.DataFrame:
 
 
 def fetch_iteration_history(option_symbol: str) -> pd.DataFrame:
-    if builditerationhistory is None or gethistory is None:
+    if gethistory is None or builditerationhistory is None:
         return pd.DataFrame()
     hist_symbol = option_symbol if str(option_symbol).startswith("NSE:") else f"NSE:{option_symbol}"
-    intradf = gethistory(hist_symbol, "5", INTRADAYLOOKBACKDAYS)
-    if intradf is None or intradf.empty:
+    try:
+        intradf = gethistory(hist_symbol, "5", INTRADAYLOOKBACKDAYS)
+        if intradf is None or intradf.empty:
+            return pd.DataFrame()
+        return builditerationhistory(intradf, SIGNALWINDOWMINUTES, ITERATIONSTOKEEP)
+    except Exception as e:
+        logger.warning("history fetch failed for %s: %s", hist_symbol, e)
         return pd.DataFrame()
-    return builditerationhistory(intradf, SIGNALWINDOWMINUTES, ITERATIONSTOKEEP)
 
 
 def build_api_scans(seed_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    option_rows = []
-    iter_rows = []
+    option_rows, iter_rows = [], []
     if seed_df is None or seed_df.empty:
         return pd.DataFrame(), pd.DataFrame()
     for _, row in seed_df.iterrows():
@@ -207,16 +178,8 @@ def build_api_scans(seed_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
             hist.insert(1, "Source Option Symbol", crow.get("Option Symbol", ""))
             hist.insert(2, "Source Option Type", req_type)
             iter_rows.append(hist)
-    options_df = pd.concat(option_rows, ignore_index=True) if option_rows else pd.DataFrame()
-    iter_df = pd.concat(iter_rows, ignore_index=True) if iter_rows else pd.DataFrame()
-    return options_df, iter_df
-
-
-def save_outputs(bull_df: pd.DataFrame, bear_df: pd.DataFrame, combined: pd.DataFrame):
-    bull_df.to_csv(OUTPUT_BULL, index=False)
-    bear_df.to_csv(OUTPUT_BEAR, index=False)
-    combined.to_csv(OUTPUT_COMBINED, index=False)
-    logger.info("Saved %s, %s, %s", OUTPUT_BULL, OUTPUT_BEAR, OUTPUT_COMBINED)
+    return (pd.concat(option_rows, ignore_index=True) if option_rows else pd.DataFrame(),
+            pd.concat(iter_rows, ignore_index=True) if iter_rows else pd.DataFrame())
 
 
 def main():
@@ -225,7 +188,10 @@ def main():
         raise FileNotFoundError(f"No file found for pattern {ASIT_GLOB} in {BASE_DIR.resolve()}")
     logger.info("Using ASIT file: %s", asit_file.resolve())
     bull_df, bear_df, combined = build_top_lists(asit_file, top_n=TOP_N)
-    save_outputs(bull_df, bear_df, combined)
+    bull_df.to_csv(OUTPUT_BULL, index=False)
+    bear_df.to_csv(OUTPUT_BEAR, index=False)
+    combined.to_csv(OUTPUT_COMBINED, index=False)
+    logger.info("Saved %s, %s, %s", OUTPUT_BULL.name, OUTPUT_BEAR.name, OUTPUT_COMBINED.name)
     options_df, iter_df = build_api_scans(combined)
     if not options_df.empty:
         options_df.to_csv(OUTPUT_DIR / "api_options.csv", index=False)
