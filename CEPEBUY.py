@@ -117,34 +117,6 @@ def initfyers() -> Optional[object]:
         return None
 
 
-def discover_sector_csvs(rootdir: str = SECTORS_DIR) -> List[str]:
-    if not os.path.isdir(rootdir):
-        return []
-    files = []
-    for dirpath, _, filenames in os.walk(rootdir):
-        for fname in filenames:
-            if fname.lower().endswith(".csv"):
-                files.append(os.path.join(dirpath, fname))
-    return sorted(set(files))
-
-
-def load_fno_symbols_from_sectors(rootdir: str = SECTORS_DIR) -> List[str]:
-    symbols = set()
-    for path in discover_sector_csvs(rootdir):
-        try:
-            df = pd.read_csv(path)
-        except Exception as e:
-            logger.warning("Failed reading sector csv %s: %s", path, e)
-            continue
-        lowered = {str(c).strip().lower(): c for c in df.columns}
-        sym_col = next((lowered[k] for k in ["symbol", "symbols", "ticker", "tradingsymbol"] if k in lowered), None)
-        if not sym_col:
-            continue
-        vals = df[sym_col].dropna().astype(str).str.strip().str.upper()
-        vals = vals[~vals.isin(["", "NAN", "NONE", "NULL"])]
-        symbols.update(vals.tolist())
-    return sorted(symbols)
-
 
 def format_eq_symbol(symbol: str) -> str:
     symbol = str(symbol).strip().upper()
@@ -918,7 +890,7 @@ def load_or_build_shortlist() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]
 
     symbols = load_fno_symbols_from_sectors(SECTORS_DIR)
     if not symbols:
-        raise RuntimeError("No F&O symbols found in sector CSVs.")
+        raise RuntimeError("ASIT shortlist source not found or empty.")
 
     rows = []
     for i, symbol in enumerate(symbols, start=1):
