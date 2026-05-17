@@ -703,9 +703,9 @@ def update_sticky_rows(state: Dict, new_rows: List[Dict]) -> List[Dict]:
 
 
 def send_single_email(subject: str, html_body: str, attachments: Optional[List[str]] = None) -> bool:
-    sender = os.environ.get("SENDEREMAIL")
-    password = os.environ.get("SENDERPASSWORD")
-    recipients_raw = os.environ.get("RECIPIENTEMAIL", "")
+    sender = os.environ.get("SENDER_EMAIL")
+    password = os.environ.get("SENDER_PASSWORD")
+    recipients_raw = os.environ.get("RECIPIENT_EMAIL", "")
     recipients = [r.strip() for r in recipients_raw.split(",") if r.strip()]
     if not sender or not password or not recipients:
         logger.warning("Email credentials/recipients not configured; skipping.")
