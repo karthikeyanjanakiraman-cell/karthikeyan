@@ -118,6 +118,53 @@ def initfyers() -> Optional[object]:
 
 
 
+def find_latest_asit_csv(rootdir: str = ".") -> Optional[str]:
+    matches = []
+    for dirpath, _, filenames in os.walk(rootdir):
+        for fname in filenames:
+            low = fname.lower()
+            if low.startswith("asit") and low.endswith(".csv"):
+                path = os.path.join(dirpath, fname)
+                try:
+                    matches.append((os.path.getmtime(path), path))
+                except Exception:
+                    pass
+    if not matches:
+        return None
+    matches.sort(reverse=True)
+    return matches[0][1]
+
+
+def normalize_underlying_symbol(value: str) -> str:
+    s = str(value or "").strip().upper().replace("NSE:", "")
+    if s.endswith("-EQ"):
+        s = s[:-3]
+    return s.strip()
+
+
+def load_asit_shortlist(path: str, topn: int = TOP_N_UNDERLYINGS) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    df = pd.read_csv(path)
+    cols = {str(c).strip().lower(): c for c in df.columns}
+    sym_col = cols.get("symbol")
+    rank_col = cols.get("rankscore15tier") or cols.get("rank")
+    bull_col = cols.get("bullmultitfscore")
+    bear_col = cols.get("bearmultitfscore")
+    trend_col = cols.get("dominanttrend")
+    if not sym_col:
+        raise RuntimeError(f"ASIT csv missing Symbol column: {path}")
+    work = df.copy()
+    work["Symbol"] = work[sym_col].astype(str).map(normalize_underlying_symbol)
+    work["__rank"] = pd.to_numeric(work[rank_col], errors="coerce").fillna(0) if rank_col and rank_col in work.columns else 0.0
+    work["__bull"] = pd.to_numeric(work[bull_col], errors="coerce").fillna(0) if bull_col and bull_col in work.columns else 0.0
+    work["__bear"] = pd.to_numeric(work[bear_col], errors="coerce").fillna(0) if bear_col and bear_col in work.columns else 0.0
+    trends = work[trend_col].astype(str).str.upper() if trend_col and trend_col in work.columns else pd.Series("", index=work.index)
+    bull_mask = trends.str.contains("BULL") | (work["__bull"] >= work["__bear"])
+    bear_mask = trends.str.contains("BEAR") | (work["__bear"] > work["__bull"])
+    long_df = work[bull_mask].copy().sort_values(["__rank", "__bull", "__bear"], ascending=[False, False, True]).drop_duplicates(subset=["Symbol"]).head(topn)
+    short_df = work[bear_mask].copy().sort_values(["__rank", "__bear", "__bull"], ascending=[False, False, True]).drop_duplicates(subset=["Symbol"]).head(topn)
+    return long_df[["Symbol"]].reset_index(drop=True), short_df[["Symbol"]].reset_index(drop=True)
+
+
 def format_eq_symbol(symbol: str) -> str:
     symbol = str(symbol).strip().upper()
     if symbol.startswith("NSE:") and symbol.endswith("-EQ"):
@@ -878,97 +925,27 @@ def scansymbol(symbol: str) -> Optional[Dict]:
 
 
 def load_or_build_shortlist() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    if REUSE_SHORTLIST and os.path.isfile(SUMMARY_PATH) and os.path.isfile(LONG_SEED_PATH) and os.path.isfile(SHORT_SEED_PATH):
-        try:
-            summary_df = pd.read_csv(SUMMARY_PATH)
-            long_seed_df = pd.read_csv(LONG_SEED_PATH)
-            short_seed_df = pd.read_csv(SHORT_SEED_PATH)
-            logger.info("Reusing saved shortlist files for %s", TODAY_TAG)
-            return summary_df, long_seed_df, short_seed_df
-        except Exception as e:
-            logger.warning("Shortlist reuse failed, rebuilding: %s", e)
+    asit_path = find_latest_asit_csv(".")
+    if not asit_path:
+        raise RuntimeError("No asit*.csv found for shortlist generation.")
 
-    symbols = load_fno_symbols_from_sectors(SECTORS_DIR)
-    if not symbols:
-        raise RuntimeError("ASIT shortlist source not found or empty.")
+    logger.info("Using ASIT shortlist source: %s", asit_path)
+    long_seed_df, short_seed_df = load_asit_shortlist(asit_path, topn=TOP_N_UNDERLYINGS)
+    if long_seed_df.empty and short_seed_df.empty:
+        raise RuntimeError(f"No bullish/bearish shortlist rows found in {asit_path}")
 
-    rows = []
-    for i, symbol in enumerate(symbols, start=1):
-        logger.info("%d/%d scanning %s", i, len(symbols), symbol)
-        row = scansymbol(symbol)
-        if row:
-            rows.append(row)
-        time.sleep(PER_SYMBOL_SLEEP_SEC)
+    summary_df = pd.concat(
+        [
+            long_seed_df.assign(Side="long"),
+            short_seed_df.assign(Side="short"),
+        ],
+        ignore_index=True,
+    )
 
-    summary_df = pd.DataFrame(rows)
-    if summary_df.empty:
-        raise RuntimeError("No symbols returned usable market data.")
-
-    summary_df = summary_df.sort_values(["% Change", "LTP"], ascending=[False, False]).reset_index(drop=True)
-    long_seed_df, short_seed_df = choose_top_candidates(summary_df, topn=TOP_N_UNDERLYINGS)
     summary_df.to_csv(SUMMARY_PATH, index=False)
     long_seed_df.to_csv(LONG_SEED_PATH, index=False)
     short_seed_df.to_csv(SHORT_SEED_PATH, index=False)
-    logger.info("Fresh shortlist built and saved for %s", TODAY_TAG)
     return summary_df, long_seed_df, short_seed_df
-
-
-
-def find_latest_asit_csv(rootdir: str = ".") -> Optional[str]:
-    matches = []
-    for dirpath, _, filenames in os.walk(rootdir):
-        for fname in filenames:
-            low = fname.lower()
-            if low.startswith("asit") and low.endswith(".csv"):
-                path = os.path.join(dirpath, fname)
-                try:
-                    matches.append((os.path.getmtime(path), path))
-                except Exception:
-                    pass
-    if not matches:
-        return None
-    matches.sort(reverse=True)
-    return matches[0][1]
-
-
-def normalize_underlying_symbol(value: str) -> str:
-    s = str(value or "").strip().upper()
-    s = s.replace("NSE:", "")
-    if s.endswith("-EQ"):
-        s = s[:-3]
-    return s.strip()
-
-
-def load_asit_shortlist(path: str, topn: int = TOP_N_UNDERLYINGS) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    df = pd.read_csv(path)
-    cols = {str(c).strip().lower(): c for c in df.columns}
-    sym_col = cols.get("symbol")
-    rank_col = cols.get("rankscore15tier") or cols.get("rank")
-    bull_col = cols.get("bullmultitfscore")
-    bear_col = cols.get("bearmultitfscore")
-    trend_col = cols.get("dominanttrend")
-    if not sym_col:
-        raise RuntimeError(f"ASIT csv missing Symbol column: {path}")
-    work = df.copy()
-    work["Symbol"] = work[sym_col].astype(str).map(normalize_underlying_symbol)
-    if rank_col and rank_col in work.columns:
-        work["__rank"] = pd.to_numeric(work[rank_col], errors="coerce").fillna(0)
-    else:
-        work["__rank"] = 0.0
-    if bull_col and bull_col in work.columns:
-        work["__bull"] = pd.to_numeric(work[bull_col], errors="coerce").fillna(0)
-    else:
-        work["__bull"] = 0.0
-    if bear_col and bear_col in work.columns:
-        work["__bear"] = pd.to_numeric(work[bear_col], errors="coerce").fillna(0)
-    else:
-        work["__bear"] = 0.0
-    trend_vals = work[trend_col].astype(str).str.upper() if trend_col and trend_col in work.columns else pd.Series("", index=work.index)
-    bull_mask = trend_vals.str.contains("BULL") | (work["__bull"] >= work["__bear"])
-    bear_mask = trend_vals.str.contains("BEAR") | (work["__bear"] > work["__bull"])
-    long_df = work[bull_mask].copy().sort_values(["__rank", "__bull", "__bear"], ascending=[False, False, True]).drop_duplicates(subset=["Symbol"]).head(topn)
-    short_df = work[bear_mask].copy().sort_values(["__rank", "__bear", "__bull"], ascending=[False, False, True]).drop_duplicates(subset=["Symbol"]).head(topn)
-    return long_df[["Symbol"]].reset_index(drop=True), short_df[["Symbol"]].reset_index(drop=True)
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
