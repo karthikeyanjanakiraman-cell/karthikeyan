@@ -905,19 +905,6 @@ def send_cepebuy_email(ce_rows: List[Dict], pe_rows: List[Dict], attachments: Op
     return send_single_email(subject, build_cepebuy_email_html(ce_rows, pe_rows), attachments)
 
 
-def scansymbol(symbol: str) -> Optional[Dict]:
-    eq = format_eq_symbol(symbol)
-    daily_df = gethistory(eq, "D", DAILY_LOOKBACK_DAYS)
-    intra_df = gethistory(eq, "5", INTRADAY_LOOKBACK_DAYS)
-    if daily_df.empty or intra_df.empty:
-        return None
-    summary = summarize_intraday(intra_df, daily_df)
-    if not summary:
-        return None
-    summary["Symbol"] = symbol
-    return summary
-
-
 def chain_row_from_group(grp: pd.DataFrame) -> Dict:
     sig = chain_entry_exit_from_iters(grp)
     first = grp.iloc[0]
@@ -931,7 +918,86 @@ def chain_row_from_group(grp: pd.DataFrame) -> Dict:
         "Exit Value": sig.get("Exit Value", np.nan),
         "Exit Time": sig.get("Exit Time", ""),
         "Chain Signal": sig.get("Chain Signal", "WAIT"),
+        "Chain Legs": int(grp["Option Symbol"].nunique()) if "Option Symbol" in grp.columns else 0,
     }
+
+
+def reduce_chain_rows_one_per_underlying(rows: List[Dict], options_df: pd.DataFrame) -> List[Dict]:
+    if not rows:
+        return []
+
+    df = pd.DataFrame(rows).copy()
+    if df.empty:
+        return []
+
+    if "Chain Legs" not in df.columns:
+        df["Chain Legs"] = 0
+    df["Chain Legs"] = pd.to_numeric(df["Chain Legs"], errors="coerce").fillna(0)
+    df = df[df["Chain Legs"] >= MIN_CHAIN_LEGS].copy()
+    if df.empty:
+        return []
+
+    df["Strike"] = pd.to_numeric(df.get("Strike"), errors="coerce")
+    df["_rank"] = -np.inf
+    df["_atm_ref"] = np.nan
+
+    if options_df is not None and not options_df.empty and "Underlying" in options_df.columns:
+        temp = options_df.copy()
+        temp["Strike"] = pd.to_numeric(temp.get("Strike"), errors="coerce")
+        temp = temp.dropna(subset=["Strike"])
+
+        if not temp.empty:
+            atm_ref_df = (
+                temp.groupby("Underlying", as_index=False)["Strike"]
+                .median()
+                .rename(columns={"Strike": "_atm_ref"})
+            )
+            df = df.merge(atm_ref_df, on="Underlying", how="left", suffixes=("", "_drop"))
+            drop_cols = [c for c in df.columns if c.endswith("_drop")]
+            if drop_cols:
+                df = df.drop(columns=drop_cols)
+
+            if "EMAIL_RANK_SCORE" in temp.columns:
+                temp["_rank"] = pd.to_numeric(temp["EMAIL_RANK_SCORE"], errors="coerce").fillna(-np.inf)
+                rank_ref_df = (
+                    temp.groupby(["Underlying", "Option Type", "Strike"], as_index=False)["_rank"]
+                    .max()
+                )
+                df = df.merge(rank_ref_df, on=["Underlying", "Option Type", "Strike"], how="left", suffixes=("", "_new"))
+                if "_rank_new" in df.columns:
+                    df["_rank"] = pd.to_numeric(df["_rank_new"], errors="coerce").fillna(df["_rank"])
+                    df = df.drop(columns=["_rank_new"])
+
+    df["_rank"] = pd.to_numeric(df["_rank"], errors="coerce").fillna(-np.inf)
+    df["_atm_gap"] = (df["Strike"] - df["_atm_ref"]).abs()
+    df["_atm_gap"] = pd.to_numeric(df["_atm_gap"], errors="coerce").fillna(np.inf)
+
+    signal_priority = {"EXIT": 0, "ENTER": 1, "WAIT": 2}
+    df["_sig_rank"] = df["Chain Signal"].astype(str).str.upper().map(signal_priority).fillna(9)
+
+    df = df.sort_values(
+        ["Underlying", "_atm_gap", "Chain Legs", "_rank", "_sig_rank"],
+        ascending=[True, True, False, False, True]
+    )
+
+    df = df.groupby("Underlying", as_index=False).head(1).copy()
+    df = df.sort_values(["_rank", "Chain Legs", "Underlying"], ascending=[False, False, True])
+
+    drop_cols = [c for c in ["_rank", "_atm_ref", "_atm_gap", "_sig_rank"] if c in df.columns]
+    return df.drop(columns=drop_cols).to_dict("records")
+
+
+def scansymbol(symbol: str) -> Optional[Dict]:
+    eq = format_eq_symbol(symbol)
+    daily_df = gethistory(eq, "D", DAILY_LOOKBACK_DAYS)
+    intra_df = gethistory(eq, "5", INTRADAY_LOOKBACK_DAYS)
+    if daily_df.empty or intra_df.empty:
+        return None
+    summary = summarize_intraday(intra_df, daily_df)
+    if not summary:
+        return None
+    summary["Symbol"] = symbol
+    return summary
 
 
 def main():
@@ -990,6 +1056,11 @@ def main():
         for _, grp in short_iter_df.groupby(cols):
             short_merged.append(chain_row_from_group(grp))
 
+    combined_options_df = pd.concat([long_df, short_df], ignore_index=True) if (not long_df.empty or not short_df.empty) else pd.DataFrame()
+
+    long_merged = reduce_chain_rows_one_per_underlying(long_merged, long_df)
+    short_merged = reduce_chain_rows_one_per_underlying(short_merged, short_df)
+
     chain_long_path = os.path.join(OUTPUT_DIR, "chain_long.csv")
     chain_short_path = os.path.join(OUTPUT_DIR, "chain_short.csv")
 
@@ -998,7 +1069,6 @@ def main():
 
     send_chain_signal_email(long_merged, short_merged, attachments=[summary_path, long_path, short_path, iter_path])
 
-    combined_options_df = pd.concat([long_df, short_df], ignore_index=True) if (not long_df.empty or not short_df.empty) else pd.DataFrame()
     ce_buy_rows, pe_buy_rows = build_cepebuy_rows(combined_options_df, iteration_df)
     send_cepebuy_email(ce_buy_rows, pe_buy_rows, attachments=[chain_long_path, chain_short_path])
 
