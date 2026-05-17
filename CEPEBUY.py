@@ -704,54 +704,49 @@ def send_chain_signal_email(long_rows: List[Dict], short_rows: List[Dict], attac
 def build_cepebuy_rows(options_df: pd.DataFrame, iteration_df: pd.DataFrame) -> Tuple[List[Dict], List[Dict]]:
     if options_df is None or options_df.empty or iteration_df is None or iteration_df.empty:
         return [], []
-    if "Option Symbol" not in iteration_df.columns or "close" not in iteration_df.columns:
+    required = {"Underlying", "Option Type", "Strike", "Option Symbol", "close"}
+    if not required.issubset(set(iteration_df.columns)):
         return [], []
 
-    iter_map = {sym: grp.copy() for sym, grp in iteration_df.groupby("Option Symbol")}
     ce_rows, pe_rows = [], []
+    group_cols = ["Underlying", "Option Type", "Strike", "Option Symbol"]
 
-    for _, row in options_df.iterrows():
-        sym = str(row.get("Option Symbol", "")).strip()
-        if not sym or sym not in iter_map:
-            continue
-
-        grp = iter_map[sym].copy()
+    for _, grp in iteration_df.groupby(group_cols):
+        grp = grp.copy()
         sort_cols = [c for c in ["iteration", "timestamp"] if c in grp.columns]
         if sort_cols:
             grp = grp.sort_values(sort_cols).reset_index(drop=True)
 
-        grp["close"] = pd.to_numeric(grp["close"], errors="coerce")
-        closes = grp["close"].dropna().tolist()
-        if len(closes) < 12:
-            continue
-
-        deltas = pd.Series(closes).diff().dropna().tolist()
-        last11 = deltas[-11:]
-        if len(last11) < 11:
-            continue
-
-        rise_count = sum(x > 0 for x in last11)
-        fall_count = sum(x < 0 for x in last11)
-        opt_type = str(row.get("Option Type", "")).upper()
-        trade_signal = "BUY MOMENTUM" if rise_count >= 8 and opt_type in ("CE", "PE") else ""
-        if not trade_signal:
-            continue
-
         chain_sig = chain_entry_exit_from_iters(grp)
+        if str(chain_sig.get("Chain Signal", "WAIT")).upper() not in ("ENTER", "EXIT"):
+            continue
+
+        first = grp.iloc[0]
+        opt_type = str(first.get("Option Type", "")).upper()
+        strike = first.get("Strike", np.nan)
+        underlying = first.get("Underlying", "")
+
+        opt_match = options_df[
+            (options_df["Underlying"].astype(str) == str(underlying)) &
+            (options_df["Option Type"].astype(str).str.upper() == opt_type) &
+            (pd.to_numeric(options_df["Strike"], errors="coerce") == safe_float(strike, np.nan))
+        ]
+        if opt_match.empty:
+            continue
+        row = opt_match.iloc[0]
+
         out = {
-            "Underlying": row.get("Underlying", ""),
-            "Option Type": row.get("Option Type", ""),
-            "Strike": row.get("Strike", np.nan),
+            "Underlying": underlying,
+            "Option Type": opt_type,
+            "Strike": strike,
             "LTP": row.get("LTP", np.nan),
             "% Change": row.get("% Change", np.nan),
             "Entry Value": chain_sig.get("Entry Value", np.nan),
             "Entry Time": chain_sig.get("Entry Time", ""),
             "Exit Value": chain_sig.get("Exit Value", np.nan),
             "Exit Time": chain_sig.get("Exit Time", ""),
-            "Last Iteration Time": row.get("Last Iteration Time", ""),
-            "Trade Signal": trade_signal,
-            "Rise Count": rise_count,
-            "Fall Count": fall_count,
+            "Trade Signal": f"{opt_type} CHAIN",
+            "Chain Signal": chain_sig.get("Chain Signal", "WAIT"),
         }
         if opt_type == "CE":
             ce_rows.append(out)
@@ -767,17 +762,17 @@ def build_cepebuy_email_html(ce_rows: List[Dict], pe_rows: List[Dict]) -> str:
     def table(rows, title):
         df = pd.DataFrame(rows)
         if df.empty:
-            return f"<h3>{title}</h3><p>No price-momentum buy signals.</p>"
-        cols = [c for c in ["Underlying", "Option Type", "Strike", "LTP", "% Change", "Entry Value", "Entry Time", "Exit Value", "Exit Time", "Trade Signal", "Rise Count", "Fall Count"] if c in df.columns]
+            return f"<h3>{title}</h3><p>No chain-based eligible strikes.</p>"
+        cols = [c for c in ["Underlying", "Option Type", "Strike", "LTP", "% Change", "Entry Value", "Entry Time", "Exit Value", "Exit Time", "Trade Signal", "Chain Signal"] if c in df.columns]
         return f"<h3>{title}</h3>{df[cols].to_html(index=False, border=0, escape=False)}"
 
     return f"""
     <html>
     <body>
-        <h2>CE PE Price Momentum Report - {ts}</h2>
-        <p>Rule: shown only when the option premium rises in at least 8 of the latest 11 price changes.</p>
-        {table(ce_rows, 'CE PRICE MOMENTUM SIGNALS')}
-        {table(pe_rows, 'PE PRICE MOMENTUM SIGNALS')}
+        <h2>CE PE Chain Eligibility Report - {ts}</h2>
+        <p>Rule: include strike only when chain iteration logic marks it as eligible from grouped strike movement.</p>
+        {table(ce_rows, 'CE CHAIN ELIGIBLE STRIKES')}
+        {table(pe_rows, 'PE CHAIN ELIGIBLE STRIKES')}
     </body>
     </html>
     """
@@ -786,7 +781,7 @@ def build_cepebuy_email_html(ce_rows: List[Dict], pe_rows: List[Dict]) -> str:
 def send_cepebuy_email(ce_rows: List[Dict], pe_rows: List[Dict], attachments: Optional[List[str]] = None) -> bool:
     if not ce_rows and not pe_rows:
         return False
-    subject = f"CE PE Price Momentum Report - {datetime.now().strftime('%d %b %H:%M')}"
+    subject = f"CE PE Chain Eligibility Report - {datetime.now().strftime('%d %b %H:%M')}"
     return send_single_email(subject, build_cepebuy_email_html(ce_rows, pe_rows), attachments)
 
 
