@@ -644,40 +644,60 @@ def buildoptioncandidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.Da
 
 
 def chain_entry_exit_from_iters(iter_df: pd.DataFrame) -> Dict[str, object]:
+    empty = {
+        "Chain Signal": "WAIT",
+        "Entry Value": np.nan,
+        "Entry Time": "",
+        "Exit Value": np.nan,
+        "Exit Time": "",
+    }
+
     if iter_df is None or iter_df.empty:
-        return {"Chain Signal": "WAIT", "Entry Value": np.nan, "Entry Time": "", "Exit Value": np.nan, "Exit Time": ""}
+        return empty
 
     d = iter_df.copy()
     d["iteration"] = pd.to_numeric(d["iteration"], errors="coerce")
     d["close"] = pd.to_numeric(d["close"], errors="coerce")
     d = d.dropna(subset=["iteration", "close", "Option Symbol"])
     if d.empty:
-        return {"Chain Signal": "WAIT", "Entry Value": np.nan, "Entry Time": "", "Exit Value": np.nan, "Exit Time": ""}
+        return empty
 
     pivot = d.pivot_table(index="iteration", columns="Option Symbol", values="close", aggfunc="last").sort_index()
     if pivot.shape[0] < 2 or pivot.shape[1] == 0:
-        return {"Chain Signal": "WAIT", "Entry Value": np.nan, "Entry Time": "", "Exit Value": np.nan, "Exit Time": ""}
+        return empty
 
     prev = pivot.shift(1)
     all_up = (pivot > prev).all(axis=1)
-    entry_iters = all_up[all_up].index.tolist()
-    if not entry_iters:
-        return {"Chain Signal": "WAIT", "Entry Value": np.nan, "Entry Time": "", "Exit Value": np.nan, "Exit Time": ""}
+    all_down = (pivot < prev).all(axis=1)
 
-    entry_iter = entry_iters[0]
+    valid_iters = list(pivot.index)
+
+    entry_iter = None
+    for it in valid_iters:
+        if pd.isna(all_up.loc[it]):
+            continue
+        if bool(all_up.loc[it]):
+            entry_iter = it
+            break
+
+    if entry_iter is None:
+        return empty
+
     entry_row = d[d["iteration"] == entry_iter].sort_values(["timestamp", "Option Symbol"]).copy()
     entry_time = str(entry_row["timestamp"].iloc[0]) if "timestamp" in entry_row.columns and not entry_row.empty else ""
     entry_value = round(float(entry_row["close"].mean()), 2) if not entry_row.empty else np.nan
 
+    down_streak = 0
     exit_iter = None
-    for it in sorted([x for x in pivot.index if x > entry_iter]):
-        prev_it = it - 1
-        if prev_it not in pivot.index:
-            continue
-        if (pivot.loc[it] > pivot.loc[prev_it]).all():
-            continue
-        exit_iter = it
-        break
+    for it in [x for x in valid_iters if x > entry_iter]:
+        is_down = bool(all_down.loc[it]) if pd.notna(all_down.loc[it]) else False
+        if is_down:
+            down_streak += 1
+        else:
+            down_streak = 0
+        if down_streak >= 2:
+            exit_iter = it
+            break
 
     if exit_iter is not None:
         exit_row = d[d["iteration"] == exit_iter].sort_values(["timestamp", "Option Symbol"]).copy()
@@ -746,11 +766,9 @@ def send_single_email(subject: str, html_body: str, attachments: Optional[List[s
 def _prepare_email_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
-
     out = df.copy()
     rename_map = {k: v for k, v in OPTION_EMAIL_COL_RENAME.items() if k in out.columns}
-    out = out.rename(columns=rename_map)
-    return out
+    return out.rename(columns=rename_map)
 
 
 def compact_table_html(df: pd.DataFrame, title: str, max_rows: int) -> str:
@@ -758,7 +776,6 @@ def compact_table_html(df: pd.DataFrame, title: str, max_rows: int) -> str:
         return f'<div class="section-card"><h3>{title}</h3><p class="muted">No rows</p></div>'
 
     df = _prepare_email_df(df)
-
     if "Chain Signal" in df.columns:
         df["Chain Signal"] = df["Chain Signal"].astype(str).map(
             lambda x: f'<span class="badge badge-enter">{x}</span>' if x.upper() == "ENTER" else (
@@ -800,7 +817,7 @@ def build_chain_email_html(long_rows: List[Dict], short_rows: List[Dict]) -> str
         <div class="wrap">
             <div class="hero">
                 <h2>Chain Signal Report - {ts}</h2>
-                <p>One row per underlying. Representative strike is the nearest ranked ATM-side leg.</p>
+                <p>One row per underlying. Entry is all legs up together. Exit is only after entry and 2 consecutive all-leg down checks.</p>
             </div>
             {compact_table_html(pd.DataFrame(long_rows), 'LONG CANDIDATES', EMAIL_MAX_ROWS_LONG)}
             {compact_table_html(pd.DataFrame(short_rows), 'SHORT CANDIDATES', EMAIL_MAX_ROWS_SHORT)}
@@ -814,8 +831,7 @@ def send_chain_signal_email(long_rows: List[Dict], short_rows: List[Dict], attac
     if not long_rows and not short_rows:
         return False
     subject = f"Chain Signal Report - {datetime.now().strftime('%d %b %H:%M')}"
-    html = build_chain_email_html(long_rows, short_rows)
-    return send_single_email(subject, html, attachments)
+    return send_single_email(subject, build_chain_email_html(long_rows, short_rows), attachments)
 
 
 def pick_best_representative(options_df: pd.DataFrame, underlying: str, opt_type: str) -> Dict:
@@ -850,34 +866,30 @@ def build_chain_rows_from_iters(options_df: pd.DataFrame, iteration_df: pd.DataF
         return []
 
     rows = []
-    group_cols = ["Underlying", "Option Type"]
-
-    for _, grp in iteration_df.groupby(group_cols):
+    for (underlying, opt_type), grp in iteration_df.groupby(["Underlying", "Option Type"]):
         grp = grp.copy()
         sort_cols = [c for c in ["iteration", "timestamp", "Option Symbol"] if c in grp.columns]
         if sort_cols:
             grp = grp.sort_values(sort_cols).reset_index(drop=True)
 
-        underlying = str(grp["Underlying"].iloc[0]).strip()
-        opt_type = str(grp["Option Type"].iloc[0]).upper().strip()
         chain_legs = int(grp["Option Symbol"].astype(str).nunique()) if "Option Symbol" in grp.columns else 0
         if chain_legs < MIN_CHAIN_LEGS:
             continue
 
         chain_sig = chain_entry_exit_from_iters(grp)
-        rep = pick_best_representative(options_df, underlying, opt_type)
+        rep = pick_best_representative(options_df, str(underlying), str(opt_type))
 
         strike = safe_float(rep.get("Strike"), np.nan) if rep else np.nan
-        if pd.isna(strike):
-            strike_series = pd.to_numeric(grp.get("Strike"), errors="coerce").dropna()
+        if pd.isna(strike) and "Strike" in grp.columns:
+            strike_series = pd.to_numeric(grp["Strike"], errors="coerce").dropna()
             strike = float(strike_series.median()) if not strike_series.empty else np.nan
 
         close_series = pd.to_numeric(grp["close"], errors="coerce").dropna()
         fallback_ltp = close_series.iloc[-1] if not close_series.empty else np.nan
 
-        out = {
-            "Underlying": underlying,
-            "Option Type": opt_type,
+        rows.append({
+            "Underlying": str(underlying),
+            "Option Type": str(opt_type).upper(),
             "Strike": strike,
             "LTP": rep.get("LTP", fallback_ltp) if rep else fallback_ltp,
             "% Change": rep.get("% Change", np.nan) if rep else np.nan,
@@ -904,8 +916,7 @@ def build_chain_rows_from_iters(options_df: pd.DataFrame, iteration_df: pd.DataF
             "Last Iteration Time": rep.get("Last Iteration Time", "") if rep else "",
             "Chain Signal": chain_sig.get("Chain Signal", "WAIT"),
             "Chain Legs": chain_legs,
-        }
-        rows.append(out)
+        })
 
     if not rows:
         return []
@@ -913,12 +924,9 @@ def build_chain_rows_from_iters(options_df: pd.DataFrame, iteration_df: pd.DataF
     out = pd.DataFrame(rows).copy()
     out["EMAIL_RANK_SCORE"] = pd.to_numeric(out.get("EMAIL_RANK_SCORE"), errors="coerce").fillna(-np.inf)
     out["Chain Legs"] = pd.to_numeric(out.get("Chain Legs"), errors="coerce").fillna(0)
-
     signal_priority = {"ENTER": 0, "EXIT": 1, "WAIT": 2}
     out["_sig"] = out["Chain Signal"].astype(str).str.upper().map(signal_priority).fillna(9)
-
     out = out.sort_values(["EMAIL_RANK_SCORE", "Chain Legs", "_sig", "Underlying"], ascending=[False, False, True, True]).reset_index(drop=True)
-
     return out.drop(columns=["_sig"]).to_dict("records")
 
 
@@ -927,13 +935,10 @@ def build_cepebuy_rows(options_df: pd.DataFrame, iteration_df: pd.DataFrame) -> 
     if not chain_rows:
         return [], []
 
-    ce_rows = []
-    pe_rows = []
-
+    ce_rows, pe_rows = [], []
     for row in chain_rows:
         sig = str(row.get("Chain Signal", "WAIT")).upper()
         opt_type = str(row.get("Option Type", "")).upper()
-
         if sig not in ("ENTER", "EXIT"):
             continue
 
@@ -951,12 +956,10 @@ def build_cepebuy_rows(options_df: pd.DataFrame, iteration_df: pd.DataFrame) -> 
             "Chain Signal": sig,
             "Chain Legs": row.get("Chain Legs", 0),
         }
-
         if opt_type == "CE":
             ce_rows.append(out)
         elif opt_type == "PE":
             pe_rows.append(out)
-
     return ce_rows, pe_rows
 
 
@@ -1007,7 +1010,7 @@ def build_cepebuy_email_html(ce_rows: List[Dict], pe_rows: List[Dict]) -> str:
         <div class="wrap">
             <div class="hero">
                 <h2>CE PE Chain Eligibility Report - {ts}</h2>
-                <p>Only one near-ATM row per underlying is included, and the chain must have at least {MIN_CHAIN_LEGS} legs.</p>
+                <p>One row per underlying. Entry is all legs up together. Exit is only after entry and 2 consecutive all-leg down checks.</p>
             </div>
             {table(ce_rows, 'CE CHAIN ELIGIBLE STRIKES', '#2563eb')}
             {table(pe_rows, 'PE CHAIN ELIGIBLE STRIKES', '#7c3aed')}
@@ -1028,14 +1031,11 @@ def scansymbol(symbol: str) -> Optional[Dict]:
     eq = format_eq_symbol(symbol)
     daily_df = gethistory(eq, "D", DAILY_LOOKBACK_DAYS)
     intra_df = gethistory(eq, "5", INTRADAY_LOOKBACK_DAYS)
-
     if daily_df.empty or intra_df.empty:
         return None
-
     summary = summarize_intraday(intra_df, daily_df)
     if not summary:
         return None
-
     summary["Symbol"] = symbol
     return summary
 
@@ -1086,7 +1086,6 @@ def main():
 
     chain_long_path = os.path.join(OUTPUT_DIR, "chain_long.csv")
     chain_short_path = os.path.join(OUTPUT_DIR, "chain_short.csv")
-
     pd.DataFrame(long_chain_rows).to_csv(chain_long_path, index=False)
     pd.DataFrame(short_chain_rows).to_csv(chain_short_path, index=False)
 
