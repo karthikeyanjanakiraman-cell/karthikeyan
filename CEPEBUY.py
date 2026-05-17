@@ -18,7 +18,7 @@ OUTPUT_BEAR = OUTPUT_DIR / "top_10_bearish.csv"
 OUTPUT_COMBINED = OUTPUT_DIR / "top_10_bull_bear.csv"
 TOP_N = int(os.environ.get("TOP_N", "10"))
 
-from OPTIONS_OI import initfyers, gethistory, builditerationhistory, SIGNALWINDOWMINUTES, ITERATIONSTOKEEP, INTRADAYLOOKBACKDAYS, formateqsymbol, safefloat
+from OPTIONS_OI import gethistory, builditerationhistory, SIGNALWINDOWMINUTES, ITERATIONSTOKEEP, INTRADAYLOOKBACKDAYS, formateqsymbol, safefloat
 
 fyers = None
 
