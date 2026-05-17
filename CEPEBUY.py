@@ -117,39 +117,42 @@ def init_client_once():
         except Exception:
             from fyersapiv3 import fyersModel as fm
         fyers = fm.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=False, log_path="")
-        logger.info("Fyers client initialized using %s", fm.__module__)
+        logger.info("Fyers client initialized")
         return fyers
     except Exception as e:
         logger.warning("Fyers client not available: %s", e)
         return None
 
 
+def normalize_symbol(raw: str) -> str:
+    s = str(raw).strip().upper()
+    if s.startswith("NSE:NSE:"):
+        s = s.replace("NSE:NSE:", "NSE:", 1)
+    if s.endswith("-EQ-EQ"):
+        s = s[:-3]
+    if s.startswith("NSE:"):
+        return s
+    return formateqsymbol(s)
+
+
 def fetch_option_chain(underlying: str) -> pd.DataFrame:
     fy = init_client_once()
     if fy is None:
-        return pd.DataFrame([{
-            "Underlying": underlying,
-            "Option Type": "CE",
-            "Strike": np.nan,
-            "Option Symbol": "",
-            "OptionLTP": np.nan,
-            "OI": np.nan,
-            "Volume": np.nan,
-            "Source": "fallback"
-        }])
-    eqsymbol = formateqsymbol(underlying)
+        return pd.DataFrame()
+    eqsymbol = normalize_symbol(underlying)
     logger.info("API chain fetch underlying=%s eqsymbol=%s", underlying, eqsymbol)
     try:
         chainres = fy.optionchain({"symbol": eqsymbol, "strikecount": 50})
     except Exception as e:
         logger.warning("optionchain failed for %s: %s", underlying, e)
         return pd.DataFrame()
+    chain = []
     if isinstance(chainres, dict):
-        chain = chainres.get("data") or chainres.get("optionsChain") or []
-        if isinstance(chain, dict):
-            chain = chain.get("optionsChain") or chain.get("data") or []
-    else:
-        chain = []
+        data = chainres.get("data") or chainres.get("optionsChain") or []
+        if isinstance(data, dict):
+            chain = data.get("optionsChain") or data.get("data") or []
+        elif isinstance(data, list):
+            chain = data
     rows = []
     for item in chain if isinstance(chain, list) else []:
         if not isinstance(item, dict):
