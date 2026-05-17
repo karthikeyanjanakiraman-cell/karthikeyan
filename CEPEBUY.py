@@ -6,19 +6,7 @@ from typing import List, Optional, Tuple
 import numpy as np
 import pandas as pd
 
-from OPTIONS_OI import (
-    initfyers,
-    gethistory,
-    builditerationhistory,
-    SIGNALWINDOWMINUTES,
-    ITERATIONSTOKEEP,
-    INTRADAYLOOKBACKDAYS,
-    formateqsymbol,
-    safefloat,
-    loaddailystate,
-    savedailystatestate,
-    sendcepebuyemail,
-)
+import OPTIONS_OI as opt
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
@@ -32,6 +20,18 @@ CHAIN_UP = int(os.environ.get("CHAIN_UP", "5"))
 CHAIN_DOWN = int(os.environ.get("CHAIN_DOWN", "5"))
 MIN_OPTION_LTP = float(os.environ.get("MIN_OPTION_LTP", "10"))
 MIN_ATM_CHAIN_VOLUME = int(os.environ.get("MIN_ATM_CHAIN_VOLUME", "100000"))
+
+initfyers = getattr(opt, "initfyers", None)
+gethistory = getattr(opt, "gethistory", None)
+builditerationhistory = getattr(opt, "builditerationhistory", None)
+SIGNALWINDOWMINUTES = getattr(opt, "SIGNALWINDOWMINUTES", 5)
+ITERATIONSTOKEEP = getattr(opt, "ITERATIONSTOKEEP", 75)
+INTRADAYLOOKBACKDAYS = getattr(opt, "INTRADAYLOOKBACKDAYS", 20)
+formateqsymbol = getattr(opt, "formateqsymbol", lambda x: f"NSE:{str(x).strip().upper()}-EQ")
+safefloat = getattr(opt, "safefloat", lambda v, default=np.nan: default if v is None or str(v).strip() == "" else float(v))
+loaddailystate = getattr(opt, "loaddailystate", lambda: {"date": str(pd.Timestamp.now().date()), "rows": []})
+savedailystatestate = getattr(opt, "savedailystatestate", lambda state: None)
+sendcepebuyemail = getattr(opt, "sendcepebuyemail", None)
 
 
 def pick_latest_file(pattern: str, base_dir: Path = BASE_DIR) -> Optional[Path]:
@@ -91,7 +91,7 @@ def build_top_lists(asit_path: Path, top_n: int = TOP_N) -> Tuple[pd.DataFrame, 
 
 
 def fetch_option_chain(underlying: str) -> pd.DataFrame:
-    fy = initfyers()
+    fy = initfyers() if callable(initfyers) else None
     if fy is None:
         return pd.DataFrame()
     eqsymbol = formateqsymbol(underlying)
@@ -123,7 +123,7 @@ def fetch_option_chain(underlying: str) -> pd.DataFrame:
 def infer_atm_from_spot(underlying: str, chain: pd.DataFrame) -> float:
     if chain.empty:
         return np.nan
-    fy = initfyers()
+    fy = initfyers() if callable(initfyers) else None
     spot = np.nan
     if fy is not None:
         try:
@@ -189,7 +189,12 @@ def build_chain_rows(seed_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]
             continue
         if pd.notna(vol) and vol < MIN_ATM_CHAIN_VOLUME:
             continue
-        hist = builditerationhistory(gethistory(atm_leg.get("Option Symbol"), "5", INTRADAYLOOKBACKDAYS), SIGNALWINDOWMINUTES, ITERATIONSTOKEEP) if gethistory is not None and builditerationhistory is not None else pd.DataFrame()
+        hist = pd.DataFrame()
+        if callable(gethistory) and callable(builditerationhistory):
+            try:
+                hist = builditerationhistory(gethistory(atm_leg.get("Option Symbol"), "5", INTRADAYLOOKBACKDAYS), SIGNALWINDOWMINUTES, ITERATIONSTOKEEP)
+            except Exception:
+                hist = pd.DataFrame()
         rows.append({
             "Underlying": underlying,
             "Option Type": req_type,
@@ -270,7 +275,7 @@ def main():
     iteration_df.to_csv(OUTPUT_DIR / f"cepebuy_iterations_{ts}.csv", index=False)
     pd.DataFrame(cebuyrows).to_csv(OUTPUT_DIR / f"ce_buy_{ts}.csv", index=False)
     pd.DataFrame(pebuyrows).to_csv(OUTPUT_DIR / f"pe_buy_{ts}.csv", index=False)
-    if cebuyrows or pebuyrows:
+    if (cebuyrows or pebuyrows) and callable(sendcepebuyemail):
         sendcepebuyemail(cebuyrows, pebuyrows, [str(OUTPUT_DIR / f"ce_buy_{ts}.csv"), str(OUTPUT_DIR / f"pe_buy_{ts}.csv")])
     print(f"ASIT file: {asit_file.name}")
     print(f"Top bullish: {len(bull_df)}")
