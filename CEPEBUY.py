@@ -689,7 +689,17 @@ def savedailystatestate(state: Dict):
 
 
 def updatestickyrows(state: Dict, newrows: List[Dict]) -> List[Dict]:
-    existing = state.get("rows", {})
+    existing_raw = state.get("rows", {})
+    if isinstance(existing_raw, list):
+        existing = {}
+        for r in existing_raw:
+            if isinstance(r, dict):
+                key = f"{r.get('Underlying')}_{r.get('Option Type')}_{r.get('Strike')}"
+                existing[key] = r
+    elif isinstance(existing_raw, dict):
+        existing = existing_raw
+    else:
+        existing = {}
     for row in newrows:
         key = f"{row.get('Underlying')}_{row.get('Option Type')}_{row.get('Strike')}"
         if key not in existing:
@@ -700,7 +710,7 @@ def updatestickyrows(state: Dict, newrows: List[Dict]) -> List[Dict]:
             for col in ["LTP", "5m", "T5", "15m", "T15", "30m", "T30", "Chain Signal", "Exit Signal"]:
                 if col in row:
                     existing[key][col] = row[col]
-    state["rows"] = existing
+    state["rows"] = list(existing.values())
     savedailystatestate(state)
     return sorted(existing.values(), key=lambda r: r.get("Entry Time", "9999"))
 
