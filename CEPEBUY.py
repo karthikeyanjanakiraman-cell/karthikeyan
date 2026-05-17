@@ -1,6 +1,6 @@
+#!/usr/bin/env python3
 import os
 import time
-import json
 import smtplib
 import logging
 from datetime import datetime, timedelta, time as dtime
@@ -29,47 +29,59 @@ logger = logging.getLogger(__name__)
 
 DAILY_LOOKBACK_DAYS = 252
 INTRADAY_LOOKBACK_DAYS = 20
-IVP_LOOKBACK_DAYS = 252
 OPTION_PAIRS_TO_KEEP = int(os.environ.get("OPTION_PAIRS_TO_KEEP", "5"))
 SIGNAL_WINDOW_MINUTES = int(os.environ.get("SIGNAL_WINDOW_MINUTES", "5"))
 ITERATIONS_TO_KEEP = int(os.environ.get("ITERATIONS_TO_KEEP", "75"))
 SECTORS_DIR = os.environ.get("SECTORS_DIR", "sectors")
 OUTPUT_DIR = os.environ.get("OUTPUT_DIR", ".")
 MIN_OPTION_LTP = float(os.environ.get("MIN_OPTION_LTP", "5"))
-MIN_ATM_CHAIN_VOLUME = int(os.environ.get("MIN_ATM_CHAIN_VOLUME", "100000"))
-MIN_OPTION_DAY_VOLUME = int(os.environ.get("MIN_OPTION_DAY_VOLUME", "100000"))
+MIN_ATM_CHAIN_VOLUME = int(os.environ.get("MIN_ATM_CHAIN_VOLUME", "10000"))
+MIN_OPTION_DAY_VOLUME = int(os.environ.get("MIN_OPTION_DAY_VOLUME", "10000"))
 PER_SYMBOL_SLEEP_SEC = float(os.environ.get("PER_SYMBOL_SLEEP_SEC", "0.10"))
 EMAIL_MAX_ROWS_LONG = int(os.environ.get("EMAIL_MAX_ROWS_LONG", "25"))
 EMAIL_MAX_ROWS_SHORT = int(os.environ.get("EMAIL_MAX_ROWS_SHORT", "25"))
 TOP_N_UNDERLYINGS = int(os.environ.get("TOP_N_UNDERLYINGS", "20"))
-MIN_CHAIN_LEGS = int(os.environ.get("MIN_CHAIN_LEGS", "8"))
-REUSE_SHORTLIST = str(os.environ.get("REUSE_SHORTLIST", "1")).strip().lower() in {"1", "true", "yes", "y"}
+MIN_CHAIN_LEGS = int(os.environ.get("MIN_CHAIN_LEGS", "3"))
+REUSE_SHORTLIST = str(os.environ.get("REUSE_SHORTLIST", "0")).strip().lower() in {"1", "true", "yes", "y"}
 TODAY_TAG = datetime.now().strftime("%Y%m%d")
 SUMMARY_PATH = os.path.join(OUTPUT_DIR, f"fo_summary_{TODAY_TAG}.csv")
 LONG_SEED_PATH = os.path.join(OUTPUT_DIR, f"fo_long_seed_{TODAY_TAG}.csv")
 SHORT_SEED_PATH = os.path.join(OUTPUT_DIR, f"fo_short_seed_{TODAY_TAG}.csv")
-STATE_PATH = os.path.join(OUTPUT_DIR, f"chain_state_{TODAY_TAG}.json")
-
-fyers = None
+LONG_CANDIDATES_PATH = os.path.join(OUTPUT_DIR, f"fo_long_candidates_{TODAY_TAG}.csv")
+SHORT_CANDIDATES_PATH = os.path.join(OUTPUT_DIR, f"fo_short_candidates_{TODAY_TAG}.csv")
+ITER_PATH = os.path.join(OUTPUT_DIR, f"fo_iteration_history_{TODAY_TAG}.csv")
+CHAIN_LONG_PATH = os.path.join(OUTPUT_DIR, f"chain_long_{TODAY_TAG}.csv")
+CHAIN_SHORT_PATH = os.path.join(OUTPUT_DIR, f"chain_short_{TODAY_TAG}.csv")
+STATE_CSV_PATH = os.path.join(OUTPUT_DIR, f"chain_state_{TODAY_TAG}.csv")
 
 OPTION_EMAIL_COLS = [
-    "Underlying", "Option Type", "Option Symbol", "Strike", "LTP", "% Change", "OI", "Volume", "OBV",
-    "OI+Volume+OBV Score", "EMAIL_RANK_SCORE", "Entry Value", "Entry Time", "Exit Value", "Exit Time",
-    "Cumulative ADX", "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal", "Bull_Signal", "Bear_Signal",
-    "Overall_Signal", "Price_Lead_Status", "IVP", "Volatility State", "Last Iteration Time",
+    "Underlying",
+    "Option Type",
+    "Option Symbol",
+    "Strike",
+    "LTP",
+    "OI",
+    "Volume",
+    "OBV",
+    "OI+Volume+OBV Score",
+    "EMAIL_RANK_SCORE",
+    "Entry Value",
+    "Entry Time",
+    "Exit Value",
+    "Exit Time",
+    "Chain Signal",
+    "Chain Legs",
 ]
 
 OPTION_EMAIL_COL_RENAME = {
     "OI+Volume+OBV Score": "Liq Score",
     "EMAIL_RANK_SCORE": "Rank",
-    "% Change": "% Chg",
-    "Last Iteration Time": "Time",
-    "Price_Lead_Status": "Lead",
-    "Volatility State": "Vol State",
     "Option Symbol": "Opt Symbol",
     "Entry Value": "Entry",
     "Exit Value": "Exit",
 }
+
+fyers = None
 
 
 def safe_float(value, default=np.nan) -> float:
@@ -206,37 +218,6 @@ def compute_obv(df: pd.DataFrame) -> float:
     return round(safe_float(obv.iloc[-1], np.nan), 2)
 
 
-def compute_ivp(history_df: pd.DataFrame, min_bars: int = 10) -> Tuple[float, str]:
-    if history_df is None or history_df.empty or len(history_df) < min_bars:
-        return np.nan, "Neutral Vol"
-
-    close = pd.to_numeric(history_df["close"], errors="coerce")
-    high = pd.to_numeric(history_df["high"], errors="coerce")
-    low = pd.to_numeric(history_df["low"], errors="coerce")
-    proxy = ((high - low) / close.replace(0, np.nan) * 100.0).replace([np.inf, -np.inf], np.nan).dropna()
-    if proxy.empty:
-        return np.nan, "Neutral Vol"
-
-    lookback = proxy.tail(min(IVP_LOOKBACK_DAYS, len(proxy)))
-    current = float(lookback.iloc[-1])
-    ivp = round((lookback.lt(current).sum() / len(lookback)) * 100.0, 2)
-    if ivp < 30:
-        return ivp, "Buyer Zone"
-    if ivp > 50:
-        return ivp, "Avoid Buy Premium"
-    return ivp, "Neutral Vol"
-
-
-def score_label(delta: float) -> str:
-    if pd.isna(delta):
-        return "Neutral"
-    if delta >= 1:
-        return "Buy"
-    if delta <= -1:
-        return "Sell"
-    return "Neutral"
-
-
 def intraday_window_score(df: pd.DataFrame, window_minutes: int = SIGNAL_WINDOW_MINUTES) -> float:
     if df is None or df.empty or len(df) < 2:
         return np.nan
@@ -256,7 +237,6 @@ def intraday_window_score(df: pd.DataFrame, window_minutes: int = SIGNAL_WINDOW_
 def previous_trading_day_same_time_score(full_df: pd.DataFrame, endts: Optional[pd.Timestamp] = None, window_minutes: int = SIGNAL_WINDOW_MINUTES) -> float:
     if full_df is None or full_df.empty or len(full_df) < 4:
         return np.nan
-
     d = full_df.copy().sort_values("timestamp").reset_index(drop=True)
     d["timestamp"] = pd.to_datetime(d["timestamp"])
     endts = pd.to_datetime(endts) if endts is not None else pd.to_datetime(d["timestamp"].iloc[-1])
@@ -264,19 +244,16 @@ def previous_trading_day_same_time_score(full_df: pd.DataFrame, endts: Optional[
     prev_days = [day for day in trading_days if day < endts.date()]
     if not prev_days:
         return np.nan
-
     prev_day = prev_days[-1]
     prev_day_df = d[d["timestamp"].dt.date == prev_day].copy()
     if prev_day_df.empty:
         return np.nan
-
     same_time_rows = prev_day_df[(prev_day_df["timestamp"].dt.hour == endts.hour) & (prev_day_df["timestamp"].dt.minute == endts.minute)]
     prev_end = pd.to_datetime(same_time_rows["timestamp"].iloc[-1] if not same_time_rows.empty else prev_day_df["timestamp"].iloc[-1])
     prev_start = prev_end - timedelta(minutes=window_minutes)
     prev_window = prev_day_df[(prev_day_df["timestamp"] >= prev_start) & (prev_day_df["timestamp"] <= prev_end)]
     if len(prev_window) < 2:
         return np.nan
-
     first_close = safe_float(prev_window["close"].iloc[0], np.nan)
     last_close = safe_float(prev_window["close"].iloc[-1], np.nan)
     if pd.isna(first_close) or first_close == 0:
@@ -342,69 +319,14 @@ def build_iteration_history(intra_df: pd.DataFrame, window_minutes: int = SIGNAL
 def summarize_intraday(intra_df: pd.DataFrame, daily_df: pd.DataFrame) -> Dict[str, object]:
     if intra_df is None or intra_df.empty:
         return {}
-
-    df = intra_df.copy().sort_values("timestamp").reset_index(drop=True)
-    close = pd.to_numeric(df["close"], errors="coerce")
-    high = pd.to_numeric(df["high"], errors="coerce")
-    low = pd.to_numeric(df["low"], errors="coerce")
-    volume = pd.to_numeric(df["volume"], errors="coerce").fillna(0.0)
-
-    delta = close.diff().fillna(0.0)
-    avg_gain = delta.clip(lower=0.0).rolling(14, min_periods=14).mean()
-    avg_loss = (-delta.clip(upper=0.0)).rolling(14, min_periods=14).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-
-    tr = pd.concat([(high - low).abs(), (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
-    upmove = high.diff()
-    downmove = -low.diff()
-    plusdm = np.where((upmove > downmove) & (upmove > 0), upmove, 0.0)
-    minusdm = np.where((downmove > upmove) & (downmove > 0), downmove, 0.0)
-    atr = pd.Series(tr).rolling(14, min_periods=14).mean()
-    plusdi = 100 * pd.Series(plusdm).rolling(14, min_periods=14).mean() / atr.replace(0, np.nan)
-    minusdi = 100 * pd.Series(minusdm).rolling(14, min_periods=14).mean() / atr.replace(0, np.nan)
-    dx = 100 * (plusdi - minusdi).abs() / (plusdi + minusdi).replace(0, np.nan)
-    adx = dx.rolling(14, min_periods=14).mean().fillna(0)
-
-    typical = (high + low + close) / 3.0
-    cumvol = volume.cumsum().replace(0, np.nan)
-    vwap = (typical * volume).cumsum() / cumvol.ffill().fillna(close)
-    vwap_std = (typical - vwap).rolling(20, min_periods=5).std().replace(0, np.nan)
-    vwap_z = ((close - vwap) / vwap_std).replace([np.inf, -np.inf], np.nan).fillna(0.0)
-
+    close = pd.to_numeric(intra_df["close"], errors="coerce")
     prev_close = safe_float(daily_df["close"].iloc[-2] if daily_df is not None and len(daily_df) >= 2 else np.nan, np.nan)
     ltp = safe_float(close.iloc[-1], np.nan)
-    pct_change = ((ltp - prev_close) / prev_close * 100.0) if pd.notna(prev_close) and prev_close != 0 else 0.0
-
-    current_win = intraday_window_score(df)
-    prev_win = previous_trading_day_same_time_score(df)
-    win_signal = compare_window_signal(current_win, prev_win)[1]
-    iteration_history = build_iteration_history(df)
-
-    bull = int(pct_change >= 0) + int(safe_float(vwap_z.iloc[-1], 0) > 0.3) + int(safe_float(plusdi.iloc[-1], 0) > safe_float(minusdi.iloc[-1], 0)) + int(safe_float(rsi.iloc[-1], 50) > 55) + int(win_signal.startswith("Buy")) * 2
-    bear = int(pct_change <= 0) + int(safe_float(vwap_z.iloc[-1], 0) < -0.3) + int(safe_float(minusdi.iloc[-1], 0) > safe_float(plusdi.iloc[-1], 0)) + int(safe_float(rsi.iloc[-1], 50) < 45) + int(win_signal.startswith("Sell")) * 2
-    rank_delta = bull - bear
-    ivp, vol_state = compute_ivp(daily_df, min_bars=10)
-    last_ts = pd.to_datetime(df["timestamp"].iloc[-1])
-
+    iteration_history = build_iteration_history(intra_df)
     return {
         "LTP": round(ltp, 2),
-        "% Change": round(pct_change, 2),
-        "5m_Signal": score_label(rank_delta),
-        "15m_Signal": win_signal,
-        "30m_Signal": score_label(rank_delta * 0.8),
-        "60m_Signal": score_label(rank_delta * 0.7),
-        "Bull_Signal": score_label(bull),
-        "Bear_Signal": score_label(-bear),
-        "Overall_Signal": score_label(rank_delta),
-        "Price_Lead_Status": "NORMAL",
-        "IVP": ivp,
-        "Volatility State": vol_state,
-        "Last Iteration Time": last_ts.strftime("%H:%M"),
-        "Bull Rank": bull,
-        "Bear Rank": bear,
-        "Rank Delta": rank_delta,
-        "Cumulative ADX": round(safe_float(adx.iloc[-1], np.nan), 2),
+        "% Change": round(((ltp - prev_close) / prev_close * 100.0), 2) if pd.notna(prev_close) and prev_close != 0 else np.nan,
+        "Last Iteration Time": pd.to_datetime(intra_df["timestamp"].iloc[-1]).strftime("%H:%M"),
         "Iteration History": iteration_history,
     }
 
@@ -412,11 +334,10 @@ def summarize_intraday(intra_df: pd.DataFrame, daily_df: pd.DataFrame) -> Dict[s
 def choose_top_candidates(summary_df: pd.DataFrame, topn: int = TOP_N_UNDERLYINGS) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if summary_df is None or summary_df.empty:
         return pd.DataFrame(), pd.DataFrame()
-    rank_delta = pd.to_numeric(summary_df.get("Rank Delta", 0), errors="coerce").fillna(0)
-    long_df = summary_df[rank_delta > 0].copy()
-    short_df = summary_df[rank_delta < 0].copy()
-    long_df = long_df.sort_values(["Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False]).head(topn)
-    short_df = short_df.sort_values(["Rank Delta", "Cumulative ADX", "% Change"], ascending=[True, False, True]).head(topn)
+    work = summary_df.copy()
+    work["% Change"] = pd.to_numeric(work.get("% Change"), errors="coerce").fillna(0)
+    long_df = work[work["% Change"] > 0].copy().sort_values(["% Change", "LTP"], ascending=[False, False]).head(topn)
+    short_df = work[work["% Change"] < 0].copy().sort_values(["% Change", "LTP"], ascending=[True, False]).head(topn)
     return long_df.reset_index(drop=True), short_df.reset_index(drop=True)
 
 
@@ -440,7 +361,6 @@ def parse_chain_records(chain_res) -> List[Dict]:
 def fetch_optionpairs(symbol: str, paircount: int = OPTION_PAIRS_TO_KEEP) -> pd.DataFrame:
     client = initfyers()
     if client is None:
-        logger.warning("fetch_optionpairs skipped no client symbol=%s", symbol)
         return pd.DataFrame()
 
     eqsymbol = format_eq_symbol(symbol)
@@ -455,7 +375,6 @@ def fetch_optionpairs(symbol: str, paircount: int = OPTION_PAIRS_TO_KEEP) -> pd.
         logger.warning("Quote fetch failed symbol=%s err=%s", symbol, e)
 
     chain_attempts = [eqsymbol, symbol if str(symbol).startswith("NSE:") else f"NSE:{str(symbol).strip().upper()}"]
-    chain_attempts = [str(s).strip() for s in chain_attempts]
     chain_res = None
     for chain_symbol in chain_attempts:
         try:
@@ -470,6 +389,8 @@ def fetch_optionpairs(symbol: str, paircount: int = OPTION_PAIRS_TO_KEEP) -> pd.
     chain = parse_chain_records(chain_res)
     rows = []
     for item in chain:
+        if not isinstance(item, dict):
+            continue
         strike = safe_float(item.get("strikePrice") or item.get("strike") or item.get("strike_price"), np.nan)
         opt_type = str(item.get("optionType") or item.get("type") or item.get("option_type") or "").upper()
         opt_symbol = str(item.get("symbol") or item.get("tradingSymbol") or item.get("trading_symbol") or item.get("optionSymbol") or "").strip()
@@ -522,27 +443,23 @@ def scansingleoption(option_symbol: str, option_type: str, strike: float, underl
 
 
 def option_liquidity_score(oi, volume, obv) -> float:
-    return round(np.log1p(max(safe_float(oi, 0), 0)) * 0.45 + np.log1p(max(safe_float(volume, 0), 0)) * 0.35 + np.log1p(max(abs(safe_float(obv, 0)), 0)) * 0.20, 4)
+    return round(
+        np.log1p(max(safe_float(oi, 0), 0)) * 0.45
+        + np.log1p(max(safe_float(volume, 0), 0)) * 0.35
+        + np.log1p(max(abs(safe_float(obv, 0)), 0)) * 0.20,
+        4,
+    )
 
 
 def rank_option_candidates(df: pd.DataFrame, side: str) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     out = df.copy()
-    out["__liq"] = pd.to_numeric(out.get("OI+Volume+OBV Score", 0), errors="coerce").fillna(0)
-    out["__adx"] = pd.to_numeric(out.get("Cumulative ADX", 0), errors="coerce").fillna(0)
-    out["__pct"] = pd.to_numeric(out.get("% Change", 0), errors="coerce").fillna(0)
-
-    opt_type = out["Option Type"].astype(str).str.upper() if "Option Type" in out.columns else pd.Series("", index=out.index)
-    if side == "long":
-        type_bonus = np.where(opt_type.eq("CE"), 0.30, 0.10)
-        out["EMAIL_RANK_SCORE"] = out["__liq"] * 0.40 + out["__adx"] * 0.18 + out["__pct"] * 0.10 + type_bonus
-        out = out.sort_values(["EMAIL_RANK_SCORE", "__liq", "__adx", "__pct"], ascending=[False, False, False, False])
-    else:
-        type_bonus = np.where(opt_type.eq("PE"), 0.30, 0.10)
-        out["EMAIL_RANK_SCORE"] = out["__liq"] * 0.40 + out["__adx"] * 0.18 + (-out["__pct"]) * 0.10 + type_bonus
-        out = out.sort_values(["EMAIL_RANK_SCORE", "__liq", "__adx", "__pct"], ascending=[False, False, False, True])
-    return out.reset_index(drop=True)
+    out["OI+Volume+OBV Score"] = pd.to_numeric(out.get("OI+Volume+OBV Score"), errors="coerce").fillna(0)
+    out["Volume"] = pd.to_numeric(out.get("Volume"), errors="coerce").fillna(0)
+    out["OI"] = pd.to_numeric(out.get("OI"), errors="coerce").fillna(0)
+    out["EMAIL_RANK_SCORE"] = out["OI+Volume+OBV Score"]
+    return out.sort_values(["EMAIL_RANK_SCORE", "Volume", "OI"], ascending=[False, False, False]).reset_index(drop=True)
 
 
 def buildoptioncandidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -617,27 +534,53 @@ def buildoptioncandidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.Da
     return final_out, iter_df
 
 
-def load_state() -> Dict:
-    if os.path.exists(STATE_PATH):
-        try:
-            with open(STATE_PATH, "r", encoding="utf-8") as f:
-                data = json.load(f)
-            if isinstance(data, dict):
-                return data
-        except Exception as e:
-            logger.warning("Could not read state file %s: %s", STATE_PATH, e)
-    return {}
-
-
-def save_state(state: Dict):
+def load_state_df() -> pd.DataFrame:
+    cols = ["State Key", "entered", "down_streak", "Entry Value", "Entry Time", "Exit Value", "Exit Time", "Chain Signal", "last_iteration"]
+    if not os.path.isfile(STATE_CSV_PATH):
+        return pd.DataFrame(columns=cols)
     try:
-        with open(STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(state, f, ensure_ascii=False, default=str, indent=2)
+        df = pd.read_csv(STATE_CSV_PATH)
+        for col in cols:
+            if col not in df.columns:
+                df[col] = np.nan
+        return df[cols].copy()
     except Exception as e:
-        logger.warning("Could not save state file %s: %s", STATE_PATH, e)
+        logger.warning("Could not read state csv %s: %s", STATE_CSV_PATH, e)
+        return pd.DataFrame(columns=cols)
 
 
-def chain_entry_exit_from_iters(iter_df: pd.DataFrame, state_key: Optional[str] = None, state: Optional[Dict] = None) -> Dict[str, object]:
+def save_state_df(state_df: pd.DataFrame):
+    cols = ["State Key", "entered", "down_streak", "Entry Value", "Entry Time", "Exit Value", "Exit Time", "Chain Signal", "last_iteration"]
+    out = state_df.copy() if state_df is not None else pd.DataFrame(columns=cols)
+    for col in cols:
+        if col not in out.columns:
+            out[col] = np.nan
+    out[cols].to_csv(STATE_CSV_PATH, index=False)
+
+
+def get_state_row(state_df: pd.DataFrame, state_key: str) -> Dict[str, object]:
+    if state_df is None or state_df.empty or "State Key" not in state_df.columns:
+        return {}
+    hit = state_df[state_df["State Key"].astype(str) == str(state_key)]
+    if hit.empty:
+        return {}
+    return hit.iloc[0].to_dict()
+
+
+def upsert_state_row(state_df: pd.DataFrame, state_key: str, row: Dict[str, object]) -> pd.DataFrame:
+    data = dict(row)
+    data["State Key"] = state_key
+    if state_df is None or state_df.empty:
+        return pd.DataFrame([data])
+    mask = state_df["State Key"].astype(str) == str(state_key)
+    if mask.any():
+        for k, v in data.items():
+            state_df.loc[mask, k] = v
+        return state_df
+    return pd.concat([state_df, pd.DataFrame([data])], ignore_index=True)
+
+
+def chain_entry_exit_from_iters(iter_df: pd.DataFrame, state_key: Optional[str] = None, state_df: Optional[pd.DataFrame] = None) -> Tuple[Dict[str, object], pd.DataFrame]:
     empty = {
         "Chain Signal": "WAIT",
         "Entry Value": np.nan,
@@ -647,37 +590,32 @@ def chain_entry_exit_from_iters(iter_df: pd.DataFrame, state_key: Optional[str] 
     }
 
     if iter_df is None or iter_df.empty:
-        return empty
+        return empty, state_df
 
     d = iter_df.copy()
     d["iteration"] = pd.to_numeric(d["iteration"], errors="coerce")
     d["close"] = pd.to_numeric(d["close"], errors="coerce")
     d = d.dropna(subset=["iteration", "close", "Option Symbol"])
     if d.empty:
-        return empty
+        return empty, state_df
 
     pivot = d.pivot_table(index="iteration", columns="Option Symbol", values="close", aggfunc="last").sort_index()
     if pivot.shape[0] < 2 or pivot.shape[1] == 0:
-        return empty
+        return empty, state_df
 
     prev = pivot.shift(1)
     all_up = (pivot > prev).all(axis=1)
     all_down = (pivot < prev).all(axis=1)
 
-    latest_iter = int(pivot.index.max())
-    latest_row = d[d["iteration"] == latest_iter].sort_values(["timestamp", "Option Symbol"]).copy()
-    latest_time = str(latest_row["timestamp"].iloc[0]) if "timestamp" in latest_row.columns and not latest_row.empty else ""
-    latest_value = round(float(latest_row["close"].mean()), 2) if not latest_row.empty else np.nan
-
-    existing = state.get(state_key, {}) if isinstance(state, dict) and state_key else {}
-    entered = bool(existing.get("entered", False))
-    down_streak = int(existing.get("down_streak", 0))
+    existing = get_state_row(state_df if state_df is not None else pd.DataFrame(), state_key) if state_key else {}
+    entered = str(existing.get("entered", "False")).strip().lower() in {"1", "true", "yes", "y"}
+    down_streak = int(safe_float(existing.get("down_streak"), 0))
     entry_value = safe_float(existing.get("Entry Value"), np.nan)
-    entry_time = str(existing.get("Entry Time", ""))
+    entry_time = "" if pd.isna(existing.get("Entry Time", np.nan)) else str(existing.get("Entry Time", ""))
     exit_value = safe_float(existing.get("Exit Value"), np.nan)
-    exit_time = str(existing.get("Exit Time", ""))
+    exit_time = "" if pd.isna(existing.get("Exit Time", np.nan)) else str(existing.get("Exit Time", ""))
     chain_signal = str(existing.get("Chain Signal", "WAIT")).upper() if existing else "WAIT"
-    last_processed_iter = int(existing.get("last_iteration", 0)) if str(existing.get("last_iteration", "")).strip() not in {"", "nan", "None"} else 0
+    last_processed_iter = int(safe_float(existing.get("last_iteration"), 0))
 
     new_iters = [int(x) for x in pivot.index if int(x) > last_processed_iter]
     if not new_iters and existing:
@@ -687,7 +625,12 @@ def chain_entry_exit_from_iters(iter_df: pd.DataFrame, state_key: Optional[str] 
             "Entry Time": entry_time,
             "Exit Value": exit_value,
             "Exit Time": exit_time,
-        }
+        }, state_df
+
+    latest_iter = int(pivot.index.max())
+    latest_row = d[d["iteration"] == latest_iter].sort_values(["timestamp", "Option Symbol"]).copy()
+    latest_time = str(latest_row["timestamp"].iloc[0]) if "timestamp" in latest_row.columns and not latest_row.empty else ""
+    latest_value = round(float(latest_row["close"].mean()), 2) if not latest_row.empty else np.nan
 
     for it in new_iters:
         is_up = bool(all_up.loc[it]) if pd.notna(all_up.loc[it]) else False
@@ -726,8 +669,8 @@ def chain_entry_exit_from_iters(iter_df: pd.DataFrame, state_key: Optional[str] 
 
         last_processed_iter = max(last_processed_iter, it)
 
-    if isinstance(state, dict) and state_key:
-        state[state_key] = {
+    if state_key:
+        state_df = upsert_state_row(state_df if state_df is not None else pd.DataFrame(), state_key, {
             "entered": entered,
             "down_streak": down_streak,
             "Entry Value": None if pd.isna(entry_value) else float(entry_value),
@@ -736,7 +679,7 @@ def chain_entry_exit_from_iters(iter_df: pd.DataFrame, state_key: Optional[str] 
             "Exit Time": exit_time,
             "Chain Signal": chain_signal,
             "last_iteration": int(last_processed_iter),
-        }
+        })
 
     return {
         "Chain Signal": chain_signal,
@@ -744,7 +687,7 @@ def chain_entry_exit_from_iters(iter_df: pd.DataFrame, state_key: Optional[str] 
         "Entry Time": entry_time,
         "Exit Value": exit_value,
         "Exit Time": exit_time,
-    }
+    }, state_df
 
 
 def send_single_email(subject: str, html_body: str, attachments: Optional[List[str]] = None) -> bool:
@@ -792,7 +735,10 @@ def _prepare_email_df(df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
     out = df.copy()
     rename_map = {k: v for k, v in OPTION_EMAIL_COL_RENAME.items() if k in out.columns}
-    return out.rename(columns=rename_map)
+    out = out.rename(columns=rename_map)
+    if "Opt Symbol" in out.columns:
+        out = out.drop(columns=["Opt Symbol"])
+    return out
 
 
 def compact_table_html(df: pd.DataFrame, title: str, max_rows: int) -> str:
@@ -807,7 +753,10 @@ def compact_table_html(df: pd.DataFrame, title: str, max_rows: int) -> str:
             )
         )
 
-    cols = [c for c in ["Underlying", "Option Type", "Strike", "LTP", "% Chg", "OI", "Volume", "OBV", "Liq Score", "Rank", "Entry", "Entry Time", "Exit", "Exit Time", "Cumulative ADX", "5m_Signal", "15m_Signal", "Overall_Signal", "IVP", "Time", "Chain Signal", "Chain Legs"] if c in df.columns]
+    cols = [c for c in [
+        "Underlying", "Option Type", "Strike", "LTP", "OI", "Volume", "OBV",
+        "Liq Score", "Rank", "Entry", "Entry Time", "Exit", "Exit Time", "Chain Signal", "Chain Legs"
+    ] if c in df.columns]
     body = df[cols].head(max_rows).to_html(index=False, border=0, escape=False, classes="mail-table")
     return f'<div class="section-card"><h3>{title}</h3>{body}</div>'
 
@@ -841,7 +790,7 @@ def build_chain_email_html(long_rows: List[Dict], short_rows: List[Dict]) -> str
         <div class="wrap">
             <div class="hero">
                 <h2>Chain Signal Report - {ts}</h2>
-                <p>Shortlist is reused when available. Entry is all legs up together. Exit is only after entry and 2 consecutive all-leg down checks.</p>
+                <p>Shortlist is reused when available. One underlying row near ATM. Entry is all legs up together. Exit is only after entry and 2 consecutive all-leg down checks.</p>
             </div>
             {compact_table_html(pd.DataFrame(long_rows), 'LONG CANDIDATES', EMAIL_MAX_ROWS_LONG)}
             {compact_table_html(pd.DataFrame(short_rows), 'SHORT CANDIDATES', EMAIL_MAX_ROWS_SHORT)}
@@ -872,23 +821,25 @@ def pick_best_representative(options_df: pd.DataFrame, underlying: str, opt_type
     if temp.empty:
         return {}
 
-    temp["_rank"] = pd.to_numeric(temp.get("EMAIL_RANK_SCORE"), errors="coerce").fillna(-np.inf)
-    temp["_vol"] = pd.to_numeric(temp.get("Volume"), errors="coerce").fillna(0)
+    temp["EMAIL_RANK_SCORE"] = pd.to_numeric(temp.get("EMAIL_RANK_SCORE"), errors="coerce").fillna(-np.inf)
+    temp["Volume"] = pd.to_numeric(temp.get("Volume"), errors="coerce").fillna(0)
+    temp["OI"] = pd.to_numeric(temp.get("OI"), errors="coerce").fillna(0)
     temp["_atm_ref"] = temp["Strike"].median()
     temp["_atm_gap"] = (temp["Strike"] - temp["_atm_ref"]).abs()
-    temp = temp.sort_values(["_atm_gap", "_rank", "_vol", "Strike"], ascending=[True, False, False, True])
+    temp = temp.sort_values(["_atm_gap", "EMAIL_RANK_SCORE", "Volume", "OI", "Strike"], ascending=[True, False, False, False, True])
     return temp.iloc[0].to_dict()
 
 
-def build_chain_rows_from_iters(options_df: pd.DataFrame, iteration_df: pd.DataFrame, state: Optional[Dict] = None) -> List[Dict]:
+def build_chain_rows_from_iters(options_df: pd.DataFrame, iteration_df: pd.DataFrame, state_df: Optional[pd.DataFrame] = None) -> Tuple[List[Dict], pd.DataFrame]:
     if options_df is None or options_df.empty or iteration_df is None or iteration_df.empty:
-        return []
+        return [], state_df
 
     required = {"Underlying", "Option Type", "Option Symbol", "close"}
     if not required.issubset(set(iteration_df.columns)):
-        return []
+        return [], state_df
 
     rows = []
+    cur_state = state_df if state_df is not None else load_state_df()
     for (underlying, opt_type), grp in iteration_df.groupby(["Underlying", "Option Type"]):
         grp = grp.copy()
         sort_cols = [c for c in ["iteration", "timestamp", "Option Symbol"] if c in grp.columns]
@@ -900,7 +851,7 @@ def build_chain_rows_from_iters(options_df: pd.DataFrame, iteration_df: pd.DataF
             continue
 
         state_key = f"{str(underlying).upper()}|{str(opt_type).upper()}"
-        chain_sig = chain_entry_exit_from_iters(grp, state_key=state_key, state=state or {})
+        chain_sig, cur_state = chain_entry_exit_from_iters(grp, state_key=state_key, state_df=cur_state)
         rep = pick_best_representative(options_df, str(underlying), str(opt_type))
 
         strike = safe_float(rep.get("Strike"), np.nan) if rep else np.nan
@@ -916,7 +867,6 @@ def build_chain_rows_from_iters(options_df: pd.DataFrame, iteration_df: pd.DataF
             "Option Type": str(opt_type).upper(),
             "Strike": strike,
             "LTP": rep.get("LTP", fallback_ltp) if rep else fallback_ltp,
-            "% Change": rep.get("% Change", np.nan) if rep else np.nan,
             "OI": rep.get("OI", np.nan) if rep else np.nan,
             "Volume": rep.get("Volume", np.nan) if rep else np.nan,
             "OBV": rep.get("OBV", np.nan) if rep else np.nan,
@@ -926,24 +876,12 @@ def build_chain_rows_from_iters(options_df: pd.DataFrame, iteration_df: pd.DataF
             "Entry Time": chain_sig.get("Entry Time", ""),
             "Exit Value": chain_sig.get("Exit Value", np.nan),
             "Exit Time": chain_sig.get("Exit Time", ""),
-            "Cumulative ADX": rep.get("Cumulative ADX", np.nan) if rep else np.nan,
-            "5m_Signal": rep.get("5m_Signal", "") if rep else "",
-            "15m_Signal": rep.get("15m_Signal", "") if rep else "",
-            "30m_Signal": rep.get("30m_Signal", "") if rep else "",
-            "60m_Signal": rep.get("60m_Signal", "") if rep else "",
-            "Bull_Signal": rep.get("Bull_Signal", "") if rep else "",
-            "Bear_Signal": rep.get("Bear_Signal", "") if rep else "",
-            "Overall_Signal": rep.get("Overall_Signal", "") if rep else "",
-            "Price_Lead_Status": rep.get("Price_Lead_Status", "") if rep else "",
-            "IVP": rep.get("IVP", np.nan) if rep else np.nan,
-            "Volatility State": rep.get("Volatility State", "") if rep else "",
-            "Last Iteration Time": rep.get("Last Iteration Time", "") if rep else "",
             "Chain Signal": chain_sig.get("Chain Signal", "WAIT"),
             "Chain Legs": chain_legs,
         })
 
     if not rows:
-        return []
+        return [], cur_state
 
     out = pd.DataFrame(rows).copy()
     out["EMAIL_RANK_SCORE"] = pd.to_numeric(out.get("EMAIL_RANK_SCORE"), errors="coerce").fillna(-np.inf)
@@ -951,103 +889,7 @@ def build_chain_rows_from_iters(options_df: pd.DataFrame, iteration_df: pd.DataF
     signal_priority = {"ENTER": 0, "EXIT": 1, "WAIT": 2}
     out["_sig"] = out["Chain Signal"].astype(str).str.upper().map(signal_priority).fillna(9)
     out = out.sort_values(["EMAIL_RANK_SCORE", "Chain Legs", "_sig", "Underlying"], ascending=[False, False, True, True]).reset_index(drop=True)
-    return out.drop(columns=["_sig"]).to_dict("records")
-
-
-def build_cepebuy_rows(options_df: pd.DataFrame, iteration_df: pd.DataFrame, state: Optional[Dict] = None) -> Tuple[List[Dict], List[Dict]]:
-    chain_rows = build_chain_rows_from_iters(options_df, iteration_df, state=state)
-    if not chain_rows:
-        return [], []
-
-    ce_rows, pe_rows = [], []
-    for row in chain_rows:
-        sig = str(row.get("Chain Signal", "WAIT")).upper()
-        opt_type = str(row.get("Option Type", "")).upper()
-        if sig not in ("ENTER", "EXIT"):
-            continue
-        out = {
-            "Underlying": row.get("Underlying", ""),
-            "Option Type": opt_type,
-            "Strike": row.get("Strike", np.nan),
-            "LTP": row.get("LTP", np.nan),
-            "% Change": row.get("% Change", np.nan),
-            "Entry Value": row.get("Entry Value", np.nan),
-            "Entry Time": row.get("Entry Time", ""),
-            "Exit Value": row.get("Exit Value", np.nan),
-            "Exit Time": row.get("Exit Time", ""),
-            "Trade Signal": f"{opt_type} CHAIN",
-            "Chain Signal": sig,
-            "Chain Legs": row.get("Chain Legs", 0),
-        }
-        if opt_type == "CE":
-            ce_rows.append(out)
-        elif opt_type == "PE":
-            pe_rows.append(out)
-    return ce_rows, pe_rows
-
-
-def build_cepebuy_email_html(ce_rows: List[Dict], pe_rows: List[Dict]) -> str:
-    ts = datetime.now().strftime("%d %b %Y, %H:%M")
-
-    def style_signal(val: str) -> str:
-        s = str(val).upper()
-        if s == "ENTER":
-            return f'<span class="badge badge-enter">{s}</span>'
-        if s == "EXIT":
-            return f'<span class="badge badge-exit">{s}</span>'
-        return f'<span class="badge badge-wait">{s}</span>'
-
-    def table(rows, title, accent):
-        df = pd.DataFrame(rows)
-        if df.empty:
-            return f'<div class="section-card"><h3 style="color:{accent};">{title}</h3><p class="muted">No chain-based eligible strikes.</p></div>'
-        if "Chain Signal" in df.columns:
-            df["Chain Signal"] = df["Chain Signal"].map(style_signal)
-        cols = [c for c in ["Underlying", "Option Type", "Strike", "LTP", "% Change", "Entry Value", "Entry Time", "Exit Value", "Exit Time", "Trade Signal", "Chain Signal", "Chain Legs"] if c in df.columns]
-        html = df[cols].to_html(index=False, border=0, escape=False, classes="mail-table")
-        return f'<div class="section-card"><h3 style="color:{accent};">{title}</h3>{html}</div>'
-
-    return f"""
-    <html>
-    <head>
-    <style>
-        body {{ font-family: Arial, sans-serif; background: #f4f7fb; color: #172033; margin: 0; padding: 20px; }}
-        .wrap {{ max-width: 1180px; margin: 0 auto; }}
-        .hero {{ background: linear-gradient(135deg, #7c3aed, #2563eb); color: white; padding: 18px 22px; border-radius: 14px; }}
-        .hero h2 {{ margin: 0 0 6px 0; font-size: 24px; }}
-        .hero p {{ margin: 0; color: #ede9fe; }}
-        .section-card {{ background: white; border: 1px solid #dbe4f0; border-radius: 14px; padding: 14px 16px; margin-top: 16px; box-shadow: 0 6px 18px rgba(15, 23, 42, 0.06); }}
-        .mail-table {{ width: 100%; border-collapse: collapse; font-size: 13px; overflow: hidden; }}
-        .mail-table th {{ background: #1d4ed8; color: white; padding: 10px 8px; text-align: left; }}
-        .mail-table td {{ padding: 8px; border-bottom: 1px solid #e5e7eb; }}
-        .mail-table tr:nth-child(even) td {{ background: #f8fbff; }}
-        .mail-table tr:hover td {{ background: #eef6ff; }}
-        .badge {{ display: inline-block; padding: 3px 8px; border-radius: 999px; font-size: 12px; font-weight: 700; }}
-        .badge-enter {{ background: #dcfce7; color: #166534; }}
-        .badge-exit {{ background: #fee2e2; color: #991b1b; }}
-        .badge-wait {{ background: #f3f4f6; color: #374151; }}
-        .muted {{ color: #64748b; }}
-    </style>
-    </head>
-    <body>
-        <div class="wrap">
-            <div class="hero">
-                <h2>CE PE Chain Eligibility Report - {ts}</h2>
-                <p>Uses cached shortlist when available. Entry is all legs up together. Exit is only after entry and 2 consecutive all-leg down checks.</p>
-            </div>
-            {table(ce_rows, 'CE CHAIN ELIGIBLE STRIKES', '#2563eb')}
-            {table(pe_rows, 'PE CHAIN ELIGIBLE STRIKES', '#7c3aed')}
-        </div>
-    </body>
-    </html>
-    """
-
-
-def send_cepebuy_email(ce_rows: List[Dict], pe_rows: List[Dict], attachments: Optional[List[str]] = None) -> bool:
-    if not ce_rows and not pe_rows:
-        return False
-    subject = f"CE PE Momentum Buy Report - {datetime.now().strftime('%d %b %H:%M')}"
-    return send_single_email(subject, build_cepebuy_email_html(ce_rows, pe_rows), attachments)
+    return out.drop(columns=["_sig"]).to_dict("records"), cur_state
 
 
 def scansymbol(symbol: str) -> Optional[Dict]:
@@ -1063,16 +905,16 @@ def scansymbol(symbol: str) -> Optional[Dict]:
     return summary
 
 
-def prepare_shortlist() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    if REUSE_SHORTLIST and os.path.exists(SUMMARY_PATH) and os.path.exists(LONG_SEED_PATH) and os.path.exists(SHORT_SEED_PATH):
+def load_or_build_shortlist() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
+    if REUSE_SHORTLIST and os.path.isfile(SUMMARY_PATH) and os.path.isfile(LONG_SEED_PATH) and os.path.isfile(SHORT_SEED_PATH):
         try:
-            logger.info("Reusing cached shortlist files for %s", TODAY_TAG)
             summary_df = pd.read_csv(SUMMARY_PATH)
             long_seed_df = pd.read_csv(LONG_SEED_PATH)
             short_seed_df = pd.read_csv(SHORT_SEED_PATH)
+            logger.info("Reusing saved shortlist files for %s", TODAY_TAG)
             return summary_df, long_seed_df, short_seed_df
         except Exception as e:
-            logger.warning("Could not reuse shortlist cache, rebuilding: %s", e)
+            logger.warning("Shortlist reuse failed, rebuilding: %s", e)
 
     symbols = load_fno_symbols_from_sectors(SECTORS_DIR)
     if not symbols:
@@ -1090,11 +932,12 @@ def prepare_shortlist() -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     if summary_df.empty:
         raise RuntimeError("No symbols returned usable market data.")
 
-    summary_df = summary_df.sort_values(["Rank Delta", "% Change"], ascending=[False, False]).reset_index(drop=True)
+    summary_df = summary_df.sort_values(["% Change", "LTP"], ascending=[False, False]).reset_index(drop=True)
     long_seed_df, short_seed_df = choose_top_candidates(summary_df, topn=TOP_N_UNDERLYINGS)
     summary_df.to_csv(SUMMARY_PATH, index=False)
     long_seed_df.to_csv(LONG_SEED_PATH, index=False)
     short_seed_df.to_csv(SHORT_SEED_PATH, index=False)
+    logger.info("Fresh shortlist built and saved for %s", TODAY_TAG)
     return summary_df, long_seed_df, short_seed_df
 
 
@@ -1102,40 +945,47 @@ def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     initfyers()
 
-    summary_df, long_seed_df, short_seed_df = prepare_shortlist()
-    summary_path = SUMMARY_PATH
+    summary_df, long_seed_df, short_seed_df = load_or_build_shortlist()
+    summary_df.to_csv(SUMMARY_PATH, index=False)
 
     long_df, long_iter_df = buildoptioncandidates(long_seed_df, side="long")
     short_df, short_iter_df = buildoptioncandidates(short_seed_df, side="short")
+
+    long_df.to_csv(LONG_CANDIDATES_PATH, index=False)
+    short_df.to_csv(SHORT_CANDIDATES_PATH, index=False)
+
     iteration_df = pd.concat([long_iter_df, short_iter_df], ignore_index=True) if (not long_iter_df.empty or not short_iter_df.empty) else pd.DataFrame()
-
-    long_path = os.path.join(OUTPUT_DIR, f"fo_long_candidates_{TODAY_TAG}.csv")
-    short_path = os.path.join(OUTPUT_DIR, f"fo_short_candidates_{TODAY_TAG}.csv")
-    iter_path = os.path.join(OUTPUT_DIR, f"fo_iteration_history_{TODAY_TAG}.csv")
-
-    long_df.to_csv(long_path, index=False)
-    short_df.to_csv(short_path, index=False)
-
     if iteration_df.empty:
-        iteration_df = pd.DataFrame(columns=["iteration", "Underlying", "Option Type", "Strike", "Option Symbol", "timestamp", "windowminutes", "windowstart", "windowend", "currentwindowscore", "previoustradingdaysametimescore", "windowdelta", "windowsignal", "close"])
-    iteration_df.to_csv(iter_path, index=False)
+        iteration_df = pd.DataFrame(columns=[
+            "iteration", "Underlying", "Option Type", "Strike", "Option Symbol",
+            "timestamp", "windowminutes", "windowstart", "windowend",
+            "currentwindowscore", "previoustradingdaysametimescore",
+            "windowdelta", "windowsignal", "close"
+        ])
+    iteration_df.to_csv(ITER_PATH, index=False)
 
-    state = load_state()
-    long_chain_rows = build_chain_rows_from_iters(long_df, long_iter_df, state=state)
-    short_chain_rows = build_chain_rows_from_iters(short_df, short_iter_df, state=state)
-    save_state(state)
+    state_df = load_state_df()
 
-    chain_long_path = os.path.join(OUTPUT_DIR, f"chain_long_{TODAY_TAG}.csv")
-    chain_short_path = os.path.join(OUTPUT_DIR, f"chain_short_{TODAY_TAG}.csv")
-    pd.DataFrame(long_chain_rows).to_csv(chain_long_path, index=False)
-    pd.DataFrame(short_chain_rows).to_csv(chain_short_path, index=False)
+    options_df = pd.concat([long_df, short_df], ignore_index=True) if (not long_df.empty or not short_df.empty) else pd.DataFrame()
+    chain_rows, state_df = build_chain_rows_from_iters(options_df, iteration_df, state_df=state_df)
+    save_state_df(state_df)
 
-    send_chain_signal_email(long_chain_rows, short_chain_rows, attachments=[summary_path, long_path, short_path, iter_path])
+    chain_df = pd.DataFrame(chain_rows)
+    if chain_df.empty:
+        long_rows = []
+        short_rows = []
+    else:
+        long_rows = chain_df[chain_df["Option Type"].astype(str).str.upper() == "CE"].to_dict("records")
+        short_rows = chain_df[chain_df["Option Type"].astype(str).str.upper() == "PE"].to_dict("records")
 
-    combined_options_df = pd.concat([long_df, short_df], ignore_index=True) if (not long_df.empty or not short_df.empty) else pd.DataFrame()
-    ce_buy_rows, pe_buy_rows = build_cepebuy_rows(combined_options_df, iteration_df, state=state)
-    save_state(state)
-    send_cepebuy_email(ce_buy_rows, pe_buy_rows, attachments=[chain_long_path, chain_short_path])
+    pd.DataFrame(long_rows).to_csv(CHAIN_LONG_PATH, index=False)
+    pd.DataFrame(short_rows).to_csv(CHAIN_SHORT_PATH, index=False)
+
+    send_chain_signal_email(
+        long_rows,
+        short_rows,
+        attachments=[SUMMARY_PATH, LONG_SEED_PATH, SHORT_SEED_PATH, LONG_CANDIDATES_PATH, SHORT_CANDIDATES_PATH, ITER_PATH, CHAIN_LONG_PATH, CHAIN_SHORT_PATH, STATE_CSV_PATH],
+    )
 
 
 if __name__ == "__main__":
