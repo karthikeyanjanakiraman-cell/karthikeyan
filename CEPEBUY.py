@@ -145,25 +145,36 @@ def normalize_underlying_symbol(value: str) -> str:
 def load_asit_shortlist(path: str, topn: int = TOP_N_UNDERLYINGS) -> Tuple[pd.DataFrame, pd.DataFrame]:
     df = pd.read_csv(path)
     cols = {str(c).strip().lower(): c for c in df.columns}
+
     sym_col = cols.get("symbol")
     rank_col = cols.get("rankscore15tier") or cols.get("rank")
     bull_col = cols.get("bullmultitfscore")
     bear_col = cols.get("bearmultitfscore")
-    trend_col = cols.get("dominanttrend")
+
     if not sym_col:
         raise RuntimeError(f"ASIT csv missing Symbol column: {path}")
+    if not bull_col or not bear_col:
+        raise RuntimeError(f"ASIT csv missing BullMultiTFScore / BearMultiTFScore columns: {path}")
+
     work = df.copy()
     work["Symbol"] = work[sym_col].astype(str).map(normalize_underlying_symbol)
     work["__rank"] = pd.to_numeric(work[rank_col], errors="coerce").fillna(0) if rank_col and rank_col in work.columns else 0.0
-    work["__bull"] = pd.to_numeric(work[bull_col], errors="coerce").fillna(0) if bull_col and bull_col in work.columns else 0.0
-    work["__bear"] = pd.to_numeric(work[bear_col], errors="coerce").fillna(0) if bear_col and bear_col in work.columns else 0.0
-    trends = work[trend_col].astype(str).str.upper() if trend_col and trend_col in work.columns else pd.Series("", index=work.index)
-    bull_mask = trends.str.contains("BULL") | (work["__bull"] >= work["__bear"])
-    bear_mask = trends.str.contains("BEAR") | (work["__bear"] > work["__bull"])
-    long_df = work[bull_mask].copy().sort_values(["__rank", "__bull", "__bear"], ascending=[False, False, True]).drop_duplicates(subset=["Symbol"]).head(topn)
-    short_df = work[bear_mask].copy().sort_values(["__rank", "__bear", "__bull"], ascending=[False, False, True]).drop_duplicates(subset=["Symbol"]).head(topn)
-    return long_df[["Symbol"]].reset_index(drop=True), short_df[["Symbol"]].reset_index(drop=True)
+    work["__bull"] = pd.to_numeric(work[bull_col], errors="coerce").fillna(0)
+    work["__bear"] = pd.to_numeric(work[bear_col], errors="coerce").fillna(0)
 
+    long_df = (
+        work.sort_values(["__bull", "__rank", "__bear"], ascending=[False, False, True])
+            .drop_duplicates(subset=["Symbol"])
+            .head(topn)
+    )
+
+    short_df = (
+        work.sort_values(["__bear", "__rank", "__bull"], ascending=[False, False, True])
+            .drop_duplicates(subset=["Symbol"])
+            .head(topn)
+    )
+
+    return long_df[["Symbol"]].reset_index(drop=True), short_df[["Symbol"]].reset_index(drop=True)
 
 def format_eq_symbol(symbol: str) -> str:
     symbol = str(symbol).strip().upper()
