@@ -81,11 +81,13 @@ def initfyers() -> Optional[object]:
     if fyersModel is None:
         logger.warning("Fyers SDK not available; running in dry mode")
         return None
+
     clientid = os.environ.get("CLIENTID") or os.environ.get("CLIENT_ID")
     accesstoken = os.environ.get("ACCESSTOKEN") or os.environ.get("ACCESS_TOKEN")
     if not clientid or not accesstoken:
         logger.warning("Missing CLIENTID / ACCESSTOKEN environment variables")
         return None
+
     try:
         fyers = fyersModel.FyersModel(client_id=clientid, token=accesstoken, is_async=False, log_path="")
         logger.info("Fyers client initialized")
@@ -115,10 +117,12 @@ def load_fno_symbols_from_sectors(rootdir: str = SECTORS_DIR) -> List[str]:
         except Exception as e:
             logger.warning("Failed reading sector csv %s: %s", path, e)
             continue
+
         lowered = {str(c).strip().lower(): c for c in df.columns}
         sym_col = next((lowered[k] for k in ["symbol", "symbols", "ticker", "tradingsymbol"] if k in lowered), None)
         if not sym_col:
             continue
+
         vals = df[sym_col].dropna().astype(str).str.strip().str.upper()
         vals = vals[~vals.isin(["", "NAN", "NONE", "NULL"])]
         symbols.update(vals.tolist())
@@ -147,6 +151,7 @@ def gethistory(symbol: str, resolution: str, days: int) -> pd.DataFrame:
     client = initfyers()
     if client is None:
         return pd.DataFrame()
+
     now = datetime.now()
     start = now - timedelta(days=days)
     payload = {
@@ -163,8 +168,10 @@ def gethistory(symbol: str, resolution: str, days: int) -> pd.DataFrame:
     except Exception as e:
         logger.warning("History fetch failed symbol=%s res=%s err=%s", symbol, resolution, e)
         return pd.DataFrame()
+
     if not candles:
         return pd.DataFrame()
+
     df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
     df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
     return df.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last").reset_index(drop=True)
@@ -197,15 +204,19 @@ def compute_obv(df: pd.DataFrame) -> float:
 def compute_ivp(history_df: pd.DataFrame, min_bars: int = 10) -> Tuple[float, str]:
     if history_df is None or history_df.empty or len(history_df) < min_bars:
         return np.nan, "Neutral Vol"
+
     close = pd.to_numeric(history_df["close"], errors="coerce")
     high = pd.to_numeric(history_df["high"], errors="coerce")
     low = pd.to_numeric(history_df["low"], errors="coerce")
+
     proxy = ((high - low) / close.replace(0, np.nan) * 100.0).replace([np.inf, -np.inf], np.nan).dropna()
     if proxy.empty:
         return np.nan, "Neutral Vol"
+
     lookback = proxy.tail(min(IVP_LOOKBACK_DAYS, len(proxy)))
     current = float(lookback.iloc[-1])
     ivp = round((lookback.lt(current).sum() / len(lookback)) * 100.0, 2)
+
     if ivp < 30:
         return ivp, "Buyer Zone"
     if ivp > 50:
@@ -226,49 +237,60 @@ def score_label(delta: float) -> str:
 def intraday_window_score(df: pd.DataFrame, window_minutes: int = SIGNAL_WINDOW_MINUTES) -> float:
     if df is None or df.empty or len(df) < 2:
         return np.nan
+
     d = df.copy().sort_values("timestamp")
     endts = pd.to_datetime(d["timestamp"].iloc[-1])
     startts = endts - timedelta(minutes=window_minutes)
     cur = d[(d["timestamp"] >= startts) & (d["timestamp"] <= endts)]
     if len(cur) < 2:
         return np.nan
+
     first_close = safe_float(cur["close"].iloc[0], np.nan)
     last_close = safe_float(cur["close"].iloc[-1], np.nan)
     if pd.isna(first_close) or first_close == 0:
         return np.nan
+
     return round(((last_close - first_close) / first_close) * 100.0, 2)
 
 
 def previous_trading_day_same_time_score(full_df: pd.DataFrame, endts: Optional[pd.Timestamp] = None, window_minutes: int = SIGNAL_WINDOW_MINUTES) -> float:
     if full_df is None or full_df.empty or len(full_df) < 4:
         return np.nan
+
     d = full_df.copy().sort_values("timestamp").reset_index(drop=True)
     d["timestamp"] = pd.to_datetime(d["timestamp"])
     endts = pd.to_datetime(endts) if endts is not None else pd.to_datetime(d["timestamp"].iloc[-1])
+
     trading_days = sorted(d["timestamp"].dt.date.unique())
     prev_days = [day for day in trading_days if day < endts.date()]
     if not prev_days:
         return np.nan
+
     prev_day = prev_days[-1]
     prev_day_df = d[d["timestamp"].dt.date == prev_day].copy()
     if prev_day_df.empty:
         return np.nan
+
     same_time_rows = prev_day_df[(prev_day_df["timestamp"].dt.hour == endts.hour) & (prev_day_df["timestamp"].dt.minute == endts.minute)]
     prev_end = pd.to_datetime(same_time_rows["timestamp"].iloc[-1] if not same_time_rows.empty else prev_day_df["timestamp"].iloc[-1])
     prev_start = prev_end - timedelta(minutes=window_minutes)
+
     prev_window = prev_day_df[(prev_day_df["timestamp"] >= prev_start) & (prev_day_df["timestamp"] <= prev_end)]
     if len(prev_window) < 2:
         return np.nan
+
     first_close = safe_float(prev_window["close"].iloc[0], np.nan)
     last_close = safe_float(prev_window["close"].iloc[-1], np.nan)
     if pd.isna(first_close) or first_close == 0:
         return np.nan
+
     return round(((last_close - first_close) / first_close) * 100.0, 2)
 
 
 def compare_window_signal(current_score: float, previous_score: float) -> Tuple[float, str]:
     if pd.isna(current_score) or pd.isna(previous_score):
         return np.nan, "Neutral"
+
     delta = round(current_score - previous_score, 2)
     if delta >= 0.05:
         return delta, "Buy"
@@ -280,17 +302,21 @@ def compare_window_signal(current_score: float, previous_score: float) -> Tuple[
 def build_iteration_history(intra_df: pd.DataFrame, window_minutes: int = SIGNAL_WINDOW_MINUTES, iterations: int = ITERATIONS_TO_KEEP) -> pd.DataFrame:
     if intra_df is None or intra_df.empty:
         return pd.DataFrame()
+
     full_df = intra_df.copy().sort_values("timestamp").reset_index(drop=True)
     full_df["timestamp"] = pd.to_datetime(full_df["timestamp"])
     last_day = full_df["timestamp"].dt.date.max()
+
     d = full_df[full_df["timestamp"].dt.date == last_day].copy().reset_index(drop=True)
     if d.empty:
         return pd.DataFrame()
+
     start_anchor = pd.Timestamp.combine(pd.Timestamp(last_day).date(), dtime(9, 15))
     end_anchor = pd.Timestamp.combine(pd.Timestamp(last_day).date(), dtime(15, 30))
     d = d[(d["timestamp"] >= start_anchor) & (d["timestamp"] <= end_anchor)].copy().reset_index(drop=True)
     if d.empty:
         return pd.DataFrame()
+
     rows = []
     for i in range(len(d)):
         endts = pd.to_datetime(d.loc[i, "timestamp"])
@@ -298,9 +324,11 @@ def build_iteration_history(intra_df: pd.DataFrame, window_minutes: int = SIGNAL
         cur = d[(d["timestamp"] >= startts) & (d["timestamp"] <= endts)]
         if len(cur) < 2:
             continue
+
         current_score = intraday_window_score(cur, window_minutes)
         previous_score = previous_trading_day_same_time_score(full_df, endts, window_minutes)
         delta, signal = compare_window_signal(current_score, previous_score)
+
         rows.append({
             "iteration": len(rows) + 1,
             "timestamp": endts.strftime("%H:%M"),
@@ -313,14 +341,17 @@ def build_iteration_history(intra_df: pd.DataFrame, window_minutes: int = SIGNAL
             "windowsignal": signal,
             "close": safe_float(cur["close"].iloc[-1], np.nan),
         })
+
         if len(rows) >= iterations:
             break
+
     return pd.DataFrame(rows)
 
 
 def summarize_intraday(intra_df: pd.DataFrame, daily_df: pd.DataFrame) -> Dict[str, object]:
     if intra_df is None or intra_df.empty:
         return {}
+
     df = intra_df.copy().sort_values("timestamp").reset_index(drop=True)
     close = pd.to_numeric(df["close"], errors="coerce")
     high = pd.to_numeric(df["high"], errors="coerce")
@@ -390,9 +421,11 @@ def summarize_intraday(intra_df: pd.DataFrame, daily_df: pd.DataFrame) -> Dict[s
 def choose_top_candidates(summary_df: pd.DataFrame, topn: int = TOP_N_UNDERLYINGS) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if summary_df is None or summary_df.empty:
         return pd.DataFrame(), pd.DataFrame()
+
     rank_delta = pd.to_numeric(summary_df.get("Rank Delta", 0), errors="coerce").fillna(0)
     long_df = summary_df[rank_delta > 0].copy()
     short_df = summary_df[rank_delta < 0].copy()
+
     long_df = long_df.sort_values(["Rank Delta", "Cumulative ADX", "% Change"], ascending=[False, False, False]).head(topn)
     short_df = short_df.sort_values(["Rank Delta", "Cumulative ADX", "% Change"], ascending=[True, False, True]).head(topn)
     return long_df.reset_index(drop=True), short_df.reset_index(drop=True)
@@ -435,12 +468,14 @@ def fetch_optionpairs(symbol: str, paircount: int = OPTION_PAIRS_TO_KEEP) -> pd.
     chain_attempts = [eqsymbol, symbol if str(symbol).startswith("NSE:") else f"NSE:{str(symbol).strip().upper()}"]
     chain_attempts = [str(s).strip() for s in chain_attempts]
     chain_res = None
+
     for chain_symbol in chain_attempts:
         try:
             chain_res = client.optionchain({"symbol": chain_symbol, "strikecount": 50})
             break
         except Exception as e:
             logger.warning("optionchain failed symbol=%s err=%s", chain_symbol, e)
+
     if chain_res is None:
         return pd.DataFrame()
 
@@ -453,8 +488,10 @@ def fetch_optionpairs(symbol: str, paircount: int = OPTION_PAIRS_TO_KEEP) -> pd.
         oi = safe_float(item.get("oi") or item.get("openInterest") or item.get("open_interest"), np.nan)
         vol = safe_float(item.get("volume") or item.get("vol"), np.nan)
         leg_ltp = safe_float(item.get("ltp") or item.get("lp") or item.get("last_price"), np.nan)
+
         if pd.isna(strike) or opt_type not in ("CE", "PE") or not opt_symbol:
             continue
+
         rows.append({
             "Underlying": symbol,
             "Strike": strike,
@@ -464,14 +501,18 @@ def fetch_optionpairs(symbol: str, paircount: int = OPTION_PAIRS_TO_KEEP) -> pd.
             "Chain Volume": vol,
             "LTP": leg_ltp,
         })
+
     if not rows:
         return pd.DataFrame()
+
     oc = pd.DataFrame(rows)
     if pd.isna(ltp):
         ltp = safe_float(oc["Strike"].median(), np.nan)
+
     step = nearest_step(ltp if pd.notna(ltp) else oc["Strike"].median())
     atm = round(ltp / step) * step if pd.notna(ltp) and step else oc["Strike"].median()
     strikes = sorted(oc["Strike"].dropna().unique(), key=lambda x: abs(x - atm))[:max(paircount, 1)]
+
     return oc[oc["Strike"].isin(strikes)].copy().sort_values(["Strike", "Option Type"]).reset_index(drop=True)
 
 
@@ -479,11 +520,14 @@ def scansingleoption(option_symbol: str, option_type: str, strike: float, underl
     hist_symbol = normalize_option_symbol(option_symbol)
     daily_df = gethistory(hist_symbol, "D", DAILY_LOOKBACK_DAYS)
     intra_df = gethistory(hist_symbol, "5", INTRADAY_LOOKBACK_DAYS)
+
     if daily_df.empty or intra_df.empty:
         return None
+
     summary = summarize_intraday(intra_df, daily_df)
     if not summary:
         return None
+
     summary.update({
         "Underlying": underlying,
         "Option Type": option_type,
@@ -503,10 +547,12 @@ def option_liquidity_score(oi, volume, obv) -> float:
 def rank_option_candidates(df: pd.DataFrame, side: str) -> pd.DataFrame:
     if df is None or df.empty:
         return df
+
     out = df.copy()
     out["__liq"] = pd.to_numeric(out.get("OI+Volume+OBV Score", 0), errors="coerce").fillna(0)
     out["__adx"] = pd.to_numeric(out.get("Cumulative ADX", 0), errors="coerce").fillna(0)
     out["__pct"] = pd.to_numeric(out.get("% Change", 0), errors="coerce").fillna(0)
+
     opt_type = out["Option Type"].astype(str).str.upper() if "Option Type" in out.columns else pd.Series("", index=out.index)
     if side == "long":
         type_bonus = np.where(opt_type.eq("CE"), 0.30, 0.10)
@@ -516,42 +562,53 @@ def rank_option_candidates(df: pd.DataFrame, side: str) -> pd.DataFrame:
         type_bonus = np.where(opt_type.eq("PE"), 0.30, 0.10)
         out["EMAIL_RANK_SCORE"] = out["__liq"] * 0.40 + out["__adx"] * 0.18 + (-out["__pct"]) * 0.10 + type_bonus
         out = out.sort_values(["EMAIL_RANK_SCORE", "__liq", "__adx", "__pct"], ascending=[False, False, False, True])
+
     return out.reset_index(drop=True)
 
 
 def buildoptioncandidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if candidates_df is None or candidates_df.empty or "Symbol" not in candidates_df.columns:
         return pd.DataFrame(), pd.DataFrame()
+
     rows = []
     iter_rows = []
+
     for underlying in candidates_df["Symbol"].dropna().astype(str):
         pair_df = fetch_optionpairs(underlying)
         if pair_df.empty:
             continue
+
         req_type = "CE" if side == "long" else "PE"
         type_df = pair_df[pair_df["Option Type"] == req_type].copy()
         if type_df.empty:
             continue
+
         atm_strike = sorted(type_df["Strike"].dropna().unique(), key=lambda x: abs(x - type_df["Strike"].median()))[0]
         atm_rows = type_df[type_df["Strike"] == atm_strike]
         atm_vol = safe_float(atm_rows["Chain Volume"].max() if not atm_rows.empty else 0, 0)
         if atm_vol < MIN_ATM_CHAIN_VOLUME:
             continue
+
         for _, row in type_df.iterrows():
             strike = safe_float(row.get("Strike"), np.nan)
             opt_type = str(row.get("Option Type", "")).upper()
             sym = str(row.get("Option Symbol", "")).strip()
+
             scanned = scansingleoption(sym, opt_type, strike, underlying)
             if not scanned:
                 continue
+
             scanned["OI"] = safe_float(row.get("OI"), np.nan)
-            scanned["Volume"] = max(safe_float(scanned.get("Volume"), 0), safe_float(row.get("Chain Volume"), 0))
+            scanned["Volume"] = max(safe_float(scanned.get("Volume", 0), 0), safe_float(row.get("Chain Volume", 0), 0))
             scanned["OI+Volume+OBV Score"] = option_liquidity_score(scanned.get("OI", 0), scanned.get("Volume", 0), scanned.get("OBV", 0))
+
             if safe_float(scanned.get("LTP", 0.0), 0.0) < MIN_OPTION_LTP:
                 continue
             if safe_float(scanned.get("Volume", 0), 0) < MIN_OPTION_DAY_VOLUME:
                 continue
+
             rows.append(scanned)
+
             hist = scanned.get("Iteration History")
             if isinstance(hist, pd.DataFrame) and not hist.empty:
                 temp = hist.copy()
@@ -560,6 +617,7 @@ def buildoptioncandidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.Da
                 temp.insert(2, "Strike", strike)
                 temp.insert(3, "Option Type", opt_type)
                 iter_rows.append(temp)
+
     if not rows:
         return pd.DataFrame(), pd.DataFrame()
 
@@ -571,25 +629,31 @@ def buildoptioncandidates(candidates_df: pd.DataFrame, side: str) -> Tuple[pd.Da
     if iter_rows and not final_out.empty:
         all_iters = pd.concat(iter_rows, ignore_index=True)
         all_iters = all_iters[all_iters["Option Symbol"].isin(final_out["Option Symbol"])].copy()
+
         group_cols = [c for c in ["Underlying", "Option Type", "Strike", "Option Symbol"] if c in all_iters.columns]
         if group_cols and not all_iters.empty:
-            all_iters = all_iters.sort_values(group_cols + (["timestamp"] if "timestamp" in all_iters.columns else [])).reset_index(drop=True)
+            sort_cols = group_cols + (["timestamp"] if "timestamp" in all_iters.columns else [])
+            all_iters = all_iters.sort_values(sort_cols).reset_index(drop=True)
             all_iters["iteration"] = all_iters.groupby(group_cols).cumcount() + 1
             all_iters["iteration"] = pd.to_numeric(all_iters["iteration"], errors="coerce").astype("Int64")
             all_iters = all_iters[all_iters["iteration"].between(1, ITERATIONS_TO_KEEP)]
+
         iter_df = all_iters.reset_index(drop=True)
+
     return final_out, iter_df
 
 
 def chain_entry_exit_from_iters(iter_df: pd.DataFrame) -> Dict[str, object]:
     if iter_df is None or iter_df.empty:
         return {"Chain Signal": "WAIT", "Entry Value": np.nan, "Entry Time": "", "Exit Value": np.nan, "Exit Time": ""}
+
     d = iter_df.copy()
     d["iteration"] = pd.to_numeric(d["iteration"], errors="coerce")
     d["close"] = pd.to_numeric(d["close"], errors="coerce")
     d = d.dropna(subset=["iteration", "close", "Option Symbol"])
     if d.empty:
         return {"Chain Signal": "WAIT", "Entry Value": np.nan, "Entry Time": "", "Exit Value": np.nan, "Exit Time": ""}
+
     pivot = d.pivot_table(index="iteration", columns="Option Symbol", values="close", aggfunc="last").sort_index()
     if pivot.shape[0] < 2 or pivot.shape[1] == 0:
         return {"Chain Signal": "WAIT", "Entry Value": np.nan, "Entry Time": "", "Exit Value": np.nan, "Exit Time": ""}
@@ -619,12 +683,24 @@ def chain_entry_exit_from_iters(iter_df: pd.DataFrame) -> Dict[str, object]:
         exit_row = d[d["iteration"] == exit_iter].sort_values(["timestamp", "Option Symbol"]).copy()
         exit_time = str(exit_row["timestamp"].iloc[0]) if "timestamp" in exit_row.columns and not exit_row.empty else ""
         exit_value = round(float(exit_row["close"].mean()), 2) if not exit_row.empty else np.nan
-        return {"Chain Signal": "EXIT", "Entry Value": entry_value, "Entry Time": entry_time, "Exit Value": exit_value, "Exit Time": exit_time}
+        return {
+            "Chain Signal": "EXIT",
+            "Entry Value": entry_value,
+            "Entry Time": entry_time,
+            "Exit Value": exit_value,
+            "Exit Time": exit_time,
+        }
 
     last_row = d[d["iteration"] == pivot.index.max()].sort_values(["timestamp", "Option Symbol"]).copy()
     last_time = str(last_row["timestamp"].iloc[0]) if "timestamp" in last_row.columns and not last_row.empty else ""
     last_value = round(float(last_row["close"].mean()), 2) if not last_row.empty else np.nan
-    return {"Chain Signal": "ENTER", "Entry Value": entry_value, "Entry Time": entry_time, "Exit Value": last_value, "Exit Time": last_time}
+    return {
+        "Chain Signal": "ENTER",
+        "Entry Value": entry_value,
+        "Entry Time": entry_time,
+        "Exit Value": last_value,
+        "Exit Time": last_time,
+    }
 
 
 def send_single_email(subject: str, html_body: str, attachments: Optional[List[str]] = None) -> bool:
@@ -632,14 +708,17 @@ def send_single_email(subject: str, html_body: str, attachments: Optional[List[s
     password = os.environ.get("SENDER_PASSWORD")
     recipients_raw = os.environ.get("RECIPIENT_EMAIL", "")
     recipients = [r.strip() for r in recipients_raw.split(",") if r.strip()]
+
     if not sender or not password or not recipients:
         logger.warning("Email credentials/recipients not configured; skipping.")
         return False
+
     msg = MIMEMultipart("mixed")
     msg["Subject"] = subject
     msg["From"] = sender
     msg["To"] = ", ".join(recipients)
     msg.attach(MIMEText(html_body, "html", "utf-8"))
+
     for path in attachments or []:
         if not path or not os.path.isfile(path):
             continue
@@ -652,6 +731,7 @@ def send_single_email(subject: str, html_body: str, attachments: Optional[List[s
                 msg.attach(part)
         except Exception as e:
             logger.warning("Could not attach %s: %s", path, e)
+
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(sender, password)
@@ -666,6 +746,7 @@ def send_single_email(subject: str, html_body: str, attachments: Optional[List[s
 def _prepare_email_df(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
+
     out = df.copy()
     rename_map = {k: v for k, v in OPTION_EMAIL_COL_RENAME.items() if k in out.columns}
     out = out.rename(columns=rename_map)
@@ -675,14 +756,17 @@ def _prepare_email_df(df: pd.DataFrame) -> pd.DataFrame:
 def compact_table_html(df: pd.DataFrame, title: str, max_rows: int) -> str:
     if df is None or df.empty:
         return f'<div class="section-card"><h3>{title}</h3><p class="muted">No rows</p></div>'
+
     df = _prepare_email_df(df)
+
     if "Chain Signal" in df.columns:
         df["Chain Signal"] = df["Chain Signal"].astype(str).map(
             lambda x: f'<span class="badge badge-enter">{x}</span>' if x.upper() == "ENTER" else (
                 f'<span class="badge badge-exit">{x}</span>' if x.upper() == "EXIT" else f'<span class="badge badge-wait">{x}</span>'
             )
         )
-    cols = [c for c in ["Underlying", "Option Type", "Strike", "LTP", "% Chg", "OI", "Volume", "OBV", "Liq Score", "Rank", "Entry", "Entry Time", "Exit", "Exit Time", "Cumulative ADX", "5m_Signal", "15m_Signal", "Overall_Signal", "IVP", "Time", "Chain Signal"] if c in df.columns]
+
+    cols = [c for c in ["Underlying", "Option Type", "Strike", "LTP", "% Chg", "OI", "Volume", "OBV", "Liq Score", "Rank", "Entry", "Entry Time", "Exit", "Exit Time", "Cumulative ADX", "5m_Signal", "15m_Signal", "Overall_Signal", "IVP", "Time", "Chain Signal", "Chain Legs"] if c in df.columns]
     body = df[cols].head(max_rows).to_html(index=False, border=0, escape=False, classes="mail-table")
     return f'<div class="section-card"><h3>{title}</h3>{body}</div>'
 
@@ -716,7 +800,7 @@ def build_chain_email_html(long_rows: List[Dict], short_rows: List[Dict]) -> str
         <div class="wrap">
             <div class="hero">
                 <h2>Chain Signal Report - {ts}</h2>
-                <p>Color-coded chain summary for long and short candidates.</p>
+                <p>One row per underlying. Representative strike is the nearest ranked ATM-side leg.</p>
             </div>
             {compact_table_html(pd.DataFrame(long_rows), 'LONG CANDIDATES', EMAIL_MAX_ROWS_LONG)}
             {compact_table_html(pd.DataFrame(short_rows), 'SHORT CANDIDATES', EMAIL_MAX_ROWS_SHORT)}
@@ -734,17 +818,39 @@ def send_chain_signal_email(long_rows: List[Dict], short_rows: List[Dict], attac
     return send_single_email(subject, html, attachments)
 
 
-def build_cepebuy_rows(options_df: pd.DataFrame, iteration_df: pd.DataFrame) -> Tuple[List[Dict], List[Dict]]:
+def pick_best_representative(options_df: pd.DataFrame, underlying: str, opt_type: str) -> Dict:
+    if options_df is None or options_df.empty:
+        return {}
+
+    temp = options_df.copy()
+    temp = temp[(temp["Underlying"].astype(str) == str(underlying)) & (temp["Option Type"].astype(str).str.upper() == str(opt_type).upper())].copy()
+    if temp.empty:
+        return {}
+
+    temp["Strike"] = pd.to_numeric(temp.get("Strike"), errors="coerce")
+    temp = temp.dropna(subset=["Strike"])
+    if temp.empty:
+        return {}
+
+    temp["_rank"] = pd.to_numeric(temp.get("EMAIL_RANK_SCORE"), errors="coerce").fillna(-np.inf)
+    temp["_vol"] = pd.to_numeric(temp.get("Volume"), errors="coerce").fillna(0)
+    temp["_atm_ref"] = temp["Strike"].median()
+    temp["_atm_gap"] = (temp["Strike"] - temp["_atm_ref"]).abs()
+
+    temp = temp.sort_values(["_atm_gap", "_rank", "_vol", "Strike"], ascending=[True, False, False, True])
+    return temp.iloc[0].to_dict()
+
+
+def build_chain_rows_from_iters(options_df: pd.DataFrame, iteration_df: pd.DataFrame) -> List[Dict]:
     if options_df is None or options_df.empty or iteration_df is None or iteration_df.empty:
-        return [], []
+        return []
 
-    required = {"Underlying", "Option Type", "Strike", "Option Symbol", "close"}
+    required = {"Underlying", "Option Type", "Option Symbol", "close"}
     if not required.issubset(set(iteration_df.columns)):
-        return [], []
+        return []
 
-    ce_candidates = []
-    pe_candidates = []
-    group_cols = ["Underlying", "Option Type", "Strike"]
+    rows = []
+    group_cols = ["Underlying", "Option Type"]
 
     for _, grp in iteration_df.groupby(group_cols):
         grp = grp.copy()
@@ -752,91 +858,104 @@ def build_cepebuy_rows(options_df: pd.DataFrame, iteration_df: pd.DataFrame) -> 
         if sort_cols:
             grp = grp.sort_values(sort_cols).reset_index(drop=True)
 
-        chain_sig = chain_entry_exit_from_iters(grp)
-        if str(chain_sig.get("Chain Signal", "WAIT")).upper() not in ("ENTER", "EXIT"):
-            continue
-
-        first = grp.iloc[0]
-        underlying = str(first.get("Underlying", "")).strip()
-        opt_type = str(first.get("Option Type", "")).upper().strip()
-        strike = safe_float(first.get("Strike", np.nan), np.nan)
-
-        chain_legs = int(grp["Option Symbol"].nunique()) if "Option Symbol" in grp.columns else 0
+        underlying = str(grp["Underlying"].iloc[0]).strip()
+        opt_type = str(grp["Option Type"].iloc[0]).upper().strip()
+        chain_legs = int(grp["Option Symbol"].astype(str).nunique()) if "Option Symbol" in grp.columns else 0
         if chain_legs < MIN_CHAIN_LEGS:
             continue
 
-        underlying_df = options_df[
-            options_df["Underlying"].astype(str) == underlying
-        ].copy()
+        chain_sig = chain_entry_exit_from_iters(grp)
+        rep = pick_best_representative(options_df, underlying, opt_type)
 
-        same_side_df = underlying_df[
-            underlying_df["Option Type"].astype(str).str.upper() == opt_type
-        ].copy()
+        strike = safe_float(rep.get("Strike"), np.nan) if rep else np.nan
+        if pd.isna(strike):
+            strike_series = pd.to_numeric(grp.get("Strike"), errors="coerce").dropna()
+            strike = float(strike_series.median()) if not strike_series.empty else np.nan
 
-        strike_series = pd.to_numeric(same_side_df.get("Strike"), errors="coerce") if not same_side_df.empty else pd.Series(dtype=float)
-        opt_match = same_side_df[strike_series == strike].copy() if not same_side_df.empty else pd.DataFrame()
-
-        if opt_match.empty:
-            close_series = pd.to_numeric(grp["close"], errors="coerce").dropna()
-            ltp = close_series.iloc[-1] if not close_series.empty else np.nan
-            pct_chg = np.nan
-            rank_score = np.nan
-        else:
-            sort_pref = [c for c in ["Volume", "OI+Volume+OBV Score", "EMAIL_RANK_SCORE"] if c in opt_match.columns]
-            if sort_pref:
-                opt_match = opt_match.sort_values(sort_pref, ascending=[False] * len(sort_pref))
-            row = opt_match.iloc[0]
-            ltp = row.get("LTP", np.nan)
-            pct_chg = row.get("% Change", np.nan)
-            rank_score = row.get("EMAIL_RANK_SCORE", np.nan)
-
-        all_strikes = pd.to_numeric(underlying_df.get("Strike"), errors="coerce").dropna() if not underlying_df.empty else pd.Series(dtype=float)
-        atm_ref = float(all_strikes.median()) if not all_strikes.empty else strike
-        atm_gap = abs(safe_float(strike, np.nan) - safe_float(atm_ref, np.nan)) if pd.notna(strike) and pd.notna(atm_ref) else np.inf
+        close_series = pd.to_numeric(grp["close"], errors="coerce").dropna()
+        fallback_ltp = close_series.iloc[-1] if not close_series.empty else np.nan
 
         out = {
             "Underlying": underlying,
             "Option Type": opt_type,
             "Strike": strike,
-            "LTP": ltp,
-            "% Change": pct_chg,
+            "LTP": rep.get("LTP", fallback_ltp) if rep else fallback_ltp,
+            "% Change": rep.get("% Change", np.nan) if rep else np.nan,
+            "OI": rep.get("OI", np.nan) if rep else np.nan,
+            "Volume": rep.get("Volume", np.nan) if rep else np.nan,
+            "OBV": rep.get("OBV", np.nan) if rep else np.nan,
+            "OI+Volume+OBV Score": rep.get("OI+Volume+OBV Score", np.nan) if rep else np.nan,
+            "EMAIL_RANK_SCORE": rep.get("EMAIL_RANK_SCORE", np.nan) if rep else np.nan,
             "Entry Value": chain_sig.get("Entry Value", np.nan),
             "Entry Time": chain_sig.get("Entry Time", ""),
             "Exit Value": chain_sig.get("Exit Value", np.nan),
             "Exit Time": chain_sig.get("Exit Time", ""),
-            "Trade Signal": f"{opt_type} CHAIN",
+            "Cumulative ADX": rep.get("Cumulative ADX", np.nan) if rep else np.nan,
+            "5m_Signal": rep.get("5m_Signal", "") if rep else "",
+            "15m_Signal": rep.get("15m_Signal", "") if rep else "",
+            "30m_Signal": rep.get("30m_Signal", "") if rep else "",
+            "60m_Signal": rep.get("60m_Signal", "") if rep else "",
+            "Bull_Signal": rep.get("Bull_Signal", "") if rep else "",
+            "Bear_Signal": rep.get("Bear_Signal", "") if rep else "",
+            "Overall_Signal": rep.get("Overall_Signal", "") if rep else "",
+            "Price_Lead_Status": rep.get("Price_Lead_Status", "") if rep else "",
+            "IVP": rep.get("IVP", np.nan) if rep else np.nan,
+            "Volatility State": rep.get("Volatility State", "") if rep else "",
+            "Last Iteration Time": rep.get("Last Iteration Time", "") if rep else "",
             "Chain Signal": chain_sig.get("Chain Signal", "WAIT"),
             "Chain Legs": chain_legs,
-            "_atm_gap": atm_gap,
-            "_rank": rank_score,
+        }
+        rows.append(out)
+
+    if not rows:
+        return []
+
+    out = pd.DataFrame(rows).copy()
+    out["EMAIL_RANK_SCORE"] = pd.to_numeric(out.get("EMAIL_RANK_SCORE"), errors="coerce").fillna(-np.inf)
+    out["Chain Legs"] = pd.to_numeric(out.get("Chain Legs"), errors="coerce").fillna(0)
+
+    signal_priority = {"ENTER": 0, "EXIT": 1, "WAIT": 2}
+    out["_sig"] = out["Chain Signal"].astype(str).str.upper().map(signal_priority).fillna(9)
+
+    out = out.sort_values(["EMAIL_RANK_SCORE", "Chain Legs", "_sig", "Underlying"], ascending=[False, False, True, True]).reset_index(drop=True)
+
+    return out.drop(columns=["_sig"]).to_dict("records")
+
+
+def build_cepebuy_rows(options_df: pd.DataFrame, iteration_df: pd.DataFrame) -> Tuple[List[Dict], List[Dict]]:
+    chain_rows = build_chain_rows_from_iters(options_df, iteration_df)
+    if not chain_rows:
+        return [], []
+
+    ce_rows = []
+    pe_rows = []
+
+    for row in chain_rows:
+        sig = str(row.get("Chain Signal", "WAIT")).upper()
+        opt_type = str(row.get("Option Type", "")).upper()
+
+        if sig not in ("ENTER", "EXIT"):
+            continue
+
+        out = {
+            "Underlying": row.get("Underlying", ""),
+            "Option Type": opt_type,
+            "Strike": row.get("Strike", np.nan),
+            "LTP": row.get("LTP", np.nan),
+            "% Change": row.get("% Change", np.nan),
+            "Entry Value": row.get("Entry Value", np.nan),
+            "Entry Time": row.get("Entry Time", ""),
+            "Exit Value": row.get("Exit Value", np.nan),
+            "Exit Time": row.get("Exit Time", ""),
+            "Trade Signal": f"{opt_type} CHAIN",
+            "Chain Signal": sig,
+            "Chain Legs": row.get("Chain Legs", 0),
         }
 
         if opt_type == "CE":
-            ce_candidates.append(out)
+            ce_rows.append(out)
         elif opt_type == "PE":
-            pe_candidates.append(out)
-
-    def keep_one_per_underlying(rows: List[Dict]) -> List[Dict]:
-        if not rows:
-            return []
-
-        df = pd.DataFrame(rows).copy()
-        df["_atm_gap"] = pd.to_numeric(df.get("_atm_gap"), errors="coerce").fillna(np.inf)
-        df["_rank"] = pd.to_numeric(df.get("_rank"), errors="coerce").fillna(-np.inf)
-        df["Chain Legs"] = pd.to_numeric(df.get("Chain Legs"), errors="coerce").fillna(0)
-
-        df = df.sort_values(
-            ["Underlying", "_atm_gap", "Chain Legs", "_rank"],
-            ascending=[True, True, False, False]
-        )
-        df = df.groupby("Underlying", as_index=False).head(1).copy()
-        df = df.sort_values(["_rank", "Chain Legs", "Underlying"], ascending=[False, False, True])
-
-        drop_cols = [c for c in ["_atm_gap", "_rank"] if c in df.columns]
-        return df.drop(columns=drop_cols).to_dict("records")
-
-    ce_rows = keep_one_per_underlying(ce_candidates)
-    pe_rows = keep_one_per_underlying(pe_candidates)
+            pe_rows.append(out)
 
     return ce_rows, pe_rows
 
@@ -888,7 +1007,7 @@ def build_cepebuy_email_html(ce_rows: List[Dict], pe_rows: List[Dict]) -> str:
         <div class="wrap">
             <div class="hero">
                 <h2>CE PE Chain Eligibility Report - {ts}</h2>
-                <p>Only one near-ATM row per underlying is included in each section, and the strike must have Chain Legs at least 5. Option Symbol is hidden from the email.</p>
+                <p>Only one near-ATM row per underlying is included, and the chain must have at least {MIN_CHAIN_LEGS} legs.</p>
             </div>
             {table(ce_rows, 'CE CHAIN ELIGIBLE STRIKES', '#2563eb')}
             {table(pe_rows, 'PE CHAIN ELIGIBLE STRIKES', '#7c3aed')}
@@ -905,97 +1024,18 @@ def send_cepebuy_email(ce_rows: List[Dict], pe_rows: List[Dict], attachments: Op
     return send_single_email(subject, build_cepebuy_email_html(ce_rows, pe_rows), attachments)
 
 
-def chain_row_from_group(grp: pd.DataFrame) -> Dict:
-    sig = chain_entry_exit_from_iters(grp)
-    first = grp.iloc[0]
-    return {
-        "Underlying": first.get("Underlying", ""),
-        "Option Type": first.get("Option Type", ""),
-        "Strike": first.get("Strike", np.nan),
-        "Option Symbol": first.get("Option Symbol", ""),
-        "Entry Value": sig.get("Entry Value", np.nan),
-        "Entry Time": sig.get("Entry Time", ""),
-        "Exit Value": sig.get("Exit Value", np.nan),
-        "Exit Time": sig.get("Exit Time", ""),
-        "Chain Signal": sig.get("Chain Signal", "WAIT"),
-        "Chain Legs": int(grp["Option Symbol"].nunique()) if "Option Symbol" in grp.columns else 0,
-    }
-
-
-def reduce_chain_rows_one_per_underlying(rows: List[Dict], options_df: pd.DataFrame) -> List[Dict]:
-    if not rows:
-        return []
-
-    df = pd.DataFrame(rows).copy()
-    if df.empty:
-        return []
-
-    if "Chain Legs" not in df.columns:
-        df["Chain Legs"] = 0
-    df["Chain Legs"] = pd.to_numeric(df["Chain Legs"], errors="coerce").fillna(0)
-    df = df[df["Chain Legs"] >= MIN_CHAIN_LEGS].copy()
-    if df.empty:
-        return []
-
-    df["Strike"] = pd.to_numeric(df.get("Strike"), errors="coerce")
-    df["_rank"] = -np.inf
-    df["_atm_ref"] = np.nan
-
-    if options_df is not None and not options_df.empty and "Underlying" in options_df.columns:
-        temp = options_df.copy()
-        temp["Strike"] = pd.to_numeric(temp.get("Strike"), errors="coerce")
-        temp = temp.dropna(subset=["Strike"])
-
-        if not temp.empty:
-            atm_ref_df = (
-                temp.groupby("Underlying", as_index=False)["Strike"]
-                .median()
-                .rename(columns={"Strike": "_atm_ref"})
-            )
-            df = df.merge(atm_ref_df, on="Underlying", how="left", suffixes=("", "_drop"))
-            drop_cols = [c for c in df.columns if c.endswith("_drop")]
-            if drop_cols:
-                df = df.drop(columns=drop_cols)
-
-            if "EMAIL_RANK_SCORE" in temp.columns:
-                temp["_rank"] = pd.to_numeric(temp["EMAIL_RANK_SCORE"], errors="coerce").fillna(-np.inf)
-                rank_ref_df = (
-                    temp.groupby(["Underlying", "Option Type", "Strike"], as_index=False)["_rank"]
-                    .max()
-                )
-                df = df.merge(rank_ref_df, on=["Underlying", "Option Type", "Strike"], how="left", suffixes=("", "_new"))
-                if "_rank_new" in df.columns:
-                    df["_rank"] = pd.to_numeric(df["_rank_new"], errors="coerce").fillna(df["_rank"])
-                    df = df.drop(columns=["_rank_new"])
-
-    df["_rank"] = pd.to_numeric(df["_rank"], errors="coerce").fillna(-np.inf)
-    df["_atm_gap"] = (df["Strike"] - df["_atm_ref"]).abs()
-    df["_atm_gap"] = pd.to_numeric(df["_atm_gap"], errors="coerce").fillna(np.inf)
-
-    signal_priority = {"EXIT": 0, "ENTER": 1, "WAIT": 2}
-    df["_sig_rank"] = df["Chain Signal"].astype(str).str.upper().map(signal_priority).fillna(9)
-
-    df = df.sort_values(
-        ["Underlying", "_atm_gap", "Chain Legs", "_rank", "_sig_rank"],
-        ascending=[True, True, False, False, True]
-    )
-
-    df = df.groupby("Underlying", as_index=False).head(1).copy()
-    df = df.sort_values(["_rank", "Chain Legs", "Underlying"], ascending=[False, False, True])
-
-    drop_cols = [c for c in ["_rank", "_atm_ref", "_atm_gap", "_sig_rank"] if c in df.columns]
-    return df.drop(columns=drop_cols).to_dict("records")
-
-
 def scansymbol(symbol: str) -> Optional[Dict]:
     eq = format_eq_symbol(symbol)
     daily_df = gethistory(eq, "D", DAILY_LOOKBACK_DAYS)
     intra_df = gethistory(eq, "5", INTRADAY_LOOKBACK_DAYS)
+
     if daily_df.empty or intra_df.empty:
         return None
+
     summary = summarize_intraday(intra_df, daily_df)
     if not summary:
         return None
+
     summary["Symbol"] = symbol
     return summary
 
@@ -1003,12 +1043,14 @@ def scansymbol(symbol: str) -> Optional[Dict]:
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
     initfyers()
+
     symbols = load_fno_symbols_from_sectors(SECTORS_DIR)
     if not symbols:
         raise RuntimeError("No F&O symbols found in sector CSVs.")
 
     rows = []
     for i, symbol in enumerate(symbols, start=1):
+        logger.info("%d/%d scanning %s", i, len(symbols), symbol)
         row = scansymbol(symbol)
         if row:
             rows.append(row)
@@ -1036,39 +1078,21 @@ def main():
     short_df.to_csv(short_path, index=False)
 
     if iteration_df.empty:
-        iteration_df = pd.DataFrame(columns=[
-            "iteration", "Underlying", "Option Type", "Strike", "Option Symbol", "timestamp",
-            "windowminutes", "windowstart", "windowend", "currentwindowscore",
-            "previoustradingdaysametimescore", "windowdelta", "windowsignal", "close"
-        ])
+        iteration_df = pd.DataFrame(columns=["iteration", "Underlying", "Option Type", "Strike", "Option Symbol", "timestamp", "windowminutes", "windowstart", "windowend", "currentwindowscore", "previoustradingdaysametimescore", "windowdelta", "windowsignal", "close"])
     iteration_df.to_csv(iter_path, index=False)
 
-    long_merged = []
-    short_merged = []
-
-    if not long_iter_df.empty:
-        cols = [c for c in ["Underlying", "Option Type", "Strike", "Option Symbol"] if c in long_iter_df.columns]
-        for _, grp in long_iter_df.groupby(cols):
-            long_merged.append(chain_row_from_group(grp))
-
-    if not short_iter_df.empty:
-        cols = [c for c in ["Underlying", "Option Type", "Strike", "Option Symbol"] if c in short_iter_df.columns]
-        for _, grp in short_iter_df.groupby(cols):
-            short_merged.append(chain_row_from_group(grp))
-
-    combined_options_df = pd.concat([long_df, short_df], ignore_index=True) if (not long_df.empty or not short_df.empty) else pd.DataFrame()
-
-    long_merged = reduce_chain_rows_one_per_underlying(long_merged, long_df)
-    short_merged = reduce_chain_rows_one_per_underlying(short_merged, short_df)
+    long_chain_rows = build_chain_rows_from_iters(long_df, long_iter_df)
+    short_chain_rows = build_chain_rows_from_iters(short_df, short_iter_df)
 
     chain_long_path = os.path.join(OUTPUT_DIR, "chain_long.csv")
     chain_short_path = os.path.join(OUTPUT_DIR, "chain_short.csv")
 
-    pd.DataFrame(long_merged).to_csv(chain_long_path, index=False)
-    pd.DataFrame(short_merged).to_csv(chain_short_path, index=False)
+    pd.DataFrame(long_chain_rows).to_csv(chain_long_path, index=False)
+    pd.DataFrame(short_chain_rows).to_csv(chain_short_path, index=False)
 
-    send_chain_signal_email(long_merged, short_merged, attachments=[summary_path, long_path, short_path, iter_path])
+    send_chain_signal_email(long_chain_rows, short_chain_rows, attachments=[summary_path, long_path, short_path, iter_path])
 
+    combined_options_df = pd.concat([long_df, short_df], ignore_index=True) if (not long_df.empty or not short_df.empty) else pd.DataFrame()
     ce_buy_rows, pe_buy_rows = build_cepebuy_rows(combined_options_df, iteration_df)
     send_cepebuy_email(ce_buy_rows, pe_buy_rows, attachments=[chain_long_path, chain_short_path])
 
