@@ -1,16 +1,35 @@
 import os
-import math
 import logging
-import smtplib
 from pathlib import Path
 from typing import List, Optional, Tuple
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from email.mime.base import MIMEBase
-from email import encoders
 
 import numpy as np
 import pandas as pd
+
+try:
+    from OPTIONS_OI import (
+        initfyers,
+        gethistory,
+        builditerationhistory,
+        SIGNALWINDOWMINUTES,
+        ITERATIONSTOKEEP,
+        INTRADAYLOOKBACKDAYS,
+        formateqsymbol,
+        safefloat,
+        sendsingleemail,
+        sendcepebuyemail,
+    )
+except Exception:
+    initfyers = None
+    gethistory = None
+    builditerationhistory = None
+    SIGNALWINDOWMINUTES = 5
+    ITERATIONSTOKEEP = 75
+    INTRADAYLOOKBACKDAYS = 20
+    formateqsymbol = lambda x: f"NSE:{str(x).strip().upper()}-EQ"
+    safefloat = lambda v, default=np.nan: default if v is None or str(v).strip() == "" else float(v)
+    sendsingleemail = None
+    sendcepebuyemail = None
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
@@ -20,21 +39,12 @@ OUTPUT_DIR = Path(os.environ.get("OUTPUT_DIR", "."))
 OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 ASIT_GLOB = os.environ.get("ASIT_GLOB", "asit*.csv")
 TOP_N = int(os.environ.get("TOP_N", "20"))
+MIN_OPTION_LTP = float(os.environ.get("MIN_OPTION_LTP", "10"))
 CHAIN_UP = int(os.environ.get("CHAIN_UP", "5"))
 CHAIN_DOWN = int(os.environ.get("CHAIN_DOWN", "5"))
-
 ENTRY_THRESHOLD = float(os.environ.get("ENTRY_THRESHOLD", "0"))
 EXIT_THRESHOLD = float(os.environ.get("EXIT_THRESHOLD", "0"))
-MIN_OPTION_LTP = float(os.environ.get("MIN_OPTION_LTP", "10"))
-
 ATTACHMENT_NAME = os.environ.get("ATTACHMENT_NAME", "near_atm_signals.csv")
-EMAIL_ENABLED = os.environ.get("EMAIL_ENABLED", "1") == "1"
-SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
-
-SENDER_EMAIL = os.environ.get("SENDER_EMAIL", os.environ.get("EMAIL_ADDRESS", ""))
-SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD", os.environ.get("EMAIL_PASSWORD", ""))
-RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", os.environ.get("EMAIL_TO", ""))
 
 
 def pick_latest_file(pattern: str, base_dir: Path = BASE_DIR) -> Optional[Path]:
@@ -96,125 +106,177 @@ def build_top_lists(asit_path: Path, top_n: int = TOP_N) -> Tuple[pd.DataFrame, 
     return bull_df, bear_df, pd.concat([bull_df, bear_df], ignore_index=True)
 
 
-def infer_option_type(side: str, trend: str = "") -> str:
-    s = str(side).upper()
-    t = str(trend).upper()
-    if s.startswith("BULL"):
-        return "CE"
-    if s.startswith("BEAR"):
-        return "PE"
-    if "UP" in t:
-        return "CE"
-    if "DOWN" in t:
-        return "PE"
-    return "CE"
-
-
-def choose_atm_row(stock_df: pd.DataFrame) -> pd.Series:
-    if stock_df.empty:
-        return pd.Series(dtype=object)
-    stock_df = stock_df.copy()
-    stock_df["Strike"] = pd.to_numeric(stock_df["Strike"], errors="coerce")
-    stock_df = stock_df.dropna(subset=["Strike"])
-    if stock_df.empty:
-        return pd.Series(dtype=object)
-    if "UnderlyingPrice" in stock_df.columns:
-        px = pd.to_numeric(stock_df["UnderlyingPrice"], errors="coerce").iloc[0]
-    else:
-        px = np.nan
-    if pd.isna(px):
-        return stock_df.iloc[(stock_df["Strike"] - stock_df["Strike"].median()).abs().argsort().iloc[0]]
-    idx = (stock_df["Strike"] - px).abs().idxmin()
-    return stock_df.loc[idx]
-
-
-def build_chain_window(chain_df: pd.DataFrame, atm_strike: float, up: int = CHAIN_UP, down: int = CHAIN_DOWN) -> pd.DataFrame:
-    if chain_df.empty or pd.isna(atm_strike):
+def fetch_option_chain(underlying: str) -> pd.DataFrame:
+    if initfyers is None:
         return pd.DataFrame()
-    chain_df = chain_df.copy()
-    chain_df["Strike"] = pd.to_numeric(chain_df["Strike"], errors="coerce")
-    chain_df = chain_df.dropna(subset=["Strike"])
-    strikes = sorted(chain_df["Strike"].unique())
-    if atm_strike not in strikes:
-        nearest = min(strikes, key=lambda x: abs(x - atm_strike))
-        atm_strike = nearest
-    pos = strikes.index(atm_strike)
-    lo = max(0, pos - down)
-    hi = min(len(strikes) - 1, pos + up)
-    window = strikes[lo:hi + 1]
-    return chain_df[chain_df["Strike"].isin(window)].sort_values(["Strike", "Option Type"]).reset_index(drop=True)
-
-
-def analyze_tandem(chain_window: pd.DataFrame) -> str:
-    if chain_window.empty:
-        return "NO_DATA"
-    if "OptionLTP" not in chain_window.columns:
-        return "NO_LTP"
-    df = chain_window.copy()
-    df["OptionLTP"] = pd.to_numeric(df["OptionLTP"], errors="coerce")
-    diffs = df.groupby("Option Type")["OptionLTP"].diff().dropna()
-    if diffs.empty:
-        return "INCONCLUSIVE"
-    mean_change = diffs.mean()
-    if mean_change > ENTRY_THRESHOLD:
-        return "MOVE_UP_TOGETHER"
-    if mean_change < -abs(EXIT_THRESHOLD):
-        return "MOVE_DOWN_TOGETHER"
-    return "MIXED"
-
-
-def build_report(seed_df: pd.DataFrame) -> pd.DataFrame:
-    if seed_df is None or seed_df.empty:
-        return pd.DataFrame(columns=["Stock", "Side", "Signal", "ATMStrike", "EntryPrice", "LTP", "Entry", "Exit15", "Exit39"])
+    fy = initfyers()
+    if fy is None:
+        return pd.DataFrame()
+    eqsymbol = formateqsymbol(underlying)
+    try:
+        res = fy.optionchain({"symbol": eqsymbol, "strikecount": max(CHAIN_UP, CHAIN_DOWN) * 2 + 5})
+    except Exception as e:
+        logger.warning("optionchain failed for %s: %s", underlying, e)
+        return pd.DataFrame()
+    chain = (res or {}).get("data") or (res or {}).get("optionsChain") or []
     rows = []
-    for _, row in seed_df.iterrows():
-        stock = str(row.get("Underlying", row.get("Symbol", ""))).strip().upper()
-        side = str(row.get("Side", "")).upper()
-        signal = f"BUY {'CE' if side.startswith('BULL') else 'PE'}"
-        atm = pd.to_numeric(row.get("ATMStrike", np.nan), errors="coerce")
-        entry = pd.to_numeric(row.get("EntryPrice", row.get("LTP", np.nan)), errors="coerce")
-        ltp = pd.to_numeric(row.get("LTP", np.nan), errors="coerce")
+    for item in chain:
+        strike = safefloat(item.get("strikePrice") or item.get("strike"), np.nan)
+        typ = str(item.get("optionType") or item.get("type") or "").upper()
+        sym = str(item.get("symbol") or item.get("tradingSymbol") or item.get("optionSymbol") or "").strip()
+        if pd.isna(strike) or typ not in ("CE", "PE"):
+            continue
         rows.append({
-            "Stock": stock,
-            "Side": "CE" if signal.endswith("CE") else "PE",
-            "Signal": signal,
-            "ATMStrike": atm,
-            "EntryPrice": entry,
-            "LTP": ltp,
-            "Entry": row.get("Entry", ""),
-            "Exit15": row.get("Exit15", "-"),
-            "Exit39": row.get("Exit39", "-")
+            "Underlying": underlying,
+            "Option Type": typ,
+            "Strike": strike,
+            "Option Symbol": sym,
+            "OptionLTP": safefloat(item.get("ltp") or item.get("lp"), np.nan),
+            "OI": safefloat(item.get("oi") or item.get("openInterest"), np.nan),
+            "Volume": safefloat(item.get("volume"), np.nan),
         })
     return pd.DataFrame(rows)
 
 
-def send_email(subject: str, html_body: str, attachment_path: Optional[Path] = None) -> bool:
-    if not EMAIL_ENABLED:
-        logger.info("Email disabled")
-        return False
-    if not SENDER_EMAIL or not SENDER_PASSWORD or not RECIPIENT_EMAIL:
-        logger.warning("Email env vars missing")
-        return False
-    try:
-        msg = MIMEMultipart()
-        msg["From"] = SENDER_EMAIL
-        msg["To"] = RECIPIENT_EMAIL
-        msg["Subject"] = subject
-        msg.attach(MIMEText(html_body, "html", "utf-8"))
-        if attachment_path and attachment_path.exists():
-            with open(attachment_path, "rb") as f:
-                part = MIMEBase("application", "octet-stream")
-                part.set_payload(f.read())
-            encoders.encode_base64(part)
-            part.add_header("Content-Disposition", f"attachment; filename={attachment_path.name}")
-            msg.attach(part)
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT) as server:
-            server.login(SENDER_EMAIL, SENDER_PASSWORD)
-            server.send_message(msg)
-        return True
-    except Exception as e:
-        logger.exception("Email send failed: %s", e)
-        return False
+def infer_atm_from_spot(underlying: str, chain: pd.DataFrame) -> float:
+    if chain.empty:
+        return np.nan
+    fx = initfyers() if initfyers is not None else None
+    spot = np.nan
+    if fx is not None:
+        try:
+            q = fx.quotes({"symbols": [formateqsymbol(underlying)]})
+            data = (q or {}).get("d") or (q or {}).get("data") or []
+            if data:
+                spot = safefloat(data[0].get("v", {}).get("lp") or data[0].get("lp"), np.nan)
+        except Exception:
+            spot = np.nan
+    strikes = pd.to_numeric(chain["Strike"], errors="coerce").dropna().unique()
+    if len(strikes) == 0:
+        return np.nan
+    strikes = sorted(map(float, strikes))
+    if pd.isna(spot):
+        return float(strikes[len(strikes) // 2])
+    return float(min(strikes, key=lambda x: abs(x - spot)))
+
+
+def chain_window(chain: pd.DataFrame, atm: float, up: int = CHAIN_UP, down: int = CHAIN_DOWN) -> pd.DataFrame:
+    if chain.empty or pd.isna(atm):
+        return pd.DataFrame()
+    chain = chain.copy()
+    chain["Strike"] = pd.to_numeric(chain["Strike"], errors="coerce")
+    chain = chain.dropna(subset=["Strike"])
+    strikes = sorted(chain["Strike"].unique())
+    if not strikes:
+        return pd.DataFrame()
+    nearest = min(strikes, key=lambda x: abs(x - atm))
+    idx = strikes.index(nearest)
+    lo = max(0, idx - down)
+    hi = min(len(strikes) - 1, idx + up)
+    keep = strikes[lo:hi + 1]
+    return chain[chain["Strike"].isin(keep)].sort_values(["Strike", "Option Type"]).reset_index(drop=True)
+
+
+def tandem_status(win: pd.DataFrame) -> str:
+    if win.empty or "OptionLTP" not in win.columns:
+        return "NO_DATA"
+    df = win.copy()
+    df["OptionLTP"] = pd.to_numeric(df["OptionLTP"], errors="coerce")
+    df = df.dropna(subset=["OptionLTP"])
+    if df.empty:
+        return "NO_DATA"
+    pivot = df.pivot_table(index="Strike", columns="Option Type", values="OptionLTP", aggfunc="last").sort_index()
+    if pivot.empty or pivot.shape[0] < 2:
+        return "INCONCLUSIVE"
+    diff = pivot.ffill().bfill().diff().dropna(how="all")
+    if diff.empty:
+        return "INCONCLUSIVE"
+    ce = diff.get("CE")
+    pe = diff.get("PE")
+    if ce is None or pe is None:
+        return "INCONCLUSIVE"
+    ce_up = (ce > ENTRY_THRESHOLD).sum()
+    pe_up = (pe > ENTRY_THRESHOLD).sum()
+    ce_dn = (ce < -EXIT_THRESHOLD).sum()
+    pe_dn = (pe < -EXIT_THRESHOLD).sum()
+    total = len(diff)
+    if ce_up >= total * 0.6 and pe_up >= total * 0.6:
+        return "MOVE_UP_TOGETHER"
+    if ce_dn >= total * 0.6 and pe_dn >= total * 0.6:
+        return "MOVE_DOWN_TOGETHER"
+    return "MIXED"
+
+
+def infer_signal(side: str) -> str:
+    return "BUY CE" if str(side).upper().startswith("BULL") else "BUY PE"
+
+
+def build_report(seed_df: pd.DataFrame) -> pd.DataFrame:
+    cols = ["Stock", "Side", "Signal", "ATMStrike", "EntryPrice", "LTP", "Entry", "Exit15", "Exit39"]
+    if seed_df is None or seed_df.empty:
+        return pd.DataFrame(columns=cols)
+    rows = []
+    for _, row in seed_df.iterrows():
+        underlying = str(row.get("Underlying", row.get("Symbol", ""))).strip().upper()
+        side = str(row.get("Side", "")).upper()
+        chain = fetch_option_chain(underlying)
+        if chain.empty:
+            continue
+        atm = infer_atm_from_spot(underlying, chain)
+        win = chain_window(chain, atm, CHAIN_UP, CHAIN_DOWN)
+        status = tandem_status(win)
+        opt_type = "CE" if side.startswith("BULL") else "PE"
+        leg = win[win["Option Type"] == opt_type].copy()
+        if leg.empty:
+            leg = win.copy()
+        leg = leg.sort_values("Strike")
+        ltp = pd.to_numeric(leg["OptionLTP"], errors="coerce").dropna()
+        ltp_val = float(ltp.iloc[0]) if not ltp.empty else np.nan
+        rows.append({
+            "Stock": underlying,
+            "Side": opt_type,
+            "Signal": infer_signal(side),
+            "ATMStrike": atm,
+            "EntryPrice": ltp_val,
+            "LTP": ltp_val,
+            "Entry": "ENTER" if status == "MOVE_UP_TOGETHER" else "WAIT",
+            "Exit15": "EXIT" if status == "MOVE_DOWN_TOGETHER" else "HOLD",
+            "Exit39": status,
+        })
+    out = pd.DataFrame(rows, columns=cols)
+    if not out.empty:
+        out = out.sort_values(["Signal", "Stock"], ascending=[True, True]).reset_index(drop=True)
+    return out
+
+
+def build_html_report(signals: pd.DataFrame, title: str) -> str:
+    if signals.empty:
+        body = "<p>No signals generated.</p>"
+    else:
+        body = signals.to_html(index=False, border=0, classes="report")
+    return f"""
+    <html><body>
+    <h3>{title}</h3>
+    <p>Top N: {TOP_N} | Chain window: {CHAIN_DOWN} down / {CHAIN_UP} up | Entry threshold: {ENTRY_THRESHOLD} | Exit threshold: {EXIT_THRESHOLD}</p>
+    {body}
+    </body></html>
+    """
+
+
+def send_email(subject: str, html_body: str, attachments: Optional[List[str]] = None) -> bool:
+    if sendcepebuyemail is not None:
+        try:
+            # keep compatibility with existing OPTIONS_OI mailer when available
+            return bool(sendcepebuyemail([], [], attachments or []))
+        except Exception:
+            pass
+    if sendsingleemail is not None:
+        try:
+            return bool(sendsingleemail(subject, html_body, attachments or []))
+        except Exception:
+            pass
+    logger.warning("No email helper available from OPTIONS_OI")
+    return False
 
 
 def main():
@@ -229,8 +291,8 @@ def main():
     bull_df.to_csv(OUTPUT_DIR / "top_20_bullish.csv", index=False)
     bear_df.to_csv(OUTPUT_DIR / "top_20_bearish.csv", index=False)
     combined.to_csv(OUTPUT_DIR / "top_20_bull_bear.csv", index=False)
-    html = f"<html><body><p>ASIT file: {asit_file.name}</p><p>Signals: {len(signals)}</p></body></html>"
-    send_email(f"CEPEBUY ATM Signals - {asit_file.stem}", html, signals_path)
+    html = build_html_report(signals, f"CEPEBUY ATM Signals - {asit_file.stem}")
+    send_email(f"CEPEBUY ATM Signals - {asit_file.stem}", html, [str(signals_path)])
     print(f"ASIT file: {asit_file.name}")
     print(f"Top bullish: {len(bull_df)}")
     print(f"Top bearish: {len(bear_df)}")
