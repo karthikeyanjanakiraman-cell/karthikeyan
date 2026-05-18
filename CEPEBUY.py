@@ -366,8 +366,8 @@ def choose_top_candidates(summary_df: pd.DataFrame, topn: int = TOP_N_UNDERLYING
         return pd.DataFrame(), pd.DataFrame()
     work = summary_df.copy()
     work["% Change"] = pd.to_numeric(work.get("% Change"), errors="coerce").fillna(0)
-    long_df = work[work["BullMultiTFScore"] > 0].copy().sort_values(["BullMultiTFScore", "BullMultiTFScore"], ascending=[False, False]).head(topn)
-    short_df = work[work["BearMultiTFScore"] < 0].copy().sort_values(["BearMultiTFScore", "BearMultiTFScore"], ascending=[True, False]).head(topn)
+    long_df = work[work["RankScore15Tier"] > 0].copy().sort_values(["RankScore15Tier", "RankScore15Tier"], ascending=[False, False]).head(topn)
+    short_df = work[work["RankScore15Tier"] < 0].copy().sort_values(["BearMultiTFScore", "RankScore15Tier"], ascending=[True, False]).head(topn)
     return long_df.reset_index(drop=True), short_df.reset_index(drop=True)
 
 
