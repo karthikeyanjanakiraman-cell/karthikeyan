@@ -419,7 +419,7 @@ def price_stats_from_series(prices: pd.Series) -> dict:
     stability = mean_p / (std + 1e-9)
 
     directional = slope + net_return
-    balanced = directional + turning + stability
+    balanced = (directional * stability) / (turning + 1)
     return {"Directional": directional, "Turning": turning, "Stability": stability, "Balanced": balanced}
 
 def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[Dict, pd.DataFrame]:
