@@ -707,18 +707,25 @@ def format_value(col: str, val):
 
 
 def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Build long/short candidate tables purely from the Directional column."""
+    """Build long/short candidate tables using composite Directional x Stability / Turning score.
+    Rewards stocks that are BOTH highly directional AND highly stable AND smooth (low Turning).
+    """
     if df is None or df.empty:
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     base = df.copy()
-    if "Directional" not in base.columns:
+    if "Directional" not in base.columns or "Stability" not in base.columns or "Turning" not in base.columns:
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     base["Directional"] = pd.to_numeric(base["Directional"], errors="coerce")
+    base["Stability"] = pd.to_numeric(base["Stability"], errors="coerce").fillna(0)
+    base["Turning"] = pd.to_numeric(base["Turning"], errors="coerce").fillna(1)
     long_df = base[base["Directional"] > 0].copy()
     short_df = base[base["Directional"] < 0].copy()
+    # Composite: high Directional x high Stability / low Turning
+    long_df["Composite"] = (long_df["Directional"] * long_df["Stability"]) / (long_df["Turning"] + 1)
+    short_df["Composite"] = (short_df["Directional"].abs() * short_df["Stability"]) / (short_df["Turning"] + 1)
     long_df = (
         long_df.sort_values(
-            by=["Directional", "Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
+            by=["Composite", "Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
             ascending=[False, False, False, False, False], na_position="last",
         )
         .drop_duplicates(subset=["Symbol"])
@@ -726,12 +733,17 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     )
     short_df = (
         short_df.sort_values(
-            by=["Directional", "Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
-            ascending=[True, False, False, False, True], na_position="last",
+            by=["Composite", "Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
+            ascending=[False, False, False, False, True], na_position="last",
         )
         .drop_duplicates(subset=["Symbol"])
         .head(15)
     )
+    # Drop the helper column before display
+    if "Composite" in long_df.columns:
+        long_df = long_df.drop(columns=["Composite"])
+    if "Composite" in short_df.columns:
+        short_df = short_df.drop(columns=["Composite"])
     long_df = (long_df[[c for c in EMAIL_DISPLAY_COLS if c in long_df.columns]] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS))
     short_df = (short_df[[c for c in EMAIL_DISPLAY_COLS if c in short_df.columns]] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS))
     return long_df, short_df
