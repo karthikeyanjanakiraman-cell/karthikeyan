@@ -74,17 +74,22 @@ def build_signals_from_raw_directional(detail_df) -> dict:
     df = detail_df.copy()
     if "Iteration No" in df.columns:
         df = df.sort_values("Iteration No")
-    vals = pd.to_numeric(df["Directional"], errors="coerce").dropna().tolist()
-    if not vals:
+    vals = pd.to_numeric(df["Directional"], errors="coerce").dropna().to_numpy(dtype=float)
+    if vals.size == 0:
         return out
-    raw = round(float(vals[-1]), 4)
-    out["5m_Signal"] = raw
-    out["15m_Signal"] = raw
-    out["30m_Signal"] = raw
-    out["60m_Signal"] = raw
-    out["Bull_Signal"] = raw
-    out["Bear_Signal"] = round(-raw, 4)
-    out["Overall_Signal"] = raw
+    last = vals.size - 1
+    def raw_at(offset: int) -> float:
+        i = last - offset
+        if i < 0:
+            i = 0
+        return float(vals[i])
+    out["5m_Signal"] = round(raw_at(0), 4)
+    out["15m_Signal"] = round(raw_at(3) if last >= 3 else raw_at(0), 4)
+    out["30m_Signal"] = round(raw_at(6) if last >= 6 else raw_at(0), 4)
+    out["60m_Signal"] = round(raw_at(12) if last >= 12 else raw_at(0), 4)
+    out["Bull_Signal"] = round(float(vals[vals > 0].max()) if (vals > 0).any() else 0.0, 4)
+    out["Bear_Signal"] = round(abs(float(vals[vals < 0].min())) if (vals < 0).any() else 0.0, 4)
+    out["Overall_Signal"] = round(raw_at(0), 4)
     return out
 
 
@@ -423,28 +428,28 @@ def compute_price_lead_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def price_stats_from_series(prices: pd.Series) -> dict:
-    """Raw statistical scores.
-
-    Directional = raw slope + raw net price move
-    Turning = raw mean absolute second difference
-    Stability = mean price / std price
-    Balanced = Directional + Stability - Turning
+    """Raw statistical scores using signal-to-noise ratio for Stability.
+    Directional = raw slope + raw net_return
+    Turning   = raw mean(abs(second_diff))
+    Stability = mean / std  (signal-to-noise ratio, scale-invariant raw statistic)
+    Balanced  = Directional + Turning + Stability
     """
     p = pd.to_numeric(prices, errors="coerce").dropna().astype(float)
     if len(p) < 3:
         return {"Directional": np.nan, "Turning": np.nan, "Stability": np.nan, "Balanced": np.nan}
 
     x = np.arange(len(p), dtype=float)
-    slope = float(np.polyfit(x, p.values, 1)[0])
-    net_move = float(p.iloc[-1] - p.iloc[0])
+    slope = np.polyfit(x, p.values, 1)[0]
+    net_return = (p.iloc[-1] - p.iloc[0]) / (abs(p.iloc[0]) + 1e-9)
     turning = float(np.mean(np.abs(np.diff(p.values, n=2))))
-    mean_p = float(np.mean(p.values))
-    std_p = float(np.std(p.values))
-    stability = float(std_p)
-    directional = slope + net_move
-    balanced = directional - turning + (mean_p / (std_p + 1e-9))
-    return {"Directional": directional, "Turning": turning, "Stability": stability, "Balanced": balanced}
 
+    std = float(np.std(p.values))
+    mean_p = float(np.mean(p.values))
+    stability = mean_p / (std + 1e-9)
+
+    directional = slope + net_return
+    balanced = (directional * stability) / (turning + 1)
+    return {"Directional": directional, "Turning": turning, "Stability": stability, "Balanced": balanced}
 
 def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[Dict, pd.DataFrame]:
     if intra_df is None or intra_df.empty:
