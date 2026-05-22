@@ -428,28 +428,19 @@ def compute_price_lead_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def price_stats_from_series(prices: pd.Series) -> dict:
-    """Raw statistical scores using signal-to-noise ratio for Stability.
-    Directional = raw slope + raw net_return
-    Turning   = raw mean(abs(second_diff))
-    Stability = mean / std  (signal-to-noise ratio, scale-invariant raw statistic)
-    Balanced  = Directional + Turning + Stability
-    """
     p = pd.to_numeric(prices, errors="coerce").dropna().astype(float)
     if len(p) < 3:
         return {"Directional": np.nan, "Turning": np.nan, "Stability": np.nan, "Balanced": np.nan}
-
     x = np.arange(len(p), dtype=float)
-    slope = np.polyfit(x, p.values, 1)[0]
-    net_return = (p.iloc[-1] - p.iloc[0]) / (abs(p.iloc[0]) + 1e-9)
+    slope = float(np.polyfit(x, p.values, 1)[0])
+    net_move = float(p.iloc[-1] - p.iloc[0])
     turning = float(np.mean(np.abs(np.diff(p.values, n=2))))
-
-    std = float(np.std(p.values))
-    mean_p = float(np.mean(p.values))
-    stability = mean_p / (std + 1e-9)
-
-    directional = slope + net_return
-    balanced = (directional * stability) / (turning + 1)
+    std_p = float(np.std(p.values))
+    directional = slope + net_move
+    stability = std_p
+    balanced = directional - turning + std_p
     return {"Directional": directional, "Turning": turning, "Stability": stability, "Balanced": balanced}
+
 
 def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[Dict, pd.DataFrame]:
     if intra_df is None or intra_df.empty:
