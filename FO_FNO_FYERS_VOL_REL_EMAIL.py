@@ -79,11 +79,11 @@ def build_signals_from_raw_directional(detail_df) -> dict:
         return out
     raw = round(float(vals[-1]), 4)
     out["5m_Signal"] = raw
-    out["15m_Signal"] = raw
-    out["30m_Signal"] = raw
-    out["60m_Signal"] = raw
-    out["Bull_Signal"] = raw
-    out["Bear_Signal"] = round(-raw, 4)
+    out["15m_Signal"] = round(float(np.mean(vals[-3:])) if len(vals) >= 3 else raw, 4)
+    out["30m_Signal"] = round(float(np.mean(vals[-6:])) if len(vals) >= 6 else raw, 4)
+    out["60m_Signal"] = round(float(np.mean(vals[-12:])) if len(vals) >= 12 else raw, 4)
+    out["Bull_Signal"] = round(float(np.mean(vals)), 4)
+    out["Bear_Signal"] = round(float(np.max(vals) - raw), 4)
     out["Overall_Signal"] = raw
     return out
 
