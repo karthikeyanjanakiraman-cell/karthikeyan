@@ -64,14 +64,7 @@ EMAIL_DISPLAY_COLS = [
 ]
 
 
-def _avg_tail(vals, n):
-    """Return mean of last n items, ignoring NaN."""
-    tail = [float(v) for v in vals[-n:] if v == v and v is not None]
-    return round(sum(tail) / len(tail), 4) if tail else float('nan')
-
-
 def build_signals_from_raw_directional(detail_df) -> dict:
-    """All signal columns are numeric Directional values or averages thereof."""
     nan = float('nan')
     out = {k: nan for k in (
         "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
@@ -84,15 +77,14 @@ def build_signals_from_raw_directional(detail_df) -> dict:
     vals = pd.to_numeric(df["Directional"], errors="coerce").dropna().tolist()
     if not vals:
         return out
-    out["5m_Signal"]  = round(float(vals[-1]), 4)
-    out["15m_Signal"] = _avg_tail(vals, 3)
-    out["30m_Signal"] = _avg_tail(vals, 6)
-    out["60m_Signal"] = _avg_tail(vals, 12)
-    tf = [out["5m_Signal"], out["15m_Signal"], out["30m_Signal"], out["60m_Signal"]]
-    bull = _avg_tail(tf, len(tf))
-    out["Bull_Signal"]    = bull
-    out["Bear_Signal"]    = round(-bull, 4) if bull == bull else nan
-    out["Overall_Signal"] = bull
+    raw = round(float(vals[-1]), 4)
+    out["5m_Signal"] = raw
+    out["15m_Signal"] = raw
+    out["30m_Signal"] = raw
+    out["60m_Signal"] = raw
+    out["Bull_Signal"] = raw
+    out["Bear_Signal"] = round(-raw, 4)
+    out["Overall_Signal"] = raw
     return out
 
 
@@ -601,12 +593,12 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "Symbol": sym, "LTP": ltp, "% Change": pct_change,
             "Directional": iter_summary.get("Directional"), "Turning": iter_summary.get("Turning"),
             "Stability": iter_summary.get("Stability"), "Balanced": iter_summary.get("Balanced"),
-            "5m_Signal":      iter_summary.get("5m_Signal"),
-            "15m_Signal":     iter_summary.get("15m_Signal"),
-            "30m_Signal":     iter_summary.get("30m_Signal"),
-            "60m_Signal":     iter_summary.get("60m_Signal"),
-            "Bull_Signal":    iter_summary.get("Bull_Signal"),
-            "Bear_Signal":    iter_summary.get("Bear_Signal"),
+            "5m_Signal": iter_summary.get("5m_Signal"),
+            "15m_Signal": iter_summary.get("15m_Signal"),
+            "30m_Signal": iter_summary.get("30m_Signal"),
+            "60m_Signal": iter_summary.get("60m_Signal"),
+            "Bull_Signal": iter_summary.get("Bull_Signal"),
+            "Bear_Signal": iter_summary.get("Bear_Signal"),
             "Overall_Signal": iter_summary.get("Overall_Signal"),
             "Current Volume": iter_summary.get("Current Volume"),
             "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"),
@@ -706,8 +698,8 @@ def signal_color(label) -> str:
     except (ValueError, TypeError):
         pass
     label = str(label).strip()
-    if label == "Buyer Zone":    return "#33691e"
-    if label == "Neutral Vol":   return "#4b5563"
+    if label == "Buyer Zone": return "#33691e"
+    if label == "Neutral Vol": return "#4b5563"
     if label == "Avoid Buy Premium": return "#7a5c00"
     return "#374151"
 
