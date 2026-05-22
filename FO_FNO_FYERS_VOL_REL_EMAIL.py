@@ -2,7 +2,7 @@
 """
 FO_FNO_FYERS_VOL_REL_EMAIL.py
 Intraday F&O scanner via Fyers API with email alerts.
-Complete standalone file Ã¢â‚¬â€ no external email.py dependency.
+Complete standalone file â€” no external email.py dependency.
 SORTS CANDIDATES BY DIRECTIONAL COLUMN.
 ALL STATISTICAL SCORES ARE RAW (ORIGINAL FORMULAS).
 """
@@ -62,6 +62,38 @@ EMAIL_DISPLAY_COLS = [
     "Bull_Signal", "Bear_Signal", "Overall_Signal", "Price_Lead_Status", "IVP",
     "Volatility State", "Last Iteration Time",
 ]
+
+
+def _avg_tail(vals, n):
+    """Return mean of last n items, ignoring NaN."""
+    tail = [float(v) for v in vals[-n:] if v == v and v is not None]
+    return round(sum(tail) / len(tail), 4) if tail else float('nan')
+
+
+def build_signals_from_raw_directional(detail_df) -> dict:
+    """All signal columns are numeric Directional values or averages thereof."""
+    nan = float('nan')
+    out = {k: nan for k in (
+        "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
+        "Bull_Signal", "Bear_Signal", "Overall_Signal")}
+    if detail_df is None or detail_df.empty:
+        return out
+    df = detail_df.copy()
+    if "Iteration No" in df.columns:
+        df = df.sort_values("Iteration No")
+    vals = pd.to_numeric(df["Directional"], errors="coerce").dropna().tolist()
+    if not vals:
+        return out
+    out["5m_Signal"]  = round(float(vals[-1]), 4)
+    out["15m_Signal"] = _avg_tail(vals, 3)
+    out["30m_Signal"] = _avg_tail(vals, 6)
+    out["60m_Signal"] = _avg_tail(vals, 12)
+    tf = [out["5m_Signal"], out["15m_Signal"], out["30m_Signal"], out["60m_Signal"]]
+    bull = _avg_tail(tf, len(tf))
+    out["Bull_Signal"]    = bull
+    out["Bear_Signal"]    = round(-bull, 4) if bull == bull else nan
+    out["Overall_Signal"] = bull
+    return out
 
 
 def init_fyers():
@@ -539,6 +571,8 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         "OBV_30m_Delta": obv_30m_delta, "RSI_30m_Delta": rsi_30m_delta,
         "Price_Lead_Status": str(price_lead_df["Price_Lead_Status"].iloc[-1]) if not price_lead_df.empty else "NORMAL",
     }
+    signals = build_signals_from_raw_directional(detail_df)
+    summary.update(signals)
     return summary, detail_df
 
 
@@ -567,6 +601,13 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "Symbol": sym, "LTP": ltp, "% Change": pct_change,
             "Directional": iter_summary.get("Directional"), "Turning": iter_summary.get("Turning"),
             "Stability": iter_summary.get("Stability"), "Balanced": iter_summary.get("Balanced"),
+            "5m_Signal":      iter_summary.get("5m_Signal"),
+            "15m_Signal":     iter_summary.get("15m_Signal"),
+            "30m_Signal":     iter_summary.get("30m_Signal"),
+            "60m_Signal":     iter_summary.get("60m_Signal"),
+            "Bull_Signal":    iter_summary.get("Bull_Signal"),
+            "Bear_Signal":    iter_summary.get("Bear_Signal"),
+            "Overall_Signal": iter_summary.get("Overall_Signal"),
             "Current Volume": iter_summary.get("Current Volume"),
             "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"),
             "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"),
@@ -652,38 +693,22 @@ def derive_rank_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def add_signal_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    for tf in ["5m", "15m", "30m", "60m"]:
-        col = f"{tf}RankDelta"
-        out[f"{tf}_Signal"] = out[col].apply(rank_delta_to_label) if col in out.columns else ""
-    out["Bull_Signal"] = out["Bull Rank"].apply(rank_delta_to_label) if "Bull Rank" in out.columns else ""
-    out["Bear_Signal"] = out["Bear Rank"].apply(lambda x: rank_delta_to_label(-x)) if "Bear Rank" in out.columns else ""
-    out["Overall_Signal"] = out["Rank Delta"].apply(rank_delta_to_label) if "Rank Delta" in out.columns else ""
-    return out
+    return df
 
 
-def signal_color(label: str) -> str:
-    label = str(label).strip()
-    if label == "Buy++":
-        return "#2e7d32"
-    if label == "Buy+":
-        return "#3f8f45"
-    if label == "Buy":
-        return "#5b9b5f"
-    if label == "Buyer Zone":
-        return "#33691e"
-    if label in ("Neutral", "Neutral Vol"):
+
+def signal_color(label) -> str:
+    try:
+        v = float(label)
+        if v > 0: return "#2e7d32"
+        if v < 0: return "#7f1d1d"
         return "#4b5563"
-    if label == "Sell++":
-        return "#7f1d1d"
-    if label == "Sell+":
-        return "#a83232"
-    if label == "Sell":
-        return "#b94a48"
-    if label == "Avoid Buy Premium":
-        return "#7a5c00"
+    except (ValueError, TypeError):
+        pass
+    label = str(label).strip()
+    if label == "Buyer Zone":    return "#33691e"
+    if label == "Neutral Vol":   return "#4b5563"
+    if label == "Avoid Buy Premium": return "#7a5c00"
     return "#374151"
 
 
@@ -835,7 +860,7 @@ def send_email_with_tables(
 </html>
 """
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"Intraday Scan Ã¢â‚¬â€ {scan_time}"
+        msg["Subject"] = f"Intraday Scan â€” {scan_time}"
         msg["From"] = sender_email
         msg["To"] = recipient_email
         msg.attach(MIMEText(html_body, "html", _charset="utf-8"))
