@@ -82,8 +82,8 @@ def build_signals_from_raw_directional(detail_df) -> dict:
     out["15m_Signal"] = raw
     out["30m_Signal"] = raw
     out["60m_Signal"] = raw
-    out["Bull_Signal"] = raw
-    out["Bear_Signal"] = round(-raw, 4)
+    out["Bull_Signal"] = round(float(np.max(vals)), 4)
+    out["Bear_Signal"] = round(float(np.min(vals)), 4)
     out["Overall_Signal"] = raw
     return out
 
@@ -724,47 +724,30 @@ def format_value(col: str, val):
 
 
 def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Build long/short candidate tables using composite Directional x Stability / Turning score.
-    Rewards stocks that are BOTH highly directional AND highly stable AND smooth (low Turning).
-    """
+    """Build long/short candidate tables using Bull_Signal for longs and Bear_Signal for shorts."""
     if df is None or df.empty:
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     base = df.copy()
-    if "Directional" not in base.columns or "Stability" not in base.columns or "Turning" not in base.columns:
-        return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-    base["Directional"] = pd.to_numeric(base["Directional"], errors="coerce")
-    base["Stability"] = pd.to_numeric(base["Stability"], errors="coerce").fillna(0)
-    base["Turning"] = pd.to_numeric(base["Turning"], errors="coerce").fillna(1)
-    long_df = base[base["Directional"] > 0].copy()
-    short_df = base[base["Directional"] < 0].copy()
-    # Composite: high Directional x high Stability / low Turning
-    long_df["Composite"] = (long_df["Directional"] * long_df["Stability"]) / (long_df["Turning"] + 1)
-    short_df["Composite"] = (short_df["Directional"].abs() * short_df["Stability"]) / (short_df["Turning"] + 1)
-    long_df = (
-        long_df.sort_values(
-            by=["Composite", "Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
-            ascending=[False, False, False, False, False], na_position="last",
-        )
-        .drop_duplicates(subset=["Symbol"])
-        .head(15)
-    )
-    short_df = (
-        short_df.sort_values(
-            by=["Composite", "Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"],
-            ascending=[False, False, False, False, True], na_position="last",
-        )
-        .drop_duplicates(subset=["Symbol"])
-        .head(15)
-    )
-    # Drop the helper column before display
-    if "Composite" in long_df.columns:
-        long_df = long_df.drop(columns=["Composite"])
-    if "Composite" in short_df.columns:
-        short_df = short_df.drop(columns=["Composite"])
-    long_df = (long_df[[c for c in EMAIL_DISPLAY_COLS if c in long_df.columns]] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS))
-    short_df = (short_df[[c for c in EMAIL_DISPLAY_COLS if c in short_df.columns]] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS))
+    for c in ["Bull_Signal", "Bear_Signal", "Overall_Signal", "Directional", "Turning", "Stability", "% Change", "Cumulative KER", "Survival_Num", "Cumulative ADX", "Cumulative RSI", "Cumulative +DI", "Cumulative -DI", "VWAP Z-Score"]:
+        if c in base.columns:
+            base[c] = pd.to_numeric(base[c], errors="coerce")
+    long_df = base[(base["Directional"] > 0) & (base["Bull_Signal"].fillna(-np.inf) > 0)].copy() if "Bull_Signal" in base.columns else base[base["Directional"] > 0].copy()
+    short_df = base[(base["Directional"] < 0) & (base["Bear_Signal"].fillna(-np.inf) > 0)].copy() if "Bear_Signal" in base.columns else base[base["Directional"] < 0].copy()
+    if not long_df.empty:
+        long_df["Composite"] = (long_df["Directional"] * long_df["Stability"].fillna(0)) / (long_df["Turning"].fillna(1) + 1)
+        long_df = long_df.sort_values(by=["Bull_Signal", "Composite", "Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"], ascending=[False, False, False, False, False, False], na_position="last").drop_duplicates(subset=["Symbol"]).head(15)
+    if not short_df.empty:
+        short_df["Composite"] = (short_df["Directional"].abs() * short_df["Stability"].fillna(0)) / (short_df["Turning"].fillna(1) + 1)
+        short_df = short_df.sort_values(by=["Bear_Signal", "Composite", "Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"], ascending=[False, False, False, False, False, True], na_position="last").drop_duplicates(subset=["Symbol"]).head(15)
+    if not long_df.empty:
+        long_df = long_df.drop(columns=[c for c in ["Bear_Signal", "Overall_Signal", "Composite"] if c in long_df.columns])
+    if not short_df.empty:
+        short_df = short_df.drop(columns=[c for c in ["Bull_Signal", "Overall_Signal", "Composite"] if c in short_df.columns])
+    long_cols = [c for c in EMAIL_DISPLAY_COLS if c in long_df.columns]
+    short_cols = [c for c in EMAIL_DISPLAY_COLS if c in short_df.columns]
+    long_df = long_df[long_cols] if not long_df.empty else pd.DataFrame(columns=[c for c in EMAIL_DISPLAY_COLS if c not in {"Bear_Signal", "Overall_Signal"}])
+    short_df = short_df[short_cols] if not short_df.empty else pd.DataFrame(columns=[c for c in EMAIL_DISPLAY_COLS if c not in {"Bull_Signal", "Overall_Signal"}])
     return long_df, short_df
-
 
 def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     if df is None or df.empty:
