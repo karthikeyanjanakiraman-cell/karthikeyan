@@ -84,6 +84,7 @@ def build_signals_from_raw_directional(detail_df) -> dict:
     out["60m_Signal"] = raw
     out["Bull_Signal"] = raw
     out["Bear_Signal"] = round(-raw, 4)
+    out["Overall_Signal"] = raw
     return out
 
 
@@ -760,14 +761,8 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         long_df = long_df.drop(columns=["Composite"])
     if "Composite" in short_df.columns:
         short_df = short_df.drop(columns=["Composite"])
-    if not long_df.empty:
-        long_df = long_df[[c for c in LONG_EMAIL_DISPLAY_COLS if c in long_df.columns]]
-    else:
-        long_df = pd.DataFrame(columns=LONG_EMAIL_DISPLAY_COLS)
-    if not short_df.empty:
-        short_df = short_df[[c for c in SHORT_EMAIL_DISPLAY_COLS if c in short_df.columns]]
-    else:
-        short_df = pd.DataFrame(columns=SHORT_EMAIL_DISPLAY_COLS)
+    long_df = (long_df[[c for c in EMAIL_DISPLAY_COLS if c in long_df.columns]] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS))
+    short_df = (short_df[[c for c in EMAIL_DISPLAY_COLS if c in short_df.columns]] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS))
     return long_df, short_df
 
 
