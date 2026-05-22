@@ -2,7 +2,7 @@
 """
 FO_FNO_FYERS_VOL_REL_EMAIL.py
 Intraday F&O scanner via Fyers API with email alerts.
-Complete standalone file Ã¢â‚¬â€ no external email.py dependency.
+Complete standalone file ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â no external email.py dependency.
 SORTS CANDIDATES BY DIRECTIONAL COLUMN.
 ALL STATISTICAL SCORES ARE RAW (ORIGINAL FORMULAS).
 """
@@ -74,17 +74,22 @@ def build_signals_from_raw_directional(detail_df) -> dict:
     df = detail_df.copy()
     if "Iteration No" in df.columns:
         df = df.sort_values("Iteration No")
-    vals = pd.to_numeric(df["Directional"], errors="coerce").dropna().tolist()
-    if not vals:
+    vals = pd.to_numeric(df["Directional"], errors="coerce").dropna().to_numpy(dtype=float)
+    if vals.size == 0:
         return out
-    raw = round(float(vals[-1]), 4)
-    out["5m_Signal"] = raw
-    out["15m_Signal"] = raw
-    out["30m_Signal"] = raw
-    out["60m_Signal"] = raw
-    out["Bull_Signal"] = raw
-    out["Bear_Signal"] = round(-raw, 4)
-    out["Overall_Signal"] = raw
+    last = vals.size - 1
+    def raw_at(offset: int) -> float:
+        i = last - offset
+        if i < 0:
+            i = 0
+        return float(vals[i])
+    out["5m_Signal"] = round(raw_at(0), 4)
+    out["15m_Signal"] = round(raw_at(3) if last >= 3 else raw_at(0), 4)
+    out["30m_Signal"] = round(raw_at(6) if last >= 6 else raw_at(0), 4)
+    out["60m_Signal"] = round(raw_at(12) if last >= 12 else raw_at(0), 4)
+    out["Bull_Signal"] = round(float(vals[vals > 0].max()) if (vals > 0).any() else 0.0, 4)
+    out["Bear_Signal"] = round(abs(float(vals[vals < 0].min())) if (vals < 0).any() else 0.0, 4)
+    out["Overall_Signal"] = round(raw_at(0), 4)
     return out
 
 
@@ -833,7 +838,7 @@ def send_email_with_tables(
 </html>
 """
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"Intraday Scan Ã¢â‚¬â€ {scan_time}"
+        msg["Subject"] = f"Intraday Scan ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â {scan_time}"
         msg["From"] = sender_email
         msg["To"] = recipient_email
         msg.attach(MIMEText(html_body, "html", _charset="utf-8"))
