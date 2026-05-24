@@ -718,69 +718,90 @@ def format_value(col: str, val):
         return f"{float(val):.2f}"
     return str(val)
 
-
- def buildcandidatetables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df is None or df.empty:
-        return pd.DataFrame(columns=EMAILDISPLAYCOLS), pd.DataFrame(columns=EMAILDISPLAYCOLS)
+        return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
 
     base = df.copy()
 
-    for c in [
-        "Directional", "Turning", "BullSignal", "BearSignal", "OverallSignal",
-        "5mSignal", "Stability", "Change", "Cumulative KER", "SurvivalNum",
-        "Cumulative ADX", "Cumulative RSI", "Cumulative DI", "Cumulative -DI",
-        "VWAP Z-Score"
-    ]:
+    # Only columns needed for this logic
+    for c in ["Bull_Signal", "Bear_Signal", "Directional", "Turning"]:
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
 
-    # ratio used only for sorting
-    base["_dir_turn_ratio"] = np.where(
-        base["Turning"].notna() & (base["Turning"] != 0),
-        base["Directional"].abs() / base["Turning"],
-        np.nan
+    # Keep the same long / short selection logic as your file
+    long_df = (
+        base[base["Bull_Signal"].fillna(-np.inf) > 0].copy()
+        if "Bull_Signal" in base.columns
+        else base[base["Directional"] > 0].copy()
     )
 
-    # keep long/short separation same as directional sign
-    longdf = base[base["Directional"] > 0].copy() if "Directional" in base.columns else pd.DataFrame()
-    shortdf = base[base["Directional"] < 0].copy() if "Directional" in base.columns else pd.DataFrame()
+    short_df = (
+        base[base["Bear_Signal"].fillna(-np.inf) > 0].copy()
+        if "Bear_Signal" in base.columns
+        else base[base["Directional"] < 0].copy()
+    )
 
-    # pure one-condition sort: Directional / Turning descending
-    if not longdf.empty:
-        longdf = (
-            longdf.sort_values(by="_dir_turn_ratio", ascending=False, na_position="last")
-                  .drop_duplicates(subset="Symbol")
-                  .head(15)
+    # LONG: sort only by abs(Directional) desc, then Turning asc
+    if not long_df.empty:
+        long_df["_abs_directional"] = long_df["Directional"].abs()
+        long_df = (
+            long_df
+            .sort_values(
+                by=["_abs_directional", "Turning"],
+                ascending=[False, True],
+                na_position="last",
+            )
+            .drop_duplicates(subset=["Symbol"])
+            .head(15)
+        )
+        long_df = long_df.drop(columns=["_abs_directional"], errors="ignore")
+
+    # SHORT: sort only by abs(Directional) desc, then Turning asc
+    if not short_df.empty:
+        short_df["_abs_directional"] = short_df["Directional"].abs()
+        short_df = (
+            short_df
+            .sort_values(
+                by=["_abs_directional", "Turning"],
+                ascending=[False, True],
+                na_position="last",
+            )
+            .drop_duplicates(subset=["Symbol"])
+            .head(15)
+        )
+        short_df = short_df.drop(columns=["_abs_directional"], errors="ignore")
+
+    # Keep same drop behavior as your original file
+    if not long_df.empty:
+        long_df = long_df.drop(
+            columns=[c for c in ["Bear_Signal", "Overall_Signal"] if c in long_df.columns]
         )
 
-    if not shortdf.empty:
-        shortdf = (
-            shortdf.sort_values(by="_dir_turn_ratio", ascending=False, na_position="last")
-                   .drop_duplicates(subset="Symbol")
-                   .head(15)
+    if not short_df.empty:
+        short_df = short_df.drop(
+            columns=[c for c in ["Bull_Signal", "Overall_Signal"] if c in short_df.columns]
         )
 
-    if "_dir_turn_ratio" in longdf.columns:
-        longdf = longdf.drop(columns=["_dir_turn_ratio"])
-    if "_dir_turn_ratio" in shortdf.columns:
-        shortdf = shortdf.drop(columns=["_dir_turn_ratio"])
+    # Keep same email display structure
+    long_cols = [c for c in EMAIL_DISPLAY_COLS if c in long_df.columns]
+    short_cols = [c for c in EMAIL_DISPLAY_COLS if c in short_df.columns]
 
-    if not longdf.empty:
-        longdf = longdf.drop(columns=[c for c in ["BearSignal", "OverallSignal"] if c in longdf.columns])
-    if not shortdf.empty:
-        shortdf = shortdf.drop(columns=[c for c in ["BullSignal", "OverallSignal"] if c in shortdf.columns])
-
-    longcols = [c for c in EMAILDISPLAYCOLS if c in longdf.columns]
-    shortcols = [c for c in EMAILDISPLAYCOLS if c in shortdf.columns]
-
-    longdf = longdf[longcols] if not longdf.empty else pd.DataFrame(
-        columns=[c for c in EMAILDISPLAYCOLS if c not in ["BearSignal", "OverallSignal"]]
-    )
-    shortdf = shortdf[shortcols] if not shortdf.empty else pd.DataFrame(
-        columns=[c for c in EMAILDISPLAYCOLS if c not in ["BullSignal", "OverallSignal"]]
+    long_df = (
+        long_df[long_cols]
+        if not long_df.empty
+        else pd.DataFrame(columns=[c for c in EMAIL_DISPLAY_COLS if c not in {"Bear_Signal", "Overall_Signal"}])
     )
 
-    return longdf, shortdf           
+    short_df = (
+        short_df[short_cols]
+        if not short_df.empty
+        else pd.DataFrame(columns=[c for c in EMAIL_DISPLAY_COLS if c not in {"Bull_Signal", "Overall_Signal"}])
+    )
+
+    return long_df, short_df
+ 
+    
                 
 def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     if df is None or df.empty:
