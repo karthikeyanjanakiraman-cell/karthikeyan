@@ -2,7 +2,7 @@
 """
 FO_FNO_FYERS_VOL_REL_EMAIL.py
 Intraday F&O scanner via Fyers API with email alerts.
-Complete standalone file ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â no external email.py dependency.
+Complete standalone file ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â no external email.py dependency.
 SORTS CANDIDATES BY DIRECTIONAL COLUMN.
 ALL STATISTICAL SCORES ARE RAW (ORIGINAL FORMULAS).
 """
@@ -722,26 +722,166 @@ def format_value(col: str, val):
 def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df is None or df.empty:
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+
     base = df.copy()
-    for c in ["Bull_Signal", "Bear_Signal", "Overall_Signal", "Directional", "Turning", "Stability", "% Change", "Cumulative KER", "Survival_Num", "Cumulative ADX", "Cumulative RSI", "Cumulative +DI", "Cumulative -DI", "VWAP Z-Score"]:
+
+    # Ensure all ranking / signal columns are numeric so sorting is correct
+    for c in [
+        "Bull_Signal",
+        "Bear_Signal",
+        "Overall_Signal",
+        "5m_Signal",          # ensure 5m signal numeric for sorting
+        "Directional",
+        "Turning",
+        "Stability",
+        "% Change",
+        "Cumulative KER",
+        "Survival_Num",
+        "Cumulative ADX",
+        "Cumulative RSI",
+        "Cumulative +DI",
+        "Cumulative -DI",
+        "VWAP Z-Score",
+    ]:
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
-    long_df = base[base["Bull_Signal"].fillna(-np.inf) > 0].copy() if "Bull_Signal" in base.columns else base[base["Directional"] > 0].copy()
-    short_df = base[base["Bear_Signal"].fillna(-np.inf) > 0].copy() if "Bear_Signal" in base.columns else base[base["Directional"] < 0].copy()
+
+    # Long and short universe selection stays the same
+    long_df = (
+        base[base["Bull_Signal"].fillna(-np.inf) > 0].copy()
+        if "Bull_Signal" in base.columns
+        else base[base["Directional"] > 0].copy()
+    )
+    short_df = (
+        base[base["Bear_Signal"].fillna(-np.inf) > 0].copy()
+        if "Bear_Signal" in base.columns
+        else base[base["Directional"] < 0].copy()
+    )
+
+    # -----------------------
+    # LONG SIDE SORTING
+    # -----------------------
     if not long_df.empty:
-        long_df = long_df.sort_values(by=["Bull_Signal", "Directional", "Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"], ascending=[False, False, False, False, False, False], na_position="last").drop_duplicates(subset=["Symbol"]).head(15)
+        long_sort_cols = []
+        long_ascending = []
+
+        # 1) 5m_Signal: strongest recent 5m push first (higher is better)
+        if "5m_Signal" in long_df.columns:
+            long_sort_cols.append("5m_Signal")
+            long_ascending.append(False)
+
+        # 2) Directional: high positive directional bias
+        if "Directional" in long_df.columns:
+            long_sort_cols.append("Directional")
+            long_ascending.append(False)
+
+        # 3) Turning: prefer smoother move (lower Turning)
+        if "Turning" in long_df.columns:
+            long_sort_cols.append("Turning")
+            long_ascending.append(True)
+
+        # 4) Overall bull score
+        if "Bull_Signal" in long_df.columns:
+            long_sort_cols.append("Bull_Signal")
+            long_ascending.append(False)
+
+        # 5) Existing tie-breakers (unchanged)
+        for col, asc in [
+            ("Cumulative KER", False),
+            ("Survival_Num", False),
+            ("Cumulative ADX", False),
+            ("% Change", False),
+        ]:
+            if col in long_df.columns:
+                long_sort_cols.append(col)
+                long_ascending.append(asc)
+
+        if long_sort_cols:
+            long_df = (
+                long_df.sort_values(
+                    by=long_sort_cols,
+                    ascending=long_ascending,
+                    na_position="last",
+                )
+                .drop_duplicates(subset=["Symbol"])
+                .head(15)
+            )
+
+    # -----------------------
+    # SHORT SIDE SORTING
+    # -----------------------
     if not short_df.empty:
-        short_df = short_df.sort_values(by=["Bear_Signal", "Directional", "Cumulative KER", "Survival_Num", "Cumulative ADX", "% Change"], ascending=[False, True, False, False, False, True], na_position="last").drop_duplicates(subset=["Symbol"]).head(15)
+        short_sort_cols = []
+        short_ascending = []
+
+        # 1) 5m_Signal: most negative recent 5m move first
+        if "5m_Signal" in short_df.columns:
+            short_sort_cols.append("5m_Signal")
+            short_ascending.append(True)  # more negative (smaller) is better
+
+        # 2) Directional: strong negative directional bias
+        if "Directional" in short_df.columns:
+            short_sort_cols.append("Directional")
+            short_ascending.append(True)  # more negative first
+
+        # 3) Turning: smoother downtrend preferred
+        if "Turning" in short_df.columns:
+            short_sort_cols.append("Turning")
+            short_ascending.append(True)
+
+        # 4) Overall bear score
+        if "Bear_Signal" in short_df.columns:
+            short_sort_cols.append("Bear_Signal")
+            short_ascending.append(False)  # higher bear score is stronger
+
+        # 5) Existing tie-breakers (unchanged logic)
+        for col, asc in [
+            ("Cumulative KER", False),
+            ("Survival_Num", False),
+            ("Cumulative ADX", False),
+            ("% Change", True),  # more negative % change first
+        ]:
+            if col in short_df.columns:
+                short_sort_cols.append(col)
+                short_ascending.append(asc)
+
+        if short_sort_cols:
+            short_df = (
+                short_df.sort_values(
+                    by=short_sort_cols,
+                    ascending=short_ascending,
+                    na_position="last",
+                )
+                .drop_duplicates(subset=["Symbol"])
+                .head(15)
+            )
+
+    # Drop opposite-side signals from each table (same as before)
     if not long_df.empty:
-        long_df = long_df.drop(columns=[c for c in ["Bear_Signal", "Overall_Signal"] if c in long_df.columns])
+        long_df = long_df.drop(
+            columns=[c for c in ["Bear_Signal", "Overall_Signal"] if c in long_df.columns]
+        )
     if not short_df.empty:
-        short_df = short_df.drop(columns=[c for c in ["Bull_Signal", "Overall_Signal"] if c in short_df.columns])
+        short_df = short_df.drop(
+            columns=[c for c in ["Bull_Signal", "Overall_Signal"] if c in short_df.columns]
+        )
+
+    # Keep email display columns & structure identical
     long_cols = [c for c in EMAIL_DISPLAY_COLS if c in long_df.columns]
     short_cols = [c for c in EMAIL_DISPLAY_COLS if c in short_df.columns]
-    long_df = long_df[long_cols] if not long_df.empty else pd.DataFrame(columns=[c for c in EMAIL_DISPLAY_COLS if c not in {"Bear_Signal", "Overall_Signal"}])
-    short_df = short_df[short_cols] if not short_df.empty else pd.DataFrame(columns=[c for c in EMAIL_DISPLAY_COLS if c not in {"Bull_Signal", "Overall_Signal"}])
-    return long_df, short_df
 
+    long_df = (
+        long_df[long_cols]
+        if not long_df.empty
+        else pd.DataFrame(columns=[c for c in EMAIL_DISPLAY_COLS if c not in {"Bear_Signal", "Overall_Signal"}])
+    )
+    short_df = (
+        short_df[short_cols]
+        if not short_df.empty
+        else pd.DataFrame(columns=[c for c in EMAIL_DISPLAY_COLS if c not in {"Bull_Signal", "Overall_Signal"}])
+    )
+
+    return long_df, short_df
 
 def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     if df is None or df.empty:
@@ -829,7 +969,7 @@ def send_email_with_tables(
 </html>
 """
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"Intraday Scan ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Â {scan_time}"
+        msg["Subject"] = f"Intraday Scan ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â {scan_time}"
         msg["From"] = sender_email
         msg["To"] = recipient_email
         msg.attach(MIMEText(html_body, "html", _charset="utf-8"))
