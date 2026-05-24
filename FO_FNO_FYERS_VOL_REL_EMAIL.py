@@ -724,55 +724,60 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
 
     base = df.copy()
 
-    # Only columns needed for this logic
-    for c in ["Bull_Signal", "Bear_Signal", "Directional", "Turning"]:
+    for c in ["Directional", "Turning", "Bull_Signal", "Bear_Signal", "Overall_Signal"]:
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
 
-    # Keep the same long / short selection logic as your file
-    long_df = (
-        base[base["Bull_Signal"].fillna(-np.inf) > 0].copy()
-        if "Bull_Signal" in base.columns
-        else base[base["Directional"] > 0].copy()
-    )
+    # Strict side filtering: long must be +ve directional, short must be -ve directional
+    long_df = base[base["Directional"] > 0].copy() if "Directional" in base.columns else pd.DataFrame()
+    short_df = base[base["Directional"] < 0].copy() if "Directional" in base.columns else pd.DataFrame()
 
-    short_df = (
-        base[base["Bear_Signal"].fillna(-np.inf) > 0].copy()
-        if "Bear_Signal" in base.columns
-        else base[base["Directional"] < 0].copy()
-    )
-
-    # LONG: sort only by abs(Directional) desc, then Turning asc
+    # LONG: ratio = abs(Directional) / Turning, then abs(Directional), then Turning
     if not long_df.empty:
         long_df["_abs_directional"] = long_df["Directional"].abs()
+        long_df["_turning_safe"] = pd.to_numeric(long_df["Turning"], errors="coerce")
+        long_df["_turning_safe"] = long_df["_turning_safe"].replace(0, np.nan)
+        long_df["_dir_turn_ratio"] = long_df["_abs_directional"] / long_df["_turning_safe"]
+
         long_df = (
             long_df
             .sort_values(
-                by=["_abs_directional", "Turning"],
-                ascending=[False, True],
+                by=["_dir_turn_ratio", "_abs_directional", "Turning"],
+                ascending=[False, False, True],
                 na_position="last",
             )
             .drop_duplicates(subset=["Symbol"])
             .head(15)
         )
-        long_df = long_df.drop(columns=["_abs_directional"], errors="ignore")
 
-    # SHORT: sort only by abs(Directional) desc, then Turning asc
+        long_df = long_df.drop(
+            columns=["_abs_directional", "_turning_safe", "_dir_turn_ratio"],
+            errors="ignore"
+        )
+
+    # SHORT: ratio = abs(Directional) / Turning, then abs(Directional), then Turning
     if not short_df.empty:
         short_df["_abs_directional"] = short_df["Directional"].abs()
+        short_df["_turning_safe"] = pd.to_numeric(short_df["Turning"], errors="coerce")
+        short_df["_turning_safe"] = short_df["_turning_safe"].replace(0, np.nan)
+        short_df["_dir_turn_ratio"] = short_df["_abs_directional"] / short_df["_turning_safe"]
+
         short_df = (
             short_df
             .sort_values(
-                by=["_abs_directional", "Turning"],
-                ascending=[False, True],
+                by=["_dir_turn_ratio", "_abs_directional", "Turning"],
+                ascending=[False, False, True],
                 na_position="last",
             )
             .drop_duplicates(subset=["Symbol"])
             .head(15)
         )
-        short_df = short_df.drop(columns=["_abs_directional"], errors="ignore")
 
-    # Keep same drop behavior as your original file
+        short_df = short_df.drop(
+            columns=["_abs_directional", "_turning_safe", "_dir_turn_ratio"],
+            errors="ignore"
+        )
+
     if not long_df.empty:
         long_df = long_df.drop(
             columns=[c for c in ["Bear_Signal", "Overall_Signal"] if c in long_df.columns]
@@ -783,7 +788,6 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
             columns=[c for c in ["Bull_Signal", "Overall_Signal"] if c in short_df.columns]
         )
 
-    # Keep same email display structure
     long_cols = [c for c in EMAIL_DISPLAY_COLS if c in long_df.columns]
     short_cols = [c for c in EMAIL_DISPLAY_COLS if c in short_df.columns]
 
@@ -800,7 +804,6 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     )
 
     return long_df, short_df
- 
     
                 
 def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
