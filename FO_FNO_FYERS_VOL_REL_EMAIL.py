@@ -15,6 +15,7 @@ from typing import List, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from statsmodels.tsa.arima.model import ARIMA
 from fyers_apiv3 import fyersModel
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -58,6 +59,7 @@ recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
 EMAIL_DISPLAY_COLS = [
     "Symbol", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced",
+    "ARIMA Signal", "Kalman Signal",
     "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
     "Bull_Signal", "Bear_Signal", "Overall_Signal", "Price_Lead_Status", "IVP",
     "Volatility State", "Last Iteration Time",
@@ -442,6 +444,40 @@ def price_stats_from_series(prices: pd.Series) -> dict:
     return {"Directional": directional, "Turning": turning, "Stability": stability, "Balanced": balanced}
 
 
+
+def arima_signal_from_series(prices: pd.Series, order: tuple = (1, 1, 1), window: int = 50) -> float:
+    """ARIMA residual z-score (price-only). Positive = price above forecast (expensive), negative = below (cheap)."""
+    p = pd.to_numeric(prices, errors="coerce").dropna().astype(float)
+    if len(p) < max(window // 2, 12):
+        return float("nan")
+    train = p.iloc[-window:] if len(p) > window else p
+    try:
+        fc = float(ARIMA(train, order=order).fit().forecast(1).iloc[0])
+        last = float(train.iloc[-1])
+        scale = float(train.diff().std()) or 1e-6
+        return round((last - fc) / scale, 4)
+    except Exception:
+        return float("nan")
+
+
+def kalman_signal_from_series(prices: pd.Series, q: float = 1e-3) -> float:
+    """Kalman fair-value gap z-score (price-only). Positive = price above fair value (expensive), negative = below (cheap)."""
+    p = pd.to_numeric(prices, errors="coerce").dropna().astype(float)
+    if len(p) < 5:
+        return float("nan")
+    arr = p.to_numpy()
+    x, P = arr[0], 1.0
+    r = float(p.diff().dropna().var()) + 1e-6
+    for y in arr:
+        P += q
+        K = P / (P + r)
+        x += K * (y - x)
+        P *= (1.0 - K)
+    gap = arr[-1] - x
+    scale = float(p.std()) or 1e-6
+    return round(gap / scale, 4)
+
+
 def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[Dict, pd.DataFrame]:
     if intra_df is None or intra_df.empty:
         return {}, pd.DataFrame()
@@ -540,6 +576,8 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
     summary = {
         "LTP": ltp, "Directional": final_ps["Directional"], "Turning": final_ps["Turning"],
         "Stability": final_ps["Stability"], "Balanced": final_ps["Balanced"],
+        "ARIMA Signal": arima_signal_from_series(curr_df["close"]),
+        "Kalman Signal": kalman_signal_from_series(curr_df["close"]),
         "Current Volume": last_cum_vol, "10 Day Relative Volume": last_rvol10,
         "20 Day Relative Volume": last_rvol20,
         "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[-1]) if not flow_df.empty else float("nan"),
@@ -589,6 +627,8 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "Symbol": sym, "LTP": ltp, "% Change": pct_change,
             "Directional": iter_summary.get("Directional"), "Turning": iter_summary.get("Turning"),
             "Stability": iter_summary.get("Stability"), "Balanced": iter_summary.get("Balanced"),
+            "ARIMA Signal": iter_summary.get("ARIMA Signal"),
+            "Kalman Signal": iter_summary.get("Kalman Signal"),
             "5m_Signal": iter_summary.get("5m_Signal"),
             "15m_Signal": iter_summary.get("15m_Signal"),
             "30m_Signal": iter_summary.get("30m_Signal"),
@@ -820,7 +860,8 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     rows_html = []
     signal_cols = {
         '5m_Signal', '15m_Signal', '30m_Signal', '60m_Signal',
-        'Bull_Signal', 'Bear_Signal', 'Overall_Signal', 'Volatility State', 'Price_Lead_Status'
+        'Bull_Signal', 'Bear_Signal', 'Overall_Signal', 'Volatility State', 'Price_Lead_Status',
+        'ARIMA Signal', 'Kalman Signal'
     }
     for _, row in df_slice.iterrows():
         cells = []
