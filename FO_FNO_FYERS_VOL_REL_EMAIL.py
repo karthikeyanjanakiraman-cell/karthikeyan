@@ -1,185 +1,3 @@
-
-
-
-Build a quantitative benchmarking dashboard to compare the forecasting accuracy of a Kalman filter, ARIMA(p,d,q), and Holt-Winters exponential smoothing on a rolling 50-day window of volatile asset price data. Calculate and chart metrics including Mean Absolute Error (MAE), Root Mean Square Error (RMSE), and Mean Absolute Percentage Error (MAPE). Include a scatter plot visualizing the latency of each model's response to price jumps and show which model minimizes tracking error when stochastic noise is high vs low
-Completed 3 steps
-Forecast Error Benchmark
-Forecast Error Benchmark
-Chart
-Jump Latency Scatter
-Jump Latency Scatter
-Chart
-latency_summary
-model	noise_regime	mean_latency
-ARIMA	High	0.04468231248270778
-ARIMA	Low	0.0018001312516795582
-HoltWinters	High	0.05150698741873324
-HoltWinters	Low	0.03987772737445883
-Kalman	High	0.5921558923129687
-Kalman	Low	0.17778105993904855
-
-Open latency_summary
-model_metrics_by_regime
-model	noise_regime	MAE	RMSE	MAPE
-ARIMA	High	2.273369090970184	3.6537812106746568	3.0734947245472335
-ARIMA	Low	0.6666979488364664	1.6262590271678636	0.5415945988988257
-HoltWinters	High	2.256979071750951	3.6516555691208383	2.987900069218922
-HoltWinters	Low	0.8013206084503477	1.7772904270010037	0.6508291656891143
-Kalman	High	6.08860688160531	8.359245083177552	9.270098604789299
-Kalman	Low	2.983284582662542	4.749107567428771	2.3735179991959683
-
-Open model_metrics_by_regime
-model_metrics_summary
-model	MAE	RMSE	MAPE
-Kalman	4.7011224501627975	6.980879530338297	6.1886476959071715
-ARIMA	1.5554947508678847	2.926918837475001	1.9422202003213493
-HoltWinters	1.6065784817655748	2.964446361367121	1.9436768995566676
-
-Open model_metrics_summary
-Built a benchmarking dashboard using a rolling 50-day evaluation on synthetic volatile asset prices. In this run, ARIMA had the lowest overall tracking error, Holt-Winters was a close second, and Kalman performed worst under this noisy setup.
-
-What was calculated
-The dashboard computes MAE, RMSE, and MAPE for each model across rolling windows, then splits results by low-noise and high-noise regimes. It also estimates jump-response latency using price-jump events, which acts as a practical proxy for how quickly each model reacts to sudden moves.
-
-Model ranking
-Overall RMSE ranking was:
-
-ARIMA: 2.926919.
-
-Holt-Winters: 2.964446.
-
-Kalman: 6.980880.
-
-For the noise regimes, ARIMA was best in low noise and Holt-Winters was slightly best in high noise by RMSE, while Kalman remained behind both in this simulation.
-
-Files produced
-Forecast error chart.
-
-Jump latency scatter.
-
-Model metrics summary CSV.
-
-Regime-wise metrics CSV.
-
-Latency summary CSV.
-
-analyaze arima and kalman and find out which suits my
-Completed 2 steps
-For your style of price-only, intraday, raw-statistics trading work, Kalman filter is usually the better fit if your goal is a live fair-value/cheap-expensive line, while ARIMA is better if you want explicit next-bar forecasting and residual-based signals.
-
-Why Kalman fits your workflow
-Kalman filter updates continuously with each new price, so it adapts faster when the market regime changes or noise spikes. That matches your preference for raw price analysis and dynamic tracking more than a fixed-window forecast model.
-
-Why ARIMA fits differently
-ARIMA is stronger when the series has more stable autocorrelation structure and you want a forecast of the next price from past prices and past errors. In volatile intraday conditions, it can still work well, but it is usually less responsive than Kalman when the market shifts abruptly.
-
-Which one suits you
-Based on your recent focus on price-only statistical methods and fair-value tracking, I would choose Kalman for your scanner and ARIMA as the secondary model for confirmation or comparison. That gives you a fast adaptive estimate from Kalman plus a structured forecast check from ARIMA.
-
-Practical rule
-Use Kalman when you want a live “cheap or expensive” gauge.
-
-Use ARIMA when you want a one-step forecast and forecast error monitoring.
-
-If you want, the best setup for your scanner is to run both and trigger only when they agree.
-
-Would you like me to turn this into a Python decision rule for your trading scanner?
-
-how you can implement Kalman and Arima in my code
-Completed 2 steps
-Yes — here is the clean way to implement both in your codebase: use ARIMA for next-bar forecast/residual signal and Kalman for adaptive fair value tracking. I saved a ready-to-adapt Python snippet for both methods.
-
-ARIMA in your code
-Fit ARIMA on a rolling window of your price series, forecast the next value, and use the forecast residual as the signal. In your workflow, that means: current price above forecast = stretched/expensive, below forecast = cheap, and the residual magnitude tells you signal strength.
-
-Kalman in your code
-Use Kalman as a recursive fair-value estimator on the same price series. Each new bar updates the hidden state, so the gap between price and filtered value becomes your live cheap/expensive measure.
-
-Practical setup for your scanner
-For your intraday scanner, I would structure it like this:
-
-ARIMA on the last 50 bars for forecast and residual.
-
-Kalman on the same window for fair-value gap.
-
-Trigger only when both agree on direction or when Kalman gap is large and ARIMA residual confirms.
-
-Next implementation step
-The saved snippet is in output/arima_kalman_snippets.py and contains two functions:
-
-arima_signal(close, order=(1,1,1), window=50)
-
-kalman_signal(close, q=1e-3, r=None)
-
-I can now rewrite this directly into your existing scanner file structure, using your 5-minute rolling loop and signal columns.
-
-For longs, prefer names where Directional > 0, Kalman Signal > 0, and ARIMA Signal > 0; for shorts, prefer Directional < 0, Kalman Signal < 0, and ARIMA Signal < 0 can you add this filter in email
-Completed 5 steps
-
-
-
-
-
-script.py
-Code
-
-Done — the email table now filters candidates using your rule: longs only when Directional > 0, ARIMA Signal > 0, and Kalman Signal > 0; shorts only when Directional < 0, ARIMA Signal < 0, and Kalman Signal < 0. I also refreshed the updated file attachment.
-
-What changed
-Added ARIMA Signal and Kalman Signal columns to the email display set.
-
-Added apply_arima_kalman_filter() to enforce the long/short signal agreement rule.
-
-Applied that filter before building the long and short candidate tables, so the email now only shows aligned setups.
-
-Result
-Your email will now separate:
-
-Long candidates that are bullish on Directional, ARIMA, and Kalman together.
-
-Short candidates that are bearish on Directional, ARIMA, and Kalman together.
-
-If you want, I can also add a visible Setup Score column so the email ranks only the strongest aligned names first.
-
-apply the cdoe
-Completed 2 steps
-
-
-script.py
-Code
-
-
-FO_FNO_FYERS_VOL_REL_EMAIL.py
-Python
-Applied. The updated file is attached now as FO_FNO_FYERS_VOL_REL_EMAIL.py with the ARIMA/Kalman agreement filter added to the email candidate selection.
-
-The long email list now only keeps rows with Directional > 0, ARIMA Signal > 0, and Kalman Signal > 0, while the short email list only keeps rows with Directional < 0, ARIMA Signal < 0, and Kalman Signal < 0.
-
-File "/home/runner/work/karthikeyan/karthikeyan/FO_FNO_FYERS_VOL_REL_EMAIL.py", line 4
-
-Build a quantitative benchmarking dashboard to compare the forecasting accuracy of a Kalman filter, ARIMA(p,d,q), and Holt-Winters exponential smoothing on a rolling 50-day window of volatile asset price data. Calculate and chart metrics including Mean Absolute Error (MAE), Root Mean Square Error (RMSE), and Mean Absolute Percentage Error (MAPE). Include a scatter plot visualizing the latency of each model's response to price jumps and show which model minimizes tracking error when stochastic noise is high vs low
-Completed 5 steps
-
-
-
-
-
-
-FO_FNO_FYERS_VOL_REL_EMAIL.py
-Python
-That error means the file on your runner got corrupted earlier, but I’ve now rebuilt and re-shared a clean version of FO_FNO_FYERS_VOL_REL_EMAIL.py.
-
-The corrected file now includes:
-
-Safe ARIMA import fallback, so missing statsmodels won’t crash the script.
-
-ARIMA Signal and Kalman Signal columns in CSV and email.
-
-Email filtering so longs require Directional > 0, ARIMA Signal > 0, and Kalman Signal > 0, while shorts require all three to be negative.
-
-Use the newly attached file and replace the old one in your GitHub repo.
-
-FO_FNO_FYERS_VOL_REL_EMAIL
 #!/usr/bin/env python3
 """
 FO_FNO_FYERS_VOL_REL_EMAIL.py
@@ -197,12 +15,6 @@ from typing import List, Dict, Optional, Tuple
 
 import numpy as np
 import pandas as pd
-try:
-    from statsmodels.tsa.arima.model import ARIMA as _ARIMA
-    _HAS_STATSMODELS = True
-except ImportError:
-    _ARIMA = None
-    _HAS_STATSMODELS = False
 from fyers_apiv3 import fyersModel
 import smtplib
 from email.mime.multipart import MIMEMultipart
@@ -246,7 +58,6 @@ recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
 EMAIL_DISPLAY_COLS = [
     "Symbol", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced",
-    "ARIMA Signal", "Kalman Signal",
     "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
     "Bull_Signal", "Bear_Signal", "Overall_Signal", "Price_Lead_Status", "IVP",
     "Volatility State", "Last Iteration Time",
@@ -631,53 +442,6 @@ def price_stats_from_series(prices: pd.Series) -> dict:
     return {"Directional": directional, "Turning": turning, "Stability": stability, "Balanced": balanced}
 
 
-
-def arima_signal_from_series(prices: pd.Series, order: tuple = (1, 1, 1), window: int = 50) -> float:
-    if not _HAS_STATSMODELS:
-        return float("nan")
-    p = pd.to_numeric(prices, errors="coerce").dropna().astype(float)
-    if len(p) < max(window // 2, 12):
-        return float("nan")
-    train = p.iloc[-window:] if len(p) > window else p
-    try:
-        fc = float(_ARIMA(train, order=order).fit().forecast(1).iloc[0])
-        last = float(train.iloc[-1])
-        scale = float(train.diff().std()) or 1e-6
-        return round((last - fc) / scale, 4)
-    except Exception:
-        return float("nan")
-
-
-def kalman_signal_from_series(prices: pd.Series, q: float = 1e-3) -> float:
-    p = pd.to_numeric(prices, errors="coerce").dropna().astype(float)
-    if len(p) < 5:
-        return float("nan")
-    arr = p.to_numpy()
-    x, P = float(arr[0]), 1.0
-    r = float(p.diff().dropna().var()) + 1e-6
-    for y in arr:
-        P += q
-        K = P / (P + r)
-        x += K * (y - x)
-        P *= (1.0 - K)
-    gap = arr[-1] - x
-    scale = float(p.std()) or 1e-6
-    return round(gap / scale, 4)
-
-
-def apply_arima_kalman_filter(df: pd.DataFrame, side: str) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-    out = df.copy()
-    ar = pd.to_numeric(out.get("ARIMA Signal"), errors="coerce")
-    ka = pd.to_numeric(out.get("Kalman Signal"), errors="coerce")
-    di = pd.to_numeric(out.get("Directional"), errors="coerce")
-    if side == "long":
-        mask = (di > 0) & (ar > 0) & (ka > 0)
-    else:
-        mask = (di < 0) & (ar < 0) & (ka < 0)
-    return out[mask.fillna(False)].copy()
-
 def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[Dict, pd.DataFrame]:
     if intra_df is None or intra_df.empty:
         return {}, pd.DataFrame()
@@ -776,8 +540,6 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
     summary = {
         "LTP": ltp, "Directional": final_ps["Directional"], "Turning": final_ps["Turning"],
         "Stability": final_ps["Stability"], "Balanced": final_ps["Balanced"],
-        "ARIMA Signal": arima_signal_from_series(curr_df["close"]),
-        "Kalman Signal": kalman_signal_from_series(curr_df["close"]),
         "Current Volume": last_cum_vol, "10 Day Relative Volume": last_rvol10,
         "20 Day Relative Volume": last_rvol20,
         "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[-1]) if not flow_df.empty else float("nan"),
@@ -827,8 +589,6 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "Symbol": sym, "LTP": ltp, "% Change": pct_change,
             "Directional": iter_summary.get("Directional"), "Turning": iter_summary.get("Turning"),
             "Stability": iter_summary.get("Stability"), "Balanced": iter_summary.get("Balanced"),
-            "ARIMA Signal": iter_summary.get("ARIMA Signal"),
-            "Kalman Signal": iter_summary.get("Kalman Signal"),
             "5m_Signal": iter_summary.get("5m_Signal"),
             "15m_Signal": iter_summary.get("15m_Signal"),
             "30m_Signal": iter_summary.get("30m_Signal"),
@@ -963,16 +723,14 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
 
     base = df.copy()
-    base_long = apply_arima_kalman_filter(base, "long")
-    base_short = apply_arima_kalman_filter(base, "short")
 
     for c in ["Directional", "Turning", "Bull_Signal", "Bear_Signal", "Overall_Signal"]:
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
 
     # Strict side filtering: long must be +ve directional, short must be -ve directional
-    long_df = base_long.copy() if not base_long.empty else pd.DataFrame()
-    short_df = base_short.copy() if not base_short.empty else pd.DataFrame()
+    long_df = base[base["Directional"] > 0].copy() if "Directional" in base.columns else pd.DataFrame()
+    short_df = base[base["Directional"] < 0].copy() if "Directional" in base.columns else pd.DataFrame()
 
     # LONG: ratio = abs(Directional) / Turning, then abs(Directional), then Turning
     if not long_df.empty:
@@ -1061,7 +819,6 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     )
     rows_html = []
     signal_cols = {
-        'ARIMA Signal', 'Kalman Signal',
         '5m_Signal', '15m_Signal', '30m_Signal', '60m_Signal',
         'Bull_Signal', 'Bear_Signal', 'Overall_Signal', 'Volatility State', 'Price_Lead_Status'
     }
