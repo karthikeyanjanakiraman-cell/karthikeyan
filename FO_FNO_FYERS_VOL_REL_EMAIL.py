@@ -2,14 +2,15 @@
 """
 FO_FNO_FYERS_VOL_REL_EMAIL.py
 Intraday F&O scanner via Fyers API with email alerts.
-Complete standalone file ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â no external email.py dependency.
+Complete standalone file - no external email.py dependency.
 SORTS CANDIDATES BY DIRECTIONAL COLUMN.
-ALL STATISTICAL SCORES ARE RAW (ORIGINAL FORMULAS).
+ALL STATISTICAL SCORES ARE RAW (ORIGINAL FORMULAS), except ARIMA/Kalman are standardized for cross-stock comparability.
 """
 import os
 import re
 import sys
 import logging
+import warnings
 from datetime import datetime, timedelta, time
 from typing import List, Dict, Optional, Tuple
 
@@ -22,6 +23,9 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
+
+warnings.filterwarnings("ignore", message="Non-stationary starting autoregressive parameters found.*")
+warnings.filterwarnings("ignore", message="Non-invertible starting MA parameters found.*")
 
 
 class UTF8Formatter(logging.Formatter):
@@ -37,9 +41,7 @@ if logger.hasHandlers():
     logger.handlers.clear()
 ch = logging.StreamHandler(sys.stdout)
 ch.setLevel(logging.INFO)
-formatter = UTF8Formatter(
-    "%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"
-)
+formatter = UTF8Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 ch.setFormatter(formatter)
 logger.addHandler(ch)
 
@@ -50,7 +52,6 @@ INDEX_SOFT_BOOST_WEIGHT = 0.25
 
 fyers: Optional[fyersModel.FyersModel] = None
 
-# Email settings (adjust to your environment)
 smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 smtp_port = int(os.environ.get("SMTP_PORT", "587"))
 sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
@@ -59,18 +60,15 @@ recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
 EMAIL_DISPLAY_COLS = [
     "Symbol", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced",
-    "ARIMA Signal", "Kalman Signal",
-    "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
+    "ARIMA Signal", "Kalman Signal", "SlopeConsistency",
     "Bull_Signal", "Bear_Signal", "Overall_Signal", "Price_Lead_Status", "IVP",
     "Volatility State", "Last Iteration Time",
 ]
 
 
 def build_signals_from_raw_directional(detail_df) -> dict:
-    nan = float('nan')
-    out = {k: nan for k in (
-        "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
-        "Bull_Signal", "Bear_Signal", "Overall_Signal")}
+    nan = float("nan")
+    out = {k: nan for k in ("SlopeConsistency", "Bull_Signal", "Bear_Signal", "Overall_Signal")}
     if detail_df is None or detail_df.empty:
         return out
     df = detail_df.copy()
@@ -79,19 +77,18 @@ def build_signals_from_raw_directional(detail_df) -> dict:
     vals = pd.to_numeric(df["Directional"], errors="coerce").dropna().to_numpy(dtype=float)
     if vals.size == 0:
         return out
-    last = vals.size - 1
-    def raw_at(offset: int) -> float:
-        i = last - offset
-        if i < 0:
-            i = 0
-        return float(vals[i])
-    out["5m_Signal"] = round(raw_at(0), 4)
-    out["15m_Signal"] = round(raw_at(3) if last >= 3 else raw_at(0), 4)
-    out["30m_Signal"] = round(raw_at(6) if last >= 6 else raw_at(0), 4)
-    out["60m_Signal"] = round(raw_at(12) if last >= 12 else raw_at(0), 4)
-    out["Bull_Signal"] = round(float(vals[vals > 0].max()) if (vals > 0).any() else 0.0, 4)
-    out["Bear_Signal"] = round(abs(float(vals[vals < 0].min())) if (vals < 0).any() else 0.0, 4)
-    out["Overall_Signal"] = round(raw_at(0), 4)
+    final_sign = np.sign(vals[-1])
+    windows = [1, 3, 6, 12]
+    agreements = []
+    for w in windows:
+        if len(vals) > w:
+            segment = vals[-w:]
+            seg_slope = segment[-1] - segment[0]
+            agreements.append(1.0 if np.sign(seg_slope) == final_sign else -1.0)
+    out["SlopeConsistency"] = round(float(np.mean(agreements)), 4) if agreements else nan
+    out["Bull_Signal"] = round(float(vals[vals > 0].max()), 4) if (vals > 0).any() else 0.0
+    out["Bear_Signal"] = round(abs(float(vals[vals < 0].min())), 4) if (vals < 0).any() else 0.0
+    out["Overall_Signal"] = round(float(vals[-1]), 4)
     return out
 
 
@@ -104,9 +101,7 @@ def init_fyers():
             logger.warning("INIT Missing Fyers credentials.")
             fyers = None
             return
-        fyers = fyersModel.FyersModel(
-            client_id=client_id, is_async=False, token=access_token, log_path=""
-        )
+        fyers = fyersModel.FyersModel(client_id=client_id, is_async=False, token=access_token, log_path="")
         logger.info("INIT FyersModel initialized successfully.")
     except Exception as e:
         logger.warning(f"INIT Failed: {e}")
@@ -123,10 +118,7 @@ def load_fno_symbols_from_sectors(root_dir: str = "sectors") -> List[str]:
                 continue
             try:
                 df = pd.read_csv(os.path.join(dirpath, fname))
-                col = next(
-                    (c for c in df.columns if c.lower() in ["symbol", "symbols", "ticker"]),
-                    None,
-                )
+                col = next((c for c in df.columns if c.lower() in ["symbol", "symbols", "ticker"]), None)
                 if col is None:
                     continue
                 for s in df[col].dropna().astype(str):
@@ -136,95 +128,6 @@ def load_fno_symbols_from_sectors(root_dir: str = "sectors") -> List[str]:
             except Exception:
                 pass
     return sorted(symbols)
-
-
-def load_symbol_to_indices_map(root_dir: str = "sectors") -> Dict[str, List[str]]:
-    mapping: Dict[str, List[str]] = {}
-    search_dirs = [root_dir, '.']
-    for base in search_dirs:
-        if not os.path.isdir(base):
-            continue
-        for dirpath, _, filenames in os.walk(base):
-            for fname in filenames:
-                if not fname.lower().endswith('.csv'):
-                    continue
-                path = os.path.join(dirpath, fname)
-                try:
-                    df = pd.read_csv(path)
-                except Exception:
-                    continue
-                cols = {str(c).strip().lower(): c for c in df.columns}
-                sym_col = None
-                for key in ['symbol', 'symbols', 'ticker']:
-                    if key in cols:
-                        sym_col = cols[key]
-                        break
-                idx_col = None
-                for key in ['belongstoindices', 'belongs_to_indices', 'index name', 'index_name', 'sector', 'indices']:
-                    if key in cols:
-                        idx_col = cols[key]
-                        break
-                if not sym_col or not idx_col:
-                    continue
-                for _, row in df[[sym_col, idx_col]].dropna().iterrows():
-                    sym = str(row[sym_col]).strip().upper()
-                    raw_idx = str(row[idx_col]).strip()
-                    if not sym or not raw_idx:
-                        continue
-                    parts = [p.strip() for p in re.split(r'[|;,/]+', raw_idx) if p.strip()]
-                    if not parts:
-                        parts = [raw_idx]
-                    current = mapping.setdefault(sym, [])
-                    for part in parts:
-                        if part not in current:
-                            current.append(part)
-    return mapping
-
-
-def resolve_universe_csv() -> str:
-    csv_files = []
-    for dirpath, _, filenames in os.walk('.'):
-        for fname in filenames:
-            if fname.lower().endswith('.csv'):
-                csv_files.append(os.path.join(dirpath, fname))
-    scored = []
-    for path in csv_files:
-        try:
-            df = pd.read_csv(path, nrows=5)
-            cols = {str(c).strip().lower() for c in df.columns}
-            score = 0
-            if 'symbol' in cols:
-                score += 5
-            if 'belongstoindices' in cols or 'belongs_to_indices' in cols:
-                score += 5
-            if 'company name' in cols or 'company_name' in cols:
-                score += 2
-            if score > 0:
-                scored.append((score, os.path.getmtime(path), path))
-        except Exception:
-            continue
-    if scored:
-        scored.sort(reverse=True)
-        chosen = scored[0][2]
-        logger.info(f"CSV Auto-selected universe file: {chosen}")
-        return chosen
-    logger.warning("CSV No matching universe CSV found; defaulting to fno_stock_list.csv")
-    return 'fno_stock_list.csv'
-
-
-def load_fno_symbols_from_csv(path: str = "fno_stock_list.csv") -> List[str]:
-    if not os.path.exists(path):
-        logger.warning(f"FNO CSV not found at {path}")
-        return []
-    try:
-        df = pd.read_csv(path)
-        if "Symbol" not in df.columns:
-            logger.warning("FNO CSV missing 'Symbol' column")
-            return []
-        return sorted(df["Symbol"].dropna().astype(str).str.strip().unique())
-    except Exception as e:
-        logger.error(f"Error reading FNO CSV {path}: {e}")
-        return []
 
 
 def format_fyers_symbol(symbol: str) -> str:
@@ -249,10 +152,7 @@ def get_fyers_history(symbol: str, resolution: str, days_back: int) -> Optional[
         }
         res = fyers.history(data=data)
         if res and res.get("s") == "ok" and "candles" in res and res["candles"]:
-            df = pd.DataFrame(
-                res["candles"],
-                columns=["timestamp", "open", "high", "low", "close", "volume"],
-            )
+            df = pd.DataFrame(res["candles"], columns=["timestamp", "open", "high", "low", "close", "volume"])
             df["timestamp"] = (
                 pd.to_datetime(df["timestamp"], unit="s")
                 .dt.tz_localize("UTC")
@@ -271,9 +171,7 @@ def get_fyers_history(symbol: str, resolution: str, days_back: int) -> Optional[
 def compute_iv_proxies(daily_df: Optional[pd.DataFrame]) -> Dict[str, float]:
     if daily_df is None or daily_df.empty or len(daily_df) < 30:
         return {"IVP": np.nan, "Volatility State": "Neutral Vol"}
-    df = daily_df.copy().sort_values(
-        "timestamp" if "timestamp" in daily_df.columns else daily_df.columns[0]
-    ).reset_index(drop=True)
+    df = daily_df.copy().sort_values("timestamp" if "timestamp" in daily_df.columns else daily_df.columns[0]).reset_index(drop=True)
     close = pd.to_numeric(df["close"], errors="coerce").astype(float)
     high = pd.to_numeric(df["high"], errors="coerce").astype(float)
     low = pd.to_numeric(df["low"], errors="coerce").astype(float)
@@ -372,7 +270,7 @@ def compute_cumulative_flow_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
     cum_vol = volume.cumsum().replace(0, float("nan"))
     vwap = (cum_pv / cum_vol).fillna(0.0)
     vwap_variance = (volume * (typical_price - vwap) ** 2).cumsum() / cum_vol
-    vwap_std = np.sqrt(vwap_variance).fillna(0.0)
+    vwap_std = pd.Series(np.sqrt(vwap_variance), index=df.index).fillna(0.0)
     vwap_z_score = np.where(vwap_std > 0, (close - vwap) / vwap_std, 0.0)
     out = pd.DataFrame({
         "Cumulative RSI": rsi,
@@ -386,10 +284,7 @@ def compute_cumulative_flow_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
 def compute_price_lead_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
     df = curr_df.copy().sort_values("time").reset_index(drop=True)
     if df.empty:
-        return pd.DataFrame(columns=[
-            "time", "range_expansion", "volume_expansion", "delta_expansion",
-            "price_leading_flag", "price_lead_streak", "Price_Lead_Status",
-        ])
+        return pd.DataFrame(columns=["time", "range_expansion", "volume_expansion", "delta_expansion", "price_leading_flag", "price_lead_streak", "Price_Lead_Status"])
     for col in ["open", "high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce")
     df["range"] = (df["high"] - df["low"]).clip(lower=0.0)
@@ -397,17 +292,14 @@ def compute_price_lead_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
     df["range_expansion"] = np.where(df["avg_range_5"] > 0, df["range"] / df["avg_range_5"], np.nan)
     df["avg_vol_5"] = df["volume"].rolling(5, min_periods=3).mean()
     df["volume_expansion"] = np.where(df["avg_vol_5"] > 0, df["volume"] / df["avg_vol_5"], np.nan)
-    df["mid"] = (df["high"] + df["low"]) / 2.0
+    df["mid"] = (df["high"] + df["low"] ) / 2.0
     df["delta"] = np.where(df["close"] > df["mid"], df["volume"], np.where(df["close"] < df["mid"], -df["volume"], 0.0))
     df["cvd"] = pd.Series(df["delta"], index=df.index).cumsum()
     df["cvd_change"] = df["cvd"].diff().abs().fillna(0.0)
     df["avg_cvd_change_5"] = df["cvd_change"].rolling(5, min_periods=3).mean()
     df["delta_expansion"] = np.where(df["avg_cvd_change_5"] > 0, df["cvd_change"] / df["avg_cvd_change_5"], np.nan)
     directional_bar = (df["close"] > df["open"]) | (df["close"] < df["open"])
-    df["price_leading_flag"] = (
-        (df["range_expansion"] >= 1.5) & (df["volume_expansion"] <= 1.0) &
-        (df["delta_expansion"] <= 1.0) & directional_bar
-    ).fillna(False)
+    df["price_leading_flag"] = ((df["range_expansion"] >= 1.5) & (df["volume_expansion"] <= 1.0) & (df["delta_expansion"] <= 1.0) & directional_bar).fillna(False)
     streak = []
     run = 0
     for flag in df["price_leading_flag"].astype(bool):
@@ -415,18 +307,11 @@ def compute_price_lead_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
         streak.append(run)
     df["price_lead_streak"] = streak
     df["Price_Lead_Status"] = np.select(
-        [
-            df["price_leading_flag"] & (df["price_lead_streak"] >= 3),
-            df["price_leading_flag"] & (df["price_lead_streak"] >= 2),
-            df["price_leading_flag"],
-        ],
+        [df["price_leading_flag"] & (df["price_lead_streak"] >= 3), df["price_leading_flag"] & (df["price_lead_streak"] >= 2), df["price_leading_flag"]],
         ["STRONG_PRICE_LEAD_FADE", "PRICE_LEADING_FADE_RISK", "EARLY_PRICE_LEAD"],
         default="NORMAL",
     )
-    return df[[
-        "time", "range_expansion", "volume_expansion", "delta_expansion",
-        "price_leading_flag", "price_lead_streak", "Price_Lead_Status",
-    ]]
+    return df[["time", "range_expansion", "volume_expansion", "delta_expansion", "price_leading_flag", "price_lead_streak", "Price_Lead_Status"]]
 
 
 def price_stats_from_series(prices: pd.Series) -> dict:
@@ -444,24 +329,22 @@ def price_stats_from_series(prices: pd.Series) -> dict:
     return {"Directional": directional, "Turning": turning, "Stability": stability, "Balanced": balanced}
 
 
-
 def arima_signal_from_series(prices: pd.Series, order: tuple = (1, 1, 1), window: int = 50) -> float:
-    """ARIMA residual z-score (price-only). Positive = price above forecast (expensive), negative = below (cheap)."""
     p = pd.to_numeric(prices, errors="coerce").dropna().astype(float)
     if len(p) < max(window // 2, 12):
         return float("nan")
-    train = p.iloc[-window:] if len(p) > window else p
+    train = p.iloc[-window:] if len(p) >= window else p
     try:
-        fc = float(ARIMA(train, order=order).fit().forecast(1).iloc[0])
+        fc = float(ARIMA(train, order=order, trend="n").fit().forecast(1).iloc[0])
         last = float(train.iloc[-1])
         scale = float(train.diff().std()) or 1e-6
-        return round((last - fc) / scale, 4)
+        raw_z = (last - fc) / scale
+        return round(float(np.tanh(raw_z / 3.0)), 4)
     except Exception:
         return float("nan")
 
 
 def kalman_signal_from_series(prices: pd.Series, q: float = 1e-3) -> float:
-    """Kalman fair-value gap z-score (price-only). Positive = price above fair value (expensive), negative = below (cheap)."""
     p = pd.to_numeric(prices, errors="coerce").dropna().astype(float)
     if len(p) < 5:
         return float("nan")
@@ -475,7 +358,8 @@ def kalman_signal_from_series(prices: pd.Series, q: float = 1e-3) -> float:
         P *= (1.0 - K)
     gap = arr[-1] - x
     scale = float(p.std()) or 1e-6
-    return round(gap / scale, 4)
+    raw_z = gap / scale
+    return round(float(np.tanh(raw_z / 3.0)), 4)
 
 
 def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[Dict, pd.DataFrame]:
@@ -570,21 +454,24 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
     if not flow_df.empty and len(flow_df) >= 7:
         obv_30m_delta = float(flow_df["Cumulative OBV"].iloc[-1]) - float(flow_df["Cumulative OBV"].iloc[-7])
         rsi_30m_delta = float(flow_df["Cumulative RSI"].iloc[-1]) - float(flow_df["Cumulative RSI"].iloc[-7])
-    adx_now = float(metric_df["Cumulative ADX"].iloc[-1]) if not metric_df.empty else float("nan")
-    ker_now = float(metric_df["Cumulative KER"].iloc[-1]) if not metric_df.empty else float("nan")
     final_ps = price_stats_from_series(curr_df["close"])
     summary = {
-        "LTP": ltp, "Directional": final_ps["Directional"], "Turning": final_ps["Turning"],
-        "Stability": final_ps["Stability"], "Balanced": final_ps["Balanced"],
+        "LTP": ltp,
+        "Directional": final_ps["Directional"],
+        "Turning": final_ps["Turning"],
+        "Stability": final_ps["Stability"],
+        "Balanced": final_ps["Balanced"],
         "ARIMA Signal": arima_signal_from_series(curr_df["close"]),
         "Kalman Signal": kalman_signal_from_series(curr_df["close"]),
-        "Current Volume": last_cum_vol, "10 Day Relative Volume": last_rvol10,
+        "Current Volume": last_cum_vol,
+        "10 Day Relative Volume": last_rvol10,
         "20 Day Relative Volume": last_rvol20,
         "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[-1]) if not flow_df.empty else float("nan"),
         "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[-1]) if not flow_df.empty else float("nan"),
-        "Total Iterations": total_iters, "Last Iteration Minutes": last_iter_mins,
+        "Total Iterations": total_iters,
+        "Last Iteration Minutes": last_iter_mins,
         "Last Iteration Time": last_iter_time,
         "Cumulative KER": float(metric_df["Cumulative KER"].iloc[-1]) if not metric_df.empty else np.nan,
         "Cumulative +DI": float(metric_df["Cumulative +DI"].iloc[-1]) if not metric_df.empty else np.nan,
@@ -592,13 +479,15 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         "Cumulative ADX": float(metric_df["Cumulative ADX"].iloc[-1]) if not metric_df.empty else np.nan,
         "Survival Score": str(metric_df["Survival Score"].iloc[-1]) if not metric_df.empty else "0/0",
         "Survival_Num": float(metric_df["Survival_Num"].iloc[-1]) if not metric_df.empty else 0.0,
-        "HOD": hod, "Strike_Distance": strike_distance,
-        "Last_5m_Volume": last_5m_volume, "Volume_1h_Avg_5m": vol_1h_avg_5m,
-        "OBV_30m_Delta": obv_30m_delta, "RSI_30m_Delta": rsi_30m_delta,
+        "HOD": hod,
+        "Strike_Distance": strike_distance,
+        "Last_5m_Volume": last_5m_volume,
+        "Volume_1h_Avg_5m": vol_1h_avg_5m,
+        "OBV_30m_Delta": obv_30m_delta,
+        "RSI_30m_Delta": rsi_30m_delta,
         "Price_Lead_Status": str(price_lead_df["Price_Lead_Status"].iloc[-1]) if not price_lead_df.empty else "NORMAL",
     }
-    signals = build_signals_from_raw_directional(detail_df)
-    summary.update(signals)
+    summary.update(build_signals_from_raw_directional(detail_df))
     return summary, detail_df
 
 
@@ -624,54 +513,46 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             iter_detail.insert(1, "% Change", pct_change)
             iteration_rows.append(iter_detail)
         rows.append({
-            "Symbol": sym, "LTP": ltp, "% Change": pct_change,
-            "Directional": iter_summary.get("Directional"), "Turning": iter_summary.get("Turning"),
-            "Stability": iter_summary.get("Stability"), "Balanced": iter_summary.get("Balanced"),
+            "Symbol": sym,
+            "LTP": ltp,
+            "% Change": pct_change,
+            "Directional": iter_summary.get("Directional"),
+            "Turning": iter_summary.get("Turning"),
+            "Stability": iter_summary.get("Stability"),
+            "Balanced": iter_summary.get("Balanced"),
             "ARIMA Signal": iter_summary.get("ARIMA Signal"),
             "Kalman Signal": iter_summary.get("Kalman Signal"),
-            "5m_Signal": iter_summary.get("5m_Signal"),
-            "15m_Signal": iter_summary.get("15m_Signal"),
-            "30m_Signal": iter_summary.get("30m_Signal"),
-            "60m_Signal": iter_summary.get("60m_Signal"),
+            "SlopeConsistency": iter_summary.get("SlopeConsistency"),
             "Bull_Signal": iter_summary.get("Bull_Signal"),
             "Bear_Signal": iter_summary.get("Bear_Signal"),
             "Overall_Signal": iter_summary.get("Overall_Signal"),
             "Current Volume": iter_summary.get("Current Volume"),
             "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"),
             "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"),
-            "Cumulative RSI": iter_summary.get("Cumulative RSI"), "Cumulative OBV": iter_summary.get("Cumulative OBV"),
-            "Cumulative VWAP": iter_summary.get("Cumulative VWAP"), "VWAP Z-Score": iter_summary.get("VWAP Z-Score"),
+            "Cumulative RSI": iter_summary.get("Cumulative RSI"),
+            "Cumulative OBV": iter_summary.get("Cumulative OBV"),
+            "Cumulative VWAP": iter_summary.get("Cumulative VWAP"),
+            "VWAP Z-Score": iter_summary.get("VWAP Z-Score"),
             "Total Iterations": iter_summary.get("Total Iterations"),
             "Last Iteration Minutes": iter_summary.get("Last Iteration Minutes"),
             "Last Iteration Time": iter_summary.get("Last Iteration Time"),
-            "Cumulative KER": iter_summary.get("Cumulative KER"), "Cumulative +DI": iter_summary.get("Cumulative +DI"),
-            "Cumulative -DI": iter_summary.get("Cumulative -DI"), "Cumulative ADX": iter_summary.get("Cumulative ADX"),
-            "Survival Score": iter_summary.get("Survival Score"), "Survival_Num": iter_summary.get("Survival_Num"),
-            "HOD": iter_summary.get("HOD"), "Strike_Distance": iter_summary.get("Strike_Distance"),
-            "Last_5m_Volume": iter_summary.get("Last_5m_Volume"), "Volume_1h_Avg_5m": iter_summary.get("Volume_1h_Avg_5m"),
-            "OBV_30m_Delta": iter_summary.get("OBV_30m_Delta"), "RSI_30m_Delta": iter_summary.get("RSI_30m_Delta"),
+            "Cumulative KER": iter_summary.get("Cumulative KER"),
+            "Cumulative +DI": iter_summary.get("Cumulative +DI"),
+            "Cumulative -DI": iter_summary.get("Cumulative -DI"),
+            "Cumulative ADX": iter_summary.get("Cumulative ADX"),
+            "Survival Score": iter_summary.get("Survival Score"),
+            "Survival_Num": iter_summary.get("Survival_Num"),
+            "HOD": iter_summary.get("HOD"),
+            "Strike_Distance": iter_summary.get("Strike_Distance"),
+            "Last_5m_Volume": iter_summary.get("Last_5m_Volume"),
+            "Volume_1h_Avg_5m": iter_summary.get("Volume_1h_Avg_5m"),
+            "OBV_30m_Delta": iter_summary.get("OBV_30m_Delta"),
+            "RSI_30m_Delta": iter_summary.get("RSI_30m_Delta"),
             "Price_Lead_Status": iter_summary.get("Price_Lead_Status", "NORMAL"),
-            "IVP": iv_info.get("IVP"), "Volatility State": iv_info.get("Volatility State"),
+            "IVP": iv_info.get("IVP"),
+            "Volatility State": iv_info.get("Volatility State"),
         })
-    return (pd.DataFrame(rows), (pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame()))
-
-
-def rank_delta_to_label(delta: float) -> str:
-    if pd.isna(delta):
-        return ""
-    if delta >= 7:
-        return "Buy++"
-    if delta >= 4:
-        return "Buy+"
-    if delta >= 1:
-        return "Buy"
-    if delta == 0:
-        return "Neutral"
-    if delta <= -7:
-        return "Sell++"
-    if delta <= -4:
-        return "Sell+"
-    return "Sell"
+    return pd.DataFrame(rows), (pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame())
 
 
 def derive_rank_columns(df: pd.DataFrame) -> pd.DataFrame:
@@ -713,10 +594,6 @@ def derive_rank_columns(df: pd.DataFrame) -> pd.DataFrame:
     out["Bull Rank"] = bull
     out["Bear Rank"] = bear
     out["Rank Delta"] = bull - bear
-    for tf, w in {"5m": 1.0, "15m": 0.9, "30m": 0.8, "60m": 0.7}.items():
-        out[f"{tf}BullRank"] = (bull * w).round().clip(lower=0, upper=14)
-        out[f"{tf}BearRank"] = (bear * w).round().clip(lower=0, upper=14)
-        out[f"{tf}RankDelta"] = out[f"{tf}BullRank"] - out[f"{tf}BearRank"]
     return out
 
 
@@ -724,19 +601,23 @@ def add_signal_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-
 def signal_color(label) -> str:
     try:
         v = float(label)
-        if v > 0: return "#2e7d32"
-        if v < 0: return "#7f1d1d"
+        if v > 0:
+            return "#2e7d32"
+        if v < 0:
+            return "#7f1d1d"
         return "#4b5563"
     except (ValueError, TypeError):
         pass
     label = str(label).strip()
-    if label == "Buyer Zone": return "#33691e"
-    if label == "Neutral Vol": return "#4b5563"
-    if label == "Avoid Buy Premium": return "#7a5c00"
+    if label == "Buyer Zone":
+        return "#33691e"
+    if label == "Neutral Vol":
+        return "#4b5563"
+    if label == "Avoid Buy Premium":
+        return "#7a5c00"
     return "#374151"
 
 
@@ -758,94 +639,39 @@ def format_value(col: str, val):
         return f"{float(val):.2f}"
     return str(val)
 
+
 def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df is None or df.empty:
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-
     base = df.copy()
-
-    for c in ["Directional", "Turning", "Bull_Signal", "Bear_Signal", "Overall_Signal"]:
+    for c in ["Directional", "Turning", "Bull_Signal", "Bear_Signal", "Overall_Signal", "SlopeConsistency"]:
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
-
-    # Strict side filtering: long must be +ve directional, short must be -ve directional
     long_df = base[base["Directional"] > 0].copy() if "Directional" in base.columns else pd.DataFrame()
     short_df = base[base["Directional"] < 0].copy() if "Directional" in base.columns else pd.DataFrame()
-
-    # LONG: ratio = abs(Directional) / Turning, then abs(Directional), then Turning
     if not long_df.empty:
         long_df["_abs_directional"] = long_df["Directional"].abs()
-        long_df["_turning_safe"] = pd.to_numeric(long_df["Turning"], errors="coerce")
-        long_df["_turning_safe"] = long_df["_turning_safe"].replace(0, np.nan)
+        long_df["_turning_safe"] = pd.to_numeric(long_df["Turning"], errors="coerce").replace(0, np.nan)
         long_df["_dir_turn_ratio"] = long_df["_abs_directional"] / long_df["_turning_safe"]
-
-        long_df = (
-            long_df
-            .sort_values(
-                by=["_dir_turn_ratio", "_abs_directional", "Turning"],
-                ascending=[False, False, True],
-                na_position="last",
-            )
-            .drop_duplicates(subset=["Symbol"])
-            .head(15)
-        )
-
-        long_df = long_df.drop(
-            columns=["_abs_directional", "_turning_safe", "_dir_turn_ratio"],
-            errors="ignore"
-        )
-
-    # SHORT: ratio = abs(Directional) / Turning, then abs(Directional), then Turning
+        long_df = long_df.sort_values(by=["_dir_turn_ratio", "_abs_directional", "Turning"], ascending=[False, False, True], na_position="last").drop_duplicates(subset=["Symbol"]).head(15)
+        long_df = long_df.drop(columns=["_abs_directional", "_turning_safe", "_dir_turn_ratio"], errors="ignore")
     if not short_df.empty:
         short_df["_abs_directional"] = short_df["Directional"].abs()
-        short_df["_turning_safe"] = pd.to_numeric(short_df["Turning"], errors="coerce")
-        short_df["_turning_safe"] = short_df["_turning_safe"].replace(0, np.nan)
+        short_df["_turning_safe"] = pd.to_numeric(short_df["Turning"], errors="coerce").replace(0, np.nan)
         short_df["_dir_turn_ratio"] = short_df["_abs_directional"] / short_df["_turning_safe"]
-
-        short_df = (
-            short_df
-            .sort_values(
-                by=["_dir_turn_ratio", "_abs_directional", "Turning"],
-                ascending=[False, False, True],
-                na_position="last",
-            )
-            .drop_duplicates(subset=["Symbol"])
-            .head(15)
-        )
-
-        short_df = short_df.drop(
-            columns=["_abs_directional", "_turning_safe", "_dir_turn_ratio"],
-            errors="ignore"
-        )
-
+        short_df = short_df.sort_values(by=["_dir_turn_ratio", "_abs_directional", "Turning"], ascending=[False, False, True], na_position="last").drop_duplicates(subset=["Symbol"]).head(15)
+        short_df = short_df.drop(columns=["_abs_directional", "_turning_safe", "_dir_turn_ratio"], errors="ignore")
     if not long_df.empty:
-        long_df = long_df.drop(
-            columns=[c for c in ["Bear_Signal", "Overall_Signal"] if c in long_df.columns]
-        )
-
+        long_df = long_df.drop(columns=[c for c in ["Bear_Signal", "Overall_Signal"] if c in long_df.columns])
     if not short_df.empty:
-        short_df = short_df.drop(
-            columns=[c for c in ["Bull_Signal", "Overall_Signal"] if c in short_df.columns]
-        )
-
+        short_df = short_df.drop(columns=[c for c in ["Bull_Signal", "Overall_Signal"] if c in short_df.columns])
     long_cols = [c for c in EMAIL_DISPLAY_COLS if c in long_df.columns]
     short_cols = [c for c in EMAIL_DISPLAY_COLS if c in short_df.columns]
-
-    long_df = (
-        long_df[long_cols]
-        if not long_df.empty
-        else pd.DataFrame(columns=[c for c in EMAIL_DISPLAY_COLS if c not in {"Bear_Signal", "Overall_Signal"}])
-    )
-
-    short_df = (
-        short_df[short_cols]
-        if not short_df.empty
-        else pd.DataFrame(columns=[c for c in EMAIL_DISPLAY_COLS if c not in {"Bull_Signal", "Overall_Signal"}])
-    )
-
+    long_df = long_df[long_cols] if not long_df.empty else pd.DataFrame(columns=[c for c in EMAIL_DISPLAY_COLS if c not in {"Bear_Signal", "Overall_Signal"}])
+    short_df = short_df[short_cols] if not short_df.empty else pd.DataFrame(columns=[c for c in EMAIL_DISPLAY_COLS if c not in {"Bull_Signal", "Overall_Signal"}])
     return long_df, short_df
-    
-                
+
+
 def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     if df is None or df.empty:
         return '<p style="color:#cbd5e1;font-family:Arial,sans-serif;">No candidates found.</p>'
@@ -853,16 +679,9 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     cols = [c for c in EMAIL_DISPLAY_COLS if c in df_slice.columns]
     if not cols:
         return '<p style="color:#cbd5e1;font-family:Arial,sans-serif;">No candidates found.</p>'
-    header_cells = ''.join(
-        f'<th style="padding:8px 10px;border:1px solid #4b5563;background:#374151;color:#f9fafb;font-size:12px;font-weight:700;text-align:center;white-space:nowrap;">{c}</th>'
-        for c in cols
-    )
+    header_cells = ''.join(f'<th style="padding:8px 10px;border:1px solid #4b5563;background:#374151;color:#f9fafb;font-size:12px;font-weight:700;text-align:center;white-space:nowrap;">{c}</th>' for c in cols)
     rows_html = []
-    signal_cols = {
-        '5m_Signal', '15m_Signal', '30m_Signal', '60m_Signal',
-        'Bull_Signal', 'Bear_Signal', 'Overall_Signal', 'Volatility State', 'Price_Lead_Status',
-        'ARIMA Signal', 'Kalman Signal'
-    }
+    signal_cols = {'SlopeConsistency', 'Bull_Signal', 'Bear_Signal', 'Overall_Signal', 'Volatility State', 'Price_Lead_Status', 'ARIMA Signal', 'Kalman Signal'}
     for _, row in df_slice.iterrows():
         cells = []
         for c in cols:
@@ -889,22 +708,15 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
                 except Exception:
                     bg = '#4b5563'; fg = '#f3f4f6'
             elif c in {'LTP', 'IVP'}:
-                bg = '#303643'
-                fg = '#f3f4f6'
+                bg = '#303643'; fg = '#f3f4f6'
             else:
-                bg = '#3b4252'
-                fg = '#f3f4f6'
+                bg = '#3b4252'; fg = '#f3f4f6'
             cells.append(f'<td style="padding:7px 9px;border:1px solid #4b5563;background:{bg};color:{fg};font-size:12px;font-weight:600;white-space:nowrap;{extra}">{val}</td>')
         rows_html.append('<tr>' + ''.join(cells) + '</tr>')
-    return ('<div style="overflow-x:auto;margin:10px 0 18px 0;">' '<table style="border-collapse:collapse;background:#1f2937;font-family:Arial,sans-serif;">' f'<thead><tr>{header_cells}</tr></thead>' f'<tbody>{"" .join(rows_html)}</tbody>' '</table></div>')
+    return '<div style="overflow-x:auto;margin:10px 0 18px 0;"><table style="border-collapse:collapse;background:#1f2937;font-family:Arial,sans-serif;"><thead><tr>' + header_cells + '</tr></thead><tbody>' + ''.join(rows_html) + '</tbody></table></div>'
 
 
-def send_email_with_tables(
-    long_df: pd.DataFrame, short_df: pd.DataFrame,
-    csv_filename: str, detail_csv_filename: str,
-    index_long_df: pd.DataFrame = None, index_short_df: pd.DataFrame = None,
-    index_iter_csv_filename: Optional[str] = None,
-) -> bool:
+def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str, detail_csv_filename: str, index_long_df: pd.DataFrame = None, index_short_df: pd.DataFrame = None, index_iter_csv_filename: Optional[str] = None) -> bool:
     try:
         if index_long_df is None:
             index_long_df = pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
@@ -917,23 +729,23 @@ def send_email_with_tables(
         stock_short_html = df_to_html_table(short_df)
         html_body = f"""
 <html>
-  <body style="font-family: Arial, sans-serif; font-size: 13px; background:#111827; color:#e5e7eb;">
-    <h2 style="color:#f9fafb;">Intraday Vol Iteration Alert</h2>
-    <p style="color:#9ca3af;">Scan completed at {scan_time}.</p>
-    <h3 style="color:#34d399;">Index Long Candidates</h3>
+  <body style=\"font-family: Arial, sans-serif; font-size: 13px; background:#111827; color:#e5e7eb;\">
+    <h2 style=\"color:#f9fafb;\">Intraday Vol Iteration Alert</h2>
+    <p style=\"color:#9ca3af;\">Scan completed at {scan_time}.</p>
+    <h3 style=\"color:#34d399;\">Index Long Candidates</h3>
     {index_long_html}
-    <h3 style="color:#f87171;">Index Short Candidates</h3>
+    <h3 style=\"color:#f87171;\">Index Short Candidates</h3>
     {index_short_html}
-    <h3 style="color:#34d399;">Stock Long Candidates</h3>
+    <h3 style=\"color:#34d399;\">Stock Long Candidates</h3>
     {stock_long_html}
-    <h3 style="color:#f87171;">Stock Short Candidates</h3>
+    <h3 style=\"color:#f87171;\">Stock Short Candidates</h3>
     {stock_short_html}
-    <p style="color:#6b7280; font-size:11px; margin-top:20px;">Generated by FO_FNO_FYERS_VOL_REL_EMAIL.py</p>
+    <p style=\"color:#6b7280; font-size:11px; margin-top:20px;\">Generated by FO_FNO_FYERS_VOL_REL_EMAIL.py</p>
   </body>
 </html>
 """
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"Intraday Scan ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â {scan_time}"
+        msg["Subject"] = f"Intraday Scan - {scan_time}"
         msg["From"] = sender_email
         msg["To"] = recipient_email
         msg.attach(MIMEText(html_body, "html", _charset="utf-8"))
@@ -989,10 +801,7 @@ def main():
     summary_df = add_signal_columns(summary_df)
     long_df, short_df = build_candidate_tables(summary_df)
     summary_csv, detail_csv = save_outputs(summary_df, detail_df, prefix="fno")
-    sent = send_email_with_tables(
-        long_df=long_df, short_df=short_df,
-        csv_filename=summary_csv, detail_csv_filename=detail_csv,
-    )
+    sent = send_email_with_tables(long_df=long_df, short_df=short_df, csv_filename=summary_csv, detail_csv_filename=detail_csv)
     if sent:
         logger.info("Scan and email completed.")
     else:
