@@ -764,86 +764,39 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
 
     base = df.copy()
-
-    for c in ["Directional", "Turning", "Bull_Signal", "Bear_Signal", "Overall_Signal"]:
+    for c in ["Directional", "Turning", "Stability", "ARIMA Signal", "Kalman Signal", "Bull_Signal", "Bear_Signal"]:
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
 
-    # Strict side filtering: long must be +ve directional, short must be -ve directional
-    long_df = base[base["Directional"] > 0].copy() if "Directional" in base.columns else pd.DataFrame()
-    short_df = base[base["Directional"] < 0].copy() if "Directional" in base.columns else pd.DataFrame()
-
-    # LONG: ratio = abs(Directional) / Turning, then abs(Directional), then Turning
-    if not long_df.empty:
-        long_df["_abs_directional"] = long_df["Directional"].abs()
-        long_df["_turning_safe"] = pd.to_numeric(long_df["Turning"], errors="coerce")
-        long_df["_turning_safe"] = long_df["_turning_safe"].replace(0, np.nan)
-        long_df["_dir_turn_ratio"] = long_df["_abs_directional"] / long_df["_turning_safe"]
-
-        long_df = (
-            long_df
-            .sort_values(
-                by=["_dir_turn_ratio", "_abs_directional", "Turning"],
-                ascending=[False, False, True],
-                na_position="last",
-            )
-            .drop_duplicates(subset=["Symbol"])
-            .head(15)
+    def prep_side(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
+        if df_side.empty:
+            return df_side
+        df_side = df_side.copy()
+        if side == "long":
+            df_side = df_side[df_side["Directional"] > 0]
+            side_signal = df_side["Bull_Signal"]
+            asc = [False, False, False, True, True, True]
+        else:
+            df_side = df_side[df_side["Directional"] < 0]
+            side_signal = df_side["Bear_Signal"]
+            asc = [True, False, False, True, True, True]
+        df_side["_side_signal"] = side_signal
+        df_side["_abs_arima"] = df_side["ARIMA Signal"].abs()
+        df_side["_abs_kalman"] = df_side["Kalman Signal"].abs()
+        df_side = df_side.sort_values(
+            by=["Directional", "_side_signal", "Stability", "Turning", "_abs_arima", "_abs_kalman"],
+            ascending=asc,
+            na_position="last",
         )
+        return df_side.drop(columns=["_side_signal", "_abs_arima", "_abs_kalman"], errors="ignore")
 
-        long_df = long_df.drop(
-            columns=["_abs_directional", "_turning_safe", "_dir_turn_ratio"],
-            errors="ignore"
-        )
-
-    # SHORT: ratio = abs(Directional) / Turning, then abs(Directional), then Turning
-    if not short_df.empty:
-        short_df["_abs_directional"] = short_df["Directional"].abs()
-        short_df["_turning_safe"] = pd.to_numeric(short_df["Turning"], errors="coerce")
-        short_df["_turning_safe"] = short_df["_turning_safe"].replace(0, np.nan)
-        short_df["_dir_turn_ratio"] = short_df["_abs_directional"] / short_df["_turning_safe"]
-
-        short_df = (
-            short_df
-            .sort_values(
-                by=["_dir_turn_ratio", "_abs_directional", "Turning"],
-                ascending=[False, False, True],
-                na_position="last",
-            )
-            .drop_duplicates(subset=["Symbol"])
-            .head(15)
-        )
-
-        short_df = short_df.drop(
-            columns=["_abs_directional", "_turning_safe", "_dir_turn_ratio"],
-            errors="ignore"
-        )
-
-    if not long_df.empty:
-        long_df = long_df.drop(
-            columns=[c for c in ["Bear_Signal", "Overall_Signal"] if c in long_df.columns]
-        )
-
-    if not short_df.empty:
-        short_df = short_df.drop(
-            columns=[c for c in ["Bull_Signal", "Overall_Signal"] if c in short_df.columns]
-        )
+    long_df = prep_side(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
+    short_df = prep_side(base, "short").drop_duplicates(subset=["Symbol"]).head(15)
 
     long_cols = [c for c in EMAIL_DISPLAY_COLS if c in long_df.columns]
     short_cols = [c for c in EMAIL_DISPLAY_COLS if c in short_df.columns]
-
-    long_df = (
-        long_df[long_cols]
-        if not long_df.empty
-        else pd.DataFrame(columns=[c for c in EMAIL_DISPLAY_COLS if c not in {"Bear_Signal", "Overall_Signal"}])
-    )
-
-    short_df = (
-        short_df[short_cols]
-        if not short_df.empty
-        else pd.DataFrame(columns=[c for c in EMAIL_DISPLAY_COLS if c not in {"Bull_Signal", "Overall_Signal"}])
-    )
-
+    long_df = long_df[long_cols] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    short_df = short_df[short_cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     return long_df, short_df
     
                 
