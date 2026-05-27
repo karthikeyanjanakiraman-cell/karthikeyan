@@ -2,7 +2,7 @@
 """
 FO_FNO_FYERS_VOL_REL_EMAIL.py
 Intraday F&O scanner via Fyers API with email alerts.
-Complete standalone file - no external email.py dependency.
+Complete standalone file ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â no external email.py dependency.
 SORTS CANDIDATES BY DIRECTIONAL COLUMN.
 ALL STATISTICAL SCORES ARE RAW (ORIGINAL FORMULAS).
 """
@@ -59,16 +59,17 @@ recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
 EMAIL_DISPLAY_COLS = [
     "Symbol", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced",
-    "ARIMA Signal", "Kalman Signal",
-    "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
-    "Bull_Signal", "Bear_Signal", "Overall_Signal", "Price_Lead_Status", "IVP",
+    "ARIMA Signal", "Kalman Signal", "SlopeConsistency",
+    "Bull_Signal", "Bear_Signal", "Overall_Signal", "Trade_Setup", "Price_Lead_Status", "IVP",
     "Volatility State", "Last Iteration Time",
 ]
 
 
 def build_signals_from_raw_directional(detail_df) -> dict:
-    nan = float("nan")
-    out = {k: nan for k in ("SlopeConsistency", "Bull_Signal", "Bear_Signal", "Overall_Signal")}
+    nan = float('nan')
+    out = {k: nan for k in (
+        "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
+        "Bull_Signal", "Bear_Signal", "Overall_Signal")}
     if detail_df is None or detail_df.empty:
         return out
     df = detail_df.copy()
@@ -77,23 +78,19 @@ def build_signals_from_raw_directional(detail_df) -> dict:
     vals = pd.to_numeric(df["Directional"], errors="coerce").dropna().to_numpy(dtype=float)
     if vals.size == 0:
         return out
-    windows = [3, 5, 8, 13, 21]
-    norm_slopes = []
-    weights = []
-    for w in windows:
-        if len(vals) < max(w, 4):
-            continue
-        seg = vals[-w:]
-        x = np.arange(len(seg), dtype=float)
-        slope = float(np.polyfit(x, seg, 1)[0])
-        scale = float(np.std(np.diff(seg))) if len(seg) > 1 else 0.0
-        scale = scale if scale > 1e-6 else 1e-6
-        norm_slopes.append(slope / scale)
-        weights.append(np.sqrt(w))
-    out["SlopeConsistency"] = round(float(np.average(norm_slopes, weights=weights)), 4) if norm_slopes else nan
-    out["Bull_Signal"] = round(float(vals[vals > 0].max()), 4) if (vals > 0).any() else 0.0
-    out["Bear_Signal"] = round(abs(float(vals[vals < 0].min())), 4) if (vals < 0).any() else 0.0
-    out["Overall_Signal"] = round(float(vals[-1]), 4)
+    last = vals.size - 1
+    def raw_at(offset: int) -> float:
+        i = last - offset
+        if i < 0:
+            i = 0
+        return float(vals[i])
+    out["5m_Signal"] = round(raw_at(0), 4)
+    out["15m_Signal"] = round(raw_at(3) if last >= 3 else raw_at(0), 4)
+    out["30m_Signal"] = round(raw_at(6) if last >= 6 else raw_at(0), 4)
+    out["60m_Signal"] = round(raw_at(12) if last >= 12 else raw_at(0), 4)
+    out["Bull_Signal"] = round(float(vals[vals > 0].max()) if (vals > 0).any() else 0.0, 4)
+    out["Bear_Signal"] = round(abs(float(vals[vals < 0].min())) if (vals < 0).any() else 0.0, 4)
+    out["Overall_Signal"] = round(raw_at(0), 4)
     return out
 
 
@@ -425,12 +422,10 @@ def compute_price_lead_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
         ["STRONG_PRICE_LEAD_FADE", "PRICE_LEADING_FADE_RISK", "EARLY_PRICE_LEAD"],
         default="NORMAL",
     )
-    return df[
-        [
-            "time", "range_expansion", "volume_expansion", "delta_expansion",
-            "price_leading_flag", "price_lead_streak", "Price_Lead_Status",
-        ]
-    ]
+    return df[[
+        "time", "range_expansion", "volume_expansion", "delta_expansion",
+        "price_leading_flag", "price_lead_streak", "Price_Lead_Status",
+    ]]
 
 
 def price_stats_from_series(prices: pd.Series) -> dict:
@@ -448,13 +443,15 @@ def price_stats_from_series(prices: pd.Series) -> dict:
     return {"Directional": directional, "Turning": turning, "Stability": stability, "Balanced": balanced}
 
 
+
 def arima_signal_from_series(prices: pd.Series, order: tuple = (1, 1, 1), window: int = 50) -> float:
+    """ARIMA residual z-score (price-only). Positive = price above forecast (expensive), negative = below (cheap)."""
     p = pd.to_numeric(prices, errors="coerce").dropna().astype(float)
     if len(p) < max(window // 2, 12):
         return float("nan")
-    train = p.iloc[-window:] if len(p) >= window else p
+    train = p.iloc[-window:] if len(p) > window else p
     try:
-        fc = float(ARIMA(train, order=order, trend="n").fit().forecast(1).iloc[0])
+        fc = float(ARIMA(train, order=order).fit().forecast(1).iloc[0])
         last = float(train.iloc[-1])
         scale = float(train.diff().std()) or 1e-6
         return round((last - fc) / scale, 4)
@@ -478,6 +475,7 @@ def kalman_signal_from_series(prices: pd.Series, q: float = 1e-3) -> float:
     gap = arr[-1] - x
     scale = float(p.std()) or 1e-6
     return round(gap / scale, 4)
+
 
 def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[Dict, pd.DataFrame]:
     if intra_df is None or intra_df.empty:
@@ -534,30 +532,28 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         iter_mins = int((dt_time - market_open).total_seconds() / 60)
         price_series = curr_df["close"].iloc[: i + 1]
         ps = price_stats_from_series(price_series)
-        rows.append(
-            {
-                "Iteration No": total_iters,
-                "Iteration Minutes": iter_mins,
-                "Iteration Time": t.strftime("%H:%M"),
-                "Current Volume": cum_vol,
-                "Directional": ps["Directional"],
-                "Turning": ps["Turning"],
-                "Stability": ps["Stability"],
-                "Balanced": ps["Balanced"],
-                "10 Day Relative Volume": rvol10,
-                "20 Day Relative Volume": rvol20,
-                "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else float("nan"),
-                "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[i]) if not flow_df.empty else float("nan"),
-                "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[i]) if not flow_df.empty else float("nan"),
-                "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[i]) if not flow_df.empty else float("nan"),
-                "Range_Expansion": float(price_lead_df["range_expansion"].iloc[i]) if not price_lead_df.empty and pd.notna(price_lead_df["range_expansion"].iloc[i]) else float("nan"),
-                "Volume_Expansion": float(price_lead_df["volume_expansion"].iloc[i]) if not price_lead_df.empty and pd.notna(price_lead_df["volume_expansion"].iloc[i]) else float("nan"),
-                "Delta_Expansion": float(price_lead_df["delta_expansion"].iloc[i]) if not price_lead_df.empty and pd.notna(price_lead_df["delta_expansion"].iloc[i]) else float("nan"),
-                "Price_Leading_Flag": bool(price_lead_df["price_leading_flag"].iloc[i]) if not price_lead_df.empty else False,
-                "Price_Lead_Streak": int(price_lead_df["price_lead_streak"].iloc[i]) if not price_lead_df.empty else 0,
-                "Price_Lead_Status": str(price_lead_df["Price_Lead_Status"].iloc[i]) if not price_lead_df.empty else "NORMAL",
-            }
-        )
+        rows.append({
+            "Iteration No": total_iters,
+            "Iteration Minutes": iter_mins,
+            "Iteration Time": t.strftime("%H:%M"),
+            "Current Volume": cum_vol,
+            "Directional": ps["Directional"],
+            "Turning": ps["Turning"],
+            "Stability": ps["Stability"],
+            "Balanced": ps["Balanced"],
+            "10 Day Relative Volume": rvol10,
+            "20 Day Relative Volume": rvol20,
+            "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else float("nan"),
+            "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[i]) if not flow_df.empty else float("nan"),
+            "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[i]) if not flow_df.empty else float("nan"),
+            "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[i]) if not flow_df.empty else float("nan"),
+            "Range_Expansion": float(price_lead_df["range_expansion"].iloc[i]) if not price_lead_df.empty and pd.notna(price_lead_df["range_expansion"].iloc[i]) else float("nan"),
+            "Volume_Expansion": float(price_lead_df["volume_expansion"].iloc[i]) if not price_lead_df.empty and pd.notna(price_lead_df["volume_expansion"].iloc[i]) else float("nan"),
+            "Delta_Expansion": float(price_lead_df["delta_expansion"].iloc[i]) if not price_lead_df.empty and pd.notna(price_lead_df["delta_expansion"].iloc[i]) else float("nan"),
+            "Price_Leading_Flag": bool(price_lead_df["price_leading_flag"].iloc[i]) if not price_lead_df.empty else False,
+            "Price_Lead_Streak": int(price_lead_df["price_lead_streak"].iloc[i]) if not price_lead_df.empty else 0,
+            "Price_Lead_Status": str(price_lead_df["Price_Lead_Status"].iloc[i]) if not price_lead_df.empty else "NORMAL",
+        })
         last_cum_vol, last_rvol10, last_rvol20 = cum_vol, rvol10, rvol20
         last_iter_mins = iter_mins
         last_iter_time = t.strftime("%H:%M")
@@ -573,24 +569,21 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
     if not flow_df.empty and len(flow_df) >= 7:
         obv_30m_delta = float(flow_df["Cumulative OBV"].iloc[-1]) - float(flow_df["Cumulative OBV"].iloc[-7])
         rsi_30m_delta = float(flow_df["Cumulative RSI"].iloc[-1]) - float(flow_df["Cumulative RSI"].iloc[-7])
+    adx_now = float(metric_df["Cumulative ADX"].iloc[-1]) if not metric_df.empty else float("nan")
+    ker_now = float(metric_df["Cumulative KER"].iloc[-1]) if not metric_df.empty else float("nan")
     final_ps = price_stats_from_series(curr_df["close"])
     summary = {
-        "LTP": ltp,
-        "Directional": final_ps["Directional"],
-        "Turning": final_ps["Turning"],
-        "Stability": final_ps["Stability"],
-        "Balanced": final_ps["Balanced"],
+        "LTP": ltp, "Directional": final_ps["Directional"], "Turning": final_ps["Turning"],
+        "Stability": final_ps["Stability"], "Balanced": final_ps["Balanced"],
         "ARIMA Signal": arima_signal_from_series(curr_df["close"]),
         "Kalman Signal": kalman_signal_from_series(curr_df["close"]),
-        "Current Volume": last_cum_vol,
-        "10 Day Relative Volume": last_rvol10,
+        "Current Volume": last_cum_vol, "10 Day Relative Volume": last_rvol10,
         "20 Day Relative Volume": last_rvol20,
         "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[-1]) if not flow_df.empty else float("nan"),
         "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[-1]) if not flow_df.empty else float("nan"),
-        "Total Iterations": total_iters,
-        "Last Iteration Minutes": last_iter_mins,
+        "Total Iterations": total_iters, "Last Iteration Minutes": last_iter_mins,
         "Last Iteration Time": last_iter_time,
         "Cumulative KER": float(metric_df["Cumulative KER"].iloc[-1]) if not metric_df.empty else np.nan,
         "Cumulative +DI": float(metric_df["Cumulative +DI"].iloc[-1]) if not metric_df.empty else np.nan,
@@ -598,15 +591,13 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         "Cumulative ADX": float(metric_df["Cumulative ADX"].iloc[-1]) if not metric_df.empty else np.nan,
         "Survival Score": str(metric_df["Survival Score"].iloc[-1]) if not metric_df.empty else "0/0",
         "Survival_Num": float(metric_df["Survival_Num"].iloc[-1]) if not metric_df.empty else 0.0,
-        "HOD": hod,
-        "Strike_Distance": strike_distance,
-        "Last_5m_Volume": last_5m_volume,
-        "Volume_1h_Avg_5m": vol_1h_avg_5m,
-        "OBV_30m_Delta": obv_30m_delta,
-        "RSI_30m_Delta": rsi_30m_delta,
+        "HOD": hod, "Strike_Distance": strike_distance,
+        "Last_5m_Volume": last_5m_volume, "Volume_1h_Avg_5m": vol_1h_avg_5m,
+        "OBV_30m_Delta": obv_30m_delta, "RSI_30m_Delta": rsi_30m_delta,
         "Price_Lead_Status": str(price_lead_df["Price_Lead_Status"].iloc[-1]) if not price_lead_df.empty else "NORMAL",
     }
-    summary.update(build_signals_from_raw_directional(detail_df))
+    signals = build_signals_from_raw_directional(detail_df)
+    summary.update(signals)
     return summary, detail_df
 
 
@@ -631,56 +622,61 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             iter_detail.insert(0, "Symbol", sym)
             iter_detail.insert(1, "% Change", pct_change)
             iteration_rows.append(iter_detail)
-        rows.append(
-            {
-                "Symbol": sym,
-                "LTP": ltp,
-                "% Change": pct_change,
-                "Directional": iter_summary.get("Directional"),
-                "Turning": iter_summary.get("Turning"),
-                "Stability": iter_summary.get("Stability"),
-                "Balanced": iter_summary.get("Balanced"),
-                "ARIMA Signal": iter_summary.get("ARIMA Signal"),
-                "Kalman Signal": iter_summary.get("Kalman Signal"),
-                "SlopeConsistency": iter_summary.get("SlopeConsistency"),
-                "Bull_Signal": iter_summary.get("Bull_Signal"),
-                "Bear_Signal": iter_summary.get("Bear_Signal"),
-                "Overall_Signal": iter_summary.get("Overall_Signal"),
-                "Current Volume": iter_summary.get("Current Volume"),
-                "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"),
-                "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"),
-                "Cumulative RSI": iter_summary.get("Cumulative RSI"),
-                "Cumulative OBV": iter_summary.get("Cumulative OBV"),
-                "Cumulative VWAP": iter_summary.get("Cumulative VWAP"),
-                "VWAP Z-Score": iter_summary.get("VWAP Z-Score"),
-                "Total Iterations": iter_summary.get("Total Iterations"),
-                "Last Iteration Minutes": iter_summary.get("Last Iteration Minutes"),
-                "Last Iteration Time": iter_summary.get("Last Iteration Time"),
-                "Cumulative KER": iter_summary.get("Cumulative KER"),
-                "Cumulative +DI": iter_summary.get("Cumulative +DI"),
-                "Cumulative -DI": iter_summary.get("Cumulative -DI"),
-                "Cumulative ADX": iter_summary.get("Cumulative ADX"),
-                "Survival Score": iter_summary.get("Survival Score"),
-                "Survival_Num": iter_summary.get("Survival_Num"),
-                "HOD": iter_summary.get("HOD"),
-                "Strike_Distance": iter_summary.get("Strike_Distance"),
-                "Last_5m_Volume": iter_summary.get("Last_5m_Volume"),
-                "Volume_1h_Avg_5m": iter_summary.get("Volume_1h_Avg_5m"),
-                "OBV_30m_Delta": iter_summary.get("OBV_30m_Delta"),
-                "RSI_30m_Delta": iter_summary.get("RSI_30m_Delta"),
-                "Price_Lead_Status": iter_summary.get("Price_Lead_Status", "NORMAL"),
-                "IVP": iv_info.get("IVP"),
-                "Volatility State": iv_info.get("Volatility State"),
-            }
-        )
-    return pd.DataFrame(rows), (pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame())
+        rows.append({
+            "Symbol": sym, "LTP": ltp, "% Change": pct_change,
+            "Directional": iter_summary.get("Directional"), "Turning": iter_summary.get("Turning"),
+            "Stability": iter_summary.get("Stability"), "Balanced": iter_summary.get("Balanced"),
+            "ARIMA Signal": iter_summary.get("ARIMA Signal"),
+            "Kalman Signal": iter_summary.get("Kalman Signal"),
+            "5m_Signal": iter_summary.get("5m_Signal"),
+            "15m_Signal": iter_summary.get("15m_Signal"),
+            "30m_Signal": iter_summary.get("30m_Signal"),
+            "60m_Signal": iter_summary.get("60m_Signal"),
+            "Bull_Signal": iter_summary.get("Bull_Signal"),
+            "Bear_Signal": iter_summary.get("Bear_Signal"),
+            "Overall_Signal": iter_summary.get("Overall_Signal"),
+            "Current Volume": iter_summary.get("Current Volume"),
+            "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"),
+            "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"),
+            "Cumulative RSI": iter_summary.get("Cumulative RSI"), "Cumulative OBV": iter_summary.get("Cumulative OBV"),
+            "Cumulative VWAP": iter_summary.get("Cumulative VWAP"), "VWAP Z-Score": iter_summary.get("VWAP Z-Score"),
+            "Total Iterations": iter_summary.get("Total Iterations"),
+            "Last Iteration Minutes": iter_summary.get("Last Iteration Minutes"),
+            "Last Iteration Time": iter_summary.get("Last Iteration Time"),
+            "Cumulative KER": iter_summary.get("Cumulative KER"), "Cumulative +DI": iter_summary.get("Cumulative +DI"),
+            "Cumulative -DI": iter_summary.get("Cumulative -DI"), "Cumulative ADX": iter_summary.get("Cumulative ADX"),
+            "Survival Score": iter_summary.get("Survival Score"), "Survival_Num": iter_summary.get("Survival_Num"),
+            "HOD": iter_summary.get("HOD"), "Strike_Distance": iter_summary.get("Strike_Distance"),
+            "Last_5m_Volume": iter_summary.get("Last_5m_Volume"), "Volume_1h_Avg_5m": iter_summary.get("Volume_1h_Avg_5m"),
+            "OBV_30m_Delta": iter_summary.get("OBV_30m_Delta"), "RSI_30m_Delta": iter_summary.get("RSI_30m_Delta"),
+            "Price_Lead_Status": iter_summary.get("Price_Lead_Status", "NORMAL"),
+            "IVP": iv_info.get("IVP"), "Volatility State": iv_info.get("Volatility State"),
+        })
+    return (pd.DataFrame(rows), (pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame()))
+
+
+def rank_delta_to_label(delta: float) -> str:
+    if pd.isna(delta):
+        return ""
+    if delta >= 7:
+        return "Buy++"
+    if delta >= 4:
+        return "Buy+"
+    if delta >= 1:
+        return "Buy"
+    if delta == 0:
+        return "Neutral"
+    if delta <= -7:
+        return "Sell++"
+    if delta <= -4:
+        return "Sell+"
+    return "Sell"
 
 
 def derive_rank_columns(df: pd.DataFrame) -> pd.DataFrame:
     if df is None or df.empty:
         return df
     out = df.copy()
-
     def score_bull(row):
         score = 0
         if pd.notna(row.get("% Change")) and row.get("% Change") > 0:
@@ -696,7 +692,6 @@ def derive_rank_columns(df: pd.DataFrame) -> pd.DataFrame:
         if pd.notna(row.get("Cumulative RSI")) and row.get("Cumulative RSI") >= 55:
             score += 1
         return min(score, 13)
-
     def score_bear(row):
         score = 0
         if pd.notna(row.get("% Change")) and row.get("% Change") < 0:
@@ -712,12 +707,15 @@ def derive_rank_columns(df: pd.DataFrame) -> pd.DataFrame:
         if pd.notna(row.get("Cumulative RSI")) and row.get("Cumulative RSI") <= 45:
             score += 1
         return min(score, 13)
-
     bull = out.apply(score_bull, axis=1)
     bear = out.apply(score_bear, axis=1)
     out["Bull Rank"] = bull
     out["Bear Rank"] = bear
     out["Rank Delta"] = bull - bear
+    for tf, w in {"5m": 1.0, "15m": 0.9, "30m": 0.8, "60m": 0.7}.items():
+        out[f"{tf}BullRank"] = (bull * w).round().clip(lower=0, upper=14)
+        out[f"{tf}BearRank"] = (bear * w).round().clip(lower=0, upper=14)
+        out[f"{tf}RankDelta"] = out[f"{tf}BullRank"] - out[f"{tf}BearRank"]
     return out
 
 
@@ -725,23 +723,19 @@ def add_signal_columns(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+
 def signal_color(label) -> str:
     try:
         v = float(label)
-        if v > 0:
-            return "#2e7d32"
-        if v < 0:
-            return "#7f1d1d"
+        if v > 0: return "#2e7d32"
+        if v < 0: return "#7f1d1d"
         return "#4b5563"
     except (ValueError, TypeError):
         pass
     label = str(label).strip()
-    if label == "Buyer Zone":
-        return "#33691e"
-    if label == "Neutral Vol":
-        return "#4b5563"
-    if label == "Avoid Buy Premium":
-        return "#7a5c00"
+    if label == "Buyer Zone": return "#33691e"
+    if label == "Neutral Vol": return "#4b5563"
+    if label == "Avoid Buy Premium": return "#7a5c00"
     return "#374151"
 
 
@@ -763,47 +757,94 @@ def format_value(col: str, val):
         return f"{float(val):.2f}"
     return str(val)
 
-
 def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df is None or df.empty:
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+
     base = df.copy()
-    for c in ["Directional", "Turning", "Bull_Signal", "Bear_Signal", "Overall_Signal", "SlopeConsistency"]:
+
+    for c in ["Directional", "Turning", "Bull_Signal", "Bear_Signal", "Overall_Signal"]:
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
+
+    # Strict side filtering: long must be +ve directional, short must be -ve directional
     long_df = base[base["Directional"] > 0].copy() if "Directional" in base.columns else pd.DataFrame()
     short_df = base[base["Directional"] < 0].copy() if "Directional" in base.columns else pd.DataFrame()
+
+    # LONG: ratio = abs(Directional) / Turning, then abs(Directional), then Turning
     if not long_df.empty:
         long_df["_abs_directional"] = long_df["Directional"].abs()
-        long_df["_turning_safe"] = pd.to_numeric(long_df["Turning"], errors="coerce").replace(0, np.nan)
+        long_df["_turning_safe"] = pd.to_numeric(long_df["Turning"], errors="coerce")
+        long_df["_turning_safe"] = long_df["_turning_safe"].replace(0, np.nan)
         long_df["_dir_turn_ratio"] = long_df["_abs_directional"] / long_df["_turning_safe"]
-        long_df = long_df.sort_values(
-            by=["_dir_turn_ratio", "_abs_directional", "Turning"],
-            ascending=[False, False, True],
-            na_position="last",
-        ).drop_duplicates(subset=["Symbol"]).head(15)
-        long_df = long_df.drop(columns=["_abs_directional", "_turning_safe", "_dir_turn_ratio"], errors="ignore")
+
+        long_df = (
+            long_df
+            .sort_values(
+                by=["_dir_turn_ratio", "_abs_directional", "Turning"],
+                ascending=[False, False, True],
+                na_position="last",
+            )
+            .drop_duplicates(subset=["Symbol"])
+            .head(15)
+        )
+
+        long_df = long_df.drop(
+            columns=["_abs_directional", "_turning_safe", "_dir_turn_ratio"],
+            errors="ignore"
+        )
+
+    # SHORT: ratio = abs(Directional) / Turning, then abs(Directional), then Turning
     if not short_df.empty:
         short_df["_abs_directional"] = short_df["Directional"].abs()
-        short_df["_turning_safe"] = pd.to_numeric(short_df["Turning"], errors="coerce").replace(0, np.nan)
+        short_df["_turning_safe"] = pd.to_numeric(short_df["Turning"], errors="coerce")
+        short_df["_turning_safe"] = short_df["_turning_safe"].replace(0, np.nan)
         short_df["_dir_turn_ratio"] = short_df["_abs_directional"] / short_df["_turning_safe"]
-        short_df = short_df.sort_values(
-            by=["_dir_turn_ratio", "_abs_directional", "Turning"],
-            ascending=[False, False, True],
-            na_position="last",
-        ).drop_duplicates(subset=["Symbol"]).head(15)
-        short_df = short_df.drop(columns=["_abs_directional", "_turning_safe", "_dir_turn_ratio"], errors="ignore")
+
+        short_df = (
+            short_df
+            .sort_values(
+                by=["_dir_turn_ratio", "_abs_directional", "Turning"],
+                ascending=[False, False, True],
+                na_position="last",
+            )
+            .drop_duplicates(subset=["Symbol"])
+            .head(15)
+        )
+
+        short_df = short_df.drop(
+            columns=["_abs_directional", "_turning_safe", "_dir_turn_ratio"],
+            errors="ignore"
+        )
+
     if not long_df.empty:
-        long_df = long_df.drop(columns=[c for c in ["Bear_Signal", "Overall_Signal"] if c in long_df.columns])
+        long_df = long_df.drop(
+            columns=[c for c in ["Bear_Signal", "Overall_Signal"] if c in long_df.columns]
+        )
+
     if not short_df.empty:
-        short_df = short_df.drop(columns=[c for c in ["Bull_Signal", "Overall_Signal"] if c in short_df.columns])
+        short_df = short_df.drop(
+            columns=[c for c in ["Bull_Signal", "Overall_Signal"] if c in short_df.columns]
+        )
+
     long_cols = [c for c in EMAIL_DISPLAY_COLS if c in long_df.columns]
     short_cols = [c for c in EMAIL_DISPLAY_COLS if c in short_df.columns]
-    long_df = long_df[long_cols] if not long_df.empty else pd.DataFrame(columns=[c for c in EMAIL_DISPLAY_COLS if c not in {"Bear_Signal", "Overall_Signal"}])
-    short_df = short_df[short_cols] if not short_df.empty else pd.DataFrame(columns=[c for c in EMAIL_DISPLAY_COLS if c not in {"Bull_Signal", "Overall_Signal"}])
+
+    long_df = (
+        long_df[long_cols]
+        if not long_df.empty
+        else pd.DataFrame(columns=[c for c in EMAIL_DISPLAY_COLS if c not in {"Bear_Signal", "Overall_Signal"}])
+    )
+
+    short_df = (
+        short_df[short_cols]
+        if not short_df.empty
+        else pd.DataFrame(columns=[c for c in EMAIL_DISPLAY_COLS if c not in {"Bull_Signal", "Overall_Signal"}])
+    )
+
     return long_df, short_df
-
-
+    
+                
 def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     if df is None or df.empty:
         return '<p style="color:#cbd5e1;font-family:Arial,sans-serif;">No candidates found.</p>'
@@ -811,9 +852,16 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     cols = [c for c in EMAIL_DISPLAY_COLS if c in df_slice.columns]
     if not cols:
         return '<p style="color:#cbd5e1;font-family:Arial,sans-serif;">No candidates found.</p>'
-    header_cells = ''.join(f'<th style="padding:8px 10px;border:1px solid #4b5563;background:#374151;color:#f9fafb;font-size:12px;font-weight:700;text-align:center;white-space:nowrap;">{c}</th>' for c in cols)
+    header_cells = ''.join(
+        f'<th style="padding:8px 10px;border:1px solid #4b5563;background:#374151;color:#f9fafb;font-size:12px;font-weight:700;text-align:center;white-space:nowrap;">{c}</th>'
+        for c in cols
+    )
     rows_html = []
-    signal_cols = {'SlopeConsistency', 'Bull_Signal', 'Bear_Signal', 'Overall_Signal', 'Volatility State', 'Price_Lead_Status', 'ARIMA Signal', 'Kalman Signal'}
+    signal_cols = {
+        '5m_Signal', '15m_Signal', '30m_Signal', '60m_Signal',
+        'Bull_Signal', 'Bear_Signal', 'Overall_Signal', 'Volatility State', 'Price_Lead_Status',
+        'ARIMA Signal', 'Kalman Signal'
+    }
     for _, row in df_slice.iterrows():
         cells = []
         for c in cols:
@@ -840,15 +888,22 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
                 except Exception:
                     bg = '#4b5563'; fg = '#f3f4f6'
             elif c in {'LTP', 'IVP'}:
-                bg = '#303643'; fg = '#f3f4f6'
+                bg = '#303643'
+                fg = '#f3f4f6'
             else:
-                bg = '#3b4252'; fg = '#f3f4f6'
+                bg = '#3b4252'
+                fg = '#f3f4f6'
             cells.append(f'<td style="padding:7px 9px;border:1px solid #4b5563;background:{bg};color:{fg};font-size:12px;font-weight:600;white-space:nowrap;{extra}">{val}</td>')
         rows_html.append('<tr>' + ''.join(cells) + '</tr>')
-    return '<div style="overflow-x:auto;margin:10px 0 18px 0;"><table style="border-collapse:collapse;background:#1f2937;font-family:Arial,sans-serif;"><thead><tr>' + header_cells + '</tr></thead><tbody>' + ''.join(rows_html) + '</tbody></table></div>'
+    return ('<div style="overflow-x:auto;margin:10px 0 18px 0;">' '<table style="border-collapse:collapse;background:#1f2937;font-family:Arial,sans-serif;">' f'<thead><tr>{header_cells}</tr></thead>' f'<tbody>{"" .join(rows_html)}</tbody>' '</table></div>')
 
 
-def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str, detail_csv_filename: str, index_long_df: pd.DataFrame = None, index_short_df: pd.DataFrame = None, index_iter_csv_filename: Optional[str] = None) -> bool:
+def send_email_with_tables(
+    long_df: pd.DataFrame, short_df: pd.DataFrame,
+    csv_filename: str, detail_csv_filename: str,
+    index_long_df: pd.DataFrame = None, index_short_df: pd.DataFrame = None,
+    index_iter_csv_filename: Optional[str] = None,
+) -> bool:
     try:
         if index_long_df is None:
             index_long_df = pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
@@ -861,23 +916,23 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
         stock_short_html = df_to_html_table(short_df)
         html_body = f"""
 <html>
-  <body style=\"font-family: Arial, sans-serif; font-size: 13px; background:#111827; color:#e5e7eb;\">
-    <h2 style=\"color:#f9fafb;\">Intraday Vol Iteration Alert</h2>
-    <p style=\"color:#9ca3af;\">Scan completed at {scan_time}.</p>
-    <h3 style=\"color:#34d399;\">Index Long Candidates</h3>
+  <body style="font-family: Arial, sans-serif; font-size: 13px; background:#111827; color:#e5e7eb;">
+    <h2 style="color:#f9fafb;">Intraday Vol Iteration Alert</h2>
+    <p style="color:#9ca3af;">Scan completed at {scan_time}.</p>
+    <h3 style="color:#34d399;">Index Long Candidates</h3>
     {index_long_html}
-    <h3 style=\"color:#f87171;\">Index Short Candidates</h3>
+    <h3 style="color:#f87171;">Index Short Candidates</h3>
     {index_short_html}
-    <h3 style=\"color:#34d399;\">Stock Long Candidates</h3>
+    <h3 style="color:#34d399;">Stock Long Candidates</h3>
     {stock_long_html}
-    <h3 style=\"color:#f87171;\">Stock Short Candidates</h3>
+    <h3 style="color:#f87171;">Stock Short Candidates</h3>
     {stock_short_html}
-    <p style=\"color:#6b7280; font-size:11px; margin-top:20px;\">Generated by FO_FNO_FYERS_VOL_REL_EMAIL.py</p>
+    <p style="color:#6b7280; font-size:11px; margin-top:20px;">Generated by FO_FNO_FYERS_VOL_REL_EMAIL.py</p>
   </body>
 </html>
 """
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"Intraday Scan - {scan_time}"
+        msg["Subject"] = f"Intraday Scan ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬ÃƒÂ¢Ã¢â€šÂ¬Ã‚Â {scan_time}"
         msg["From"] = sender_email
         msg["To"] = recipient_email
         msg.attach(MIMEText(html_body, "html", _charset="utf-8"))
@@ -933,7 +988,10 @@ def main():
     summary_df = add_signal_columns(summary_df)
     long_df, short_df = build_candidate_tables(summary_df)
     summary_csv, detail_csv = save_outputs(summary_df, detail_df, prefix="fno")
-    sent = send_email_with_tables(long_df=long_df, short_df=short_df, csv_filename=summary_csv, detail_csv_filename=detail_csv)
+    sent = send_email_with_tables(
+        long_df=long_df, short_df=short_df,
+        csv_filename=summary_csv, detail_csv_filename=detail_csv,
+    )
     if sent:
         logger.info("Scan and email completed.")
     else:
