@@ -10,6 +10,7 @@ import os
 import re
 import sys
 import logging
+import warnings
 from datetime import datetime, timedelta, time
 from typing import List, Dict, Optional, Tuple
 
@@ -59,8 +60,9 @@ recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
 EMAIL_DISPLAY_COLS = [
     "Symbol", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced",
-    "ARIMA Signal", "Kalman Signal", "SlopeConsistency",
-    "Bull_Signal", "Bear_Signal", "Overall_Signal", "Trade_Setup", "Price_Lead_Status", "IVP",
+    "ARIMA Signal", "Kalman Signal",
+    "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
+    "Bull_Signal", "Bear_Signal", "Overall_Signal", "Price_Lead_Status", "IVP",
     "Volatility State", "Last Iteration Time",
 ]
 
