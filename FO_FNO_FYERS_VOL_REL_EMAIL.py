@@ -59,27 +59,11 @@ sender_password = os.environ.get("SENDER_PASSWORD", "password")
 recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
 EMAIL_DISPLAY_COLS = [
-    "Symbol",
-    "LTP",
-    "% Change",
-    "Directional",
-    "Turning",
-    "Stability",
-    "Balanced",
-    "CumsumPlus",
-    "ARIMA Signal",
-    "Kalman Signal",
-    "5m_Signal",
-    "15m_Signal",
-    "30m_Signal",
-    "60m_Signal",
-    "Bull_Signal",
-    "Bear_Signal",
-    "Overall_Signal",
-    "Price_Lead_Status",
-    "IVP",
-    "Volatility State",
-    "Last Iteration Time",
+    "Symbol", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced",
+    "ARIMA Signal", "Kalman Signal",
+    "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
+    "Bull_Signal", "Bear_Signal", "Overall_Signal", "Price_Lead_Status", "IVP",
+    "Volatility State", "Last Iteration Time",
 ]
 
 
@@ -554,13 +538,11 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
             "Iteration No": total_iters,
             "Iteration Minutes": iter_mins,
             "Iteration Time": t.strftime("%H:%M"),
-            "LTP": float(row["close"]),
             "Current Volume": cum_vol,
             "Directional": ps["Directional"],
             "Turning": ps["Turning"],
             "Stability": ps["Stability"],
             "Balanced": ps["Balanced"],
-            "CumsumPlus": ps["CumsumPlus"],
             "10 Day Relative Volume": rvol10,
             "20 Day Relative Volume": rvol20,
             "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else float("nan"),
@@ -953,28 +935,18 @@ def main():
     if not fyers:
         logger.error("Fyers not initialized. Exiting.")
         return
-
     summary_df, detail_df = scan_fno_universe()
     if summary_df.empty:
         logger.warning("No summary data produced.")
         return
-
     summary_df = derive_rank_columns(summary_df)
     summary_df = add_signal_columns(summary_df)
-
     long_df, short_df = build_candidate_tables(summary_df)
-    history_df = load_iteration_history(detail_df)
-
     summary_csv, detail_csv = save_outputs(summary_df, detail_df, prefix="fno")
-
     sent = send_email_with_tables(
-        long_df=long_df,
-        short_df=short_df,
-        history_df=history_df,
-        csv_filename=summary_csv,
-        detail_csv_filename=detail_csv
+        long_df=long_df, short_df=short_df,
+        csv_filename=summary_csv, detail_csv_filename=detail_csv,
     )
-
     if sent:
         logger.info("Scan and email completed.")
     else:
