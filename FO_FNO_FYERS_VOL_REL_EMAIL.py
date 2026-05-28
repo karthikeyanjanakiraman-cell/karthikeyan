@@ -812,21 +812,20 @@ def append_top1_to_history(long_df: pd.DataFrame, short_df: pd.DataFrame) -> Non
     for side, df in [("Long", long_df), ("Short", short_df)]:
         if df is None or df.empty:
             continue
-        row = df.iloc[0].copy()
-        out = {col: row[col] for col in df.columns if col in row.index}
-        out["Iteration"] = iteration_id
-        out["Side"] = side
-        rows.append(out)
+        row = df.iloc[0].copy().to_dict()
+        row["Iteration"] = iteration_id
+        row["Side"] = side
+        rows.append(row)
     if not rows:
         return
-    hist_new = pd.DataFrame(rows)
+    new_df = pd.DataFrame(rows)
     if os.path.exists(ITERATION_HISTORY_CSV):
         try:
-            hist_old = pd.read_csv(ITERATION_HISTORY_CSV)
-            hist_new = pd.concat([hist_old, hist_new], ignore_index=True)
+            old_df = pd.read_csv(ITERATION_HISTORY_CSV)
+            new_df = pd.concat([old_df, new_df], ignore_index=True)
         except Exception:
             pass
-    hist_new.to_csv(ITERATION_HISTORY_CSV, index=False)
+    new_df.to_csv(ITERATION_HISTORY_CSV, index=False)
 
 
 def load_iteration_history() -> pd.DataFrame:
@@ -855,7 +854,7 @@ def build_history_table(history_df: pd.DataFrame, side: str) -> str:
     cols = [c for c in cols if c in df.columns]
     df = df.tail(15)[cols].copy()
 
-    def cell_style(col, val):
+    def style_cell(col, val):
         base = 'padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;'
         try:
             num = float(val)
@@ -868,7 +867,7 @@ def build_history_table(history_df: pd.DataFrame, side: str) -> str:
                 return base + 'background:#7f1d1d;color:#fee2e2;font-weight:600;'
         return base
 
-    def format_cell(col, val):
+    def fmt(col, val):
         if pd.isna(val):
             return ""
         if col == "% Change":
@@ -877,17 +876,19 @@ def build_history_table(history_df: pd.DataFrame, side: str) -> str:
             return f"{float(val):.2f}"
         return str(val)
 
-    header = ''.join(f'<th style="padding:6px 8px;border:1px solid #4b5563;background:#374151;color:#f9fafb;">{c}</th>' for c in cols)
-    rows_html = []
+    header = ''.join(
+        f'<th style="padding:6px 8px;border:1px solid #4b5563;background:#374151;color:#f9fafb;">{c}</th>'
+        for c in cols
+    )
+    body = []
     for _, row in df.iterrows():
-        tds = []
+        cells = []
         for col in cols:
             val = row.get(col, "")
-            tds.append(f'<td style="{cell_style(col, val)}">{format_cell(col, val)}</td>')
-        rows_html.append('<tr>' + ''.join(tds) + '</tr>')
-
+            cells.append(f'<td style="{style_cell(col, val)}">{fmt(col, val)}</td>')
+        body.append('<tr>' + ''.join(cells) + '</tr>')
     title = "Long" if side.lower() == "long" else "Short"
-    return f'<h3 style="color:#f9fafb;">Iteration history {title}</h3><table style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:12px;"><thead><tr>{header}</tr></thead><tbody>{"".join(rows_html)}</tbody></table>'
+    return f'<h3 style="color:#f9fafb;">Iteration history {title}</h3><table style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:12px;"><thead><tr>{header}</tr></thead><tbody>{"".join(body)}</tbody></table>'
 
 
 def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
