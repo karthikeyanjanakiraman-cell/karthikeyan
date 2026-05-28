@@ -279,7 +279,6 @@ def load_fno_symbols_from_csv(path: str = "fno_stock_list.csv") -> List[str]:
         logger.error(f"Error reading FNO CSV {path}: {e}")
         return []
 
-
 def format_fyers_symbol(symbol: str) -> str:
     if symbol.startswith("NSE:") and symbol.endswith("-EQ"):
         return symbol
@@ -984,13 +983,21 @@ def format_value(col: str, val):
         return f"{float(val):.2f}"
     return str(val)
 
-
 def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Build current long/short candidate tables for the email.
+
+    For SCALPING:
+    - Longs: sort by % Change desc, Directional desc, Turning asc, CumsumPlus desc, Stability desc
+    - Shorts: sort by % Change asc, Directional asc, Turning asc, CumsumPlus asc, Stability desc
+    """
     if df is None or df.empty:
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
 
     base = df.copy()
-    for c in ["Directional", "Turning", "Stability", "ARIMA Signal", "Kalman Signal", "Bull_Signal", "Bear_Signal"]:
+
+    # Ensure key numeric columns are numeric
+    for c in ["% Change", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus"]:
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
 
@@ -999,28 +1006,42 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
             return df_side
 
         df_side = df_side.copy()
+
         if side == "long":
-            df_side = df_side[df_side["Directional"] > 0]
-            side_signal = df_side["Bull_Signal"]
-            asc = [False, False, False, True, True, True]
+            # Only positive directional for longs
+            if "Directional" in df_side.columns:
+                df_side = df_side[df_side["Directional"] > 0]
+
+            # Scalping sort: focus on immediate momentum, then direction, then smoothness
+            df_side = df_side.sort_values(
+                by=["% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
+                ascending=[False, False, True, False, False],
+                na_position="last",
+            )
         else:
-            df_side = df_side[df_side["Directional"] < 0]
-            side_signal = df_side["Bear_Signal"]
-            asc = [True, False, False, True, True, True]
+            # Only negative directional for shorts
+            if "Directional" in df_side.columns:
+                df_side = df_side[df_side["Directional"] < 0]
 
-        df_side["_side_signal"] = side_signal
-        df_side["_abs_arima"] = df_side["ARIMA Signal"].abs()
-        df_side["_abs_kalman"] = df_side["Kalman Signal"].abs()
+            # Scalping sort for shorts: biggest drop first, most negative direction
+            df_side = df_side.sort_values(
+                by=["% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
+                ascending=[True, True, True, True, False],
+                na_position="last",
+            )
 
-        df_side = df_side.sort_values(
-            by=["Directional", "_side_signal", "Stability", "Turning", "_abs_arima", "_abs_kalman"],
-            ascending=asc,
-            na_position="last",
-        )
-        return df_side.drop(columns=["_side_signal", "_abs_arima", "_abs_kalman"], errors="ignore")
+        return df_side
 
-    long_df = prep_side(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
-    short_df = prep_side(base, "short").drop_duplicates(subset=["Symbol"]).head(15)
+    long_df = (
+        prep_side(base, "long")
+        .drop_duplicates(subset=["Symbol"])
+        .head(15)
+    )
+    short_df = (
+        prep_side(base, "short")
+        .drop_duplicates(subset=["Symbol"])
+        .head(15)
+    )
 
     long_cols = [c for c in EMAIL_DISPLAY_COLS if c in long_df.columns]
     short_cols = [c for c in EMAIL_DISPLAY_COLS if c in short_df.columns]
@@ -1030,67 +1051,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
 
     return long_df, short_df
 
-
-def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
-    if detail_df is None or detail_df.empty:
-        return pd.DataFrame()
-
-    df = detail_df.copy()
-    numeric_cols = [
-        "Iteration No", "LTP", "% Change", "Directional", "Turning",
-        "Stability", "Balanced", "CumsumPlus"
-    ]
-    for col in numeric_cols:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    if "Iteration No" not in df.columns:
-        return pd.DataFrame()
-
-    last_15_iters = sorted(df["Iteration No"].dropna().astype(int).unique())[-15:]
-    df = df[df["Iteration No"].isin(last_15_iters)].copy()
-
-    long_top = (
-        df[df["Directional"] > 0]
-        .sort_values(
-            ["Iteration No", "Directional", "Balanced", "Turning", "Stability"],
-            ascending=[True, False, False, True, True],
-            na_position="last",
-        )
-        .groupby("Iteration No", group_keys=False)
-        .head(1)
-        .assign(Side="Long")
-    )
-
-    short_top = (
-        df[df["Directional"] < 0]
-        .sort_values(
-            ["Iteration No", "Directional", "Balanced", "Turning", "Stability"],
-            ascending=[True, True, True, True, True],
-            na_position="last",
-        )
-        .groupby("Iteration No", group_keys=False)
-        .head(1)
-        .assign(Side="Short")
-    )
-
-    out = pd.concat([long_top, short_top], ignore_index=True, sort=False)
-    if out.empty:
-        return out
-
-    out = out.sort_values(["Iteration No", "Side"]).reset_index(drop=True)
-
-    if "Iteration Time" in out.columns:
-        out["Iteration"] = (
-        out["Iteration No"].astype("Int64").astype(str)
-        + " | "
-        + out["Iteration Time"].astype(str)
-    )
-    else:
-        out["Iteration"] = out["Iteration No"].astype("Int64").astype(str)
-
-    return out
-
+    
 
 def build_history_table(history_df: pd.DataFrame, side: str) -> str:
     if history_df is None or history_df.empty:
