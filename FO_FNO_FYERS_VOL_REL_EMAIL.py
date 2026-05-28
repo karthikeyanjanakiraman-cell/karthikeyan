@@ -1094,11 +1094,7 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
 
 def build_history_table(history_df: pd.DataFrame, side: str) -> str:
     if history_df is None or history_df.empty:
-        return "
-
-No history yet.
-
-"
+        return "No history yet."
 
     df = history_df.copy()
     if "Side" in df.columns:
