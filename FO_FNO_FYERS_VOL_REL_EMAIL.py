@@ -59,11 +59,27 @@ sender_password = os.environ.get("SENDER_PASSWORD", "password")
 recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
 EMAIL_DISPLAY_COLS = [
-    "Symbol", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced",
-    "ARIMA Signal", "Kalman Signal",
-    "5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal",
-    "Bull_Signal", "Bear_Signal", "Overall_Signal", "Price_Lead_Status", "IVP",
-    "Volatility State", "Last Iteration Time",
+    "Symbol",
+    "LTP",
+    "% Change",
+    "Directional",
+    "Turning",
+    "Stability",
+    "Balanced",
+    "CumsumPlus",
+    "ARIMA Signal",
+    "Kalman Signal",
+    "5m_Signal",
+    "15m_Signal",
+    "30m_Signal",
+    "60m_Signal",
+    "Bull_Signal",
+    "Bear_Signal",
+    "Overall_Signal",
+    "Price_Lead_Status",
+    "IVP",
+    "Volatility State",
+    "Last Iteration Time",
 ]
 
 
@@ -433,7 +449,7 @@ def compute_price_lead_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
 def price_stats_from_series(prices: pd.Series) -> dict:
     p = pd.to_numeric(prices, errors="coerce").dropna().astype(float)
     if len(p) < 3:
-        return {"Directional": np.nan, "Turning": np.nan, "Stability": np.nan, "Balanced": np.nan, "CumsumPlus": np.nan}
+        return {"Directional": np.nan, "Turning": np.nan, "Stability": np.nan, "Balanced": np.nan}
     x = np.arange(len(p), dtype=float)
     slope = float(np.polyfit(x, p.values, 1)[0])
     net_move = float(p.iloc[-1] - p.iloc[0])
@@ -442,8 +458,7 @@ def price_stats_from_series(prices: pd.Series) -> dict:
     directional = slope + net_move
     stability = std_p
     balanced = directional - turning + std_p
-    cumsum_plus = float(np.sum(np.clip(np.diff(p.values), 0, None)))
-    return {"Directional": directional, "Turning": turning, "Stability": stability, "Balanced": balanced, "CumsumPlus": cumsum_plus}
+    return {"Directional": directional, "Turning": turning, "Stability": stability, "Balanced": balanced}
 
 
 
@@ -539,11 +554,13 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
             "Iteration No": total_iters,
             "Iteration Minutes": iter_mins,
             "Iteration Time": t.strftime("%H:%M"),
+            "LTP": float(row["close"]),
             "Current Volume": cum_vol,
             "Directional": ps["Directional"],
             "Turning": ps["Turning"],
             "Stability": ps["Stability"],
             "Balanced": ps["Balanced"],
+            "CumsumPlus": ps["CumsumPlus"],
             "10 Day Relative Volume": rvol10,
             "20 Day Relative Volume": rvol20,
             "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else float("nan"),
@@ -578,7 +595,6 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
     summary = {
         "LTP": ltp, "Directional": final_ps["Directional"], "Turning": final_ps["Turning"],
         "Stability": final_ps["Stability"], "Balanced": final_ps["Balanced"],
-        "CumsumPlus": final_ps.get("CumsumPlus", np.nan),
         "ARIMA Signal": arima_signal_from_series(curr_df["close"]),
         "Kalman Signal": kalman_signal_from_series(curr_df["close"]),
         "Current Volume": last_cum_vol, "10 Day Relative Volume": last_rvol10,
@@ -630,7 +646,6 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "Symbol": sym, "LTP": ltp, "% Change": pct_change,
             "Directional": iter_summary.get("Directional"), "Turning": iter_summary.get("Turning"),
             "Stability": iter_summary.get("Stability"), "Balanced": iter_summary.get("Balanced"),
-            "CumsumPlus": iter_summary.get("CumsumPlus"),
             "ARIMA Signal": iter_summary.get("ARIMA Signal"),
             "Kalman Signal": iter_summary.get("Kalman Signal"),
             "5m_Signal": iter_summary.get("5m_Signal"),
@@ -803,94 +818,6 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     return long_df, short_df
     
                 
-ITERATION_HISTORY_CSV = "iteration_top1_history.csv"
-
-
-def append_top1_to_history(long_df: pd.DataFrame, short_df: pd.DataFrame) -> None:
-    rows = []
-    iteration_id = datetime.now().strftime("%Y-%m-%d %H:%M")
-    for side, df in [("Long", long_df), ("Short", short_df)]:
-        if df is None or df.empty:
-            continue
-        row = df.iloc[0].copy().to_dict()
-        row["Iteration"] = iteration_id
-        row["Side"] = side
-        rows.append(row)
-    if not rows:
-        return
-    new_df = pd.DataFrame(rows)
-    if os.path.exists(ITERATION_HISTORY_CSV):
-        try:
-            old_df = pd.read_csv(ITERATION_HISTORY_CSV)
-            new_df = pd.concat([old_df, new_df], ignore_index=True)
-        except Exception:
-            pass
-    new_df.to_csv(ITERATION_HISTORY_CSV, index=False)
-
-
-def load_iteration_history() -> pd.DataFrame:
-    if not os.path.exists(ITERATION_HISTORY_CSV):
-        return pd.DataFrame()
-    try:
-        return pd.read_csv(ITERATION_HISTORY_CSV)
-    except Exception:
-        return pd.DataFrame()
-
-
-def build_history_table(history_df: pd.DataFrame, side: str) -> str:
-    if history_df is None or history_df.empty:
-        return '<p style="color:#9ca3af;">No history yet.</p>'
-    df = history_df.copy()
-    if "Side" in df.columns:
-        df = df[df["Side"].astype(str).str.lower() == side.lower()]
-    if df.empty:
-        return '<p style="color:#9ca3af;">No history yet.</p>'
-
-    cols = [
-        "Iteration", "Symbol", "LTP", "% Change", "Directional", "Turning", "Stability",
-        "Balanced", "CumsumPlus", "ARIMA Signal", "Kalman Signal", "Bull_Signal",
-        "Bear_Signal", "Overall_Signal", "Last Iteration Time"
-    ]
-    cols = [c for c in cols if c in df.columns]
-    df = df.tail(15)[cols].copy()
-
-    def style_cell(col, val):
-        base = 'padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;'
-        try:
-            num = float(val)
-        except Exception:
-            return base
-        if col in ["% Change", "Directional", "Balanced", "CumsumPlus", "Bull_Signal", "Bear_Signal", "Overall_Signal"]:
-            if num > 0:
-                return base + 'background:#14532d;color:#dcfce7;font-weight:600;'
-            if num < 0:
-                return base + 'background:#7f1d1d;color:#fee2e2;font-weight:600;'
-        return base
-
-    def fmt(col, val):
-        if pd.isna(val):
-            return ""
-        if col == "% Change":
-            return f"{float(val):.2f}%"
-        if isinstance(val, (int, float, np.integer, np.floating)):
-            return f"{float(val):.2f}"
-        return str(val)
-
-    header = ''.join(
-        f'<th style="padding:6px 8px;border:1px solid #4b5563;background:#374151;color:#f9fafb;">{c}</th>'
-        for c in cols
-    )
-    body = []
-    for _, row in df.iterrows():
-        cells = []
-        for col in cols:
-            val = row.get(col, "")
-            cells.append(f'<td style="{style_cell(col, val)}">{fmt(col, val)}</td>')
-        body.append('<tr>' + ''.join(cells) + '</tr>')
-    title = "Long" if side.lower() == "long" else "Short"
-    return f'<h3 style="color:#f9fafb;">Iteration history {title}</h3><table style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:12px;"><thead><tr>{header}</tr></thead><tbody>{"".join(body)}</tbody></table>'
-
-
 def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     if df is None or df.empty:
         return '<p style="color:#cbd5e1;font-family:Arial,sans-serif;">No candidates found.</p>'
@@ -944,29 +871,45 @@ def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     return ('<div style="overflow-x:auto;margin:10px 0 18px 0;">' '<table style="border-collapse:collapse;background:#1f2937;font-family:Arial,sans-serif;">' f'<thead><tr>{header_cells}</tr></thead>' f'<tbody>{"" .join(rows_html)}</tbody>' '</table></div>')
 
 
-def send_email_with_tables(history_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
-    scan_time = datetime.now().strftime("%d %b %Y, %H:%M")
+def send_email_with_tables(
+    long_df: pd.DataFrame, short_df: pd.DataFrame,
+    csv_filename: str, detail_csv_filename: str,
+    index_long_df: pd.DataFrame = None, index_short_df: pd.DataFrame = None,
+    index_iter_csv_filename: Optional[str] = None,
+) -> bool:
     try:
-        history_long_html = build_history_table(history_df, "Long")
-        history_short_html = build_history_table(history_df, "Short")
+        if index_long_df is None:
+            index_long_df = pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+        if index_short_df is None:
+            index_short_df = pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+        scan_time = datetime.now().strftime("%d %b %Y, %H:%M")
+        index_long_html = df_to_html_table(index_long_df)
+        index_short_html = df_to_html_table(index_short_df)
+        stock_long_html = df_to_html_table(long_df)
+        stock_short_html = df_to_html_table(short_df)
         html_body = f"""
 <html>
   <body style="font-family: Arial, sans-serif; font-size: 13px; background:#111827; color:#e5e7eb;">
     <h2 style="color:#f9fafb;">Intraday Vol Iteration Alert</h2>
     <p style="color:#9ca3af;">Scan completed at {scan_time}.</p>
-    {history_long_html}
-    <div style="height:14px"></div>
-    {history_short_html}
+    <h3 style="color:#34d399;">Index Long Candidates</h3>
+    {index_long_html}
+    <h3 style="color:#f87171;">Index Short Candidates</h3>
+    {index_short_html}
+    <h3 style="color:#34d399;">Stock Long Candidates</h3>
+    {stock_long_html}
+    <h3 style="color:#f87171;">Stock Short Candidates</h3>
+    {stock_short_html}
     <p style="color:#6b7280; font-size:11px; margin-top:20px;">Generated by FO_FNO_FYERS_VOL_REL_EMAIL.py</p>
   </body>
 </html>
 """
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"Intraday Vol Iteration Alert - {scan_time}"
+        msg["Subject"] = f"Intraday Scan ÃƒÆ’Ã†â€™Ãƒâ€šÃ‚Â¢ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â€šÂ¬Ã…Â¡Ãƒâ€šÃ‚Â¬ÃƒÆ’Ã‚Â¢ÃƒÂ¢Ã¢â‚¬Å¡Ã‚Â¬Ãƒâ€šÃ‚Â {scan_time}"
         msg["From"] = sender_email
         msg["To"] = recipient_email
         msg.attach(MIMEText(html_body, "html", _charset="utf-8"))
-        for fname in [csv_filename, detail_csv_filename]:
+        for fname in [csv_filename, detail_csv_filename, index_iter_csv_filename]:
             if not fname or not os.path.exists(fname):
                 continue
             with open(fname, "rb") as f:
@@ -1010,17 +953,28 @@ def main():
     if not fyers:
         logger.error("Fyers not initialized. Exiting.")
         return
+
     summary_df, detail_df = scan_fno_universe()
     if summary_df.empty:
         logger.warning("No summary data produced.")
         return
+
     summary_df = derive_rank_columns(summary_df)
     summary_df = add_signal_columns(summary_df)
+
     long_df, short_df = build_candidate_tables(summary_df)
-    append_top1_to_history(long_df, short_df)
-    history_df = load_iteration_history()
+    history_df = load_iteration_history(detail_df)
+
     summary_csv, detail_csv = save_outputs(summary_df, detail_df, prefix="fno")
-    sent = send_email_with_tables(history_df=history_df, csv_filename=summary_csv, detail_csv_filename=detail_csv)
+
+    sent = send_email_with_tables(
+        long_df=long_df,
+        short_df=short_df,
+        history_df=history_df,
+        csv_filename=summary_csv,
+        detail_csv_filename=detail_csv
+    )
+
     if sent:
         logger.info("Scan and email completed.")
     else:
