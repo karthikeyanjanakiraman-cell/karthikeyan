@@ -1082,7 +1082,7 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
 
     if "Iteration Time" in out.columns:
         out["Iteration"] = (
-            out["Iteration No"].astype("Int64").astype(str)
+            out["Iteration No"].astype("Int64").astype(str)0
             + " | "
             + out["Iteration Time"].astype(str)
         )
@@ -1101,10 +1101,7 @@ def build_history_table(history_df: pd.DataFrame, side: str) -> str:
         df = df[df["Side"].astype(str).str.lower() == side.lower()]
 
     if df.empty:
-        return "
-No history yet.
-
-"
+        return "No history yet."
 
     cols = [
         "Iteration", "Symbol", "LTP", "% Change", "Directional", "Turning",
