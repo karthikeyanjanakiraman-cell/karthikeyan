@@ -1082,10 +1082,10 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
 
     if "Iteration Time" in out.columns:
         out["Iteration"] = (
-            out["Iteration No"].astype("Int64").astype(str)0
-            + " | "
-            + out["Iteration Time"].astype(str)
-        )
+        out["Iteration No"].astype("Int64").astype(str)
+        + " | "
+        + out["Iteration Time"].astype(str)
+    )
     else:
         out["Iteration"] = out["Iteration No"].astype("Int64").astype(str)
 
