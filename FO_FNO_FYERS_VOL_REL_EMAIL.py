@@ -578,7 +578,7 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
     summary = {
         "LTP": ltp, "Directional": final_ps["Directional"], "Turning": final_ps["Turning"],
         "Stability": final_ps["Stability"], "Balanced": final_ps["Balanced"],
-        "CumsumPlus": final_ps.get("CumsumPlus"),
+        "CumsumPlus": final_ps.get("CumsumPlus", np.nan),
         "ARIMA Signal": arima_signal_from_series(curr_df["close"]),
         "Kalman Signal": kalman_signal_from_series(curr_df["close"]),
         "Current Volume": last_cum_vol, "10 Day Relative Volume": last_rvol10,
@@ -630,6 +630,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "Symbol": sym, "LTP": ltp, "% Change": pct_change,
             "Directional": iter_summary.get("Directional"), "Turning": iter_summary.get("Turning"),
             "Stability": iter_summary.get("Stability"), "Balanced": iter_summary.get("Balanced"),
+            "CumsumPlus": iter_summary.get("CumsumPlus"),
             "ARIMA Signal": iter_summary.get("ARIMA Signal"),
             "Kalman Signal": iter_summary.get("Kalman Signal"),
             "5m_Signal": iter_summary.get("5m_Signal"),
@@ -802,7 +803,6 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     return long_df, short_df
     
                 
-
 ITERATION_HISTORY_CSV = "iteration_top1_history.csv"
 
 
@@ -812,27 +812,28 @@ def append_top1_to_history(long_df: pd.DataFrame, short_df: pd.DataFrame) -> Non
     for side, df in [("Long", long_df), ("Short", short_df)]:
         if df is None or df.empty:
             continue
-        r = df.iloc[0].to_dict()
-        r["Iteration"] = iteration_id
-        r["Side"] = side
-        rows.append(r)
+        row = df.iloc[0].copy()
+        out = {col: row[col] for col in df.columns if col in row.index}
+        out["Iteration"] = iteration_id
+        out["Side"] = side
+        rows.append(out)
     if not rows:
         return
-    new_df = pd.DataFrame(rows)
+    hist_new = pd.DataFrame(rows)
     if os.path.exists(ITERATION_HISTORY_CSV):
         try:
-            old = pd.read_csv(ITERATION_HISTORY_CSV)
-            new_df = pd.concat([old, new_df], ignore_index=True)
+            hist_old = pd.read_csv(ITERATION_HISTORY_CSV)
+            hist_new = pd.concat([hist_old, hist_new], ignore_index=True)
         except Exception:
             pass
-    new_df.to_csv(ITERATION_HISTORY_CSV, index=False)
+    hist_new.to_csv(ITERATION_HISTORY_CSV, index=False)
 
 
 def load_iteration_history() -> pd.DataFrame:
     if not os.path.exists(ITERATION_HISTORY_CSV):
         return pd.DataFrame()
     try:
-        return pd.read_csv(ITERATION_HISTORY_CSV).tail(30)
+        return pd.read_csv(ITERATION_HISTORY_CSV)
     except Exception:
         return pd.DataFrame()
 
@@ -845,22 +846,50 @@ def build_history_table(history_df: pd.DataFrame, side: str) -> str:
         df = df[df["Side"].astype(str).str.lower() == side.lower()]
     if df.empty:
         return '<p style="color:#9ca3af;">No history yet.</p>'
-    cols = [c for c in ["Iteration", "Side", "Symbol", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus", "ARIMA Signal", "Kalman Signal", "Bull_Signal", "Bear_Signal", "Overall_Signal", "Last Iteration Time"] if c in df.columns]
-    df = df.tail(15)[cols]
-    head = ''.join(f'<th style="padding:6px 8px;border:1px solid #4b5563;background:#374151;color:#f9fafb;">{c}</th>' for c in cols)
-    body = []
-    for _, r in df.iterrows():
+
+    cols = [
+        "Iteration", "Symbol", "LTP", "% Change", "Directional", "Turning", "Stability",
+        "Balanced", "CumsumPlus", "ARIMA Signal", "Kalman Signal", "Bull_Signal",
+        "Bear_Signal", "Overall_Signal", "Last Iteration Time"
+    ]
+    cols = [c for c in cols if c in df.columns]
+    df = df.tail(15)[cols].copy()
+
+    def cell_style(col, val):
+        base = 'padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;'
+        try:
+            num = float(val)
+        except Exception:
+            return base
+        if col in ["% Change", "Directional", "Balanced", "CumsumPlus", "Bull_Signal", "Bear_Signal", "Overall_Signal"]:
+            if num > 0:
+                return base + 'background:#14532d;color:#dcfce7;font-weight:600;'
+            if num < 0:
+                return base + 'background:#7f1d1d;color:#fee2e2;font-weight:600;'
+        return base
+
+    def format_cell(col, val):
+        if pd.isna(val):
+            return ""
+        if col == "% Change":
+            return f"{float(val):.2f}%"
+        if isinstance(val, (int, float, np.integer, np.floating)):
+            return f"{float(val):.2f}"
+        return str(val)
+
+    header = ''.join(f'<th style="padding:6px 8px;border:1px solid #4b5563;background:#374151;color:#f9fafb;">{c}</th>' for c in cols)
+    rows_html = []
+    for _, row in df.iterrows():
         tds = []
-        for c in cols:
-            v = r.get(c, '')
-            if c == "% Change" and pd.notna(v):
-                v = f"{float(v):.2f}%"
-            elif isinstance(v, (int, float, np.integer, np.floating)):
-                v = f"{float(v):.2f}"
-            tds.append(f'<td style="padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;">{v}</td>')
-        body.append(f'<tr>{"".join(tds)}</tr>')
+        for col in cols:
+            val = row.get(col, "")
+            tds.append(f'<td style="{cell_style(col, val)}">{format_cell(col, val)}</td>')
+        rows_html.append('<tr>' + ''.join(tds) + '</tr>')
+
     title = "Long" if side.lower() == "long" else "Short"
-    return f'<h3 style="color:#f9fafb;">Iteration history {title}</h3><table style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:12px;"><thead><tr>{head}</tr></thead><tbody>{"".join(body)}</tbody></table>'
+    return f'<h3 style="color:#f9fafb;">Iteration history {title}</h3><table style="border-collapse:collapse;width:100%;font-family:Arial,sans-serif;font-size:12px;"><thead><tr>{header}</tr></thead><tbody>{"".join(rows_html)}</tbody></table>'
+
+
 def df_to_html_table(df: pd.DataFrame, max_rows: int = 15) -> str:
     if df is None or df.empty:
         return '<p style="color:#cbd5e1;font-family:Arial,sans-serif;">No candidates found.</p>'
@@ -949,10 +978,12 @@ def send_email_with_tables(history_df: pd.DataFrame, csv_filename: str = "", det
             server.starttls()
             server.login(sender_email, sender_password)
             server.sendmail(sender_email, recipient_email, msg.as_string())
+        logger.info("Email sent successfully.")
         return True
     except Exception as e:
         logger.error(f"EMAIL Error: {e}")
         return False
+
 
 def save_outputs(summary_df: pd.DataFrame, detail_df: pd.DataFrame, prefix: str = "scan") -> Tuple[str, str]:
     ts = datetime.now().strftime("%Y%m%d_%H%M")
