@@ -990,44 +990,30 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
 
     base = df.copy()
-    for c in ["Directional", "Turning", "Stability", "ARIMA Signal", "Kalman Signal", "Bull_Signal", "Bear_Signal"]:
+    for c in ["% Change", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus"]:
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
 
     def prep_side(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
         if df_side.empty:
             return df_side
-
         df_side = df_side.copy()
         if side == "long":
-            df_side = df_side[df_side["Directional"] > 0]
-            side_signal = df_side["Bull_Signal"]
-            asc = [False, False, False, True, True, True]
+            if "Directional" in df_side.columns:
+                df_side = df_side[df_side["Directional"] > 0]
+            df_side = df_side.sort_values(by=["% Change", "Directional", "Turning", "CumsumPlus", "Stability"], ascending=[False, False, True, False, False], na_position="last")
         else:
-            df_side = df_side[df_side["Directional"] < 0]
-            side_signal = df_side["Bear_Signal"]
-            asc = [True, False, False, True, True, True]
-
-        df_side["_side_signal"] = side_signal
-        df_side["_abs_arima"] = df_side["ARIMA Signal"].abs()
-        df_side["_abs_kalman"] = df_side["Kalman Signal"].abs()
-
-        df_side = df_side.sort_values(
-            by=["Directional", "_side_signal", "Stability", "Turning", "_abs_arima", "_abs_kalman"],
-            ascending=asc,
-            na_position="last",
-        )
-        return df_side.drop(columns=["_side_signal", "_abs_arima", "_abs_kalman"], errors="ignore")
+            if "Directional" in df_side.columns:
+                df_side = df_side[df_side["Directional"] < 0]
+            df_side = df_side.sort_values(by=["% Change", "Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, True, True, True, False], na_position="last")
+        return df_side
 
     long_df = prep_side(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
     short_df = prep_side(base, "short").drop_duplicates(subset=["Symbol"]).head(15)
-
     long_cols = [c for c in EMAIL_DISPLAY_COLS if c in long_df.columns]
     short_cols = [c for c in EMAIL_DISPLAY_COLS if c in short_df.columns]
-
     long_df = long_df[long_cols] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     short_df = short_df[short_cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-
     return long_df, short_df
 
 
@@ -1036,10 +1022,7 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = detail_df.copy()
-    numeric_cols = [
-        "Iteration No", "LTP", "% Change", "Directional", "Turning",
-        "Stability", "Balanced", "CumsumPlus"
-    ]
+    numeric_cols = ["Iteration No", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus"]
     for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -1052,11 +1035,7 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
 
     long_top = (
         df[df["Directional"] > 0]
-        .sort_values(
-            ["Iteration No", "Directional", "Balanced", "Turning", "Stability"],
-            ascending=[True, False, False, True, True],
-            na_position="last",
-        )
+        .sort_values(["Iteration No", "% Change", "Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, False, False, True, False, False], na_position="last")
         .groupby("Iteration No", group_keys=False)
         .head(1)
         .assign(Side="Long")
@@ -1064,11 +1043,7 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
 
     short_top = (
         df[df["Directional"] < 0]
-        .sort_values(
-            ["Iteration No", "Directional", "Balanced", "Turning", "Stability"],
-            ascending=[True, True, True, True, True],
-            na_position="last",
-        )
+        .sort_values(["Iteration No", "% Change", "Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, True, True, True, False, False], na_position="last")
         .groupby("Iteration No", group_keys=False)
         .head(1)
         .assign(Side="Short")
@@ -1079,18 +1054,12 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
         return out
 
     out = out.sort_values(["Iteration No", "Side"]).reset_index(drop=True)
-
     if "Iteration Time" in out.columns:
-        out["Iteration"] = (
-        out["Iteration No"].astype("Int64").astype(str)
-        + " | "
-        + out["Iteration Time"].astype(str)
-    )
+        out["Iteration"] = out["Iteration No"].astype("Int64").astype(str) + " | " + out["Iteration Time"].astype(str)
     else:
         out["Iteration"] = out["Iteration No"].astype("Int64").astype(str)
 
     return out
-
 
 def build_history_table(history_df: pd.DataFrame, side: str) -> str:
     if history_df is None or history_df.empty:
