@@ -1025,88 +1025,63 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
 
 
 def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    cols_all = ["Symbol", "Count", "Gap", "First Occurrence", "Latest Iteration"]
+    cols_combo = cols_all + ["Count (Last 15)", "Gap (Last 15)", "First Occurrence (Last 15)", "Latest Iteration (Last 15)"]
     if detail_df is None or detail_df.empty:
-        empty_cols = [
-            "Symbol", "Count", "Gap", "First Occurrence", "Latest Iteration",
-            "Count (Last 15)", "Gap (Last 15)", "First Occurrence (Last 15)", "Latest Iteration (Last 15)"
-        ]
-        return pd.DataFrame(columns=empty_cols), pd.DataFrame(columns=empty_cols)
-
+        return pd.DataFrame(columns=cols_all), pd.DataFrame(columns=cols_combo)
     df = detail_df.copy()
     for col in ["Iteration No", "Directional", "Balanced"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    if "Symbol" not in df.columns or "Iteration No" not in df.columns:
-        empty_cols = [
-            "Symbol", "Count", "Gap", "First Occurrence", "Latest Iteration",
-            "Count (Last 15)", "Gap (Last 15)", "First Occurrence (Last 15)", "Latest Iteration (Last 15)"
-        ]
-        return pd.DataFrame(columns=empty_cols), pd.DataFrame(columns=empty_cols)
-
+    if "Symbol" not in df.columns or "Iteration No" not in df.columns or "Directional" not in df.columns or "Balanced" not in df.columns:
+        return pd.DataFrame(columns=cols_all), pd.DataFrame(columns=cols_combo)
     rows = []
     for sym, g in df.groupby("Symbol", sort=False):
         g = g.sort_values("Iteration No").copy()
-        if g.empty:
-            continue
-
         bal_diff = g["Balanced"].diff()
         dir_diff = g["Directional"].diff()
-        cond_all = (bal_diff > dir_diff) & bal_diff.notna() & dir_diff.notna()
-
-        if cond_all.any():
-            count_all = int(cond_all.sum())
-            gap_all = float((bal_diff[cond_all] - dir_diff[cond_all]).sum())
-            first_all = int(g.loc[cond_all, "Iteration No"].iloc[0])
-            latest_all = int(g.loc[cond_all, "Iteration No"].iloc[-1])
+        cond = (bal_diff > dir_diff) & bal_diff.notna() & dir_diff.notna()
+        if cond.any():
+            count_all = int(cond.sum())
+            gap_all = float((bal_diff[cond] - dir_diff[cond]).sum())
+            first_all = int(g.loc[cond, "Iteration No"].iloc[0])
+            last_all = int(g.loc[cond, "Iteration No"].iloc[-1])
         else:
-            count_all, gap_all, first_all, latest_all = 0, 0.0, np.nan, np.nan
-
+            count_all, gap_all, first_all, last_all = 0, 0.0, np.nan, np.nan
         g15 = g.tail(15).copy()
         bal_diff_15 = g15["Balanced"].diff()
         dir_diff_15 = g15["Directional"].diff()
-        cond_15 = (bal_diff_15 > dir_diff_15) & bal_diff_15.notna() & dir_diff_15.notna()
-
-        if cond_15.any():
-            count_15 = int(cond_15.sum())
-            gap_15 = float((bal_diff_15[cond_15] - dir_diff_15[cond_15]).sum())
-            first_15 = int(g15.loc[cond_15, "Iteration No"].iloc[0])
-            latest_15 = int(g15.loc[cond_15, "Iteration No"].iloc[-1])
+        cond15 = (bal_diff_15 > dir_diff_15) & bal_diff_15.notna() & dir_diff_15.notna()
+        if cond15.any():
+            count_15 = int(cond15.sum())
+            gap_15 = float((bal_diff_15[cond15] - dir_diff_15[cond15]).sum())
+            first_15 = int(g15.loc[cond15, "Iteration No"].iloc[0])
+            last_15 = int(g15.loc[cond15, "Iteration No"].iloc[-1])
         else:
-            count_15, gap_15, first_15, latest_15 = 0, 0.0, np.nan, np.nan
-
+            count_15, gap_15, first_15, last_15 = 0, 0.0, np.nan, np.nan
         rows.append({
             "Symbol": sym,
             "Count": count_all,
             "Gap": gap_all,
             "First Occurrence": first_all,
-            "Latest Iteration": latest_all,
+            "Latest Iteration": last_all,
             "Count (Last 15)": count_15,
             "Gap (Last 15)": gap_15,
             "First Occurrence (Last 15)": first_15,
-            "Latest Iteration (Last 15)": latest_15,
+            "Latest Iteration (Last 15)": last_15,
         })
-
     out = pd.DataFrame(rows)
     if out.empty:
-        return out, out
-
+        return pd.DataFrame(columns=cols_all), pd.DataFrame(columns=cols_combo)
     out = out.sort_values(["Count", "Gap"], ascending=[False, False], na_position="last").reset_index(drop=True)
-    all_df = out[["Symbol", "Count", "Gap", "First Occurrence", "Latest Iteration"]].copy()
-    combined_df = out[[
-        "Symbol", "Count", "Gap", "First Occurrence", "Latest Iteration",
-        "Count (Last 15)", "Gap (Last 15)", "First Occurrence (Last 15)", "Latest Iteration (Last 15)"
-    ]].copy()
-    return all_df, combined_df
+    return out[cols_all].copy(), out[cols_combo].copy()
 
 
 def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25) -> str:
     if df is None or df.empty:
-        return '<h3 style="color:#f9fafb;margin:14px 0 8px 0">{}</h3><div style="padding:12px;border:1px solid #374151;background:#111827;color:#d1d5db;border-radius:8px;">No data found.</div>'.format(title)
-
+        return '<h3 style="color:#f9fafb;margin:14px 0 8px 0">' + title + '</h3><div style="padding:12px;border:1px solid #374151;background:#111827;color:#d1d5db;border-radius:8px;">No data found.</div>'
     view = df.head(max_rows).copy()
     cols = list(view.columns)
-
     def fmt(col, val):
         if pd.isna(val):
             return ""
@@ -1114,53 +1089,35 @@ def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25
             return str(val)
         if "Gap" in col:
             return f"{float(val):.2f}"
-        return str(int(float(val))) if isinstance(val, (int, float, np.integer, np.floating)) else str(val)
-
-    header = "".join(
-        f'<th style="padding:8px;border:1px solid #4b5563;background:#111827;color:#f9fafb;white-space:nowrap">{c}</th>'
-        for c in cols
-    )
-    rows = []
-    for _, r in view.iterrows():
-        tds = "".join(
-            f'<td style="padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;white-space:nowrap">{fmt(c, r[c])}</td>'
-            for c in cols
-        )
-        rows.append(f"<tr>{tds}</tr>")
-
-    return (
-        f'<h3 style="color:#f9fafb;margin:14px 0 8px 0">{title}</h3>'
-        f'<div style="overflow-x:auto">'
-        f'<table style="border-collapse:collapse;width:100%;background:#030712">'
-        f'<thead><tr>{header}</tr></thead>'
-        f'<tbody>{"".join(rows)}</tbody>'
-        f'</table></div>'
-    )
+        return str(int(float(val)))
+    header = "".join(['<th style="padding:8px;border:1px solid #4b5563;background:#111827;color:#f9fafb;white-space:nowrap">' + c + '</th>' for c in cols])
+    body = []
+    for _, row in view.iterrows():
+        cells = "".join(['<td style="padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;white-space:nowrap">' + fmt(c, row[c]) + '</td>' for c in cols])
+        body.append('<tr>' + cells + '</tr>')
+    return '<h3 style="color:#f9fafb;margin:14px 0 8px 0">' + title + '</h3><div style="overflow-x:auto"><table style="border-collapse:collapse;width:100%;background:#030712"><thead><tr>' + header + '</tr></thead><tbody>' + ''.join(body) + '</tbody></table></div>'
 
 
-def send_second_email_with_exceedance_tables(all_iter_df: pd.DataFrame, combined_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
+def send_second_email_with_exceedance_tables(all_iter_df: pd.DataFrame, combo_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
     try:
-        scan_time = datetime.now().strftime("%Y-%m-%d %H:%M")
-        all_iter_html = build_exceedance_table_html(all_iter_df, "Balanced vs Directional - All Iterations", max_rows=25)
-        combined_html = build_exceedance_table_html(combined_df, "Balanced vs Directional - All + Last 15", max_rows=25)
-
+        scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        combo_html = build_exceedance_table_html(combo_df, "Balanced vs Directional - All + Last 15", max_rows=25)
+        all_html = build_exceedance_table_html(all_iter_df, "Balanced vs Directional - All Iterations", max_rows=25)
         html_body = (
             '<html><body style="margin:0;padding:20px;background:#030712;color:#e5e7eb;font-family:Arial,sans-serif;">'
             '<div style="max-width:1600px;margin:0 auto;">'
             '<h2 style="margin:0 0 12px 0;color:#facc15;">Intraday Vol Iteration Alert - Exceedance Tables</h2>'
-            f'<div style="margin-bottom:18px;color:#cbd5e1;font-size:14px;">Scan completed at {scan_time}</div>'
-            f'<div style="margin-bottom:24px;padding:14px;border:1px solid #374151;background:#111827;border-radius:10px;">{combined_html}</div>'
-            f'<div style="margin-bottom:24px;padding:14px;border:1px solid #374151;background:#111827;border-radius:10px;">{all_iter_html}</div>'
+            '<div style="margin-bottom:18px;color:#cbd5e1;font-size:14px;">Scan completed at ' + scan_time + '</div>'
+            '<div style="margin-bottom:24px;padding:14px;border:1px solid #374151;background:#111827;border-radius:10px;">' + combo_html + '</div>'
+            '<div style="margin-bottom:24px;padding:14px;border:1px solid #374151;background:#111827;border-radius:10px;">' + all_html + '</div>'
             '<div style="margin-top:18px;color:#94a3b8;font-size:12px;">Generated by FO_FNO_FYERS_VOL_REL_EMAIL.py</div>'
             '</div></body></html>'
         )
-
         msg = MIMEMultipart("alternative")
         msg["Subject"] = f"Intraday Vol Iteration Alert - Exceedance Tables - {scan_time}"
         msg["From"] = sender_email
         msg["To"] = recipient_email
         msg.attach(MIMEText(html_body, "html", _charset="utf-8"))
-
         for fname in [csv_filename, detail_csv_filename]:
             if not fname or not os.path.exists(fname):
                 continue
@@ -1170,12 +1127,10 @@ def send_second_email_with_exceedance_tables(all_iter_df: pd.DataFrame, combined
                 encoders.encode_base64(part)
                 part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(fname)}"')
                 msg.attach(part)
-
         with smtplib.SMTP(smtp_host, smtp_port) as server:
             server.starttls()
             server.login(sender_email, sender_password)
             server.sendmail(sender_email, recipient_email, msg.as_string())
-
         logger.info("Second exceedance email sent successfully.")
         return True
     except Exception as e:
