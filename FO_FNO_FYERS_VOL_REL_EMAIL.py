@@ -1273,49 +1273,6 @@ def send_email_with_tables(
         return False
 
 
-
-
-def send_balanced_email(detail_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
-    if detail_df is None or detail_df.empty:
-        logger.info("EMAIL BalancedEmail skipped: empty detail_df.")
-        return False
-    try:
-        recentsummary = summarize_balanced_exceeds(detail_df, window_minutes=15)
-        allsummary = summarize_balanced_exceeds(detail_df, window_minutes=None)
-        if recentsummary.empty and allsummary.empty:
-            logger.info("EMAIL BalancedEmail skipped: no qualifying rows found.")
-            return False
-        msg = MIMEMultipart()
-        msg["From"] = sender_email
-        msg["To"] = recipient_email
-        msg["Subject"] = f"FO Balanced Directional Scan - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-        html = f"""
-        <html><body style="font-family:Arial,sans-serif;background:#111827;color:#e5e7eb;padding:18px">
-        <h2 style="margin:0 0 12px 0;color:#fde68a">Balanced vs Directional - Last 15 Minutes</h2>
-        {build_balanced_exceed_html(recentsummary)}
-        <div style="height:18px"></div>
-        <h2 style="margin:0 0 12px 0;color:#93c5fd">Balanced vs Directional - All Iterations</h2>
-        {build_balanced_exceed_html(allsummary)}
-        </body></html>
-        """
-        msg.attach(MIMEText(html, "html"))
-        for path in (csv_filename, detail_csv_filename):
-            if path and os.path.exists(path):
-                with open(path, "rb") as f:
-                    part = MIMEBase("application", "octet-stream")
-                    part.set_payload(f.read())
-                encoders.encode_base64(part)
-                part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(path)}")
-                msg.attach(part)
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.starttls()
-            server.login(sender_email, sender_password)
-            server.send_message(msg)
-        logger.info("EMAIL BalancedEmail sent successfully.")
-        return True
-    except Exception as e:
-        logger.error(f"EMAIL BalancedEmail failed: {e}")
-        return False
 def save_outputs(summary_df: pd.DataFrame, detail_df: pd.DataFrame, prefix: str = "scan") -> Tuple[str, str]:
     ts = datetime.now().strftime("%Y%m%d_%H%M")
     summary_csv = f"{prefix}_summary_{ts}.csv"
@@ -1505,12 +1462,6 @@ def main():
 
     if sent:
         logger.info("Scan and email completed.")
-    logger.info("EMAIL Dispatching balanced email...")
-    try:
-        sent_balanced = send_balanced_email(detail_df=detail_df if "detail_df" in locals() else pd.DataFrame(), csv_filename=summary_csv, detail_csv_filename=detail_csv)
-    except Exception as e:
-        sent_balanced = False
-        logger.error(f"EMAIL BalancedEmail failed during dispatch: {e}")
     else:
         logger.warning("Scan completed but email failed.")
 
