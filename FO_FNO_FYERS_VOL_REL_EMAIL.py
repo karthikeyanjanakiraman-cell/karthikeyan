@@ -1265,7 +1265,7 @@ def send_email_with_tables(
             server.login(sender_email, sender_password)
             server.sendmail(sender_email, recipient_email, msg.as_string())
 
-        logger.info("Email sent successfully.")
+        logger.info("Main email sent successfully.")
         return True
 
     except Exception as e:
@@ -1433,45 +1433,6 @@ def send_balanced_exceed_email(detail_df: pd.DataFrame, csv_filename: str = "", 
         logger.error(f"EMAIL Balanced>Email failed: {e}")
         return False
 
-
-
-def send_balanced_email(detail_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
-    if detail_df is None or detail_df.empty:
-        logger.info("EMAIL BalancedEmail skipped: empty detail_df.")
-        return False
-    try:
-        balanced_df = summarize_balanced_exceeds(detail_df, window_minutes=None)
-        if balanced_df.empty:
-            logger.info("EMAIL BalancedEmail skipped: no qualifying rows found.")
-            return False
-        msg = MIMEMultipart()
-        msg["From"] = sender_email
-        msg["To"] = recipient_email
-        msg["Subject"] = f"FO Balanced Directional Scan - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-        html = f"""
-        <html><body style="font-family:Arial,sans-serif;background:#111827;color:#e5e7eb;padding:18px">
-        <h2 style="margin:0 0 12px 0;color:#fde68a">Balanced vs Directional</h2>
-        {build_balanced_exceed_html(balanced_df)}
-        </body></html>
-        """
-        msg.attach(MIMEText(html, "html"))
-        for path in (csv_filename, detail_csv_filename):
-            if path and os.path.exists(path):
-                with open(path, "rb") as f:
-                    part = MIMEBase("application", "octet-stream")
-                    part.set_payload(f.read())
-                encoders.encode_base64(part)
-                part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(path)}")
-                msg.attach(part)
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.starttls()
-            server.login(sender_email, sender_password)
-            server.send_message(msg)
-        logger.info("EMAIL BalancedEmail sent successfully.")
-        return True
-    except Exception as e:
-        logger.error(f"EMAIL BalancedEmail failed: {e}")
-        return False
 def main():
     init_fyers()
     if not fyers:
@@ -1500,7 +1461,7 @@ def main():
     )
 
     if sent:
-        logger.info("Scan and email completed.")
+        logger.info("Both emails sent successfully.")
     else:
         logger.warning("Scan completed but email failed.")
 
