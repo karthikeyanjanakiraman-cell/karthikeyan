@@ -1002,7 +1002,14 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     if "Last_5m_Volume" in base.columns:
         base = base[base["Last_5m_Volume"].fillna(0) > 0]
 
-    base["BalancedVsDirectional"] = (base["Balanced"].fillna(0) - base["Directional"].fillna(0)).clip(lower=0)
+    if "Iteration No" not in base.columns:
+        base["Iteration No"] = np.nan
+    if "Balanced" not in base.columns:
+        base["Balanced"] = np.nan
+    if "Directional" not in base.columns:
+        base["Directional"] = np.nan
+
+    base["BalancedVsDirectional"] = (pd.to_numeric(base["Balanced"], errors="coerce").fillna(0) - pd.to_numeric(base["Directional"], errors="coerce").fillna(0)).clip(lower=0)
     base["BalanceCount"] = np.where(base["BalancedVsDirectional"] > 0, 1, 0)
 
     def prep_side(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
@@ -1039,39 +1046,32 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = detail_df.copy()
-    for col in ["Iteration No", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus"]:
+    for col in ["Iteration No", "Iteration Time", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus"]:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            df[col] = pd.to_numeric(df[col], errors="coerce") if col != "Iteration Time" else df[col]
 
     if "Iteration No" not in df.columns:
+        df["Iteration No"] = np.arange(1, len(df) + 1)
+    if "Balanced" not in df.columns:
+        df["Balanced"] = np.nan
+    if "Directional" not in df.columns:
+        df["Directional"] = np.nan
+
+    df["BalancedVsDirectional"] = (pd.to_numeric(df["Balanced"], errors="coerce").fillna(0) - pd.to_numeric(df["Directional"], errors="coerce").fillna(0)).clip(lower=0)
+    df = df[df["BalancedVsDirectional"] > 0].copy()
+    if df.empty:
         return pd.DataFrame()
 
-    last_15_iters = sorted(df["Iteration No"].dropna().astype(int).unique())[-15:]
-    df = df[df["Iteration No"].isin(last_15_iters)].copy()
-
-    long_top = (
-        df[df["Directional"] > 0]
-        .sort_values(["Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, False, True, False, False], na_position="last")
-        .groupby("Iteration No", group_keys=False)
-        .head(1)
-        .assign(Side="Long")
-    )
-
-    short_top = (
-        df[df["Directional"] < 0]
-        .sort_values(["Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, True, True, False, False], na_position="last")
-        .groupby("Iteration No", group_keys=False)
-        .head(1)
-        .assign(Side="Short")
-    )
-
-    out = pd.concat([long_top, short_top], ignore_index=True, sort=False)
-    if out.empty:
-        return out
-
-    out = out.sort_values(["Iteration No", "Side"]).reset_index(drop=True)
-    out["Iteration"] = out["Iteration No"].astype("Int64").astype(str) + " | " + out.get("Iteration Time", "").astype(str)
-    return out
+    df["_iter_rank"] = pd.to_numeric(df["Iteration No"], errors="coerce")
+    df = df.sort_values(["BalancedVsDirectional", "_iter_rank"], ascending=[False, False], na_position="last")
+    df = df.groupby("Iteration No", as_index=False, group_keys=False).head(1)
+    df["Side"] = np.where(df["Directional"] >= 0, "Long", "Short")
+    df = df.sort_values(["Iteration No", "Side"]).reset_index(drop=True)
+    if "Iteration Time" in df.columns:
+        df["Iteration"] = df["Iteration No"].astype("Int64").astype(str) + " | " + df["Iteration Time"].astype(str)
+    else:
+        df["Iteration"] = df["Iteration No"].astype("Int64").astype(str)
+    return df.drop(columns=["_iter_rank"], errors="ignore")
 
 def build_history_table(history_df: pd.DataFrame, side: str) -> str:
     if history_df is None or history_df.empty:
@@ -1286,6 +1286,7 @@ def send_email_with_tables(
 
 
 
+
 def send_balanced_email(detail_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
     if detail_df is None or detail_df.empty:
         logger.info("EMAIL BalancedEmail skipped: empty detail_df.")
@@ -1327,7 +1328,6 @@ def send_balanced_email(detail_df: pd.DataFrame, csv_filename: str = "", detail_
     except Exception as e:
         logger.error(f"EMAIL BalancedEmail failed: {e}")
         return False
-
 def save_outputs(summary_df: pd.DataFrame, detail_df: pd.DataFrame, prefix: str = "scan") -> Tuple[str, str]:
     ts = datetime.now().strftime("%Y%m%d_%H%M")
     summary_csv = f"{prefix}_summary_{ts}.csv"
