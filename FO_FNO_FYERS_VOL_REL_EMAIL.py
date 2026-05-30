@@ -993,24 +993,15 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
 
     base = df.copy()
-    for c in ["Directional", "Turning", "Stability", "Balanced", "CumsumPlus", "10 Day Relative Volume", "Last_5m_Volume", "Iteration No"]:
+    for c in ["Directional", "Turning", "Stability", "Balanced", "CumsumPlus", "10 Day Relative Volume", "Last_5m_Volume"]:
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
 
+    base = base.copy()
     if "10 Day Relative Volume" in base.columns:
         base = base[base["10 Day Relative Volume"].fillna(0) >= 1.0]
     if "Last_5m_Volume" in base.columns:
         base = base[base["Last_5m_Volume"].fillna(0) > 0]
-
-    if "Iteration No" not in base.columns:
-        base["Iteration No"] = np.nan
-    if "Balanced" not in base.columns:
-        base["Balanced"] = np.nan
-    if "Directional" not in base.columns:
-        base["Directional"] = np.nan
-
-    base["BalancedVsDirectional"] = (pd.to_numeric(base["Balanced"], errors="coerce").fillna(0) - pd.to_numeric(base["Directional"], errors="coerce").fillna(0)).clip(lower=0)
-    base["BalanceCount"] = np.where(base["BalancedVsDirectional"] > 0, 1, 0)
 
     def prep_side(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
         if df_side.empty:
@@ -1018,20 +1009,10 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         df_side = df_side.copy()
         if side == "long":
             df_side = df_side[df_side["Directional"] > 0]
-            df_side = df_side[df_side["BalancedVsDirectional"] > 0]
-            df_side = df_side.sort_values(
-                ["BalanceCount", "BalancedVsDirectional", "Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"],
-                ascending=[False, False, False, False, True, False, False],
-                na_position="last",
-            )
+            df_side = df_side.sort_values(["Directional", "Turning", "CumsumPlus", "Stability"], ascending=[False, True, False, False], na_position="last")
         else:
             df_side = df_side[df_side["Directional"] < 0]
-            df_side = df_side[df_side["BalancedVsDirectional"] > 0]
-            df_side = df_side.sort_values(
-                ["BalanceCount", "BalancedVsDirectional", "Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"],
-                ascending=[False, False, False, True, True, True, False],
-                na_position="last",
-            )
+            df_side = df_side.sort_values(["Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, True, True, False], na_position="last")
         return df_side
 
     long_df = prep_side(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
@@ -1046,38 +1027,41 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = detail_df.copy()
-    for col in ["Iteration No", "Iteration Time", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus"]:
+    for col in ["Iteration No", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus"]:
         if col in df.columns:
-            if col == "Iteration Time":
-                df[col] = df[col]
-            else:
-                df[col] = pd.to_numeric(df[col], errors="coerce")
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
     if "Iteration No" not in df.columns:
-        df["Iteration No"] = np.arange(1, len(df) + 1)
-    if "Balanced" not in df.columns:
-        df["Balanced"] = np.nan
-    if "Directional" not in df.columns:
-        df["Directional"] = np.nan
-
-    df["BalancedVsDirectional"] = (pd.to_numeric(df["Balanced"], errors="coerce").fillna(0) - pd.to_numeric(df["Directional"], errors="coerce").fillna(0)).clip(lower=0)
-    df = df[df["BalancedVsDirectional"] > 0].copy()
-    if df.empty:
         return pd.DataFrame()
 
-    df["_iter_rank"] = pd.to_numeric(df["Iteration No"], errors="coerce")
-    df = df.sort_values(["BalancedVsDirectional", "_iter_rank"], ascending=[False, False], na_position="last")
-    df = df.groupby("Iteration No", as_index=False, group_keys=False).head(1)
-    df["Side"] = np.where(df["Directional"] >= 0, "Long", "Short")
-    df = df.sort_values(["Iteration No", "Side"]).reset_index(drop=True)
-    if "Iteration Time" in df.columns:
-        df["Iteration"] = df["Iteration No"].astype("Int64").astype(str) + " | " + df["Iteration Time"].astype(str)
-    else:
-        df["Iteration"] = df["Iteration No"].astype("Int64").astype(str)
-    return df.drop(columns=["_iter_rank"], errors="ignore")
+    last_15_iters = sorted(df["Iteration No"].dropna().astype(int).unique())[-15:]
+    df = df[df["Iteration No"].isin(last_15_iters)].copy()
+
+    long_top = (
+        df[df["Directional"] > 0]
+        .sort_values(["Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, False, True, False, False], na_position="last")
+        .groupby("Iteration No", group_keys=False)
+        .head(1)
+        .assign(Side="Long")
+    )
+
+    short_top = (
+        df[df["Directional"] < 0]
+        .sort_values(["Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, True, True, False, False], na_position="last")
+        .groupby("Iteration No", group_keys=False)
+        .head(1)
+        .assign(Side="Short")
+    )
+
+    out = pd.concat([long_top, short_top], ignore_index=True, sort=False)
+    if out.empty:
+        return out
+
+    out = out.sort_values(["Iteration No", "Side"]).reset_index(drop=True)
+    out["Iteration"] = out["Iteration No"].astype("Int64").astype(str) + " | " + out.get("Iteration Time", "").astype(str)
+    return out
 
 def build_history_table(history_df: pd.DataFrame, side: str) -> str:
-
     if history_df is None or history_df.empty:
         return "No history yet."
 
@@ -1521,6 +1505,12 @@ def main():
 
     if sent:
         logger.info("Scan and email completed.")
+    logger.info("EMAIL Dispatching balanced email...")
+    try:
+        sent_balanced = send_balanced_email(detail_df=detail_df if "detail_df" in locals() else pd.DataFrame(), csv_filename=summary_csv, detail_csv_filename=detail_csv)
+    except Exception as e:
+        sent_balanced = False
+        logger.error(f"EMAIL BalancedEmail failed during dispatch: {e}")
     else:
         logger.warning("Scan completed but email failed.")
 
