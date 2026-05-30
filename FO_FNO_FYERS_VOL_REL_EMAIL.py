@@ -1440,9 +1440,8 @@ def send_balanced_email(detail_df: pd.DataFrame, csv_filename: str = "", detail_
         logger.info("EMAIL BalancedEmail skipped: empty detail_df.")
         return False
     try:
-        recentsummary = summarize_balanced_exceeds(detail_df, window_minutes=15)
-        allsummary = summarize_balanced_exceeds(detail_df, window_minutes=None)
-        if recentsummary.empty and allsummary.empty:
+        balanced_df = summarize_balanced_exceeds(detail_df, window_minutes=None)
+        if balanced_df.empty:
             logger.info("EMAIL BalancedEmail skipped: no qualifying rows found.")
             return False
         msg = MIMEMultipart()
@@ -1451,11 +1450,8 @@ def send_balanced_email(detail_df: pd.DataFrame, csv_filename: str = "", detail_
         msg["Subject"] = f"FO Balanced Directional Scan - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
         html = f"""
         <html><body style="font-family:Arial,sans-serif;background:#111827;color:#e5e7eb;padding:18px">
-        <h2 style="margin:0 0 12px 0;color:#fde68a">Balanced vs Directional - Last 15 Minutes</h2>
-        {build_balanced_exceed_html(recentsummary)}
-        <div style="height:18px"></div>
-        <h2 style="margin:0 0 12px 0;color:#93c5fd">Balanced vs Directional - All Iterations</h2>
-        {build_balanced_exceed_html(allsummary)}
+        <h2 style="margin:0 0 12px 0;color:#fde68a">Balanced vs Directional</h2>
+        {build_balanced_exceed_html(balanced_df)}
         </body></html>
         """
         msg.attach(MIMEText(html, "html"))
