@@ -993,15 +993,17 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
 
     base = df.copy()
-    for c in ["Directional", "Turning", "Stability", "Balanced", "CumsumPlus", "10 Day Relative Volume", "Last_5m_Volume"]:
+    for c in ["Directional", "Turning", "Stability", "Balanced", "CumsumPlus", "10 Day Relative Volume", "Last_5m_Volume", "Iteration No"]:
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
 
-    base = base.copy()
     if "10 Day Relative Volume" in base.columns:
         base = base[base["10 Day Relative Volume"].fillna(0) >= 1.0]
     if "Last_5m_Volume" in base.columns:
         base = base[base["Last_5m_Volume"].fillna(0) > 0]
+
+    base["BalancedVsDirectional"] = (base["Balanced"].fillna(0) - base["Directional"].fillna(0)).clip(lower=0)
+    base["BalanceCount"] = np.where(base["BalancedVsDirectional"] > 0, 1, 0)
 
     def prep_side(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
         if df_side.empty:
@@ -1009,10 +1011,20 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         df_side = df_side.copy()
         if side == "long":
             df_side = df_side[df_side["Directional"] > 0]
-            df_side = df_side.sort_values(["Directional", "Turning", "CumsumPlus", "Stability"], ascending=[False, True, False, False], na_position="last")
+            df_side = df_side[df_side["BalancedVsDirectional"] > 0]
+            df_side = df_side.sort_values(
+                ["BalanceCount", "BalancedVsDirectional", "Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"],
+                ascending=[False, False, False, False, True, False, False],
+                na_position="last",
+            )
         else:
             df_side = df_side[df_side["Directional"] < 0]
-            df_side = df_side.sort_values(["Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, True, True, False], na_position="last")
+            df_side = df_side[df_side["BalancedVsDirectional"] > 0]
+            df_side = df_side.sort_values(
+                ["BalanceCount", "BalancedVsDirectional", "Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"],
+                ascending=[False, False, False, True, True, True, False],
+                na_position="last",
+            )
         return df_side
 
     long_df = prep_side(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
@@ -1272,6 +1284,49 @@ def send_email_with_tables(
         logger.error(f"EMAIL Error: {e}")
         return False
 
+
+
+def send_balanced_email(detail_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
+    if detail_df is None or detail_df.empty:
+        logger.info("EMAIL BalancedEmail skipped: empty detail_df.")
+        return False
+    try:
+        recentsummary = summarize_balanced_exceeds(detail_df, window_minutes=15)
+        allsummary = summarize_balanced_exceeds(detail_df, window_minutes=None)
+        if recentsummary.empty and allsummary.empty:
+            logger.info("EMAIL BalancedEmail skipped: no qualifying rows found.")
+            return False
+        msg = MIMEMultipart()
+        msg["From"] = sender_email
+        msg["To"] = recipient_email
+        msg["Subject"] = f"FO Balanced Directional Scan - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
+        html = f"""
+        <html><body style="font-family:Arial,sans-serif;background:#111827;color:#e5e7eb;padding:18px">
+        <h2 style="margin:0 0 12px 0;color:#fde68a">Balanced vs Directional - Last 15 Minutes</h2>
+        {build_balanced_exceed_html(recentsummary)}
+        <div style="height:18px"></div>
+        <h2 style="margin:0 0 12px 0;color:#93c5fd">Balanced vs Directional - All Iterations</h2>
+        {build_balanced_exceed_html(allsummary)}
+        </body></html>
+        """
+        msg.attach(MIMEText(html, "html"))
+        for path in (csv_filename, detail_csv_filename):
+            if path and os.path.exists(path):
+                with open(path, "rb") as f:
+                    part = MIMEBase("application", "octet-stream")
+                    part.set_payload(f.read())
+                encoders.encode_base64(part)
+                part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(path)}")
+                msg.attach(part)
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(sender_email, sender_password)
+            server.send_message(msg)
+        logger.info("EMAIL BalancedEmail sent successfully.")
+        return True
+    except Exception as e:
+        logger.error(f"EMAIL BalancedEmail failed: {e}")
+        return False
 
 def save_outputs(summary_df: pd.DataFrame, detail_df: pd.DataFrame, prefix: str = "scan") -> Tuple[str, str]:
     ts = datetime.now().strftime("%Y%m%d_%H%M")
