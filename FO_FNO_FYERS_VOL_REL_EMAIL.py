@@ -1048,7 +1048,10 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     df = detail_df.copy()
     for col in ["Iteration No", "Iteration Time", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus"]:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce") if col != "Iteration Time" else df[col]
+            if col == "Iteration Time":
+                df[col] = df[col]
+            else:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
     if "Iteration No" not in df.columns:
         df["Iteration No"] = np.arange(1, len(df) + 1)
@@ -1074,6 +1077,7 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     return df.drop(columns=["_iter_rank"], errors="ignore")
 
 def build_history_table(history_df: pd.DataFrame, side: str) -> str:
+
     if history_df is None or history_df.empty:
         return "No history yet."
 
