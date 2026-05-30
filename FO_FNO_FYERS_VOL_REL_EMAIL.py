@@ -1356,7 +1356,10 @@ def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.D
         return pd.DataFrame(columns=cols_all), pd.DataFrame(columns=cols_combo)
 
     out = out.sort_values(["Count", "Gap"], ascending=[False, False], na_position="last").reset_index(drop=True)
-    return out[cols_all].copy(), out[cols_combo].copy()
+    last15_df = out[["Symbol", "Count (Last 15)", "Gap (Last 15)", "First Occurrence (Last 15)", "Latest Iteration (Last 15)"]].copy()
+    last15_df.columns = ["Symbol", "Count", "Gap", "First Occurrence", "Latest Iteration"]
+    last15_df = last15_df.sort_values(["Count", "Gap"], ascending=[False, False], na_position="last").reset_index(drop=True)
+    return out[cols_all].copy(), last15_df
 
 
 def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25) -> str:
@@ -1387,7 +1390,7 @@ def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25
 def send_second_email_with_exceedance_tables(all_iter_df: pd.DataFrame, combo_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
     try:
         scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        combo_html = build_exceedance_table_html(combo_df, "Balanced vs Directional - All + Last 15", max_rows=25)
+        combo_html = build_exceedance_table_html(combo_df, "Balanced vs Directional - Last 15", max_rows=25)
         all_html = build_exceedance_table_html(all_iter_df, "Balanced vs Directional - All Iterations", max_rows=25)
         html_body = (
             '<html><body style="margin:0;padding:20px;background:#030712;color:#e5e7eb;font-family:Arial,sans-serif;">'
