@@ -1193,6 +1193,241 @@ def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 15) -> str:
     """
 
 
+def summarize_balanced_exceeds(detail_df: pd.DataFrame, window_minutes: int | None = None) -> pd.DataFrame:
+    """Summarize where Balanced > Directional.
+
+    Returns one row per symbol with:
+    - Count: number of iterations where Balanced > Directional
+    - MaxGap: max(Balanced - Directional)
+    - First Occurrence: first iteration no and time where condition met
+    - Latest Iteration: latest iteration no where condition met
+
+    If window_minutes is provided, restricts to iterations within the last
+    `window_minutes` minutes based on the Iteration Minutes column.
+    """
+    if detail_df is None or detail_df.empty:
+        return pd.DataFrame()
+
+    df = detail_df.copy()
+
+    required_cols = ["Symbol", "Balanced", "Directional", "Iteration No"]
+    for col in required_cols:
+        if col not in df.columns:
+            return pd.DataFrame()
+
+    # numeric conversions
+    for col in ["Balanced", "Directional", "Iteration No", "Iteration Minutes"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
+
+    df = df.dropna(subset=["Balanced", "Directional", "Iteration No"])
+    df = df[df["Balanced"] > df["Directional"]].copy()
+    if df.empty:
+        return pd.DataFrame()
+
+    df["Gap"] = df["Balanced"] - df["Directional"]
+
+    # restrict to last N minutes window if requested
+    if window_minutes is not None and "Iteration Minutes" in df.columns and not df["Iteration Minutes"].isna().all():
+        try:
+            max_min = float(df["Iteration Minutes"].max())
+            cutoff = max_min - float(window_minutes)
+            df = df[df["Iteration Minutes"] >= cutoff].copy()
+        except Exception:
+            pass
+        if df.empty:
+            return pd.DataFrame()
+
+    # ensure time columns exist for readable occurrence description
+    if "Iteration Time" not in df.columns:
+        df["Iteration Time"] = ""
+
+    grouped = df.groupby("Symbol", as_index=False).agg(
+        Count=("Iteration No", lambda s: int(pd.Series(s).nunique())),
+        MaxGap=("Gap", lambda s: float(pd.Series(s).max())),
+        FirstIterationNo=("Iteration No", lambda s: int(pd.Series(s).min())),
+        FirstIterationTime=("Iteration Time", lambda s: str(pd.Series(s).iloc[0])),
+        LastIterationNo=("Iteration No", lambda s: int(pd.Series(s).max())),
+    )
+
+    grouped["First Occurrence"] = grouped["FirstIterationNo"].astype(int).astype(str) + " | " + grouped["FirstIterationTime"].astype(str)
+    grouped["Latest Iteration"] = grouped["LastIterationNo"].astype(int).astype(str)
+
+    # sort by count desc, then gap desc, then latest iteration desc
+    grouped = grouped.sort_values([
+        "Count",
+        "MaxGap",
+        "LastIterationNo",
+    ], ascending=[False, False, False]).reset_index(drop=True)
+
+    cols = ["Symbol", "Count", "MaxGap", "First Occurrence", "Latest Iteration"]
+    grouped = grouped[cols]
+    return grouped
+
+
+def build_balanced_exceed_html(df: pd.DataFrame, title: str, max_rows: int = 30) -> str:
+    """Build a compact, colourful HTML table for Balanced > Directional summary."""
+    if df is None or df.empty:
+        return f"""
+        <h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3>
+        <div style="padding:12px;border:1px solid #374151;background:#111827;color:#d1d5db;border-radius:8px;">
+            No symbols where Balanced &gt; Directional in this window.
+        </div>
+        """
+
+    df_slice = df.head(max_rows).copy()
+    cols = list(df_slice.columns)
+
+    header_cells = "".join(
+        f'<th style="padding:8px;border:1px solid #4b5563;background:#0f172a;color:#f9fafb;white-space:nowrap;">{c}</th>'
+        for c in cols
+    )
+
+    def cell_style(col: str, val) -> str:
+        base = "padding:6px 10px;border:1px solid #4b5563;color:#e5e7eb;white-space:nowrap;font-size:13px;"
+        if col == "Count":
+            try:
+                num = int(val)
+            except Exception:
+                return base
+            if num >= 5:
+                return base + "background:#14532d;color:#dcfce7;font-weight:600;"
+            if num >= 3:
+                return base + "background:#166534;color:#bbf7d0;font-weight:600;"
+            return base + "background:#1f2937;"
+        if col == "MaxGap":
+            try:
+                num = float(val)
+            except Exception:
+                return base
+            if num >= 5:
+                return base + "background:#7c2d12;color:#ffedd5;font-weight:600;"
+            if num >= 2:
+                return base + "background:#9a3412;color:#fed7aa;font-weight:600;"
+            return base + "background:#111827;"
+        return base + "background:#020617;"
+
+    def fmt(col: str, val):
+        if pd.isna(val):
+            return ""
+        if col in {"MaxGap"}:
+            try:
+                return f"{float(val):.2f}"
+            except Exception:
+                return str(val)
+        return str(val)
+
+    body_rows = []
+    for i, row in df_slice.iterrows():
+        tds = "".join(
+            f'<td style="{cell_style(col, row[col])}">{fmt(col, row[col])}</td>'
+            for col in cols
+        )
+        body_rows.append(f"<tr>{tds}</tr>")
+
+    return f"""
+    <h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3>
+    <div style="overflow-x:auto;">
+        <table style="border-collapse:collapse;width:100%;background:#020617;border-radius:10px;overflow:hidden;">
+            <thead><tr>{header_cells}</tr></thead>
+            <tbody>{''.join(body_rows)}</tbody>
+        </table>
+    </div>
+    """
+
+
+
+def send_balanced_exceed_email(
+    detail_df: pd.DataFrame,
+    csv_filename: str = "",
+    detail_csv_filename: str = "",
+) -> bool:
+    """Send a separate email focusing on Balanced > Directional occurrences.
+
+    The email contains two colourful, compact tables:
+    - Last 15 minutes window (based on Iteration Minutes)
+    - Full-day summary for all iterations
+    """
+    try:
+        if detail_df is None or detail_df.empty:
+            logger.info("Balanced>Directional email: no detail data available.")
+            return False
+
+        summary_all = summarize_balanced_exceeds(detail_df, window_minutes=None)
+        if summary_all is None or summary_all.empty:
+            logger.info("Balanced>Directional email: no rows where Balanced > Directional.")
+            return False
+
+        summary_last15 = summarize_balanced_exceeds(detail_df, window_minutes=15)
+
+        scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        last15_html = build_balanced_exceed_html(
+            summary_last15,
+            "Balanced &gt; Directional - Last 15 Minutes",
+        )
+        all_html = build_balanced_exceed_html(
+            summary_all,
+            "Balanced &gt; Directional - All Iterations",
+        )
+
+        html_body = f"""
+        <html>
+        <body style="margin:0;padding:20px;background:#020617;color:#e5e7eb;font-family:Arial,sans-serif;">
+            <div style="max-width:1400px;margin:0 auto;">
+                <h2 style="margin:0 0 12px 0;color:#f97316;">Balanced &gt; Directional Focus Alert</h2>
+                <div style="margin-bottom:18px;color:#cbd5e1;font-size:14px;">
+                    Scan completed at {scan_time}
+                </div>
+
+                <div style="margin-bottom:24px;padding:14px;border:1px solid #374151;background:#0b1120;border-radius:10px;">
+                    {last15_html}
+                </div>
+
+                <div style="margin-bottom:24px;padding:14px;border:1px solid #374151;background:#0b1120;border-radius:10px;">
+                    {all_html}
+                </div>
+
+                <div style="margin-top:18px;color:#94a3b8;font-size:12px;">
+                    Generated by FO_FNO_FYERS_VOL_REL_EMAIL.py (Balanced &gt; Directional view)
+                </div>
+            </div>
+        </body>
+        </html>
+        """
+
+        msg = MIMEMultipart("alternative")
+        msg["Subject"] = f"Balanced > Directional Alert - {scan_time}"
+        msg["From"] = sender_email
+        msg["To"] = recipient_email
+        msg.attach(MIMEText(html_body, "html", _charset="utf-8"))
+
+        for fname in [csv_filename, detail_csv_filename]:
+            if not fname or not Path(fname).exists():
+                continue
+            with open(fname, "rb") as f:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header(
+                "Content-Disposition",
+                f'attachment; filename="{Path(fname).name}"',
+            )
+            msg.attach(part)
+
+        with smtplib.SMTP(smtp_host, smtp_port) as server:
+            server.starttls()
+            server.login(sender_email, sender_password)
+            server.sendmail(sender_email, recipient_email, msg.as_string())
+
+        logger.info("Balanced>Directional email sent successfully.")
+        return True
+
+    except Exception as e:
+        logger.error(f"Balanced>Directional EMAIL Error: {e}")
+        return False
+
+
 def send_email_with_tables(
     long_df: pd.DataFrame,
     short_df: pd.DataFrame,
@@ -1322,10 +1557,21 @@ def main():
         detail_csv_filename=detail_csv
     )
 
+    balanced_sent = send_balanced_exceed_email(
+        detail_df=detail_df,
+        csv_filename=summary_csv,
+        detail_csv_filename=detail_csv,
+    )
+
     if sent:
         logger.info("Scan and email completed.")
     else:
         logger.warning("Scan completed but email failed.")
+
+    if balanced_sent:
+        logger.info("Balanced>Directional email completed.")
+    else:
+        logger.info("Balanced>Directional email not sent (no data or error).")
 
 
 if __name__ == "__main__":
