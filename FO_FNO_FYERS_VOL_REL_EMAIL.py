@@ -1054,7 +1054,7 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     df = detail_df.copy()
     rename_map = {
         "Daily Change": "% Change",
-        "Iteration Change": "% Change",
+        "Iteration Change": "% Change_iter",
         "5mSignal": "5m_Signal",
         "15mSignal": "15m_Signal",
         "30mSignal": "30m_Signal",
@@ -1066,9 +1066,13 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     }
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
-    for col in ["Iteration No", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus"]:
+    numeric_cols = ["Iteration No", "LTP", "% Change", "% Change_iter", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus"]
+    for col in numeric_cols:
         if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            series = df[col]
+            if isinstance(series, pd.DataFrame):
+                series = series.iloc[:, 0]
+            df[col] = pd.to_numeric(series, errors="coerce")
 
     if "Iteration No" not in df.columns:
         return pd.DataFrame()
@@ -1113,6 +1117,9 @@ def build_history_table(history_df: pd.DataFrame, side: str) -> str:
 
     if df.empty:
         return "No history yet."
+
+    if "% Change" not in df.columns and "% Change_iter" in df.columns:
+        df["% Change"] = df["% Change_iter"]
 
     cols = [
         "Iteration", "Symbol", "LTP", "% Change", "Directional", "Turning",
