@@ -704,6 +704,8 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
             "Stability": ps["Stability"],
             "Balanced": ps["Balanced"],
             "CumsumPlus": ps.get("CumsumPlus", np.nan),
+            "ARIMA Signal": arima_signal_from_series(price_series),
+            "Kalman Signal": kalman_signal_from_series(price_series),
             "10 Day Relative Volume": rvol10,
             "20 Day Relative Volume": rvol20,
             "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else float("nan"),
