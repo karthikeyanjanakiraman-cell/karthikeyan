@@ -498,7 +498,7 @@ def compute_price_lead_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
     df["avg_vol_5"] = df["volume"].rolling(5, min_periods=3).mean()
     df["volume_expansion"] = np.where(df["avg_vol_5"] > 0, df["volume"] / df["avg_vol_5"], np.nan)
 
-    df["mid"] = (df["high"] + df["low"] ) / 2.0
+    df["mid"] = (df["high"] + df["low"]) / 2.0
     df["delta"] = np.where(
         df["close"] > df["mid"],
         df["volume"],
@@ -596,6 +596,14 @@ def kalman_signal_from_series(prices: pd.Series, q: float = 1e-3) -> float:
     if len(p) < 5:
         return float("nan")
 
+
+
+def _build_iteration_signals_from_rows(rows: List[Dict]) -> Dict[str, float]:
+    if not rows:
+        return build_signals_from_raw_directional(pd.DataFrame())
+    temp_df = pd.DataFrame(rows)
+    return build_signals_from_raw_directional(temp_df)
+
     arr = p.to_numpy()
     x, P = arr[0], 1.0
     r = float(p.diff().dropna().var()) + 1e-6
@@ -609,13 +617,6 @@ def kalman_signal_from_series(prices: pd.Series, q: float = 1e-3) -> float:
     gap = arr[-1] - x
     scale = float(p.std()) or 1e-6
     return round(gap / scale, 4)
-
-
-def _build_iteration_signals_from_rows(rows: List[Dict]) -> Dict[str, float]:
-    if not rows:
-        return build_signals_from_raw_directional(pd.DataFrame())
-    temp_df = pd.DataFrame(rows)
-    return build_signals_from_raw_directional(temp_df)
 
 
 def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[Dict, pd.DataFrame]:
@@ -725,7 +726,6 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
             "PriceLeadStreak": int(price_lead_df["price_lead_streak"].iloc[i]) if not price_lead_df.empty else 0,
             "PriceLeadStatus": str(price_lead_df["Price_Lead_Status"].iloc[i]) if not price_lead_df.empty else "NORMAL",
         }
-
         temp_rows = rows + [row_data]
         iter_signals = _build_iteration_signals_from_rows(temp_rows)
         row_data.update({
@@ -1046,15 +1046,12 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     short_df = short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     return long_df, short_df
 
-
 def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     if detail_df is None or detail_df.empty:
         return pd.DataFrame()
 
     df = detail_df.copy()
     rename_map = {
-        "Daily Change": "% Change",
-        "Iteration Change": "% Change_iter",
         "5mSignal": "5m_Signal",
         "15mSignal": "15m_Signal",
         "30mSignal": "30m_Signal",
@@ -1066,8 +1063,13 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     }
     df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
 
-    numeric_cols = ["Iteration No", "LTP", "% Change", "% Change_iter", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus"]
-    for col in numeric_cols:
+    if "% Change" not in df.columns:
+        if "Daily Change" in df.columns:
+            df["% Change"] = df["Daily Change"]
+        elif "Iteration Change" in df.columns:
+            df["% Change"] = df["Iteration Change"]
+
+    for col in ["Iteration No", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus"]:
         if col in df.columns:
             series = df[col]
             if isinstance(series, pd.DataFrame):
@@ -1101,11 +1103,11 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
         return out
 
     out = out.sort_values(["Iteration No", "Side"]).reset_index(drop=True)
-    out["Iteration"] = out["Iteration No"].astype("Int64").astype(str) + " | " + out.get("Iteration Time", "").astype(str)
+    iter_time = out["Iteration Time"].astype(str) if "Iteration Time" in out.columns else pd.Series([""] * len(out), index=out.index)
+    out["Iteration"] = out["Iteration No"].astype("Int64").astype(str) + " | " + iter_time
     if "Last Iteration Time" not in out.columns and "Iteration Time" in out.columns:
         out["Last Iteration Time"] = out["Iteration Time"]
     return out
-
 
 def build_history_table(history_df: pd.DataFrame, side: str) -> str:
     if history_df is None or history_df.empty:
@@ -1117,9 +1119,6 @@ def build_history_table(history_df: pd.DataFrame, side: str) -> str:
 
     if df.empty:
         return "No history yet."
-
-    if "% Change" not in df.columns and "% Change_iter" in df.columns:
-        df["% Change"] = df["% Change_iter"]
 
     cols = [
         "Iteration", "Symbol", "LTP", "% Change", "Directional", "Turning",
@@ -1342,6 +1341,7 @@ def save_outputs(summary_df: pd.DataFrame, detail_df: pd.DataFrame, prefix: str 
         detail_csv = ""
 
     return summary_csv, detail_csv
+
 
 
 def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
