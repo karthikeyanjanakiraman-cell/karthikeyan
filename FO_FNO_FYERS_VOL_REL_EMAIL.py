@@ -1308,63 +1308,59 @@ def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.D
     for col in ["Iteration No", "Directional", "Balanced"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
+
     required = {"Symbol", "Iteration No", "Directional", "Balanced"}
-    if not required.issubset(df.columns):
+    if not required.issubset(set(df.columns)):
         return pd.DataFrame(columns=cols), pd.DataFrame(columns=cols)
+
+    def first_two_continuous(gscope: pd.DataFrame) -> Dict[str, object]:
+        gscope = gscope.sort_values("Iteration No").copy()
+        bal_diff = gscope["Balanced"].diff()
+        dir_diff = gscope["Directional"].diff()
+        cond = (bal_diff > dir_diff) & bal_diff.notna() & dir_diff.notna()
+        gap_series = (bal_diff - dir_diff).fillna(0.0)
+
+        valid_positions = [i for i, flag in enumerate(cond.tolist()) if flag]
+        for i in range(len(valid_positions) - 1):
+            p1 = valid_positions[i]
+            p2 = valid_positions[i + 1]
+            if p2 == p1 + 1:
+                idx1 = gscope.index[p1]
+                idx2 = gscope.index[p2]
+                return {
+                    "Count": 2,
+                    "Gap": float(gap_series.loc[idx1] + gap_series.loc[idx2]),
+                    "First Occurrence": int(gscope.loc[idx1, "Iteration No"]),
+                    "Latest Iteration": int(gscope.loc[idx2, "Iteration No"]),
+                }
+
+        return {
+            "Count": 0,
+            "Gap": 0.0,
+            "First Occurrence": np.nan,
+            "Latest Iteration": np.nan,
+        }
 
     rows_all = []
     rows_15 = []
-
     for sym, g in df.groupby("Symbol", sort=False):
-        g = g.sort_values("Iteration No").copy()
-        bal_diff = g["Balanced"].diff()
-        dir_diff = g["Directional"].diff()
-        cond = (bal_diff > dir_diff) & bal_diff.notna() & dir_diff.notna()
-        run_id = cond.ne(cond.shift(fill_value=False)).cumsum()
-        run_len = cond.groupby(run_id).transform("sum")
-        valid = cond & run_len.ge(2)
-        if valid.any():
-            max_run = int(run_len[valid].max())
-            best = None
-            for rid, rg in g.loc[valid].groupby(run_id[valid]):
-                if len(rg) >= 2:
-                    gap = float((bal_diff.loc[rg.index] - dir_diff.loc[rg.index]).sum())
-                    first = int(rg["Iteration No"].iloc[0])
-                    last = int(rg["Iteration No"].iloc[-1])
-                    cand = (len(rg), gap, first, last)
-                    if best is None or cand[0] > best[0] or (cand[0] == best[0] and cand[1] > best[1]):
-                        best = cand
-            if best:
-                rows_all.append({"Symbol": sym, "Count": best[0], "Gap": best[1], "First Occurrence": best[2], "Latest Iteration": best[3]})
+        stats_all = first_two_continuous(g)
+        if stats_all["Count"] >= 2:
+            rows_all.append({"Symbol": sym, **stats_all})
 
-        g15 = g.tail(15).copy()
-        bal_diff15 = g15["Balanced"].diff()
-        dir_diff15 = g15["Directional"].diff()
-        cond15 = (bal_diff15 > dir_diff15) & bal_diff15.notna() & dir_diff15.notna()
-        run_id15 = cond15.ne(cond15.shift(fill_value=False)).cumsum()
-        run_len15 = cond15.groupby(run_id15).transform("sum")
-        valid15 = cond15 & run_len15.ge(2)
-        if valid15.any():
-            best15 = None
-            for rid, rg in g15.loc[valid15].groupby(run_id15[valid15]):
-                if len(rg) >= 2:
-                    gap = float((bal_diff15.loc[rg.index] - dir_diff15.loc[rg.index]).sum())
-                    first = int(rg["Iteration No"].iloc[0])
-                    last = int(rg["Iteration No"].iloc[-1])
-                    cand = (len(rg), gap, first, last)
-                    if best15 is None or cand[0] > best15[0] or (cand[0] == best15[0] and cand[1] > best15[1]):
-                        best15 = cand
-            if best15:
-                rows_15.append({"Symbol": sym, "Count": best15[0], "Gap": best15[1], "First Occurrence": best15[2], "Latest Iteration": best15[3]})
+        stats_15 = first_two_continuous(g.sort_values("Iteration No").tail(15))
+        if stats_15["Count"] >= 2:
+            rows_15.append({"Symbol": sym, **stats_15})
 
     all_df = pd.DataFrame(rows_all, columns=cols)
     last15_df = pd.DataFrame(rows_15, columns=cols)
     if not all_df.empty:
-        all_df = all_df.sort_values(["Count", "Gap", "Symbol"], ascending=[False, False, True], na_position="last").reset_index(drop=True)
+        all_df = all_df.sort_values(["Gap", "Symbol"], ascending=[False, True], na_position="last").reset_index(drop=True)
     if not last15_df.empty:
-        last15_df = last15_df.sort_values(["Count", "Gap", "Symbol"], ascending=[False, False, True], na_position="last").reset_index(drop=True)
+        last15_df = last15_df.sort_values(["Gap", "Symbol"], ascending=[False, True], na_position="last").reset_index(drop=True)
     return all_df, last15_df
-(df: pd.DataFrame, title: str, max_rows: int = 25) -> str:
+
+def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25) -> str:
     if df is None or df.empty:
         return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0">{title}</h3><div style="padding:12px;border:1px solid #374151;background:#111827;color:#d1d5db;border-radius:8px;">No data found.</div>'
 
@@ -1392,8 +1388,8 @@ def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.D
 def send_second_email_with_exceedance_tables(all_iter_df: pd.DataFrame, combo_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
     try:
         scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        combo_html = build_exceedance_table_html(combo_df, "Balanced vs Directional - Last 15", max_rows=25)
-        all_html = build_exceedance_table_html(all_iter_df, "Balanced vs Directional - All Iterations", max_rows=25)
+        combo_html = build_exceedance_table_html(combo_df, "Balanced vs Directional - First 2 Continuous - Last 15", max_rows=25)
+        all_html = build_exceedance_table_html(all_iter_df, "Balanced vs Directional - First 2 Continuous - All Iterations", max_rows=25)
         html_body = (
             '<html><body style="margin:0;padding:20px;background:#030712;color:#e5e7eb;font-family:Arial,sans-serif;">'
             '<div style="max-width:1600px;margin:0 auto;">'
