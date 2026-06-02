@@ -422,11 +422,11 @@ def compute_cumulative_directional_metrics(curr_df: pd.DataFrame) -> pd.DataFram
 
     cols = [
         "Cumulative KER",
-        "Cumulative +DI",
+        "Cumulative DI",
         "Cumulative -DI",
         "Cumulative ADX",
         "Survival Score",
-        "Survival_Num",
+        "SurvivalNum",
     ]
     return pd.concat([df, pd.DataFrame(out, columns=cols)], axis=1)
 
@@ -595,28 +595,23 @@ def kalman_signal_from_series(prices: pd.Series, q: float = 1e-3) -> float:
     p = pd.to_numeric(prices, errors="coerce").dropna().astype(float)
     if len(p) < 5:
         return float("nan")
-
-
-
-def _build_iteration_signals_from_rows(rows: List[Dict]) -> Dict[str, float]:
-    if not rows:
-        return build_signals_from_raw_directional(pd.DataFrame())
-    temp_df = pd.DataFrame(rows)
-    return build_signals_from_raw_directional(temp_df)
-
     arr = p.to_numpy()
     x, P = arr[0], 1.0
     r = float(p.diff().dropna().var()) + 1e-6
-
     for y in arr:
         P += q
         K = P / (P + r)
         x += K * (y - x)
         P *= (1.0 - K)
-
     gap = arr[-1] - x
     scale = float(p.std()) or 1e-6
     return round(gap / scale, 4)
+
+
+def _build_iteration_signals_from_rows(rows: List[Dict]) -> Dict[str, float]:
+    if not rows:
+        return build_signals_from_raw_directional(pd.DataFrame())
+    return build_signals_from_raw_directional(pd.DataFrame(rows))
 
 
 def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[Dict, pd.DataFrame]:
@@ -694,12 +689,10 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
 
         price_series = curr_df["close"].iloc[: i + 1]
         ps = price_stats_from_series(price_series)
-        iter_arima_signal = arima_signal_from_series(price_series)
-        iter_kalman_signal = kalman_signal_from_series(price_series)
 
-        pct_change_iter = ((float(row["close"]) - float(curr_df["close"].iloc[i - 1])) / float(curr_df["close"].iloc[i - 1]) * 100) if i > 0 and float(curr_df["close"].iloc[i - 1]) != 0 else 0.0
+        pct_change_iter = ((float(row["close"]) - float(curr_df["close"].iloc[i-1])) / float(curr_df["close"].iloc[i-1]) * 100) if i > 0 and float(curr_df["close"].iloc[i-1]) != 0 else 0.0
 
-        row_data = {
+        rows.append({
             "Iteration No": total_iters,
             "Iteration Minutes": iter_mins,
             "Iteration Time": t.strftime("%H:%M"),
@@ -711,33 +704,19 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
             "Stability": ps["Stability"],
             "Balanced": ps["Balanced"],
             "CumsumPlus": ps.get("CumsumPlus", np.nan),
-            "ARIMA Signal": iter_arima_signal,
-            "Kalman Signal": iter_kalman_signal,
             "10 Day Relative Volume": rvol10,
             "20 Day Relative Volume": rvol20,
             "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else float("nan"),
             "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[i]) if not flow_df.empty else float("nan"),
             "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[i]) if not flow_df.empty else float("nan"),
             "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[i]) if not flow_df.empty else float("nan"),
-            "RangeExpansion": float(price_lead_df["range_expansion"].iloc[i]) if not price_lead_df.empty and pd.notna(price_lead_df["range_expansion"].iloc[i]) else float("nan"),
-            "VolumeExpansion": float(price_lead_df["volume_expansion"].iloc[i]) if not price_lead_df.empty and pd.notna(price_lead_df["volume_expansion"].iloc[i]) else float("nan"),
-            "DeltaExpansion": float(price_lead_df["delta_expansion"].iloc[i]) if not price_lead_df.empty and pd.notna(price_lead_df["delta_expansion"].iloc[i]) else float("nan"),
-            "PriceLeadingFlag": bool(price_lead_df["price_leading_flag"].iloc[i]) if not price_lead_df.empty else False,
-            "PriceLeadStreak": int(price_lead_df["price_lead_streak"].iloc[i]) if not price_lead_df.empty else 0,
-            "PriceLeadStatus": str(price_lead_df["Price_Lead_Status"].iloc[i]) if not price_lead_df.empty else "NORMAL",
-        }
-        temp_rows = rows + [row_data]
-        iter_signals = _build_iteration_signals_from_rows(temp_rows)
-        row_data.update({
-            "5mSignal": iter_signals.get("5m_Signal", np.nan),
-            "15mSignal": iter_signals.get("15m_Signal", np.nan),
-            "30mSignal": iter_signals.get("30m_Signal", np.nan),
-            "60mSignal": iter_signals.get("60m_Signal", np.nan),
-            "BullSignal": iter_signals.get("Bull_Signal", np.nan),
-            "BearSignal": iter_signals.get("Bear_Signal", np.nan),
-            "OverallSignal": iter_signals.get("Overall_Signal", np.nan),
+            "Range_Expansion": float(price_lead_df["range_expansion"].iloc[i]) if not price_lead_df.empty and pd.notna(price_lead_df["range_expansion"].iloc[i]) else float("nan"),
+            "Volume_Expansion": float(price_lead_df["volume_expansion"].iloc[i]) if not price_lead_df.empty and pd.notna(price_lead_df["volume_expansion"].iloc[i]) else float("nan"),
+            "Delta_Expansion": float(price_lead_df["delta_expansion"].iloc[i]) if not price_lead_df.empty and pd.notna(price_lead_df["delta_expansion"].iloc[i]) else float("nan"),
+            "Price_Leading_Flag": bool(price_lead_df["price_leading_flag"].iloc[i]) if not price_lead_df.empty else False,
+            "Price_Lead_Streak": int(price_lead_df["price_lead_streak"].iloc[i]) if not price_lead_df.empty else 0,
+            "Price_Lead_Status": str(price_lead_df["Price_Lead_Status"].iloc[i]) if not price_lead_df.empty else "NORMAL",
         })
-        rows.append(row_data)
 
         last_cum_vol, last_rvol10, last_rvol20 = cum_vol, rvol10, rvol20
         last_iter_mins = iter_mins
@@ -780,17 +759,17 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         "Last Iteration Minutes": last_iter_mins,
         "Last Iteration Time": last_iter_time,
         "Cumulative KER": float(metric_df["Cumulative KER"].iloc[-1]) if not metric_df.empty else np.nan,
-        "Cumulative +DI": float(metric_df["Cumulative +DI"].iloc[-1]) if not metric_df.empty else np.nan,
+        "Cumulative DI": float(metric_df["Cumulative DI"].iloc[-1]) if not metric_df.empty else np.nan,
         "Cumulative -DI": float(metric_df["Cumulative -DI"].iloc[-1]) if not metric_df.empty else np.nan,
         "Cumulative ADX": float(metric_df["Cumulative ADX"].iloc[-1]) if not metric_df.empty else np.nan,
         "Survival Score": str(metric_df["Survival Score"].iloc[-1]) if not metric_df.empty else "0/0",
-        "Survival_Num": float(metric_df["Survival_Num"].iloc[-1]) if not metric_df.empty else 0.0,
+        "SurvivalNum": float(metric_df["SurvivalNum"].iloc[-1]) if not metric_df.empty else 0.0,
         "HOD": hod,
-        "Strike_Distance": strike_distance,
-        "Last_5m_Volume": last_5m_volume,
-        "Volume_1h_Avg_5m": vol_1h_avg_5m,
-        "OBV_30m_Delta": obv_30m_delta,
-        "RSI_30m_Delta": rsi_30m_delta,
+        "StrikeDistance": strike_distance,
+        "Last5mVolume": last_5m_volume,
+        "Volume1hAvg5m": vol_1h_avg_5m,
+        "OBV30mDelta": obv_30m_delta,
+        "RSI30mDelta": rsi_30m_delta,
         "Price_Lead_Status": str(price_lead_df["Price_Lead_Status"].iloc[-1]) if not price_lead_df.empty else "NORMAL",
     }
 
@@ -864,17 +843,17 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "Last Iteration Minutes": iter_summary.get("Last Iteration Minutes"),
             "Last Iteration Time": iter_summary.get("Last Iteration Time"),
             "Cumulative KER": iter_summary.get("Cumulative KER"),
-            "Cumulative +DI": iter_summary.get("Cumulative +DI"),
+            "Cumulative DI": iter_summary.get("Cumulative DI"),
             "Cumulative -DI": iter_summary.get("Cumulative -DI"),
             "Cumulative ADX": iter_summary.get("Cumulative ADX"),
             "Survival Score": iter_summary.get("Survival Score"),
-            "Survival_Num": iter_summary.get("Survival_Num"),
+            "SurvivalNum": iter_summary.get("SurvivalNum"),
             "HOD": iter_summary.get("HOD"),
-            "Strike_Distance": iter_summary.get("Strike_Distance"),
-            "Last_5m_Volume": iter_summary.get("Last_5m_Volume"),
-            "Volume_1h_Avg_5m": iter_summary.get("Volume_1h_Avg_5m"),
-            "OBV_30m_Delta": iter_summary.get("OBV_30m_Delta"),
-            "RSI_30m_Delta": iter_summary.get("RSI_30m_Delta"),
+            "StrikeDistance": iter_summary.get("StrikeDistance"),
+            "Last5mVolume": iter_summary.get("Last5mVolume"),
+            "Volume1hAvg5m": iter_summary.get("Volume1hAvg5m"),
+            "OBV30mDelta": iter_summary.get("OBV30mDelta"),
+            "RSI30mDelta": iter_summary.get("RSI30mDelta"),
             "Price_Lead_Status": iter_summary.get("Price_Lead_Status", "NORMAL"),
             "IVP": iv_info.get("IVP"),
             "Volatility State": iv_info.get("Volatility State"),
@@ -917,9 +896,9 @@ def derive_rank_columns(df: pd.DataFrame) -> pd.DataFrame:
         if pd.notna(row.get("VWAP Z-Score")) and row.get("VWAP Z-Score") >= 0.30:
             score += 2
         if (
-            pd.notna(row.get("Cumulative +DI")) and
+            pd.notna(row.get("Cumulative DI")) and
             pd.notna(row.get("Cumulative -DI")) and
-            row.get("Cumulative +DI") > row.get("Cumulative -DI")
+            row.get("Cumulative DI") > row.get("Cumulative -DI")
         ):
             score += 2
         if pd.notna(row.get("Cumulative ADX")) and row.get("Cumulative ADX") >= 20:
@@ -937,9 +916,9 @@ def derive_rank_columns(df: pd.DataFrame) -> pd.DataFrame:
         if pd.notna(row.get("VWAP Z-Score")) and row.get("VWAP Z-Score") <= -0.30:
             score += 2
         if (
-            pd.notna(row.get("Cumulative +DI")) and
+            pd.notna(row.get("Cumulative DI")) and
             pd.notna(row.get("Cumulative -DI")) and
-            row.get("Cumulative -DI") > row.get("Cumulative +DI")
+            row.get("Cumulative -DI") > row.get("Cumulative DI")
         ):
             score += 2
         if pd.notna(row.get("Cumulative ADX")) and row.get("Cumulative ADX") >= 20:
@@ -1017,15 +996,15 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
 
     base = df.copy()
-    for c in ["Directional", "Turning", "Stability", "Balanced", "CumsumPlus", "10 Day Relative Volume", "Last_5m_Volume"]:
+    for c in ["Directional", "Turning", "Stability", "Balanced", "CumsumPlus", "10 Day Relative Volume", "Last5mVolume"]:
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
 
     base = base.copy()
     if "10 Day Relative Volume" in base.columns:
         base = base[base["10 Day Relative Volume"].fillna(0) >= 1.0]
-    if "Last_5m_Volume" in base.columns:
-        base = base[base["Last_5m_Volume"].fillna(0) > 0]
+    if "Last5mVolume" in base.columns:
+        base = base[base["Last5mVolume"].fillna(0) > 0]
 
     def prep_side(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
         if df_side.empty:
@@ -1051,30 +1030,9 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = detail_df.copy()
-    rename_map = {
-        "5mSignal": "5m_Signal",
-        "15mSignal": "15m_Signal",
-        "30mSignal": "30m_Signal",
-        "60mSignal": "60m_Signal",
-        "BullSignal": "Bull_Signal",
-        "BearSignal": "Bear_Signal",
-        "OverallSignal": "Overall_Signal",
-        "PriceLeadStatus": "Price_Lead_Status",
-    }
-    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
-
-    if "% Change" not in df.columns:
-        if "Daily Change" in df.columns:
-            df["% Change"] = df["Daily Change"]
-        elif "Iteration Change" in df.columns:
-            df["% Change"] = df["Iteration Change"]
-
     for col in ["Iteration No", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus"]:
         if col in df.columns:
-            series = df[col]
-            if isinstance(series, pd.DataFrame):
-                series = series.iloc[:, 0]
-            df[col] = pd.to_numeric(series, errors="coerce")
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
     if "Iteration No" not in df.columns:
         return pd.DataFrame()
@@ -1103,10 +1061,7 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
         return out
 
     out = out.sort_values(["Iteration No", "Side"]).reset_index(drop=True)
-    iter_time = out["Iteration Time"].astype(str) if "Iteration Time" in out.columns else pd.Series([""] * len(out), index=out.index)
-    out["Iteration"] = out["Iteration No"].astype("Int64").astype(str) + " | " + iter_time
-    if "Last Iteration Time" not in out.columns and "Iteration Time" in out.columns:
-        out["Last Iteration Time"] = out["Iteration Time"]
+    out["Iteration"] = out["Iteration No"].astype("Int64").astype(str) + " | " + out.get("Iteration Time", "").astype(str)
     return out
 
 def build_history_table(history_df: pd.DataFrame, side: str) -> str:
