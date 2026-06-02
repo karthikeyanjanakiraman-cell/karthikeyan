@@ -1305,35 +1305,29 @@ def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.D
         return pd.DataFrame(columns=cols), pd.DataFrame(columns=cols)
 
     df = detail_df.copy()
-    for col in ["Iteration No", "Directional", "Balanced"]:
+    for col in ["Iteration No", "CumsumPlus"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    required = {"Symbol", "Iteration No", "Directional", "Balanced"}
+    required = {"Symbol", "Iteration No", "CumsumPlus"}
     if not required.issubset(set(df.columns)):
         return pd.DataFrame(columns=cols), pd.DataFrame(columns=cols)
 
-    def first_two_continuous(gscope: pd.DataFrame) -> Dict[str, object]:
+    def first_two_positive_cumsumdiff(gscope: pd.DataFrame) -> Dict[str, object]:
         gscope = gscope.sort_values("Iteration No").copy()
-        bal_diff = gscope["Balanced"].diff()
-        dir_diff = gscope["Directional"].diff()
-        cond = (bal_diff > dir_diff) & bal_diff.notna() & dir_diff.notna()
-        gap_series = (bal_diff - dir_diff).fillna(0.0)
-
-        valid_positions = [i for i, flag in enumerate(cond.tolist()) if flag]
-        for i in range(len(valid_positions) - 1):
-            p1 = valid_positions[i]
-            p2 = valid_positions[i + 1]
-            if p2 == p1 + 1:
-                idx1 = gscope.index[p1]
-                idx2 = gscope.index[p2]
+        cpdiff = gscope["CumsumPlus"].diff()
+        cond = cpdiff.gt(0) & cpdiff.notna()
+        pos = [i for i, flag in enumerate(cond.tolist()) if flag]
+        for i in range(len(pos) - 1):
+            if pos[i + 1] == pos[i] + 1:
+                p1, p2 = pos[i], pos[i + 1]
+                idx1, idx2 = gscope.index[p1], gscope.index[p2]
                 return {
                     "Count": 2,
-                    "Gap": float(gap_series.loc[idx1] + gap_series.loc[idx2]),
+                    "Gap": float(cpdiff.loc[idx1] + cpdiff.loc[idx2]),
                     "First Occurrence": int(gscope.loc[idx1, "Iteration No"]),
                     "Latest Iteration": int(gscope.loc[idx2, "Iteration No"]),
                 }
-
         return {
             "Count": 0,
             "Gap": 0.0,
@@ -1344,20 +1338,20 @@ def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.D
     rows_all = []
     rows_15 = []
     for sym, g in df.groupby("Symbol", sort=False):
-        stats_all = first_two_continuous(g)
-        if stats_all["Count"] >= 2:
-            rows_all.append({"Symbol": sym, **stats_all})
-
-        stats_15 = first_two_continuous(g.sort_values("Iteration No").tail(15))
+        stats_15 = first_two_positive_cumsumdiff(g.sort_values("Iteration No").tail(15))
         if stats_15["Count"] >= 2:
             rows_15.append({"Symbol": sym, **stats_15})
 
-    all_df = pd.DataFrame(rows_all, columns=cols)
+        stats_all = first_two_positive_cumsumdiff(g)
+        if stats_all["Count"] >= 2:
+            rows_all.append({"Symbol": sym, **stats_all})
+
     last15_df = pd.DataFrame(rows_15, columns=cols)
-    if not all_df.empty:
-        all_df = all_df.sort_values(["Gap", "Symbol"], ascending=[False, True], na_position="last").reset_index(drop=True)
+    all_df = pd.DataFrame(rows_all, columns=cols)
     if not last15_df.empty:
         last15_df = last15_df.sort_values(["Gap", "Symbol"], ascending=[False, True], na_position="last").reset_index(drop=True)
+    if not all_df.empty:
+        all_df = all_df.sort_values(["Gap", "Symbol"], ascending=[False, True], na_position="last").reset_index(drop=True)
     return all_df, last15_df
 
 def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25) -> str:
@@ -1388,8 +1382,8 @@ def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25
 def send_second_email_with_exceedance_tables(all_iter_df: pd.DataFrame, combo_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
     try:
         scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        combo_html = build_exceedance_table_html(combo_df, "Balanced vs Directional - First 2 Continuous - Last 15", max_rows=25)
-        all_html = build_exceedance_table_html(all_iter_df, "Balanced vs Directional - First 2 Continuous - All Iterations", max_rows=25)
+        combo_html = build_exceedance_table_html(combo_df, "CumsumPlus Diff > 0 - 2 Continuous - Last 15", max_rows=25)
+        all_html = build_exceedance_table_html(all_iter_df, "CumsumPlus Diff > 0 - 2 Continuous - All Iterations", max_rows=25)
         html_body = (
             '<html><body style="margin:0;padding:20px;background:#030712;color:#e5e7eb;font-family:Arial,sans-serif;">'
             '<div style="max-width:1600px;margin:0 auto;">'
