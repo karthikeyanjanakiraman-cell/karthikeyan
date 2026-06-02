@@ -689,6 +689,9 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
 
         pct_change_iter = ((float(row["close"]) - float(curr_df["close"].iloc[i-1])) / float(curr_df["close"].iloc[i-1]) * 100) if i > 0 and float(curr_df["close"].iloc[i-1]) != 0 else 0.0
 
+        iter_arima_signal = arima_signal_from_series(price_series)
+        iter_kalman_signal = kalman_signal_from_series(price_series)
+
         rows.append({
             "Iteration No": total_iters,
             "Iteration Minutes": iter_mins,
@@ -701,6 +704,8 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
             "Stability": ps["Stability"],
             "Balanced": ps["Balanced"],
             "CumsumPlus": ps.get("CumsumPlus", np.nan),
+            "ARIMA Signal": iter_arima_signal,
+            "Kalman Signal": iter_kalman_signal,
             "10 Day Relative Volume": rvol10,
             "20 Day Relative Volume": rvol20,
             "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else float("nan"),
@@ -809,6 +814,36 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
         if not iter_detail.empty:
             iter_detail.insert(0, "Symbol", sym)
             iter_detail.insert(1, "Daily % Change", pct_change)
+            detail_col_order = [
+                "Symbol",
+                "Daily % Change",
+                "Iteration No",
+                "Iteration Minutes",
+                "Iteration Time",
+                "LTP",
+                "Iteration % Change",
+                "Current Volume",
+                "Directional",
+                "Turning",
+                "Stability",
+                "Balanced",
+                "CumsumPlus",
+                "ARIMA Signal",
+                "Kalman Signal",
+                "10 Day Relative Volume",
+                "20 Day Relative Volume",
+                "Cumulative RSI",
+                "Cumulative OBV",
+                "Cumulative VWAP",
+                "VWAP Z-Score",
+                "Range_Expansion",
+                "Volume_Expansion",
+                "Delta_Expansion",
+                "Price_Leading_Flag",
+                "Price_Lead_Streak",
+                "Price_Lead_Status",
+            ]
+            iter_detail = iter_detail[[c for c in detail_col_order if c in iter_detail.columns]]
             iteration_rows.append(iter_detail)
 
         rows.append({
