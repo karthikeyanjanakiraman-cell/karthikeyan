@@ -704,8 +704,6 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
             "Stability": ps["Stability"],
             "Balanced": ps["Balanced"],
             "CumsumPlus": ps.get("CumsumPlus", np.nan),
-            "ARIMA Signal": arima_signal_from_series(price_series),
-            "Kalman Signal": kalman_signal_from_series(price_series),
             "10 Day Relative Volume": rvol10,
             "20 Day Relative Volume": rvol20,
             "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else float("nan"),
@@ -1324,10 +1322,16 @@ def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.D
         cond = (bal_diff > dir_diff) & bal_diff.notna() & dir_diff.notna()
 
         if cond.any():
-            count_all = int(cond.sum())
-            gap_all = float((bal_diff[cond] - dir_diff[cond]).sum())
-            first_all = int(g.loc[cond, "Iteration No"].iloc[0])
-            latest_all = int(g.loc[cond, "Iteration No"].iloc[-1])
+            run_id = cond.ne(cond.shift(fill_value=False)).cumsum()
+            run_lengths = cond.groupby(run_id).transform("sum")
+            valid_cond = cond & run_lengths.ge(2)
+            if valid_cond.any():
+                count_all = int(valid_cond.sum())
+                gap_all = float((bal_diff[valid_cond] - dir_diff[valid_cond]).sum())
+                first_all = int(g.loc[valid_cond, "Iteration No"].iloc[0])
+                latest_all = int(g.loc[valid_cond, "Iteration No"].iloc[-1])
+            else:
+                count_all, gap_all, first_all, latest_all = 0, 0.0, np.nan, np.nan
         else:
             count_all, gap_all, first_all, latest_all = 0, 0.0, np.nan, np.nan
 
@@ -1337,10 +1341,16 @@ def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.D
         cond15 = (bal_diff_15 > dir_diff_15) & bal_diff_15.notna() & dir_diff_15.notna()
 
         if cond15.any():
-            count_15 = int(cond15.sum())
-            gap_15 = float((bal_diff_15[cond15] - dir_diff_15[cond15]).sum())
-            first_15 = int(g15.loc[cond15, "Iteration No"].iloc[0])
-            latest_15 = int(g15.loc[cond15, "Iteration No"].iloc[-1])
+            run_id_15 = cond15.ne(cond15.shift(fill_value=False)).cumsum()
+            run_lengths_15 = cond15.groupby(run_id_15).transform("sum")
+            valid_cond15 = cond15 & run_lengths_15.ge(2)
+            if valid_cond15.any():
+                count_15 = int(valid_cond15.sum())
+                gap_15 = float((bal_diff_15[valid_cond15] - dir_diff_15[valid_cond15]).sum())
+                first_15 = int(g15.loc[valid_cond15, "Iteration No"].iloc[0])
+                latest_15 = int(g15.loc[valid_cond15, "Iteration No"].iloc[-1])
+            else:
+                count_15, gap_15, first_15, latest_15 = 0, 0.0, np.nan, np.nan
         else:
             count_15, gap_15, first_15, latest_15 = 0, 0.0, np.nan, np.nan
 
