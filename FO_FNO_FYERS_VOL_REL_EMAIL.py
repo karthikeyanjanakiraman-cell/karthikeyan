@@ -498,7 +498,7 @@ def compute_price_lead_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
     df["avg_vol_5"] = df["volume"].rolling(5, min_periods=3).mean()
     df["volume_expansion"] = np.where(df["avg_vol_5"] > 0, df["volume"] / df["avg_vol_5"], np.nan)
 
-    df["mid"] = (df["high"] + df["low"]) / 2.0
+    df["mid"] = (df["high"] + df["low"] ) / 2.0
     df["delta"] = np.where(
         df["close"] > df["mid"],
         df["volume"],
@@ -611,6 +611,13 @@ def kalman_signal_from_series(prices: pd.Series, q: float = 1e-3) -> float:
     return round(gap / scale, 4)
 
 
+def _build_iteration_signals_from_rows(rows: List[Dict]) -> Dict[str, float]:
+    if not rows:
+        return build_signals_from_raw_directional(pd.DataFrame())
+    temp_df = pd.DataFrame(rows)
+    return build_signals_from_raw_directional(temp_df)
+
+
 def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[Dict, pd.DataFrame]:
     if intra_df is None or intra_df.empty:
         return {}, pd.DataFrame()
@@ -686,34 +693,51 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
 
         price_series = curr_df["close"].iloc[: i + 1]
         ps = price_stats_from_series(price_series)
+        iter_arima_signal = arima_signal_from_series(price_series)
+        iter_kalman_signal = kalman_signal_from_series(price_series)
 
-        pct_change_iter = ((float(row["close"]) - float(curr_df["close"].iloc[i-1])) / float(curr_df["close"].iloc[i-1]) * 100) if i > 0 and float(curr_df["close"].iloc[i-1]) != 0 else 0.0
+        pct_change_iter = ((float(row["close"]) - float(curr_df["close"].iloc[i - 1])) / float(curr_df["close"].iloc[i - 1]) * 100) if i > 0 and float(curr_df["close"].iloc[i - 1]) != 0 else 0.0
 
-        rows.append({
+        row_data = {
             "Iteration No": total_iters,
             "Iteration Minutes": iter_mins,
             "Iteration Time": t.strftime("%H:%M"),
             "LTP": float(row["close"]),
-            "Iteration % Change": pct_change_iter,
+            "Iteration Change": pct_change_iter,
             "Current Volume": cum_vol,
             "Directional": ps["Directional"],
             "Turning": ps["Turning"],
             "Stability": ps["Stability"],
             "Balanced": ps["Balanced"],
             "CumsumPlus": ps.get("CumsumPlus", np.nan),
+            "ARIMA Signal": iter_arima_signal,
+            "Kalman Signal": iter_kalman_signal,
             "10 Day Relative Volume": rvol10,
             "20 Day Relative Volume": rvol20,
             "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else float("nan"),
             "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[i]) if not flow_df.empty else float("nan"),
             "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[i]) if not flow_df.empty else float("nan"),
             "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[i]) if not flow_df.empty else float("nan"),
-            "Range_Expansion": float(price_lead_df["range_expansion"].iloc[i]) if not price_lead_df.empty and pd.notna(price_lead_df["range_expansion"].iloc[i]) else float("nan"),
-            "Volume_Expansion": float(price_lead_df["volume_expansion"].iloc[i]) if not price_lead_df.empty and pd.notna(price_lead_df["volume_expansion"].iloc[i]) else float("nan"),
-            "Delta_Expansion": float(price_lead_df["delta_expansion"].iloc[i]) if not price_lead_df.empty and pd.notna(price_lead_df["delta_expansion"].iloc[i]) else float("nan"),
-            "Price_Leading_Flag": bool(price_lead_df["price_leading_flag"].iloc[i]) if not price_lead_df.empty else False,
-            "Price_Lead_Streak": int(price_lead_df["price_lead_streak"].iloc[i]) if not price_lead_df.empty else 0,
-            "Price_Lead_Status": str(price_lead_df["Price_Lead_Status"].iloc[i]) if not price_lead_df.empty else "NORMAL",
+            "RangeExpansion": float(price_lead_df["range_expansion"].iloc[i]) if not price_lead_df.empty and pd.notna(price_lead_df["range_expansion"].iloc[i]) else float("nan"),
+            "VolumeExpansion": float(price_lead_df["volume_expansion"].iloc[i]) if not price_lead_df.empty and pd.notna(price_lead_df["volume_expansion"].iloc[i]) else float("nan"),
+            "DeltaExpansion": float(price_lead_df["delta_expansion"].iloc[i]) if not price_lead_df.empty and pd.notna(price_lead_df["delta_expansion"].iloc[i]) else float("nan"),
+            "PriceLeadingFlag": bool(price_lead_df["price_leading_flag"].iloc[i]) if not price_lead_df.empty else False,
+            "PriceLeadStreak": int(price_lead_df["price_lead_streak"].iloc[i]) if not price_lead_df.empty else 0,
+            "PriceLeadStatus": str(price_lead_df["Price_Lead_Status"].iloc[i]) if not price_lead_df.empty else "NORMAL",
+        }
+
+        temp_rows = rows + [row_data]
+        iter_signals = _build_iteration_signals_from_rows(temp_rows)
+        row_data.update({
+            "5mSignal": iter_signals.get("5m_Signal", np.nan),
+            "15mSignal": iter_signals.get("15m_Signal", np.nan),
+            "30mSignal": iter_signals.get("30m_Signal", np.nan),
+            "60mSignal": iter_signals.get("60m_Signal", np.nan),
+            "BullSignal": iter_signals.get("Bull_Signal", np.nan),
+            "BearSignal": iter_signals.get("Bear_Signal", np.nan),
+            "OverallSignal": iter_signals.get("Overall_Signal", np.nan),
         })
+        rows.append(row_data)
 
         last_cum_vol, last_rvol10, last_rvol20 = cum_vol, rvol10, rvol20
         last_iter_mins = iter_mins
@@ -808,7 +832,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
         if not iter_detail.empty:
             iter_detail.insert(0, "Symbol", sym)
-            iter_detail.insert(1, "Daily % Change", pct_change)
+            iter_detail.insert(1, "Daily Change", pct_change)
             iteration_rows.append(iter_detail)
 
         rows.append({
@@ -1022,11 +1046,26 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     short_df = short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     return long_df, short_df
 
+
 def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     if detail_df is None or detail_df.empty:
         return pd.DataFrame()
 
     df = detail_df.copy()
+    rename_map = {
+        "Daily Change": "% Change",
+        "Iteration Change": "% Change",
+        "5mSignal": "5m_Signal",
+        "15mSignal": "15m_Signal",
+        "30mSignal": "30m_Signal",
+        "60mSignal": "60m_Signal",
+        "BullSignal": "Bull_Signal",
+        "BearSignal": "Bear_Signal",
+        "OverallSignal": "Overall_Signal",
+        "PriceLeadStatus": "Price_Lead_Status",
+    }
+    df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
+
     for col in ["Iteration No", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -1059,7 +1098,10 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
 
     out = out.sort_values(["Iteration No", "Side"]).reset_index(drop=True)
     out["Iteration"] = out["Iteration No"].astype("Int64").astype(str) + " | " + out.get("Iteration Time", "").astype(str)
+    if "Last Iteration Time" not in out.columns and "Iteration Time" in out.columns:
+        out["Last Iteration Time"] = out["Iteration Time"]
     return out
+
 
 def build_history_table(history_df: pd.DataFrame, side: str) -> str:
     if history_df is None or history_df.empty:
@@ -1295,7 +1337,6 @@ def save_outputs(summary_df: pd.DataFrame, detail_df: pd.DataFrame, prefix: str 
     return summary_csv, detail_csv
 
 
-
 def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     cols_all = ["Symbol", "Count", "Gap", "First Occurrence", "Latest Iteration"]
     cols_combo = cols_all + ["Count (Last 15)", "Gap (Last 15)", "First Occurrence (Last 15)", "Latest Iteration (Last 15)"]
@@ -1303,11 +1344,11 @@ def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.D
         return pd.DataFrame(columns=cols_all), pd.DataFrame(columns=cols_combo)
 
     df = detail_df.copy()
-    for col in ["Iteration No", "Directional", "Balanced", "ARIMA Signal", "Kalman Signal"]:
+    for col in ["Iteration No", "Directional", "Balanced"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    required = {"Symbol", "Iteration No", "Directional", "Balanced", "ARIMA Signal", "Kalman Signal"}
+    required = {"Symbol", "Iteration No", "Directional", "Balanced"}
     if not required.issubset(set(df.columns)):
         return pd.DataFrame(columns=cols_all), pd.DataFrame(columns=cols_combo)
 
@@ -1316,13 +1357,7 @@ def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.D
         g = g.sort_values("Iteration No").copy()
         bal_diff = g["Balanced"].diff()
         dir_diff = g["Directional"].diff()
-        cond = (
-            (bal_diff > dir_diff)
-            & bal_diff.notna()
-            & dir_diff.notna()
-            & (g["ARIMA Signal"] > 0)
-            & (g["Kalman Signal"] > 0)
-        )
+        cond = (bal_diff > dir_diff) & bal_diff.notna() & dir_diff.notna()
 
         if cond.any():
             count_all = int(cond.sum())
@@ -1335,13 +1370,7 @@ def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.D
         g15 = g.tail(15).copy()
         bal_diff_15 = g15["Balanced"].diff()
         dir_diff_15 = g15["Directional"].diff()
-        cond15 = (
-            (bal_diff_15 > dir_diff_15)
-            & bal_diff_15.notna()
-            & dir_diff_15.notna()
-            & (g15["ARIMA Signal"] > 0)
-            & (g15["Kalman Signal"] > 0)
-        )
+        cond15 = (bal_diff_15 > dir_diff_15) & bal_diff_15.notna() & dir_diff_15.notna()
 
         if cond15.any():
             count_15 = int(cond15.sum())
