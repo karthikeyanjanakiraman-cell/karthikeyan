@@ -808,7 +808,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             resolution="D",
             days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS)
         )
-                intra_df = get_fyers_history(
+        intra_df = get_fyers_history(
             fyers_sym, resolution="5", days_back=INTRADAY_LOOKBACK_DAYS
         )
         prev_close = float(daily_df["close"].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2) else None
