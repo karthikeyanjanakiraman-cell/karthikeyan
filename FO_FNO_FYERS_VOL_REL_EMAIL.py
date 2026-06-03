@@ -649,11 +649,7 @@ def compute_iteration_volume_profile(
     curr_df["cum_vol"] = curr_df["volume"].cumsum()
 
     if prev_close is not None and prev_close != 0:
-        curr_df["Iteration Change"] = (
-            (pd.to_numeric(curr_df["close"], errors="coerce") - float(prev_close))
-            / float(prev_close)
-            * 100.0
-        )
+        curr_df["Iteration Change"] = ((pd.to_numeric(curr_df["close"], errors="coerce") - float(prev_close)) / float(prev_close) * 100.0)
     else:
         curr_df["Iteration Change"] = 0.0
 
@@ -662,21 +658,13 @@ def compute_iteration_volume_profile(
         if "timestamp" in work_df.columns:
             work_df["time"] = pd.to_datetime(work_df["timestamp"])
         elif "date" in work_df.columns and "time_only" in work_df.columns:
-            work_df["time"] = pd.to_datetime(
-                work_df["date"].astype(str) + " " + work_df["time_only"].astype(str)
-            )
+            work_df["time"] = pd.to_datetime(work_df["date"].astype(str) + " " + work_df["time_only"].astype(str))
         else:
             work_df["time"] = pd.RangeIndex(start=0, stop=len(work_df), step=1)
 
-    metric_df = compute_cumulative_directional_metrics(
-        work_df[["time", "open", "high", "low", "close", "volume"]].copy()
-    )
-    flow_df = compute_cumulative_flow_metrics(
-        work_df[["time", "high", "low", "close", "volume"]].copy()
-    )
-    price_lead_df = compute_price_lead_metrics(
-        work_df[["time", "open", "high", "low", "close", "volume"]].copy()
-    )
+    metric_df = compute_cumulative_directional_metrics(work_df[["time", "open", "high", "low", "close", "volume"]].copy())
+    flow_df = compute_cumulative_flow_metrics(work_df[["time", "high", "low", "close", "volume"]].copy())
+    price_lead_df = compute_price_lead_metrics(work_df[["time", "open", "high", "low", "close", "volume"]].copy())
 
     rows = []
     total_iters = 0
@@ -789,7 +777,6 @@ def compute_iteration_volume_profile(
     signals = build_signals_from_raw_directional(detail_df)
     summary.update(signals)
     return summary, detail_df
-
 def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
     symbols = load_fno_symbols_from_sectors("sectors")
     if not symbols:
@@ -809,11 +796,15 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS)
         )
         intra_df = get_fyers_history(
-            fyers_sym, resolution="5", days_back=INTRADAY_LOOKBACK_DAYS
+            fyers_sym,
+            resolution="5",
+            days_back=INTRADAY_LOOKBACK_DAYS
         )
-        prev_close = float(daily_df["close"].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2) else None
-        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df, prev_close)
+
+        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
         iv_info = compute_iv_proxies(daily_df)
+
+        prev_close = float(daily_df["close"].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2) else None
         ltp = iter_summary.get("LTP")
         pct_change = ((ltp - prev_close) / prev_close * 100) if (ltp is not None and prev_close and prev_close != 0) else 0.0
 
