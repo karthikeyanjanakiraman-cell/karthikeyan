@@ -1060,7 +1060,10 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
         return out
 
     out = out.sort_values(["Iteration No", "Side"]).reset_index(drop=True)
-    out["Iteration"] = out["Iteration No"].astype("Int64").astype(str) + " | " + out.get("Iteration Time", "").astype(str)
+    iter_time = out.get("Iteration Time", pd.Series("", index=out.index)).astype(str)
+    out["Iteration"] = out["Iteration No"].astype("Int64").astype(str) + " | " + iter_time
+    out["First Occurrence"] = out["Iteration No"].astype("Int64").astype(str) + " | " + iter_time
+    out["Latest"] = out["Iteration No"].astype("Int64").astype(str) + " | " + iter_time
     return out
 
 def build_history_table(history_df: pd.DataFrame, side: str) -> str:
@@ -1075,10 +1078,14 @@ def build_history_table(history_df: pd.DataFrame, side: str) -> str:
         return "No history yet."
 
     cols = [
-        "Iteration", "Symbol", "LTP", "% Change", "Directional", "Turning",
+        "First Occurrence", "Latest", "Symbol", "LTP", "% Change", "Directional", "Turning",
         "Stability", "Balanced", "CumsumPlus", "ARIMA Signal", "Kalman Signal",
         "Bull_Signal", "Bear_Signal", "Overall_Signal", "Last Iteration Time"
     ]
+    if "First Occurrence" not in df.columns and "Iteration" in df.columns:
+        df["First Occurrence"] = df["Iteration"]
+    if "Latest" not in df.columns and "Iteration" in df.columns:
+        df["Latest"] = df["Iteration"]
     cols = [c for c in cols if c in df.columns]
     df = df.tail(15)[cols].copy()
 
