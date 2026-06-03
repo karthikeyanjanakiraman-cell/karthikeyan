@@ -808,16 +808,12 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             resolution="D",
             days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS)
         )
-        intra_df = get_fyers_history(
-            fyers_sym,
-            resolution="5",
-            days_back=INTRADAY_LOOKBACK_DAYS
+                intra_df = get_fyers_history(
+            fyers_sym, resolution="5", days_back=INTRADAY_LOOKBACK_DAYS
         )
-
+        prev_close = float(daily_df["close"].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2) else None
         iter_summary, iter_detail = compute_iteration_volume_profile(intra_df, prev_close)
         iv_info = compute_iv_proxies(daily_df)
-
-        prev_close = float(daily_df["close"].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2) else None
         ltp = iter_summary.get("LTP")
         pct_change = ((ltp - prev_close) / prev_close * 100) if (ltp is not None and prev_close and prev_close != 0) else 0.0
 
