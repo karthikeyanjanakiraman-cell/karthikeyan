@@ -614,11 +614,15 @@ def _build_iteration_signals_from_rows(rows: List[Dict]) -> Dict[str, float]:
     return build_signals_from_raw_directional(pd.DataFrame(rows))
 
 
-def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[Dict, pd.DataFrame]:
+def compute_iteration_volume_profile(
+    intra_df: Optional[pd.DataFrame],
+    prev_close: Optional[float] = None,
+) -> Tuple[Dict, pd.DataFrame]:
     if intra_df is None or intra_df.empty:
         return {}, pd.DataFrame()
 
     df = intra_df.copy()
+
     if "timestamp" in df.columns:
         df["date"] = pd.to_datetime(df["timestamp"]).dt.date
         df["time_only"] = pd.to_datetime(df["timestamp"]).dt.time
@@ -644,12 +648,23 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
     curr_df.sort_values("time_only", inplace=True)
     curr_df["cum_vol"] = curr_df["volume"].cumsum()
 
+    if prev_close is not None and prev_close != 0:
+        curr_df["Iteration Change"] = (
+            (pd.to_numeric(curr_df["close"], errors="coerce") - float(prev_close))
+            / float(prev_close)
+            * 100.0
+        )
+    else:
+        curr_df["Iteration Change"] = 0.0
+
     work_df = curr_df.copy()
     if "time" not in work_df.columns:
         if "timestamp" in work_df.columns:
             work_df["time"] = pd.to_datetime(work_df["timestamp"])
         elif "date" in work_df.columns and "time_only" in work_df.columns:
-            work_df["time"] = pd.to_datetime(work_df["date"].astype(str) + " " + work_df["time_only"].astype(str))
+            work_df["time"] = pd.to_datetime(
+                work_df["date"].astype(str) + " " + work_df["time_only"].astype(str)
+            )
         else:
             work_df["time"] = pd.RangeIndex(start=0, stop=len(work_df), step=1)
 
@@ -667,7 +682,7 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
     total_iters = 0
     last_iter_mins = None
     last_iter_time = None
-    last_cum_vol = last_rvol10 = last_rvol20 = 0
+    last_cum_vol = last_rvol10 = last_rvol20 = 0.0
 
     for i in range(len(curr_df)):
         total_iters += 1
@@ -676,21 +691,20 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         cum_vol = float(row["cum_vol"])
 
         h10 = hist_df_10[hist_df_10["time_only"] <= t]
-        avg_cum_10 = h10.groupby("date")["volume"].sum().mean() if not h10.empty else 0
-        rvol10 = cum_vol / avg_cum_10 if avg_cum_10 > 0 else 0
+        avg_cum_10 = h10.groupby("date")["volume"].sum().mean() if not h10.empty else 0.0
+        rvol10 = cum_vol / avg_cum_10 if avg_cum_10 > 0 else 0.0
 
         h20 = hist_df_20[hist_df_20["time_only"] <= t]
-        avg_cum_20 = h20.groupby("date")["volume"].sum().mean() if not h20.empty else 0
-        rvol20 = cum_vol / avg_cum_20 if avg_cum_20 > 0 else 0
+        avg_cum_20 = h20.groupby("date")["volume"].sum().mean() if not h20.empty else 0.0
+        rvol20 = cum_vol / avg_cum_20 if avg_cum_20 > 0 else 0.0
 
         dt_time = datetime.combine(current_date, t)
         market_open = datetime.combine(current_date, time(9, 15))
         iter_mins = int((dt_time - market_open).total_seconds() / 60)
 
-        price_series = curr_df["close"].iloc[: i + 1]
-        ps = price_stats_from_series(price_series)
-
-        pct_change_iter = ((float(row["close"]) - float(curr_df["close"].iloc[i-1])) / float(curr_df["close"].iloc[i-1]) * 100) if i > 0 and float(curr_df["close"].iloc[i-1]) != 0 else 0.0
+        pct_series = curr_df["Iteration Change"].iloc[: i + 1]
+        ps = price_stats_from_series(pct_series)
+        pct_change_iter = float(curr_df["Iteration Change"].iloc[i])
 
         rows.append({
             "Iteration No": total_iters,
@@ -737,8 +751,7 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         obv_30m_delta = float(flow_df["Cumulative OBV"].iloc[-1]) - float(flow_df["Cumulative OBV"].iloc[-7])
         rsi_30m_delta = float(flow_df["Cumulative RSI"].iloc[-1]) - float(flow_df["Cumulative RSI"].iloc[-7])
 
-    final_ps = price_stats_from_series(curr_df["close"])
-
+    final_ps = price_stats_from_series(curr_df["Iteration Change"])
     summary = {
         "LTP": ltp,
         "Directional": final_ps["Directional"],
@@ -746,8 +759,8 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
         "Stability": final_ps["Stability"],
         "Balanced": final_ps["Balanced"],
         "CumsumPlus": final_ps.get("CumsumPlus", np.nan),
-        "ARIMA Signal": arima_signal_from_series(curr_df["close"]),
-        "Kalman Signal": kalman_signal_from_series(curr_df["close"]),
+        "ARIMA Signal": arima_signal_from_series(curr_df["Iteration Change"]),
+        "Kalman Signal": kalman_signal_from_series(curr_df["Iteration Change"]),
         "Current Volume": last_cum_vol,
         "10 Day Relative Volume": last_rvol10,
         "20 Day Relative Volume": last_rvol20,
@@ -777,7 +790,6 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame]) -> Tuple[
     summary.update(signals)
     return summary, detail_df
 
-
 def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
     symbols = load_fno_symbols_from_sectors("sectors")
     if not symbols:
@@ -802,7 +814,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             days_back=INTRADAY_LOOKBACK_DAYS
         )
 
-        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
+        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df, prev_close)
         iv_info = compute_iv_proxies(daily_df)
 
         prev_close = float(daily_df["close"].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2) else None
