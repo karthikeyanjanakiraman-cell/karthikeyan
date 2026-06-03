@@ -395,18 +395,18 @@ def compute_cumulative_directional_metrics(curr_df: pd.DataFrame) -> pd.DataFram
 
         cum_ker = float(np.mean(prior_kers)) if prior_kers else np.nan
 
-        tr_sum = tr[1 : i + 1].sum()
-        plus_sum = plus_dm[1 : i + 1].sum()
-        minus_sum = minus_dm[1 : i + 1].sum()
+        tr_sum = tr[1: i + 1].sum()
+        plus_sum = plus_dm[1: i + 1].sum()
+        minus_sum = minus_dm[1: i + 1].sum()
 
         pdi = 100 * plus_sum / tr_sum if tr_sum > 0 else 0.0
         mdi = 100 * minus_sum / tr_sum if tr_sum > 0 else 0.0
 
         dxs = []
         for k in range(1, i + 1):
-            ktr = tr[1 : k + 1].sum()
-            kp = plus_dm[1 : k + 1].sum()
-            km = minus_dm[1 : k + 1].sum()
+            ktr = tr[1: k + 1].sum()
+            kp = plus_dm[1: k + 1].sum()
+            km = minus_dm[1: k + 1].sum()
             kpdi = 100 * kp / ktr if ktr > 0 else 0.0
             kmdi = 100 * km / ktr if ktr > 0 else 0.0
             dxs.append(100 * abs(kpdi - kmdi) / (kpdi + kmdi) if (kpdi + kmdi) > 0 else 0.0)
@@ -649,7 +649,11 @@ def compute_iteration_volume_profile(
     curr_df["cum_vol"] = curr_df["volume"].cumsum()
 
     if prev_close is not None and prev_close != 0:
-        curr_df["Iteration Change"] = ((pd.to_numeric(curr_df["close"], errors="coerce") - float(prev_close)) / float(prev_close) * 100.0)
+        curr_df["Iteration Change"] = (
+            (pd.to_numeric(curr_df["close"], errors="coerce") - float(prev_close))
+            / float(prev_close)
+            * 100.0
+        )
     else:
         curr_df["Iteration Change"] = 0.0
 
@@ -658,13 +662,21 @@ def compute_iteration_volume_profile(
         if "timestamp" in work_df.columns:
             work_df["time"] = pd.to_datetime(work_df["timestamp"])
         elif "date" in work_df.columns and "time_only" in work_df.columns:
-            work_df["time"] = pd.to_datetime(work_df["date"].astype(str) + " " + work_df["time_only"].astype(str))
+            work_df["time"] = pd.to_datetime(
+                work_df["date"].astype(str) + " " + work_df["time_only"].astype(str)
+            )
         else:
             work_df["time"] = pd.RangeIndex(start=0, stop=len(work_df), step=1)
 
-    metric_df = compute_cumulative_directional_metrics(work_df[["time", "open", "high", "low", "close", "volume"]].copy())
-    flow_df = compute_cumulative_flow_metrics(work_df[["time", "high", "low", "close", "volume"]].copy())
-    price_lead_df = compute_price_lead_metrics(work_df[["time", "open", "high", "low", "close", "volume"]].copy())
+    metric_df = compute_cumulative_directional_metrics(
+        work_df[["time", "open", "high", "low", "close", "volume"]].copy()
+    )
+    flow_df = compute_cumulative_flow_metrics(
+        work_df[["time", "high", "low", "close", "volume"]].copy()
+    )
+    price_lead_df = compute_price_lead_metrics(
+        work_df[["time", "open", "high", "low", "close", "volume"]].copy()
+    )
 
     rows = []
     total_iters = 0
@@ -777,6 +789,8 @@ def compute_iteration_volume_profile(
     signals = build_signals_from_raw_directional(detail_df)
     summary.update(signals)
     return summary, detail_df
+
+
 def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
     symbols = load_fno_symbols_from_sectors("sectors")
     if not symbols:
@@ -796,15 +810,11 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS)
         )
         intra_df = get_fyers_history(
-            fyers_sym,
-            resolution="5",
-            days_back=INTRADAY_LOOKBACK_DAYS
+            fyers_sym, resolution="5", days_back=INTRADAY_LOOKBACK_DAYS
         )
-
-        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df)
-        iv_info = compute_iv_proxies(daily_df)
-
         prev_close = float(daily_df["close"].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2) else None
+        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df, prev_close)
+        iv_info = compute_iv_proxies(daily_df)
         ltp = iter_summary.get("LTP")
         pct_change = ((ltp - prev_close) / prev_close * 100) if (ltp is not None and prev_close and prev_close != 0) else 0.0
 
@@ -861,628 +871,4 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
     return (
         pd.DataFrame(rows),
         pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame()
-    )
-
-
-def rank_delta_to_label(delta: float) -> str:
-    if pd.isna(delta):
-        return ""
-    if delta >= 7:
-        return "Buy++"
-    if delta >= 4:
-        return "Buy+"
-    if delta >= 1:
-        return "Buy"
-    if delta == 0:
-        return "Neutral"
-    if delta <= -7:
-        return "Sell++"
-    if delta <= -4:
-        return "Sell+"
-    return "Sell"
-
-
-def derive_rank_columns(df: pd.DataFrame) -> pd.DataFrame:
-    if df is None or df.empty:
-        return df
-
-    out = df.copy()
-
-    def score_bull(row):
-        score = 0
-        if pd.notna(row.get("% Change")) and row.get("% Change") > 0:
-            score += 2
-        if pd.notna(row.get("VWAP Z-Score")) and row.get("VWAP Z-Score") >= 0.30:
-            score += 2
-        if (
-            pd.notna(row.get("Cumulative DI")) and
-            pd.notna(row.get("Cumulative -DI")) and
-            row.get("Cumulative DI") > row.get("Cumulative -DI")
-        ):
-            score += 2
-        if pd.notna(row.get("Cumulative ADX")) and row.get("Cumulative ADX") >= 20:
-            score += 1
-        if pd.notna(row.get("Cumulative KER")) and row.get("Cumulative KER") >= 0.40:
-            score += 1
-        if pd.notna(row.get("Cumulative RSI")) and row.get("Cumulative RSI") >= 55:
-            score += 1
-        return min(score, 13)
-
-    def score_bear(row):
-        score = 0
-        if pd.notna(row.get("% Change")) and row.get("% Change") < 0:
-            score += 2
-        if pd.notna(row.get("VWAP Z-Score")) and row.get("VWAP Z-Score") <= -0.30:
-            score += 2
-        if (
-            pd.notna(row.get("Cumulative DI")) and
-            pd.notna(row.get("Cumulative -DI")) and
-            row.get("Cumulative -DI") > row.get("Cumulative DI")
-        ):
-            score += 2
-        if pd.notna(row.get("Cumulative ADX")) and row.get("Cumulative ADX") >= 20:
-            score += 1
-        if pd.notna(row.get("Cumulative KER")) and row.get("Cumulative KER") >= 0.40:
-            score += 1
-        if pd.notna(row.get("Cumulative RSI")) and row.get("Cumulative RSI") <= 45:
-            score += 1
-        return min(score, 13)
-
-    bull = out.apply(score_bull, axis=1)
-    bear = out.apply(score_bear, axis=1)
-
-    out["Bull Rank"] = bull
-    out["Bear Rank"] = bear
-    out["Rank Delta"] = bull - bear
-
-    for tf, w in {"5m": 1.0, "15m": 0.9, "30m": 0.8, "60m": 0.7}.items():
-        out[f"{tf}BullRank"] = (bull * w).round().clip(lower=0, upper=14)
-        out[f"{tf}BearRank"] = (bear * w).round().clip(lower=0, upper=14)
-        out[f"{tf}RankDelta"] = out[f"{tf}BullRank"] - out[f"{tf}BearRank"]
-
-    return out
-
-
-def add_signal_columns(df: pd.DataFrame) -> pd.DataFrame:
-    return df
-
-
-def signal_color(label) -> str:
-    try:
-        v = float(label)
-        if v > 0:
-            return "#2e7d32"
-        if v < 0:
-            return "#7f1d1d"
-        return "#4b5563"
-    except (ValueError, TypeError):
-        pass
-
-    label = str(label).strip()
-    if label == "Buyer Zone":
-        return "#33691e"
-    if label == "Neutral Vol":
-        return "#4b5563"
-    if label == "Avoid Buy Premium":
-        return "#7a5c00"
-    return "#374151"
-
-
-def text_color_for_bg(bg: str) -> str:
-    bg = str(bg).lower()
-    if bg in {
-        "#4b5563", "#374151", "#7f1d1d", "#a83232",
-        "#b94a48", "#7a5c00", "#33691e", "#2e7d32", "#3f8f45"
-    }:
-        return "#f3f4f6"
-    return "#ffffff"
-
-
-def format_value(col: str, val):
-    if pd.isna(val):
-        return ""
-    if col == "% Change":
-        return f"{float(val):.2f}%"
-    if col == "IVP":
-        return f"{float(val):.2f}"
-    if isinstance(val, (int, float, np.integer, np.floating)):
-        return f"{float(val):.2f}"
-    return str(val)
-
-
-def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    if df is None or df.empty:
-        return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-
-    base = df.copy()
-    for c in ["Directional", "Turning", "Stability", "Balanced", "CumsumPlus", "10 Day Relative Volume", "Last5mVolume"]:
-        if c in base.columns:
-            base[c] = pd.to_numeric(base[c], errors="coerce")
-
-    base = base.copy()
-    if "10 Day Relative Volume" in base.columns:
-        base = base[base["10 Day Relative Volume"].fillna(0) >= 1.0]
-    if "Last5mVolume" in base.columns:
-        base = base[base["Last5mVolume"].fillna(0) > 0]
-
-    def prep_side(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
-        if df_side.empty:
-            return df_side
-        df_side = df_side.copy()
-        if side == "long":
-            df_side = df_side[df_side["Directional"] > 0]
-            df_side = df_side.sort_values(["Directional", "Turning", "CumsumPlus", "Stability"], ascending=[False, True, False, False], na_position="last")
-        else:
-            df_side = df_side[df_side["Directional"] < 0]
-            df_side = df_side.sort_values(["Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, True, True, False], na_position="last")
-        return df_side
-
-    long_df = prep_side(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
-    short_df = prep_side(base, "short").drop_duplicates(subset=["Symbol"]).head(15)
-    cols = [c for c in EMAIL_DISPLAY_COLS if c in base.columns]
-    long_df = long_df[cols] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-    short_df = short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-    return long_df, short_df
-
-def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
-    if detail_df is None or detail_df.empty:
-        return pd.DataFrame()
-
-    df = detail_df.copy()
-    for col in ["Iteration No", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    if "Iteration No" not in df.columns:
-        return pd.DataFrame()
-
-    last_15_iters = sorted(df["Iteration No"].dropna().astype(int).unique())[-15:]
-    df = df[df["Iteration No"].isin(last_15_iters)].copy()
-
-    long_top = (
-        df[df["Directional"] > 0]
-        .sort_values(["Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, False, True, False, False], na_position="last")
-        .groupby("Iteration No", group_keys=False)
-        .head(1)
-        .assign(Side="Long")
-    )
-
-    short_top = (
-        df[df["Directional"] < 0]
-        .sort_values(["Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, True, True, False, False], na_position="last")
-        .groupby("Iteration No", group_keys=False)
-        .head(1)
-        .assign(Side="Short")
-    )
-
-    out = pd.concat([long_top, short_top], ignore_index=True, sort=False)
-    if out.empty:
-        return out
-
-    out = out.sort_values(["Iteration No", "Side"]).reset_index(drop=True)
-    out["Iteration"] = out["Iteration No"].astype("Int64").astype(str) + " | " + out.get("Iteration Time", "").astype(str)
-    return out
-
-def build_history_table(history_df: pd.DataFrame, side: str) -> str:
-    if history_df is None or history_df.empty:
-        return "No history yet."
-
-    df = history_df.copy()
-    if "Side" in df.columns:
-        df = df[df["Side"].astype(str).str.lower() == side.lower()]
-
-    if df.empty:
-        return "No history yet."
-
-    cols = [
-        "Iteration", "Symbol", "LTP", "% Change", "Directional", "Turning",
-        "Stability", "Balanced", "CumsumPlus", "ARIMA Signal", "Kalman Signal",
-        "Bull_Signal", "Bear_Signal", "Overall_Signal", "Last Iteration Time"
-    ]
-    cols = [c for c in cols if c in df.columns]
-    df = df.tail(15)[cols].copy()
-
-    def style_cell(col, val):
-        base = "padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;"
-        try:
-            num = float(val)
-        except Exception:
-            return base
-
-        if col in ["% Change", "Directional", "Balanced", "CumsumPlus", "Bull_Signal", "Bear_Signal", "Overall_Signal"]:
-            if num > 0:
-                return base + "background:#14532d;color:#dcfce7;font-weight:600;"
-            if num < 0:
-                return base + "background:#7f1d1d;color:#fee2e2;font-weight:600;"
-        return base
-
-    def fmt(col, val):
-        if pd.isna(val):
-            return ""
-        if col == "% Change":
-            return f"{float(val):.2f}%"
-        if isinstance(val, (int, float, np.integer, np.floating)):
-            return f"{float(val):.2f}"
-        return str(val)
-
-    header = "".join(
-        f'<th style="padding:8px;border:1px solid #4b5563;background:#111827;color:#f9fafb;">{c}</th>'
-        for c in cols
-    )
-
-    body_rows = []
-    for _, r in df.iterrows():
-        tds = "".join(
-            f'<td style="{style_cell(c, r[c])}">{fmt(c, r[c])}</td>'
-            for c in cols
         )
-        body_rows.append(f"<tr>{tds}</tr>")
-
-    title_color = "#22c55e" if side.lower() == "long" else "#ef4444"
-    return f"""
-    <h3 style="color:{title_color};margin:12px 0 6px 0;">Top 1 {side.title()} - Last 15 Iterations</h3>
-    <div style="overflow-x:auto;">
-      <table style="border-collapse:collapse;width:100%;background:#030712;">
-        <thead><tr>{header}</tr></thead>
-        <tbody>{''.join(body_rows)}</tbody>
-      </table>
-    </div>
-    """
-
-
-def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 15) -> str:
-    if df is None or df.empty:
-        return f"""
-        <h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3>
-        <div style="padding:12px;border:1px solid #374151;background:#111827;color:#d1d5db;border-radius:8px;">
-            No candidates found.
-        </div>
-        """
-
-    df_slice = df.head(max_rows).copy()
-    cols = [c for c in EMAIL_DISPLAY_COLS if c in df_slice.columns]
-    if not cols:
-        return f"""
-        <h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3>
-        <div style="padding:12px;border:1px solid #374151;background:#111827;color:#d1d5db;border-radius:8px;">
-            No candidates found.
-        </div>
-        """
-
-    header_cells = "".join(
-        f'<th style="padding:8px;border:1px solid #4b5563;background:#111827;color:#f9fafb;white-space:nowrap;">{c}</th>'
-        for c in cols
-    )
-
-    def cell_style(col: str, val) -> str:
-        base = "padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;white-space:nowrap;"
-        try:
-            num = float(val)
-        except Exception:
-            num = None
-
-        if col in ["% Change", "Directional", "Balanced", "CumsumPlus", "Bull_Signal", "Bear_Signal", "Overall_Signal"]:
-            if num is not None:
-                if num > 0:
-                    return base + "background:#14532d;color:#dcfce7;font-weight:600;"
-                if num < 0:
-                    return base + "background:#7f1d1d;color:#fee2e2;font-weight:600;"
-            return base
-
-        if col in ["Volatility State", "Price_Lead_Status"]:
-            bg = signal_color(val)
-            fg = text_color_for_bg(bg)
-            return base + f"background:{bg};color:{fg};font-weight:600;"
-
-        return base
-
-    body_rows = []
-    for _, row in df_slice.iterrows():
-        tds = "".join(
-            f'<td style="{cell_style(col, row[col])}">{format_value(col, row[col])}</td>'
-            for col in cols
-        )
-        body_rows.append(f"<tr>{tds}</tr>")
-
-    return f"""
-    <h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3>
-    <div style="overflow-x:auto;">
-        <table style="border-collapse:collapse;width:100%;background:#030712;">
-            <thead><tr>{header_cells}</tr></thead>
-            <tbody>{''.join(body_rows)}</tbody>
-        </table>
-    </div>
-    """
-
-
-def send_email_with_tables(
-    long_df: pd.DataFrame,
-    short_df: pd.DataFrame,
-    history_df: pd.DataFrame,
-    csv_filename: str = "",
-    detail_csv_filename: str = ""
-) -> bool:
-    try:
-        scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        history_long_html = build_history_table(history_df, "long")
-        history_short_html = build_history_table(history_df, "short")
-
-        long_html = build_html_table(long_df, "Current Long Candidates", max_rows=15)
-        short_html = build_html_table(short_df, "Current Short Candidates", max_rows=15)
-
-        html_body = f"""
-        <html>
-        <body style="margin:0;padding:20px;background:#030712;color:#e5e7eb;font-family:Arial,sans-serif;">
-            <div style="max-width:1600px;margin:0 auto;">
-                <h2 style="margin:0 0 12px 0;color:#facc15;">Intraday Vol Iteration Alert</h2>
-                <div style="margin-bottom:18px;color:#cbd5e1;font-size:14px;">
-                    Scan completed at {scan_time}
-                </div>
-
-                <div style="margin-bottom:24px;padding:14px;border:1px solid #374151;background:#111827;border-radius:10px;">
-                    <h2 style="margin:0 0 14px 0;color:#facc15;">Last 15 Iterations - Top 1 Candidates</h2>
-                    {history_long_html}
-                    <div style="height:14px;"></div>
-                    {history_short_html}
-                </div>
-
-                <div style="margin-bottom:24px;padding:14px;border:1px solid #374151;background:#111827;border-radius:10px;">
-                    {long_html}
-                </div>
-
-                <div style="margin-bottom:24px;padding:14px;border:1px solid #374151;background:#111827;border-radius:10px;">
-                    {short_html}
-                </div>
-
-                <div style="margin-top:18px;color:#94a3b8;font-size:12px;">
-                    Generated by FO_FNO_FYERS_VOL_REL_EMAIL.py
-                </div>
-            </div>
-        </body>
-        </html>
-        """
-
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"Intraday Vol Iteration Alert - {scan_time}"
-        msg["From"] = sender_email
-        msg["To"] = recipient_email
-        msg.attach(MIMEText(html_body, "html", _charset="utf-8"))
-
-        for fname in [csv_filename, detail_csv_filename]:
-            if not fname or not os.path.exists(fname):
-                continue
-            with open(fname, "rb") as f:
-                part = MIMEBase("application", "octet-stream")
-                part.set_payload(f.read())
-            encoders.encode_base64(part)
-            part.add_header(
-                "Content-Disposition",
-                f'attachment; filename="{os.path.basename(fname)}"'
-            )
-            msg.attach(part)
-
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.starttls()
-            server.login(sender_email, sender_password)
-            server.sendmail(sender_email, recipient_email, msg.as_string())
-
-        logger.info("Email sent successfully.")
-        return True
-
-    except Exception as e:
-        logger.error(f"EMAIL Error: {e}")
-        return False
-
-
-def save_outputs(summary_df: pd.DataFrame, detail_df: pd.DataFrame, prefix: str = "scan") -> Tuple[str, str]:
-    ts = datetime.now().strftime("%Y%m%d_%H%M")
-    summary_csv = f"{prefix}_summary_{ts}.csv"
-    detail_csv = f"{prefix}_detail_{ts}.csv"
-
-    try:
-        summary_df.to_csv(summary_csv, index=False)
-        logger.info(f"Saved summary: {summary_csv}")
-    except Exception as e:
-        logger.error(f"Failed to save summary CSV: {e}")
-        summary_csv = ""
-
-    try:
-        detail_df.to_csv(detail_csv, index=False)
-        logger.info(f"Saved detail: {detail_csv}")
-    except Exception as e:
-        logger.error(f"Failed to save detail CSV: {e}")
-        detail_csv = ""
-
-    return summary_csv, detail_csv
-
-
-
-def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    cols_all = ["Symbol", "Count", "Gap", "First Occurrence", "Latest Iteration"]
-    cols_combo = cols_all + ["Count (Last 15)", "Gap (Last 15)", "First Occurrence (Last 15)", "Latest Iteration (Last 15)"]
-    if detail_df is None or detail_df.empty:
-        return pd.DataFrame(columns=cols_all), pd.DataFrame(columns=cols_combo)
-
-    df = detail_df.copy()
-    for col in ["Iteration No", "CumsumPlus"]:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-    required = {"Symbol", "Iteration No", "CumsumPlus"}
-    if not required.issubset(set(df.columns)):
-        return pd.DataFrame(columns=cols_all), pd.DataFrame(columns=cols_combo)
-
-    def summarize_runs(g: pd.DataFrame) -> Tuple[int, float, float, float]:
-        if g is None or g.empty:
-            return 0, 0.0, np.nan, np.nan
-
-        g = g.sort_values("Iteration No").copy()
-        g["CumsumPlus Diff"] = g["CumsumPlus"].diff()
-        cond = (g["CumsumPlus Diff"] > 0) & g["CumsumPlus Diff"].notna()
-
-        if not cond.any():
-            return 0, 0.0, np.nan, np.nan
-
-        run_id = (cond != cond.shift(fill_value=False)).cumsum()
-        runs = []
-        for _, rg in g[cond].groupby(run_id[cond]):
-            runs.append({
-                "Count": int(len(rg)),
-                "Gap": float(rg["CumsumPlus Diff"].sum()),
-                "First Occurrence": int(rg["Iteration No"].iloc[0]),
-                "Latest Iteration": int(rg["Iteration No"].iloc[-1]),
-            })
-
-        if not runs:
-            return 0, 0.0, np.nan, np.nan
-
-        best = sorted(runs, key=lambda x: (x["Count"], x["Gap"], x["Latest Iteration"]), reverse=True)[0]
-        return best["Count"], best["Gap"], best["First Occurrence"], best["Latest Iteration"]
-
-    rows = []
-    for sym, g in df.groupby("Symbol", sort=False):
-        count_all, gap_all, first_all, latest_all = summarize_runs(g)
-        count_15, gap_15, first_15, latest_15 = summarize_runs(g.sort_values("Iteration No").tail(15).copy())
-
-        rows.append({
-            "Symbol": sym,
-            "Count": count_all,
-            "Gap": gap_all,
-            "First Occurrence": first_all,
-            "Latest Iteration": latest_all,
-            "Count (Last 15)": count_15,
-            "Gap (Last 15)": gap_15,
-            "First Occurrence (Last 15)": first_15,
-            "Latest Iteration (Last 15)": latest_15,
-        })
-
-    out = pd.DataFrame(rows)
-    if out.empty:
-        return pd.DataFrame(columns=cols_all), pd.DataFrame(columns=cols_combo)
-
-    out = out[out["Count"] >= 2].copy()
-    out = out.sort_values(["Count", "Gap"], ascending=[False, False], na_position="last").reset_index(drop=True)
-
-    last15_df = pd.DataFrame(rows)
-    last15_df = last15_df[last15_df["Count (Last 15)"] >= 2].copy()
-    last15_df = last15_df[["Symbol", "Count (Last 15)", "Gap (Last 15)", "First Occurrence (Last 15)", "Latest Iteration (Last 15)"]]
-    last15_df.columns = ["Symbol", "Count", "Gap", "First Occurrence", "Latest Iteration"]
-    last15_df = last15_df.sort_values(["Count", "Gap"], ascending=[False, False], na_position="last").reset_index(drop=True)
-    return out[cols_all].copy(), last15_df
-
-
-def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25) -> str:
-    if df is None or df.empty:
-        return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0">{title}</h3><div style="padding:12px;border:1px solid #374151;background:#111827;color:#d1d5db;border-radius:8px;">No data found.</div>'
-
-    view = df.head(max_rows).copy()
-    cols = list(view.columns)
-
-    def fmt(col, val):
-        if pd.isna(val):
-            return ""
-        if col == "Symbol":
-            return str(val)
-        if "Gap" in col:
-            return f"{float(val):.2f}"
-        return str(int(float(val)))
-
-    header = ''.join([f'<th style="padding:8px;border:1px solid #4b5563;background:#111827;color:#f9fafb;white-space:nowrap">{c}</th>' for c in cols])
-    body = []
-    for _, row in view.iterrows():
-        cells = ''.join([f'<td style="padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;white-space:nowrap">{fmt(c, row[c])}</td>' for c in cols])
-        body.append(f'<tr>{cells}</tr>')
-
-    return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0">{title}</h3><div style="overflow-x:auto"><table style="border-collapse:collapse;width:100%;background:#030712"><thead><tr>{header}</tr></thead><tbody>{"".join(body)}</tbody></table></div>'
-
-
-def send_second_email_with_exceedance_tables(all_iter_df: pd.DataFrame, combo_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
-    try:
-        scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        combo_html = build_exceedance_table_html(combo_df, "Balanced vs Directional - Last 15", max_rows=25)
-        all_html = build_exceedance_table_html(all_iter_df, "Balanced vs Directional - All Iterations", max_rows=25)
-        html_body = (
-            '<html><body style="margin:0;padding:20px;background:#030712;color:#e5e7eb;font-family:Arial,sans-serif;">'
-            '<div style="max-width:1600px;margin:0 auto;">'
-            '<h2 style="margin:0 0 12px 0;color:#facc15;">Intraday Vol Iteration Alert - Exceedance Tables</h2>'
-            f'<div style="margin-bottom:18px;color:#cbd5e1;font-size:14px;">Scan completed at {scan_time}</div>'
-            f'<div style="margin-bottom:24px;padding:14px;border:1px solid #374151;background:#111827;border-radius:10px;">{combo_html}</div>'
-            f'<div style="margin-bottom:24px;padding:14px;border:1px solid #374151;background:#111827;border-radius:10px;">{all_html}</div>'
-            '<div style="margin-top:18px;color:#94a3b8;font-size:12px;">Generated by FO_FNO_FYERS_VOL_REL_EMAIL.py</div>'
-            '</div></body></html>'
-        )
-
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"Intraday Vol Iteration Alert - Exceedance Tables - {scan_time}"
-        msg["From"] = sender_email
-        msg["To"] = recipient_email
-        msg.attach(MIMEText(html_body, "html", _charset="utf-8"))
-
-        for fname in [csv_filename, detail_csv_filename]:
-            if not fname or not os.path.exists(fname):
-                continue
-            with open(fname, "rb") as f:
-                part = MIMEBase("application", "octet-stream")
-                part.set_payload(f.read())
-                encoders.encode_base64(part)
-                part.add_header("Content-Disposition", f'attachment; filename="{os.path.basename(fname)}"')
-                msg.attach(part)
-
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.starttls()
-            server.login(sender_email, sender_password)
-            server.sendmail(sender_email, recipient_email, msg.as_string())
-
-        logger.info("Second exceedance email sent successfully.")
-        return True
-    except Exception as e:
-        logger.error(f"SECOND EMAIL Error: {e}")
-        return False
-
-
-def main():
-    init_fyers()
-    if not fyers:
-        logger.error("Fyers not initialized. Exiting.")
-        return
-
-    summary_df, detail_df = scan_fno_universe()
-    if summary_df.empty:
-        logger.warning("No summary data produced.")
-        return
-
-    summary_df = derive_rank_columns(summary_df)
-    summary_df = add_signal_columns(summary_df)
-
-    long_df, short_df = build_candidate_tables(summary_df)
-    history_df = load_iteration_history(detail_df)
-    all_iter_exceed_df, combo_exceed_df = build_exceedance_tables(detail_df)
-
-    summary_csv, detail_csv = save_outputs(summary_df, detail_df, prefix="fno")
-
-    sent = send_email_with_tables(
-        long_df=long_df,
-        short_df=short_df,
-        history_df=history_df,
-        csv_filename=summary_csv,
-        detail_csv_filename=detail_csv
-    )
-
-    sent_second = send_second_email_with_exceedance_tables(
-        all_iter_df=all_iter_exceed_df,
-        combo_df=combo_exceed_df,
-        csv_filename=summary_csv,
-        detail_csv_filename=detail_csv
-    )
-
-    if sent and sent_second:
-        logger.info("Scan and both emails completed.")
-    elif sent:
-        logger.warning("Scan completed, first email sent, second email failed.")
-    else:
-        logger.warning("Scan completed but email failed.")
-
-
-if __name__ == "__main__":
-    main()
