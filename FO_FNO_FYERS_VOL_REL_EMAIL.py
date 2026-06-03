@@ -648,7 +648,10 @@ def compute_iteration_volume_profile(
     curr_df["cum_vol"] = curr_df["volume"].cumsum()
 
     if prev_close is not None and prev_close != 0:
-        curr_df["Iteration Change"] = ((pd.to_numeric(curr_df["close"], errors="coerce") - float(prev_close)) / float(prev_close) * 100.0)
+        curr_df["Iteration Change"] = (
+            (pd.to_numeric(curr_df["close"], errors="coerce") - float(prev_close))
+            / float(prev_close) * 100.0
+        )
     else:
         curr_df["Iteration Change"] = 0.0
 
@@ -810,7 +813,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
         if not iter_detail.empty:
             iter_detail.insert(0, "Symbol", sym)
-            iter_detail.insert(1, "% Change", pct_change)
+            iter_detail.insert(1, "Daily Change", pct_change)
             iteration_rows.append(iter_detail)
 
         rows.append({
