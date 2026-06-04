@@ -1383,11 +1383,7 @@ def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.D
 
 def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25) -> str:
     if df is None or df.empty:
-        return (
-            f'<h3 style="color:#f9fafb;margin:14px 0 8px 0">{title}</h3>'
-            '<div style="padding:12px;border:1px solid #374151;background:#111827;'
-            'color:#d1d5db;border-radius:8px;">No data found.</div>'
-        )
+        return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0">{title}</h3><div style="padding:12px;border:1px solid #374151;background:#111827;color:#d1d5db;border-radius:8px;">No data found.</div>'
 
     view = df.head(max_rows).copy()
     cols = list(view.columns)
@@ -1404,11 +1400,7 @@ def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25
         return str(val)
 
     def cell_style(col, val):
-        base = (
-            "padding:6px 8px;border:1px solid #4b5563;"
-            "color:#e5e7eb;white-space:nowrap;"
-        )
-
+        base = "padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;white-space:nowrap;"
         if col == "Status":
             label = str(val).strip()
             if label == "Fresh Move":
@@ -1416,21 +1408,16 @@ def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25
             if label == "Continued Accumulation":
                 return base + "background:#14532d;color:#dcfce7;font-weight:700;"
             return base
-
         if col == "Gap":
             try:
-                num = float(val)
-                if num > 0:
+                if float(val) > 0:
                     return base + "background:#3f6212;color:#ecfccb;font-weight:700;"
             except Exception:
                 pass
-            return base
-
         return base
 
     header = "".join(
-        f'<th style="padding:8px;border:1px solid #4b5563;'
-        f'background:#111827;color:#f9fafb;white-space:nowrap">{c}</th>'
+        f'<th style="padding:8px;border:1px solid #4b5563;background:#111827;color:#f9fafb;white-space:nowrap">{c}</th>'
         for c in cols
     )
 
@@ -1449,8 +1436,7 @@ def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25
         f"<thead><tr>{header}</tr></thead>"
         f'<tbody>{"".join(body)}</tbody>'
         "</table></div>"
-                            )
-
+    )
 
 def send_second_email_with_exceedance_tables(all_iter_df: pd.DataFrame, combo_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
     try:
