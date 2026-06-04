@@ -1309,10 +1309,10 @@ def save_outputs(summary_df: pd.DataFrame, detail_df: pd.DataFrame, prefix: str 
 
 
 def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    cols_all = ["Symbol", "Count", "Gap", "First Occurrence", "Latest Iteration"]
-    cols_combo = cols_all + ["Count (Last 15)", "Gap (Last 15)", "First Occurrence (Last 15)", "Latest Iteration (Last 15)"]
+    cols_all = ["Symbol", "Count", "Gap", "First Occurrence", "Latest Iteration", "Status"]
+    cols_15 = cols_all.copy()
     if detail_df is None or detail_df.empty:
-        return pd.DataFrame(columns=cols_all), pd.DataFrame(columns=cols_combo)
+        return pd.DataFrame(columns=cols_all), pd.DataFrame(columns=cols_15)
 
     df = detail_df.copy()
     for col in ["Iteration No", "CumsumPlus"]:
@@ -1321,65 +1321,53 @@ def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.D
 
     required = {"Symbol", "Iteration No", "CumsumPlus"}
     if not required.issubset(set(df.columns)):
-        return pd.DataFrame(columns=cols_all), pd.DataFrame(columns=cols_combo)
+        return pd.DataFrame(columns=cols_all), pd.DataFrame(columns=cols_15)
 
-    def summarize_runs(g: pd.DataFrame) -> Tuple[int, float, float, float]:
+    def summarize_window(g: pd.DataFrame) -> dict:
         if g is None or g.empty:
-            return 0, 0.0, np.nan, np.nan
+            return {"Count": 0, "Gap": 0.0, "First Occurrence": np.nan, "Latest Iteration": np.nan, "Status": ""}
 
         g = g.sort_values("Iteration No").copy()
         g["CumsumPlus Diff"] = g["CumsumPlus"].diff()
-        cond = (g["CumsumPlus Diff"] > 0) & g["CumsumPlus Diff"].notna()
+        g["pos"] = g["CumsumPlus Diff"].gt(0)
+        if len(g) < 2 or not g["pos"].any():
+            return {"Count": 0, "Gap": 0.0, "First Occurrence": np.nan, "Latest Iteration": np.nan, "Status": ""}
 
-        if not cond.any():
-            return 0, 0.0, np.nan, np.nan
+        g["run_id"] = g["pos"].ne(g["pos"].shift(fill_value=False)).cumsum()
+        latest_run = g.loc[g["pos"]].groupby("run_id", sort=False).tail(1)
+        if latest_run.empty:
+            return {"Count": 0, "Gap": 0.0, "First Occurrence": np.nan, "Latest Iteration": np.nan, "Status": ""}
 
-        run_id = (cond != cond.shift(fill_value=False)).cumsum()
-        runs = []
-        for _, rg in g[cond].groupby(run_id[cond]):
-            runs.append({
-                "Count": int(len(rg)),
-                "Gap": float(rg["CumsumPlus Diff"].sum()),
-                "First Occurrence": int(rg["Iteration No"].iloc[0]),
-                "Latest Iteration": int(rg["Iteration No"].iloc[-1]),
-            })
+        rid = int(latest_run["run_id"].iloc[-1])
+        run = g[(g["run_id"] == rid) & (g["pos"])].copy()
+        if run.empty:
+            return {"Count": 0, "Gap": 0.0, "First Occurrence": np.nan, "Latest Iteration": np.nan, "Status": ""}
 
-        if not runs:
-            return 0, 0.0, np.nan, np.nan
+        count = int(len(run))
+        gap = float(run["CumsumPlus Diff"].sum())
+        first_i = int(run["Iteration No"].iloc[0])
+        last_i = int(run["Iteration No"].iloc[-1])
+        status = "Fresh Move" if count == 1 else "Continued Accumulation"
+        return {"Count": count, "Gap": gap, "First Occurrence": first_i, "Latest Iteration": last_i, "Status": status}
 
-        best = sorted(runs, key=lambda x: (x["Count"], x["Gap"], x["Latest Iteration"]), reverse=True)[0]
-        return best["Count"], best["Gap"], best["First Occurrence"], best["Latest Iteration"]
-
-    rows = []
+    rows_all = []
+    rows_15 = []
     for sym, g in df.groupby("Symbol", sort=False):
-        count_all, gap_all, first_all, latest_all = summarize_runs(g)
-        count_15, gap_15, first_15, latest_15 = summarize_runs(g.sort_values("Iteration No").tail(15).copy())
+        full = summarize_window(g)
+        last15 = summarize_window(g.sort_values("Iteration No").tail(15).copy())
+        if full["Count"] >= 1:
+            rows_all.append({"Symbol": sym, **full})
+        if last15["Count"] >= 1:
+            rows_15.append({"Symbol": sym, **last15})
 
-        rows.append({
-            "Symbol": sym,
-            "Count": count_all,
-            "Gap": gap_all,
-            "First Occurrence": first_all,
-            "Latest Iteration": latest_all,
-            "Count (Last 15)": count_15,
-            "Gap (Last 15)": gap_15,
-            "First Occurrence (Last 15)": first_15,
-            "Latest Iteration (Last 15)": latest_15,
-        })
-
-    out = pd.DataFrame(rows)
+    out = pd.DataFrame(rows_all)
+    out15 = pd.DataFrame(rows_15)
     if out.empty:
-        return pd.DataFrame(columns=cols_all), pd.DataFrame(columns=cols_combo)
+        return pd.DataFrame(columns=cols_all), pd.DataFrame(columns=cols_15)
 
-    out = out[out["Count"] >= 2].copy()
     out = out.sort_values(["Count", "Gap"], ascending=[False, False], na_position="last").reset_index(drop=True)
-
-    last15_df = pd.DataFrame(rows)
-    last15_df = last15_df[last15_df["Count (Last 15)"] >= 2].copy()
-    last15_df = last15_df[["Symbol", "Count (Last 15)", "Gap (Last 15)", "First Occurrence (Last 15)", "Latest Iteration (Last 15)"]]
-    last15_df.columns = ["Symbol", "Count", "Gap", "First Occurrence", "Latest Iteration"]
-    last15_df = last15_df.sort_values(["Count", "Gap"], ascending=[False, False], na_position="last").reset_index(drop=True)
-    return out[cols_all].copy(), last15_df
+    out15 = out15.sort_values(["Count", "Gap"], ascending=[False, False], na_position="last").reset_index(drop=True)
+    return out[cols_all].copy(), out15[cols_15].copy()
 
 
 def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25) -> str:
