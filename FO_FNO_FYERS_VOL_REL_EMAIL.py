@@ -1381,10 +1381,13 @@ def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.D
     last15_df = last15_df.sort_values(["Count", "Gap"], ascending=[False, False], na_position="last").reset_index(drop=True)
     return out[cols_all].copy(), last15_df
 
-
 def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25) -> str:
     if df is None or df.empty:
-        return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0">{title}</h3><div style="padding:12px;border:1px solid #374151;background:#111827;color:#d1d5db;border-radius:8px;">No data found.</div>'
+        return (
+            f'<h3 style="color:#f9fafb;margin:14px 0 8px 0">{title}</h3>'
+            '<div style="padding:12px;border:1px solid #374151;background:#111827;'
+            'color:#d1d5db;border-radius:8px;">No data found.</div>'
+        )
 
     view = df.head(max_rows).copy()
     cols = list(view.columns)
@@ -1392,21 +1395,61 @@ def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25
     def fmt(col, val):
         if pd.isna(val):
             return ""
-        if col == "Symbol":
+        if col in {"Symbol", "Status"}:
             return str(val)
         if "Gap" in col:
             return f"{float(val):.2f}"
-        if col in {"Count", "First Occurrence", "Latest Iteration"} and pd.notna(val):
+        if col in {"Count", "First Occurrence", "Latest Iteration"}:
             return str(int(float(val)))
         return str(val)
 
-    header = ''.join([f'<th style="padding:8px;border:1px solid #4b5563;background:#111827;color:#f9fafb;white-space:nowrap">{c}</th>' for c in cols])
+    def cell_style(col, val):
+        base = (
+            "padding:6px 8px;border:1px solid #4b5563;"
+            "color:#e5e7eb;white-space:nowrap;"
+        )
+
+        if col == "Status":
+            label = str(val).strip()
+            if label == "Fresh Move":
+                return base + "background:#1d4ed8;color:#dbeafe;font-weight:700;"
+            if label == "Continued Accumulation":
+                return base + "background:#14532d;color:#dcfce7;font-weight:700;"
+            return base
+
+        if col == "Gap":
+            try:
+                num = float(val)
+                if num > 0:
+                    return base + "background:#3f6212;color:#ecfccb;font-weight:700;"
+            except Exception:
+                pass
+            return base
+
+        return base
+
+    header = "".join(
+        f'<th style="padding:8px;border:1px solid #4b5563;'
+        f'background:#111827;color:#f9fafb;white-space:nowrap">{c}</th>'
+        for c in cols
+    )
+
     body = []
     for _, row in view.iterrows():
-        cells = ''.join([f'<td style="padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;white-space:nowrap">{fmt(c, row[c])}</td>' for c in cols])
-        body.append(f'<tr>{cells}</tr>')
+        cells = "".join(
+            f'<td style="{cell_style(c, row[c])}">{fmt(c, row[c])}</td>'
+            for c in cols
+        )
+        body.append(f"<tr>{cells}</tr>")
 
-    return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0">{title}</h3><div style="overflow-x:auto"><table style="border-collapse:collapse;width:100%;background:#030712"><thead><tr>{header}</tr></thead><tbody>{"".join(body)}</tbody></table></div>'
+    return (
+        f'<h3 style="color:#f9fafb;margin:14px 0 8px 0">{title}</h3>'
+        '<div style="overflow-x:auto">'
+        '<table style="border-collapse:collapse;width:100%;background:#030712">'
+        f"<thead><tr>{header}</tr></thead>"
+        f'<tbody>{"".join(body)}</tbody>'
+        "</table></div>"
+                            )
 
 
 def send_second_email_with_exceedance_tables(all_iter_df: pd.DataFrame, combo_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
