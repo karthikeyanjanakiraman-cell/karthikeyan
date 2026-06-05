@@ -1562,13 +1562,12 @@ def build_occurrence_table(
         .reset_index(drop=True)
     )
     return out
-    
-    
+
 def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     last10_df = build_occurrence_table(detail_df, last_n_iterations=10, top_n=10)
     all_df = build_occurrence_table(detail_df, last_n_iterations=None, top_n=10)
     return last10_df, all_df
-
+    
 
 def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 10) -> str:
     if df is None or df.empty:
