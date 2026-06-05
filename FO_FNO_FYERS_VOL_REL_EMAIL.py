@@ -1505,7 +1505,7 @@ def build_occurrence_table(
     detail_df: pd.DataFrame,
     last_n_iterations: Optional[int] = None,
     top_n: int = 10,
-    eps: float = 1e-9,
+    eps: float = 1e-4,
 ) -> pd.DataFrame:
     cols = [
         "Symbol",
@@ -1525,13 +1525,15 @@ def build_occurrence_table(
     if not required.issubset(detail_df.columns):
         return empty
 
-    df = detail_df.copy().sort_values(["Symbol", "Iteration No"]).reset_index(drop=True)
+    df = detail_df.copy()
+    df["Iteration No"] = pd.to_numeric(df["Iteration No"], errors="coerce")
     df["CumsumDiff"] = pd.to_numeric(df["CumsumDiff"], errors="coerce").fillna(0.0)
     df["TurningDiff"] = pd.to_numeric(df["TurningDiff"], errors="coerce").fillna(0.0)
+    df = df.dropna(subset=["Iteration No"]).sort_values(["Symbol", "Iteration No"]).reset_index(drop=True)
 
     if last_n_iterations is not None:
-        last_iters = sorted(df["Iteration No"].dropna().astype(int).unique())[-last_n_iterations:]
-        df = df[df["Iteration No"].isin(last_iters)].copy()
+        last_iters = sorted(df["Iteration No"].astype(int).unique())[-last_n_iterations:]
+        df = df[df["Iteration No"].astype(int).isin(last_iters)].copy()
 
     if df.empty:
         return empty
@@ -1540,18 +1542,33 @@ def build_occurrence_table(
 
     for sym, g in df.groupby("Symbol", sort=False):
         g = g.sort_values("Iteration No").reset_index(drop=True)
-        qualifies = (g["CumsumDiff"].abs() > eps) | (g["TurningDiff"].abs() > eps)
 
-        if not bool(qualifies.iloc[-1]):
+        qualifies = (
+            (g["CumsumDiff"] > eps) |
+            (g["TurningDiff"].abs() > eps)
+        )
+
+        if len(g) == 0 or not bool(qualifies.iloc[-1]):
             continue
 
         idx = len(g) - 1
-        keep_idx = [idx]
-        while idx - 1 >= 0 and bool(qualifies.iloc[idx - 1]):
-            keep_idx.append(idx - 1)
-            idx -= 1
+        chain_rows = [idx]
 
-        chain = g.iloc[sorted(keep_idx)].copy()
+        while idx - 1 >= 0:
+            prev_idx = idx - 1
+            if not bool(qualifies.iloc[prev_idx]):
+                break
+
+            curr_iter = int(g.iloc[idx]["Iteration No"])
+            prev_iter = int(g.iloc[prev_idx]["Iteration No"])
+
+            if prev_iter != curr_iter - 1:
+                break
+
+            chain_rows.append(prev_idx)
+            idx = prev_idx
+
+        chain = g.iloc[sorted(chain_rows)].copy()
         latest = chain.iloc[-1]
 
         latest_cumsum = float(latest["CumsumDiff"])
@@ -1574,10 +1591,11 @@ def build_occurrence_table(
         return empty
 
     out["_current_sort"] = pd.to_datetime(out["Current Iteration"], format="%H:%M", errors="coerce")
+
     out = (
         out.sort_values(
-            ["_current_sort", "Count", "CumsumPlusDiff", "TurningDiff"],
-            ascending=[False, False, False, True],
+            ["Count", "_current_sort", "CumsumPlusDiff"],
+            ascending=[False, False, False],
             na_position="last",
         )
         .drop(columns=["_current_sort"])
