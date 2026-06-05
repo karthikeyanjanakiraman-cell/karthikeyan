@@ -907,7 +907,6 @@ def compute_iteration_volume_profile(
     summary.update(signals)
     return summary, detail_df
 
-
 def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
     symbols = load_fno_symbols_from_sectors("sectors")
     if not symbols:
@@ -1141,7 +1140,7 @@ def format_value(col: str, val):
     if col == "IVP":
         return f"{float(val):.2f}"
     if isinstance(val, (int, float, np.integer, np.floating)):
-        return f"{float(val):.2f}"
+        return f"{float(val):.4f}"
     return str(val)
 
 
@@ -1186,7 +1185,9 @@ def build_occurrence_table(
     top_n: int = 10,
     eps: float = 1e-4,
 ) -> pd.DataFrame:
-    # THIS is the fully restored function with backward tracking and exact requested columns.
+    # -------------------------------------------------------------
+    # FIXED: True Backwards Tracking + Zero Energy / Trap Filtering
+    # -------------------------------------------------------------
     cols = [
         "Symbol",
         "Count",
@@ -1201,7 +1202,7 @@ def build_occurrence_table(
     if detail_df is None or detail_df.empty:
         return empty
 
-    required = {"Symbol", "Iteration No", "Iteration Time", "CumsumPlus", "Turning"}
+    required = {"Symbol", "Iteration No", "Iteration Time", "CumsumDiff", "TurningDiff", "Dual Engine State"}
     if not required.issubset(detail_df.columns):
         return empty
 
@@ -1216,67 +1217,61 @@ def build_occurrence_table(
     if df.empty:
         return empty
 
+    # Only trace backward for things that are CURRENTLY alive or holding.
+    valid_states = {"PRISTINE_BREAKOUT", "ACTIVE_CONTINUATION", "HEALTHY_PAUSE"}
+
     rows = []
     for sym, g in df.groupby("Symbol", sort=False):
         g = g.sort_values("Iteration No").reset_index(drop=True)
         if g.empty:
             continue
 
-        if "CumsumDiff" not in g.columns:
-            g["CumsumDiff"] = g["CumsumPlus"].diff().fillna(0.0)
-        if "TurningDiff" not in g.columns:
-            g["TurningDiff"] = g["Turning"].diff().fillna(0.0)
-
-        # Zero-Lag backward tracking condition: 
-        # A streak qualifies if the asset is actively accumulating (CumsumDiff > 0) 
-        # OR it is pausing (CumsumDiff == 0) but friction is NOT expanding.
-        g["Friction_Expanding"] = (g["TurningDiff"] > eps)
-        qualifies = (g["CumsumDiff"] > eps) | ((g["CumsumDiff"].abs() <= eps) & ~g["Friction_Expanding"])
-        
         last_idx = len(g) - 1
-        
-        # Only process if the CURRENT bar qualifies for an active streak
-        if not bool(qualifies.iloc[last_idx]):
+        curr_state = str(g["Dual Engine State"].iloc[last_idx]).strip()
+
+        # FILTER 1: Do not report dead/fakeout stocks as active streaks.
+        if curr_state not in valid_states:
             continue
 
-        # Tracking consecutive valid iterations backwards
-        chain_idx = [last_idx]
+        chain_idx = []
         idx = last_idx
-        while idx - 1 >= 0:
-            prev_idx = idx - 1
-            prev_iter = int(g.iloc[prev_idx]["Iteration No"])
-            curr_iter = int(g.iloc[idx]["Iteration No"])
+
+        # Backwards iteration
+        while idx >= 0:
+            state = str(g["Dual Engine State"].iloc[idx]).strip()
             
-            if prev_iter != curr_iter - 1:
-                break  # Skipped iteration, break chain
+            if state not in valid_states:
+                break  # The streak was broken here! Stop tracing back.
+
+            chain_idx.append(idx)
             
-            if not bool(qualifies.iloc[prev_idx]):
-                break  # The backward bar did not qualify, break chain
+            # FILTER 2: Inception Stop. 
+            # If we hit the pure inception point, the trend originated here. Do not trace past Bar 0.
+            if state == "PRISTINE_BREAKOUT":
+                break
                 
-            chain_idx.append(prev_idx)
-            idx = prev_idx
+            idx -= 1
+
+        if not chain_idx:
+            continue
 
         chain = g.iloc[sorted(chain_idx)].copy()
         
-        latest = chain.iloc[-1]
-        latest_cumsum = float(latest["CumsumDiff"])
-        latest_turning = float(latest["TurningDiff"])
-        
-        # Need prior Cumsum for determining if it's PRISTINE_BREAKOUT or ACTIVE_CONTINUATION
-        prior_cumsum = float(chain.iloc[-2]["CumsumDiff"]) if len(chain) > 1 else 0.0
-        status = classify_diff_status(latest_cumsum, latest_turning, prior_cumsum, eps=eps)
+        # FILTER 3: Dead Zero-Energy Tracker.
+        # If the highest accumulation step in this whole sequence is 0.00, it's NOT a trend. It's a dead stock.
+        if chain["CumsumDiff"].max() <= eps:
+            continue
 
-        rows.append(
-            {
-                "Symbol": sym,
-                "Count": int(len(chain)),
-                "CumsumPlusDiff": latest_cumsum,
-                "TurningDiff": latest_turning,
-                "First Occurrence": str(chain["Iteration Time"].iloc[0]),
-                "Current Iteration": str(chain["Iteration Time"].iloc[-1]),
-                "Status": status,
-            }
-        )
+        latest = chain.iloc[-1]
+        rows.append({
+            "Symbol": sym,
+            "Count": int(len(chain)),
+            "CumsumPlusDiff": float(latest["CumsumDiff"]),
+            "TurningDiff": float(latest["TurningDiff"]),
+            "First Occurrence": str(chain["Iteration Time"].iloc[0]),
+            "Current Iteration": str(chain["Iteration Time"].iloc[-1]),
+            "Status": curr_state,
+        })
 
     out = pd.DataFrame(rows, columns=cols)
     if out.empty:
@@ -1284,7 +1279,7 @@ def build_occurrence_table(
 
     out["_curr_iter_sort"] = pd.to_datetime(out["Current Iteration"], format="%H:%M", errors="coerce")
     
-    # Sort strictly by the length of the backward consecutive streak and then velocity
+    # Prioritize length of the streak, then recentness, then current momentum velocity.
     out = out.sort_values(
         ["Count", "_curr_iter_sort", "CumsumPlusDiff"],
         ascending=[False, False, False],
@@ -1295,11 +1290,10 @@ def build_occurrence_table(
 
 
 def build_exceedance_tables(detail_df: pd.DataFrame):
-    # This safely returns your dual occurrence tables WITHOUT calling the problematic velocity function
-    return (
-        build_occurrence_table(detail_df, last_n_iterations=10, top_n=10),
-        build_occurrence_table(detail_df, last_n_iterations=None, top_n=10),
-    )
+    # Fixed explicitly to use the correct backward occurrence table.
+    recent_10_df = build_occurrence_table(detail_df, last_n_iterations=10, top_n=15)
+    all_time_df = build_occurrence_table(detail_df, last_n_iterations=None, top_n=15)
+    return recent_10_df, all_time_df
 
 
 def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
@@ -1647,18 +1641,18 @@ def save_outputs(summary_df: pd.DataFrame, detail_df: pd.DataFrame, prefix: str 
     return summary_csv, detail_csv
 
 
-def send_second_email_with_exceedance_tables(all_iter_df: pd.DataFrame, combo_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
+def send_second_email_with_exceedance_tables(recent_10_df: pd.DataFrame, all_time_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
     try:
         scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
         # Uses the restored columns and format specifically!
-        combo_html = build_exceedance_table_html(combo_df, "Consecutive Streak Active Breakouts - Last 10 Iters", max_rows=25)
-        all_html = build_exceedance_table_html(all_iter_df, "Consecutive Streak Active Breakouts - All Time", max_rows=25)
+        combo_html = build_exceedance_table_html(recent_10_df, "Active Trend Matrix - Last 10 Iterations", max_rows=25)
+        all_html = build_exceedance_table_html(all_time_df, "Active Trend Matrix - All Time", max_rows=25)
         
         html_body = (
             '<html><body style="margin:0;padding:20px;background:#030712;color:#e5e7eb;font-family:Arial,sans-serif;">'
             '<div style="max-width:1600px;margin:0 auto;">'
-            '<h2 style="margin:0 0 12px 0;color:#facc15;">Intraday Vol Iteration Alert - Occurrence Tables</h2>'
+            '<h2 style="margin:0 0 12px 0;color:#facc15;">Intraday Vol Iteration Alert - Trend Matrices</h2>'
             f'<div style="margin-bottom:18px;color:#cbd5e1;font-size:14px;">Scan completed at {scan_time}</div>'
             f'<div style="margin-bottom:24px;padding:14px;border:1px solid #374151;background:#111827;border-radius:10px;">{combo_html}</div>'
             f'<div style="margin-bottom:24px;padding:14px;border:1px solid #374151;background:#111827;border-radius:10px;">{all_html}</div>'
@@ -1667,7 +1661,7 @@ def send_second_email_with_exceedance_tables(all_iter_df: pd.DataFrame, combo_df
         )
 
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"Intraday Vol Iteration Alert - Occurrence Tables - {scan_time}"
+        msg["Subject"] = f"Intraday Vol Iteration Alert - Trend Matrices - {scan_time}"
         msg["From"] = sender_email
         msg["To"] = recipient_email
         msg.attach(MIMEText(html_body, "html", _charset="utf-8"))
@@ -1714,8 +1708,7 @@ def main():
     long_df, short_df = build_candidate_tables(summary_df)
     history_df = load_iteration_history(detail_df)
     
-    # Cleanly calling the RESTORED occurrence function which builds exactly your required matrix
-    all_iter_exceed_df, combo_exceed_df = build_exceedance_tables(detail_df)
+    recent_10_exceed_df, all_time_exceed_df = build_exceedance_tables(detail_df)
 
     summary_csv, detail_csv = save_outputs(summary_df, detail_df, prefix="fno")
 
@@ -1728,8 +1721,8 @@ def main():
     )
 
     sent_second = send_second_email_with_exceedance_tables(
-        all_iter_df=all_iter_exceed_df,
-        combo_df=combo_exceed_df,
+        recent_10_df=recent_10_exceed_df,
+        all_time_df=all_time_exceed_df,
         csv_filename=summary_csv,
         detail_csv_filename=detail_csv
     )
