@@ -4,8 +4,6 @@ FO_FNO_FYERS_VOL_REL_EMAIL.py
 
 Intraday F&O scanner via Fyers API with email alerts.
 Complete standalone file - no external email.py dependency.
-SORTS CANDIDATES BY DIRECTIONAL COLUMN.
-ALL STATISTICAL SCORES ARE RAW (ORIGINAL FORMULAS).
 
 Dual-Engine Matrix integrated:
 1. PRISTINE_BREAKOUT -> ENTRY
@@ -13,7 +11,7 @@ Dual-Engine Matrix integrated:
 3. CHURNING_FAKEOUT -> BLOCK_ENTRY
 4. TRUE_EXHAUSTION -> EXIT
 
-Email 2 updated:
+Email 2:
 - Table 1: Top 10 symbols from last 10 iterations
 - Table 2: Top 10 symbols from all iterations
 - Columns:
@@ -107,7 +105,7 @@ EMAIL_DISPLAY_COLS = [
 ]
 
 
-def build_signals_from_raw_directional(detail_df) -> dict:
+def build_signals_from_raw_directional(detail_df: pd.DataFrame) -> dict:
     nan = float("nan")
     out = {
         k: nan
@@ -122,7 +120,7 @@ def build_signals_from_raw_directional(detail_df) -> dict:
         )
     }
 
-    if detail_df is None or detail_df.empty:
+    if detail_df is None or detail_df.empty or "Directional" not in detail_df.columns:
         return out
 
     df = detail_df.copy()
@@ -136,9 +134,7 @@ def build_signals_from_raw_directional(detail_df) -> dict:
     last = vals.size - 1
 
     def raw_at(offset: int) -> float:
-        i = last - offset
-        if i < 0:
-            i = 0
+        i = max(last - offset, 0)
         return float(vals[i])
 
     out["5m_Signal"] = round(raw_at(0), 4)
@@ -329,69 +325,13 @@ def load_fno_symbols_from_sectors(root_dir: str = "sectors") -> List[str]:
                 if col is None:
                     continue
                 for s in df[col].dropna().astype(str):
-                    s = s.strip()
+                    s = s.strip().upper()
                     if s:
-                        symbols.add(s.upper())
+                        symbols.add(s)
             except Exception:
                 pass
 
     return sorted(symbols)
-
-
-def load_symbol_to_indices_map(root_dir: str = "sectors") -> Dict[str, List[str]]:
-    mapping: Dict[str, List[str]] = {}
-    search_dirs = [root_dir, "."]
-
-    for base in search_dirs:
-        if not os.path.isdir(base):
-            continue
-        for dirpath, _, filenames in os.walk(base):
-            for fname in filenames:
-                if not fname.lower().endswith(".csv"):
-                    continue
-                path = os.path.join(dirpath, fname)
-                try:
-                    df = pd.read_csv(path)
-                except Exception:
-                    continue
-
-                cols = {str(c).strip().lower(): c for c in df.columns}
-                sym_col = None
-                for key in ["symbol", "symbols", "ticker"]:
-                    if key in cols:
-                        sym_col = cols[key]
-                        break
-
-                idx_col = None
-                for key in [
-                    "belongstoindices",
-                    "belongs_to_indices",
-                    "index name",
-                    "index_name",
-                    "sector",
-                    "indices",
-                ]:
-                    if key in cols:
-                        idx_col = cols[key]
-                        break
-
-                if not sym_col or not idx_col:
-                    continue
-
-                for _, row in df[[sym_col, idx_col]].dropna().iterrows():
-                    sym = str(row[sym_col]).strip().upper()
-                    raw_idx = str(row[idx_col]).strip()
-                    if not sym or not raw_idx:
-                        continue
-                    parts = [p.strip() for p in re.split(r"[|;,/]+", raw_idx) if p.strip()]
-                    if not parts:
-                        parts = [raw_idx]
-                    current = mapping.setdefault(sym, [])
-                    for part in parts:
-                        if part not in current:
-                            current.append(part)
-
-    return mapping
 
 
 def resolve_universe_csv() -> str:
@@ -493,9 +433,7 @@ def compute_iv_proxies(daily_df: Optional[pd.DataFrame]) -> Dict[str, float]:
     if daily_df is None or daily_df.empty or len(daily_df) < 30:
         return {"IVP": np.nan, "Volatility State": "Neutral Vol"}
 
-    df = daily_df.copy().sort_values(
-        "timestamp" if "timestamp" in daily_df.columns else daily_df.columns[0]
-    ).reset_index(drop=True)
+    df = daily_df.copy().sort_values("timestamp").reset_index(drop=True)
 
     close = pd.to_numeric(df["close"], errors="coerce").astype(float)
     high = pd.to_numeric(df["high"], errors="coerce").astype(float)
@@ -535,7 +473,6 @@ def compute_cumulative_directional_metrics(curr_df: pd.DataFrame) -> pd.DataFram
     tr = np.zeros(n)
     plus_dm = np.zeros(n)
     minus_dm = np.zeros(n)
-
     tr[0] = max(h[0] - l[0], 0)
 
     for i in range(1, n):
@@ -764,7 +701,8 @@ def arima_signal_from_series(prices: pd.Series, order: tuple = (1, 1, 1), window
 
     train = p.iloc[-window:] if len(p) > window else p
     try:
-        fc = float(ARIMA(train, order=order).fit().forecast(1).iloc[0])
+        fit = ARIMA(train, order=order).fit()
+        fc = float(fit.forecast(1).iloc[0])
         last = float(train.iloc[-1])
         scale = float(train.diff().std()) or 1e-6
         return round((last - fc) / scale, 4)
@@ -792,12 +730,6 @@ def kalman_signal_from_series(prices: pd.Series, q: float = 1e-3) -> float:
     return round(gap / scale, 4)
 
 
-def _build_iteration_signals_from_rows(rows: List[Dict]) -> Dict[str, float]:
-    if not rows:
-        return build_signals_from_raw_directional(pd.DataFrame())
-    return build_signals_from_raw_directional(pd.DataFrame(rows))
-
-
 def compute_iteration_volume_profile(
     intra_df: Optional[pd.DataFrame],
     prev_close: Optional[float] = None,
@@ -806,12 +738,8 @@ def compute_iteration_volume_profile(
         return {}, pd.DataFrame()
 
     df = intra_df.copy()
-    if "timestamp" in df.columns:
-        df["date"] = pd.to_datetime(df["timestamp"]).dt.date
-        df["time_only"] = pd.to_datetime(df["timestamp"]).dt.time
-    else:
-        df["date"] = pd.to_datetime(df["time"]).dt.date
-        df["time_only"] = pd.to_datetime(df["time"]).dt.time
+    df["date"] = pd.to_datetime(df["timestamp"]).dt.date
+    df["time_only"] = pd.to_datetime(df["timestamp"]).dt.time
 
     dates = sorted(df["date"].unique())
     if len(dates) < 2:
@@ -829,7 +757,7 @@ def compute_iteration_volume_profile(
         return {}, pd.DataFrame()
 
     curr_df.sort_values("time_only", inplace=True)
-    curr_df["cum_vol"] = curr_df["volume"].cumsum()
+    curr_df["cum_vol"] = pd.to_numeric(curr_df["volume"], errors="coerce").fillna(0.0).cumsum()
 
     if prev_close is not None and prev_close != 0:
         curr_df["Iteration Change"] = (
@@ -841,15 +769,7 @@ def compute_iteration_volume_profile(
         curr_df["Iteration Change"] = 0.0
 
     work_df = curr_df.copy()
-    if "time" not in work_df.columns:
-        if "timestamp" in work_df.columns:
-            work_df["time"] = pd.to_datetime(work_df["timestamp"])
-        elif "date" in work_df.columns and "time_only" in work_df.columns:
-            work_df["time"] = pd.to_datetime(
-                work_df["date"].astype(str) + " " + work_df["time_only"].astype(str)
-            )
-        else:
-            work_df["time"] = pd.RangeIndex(start=0, stop=len(work_df), step=1)
+    work_df["time"] = pd.to_datetime(work_df["timestamp"])
 
     metric_df = compute_cumulative_directional_metrics(
         work_df[["time", "open", "high", "low", "close", "volume"]].copy()
@@ -908,21 +828,9 @@ def compute_iteration_volume_profile(
                 "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[i]) if not flow_df.empty else float("nan"),
                 "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[i]) if not flow_df.empty else float("nan"),
                 "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[i]) if not flow_df.empty else float("nan"),
-                "Range_Expansion": (
-                    float(price_lead_df["range_expansion"].iloc[i])
-                    if not price_lead_df.empty and pd.notna(price_lead_df["range_expansion"].iloc[i])
-                    else float("nan")
-                ),
-                "Volume_Expansion": (
-                    float(price_lead_df["volume_expansion"].iloc[i])
-                    if not price_lead_df.empty and pd.notna(price_lead_df["volume_expansion"].iloc[i])
-                    else float("nan")
-                ),
-                "Delta_Expansion": (
-                    float(price_lead_df["delta_expansion"].iloc[i])
-                    if not price_lead_df.empty and pd.notna(price_lead_df["delta_expansion"].iloc[i])
-                    else float("nan")
-                ),
+                "Range_Expansion": float(price_lead_df["range_expansion"].iloc[i]) if not price_lead_df.empty else float("nan"),
+                "Volume_Expansion": float(price_lead_df["volume_expansion"].iloc[i]) if not price_lead_df.empty else float("nan"),
+                "Delta_Expansion": float(price_lead_df["delta_expansion"].iloc[i]) if not price_lead_df.empty else float("nan"),
                 "Price_Leading_Flag": bool(price_lead_df["price_leading_flag"].iloc[i]) if not price_lead_df.empty else False,
                 "Price_Lead_Streak": int(price_lead_df["price_lead_streak"].iloc[i]) if not price_lead_df.empty else 0,
                 "Price_Lead_Status": str(price_lead_df["Price_Lead_Status"].iloc[i]) if not price_lead_df.empty else "NORMAL",
@@ -953,6 +861,7 @@ def compute_iteration_volume_profile(
 
     summary = {
         "LTP": ltp,
+        "% Change": ((ltp - prev_close) / prev_close * 100.0) if (prev_close and prev_close != 0 and pd.notna(ltp)) else 0.0,
         "Directional": final_ps["Directional"],
         "Turning": final_ps["Turning"],
         "Stability": final_ps["Stability"],
@@ -985,8 +894,7 @@ def compute_iteration_volume_profile(
         "Price_Lead_Status": str(price_lead_df["Price_Lead_Status"].iloc[-1]) if not price_lead_df.empty else "NORMAL",
     }
 
-    signals = build_signals_from_raw_directional(detail_df)
-    summary.update(signals)
+    summary.update(build_signals_from_raw_directional(detail_df))
     return summary, detail_df
 
 
@@ -1000,7 +908,8 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
         logger.error("CORE No F&O symbols found.")
         return pd.DataFrame(), pd.DataFrame()
 
-    rows, iteration_rows = [], []
+    rows = []
+    iteration_rows = []
     total = len(symbols)
 
     for idx, sym in enumerate(symbols, start=1):
@@ -1023,8 +932,11 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
         iter_summary, iter_detail = compute_iteration_volume_profile(intra_df, prev_close)
         iv_info = compute_iv_proxies(daily_df)
 
+        if not iter_summary:
+            continue
+
         ltp = iter_summary.get("LTP")
-        pct_change = ((ltp - prev_close) / prev_close * 100) if (
+        pct_change = ((ltp - prev_close) / prev_close * 100.0) if (
             ltp is not None and prev_close and prev_close != 0
         ) else 0.0
 
@@ -1033,52 +945,12 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             iter_detail.insert(1, "% Change", pct_change)
             iteration_rows.append(iter_detail)
 
-        rows.append(
-            {
-                "Symbol": sym,
-                "LTP": ltp,
-                "% Change": pct_change,
-                "Directional": iter_summary.get("Directional"),
-                "Turning": iter_summary.get("Turning"),
-                "Stability": iter_summary.get("Stability"),
-                "Balanced": iter_summary.get("Balanced"),
-                "CumsumPlus": iter_summary.get("CumsumPlus"),
-                "ARIMA Signal": iter_summary.get("ARIMA Signal"),
-                "Kalman Signal": iter_summary.get("Kalman Signal"),
-                "5m_Signal": iter_summary.get("5m_Signal"),
-                "15m_Signal": iter_summary.get("15m_Signal"),
-                "30m_Signal": iter_summary.get("30m_Signal"),
-                "60m_Signal": iter_summary.get("60m_Signal"),
-                "Bull_Signal": iter_summary.get("Bull_Signal"),
-                "Bear_Signal": iter_summary.get("Bear_Signal"),
-                "Overall_Signal": iter_summary.get("Overall_Signal"),
-                "Current Volume": iter_summary.get("Current Volume"),
-                "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"),
-                "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"),
-                "Cumulative RSI": iter_summary.get("Cumulative RSI"),
-                "Cumulative OBV": iter_summary.get("Cumulative OBV"),
-                "Cumulative VWAP": iter_summary.get("Cumulative VWAP"),
-                "VWAP Z-Score": iter_summary.get("VWAP Z-Score"),
-                "Total Iterations": iter_summary.get("Total Iterations"),
-                "Last Iteration Minutes": iter_summary.get("Last Iteration Minutes"),
-                "Last Iteration Time": iter_summary.get("Last Iteration Time"),
-                "Cumulative KER": iter_summary.get("Cumulative KER"),
-                "Cumulative DI": iter_summary.get("Cumulative DI"),
-                "Cumulative -DI": iter_summary.get("Cumulative -DI"),
-                "Cumulative ADX": iter_summary.get("Cumulative ADX"),
-                "Survival Score": iter_summary.get("Survival Score"),
-                "SurvivalNum": iter_summary.get("SurvivalNum"),
-                "HOD": iter_summary.get("HOD"),
-                "StrikeDistance": iter_summary.get("StrikeDistance"),
-                "Last5mVolume": iter_summary.get("Last5mVolume"),
-                "Volume1hAvg5m": iter_summary.get("Volume1hAvg5m"),
-                "OBV30mDelta": iter_summary.get("OBV30mDelta"),
-                "RSI30mDelta": iter_summary.get("RSI30mDelta"),
-                "Price_Lead_Status": iter_summary.get("Price_Lead_Status", "NORMAL"),
-                "IVP": iv_info.get("IVP"),
-                "Volatility State": iv_info.get("Volatility State"),
-            }
-        )
+        row = {"Symbol": sym}
+        row.update(iter_summary)
+        row["% Change"] = pct_change
+        row["IVP"] = iv_info.get("IVP")
+        row["Volatility State"] = iv_info.get("Volatility State")
+        rows.append(row)
 
     return (
         pd.DataFrame(rows),
@@ -1171,12 +1043,10 @@ def add_signal_columns(df: pd.DataFrame) -> pd.DataFrame:
         return df
 
     out = df.copy()
-
     if "Trade Action" in out.columns:
         out["Entry Allowed"] = out["Trade Action"].eq("ENTRY")
         out["Hold Allowed"] = out["Trade Action"].eq("HOLD")
         out["Exit Now"] = out["Trade Action"].eq("EXIT")
-
     return out
 
 
@@ -1193,55 +1063,33 @@ def signal_color(label) -> str:
 
     label = str(label).strip()
 
-    if label == "Buyer Zone":
-        return "#33691e"
-    if label == "Neutral Vol":
-        return "#4b5563"
-    if label == "Avoid Buy Premium":
-        return "#7a5c00"
-
-    if label == "LOW":
-        return "#166534"
-    if label == "MID":
-        return "#4b5563"
-    if label == "HIGH":
-        return "#991b1b"
-
-    if label == "PRISTINE_BREAKOUT":
-        return "#15803d"
-    if label == "HEALTHY_PAUSE":
-        return "#0f766e"
-    if label == "CHURNING_FAKEOUT":
-        return "#b45309"
-    if label == "TRUE_EXHAUSTION":
-        return "#b91c1c"
-    if label == "TRANSITION":
-        return "#374151"
-
-    if label == "ENTRY":
-        return "#15803d"
-    if label == "HOLD":
-        return "#0f766e"
-    if label == "BLOCK_ENTRY":
-        return "#b45309"
-    if label == "EXIT":
-        return "#b91c1c"
-    if label == "WAIT":
-        return "#4b5563"
-
-    if label == "STRONG_PRICE_LEAD_FADE":
-        return "#7f1d1d"
-    if label == "PRICE_LEADING_FADE_RISK":
-        return "#b45309"
-    if label == "EARLY_PRICE_LEAD":
-        return "#374151"
-
-    return "#374151"
+    mapping = {
+        "Buyer Zone": "#33691e",
+        "Neutral Vol": "#4b5563",
+        "Avoid Buy Premium": "#7a5c00",
+        "LOW": "#166534",
+        "MID": "#4b5563",
+        "HIGH": "#991b1b",
+        "PRISTINE_BREAKOUT": "#15803d",
+        "HEALTHY_PAUSE": "#0f766e",
+        "CHURNING_FAKEOUT": "#b45309",
+        "TRUE_EXHAUSTION": "#b91c1c",
+        "TRANSITION": "#374151",
+        "ENTRY": "#15803d",
+        "HOLD": "#0f766e",
+        "BLOCK_ENTRY": "#b45309",
+        "EXIT": "#b91c1c",
+        "WAIT": "#4b5563",
+        "STRONG_PRICE_LEAD_FADE": "#7f1d1d",
+        "PRICE_LEADING_FADE_RISK": "#b45309",
+        "EARLY_PRICE_LEAD": "#374151",
+    }
+    return mapping.get(label, "#374151")
 
 
 def text_color_for_bg(bg: str) -> str:
     bg = str(bg).lower()
-    if bg in {
+    darkish = {
         "#4b5563",
         "#374151",
         "#7f1d1d",
@@ -1257,9 +1105,8 @@ def text_color_for_bg(bg: str) -> str:
         "#0f766e",
         "#b45309",
         "#b91c1c",
-    }:
-        return "#f3f4f6"
-    return "#ffffff"
+    }
+    return "#f3f4f6" if bg in darkish else "#ffffff"
 
 
 def format_value(col: str, val):
@@ -1320,18 +1167,20 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
 
         if side == "long":
             df_side = df_side[df_side["Directional"] > 0]
-
             if "Trade Action" in df_side.columns:
                 df_side = df_side[df_side["Trade Action"].isin(["ENTRY", "HOLD", "WAIT"])]
-
-            sort_cols = ["Trade Action Rank", "Directional", "Turning", "CumsumPlus", "CumsumDiff", "TurningDiff", "Stability"]
-            ascending = [True, False, True, False, False, True, False]
-            df_side = df_side.sort_values(sort_cols, ascending=ascending, na_position="last")
+            df_side = df_side.sort_values(
+                ["Trade Action Rank", "Directional", "Turning", "CumsumPlus", "CumsumDiff", "TurningDiff", "Stability"],
+                ascending=[True, False, True, False, False, True, False],
+                na_position="last",
+            )
         else:
             df_side = df_side[df_side["Directional"] < 0]
-            sort_cols = ["Directional", "Turning", "CumsumPlus", "CumsumDiff", "TurningDiff", "Stability"]
-            ascending = [True, True, True, True, False, False]
-            df_side = df_side.sort_values(sort_cols, ascending=ascending, na_position="last")
+            df_side = df_side.sort_values(
+                ["Directional", "Turning", "CumsumPlus", "CumsumDiff", "TurningDiff", "Stability"],
+                ascending=[True, True, True, True, False, False],
+                na_position="last",
+            )
 
         return df_side
 
@@ -1400,8 +1249,7 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
         return out
 
     out = out.sort_values(["Iteration No", "Side"]).reset_index(drop=True)
-    iter_time = out.get("Iteration Time", pd.Series("", index=out.index)).astype(str)
-    out["Iteration"] = out["Iteration No"].astype("Int64").astype(str) + " | " + iter_time
+    out["Iteration"] = out["Iteration No"].astype("Int64").astype(str) + " | " + out["Iteration Time"].astype(str)
     out["First Occurrence"] = out["Iteration"]
     out["Latest"] = out["Iteration"]
     return out
@@ -1436,12 +1284,6 @@ def build_history_table(history_df: pd.DataFrame, side: str) -> str:
         "CumsumPlus",
         "Last Iteration Time",
     ]
-
-    if "First Occurrence" not in df.columns and "Iteration" in df.columns:
-        df["First Occurrence"] = df["Iteration"]
-    if "Latest" not in df.columns and "Iteration" in df.columns:
-        df["Latest"] = df["Iteration"]
-
     cols = [c for c in cols if c in df.columns]
     df = df.tail(15)[cols].copy()
 
@@ -1460,13 +1302,7 @@ def build_history_table(history_df: pd.DataFrame, side: str) -> str:
                     return base + "background:#7f1d1d;color:#fee2e2;font-weight:600;"
             return base
 
-        if col in [
-            "Turning Regime",
-            "Dual Engine State",
-            "Trade Action",
-            "Price_Lead_Status",
-            "Volatility State",
-        ]:
+        if col in ["Turning Regime", "Dual Engine State", "Trade Action", "Price_Lead_Status", "Volatility State"]:
             bg = signal_color(val)
             fg = text_color_for_bg(bg)
             return base + f"background:{bg};color:{fg};font-weight:600;"
@@ -1494,8 +1330,7 @@ def build_history_table(history_df: pd.DataFrame, side: str) -> str:
 
     title_color = "#22c55e" if side.lower() == "long" else "#ef4444"
     return (
-        f'<h3 style="color:{title_color};margin:12px 0 6px 0;">'
-        f'Top 1 {side.title()} - Last 15 Iterations</h3>'
+        f'<h3 style="color:{title_color};margin:12px 0 6px 0;">Top 1 {side.title()} - Last 15 Iterations</h3>'
         f'<div style="overflow-x:auto;">'
         f'<table style="border-collapse:collapse;width:100%;background:#030712;">'
         f"<thead><tr>{header}</tr></thead>"
@@ -1543,13 +1378,7 @@ def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 15) -> str:
                     return base + "background:#7f1d1d;color:#fee2e2;font-weight:600;"
             return base
 
-        if col in [
-            "Volatility State",
-            "Price_Lead_Status",
-            "Turning Regime",
-            "Dual Engine State",
-            "Trade Action",
-        ]:
+        if col in ["Volatility State", "Price_Lead_Status", "Turning Regime", "Dual Engine State", "Trade Action"]:
             bg = signal_color(val)
             fg = text_color_for_bg(bg)
             return base + f"background:{bg};color:{fg};font-weight:600;"
@@ -1671,7 +1500,12 @@ def save_outputs(summary_df: pd.DataFrame, detail_df: pd.DataFrame, prefix: str 
     return summary_csv, detail_csv
 
 
-def _build_occurrence_table(detail_df: pd.DataFrame, last_n_iterations: Optional[int] = None, top_n: int = 10) -> pd.DataFrame:
+def build_occurrence_table(
+    detail_df: pd.DataFrame,
+    last_n_iterations: Optional[int] = None,
+    top_n: int = 10,
+    eps: float = 1e-9,
+) -> pd.DataFrame:
     cols = [
         "Symbol",
         "Count",
@@ -1701,7 +1535,7 @@ def _build_occurrence_table(detail_df: pd.DataFrame, last_n_iterations: Optional
     if df.empty:
         return empty
 
-    active = df[(df["CumsumDiff"].abs() > 0) | (df["TurningDiff"].abs() > 0)].copy()
+    active = df[(df["CumsumDiff"].abs() > eps) | (df["TurningDiff"].abs() > eps)].copy()
     if active.empty:
         return empty
 
@@ -1709,8 +1543,11 @@ def _build_occurrence_table(detail_df: pd.DataFrame, last_n_iterations: Optional
     for sym, g in active.groupby("Symbol", sort=False):
         g = g.sort_values("Iteration No").copy()
 
-        first_time = str(g["Iteration Time"].iloc[0]) if "Iteration Time" in g.columns else ""
-        current_time = str(g["Iteration Time"].iloc[-1]) if "Iteration Time" in g.columns else ""
+        first_time = str(g["Iteration Time"].iloc[0])
+        current_time = str(g["Iteration Time"].iloc[-1])
+
+        agg_cumsum = float(g["CumsumDiff"].sum())
+        agg_turning = float(g["TurningDiff"].sum())
 
         latest_cumsum = float(g["CumsumDiff"].iloc[-1])
         latest_turning = float(g["TurningDiff"].iloc[-1])
@@ -1719,8 +1556,8 @@ def _build_occurrence_table(detail_df: pd.DataFrame, last_n_iterations: Optional
             {
                 "Symbol": sym,
                 "Count": int(len(g)),
-                "CumsumPlusDiff": latest_cumsum,
-                "TurningDiff": latest_turning,
+                "CumsumPlusDiff": agg_cumsum,
+                "TurningDiff": agg_turning,
                 "First Occurrence": first_time,
                 "Current Iteration": current_time,
                 "Status": classify_diff_status(latest_cumsum, latest_turning),
@@ -1742,8 +1579,8 @@ def _build_occurrence_table(detail_df: pd.DataFrame, last_n_iterations: Optional
 
 
 def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    last10_df = _build_occurrence_table(detail_df, last_n_iterations=10, top_n=10)
-    all_df = _build_occurrence_table(detail_df, last_n_iterations=None, top_n=10)
+    last10_df = build_occurrence_table(detail_df, last_n_iterations=10, top_n=10)
+    all_df = build_occurrence_table(detail_df, last_n_iterations=None, top_n=10)
     return last10_df, all_df
 
 
@@ -1763,7 +1600,7 @@ def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 10
             return ""
         if col in ["Symbol", "Status", "First Occurrence", "Current Iteration"]:
             return str(val)
-        if col in ["Count"]:
+        if col == "Count":
             return str(int(float(val)))
         if col in ["CumsumPlusDiff", "TurningDiff"]:
             return f"{float(val):.2f}"
@@ -1789,11 +1626,7 @@ def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 10
             return base + f"background:{bg};color:{fg};font-weight:700;"
 
         if col == "Count":
-            try:
-                if float(val) > 0:
-                    return base + "background:#1f2937;color:#f9fafb;font-weight:700;"
-            except Exception:
-                pass
+            return base + "background:#1f2937;color:#f9fafb;font-weight:700;"
 
         return base
 
@@ -1804,9 +1637,7 @@ def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 10
 
     body = []
     for _, row in view.iterrows():
-        cells = "".join(
-            f'<td style="{cell_style(c, row[c])}">{fmt(c, row[c])}</td>' for c in cols
-        )
+        cells = "".join(f'<td style="{cell_style(c, row[c])}">{fmt(c, row[c])}</td>' for c in cols)
         body.append(f"<tr>{cells}</tr>")
 
     return (
