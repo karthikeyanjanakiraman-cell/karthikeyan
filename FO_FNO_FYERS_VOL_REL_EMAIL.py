@@ -1478,7 +1478,6 @@ def save_outputs(summary_df: pd.DataFrame, detail_df: pd.DataFrame, prefix: str 
 
     return summary_csv, detail_csv
 
-
 def build_occurrence_table(
     detail_df: pd.DataFrame,
     last_n_iterations: Optional[int] = None,
@@ -1507,6 +1506,7 @@ def build_occurrence_table(
     df["CumsumDiff"] = pd.to_numeric(df["CumsumDiff"], errors="coerce").fillna(0.0)
     df["TurningDiff"] = pd.to_numeric(df["TurningDiff"], errors="coerce").fillna(0.0)
 
+    # Slice the window (e.g., Last 10 iterations)
     if last_n_iterations is not None:
         last_iters = sorted(df["Iteration No"].dropna().astype(int).unique())[-last_n_iterations:]
         df = df[df["Iteration No"].isin(last_iters)].copy()
@@ -1514,32 +1514,44 @@ def build_occurrence_table(
     if df.empty:
         return empty
 
-    active = df[(df["CumsumDiff"].abs() > eps) | (df["TurningDiff"].abs() > eps)].copy()
-    if active.empty:
-        return empty
-
     rows = []
-    for sym, g in active.groupby("Symbol", sort=False):
+    # Loop over the UNFILTERED data so we don't lose the true latest iteration
+    for sym, g in df.groupby("Symbol", sort=False):
         g = g.sort_values("Iteration No").copy()
+        
+        # Identify which specific iterations had active movement
+        active_g = g[(g["CumsumDiff"].abs() > eps) | (g["TurningDiff"].abs() > eps)]
+        
+        # If it didn't move at all in this 10-iteration window, skip it
+        if active_g.empty:
+            continue
 
-        first_time = str(g["Iteration Time"].iloc[0])
+        # First occurrence is based on when it actually moved
+        first_time = str(active_g["Iteration Time"].iloc[0])
+        
+        # Current iteration time and status are based on the ABSOLUTE LATEST row
         current_time = str(g["Iteration Time"].iloc[-1])
 
         agg_cumsum = float(g["CumsumDiff"].sum())
         agg_turning = float(g["TurningDiff"].sum())
 
-        latest_cumsum = float(g["CumsumDiff"].iloc[-1])
-        latest_turning = float(g["TurningDiff"].iloc[-1])
+        # Safely get the true Dual Engine Matrix state if available, otherwise recalculate
+        if "Dual Engine State" in g.columns:
+            latest_status = str(g["Dual Engine State"].iloc[-1])
+        else:
+            latest_cumsum = float(g["CumsumDiff"].iloc[-1])
+            latest_turning = float(g["TurningDiff"].iloc[-1])
+            latest_status = classify_diff_status(latest_cumsum, latest_turning)
 
         rows.append(
             {
                 "Symbol": sym,
-                "Count": int(len(g)),
+                "Count": int(len(active_g)),  # Total active pushes in the window
                 "CumsumPlusDiff": agg_cumsum,
                 "TurningDiff": agg_turning,
                 "First Occurrence": first_time,
                 "Current Iteration": current_time,
-                "Status": classify_diff_status(latest_cumsum, latest_turning),
+                "Status": latest_status, # True status on the very last tick
             }
         )
 
@@ -1547,6 +1559,7 @@ def build_occurrence_table(
     if out.empty:
         return empty
 
+    # Sort so the freshest first occurrences and highest counts bubble to the top
     out["_first_occ_sort"] = pd.to_datetime(out["First Occurrence"], format="%H:%M", errors="coerce")
     out = out.sort_values(
         ["_first_occ_sort", "Count", "CumsumPlusDiff", "TurningDiff"],
