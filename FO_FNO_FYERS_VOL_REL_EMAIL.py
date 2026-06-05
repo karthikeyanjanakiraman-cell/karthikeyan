@@ -6,6 +6,7 @@ Intraday F&O scanner via Fyers API with email alerts.
 Complete standalone file - no external email.py dependency.
 SORTS CANDIDATES BY DIRECTIONAL COLUMN.
 ALL STATISTICAL SCORES ARE RAW (ORIGINAL FORMULAS).
+Now powered by Zero-Lag Dual Engine Row-vs-Row State Matrices.
 """
 
 import os
@@ -136,29 +137,29 @@ def build_signals_from_raw_directional(detail_df) -> dict:
     return out
 
 
-
 def classify_diff_status(cumsum_diff: float, turning_diff: float, eps: float = 1e-4) -> str:
+    # Strict 1-to-1 zero lag logic
     c = 0.0 if pd.isna(cumsum_diff) else float(cumsum_diff)
     t = 0.0 if pd.isna(turning_diff) else float(turning_diff)
 
-    if c > eps and t <= eps:
+    friction_expanding = t > eps
+
+    if c > eps and not friction_expanding:
         return "PRISTINE_BREAKOUT"
-    if abs(c) <= eps and t <= eps:
-        return "HEALTHY_PAUSE"
-    if c > eps and t > eps:
-        return "CHURNING_FAKEOUT"
-    if c <= eps and t > eps:
+    if c <= eps and friction_expanding:
         return "TRUE_EXHAUSTION"
+    if c > eps and friction_expanding:
+        return "CHURNING_FAKEOUT"
+    if abs(c) <= eps and not friction_expanding:
+        return "HEALTHY_PAUSE"
     return "TRANSITION"
 
 
 def add_dual_engine_matrix(
     detail_df: pd.DataFrame,
-    turning_lookback: int = 10,
-    low_q: float = 0.35,
-    high_q: float = 0.70,
     eps: float = 1e-4,
 ) -> pd.DataFrame:
+    # Removed all rolling() lookbacks. Fully instantaneous state mapping.
     if detail_df is None or detail_df.empty:
         return pd.DataFrame() if detail_df is None else detail_df.copy()
 
@@ -167,65 +168,57 @@ def add_dual_engine_matrix(
         return detail_df.copy()
 
     out = detail_df.copy()
-    out["Turning"] = pd.to_numeric(out["Turning"], errors="coerce")
-    out["CumsumPlus"] = pd.to_numeric(out["CumsumPlus"], errors="coerce")
+    out["Turning"] = pd.to_numeric(out["Turning"], errors="coerce").fillna(0.0)
+    out["CumsumPlus"] = pd.to_numeric(out["CumsumPlus"], errors="coerce").fillna(0.0)
     out["Iteration No"] = pd.to_numeric(out["Iteration No"], errors="coerce")
     out = out.dropna(subset=["Iteration No"]).sort_values(["Symbol", "Iteration No"]).reset_index(drop=True)
 
     grouped = out.groupby("Symbol", group_keys=False)
-    out["CumsumDiff"] = grouped["CumsumPlus"].diff().fillna(0.0)
-    out["TurningDiff"] = grouped["Turning"].diff().fillna(0.0)
 
-    out["Turning Low Band"] = grouped["Turning"].transform(
-        lambda s: s.rolling(turning_lookback, min_periods=1).quantile(low_q)
-    )
-    out["Turning High Band"] = grouped["Turning"].transform(
-        lambda s: s.rolling(turning_lookback, min_periods=1).quantile(high_q)
-    )
+    # 1. Linear Accumulation (The Gas Pedal)
+    out["Current_Step"] = grouped["CumsumPlus"].diff().fillna(0.0)
+    out["Prior_Step"] = grouped["Current_Step"].shift(1).fillna(0.0)
+    out["CumsumDiff"] = out["Current_Step"]  # Preserved for downstream compatibility
 
-    out["Turning Regime"] = np.select(
-        [
-            out["Turning"] <= out["Turning Low Band"],
-            out["Turning"] >= out["Turning High Band"],
-        ],
-        ["LOW", "HIGH"],
-        default="MID",
-    )
+    # 2. Structural Friction (The Brakes)
+    out["Prior_Turning"] = grouped["Turning"].shift(1).fillna(0.0)
+    out["TurningDiff"] = out["Turning"] - out["Prior_Turning"]
+
+    # The absolute Zero-Lag Friction test: Is rotational resistance expanding right now?
+    out["Friction_Expanding"] = (out["Turning"] > out["Prior_Turning"]) & (out["Turning"] > eps)
+
+    # --- PURE DUAL-ENGINE MATRIX ---
+    cond_pristine = (out["Current_Step"] > eps) & (out["Prior_Step"] <= eps) & (~out["Friction_Expanding"])
+    cond_exhaustion = (out["Current_Step"] <= eps) & out["Friction_Expanding"]
+    cond_trap = (out["Current_Step"] > eps) & out["Friction_Expanding"]
+    cond_pause = (out["Current_Step"].abs() <= eps) & (~out["Friction_Expanding"])
+    cond_active = (out["Current_Step"] > eps) & (out["Prior_Step"] > eps) & (~out["Friction_Expanding"])
 
     out["Dual Engine State"] = np.select(
-        [
-            (out["CumsumDiff"] > eps) & (out["Turning Regime"] == "LOW"),
-            (out["CumsumDiff"].abs() <= eps) & (out["Turning Regime"] == "LOW"),
-            (out["CumsumDiff"] > eps) & (out["Turning Regime"] == "HIGH"),
-            (out["CumsumDiff"] <= eps) & (out["Turning Regime"] == "HIGH"),
-        ],
-        [
-            "PRISTINE_BREAKOUT",
-            "HEALTHY_PAUSE",
-            "CHURNING_FAKEOUT",
-            "TRUE_EXHAUSTION",
-        ],
+        [cond_pristine, cond_exhaustion, cond_trap, cond_pause, cond_active],
+        ["PRISTINE_BREAKOUT", "TRUE_EXHAUSTION", "CHURNING_FAKEOUT", "HEALTHY_PAUSE", "ACTIVE_CONTINUATION"],
         default="TRANSITION",
     )
 
     out["Trade Action"] = np.select(
         [
             out["Dual Engine State"] == "PRISTINE_BREAKOUT",
-            out["Dual Engine State"] == "HEALTHY_PAUSE",
-            out["Dual Engine State"] == "CHURNING_FAKEOUT",
             out["Dual Engine State"] == "TRUE_EXHAUSTION",
+            out["Dual Engine State"] == "CHURNING_FAKEOUT",
+            out["Dual Engine State"] == "HEALTHY_PAUSE",
+            out["Dual Engine State"] == "ACTIVE_CONTINUATION"
         ],
-        ["ENTRY", "HOLD", "BLOCK_ENTRY", "EXIT"],
+        ["ENTRY", "EXIT", "BLOCK_ENTRY", "HOLD", "HOLD"],
         default="WAIT",
     )
 
-    out["Diff Status"] = out.apply(
-        lambda r: classify_diff_status(r.get("CumsumDiff"), r.get("TurningDiff"), eps=eps),
-        axis=1,
-    )
+    out["Turning Regime"] = np.where(out["Friction_Expanding"], "EXPANDING_FRICTION", "LOW_FRICTION")
+
     out["Entry Allowed"] = out["Trade Action"].eq("ENTRY")
     out["Hold Allowed"] = out["Trade Action"].eq("HOLD")
     out["Exit Now"] = out["Trade Action"].eq("EXIT")
+    out["Diff Status"] = out["Dual Engine State"]
+
     return out
 
 
@@ -1089,6 +1082,7 @@ def add_signal_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def signal_color(label) -> str:
+    # Updated to dynamically support the instantaneous Dual Engine states
     try:
         v = float(label)
         if v > 0:
@@ -1104,13 +1098,13 @@ def signal_color(label) -> str:
         "Buyer Zone": "#33691e",
         "Neutral Vol": "#4b5563",
         "Avoid Buy Premium": "#7a5c00",
-        "LOW": "#166534",
-        "MID": "#4b5563",
-        "HIGH": "#991b1b",
+        "LOW_FRICTION": "#166534",
+        "EXPANDING_FRICTION": "#991b1b",
         "PRISTINE_BREAKOUT": "#15803d",
         "HEALTHY_PAUSE": "#0f766e",
         "CHURNING_FAKEOUT": "#b45309",
         "TRUE_EXHAUSTION": "#b91c1c",
+        "ACTIVE_CONTINUATION": "#16a34a",
         "TRANSITION": "#374151",
         "ENTRY": "#15803d",
         "HOLD": "#0f766e",
@@ -1128,7 +1122,8 @@ def text_color_for_bg(bg: str) -> str:
     bg = str(bg).lower()
     if bg in {
         "#4b5563", "#374151", "#7f1d1d", "#a83232",
-        "#b94a48", "#7a5c00", "#33691e", "#2e7d32", "#3f8f45"
+        "#b94a48", "#7a5c00", "#33691e", "#2e7d32", "#3f8f45",
+        "#15803d", "#0f766e", "#b45309", "#b91c1c", "#16a34a", "#991b1b"
     }:
         return "#f3f4f6"
     return "#ffffff"
@@ -1273,10 +1268,79 @@ def build_occurrence_table(
 
 
 def build_exceedance_tables(detail_df: pd.DataFrame):
-    return (
-        build_occurrence_table(detail_df, last_n_iterations=10, top_n=10),
-        build_occurrence_table(detail_df, last_n_iterations=None, top_n=10),
-    )
+    return build_velocity_tables(detail_df)
+
+
+def build_velocity_tables(detail_df: pd.DataFrame):
+    # Completely rewritten to use pure instantaneous velocity, stripped of all rolling lag
+    cols = ["Symbol", "Peak Iteration", "Peak Time", "Inst_Velocity", "Friction_Drag", "VelocityScore", "CumsumPlusDiff", "Stability", "Status"]
+    empty = pd.DataFrame(columns=cols)
+    if detail_df is None or detail_df.empty:
+        return empty, empty
+    if "Symbol" not in detail_df.columns or "Iteration No" not in detail_df.columns:
+        return empty, empty
+
+    rows_all = []
+    rows_last5 = []
+
+    for sym, g in detail_df.groupby("Symbol", sort=False):
+        g = g.copy().sort_values("Iteration No")
+        if "CumsumPlus" not in g.columns or "Stability" not in g.columns or "Turning" not in g.columns:
+            continue
+
+        g["CumsumPlus"] = pd.to_numeric(g["CumsumPlus"], errors="coerce").fillna(0.0)
+        g["Stability"] = pd.to_numeric(g["Stability"], errors="coerce").replace(0, np.nan)
+        g["Turning"] = pd.to_numeric(g["Turning"], errors="coerce").fillna(0.0)
+        
+        g["CumsumPlusDiff"] = g["CumsumPlus"].diff().fillna(0.0)
+        g["TurningDiff"] = g["Turning"].diff().fillna(0.0)
+
+        # Pure Zero-Lag 1-to-1 instantaneous metrics
+        g["Inst_Velocity"] = g["CumsumPlusDiff"] / g["Stability"]
+        g["Friction_Drag"] = g["TurningDiff"] / g["Stability"]
+        
+        # Velocity Score penalizes structural friction strictly and instantly
+        g["VelocityScore"] = g["Inst_Velocity"] - g["Friction_Drag"].clip(lower=0)
+
+        valid = g[g["VelocityScore"].notna()].copy()
+        if valid.empty:
+            continue
+
+        # Find the absolute peak mathematical moment in the session
+        best_idx = valid.sort_values(["VelocityScore", "Iteration No"], ascending=[False, False]).index[0]
+        best_row = valid.loc[best_idx]
+        
+        # Status based on latest row
+        latest_row = valid.iloc[-1]
+        c_diff = float(latest_row["CumsumPlusDiff"])
+        t_diff = float(latest_row["TurningDiff"])
+        status = "Active & Clean" if (c_diff > 0 and t_diff <= 0) else ("Exhausted/Paused" if c_diff <= 0 else "Churning Trap")
+
+        row = {
+            "Symbol": sym,
+            "Peak Iteration": int(best_row["Iteration No"]),
+            "Peak Time": best_row["Iteration Time"] if "Iteration Time" in best_row else "",
+            "Inst_Velocity": float(best_row["Inst_Velocity"]) if pd.notna(best_row["Inst_Velocity"]) else np.nan,
+            "Friction_Drag": float(best_row["Friction_Drag"]) if pd.notna(best_row["Friction_Drag"]) else np.nan,
+            "VelocityScore": float(best_row["VelocityScore"]) if pd.notna(best_row["VelocityScore"]) else np.nan,
+            "CumsumPlusDiff": float(best_row["CumsumPlusDiff"]) if pd.notna(best_row["CumsumPlusDiff"]) else np.nan,
+            "Stability": float(best_row["Stability"]) if pd.notna(best_row["Stability"]) else np.nan,
+            "Status": status,
+        }
+        rows_all.append(row)
+        if len(valid) >= 5:
+            rows_last5.append(row)
+
+    out_all = pd.DataFrame(rows_all, columns=cols)
+    out_last5 = pd.DataFrame(rows_last5, columns=cols)
+
+    if not out_all.empty:
+        out_all = out_all.sort_values(["VelocityScore", "Peak Iteration"], ascending=[False, False]).reset_index(drop=True)
+    if not out_last5.empty:
+        out_last5 = out_last5.sort_values(["VelocityScore", "Peak Iteration"], ascending=[False, False]).reset_index(drop=True)
+
+    return out_all, out_last5
+
 
 def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     if detail_df is None or detail_df.empty:
@@ -1319,6 +1383,7 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     out["First Occurrence"] = out["Iteration No"].astype("Int64").astype(str) + " | " + iter_time
     out["Latest"] = out["Iteration No"].astype("Int64").astype(str) + " | " + iter_time
     return out
+
 
 def build_history_table(history_df: pd.DataFrame, side: str) -> str:
     if history_df is None or history_df.empty:
@@ -1430,7 +1495,7 @@ def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 15) -> str:
                     return base + "background:#7f1d1d;color:#fee2e2;font-weight:600;"
             return base
 
-        if col in ["Volatility State", "Price_Lead_Status"]:
+        if col in ["Volatility State", "Price_Lead_Status", "Dual Engine State", "Trade Action", "Turning Regime"]:
             bg = signal_color(val)
             fg = text_color_for_bg(bg)
             return base + f"background:{bg};color:{fg};font-weight:600;"
@@ -1455,6 +1520,60 @@ def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 15) -> str:
     </div>
     """
 
+
+def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25) -> str:
+    # Updated to apply the correct color styling to the new instantaneous statuses
+    if df is None or df.empty:
+        return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0">{title}</h3><div style="padding:12px;border:1px solid #374151;background:#111827;color:#d1d5db;border-radius:8px;">No data found.</div>'
+
+    view = df.head(max_rows).copy()
+    cols = list(view.columns)
+
+    def fmt(col, val):
+        if pd.isna(val):
+            return ""
+        if col in {"Symbol", "Status"}:
+            return str(val)
+        if "Velocity" in col or "Drag" in col or "Gap" in col:
+            return f"{float(val):.2f}"
+        if col in {"Count", "First Occurrence", "Latest Iteration"}:
+            return str(int(float(val)))
+        return str(val)
+
+    def cell_style(col, val):
+        base = "padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;white-space:nowrap;"
+        if col == "Status":
+            label = str(val).strip()
+            if label == "Active & Clean":
+                return base + "background:#1d4ed8;color:#dbeafe;font-weight:700;"
+            if label == "Exhausted/Paused":
+                return base + "background:#b91c1c;color:#fee2e2;font-weight:700;"
+            if label == "Churning Trap":
+                return base + "background:#b45309;color:#fef3c7;font-weight:700;"
+            return base
+        return base
+
+    header = "".join(
+        f'<th style="padding:8px;border:1px solid #4b5563;background:#111827;color:#f9fafb;white-space:nowrap">{c}</th>'
+        for c in cols
+    )
+
+    body = []
+    for _, row in view.iterrows():
+        cells = "".join(
+            f'<td style="{cell_style(c, row[c])}">{fmt(c, row[c])}</td>'
+            for c in cols
+        )
+        body.append(f"<tr>{cells}</tr>")
+
+    return (
+        f'<h3 style="color:#f9fafb;margin:14px 0 8px 0">{title}</h3>'
+        '<div style="overflow-x:auto">'
+        '<table style="border-collapse:collapse;width:100%;background:#030712">'
+        f"<thead><tr>{header}</tr></thead>"
+        f'<tbody>{"".join(body)}</tbody>'
+        "</table></div>"
+    )
 
 def send_email_with_tables(
     long_df: pd.DataFrame,
@@ -1557,137 +1676,6 @@ def save_outputs(summary_df: pd.DataFrame, detail_df: pd.DataFrame, prefix: str 
 
     return summary_csv, detail_csv
 
-def build_exceedance_tables(detail_df: pd.DataFrame):
-    return build_velocity_tables(detail_df)
-
-
-def build_velocity_tables(detail_df: pd.DataFrame):
-    cols = ["Symbol", "Peak Iteration", "Peak Time", "Velocity3", "Velocity5", "VelocityScore", "CumsumPlusDiff", "Stability", "Status"]
-    empty = pd.DataFrame(columns=cols)
-    if detail_df is None or detail_df.empty:
-        return empty, empty
-    if "Symbol" not in detail_df.columns or "Iteration No" not in detail_df.columns:
-        return empty, empty
-
-    rows_all = []
-    rows_last5 = []
-
-    for sym, g in detail_df.groupby("Symbol", sort=False):
-        g = g.copy().sort_values("Iteration No")
-        if "CumsumPlus" not in g.columns or "Stability" not in g.columns:
-            continue
-
-        g["CumsumPlus"] = pd.to_numeric(g["CumsumPlus"], errors="coerce")
-        g["Stability"] = pd.to_numeric(g["Stability"], errors="coerce").replace(0, np.nan)
-        g["CumsumPlusDiff"] = g["CumsumPlus"].diff().fillna(0.0)
-        g["Velocity3"] = g["CumsumPlusDiff"].rolling(3, min_periods=3).sum() / g["Stability"]
-        g["Velocity5"] = g["CumsumPlusDiff"].rolling(5, min_periods=5).sum() / g["Stability"]
-        g["VelocityScore"] = g[["Velocity3", "Velocity5"]].max(axis=1)
-
-        valid = g[g["VelocityScore"].notna()].copy()
-        if valid.empty:
-            continue
-
-        push = valid["CumsumPlusDiff"] > 0
-        streak = 0
-        streak_map = []
-        prev = False
-        for flag in push.tolist():
-            if flag:
-                streak = streak + 1 if prev else 1
-                prev = True
-            else:
-                streak = 0
-                prev = False
-            streak_map.append(streak)
-        valid["PushStreak"] = streak_map
-
-        best_idx = valid.sort_values(["VelocityScore", "Iteration No"], ascending=[False, False]).index[0]
-        best_row = valid.loc[best_idx]
-        status = "Fresh" if int(best_row.get("PushStreak", 0)) <= 1 else "Accumulated Continuous"
-
-        row = {
-            "Symbol": sym,
-            "Peak Iteration": int(best_row["Iteration No"]),
-            "Peak Time": best_row["Iteration Time"] if "Iteration Time" in best_row else "",
-            "Velocity3": float(best_row["Velocity3"]) if pd.notna(best_row["Velocity3"]) else np.nan,
-            "Velocity5": float(best_row["Velocity5"]) if pd.notna(best_row["Velocity5"]) else np.nan,
-            "VelocityScore": float(best_row["VelocityScore"]) if pd.notna(best_row["VelocityScore"]) else np.nan,
-            "CumsumPlusDiff": float(best_row["CumsumPlusDiff"]) if pd.notna(best_row["CumsumPlusDiff"]) else np.nan,
-            "Stability": float(best_row["Stability"]) if pd.notna(best_row["Stability"]) else np.nan,
-            "Status": status,
-        }
-        rows_all.append(row)
-        if len(valid) >= 5:
-            rows_last5.append(row)
-
-    out_all = pd.DataFrame(rows_all, columns=cols)
-    out_last5 = pd.DataFrame(rows_last5, columns=cols)
-
-    if not out_all.empty:
-        out_all = out_all.sort_values(["VelocityScore", "Peak Iteration"], ascending=[False, False]).reset_index(drop=True)
-    if not out_last5.empty:
-        out_last5 = out_last5.sort_values(["VelocityScore", "Peak Iteration"], ascending=[False, False]).reset_index(drop=True)
-
-    return out_all, out_last5
-
-
-def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25) -> str:
-    if df is None or df.empty:
-        return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0">{title}</h3><div style="padding:12px;border:1px solid #374151;background:#111827;color:#d1d5db;border-radius:8px;">No data found.</div>'
-
-    view = df.head(max_rows).copy()
-    cols = list(view.columns)
-
-    def fmt(col, val):
-        if pd.isna(val):
-            return ""
-        if col in {"Symbol", "Status"}:
-            return str(val)
-        if "Gap" in col:
-            return f"{float(val):.2f}"
-        if col in {"Count", "First Occurrence", "Latest Iteration"}:
-            return str(int(float(val)))
-        return str(val)
-
-    def cell_style(col, val):
-        base = "padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;white-space:nowrap;"
-        if col == "Status":
-            label = str(val).strip()
-            if label == "Fresh Move":
-                return base + "background:#1d4ed8;color:#dbeafe;font-weight:700;"
-            if label == "Continued Accumulation":
-                return base + "background:#14532d;color:#dcfce7;font-weight:700;"
-            return base
-        if col == "Gap":
-            try:
-                if float(val) > 0:
-                    return base + "background:#3f6212;color:#ecfccb;font-weight:700;"
-            except Exception:
-                pass
-        return base
-
-    header = "".join(
-        f'<th style="padding:8px;border:1px solid #4b5563;background:#111827;color:#f9fafb;white-space:nowrap">{c}</th>'
-        for c in cols
-    )
-
-    body = []
-    for _, row in view.iterrows():
-        cells = "".join(
-            f'<td style="{cell_style(c, row[c])}">{fmt(c, row[c])}</td>'
-            for c in cols
-        )
-        body.append(f"<tr>{cells}</tr>")
-
-    return (
-        f'<h3 style="color:#f9fafb;margin:14px 0 8px 0">{title}</h3>'
-        '<div style="overflow-x:auto">'
-        '<table style="border-collapse:collapse;width:100%;background:#030712">'
-        f"<thead><tr>{header}</tr></thead>"
-        f'<tbody>{"".join(body)}</tbody>'
-        "</table></div>"
-    )
 
 def send_second_email_with_exceedance_tables(all_iter_df: pd.DataFrame, combo_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
     try:
