@@ -1478,35 +1478,24 @@ def save_outputs(summary_df: pd.DataFrame, detail_df: pd.DataFrame, prefix: str 
 
     return summary_csv, detail_csv
 
-def build_occurrence_table(
-    detail_df: pd.DataFrame,
-    last_n_iterations: Optional[int] = None,
-    top_n: int = 10,
-    eps: float = 1e-9,
-) -> pd.DataFrame:
+def build_occurrence_table(detaildf, last_n_iterations=10, top_n=10, eps=1e-9):
     cols = [
-        "Symbol",
-        "Count",
-        "CumsumPlusDiff",
-        "TurningDiff",
-        "First Occurrence",
-        "Current Iteration",
-        "Status",
+        "Symbol", "Count", "CumsumPlusDiff", "TurningDiff",
+        "First Occurrence", "Current Iteration", "Status"
     ]
     empty = pd.DataFrame(columns=cols)
 
-    if detail_df is None or detail_df.empty:
+    if detaildf is None or detaildf.empty:
         return empty
 
     required = {"Symbol", "Iteration No", "Iteration Time", "CumsumDiff", "TurningDiff"}
-    if not required.issubset(detail_df.columns):
+    if not required.issubset(detaildf.columns):
         return empty
 
-    df = detail_df.copy().sort_values(["Iteration No", "Symbol"]).reset_index(drop=True)
+    df = detaildf.copy().sort_values(["Symbol", "Iteration No"]).reset_index(drop=True)
     df["CumsumDiff"] = pd.to_numeric(df["CumsumDiff"], errors="coerce").fillna(0.0)
     df["TurningDiff"] = pd.to_numeric(df["TurningDiff"], errors="coerce").fillna(0.0)
 
-    # Slice the window (e.g., Last 10 iterations)
     if last_n_iterations is not None:
         last_iters = sorted(df["Iteration No"].dropna().astype(int).unique())[-last_n_iterations:]
         df = df[df["Iteration No"].isin(last_iters)].copy()
@@ -1515,60 +1504,51 @@ def build_occurrence_table(
         return empty
 
     rows = []
-    # Loop over the UNFILTERED data so we don't lose the true latest iteration
+
     for sym, g in df.groupby("Symbol", sort=False):
-        g = g.sort_values("Iteration No").copy()
-        
-        # Identify which specific iterations had active movement
-        active_g = g[(g["CumsumDiff"].abs() > eps) | (g["TurningDiff"].abs() > eps)]
-        
-        # If it didn't move at all in this 10-iteration window, skip it
-        if active_g.empty:
+        g = g.sort_values("Iteration No").reset_index(drop=True)
+
+        qualifying = (g["CumsumDiff"].abs() > eps) | (g["TurningDiff"].abs() > eps)
+        if g.empty or not qualifying.iloc[-1]:
             continue
 
-        # First occurrence is based on when it actually moved
-        first_time = str(active_g["Iteration Time"].iloc[0])
-        
-        # Current iteration time and status are based on the ABSOLUTE LATEST row
-        current_time = str(g["Iteration Time"].iloc[-1])
+        idx = len(g) - 1
+        chain_idx = [idx]
 
-        agg_cumsum = float(g["CumsumDiff"].sum())
-        agg_turning = float(g["TurningDiff"].sum())
+        while idx - 1 >= 0 and qualifying.iloc[idx - 1]:
+            chain_idx.append(idx - 1)
+            idx -= 1
 
-        # Safely get the true Dual Engine Matrix state if available, otherwise recalculate
-        if "Dual Engine State" in g.columns:
-            latest_status = str(g["Dual Engine State"].iloc[-1])
+        chain = g.iloc[sorted(chain_idx)].copy()
+        latest_row = chain.iloc[-1]
+
+        if "Dual Engine State" in chain.columns and pd.notna(latest_row.get("Dual Engine State")):
+            status = str(latest_row["Dual Engine State"])
         else:
-            latest_cumsum = float(g["CumsumDiff"].iloc[-1])
-            latest_turning = float(g["TurningDiff"].iloc[-1])
-            latest_status = classify_diff_status(latest_cumsum, latest_turning)
+            status = classify_diff_status(
+                float(latest_row["CumsumDiff"]),
+                float(latest_row["TurningDiff"]),
+                eps=eps,
+            )
 
-        rows.append(
-            {
-                "Symbol": sym,
-                "Count": int(len(active_g)),  # Total active pushes in the window
-                "CumsumPlusDiff": agg_cumsum,
-                "TurningDiff": agg_turning,
-                "First Occurrence": first_time,
-                "Current Iteration": current_time,
-                "Status": latest_status, # True status on the very last tick
-            }
-        )
+        rows.append({
+            "Symbol": sym,
+            "Count": int(len(chain)),
+            "CumsumPlusDiff": float(chain["CumsumDiff"].sum()),
+            "TurningDiff": float(chain["TurningDiff"].sum()),
+            "First Occurrence": str(chain["Iteration Time"].iloc[0]),
+            "Current Iteration": str(chain["Iteration Time"].iloc[-1]),
+            "Status": status,
+        })
 
     out = pd.DataFrame(rows, columns=cols)
     if out.empty:
         return empty
 
-    # Sort so the freshest first occurrences and highest counts bubble to the top
-    out["_first_occ_sort"] = pd.to_datetime(out["First Occurrence"], format="%H:%M", errors="coerce")
-    out = out.sort_values(
-        ["_first_occ_sort", "Count", "CumsumPlusDiff", "TurningDiff"],
-        ascending=[False, False, False, True],
-        na_position="last",
-    ).drop(columns=["_first_occ_sort"])
-
-    return out.head(top_n).reset_index(drop=True)
-
+    return out.sort_values(
+        ["Current Iteration", "Count", "CumsumPlusDiff"],
+        ascending=[False, False, False]
+    ).head(top_n).reset_index(drop=True)
 
 def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     last10_df = build_occurrence_table(detail_df, last_n_iterations=10, top_n=10)
