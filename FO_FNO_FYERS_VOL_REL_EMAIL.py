@@ -1478,7 +1478,12 @@ def save_outputs(summary_df: pd.DataFrame, detail_df: pd.DataFrame, prefix: str 
 
     return summary_csv, detail_csv
 
-def build_occurrence_table(detaildf, last_n_iterations=10, top_n=10, eps=1e-9):
+def build_occurrence_table(
+    detaildf: pd.DataFrame,
+    lastniterations: Optional[int] = None,
+    topn: int = 10,
+    eps: float = 1e-9,
+) -> pd.DataFrame:
     cols = [
         "Symbol", "Count", "CumsumPlusDiff", "TurningDiff",
         "First Occurrence", "Current Iteration", "Status"
@@ -1496,9 +1501,9 @@ def build_occurrence_table(detaildf, last_n_iterations=10, top_n=10, eps=1e-9):
     df["CumsumDiff"] = pd.to_numeric(df["CumsumDiff"], errors="coerce").fillna(0.0)
     df["TurningDiff"] = pd.to_numeric(df["TurningDiff"], errors="coerce").fillna(0.0)
 
-    if last_n_iterations is not None:
-        last_iters = sorted(df["Iteration No"].dropna().astype(int).unique())[-last_n_iterations:]
-        df = df[df["Iteration No"].isin(last_iters)].copy()
+    if lastniterations is not None:
+        lastiters = sorted(df["Iteration No"].dropna().astype(int).unique())[-lastniterations:]
+        df = df[df["Iteration No"].isin(lastiters)].copy()
 
     if df.empty:
         return empty
@@ -1508,26 +1513,26 @@ def build_occurrence_table(detaildf, last_n_iterations=10, top_n=10, eps=1e-9):
     for sym, g in df.groupby("Symbol", sort=False):
         g = g.sort_values("Iteration No").reset_index(drop=True)
 
-        qualifying = (g["CumsumDiff"].abs() > eps) | (g["TurningDiff"].abs() > eps)
-        if g.empty or not qualifying.iloc[-1]:
+        qualifies = (g["CumsumDiff"].abs() > eps) | (g["TurningDiff"].abs() > eps)
+        if not qualifies.iloc[-1]:
             continue
 
         idx = len(g) - 1
-        chain_idx = [idx]
+        keep = [idx]
 
-        while idx - 1 >= 0 and qualifying.iloc[idx - 1]:
-            chain_idx.append(idx - 1)
+        while idx - 1 >= 0 and qualifies.iloc[idx - 1]:
+            keep.append(idx - 1)
             idx -= 1
 
-        chain = g.iloc[sorted(chain_idx)].copy()
-        latest_row = chain.iloc[-1]
+        chain = g.iloc[sorted(keep)].copy()
+        latest = chain.iloc[-1]
 
-        if "Dual Engine State" in chain.columns and pd.notna(latest_row.get("Dual Engine State")):
-            status = str(latest_row["Dual Engine State"])
+        if "Dual Engine State" in chain.columns and pd.notna(latest.get("Dual Engine State")):
+            status = str(latest["Dual Engine State"])
         else:
             status = classify_diff_status(
-                float(latest_row["CumsumDiff"]),
-                float(latest_row["TurningDiff"]),
+                float(latest["CumsumDiff"]),
+                float(latest["TurningDiff"]),
                 eps=eps,
             )
 
@@ -1545,11 +1550,20 @@ def build_occurrence_table(detaildf, last_n_iterations=10, top_n=10, eps=1e-9):
     if out.empty:
         return empty
 
-    return out.sort_values(
-        ["Current Iteration", "Count", "CumsumPlusDiff"],
-        ascending=[False, False, False]
-    ).head(top_n).reset_index(drop=True)
-
+    out["_current_sort"] = pd.to_datetime(out["Current Iteration"], format="%H:%M", errors="coerce")
+    out = (
+        out.sort_values(
+            ["_current_sort", "Count", "CumsumPlusDiff", "TurningDiff"],
+            ascending=[False, False, False, True],
+            na_position="last",
+        )
+        .drop(columns=["_current_sort"])
+        .head(topn)
+        .reset_index(drop=True)
+    )
+    return out
+    
+    
 def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     last10_df = build_occurrence_table(detail_df, last_n_iterations=10, top_n=10)
     all_df = build_occurrence_table(detail_df, last_n_iterations=None, top_n=10)
