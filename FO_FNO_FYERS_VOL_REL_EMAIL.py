@@ -1186,7 +1186,7 @@ def build_occurrence_table(
     eps: float = 1e-4,
 ) -> pd.DataFrame:
     # -------------------------------------------------------------
-    # FIXED: True Backwards Tracking + Zero Energy / Trap Filtering
+    # FIXED: True Backwards Tracking + Velocity First Sorting
     # -------------------------------------------------------------
     cols = [
         "Symbol",
@@ -1279,9 +1279,12 @@ def build_occurrence_table(
 
     out["_curr_iter_sort"] = pd.to_datetime(out["Current Iteration"], format="%H:%M", errors="coerce")
     
-    # Prioritize length of the streak, then recentness, then current momentum velocity.
+    # -------------------------------------------------------------
+    # FIXED: Velocity First Sorting
+    # Prioritizes actively exploding breakouts (CumsumPlusDiff) over sleeping trades
+    # -------------------------------------------------------------
     out = out.sort_values(
-        ["Count", "_curr_iter_sort", "CumsumPlusDiff"],
+        ["CumsumPlusDiff", "Count", "_curr_iter_sort"],
         ascending=[False, False, False],
         na_position="last",
     ).drop(columns=["_curr_iter_sort"])
@@ -1290,7 +1293,6 @@ def build_occurrence_table(
 
 
 def build_exceedance_tables(detail_df: pd.DataFrame):
-    # Fixed explicitly to use the correct backward occurrence table.
     recent_10_df = build_occurrence_table(detail_df, last_n_iterations=10, top_n=15)
     all_time_df = build_occurrence_table(detail_df, last_n_iterations=None, top_n=15)
     return recent_10_df, all_time_df
@@ -1476,7 +1478,6 @@ def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 15) -> str:
 
 
 def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25) -> str:
-    # Renders the exact columns explicitly required from `build_occurrence_table`
     if df is None or df.empty:
         return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0">{title}</h3><div style="padding:12px;border:1px solid #374151;background:#111827;color:#d1d5db;border-radius:8px;">No data found.</div>'
 
@@ -1645,7 +1646,6 @@ def send_second_email_with_exceedance_tables(recent_10_df: pd.DataFrame, all_tim
     try:
         scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         
-        # Uses the restored columns and format specifically!
         combo_html = build_exceedance_table_html(recent_10_df, "Active Trend Matrix - Last 10 Iterations", max_rows=25)
         all_html = build_exceedance_table_html(all_time_df, "Active Trend Matrix - All Time", max_rows=25)
         
