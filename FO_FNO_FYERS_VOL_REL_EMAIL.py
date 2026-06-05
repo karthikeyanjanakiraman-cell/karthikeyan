@@ -137,15 +137,18 @@ def build_signals_from_raw_directional(detail_df) -> dict:
     return out
 
 
-def classify_diff_status(cumsum_diff: float, turning_diff: float, eps: float = 1e-4) -> str:
+def classify_diff_status(cumsum_diff: float, turning_diff: float, prior_cumsum: float = 0.0, eps: float = 1e-4) -> str:
     # Strict 1-to-1 zero lag logic
     c = 0.0 if pd.isna(cumsum_diff) else float(cumsum_diff)
     t = 0.0 if pd.isna(turning_diff) else float(turning_diff)
+    p = 0.0 if pd.isna(prior_cumsum) else float(prior_cumsum)
 
     friction_expanding = t > eps
 
-    if c > eps and not friction_expanding:
+    if c > eps and p <= eps and not friction_expanding:
         return "PRISTINE_BREAKOUT"
+    if c > eps and p > eps and not friction_expanding:
+        return "ACTIVE_CONTINUATION"
     if c <= eps and friction_expanding:
         return "TRUE_EXHAUSTION"
     if c > eps and friction_expanding:
@@ -904,6 +907,7 @@ def compute_iteration_volume_profile(
     summary.update(signals)
     return summary, detail_df
 
+
 def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
     symbols = load_fno_symbols_from_sectors("sectors")
     if not symbols:
@@ -1182,6 +1186,7 @@ def build_occurrence_table(
     top_n: int = 10,
     eps: float = 1e-4,
 ) -> pd.DataFrame:
+    # THIS is the fully restored function with backward tracking and exact requested columns.
     cols = [
         "Symbol",
         "Count",
@@ -1196,14 +1201,12 @@ def build_occurrence_table(
     if detail_df is None or detail_df.empty:
         return empty
 
-    required = {"Symbol", "Iteration No", "Iteration Time", "CumsumDiff", "TurningDiff"}
+    required = {"Symbol", "Iteration No", "Iteration Time", "CumsumPlus", "Turning"}
     if not required.issubset(detail_df.columns):
         return empty
 
     df = detail_df.copy()
     df["Iteration No"] = pd.to_numeric(df["Iteration No"], errors="coerce")
-    df["CumsumDiff"] = pd.to_numeric(df["CumsumDiff"], errors="coerce").fillna(0.0)
-    df["TurningDiff"] = pd.to_numeric(df["TurningDiff"], errors="coerce").fillna(0.0)
     df = df.dropna(subset=["Iteration No"]).sort_values(["Symbol", "Iteration No"]).reset_index(drop=True)
 
     if last_n_iterations is not None:
@@ -1219,28 +1222,49 @@ def build_occurrence_table(
         if g.empty:
             continue
 
-        qualifies = (g["CumsumDiff"] > eps) | (g["TurningDiff"].abs() > eps)
+        if "CumsumDiff" not in g.columns:
+            g["CumsumDiff"] = g["CumsumPlus"].diff().fillna(0.0)
+        if "TurningDiff" not in g.columns:
+            g["TurningDiff"] = g["Turning"].diff().fillna(0.0)
+
+        # Zero-Lag backward tracking condition: 
+        # A streak qualifies if the asset is actively accumulating (CumsumDiff > 0) 
+        # OR it is pausing (CumsumDiff == 0) but friction is NOT expanding.
+        g["Friction_Expanding"] = (g["TurningDiff"] > eps)
+        qualifies = (g["CumsumDiff"] > eps) | ((g["CumsumDiff"].abs() <= eps) & ~g["Friction_Expanding"])
+        
         last_idx = len(g) - 1
+        
+        # Only process if the CURRENT bar qualifies for an active streak
         if not bool(qualifies.iloc[last_idx]):
             continue
 
+        # Tracking consecutive valid iterations backwards
         chain_idx = [last_idx]
         idx = last_idx
         while idx - 1 >= 0:
             prev_idx = idx - 1
             prev_iter = int(g.iloc[prev_idx]["Iteration No"])
             curr_iter = int(g.iloc[idx]["Iteration No"])
+            
             if prev_iter != curr_iter - 1:
-                break
+                break  # Skipped iteration, break chain
+            
             if not bool(qualifies.iloc[prev_idx]):
-                break
+                break  # The backward bar did not qualify, break chain
+                
             chain_idx.append(prev_idx)
             idx = prev_idx
 
         chain = g.iloc[sorted(chain_idx)].copy()
+        
         latest = chain.iloc[-1]
         latest_cumsum = float(latest["CumsumDiff"])
         latest_turning = float(latest["TurningDiff"])
+        
+        # Need prior Cumsum for determining if it's PRISTINE_BREAKOUT or ACTIVE_CONTINUATION
+        prior_cumsum = float(chain.iloc[-2]["CumsumDiff"]) if len(chain) > 1 else 0.0
+        status = classify_diff_status(latest_cumsum, latest_turning, prior_cumsum, eps=eps)
 
         rows.append(
             {
@@ -1250,7 +1274,7 @@ def build_occurrence_table(
                 "TurningDiff": latest_turning,
                 "First Occurrence": str(chain["Iteration Time"].iloc[0]),
                 "Current Iteration": str(chain["Iteration Time"].iloc[-1]),
-                "Status": classify_diff_status(latest_cumsum, latest_turning, eps=eps),
+                "Status": status,
             }
         )
 
@@ -1259,87 +1283,23 @@ def build_occurrence_table(
         return empty
 
     out["_curr_iter_sort"] = pd.to_datetime(out["Current Iteration"], format="%H:%M", errors="coerce")
+    
+    # Sort strictly by the length of the backward consecutive streak and then velocity
     out = out.sort_values(
-        ["Count", "_curr_iter_sort", "CumsumPlusDiff", "TurningDiff"],
-        ascending=[False, False, False, False],
+        ["Count", "_curr_iter_sort", "CumsumPlusDiff"],
+        ascending=[False, False, False],
         na_position="last",
     ).drop(columns=["_curr_iter_sort"])
+    
     return out.head(top_n).reset_index(drop=True)
 
 
 def build_exceedance_tables(detail_df: pd.DataFrame):
-    return build_velocity_tables(detail_df)
-
-
-def build_velocity_tables(detail_df: pd.DataFrame):
-    # Completely rewritten to use pure instantaneous velocity, stripped of all rolling lag
-    cols = ["Symbol", "Peak Iteration", "Peak Time", "Inst_Velocity", "Friction_Drag", "VelocityScore", "CumsumPlusDiff", "Stability", "Status"]
-    empty = pd.DataFrame(columns=cols)
-    if detail_df is None or detail_df.empty:
-        return empty, empty
-    if "Symbol" not in detail_df.columns or "Iteration No" not in detail_df.columns:
-        return empty, empty
-
-    rows_all = []
-    rows_last5 = []
-
-    for sym, g in detail_df.groupby("Symbol", sort=False):
-        g = g.copy().sort_values("Iteration No")
-        if "CumsumPlus" not in g.columns or "Stability" not in g.columns or "Turning" not in g.columns:
-            continue
-
-        g["CumsumPlus"] = pd.to_numeric(g["CumsumPlus"], errors="coerce").fillna(0.0)
-        g["Stability"] = pd.to_numeric(g["Stability"], errors="coerce").replace(0, np.nan)
-        g["Turning"] = pd.to_numeric(g["Turning"], errors="coerce").fillna(0.0)
-        
-        g["CumsumPlusDiff"] = g["CumsumPlus"].diff().fillna(0.0)
-        g["TurningDiff"] = g["Turning"].diff().fillna(0.0)
-
-        # Pure Zero-Lag 1-to-1 instantaneous metrics
-        g["Inst_Velocity"] = g["CumsumPlusDiff"] / g["Stability"]
-        g["Friction_Drag"] = g["TurningDiff"] / g["Stability"]
-        
-        # Velocity Score penalizes structural friction strictly and instantly
-        g["VelocityScore"] = g["Inst_Velocity"] - g["Friction_Drag"].clip(lower=0)
-
-        valid = g[g["VelocityScore"].notna()].copy()
-        if valid.empty:
-            continue
-
-        # Find the absolute peak mathematical moment in the session
-        best_idx = valid.sort_values(["VelocityScore", "Iteration No"], ascending=[False, False]).index[0]
-        best_row = valid.loc[best_idx]
-        
-        # Status based on latest row
-        latest_row = valid.iloc[-1]
-        c_diff = float(latest_row["CumsumPlusDiff"])
-        t_diff = float(latest_row["TurningDiff"])
-        status = "Active & Clean" if (c_diff > 0 and t_diff <= 0) else ("Exhausted/Paused" if c_diff <= 0 else "Churning Trap")
-
-        row = {
-            "Symbol": sym,
-            "Peak Iteration": int(best_row["Iteration No"]),
-            "Peak Time": best_row["Iteration Time"] if "Iteration Time" in best_row else "",
-            "Inst_Velocity": float(best_row["Inst_Velocity"]) if pd.notna(best_row["Inst_Velocity"]) else np.nan,
-            "Friction_Drag": float(best_row["Friction_Drag"]) if pd.notna(best_row["Friction_Drag"]) else np.nan,
-            "VelocityScore": float(best_row["VelocityScore"]) if pd.notna(best_row["VelocityScore"]) else np.nan,
-            "CumsumPlusDiff": float(best_row["CumsumPlusDiff"]) if pd.notna(best_row["CumsumPlusDiff"]) else np.nan,
-            "Stability": float(best_row["Stability"]) if pd.notna(best_row["Stability"]) else np.nan,
-            "Status": status,
-        }
-        rows_all.append(row)
-        if len(valid) >= 5:
-            rows_last5.append(row)
-
-    out_all = pd.DataFrame(rows_all, columns=cols)
-    out_last5 = pd.DataFrame(rows_last5, columns=cols)
-
-    if not out_all.empty:
-        out_all = out_all.sort_values(["VelocityScore", "Peak Iteration"], ascending=[False, False]).reset_index(drop=True)
-    if not out_last5.empty:
-        out_last5 = out_last5.sort_values(["VelocityScore", "Peak Iteration"], ascending=[False, False]).reset_index(drop=True)
-
-    return out_all, out_last5
+    # This safely returns your dual occurrence tables WITHOUT calling the problematic velocity function
+    return (
+        build_occurrence_table(detail_df, last_n_iterations=10, top_n=10),
+        build_occurrence_table(detail_df, last_n_iterations=None, top_n=10),
+    )
 
 
 def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
@@ -1522,7 +1482,7 @@ def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 15) -> str:
 
 
 def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25) -> str:
-    # Updated to apply the correct color styling to the new instantaneous statuses
+    # Renders the exact columns explicitly required from `build_occurrence_table`
     if df is None or df.empty:
         return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0">{title}</h3><div style="padding:12px;border:1px solid #374151;background:#111827;color:#d1d5db;border-radius:8px;">No data found.</div>'
 
@@ -1532,11 +1492,11 @@ def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25
     def fmt(col, val):
         if pd.isna(val):
             return ""
-        if col in {"Symbol", "Status"}:
+        if col in {"Symbol", "Status", "First Occurrence", "Current Iteration"}:
             return str(val)
-        if "Velocity" in col or "Drag" in col or "Gap" in col:
-            return f"{float(val):.2f}"
-        if col in {"Count", "First Occurrence", "Latest Iteration"}:
+        if "Diff" in col or "Gap" in col:
+            return f"{float(val):.4f}"
+        if col in {"Count"}:
             return str(int(float(val)))
         return str(val)
 
@@ -1544,13 +1504,23 @@ def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25
         base = "padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;white-space:nowrap;"
         if col == "Status":
             label = str(val).strip()
-            if label == "Active & Clean":
-                return base + "background:#1d4ed8;color:#dbeafe;font-weight:700;"
-            if label == "Exhausted/Paused":
-                return base + "background:#b91c1c;color:#fee2e2;font-weight:700;"
-            if label == "Churning Trap":
+            if label in ["PRISTINE_BREAKOUT", "ACTIVE_CONTINUATION"]:
+                return base + "background:#15803d;color:#dcfce7;font-weight:700;"
+            if label == "HEALTHY_PAUSE":
+                return base + "background:#0f766e;color:#ccfbf1;font-weight:700;"
+            if label == "CHURNING_FAKEOUT":
                 return base + "background:#b45309;color:#fef3c7;font-weight:700;"
+            if label == "TRUE_EXHAUSTION":
+                return base + "background:#b91c1c;color:#fee2e2;font-weight:700;"
             return base
+        if "Diff" in col:
+            try:
+                if float(val) > 0:
+                    return base + "background:#064e3b;color:#dcfce7;font-weight:700;"
+                elif float(val) < 0:
+                    return base + "background:#7f1d1d;color:#fee2e2;font-weight:700;"
+            except Exception:
+                pass
         return base
 
     header = "".join(
@@ -1680,12 +1650,15 @@ def save_outputs(summary_df: pd.DataFrame, detail_df: pd.DataFrame, prefix: str 
 def send_second_email_with_exceedance_tables(all_iter_df: pd.DataFrame, combo_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
     try:
         scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        combo_html = build_exceedance_table_html(combo_df, "Peak Velocity Score - Last 5 Qualified Symbols", max_rows=25)
-        all_html = build_exceedance_table_html(all_iter_df, "Peak Velocity Score - All Symbols", max_rows=25)
+        
+        # Uses the restored columns and format specifically!
+        combo_html = build_exceedance_table_html(combo_df, "Consecutive Streak Active Breakouts - Last 10 Iters", max_rows=25)
+        all_html = build_exceedance_table_html(all_iter_df, "Consecutive Streak Active Breakouts - All Time", max_rows=25)
+        
         html_body = (
             '<html><body style="margin:0;padding:20px;background:#030712;color:#e5e7eb;font-family:Arial,sans-serif;">'
             '<div style="max-width:1600px;margin:0 auto;">'
-            '<h2 style="margin:0 0 12px 0;color:#facc15;">Intraday Vol Iteration Alert - Peak Velocity Tables</h2>'
+            '<h2 style="margin:0 0 12px 0;color:#facc15;">Intraday Vol Iteration Alert - Occurrence Tables</h2>'
             f'<div style="margin-bottom:18px;color:#cbd5e1;font-size:14px;">Scan completed at {scan_time}</div>'
             f'<div style="margin-bottom:24px;padding:14px;border:1px solid #374151;background:#111827;border-radius:10px;">{combo_html}</div>'
             f'<div style="margin-bottom:24px;padding:14px;border:1px solid #374151;background:#111827;border-radius:10px;">{all_html}</div>'
@@ -1694,7 +1667,7 @@ def send_second_email_with_exceedance_tables(all_iter_df: pd.DataFrame, combo_df
         )
 
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"Intraday Vol Iteration Alert - Peak Velocity Tables - {scan_time}"
+        msg["Subject"] = f"Intraday Vol Iteration Alert - Occurrence Tables - {scan_time}"
         msg["From"] = sender_email
         msg["To"] = recipient_email
         msg.attach(MIMEText(html_body, "html", _charset="utf-8"))
@@ -1714,7 +1687,7 @@ def send_second_email_with_exceedance_tables(all_iter_df: pd.DataFrame, combo_df
             server.login(sender_email, sender_password)
             server.sendmail(sender_email, recipient_email, msg.as_string())
 
-        logger.info("Second peak velocity email sent successfully.")
+        logger.info("Second exceedance email sent successfully.")
         return True
     except Exception as e:
         logger.error(f"SECOND EMAIL Error: {e}")
@@ -1740,6 +1713,8 @@ def main():
 
     long_df, short_df = build_candidate_tables(summary_df)
     history_df = load_iteration_history(detail_df)
+    
+    # Cleanly calling the RESTORED occurrence function which builds exactly your required matrix
     all_iter_exceed_df, combo_exceed_df = build_exceedance_tables(detail_df)
 
     summary_csv, detail_csv = save_outputs(summary_df, detail_df, prefix="fno")
