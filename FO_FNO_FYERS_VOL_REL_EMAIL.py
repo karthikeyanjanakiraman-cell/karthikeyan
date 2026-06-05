@@ -64,6 +64,7 @@ warnings.filterwarnings("ignore")
 DAILY_LOOKBACK_DAYS = 60
 INTRADAY_LOOKBACK_DAYS = 20
 IVP_LOOKBACK_DAYS = 252
+INDEX_SOFT_BOOST_WEIGHT = 0.25
 
 fyers: Optional[fyersModel.FyersModel] = None
 
@@ -89,14 +90,14 @@ EMAIL_DISPLAY_COLS = [
     "Trade Action",
     "ARIMA Signal",
     "Kalman Signal",
-    "5mSignal",
-    "15mSignal",
-    "30mSignal",
-    "60mSignal",
-    "BullSignal",
-    "BearSignal",
-    "OverallSignal",
-    "PriceLeadStatus",
+    "5m_Signal",
+    "15m_Signal",
+    "30m_Signal",
+    "60m_Signal",
+    "Bull_Signal",
+    "Bear_Signal",
+    "Overall_Signal",
+    "Price_Lead_Status",
     "IVP",
     "Volatility State",
     "Last Iteration Time",
@@ -107,15 +108,15 @@ def build_signals_from_raw_directional(detail_df: pd.DataFrame) -> dict:
     nan = float("nan")
     out = {
         k: nan
-        for k in [
-            "5mSignal",
-            "15mSignal",
-            "30mSignal",
-            "60mSignal",
-            "BullSignal",
-            "BearSignal",
-            "OverallSignal",
-        ]
+        for k in (
+            "5m_Signal",
+            "15m_Signal",
+            "30m_Signal",
+            "60m_Signal",
+            "Bull_Signal",
+            "Bear_Signal",
+            "Overall_Signal",
+        )
     }
 
     if detail_df is None or detail_df.empty or "Directional" not in detail_df.columns:
@@ -135,13 +136,13 @@ def build_signals_from_raw_directional(detail_df: pd.DataFrame) -> dict:
         i = max(last - offset, 0)
         return float(vals[i])
 
-    out["5mSignal"] = round(raw_at(0), 4)
-    out["15mSignal"] = round(raw_at(3) if last >= 3 else raw_at(0), 4)
-    out["30mSignal"] = round(raw_at(6) if last >= 6 else raw_at(0), 4)
-    out["60mSignal"] = round(raw_at(12) if last >= 12 else raw_at(0), 4)
-    out["BullSignal"] = round(float(vals[vals > 0].max()) if (vals > 0).any() else 0.0, 4)
-    out["BearSignal"] = round(abs(float(vals[vals < 0].min())) if (vals < 0).any() else 0.0, 4)
-    out["OverallSignal"] = round(raw_at(0), 4)
+    out["5m_Signal"] = round(raw_at(0), 4)
+    out["15m_Signal"] = round(raw_at(3) if last >= 3 else raw_at(0), 4)
+    out["30m_Signal"] = round(raw_at(6) if last >= 6 else raw_at(0), 4)
+    out["60m_Signal"] = round(raw_at(12) if last >= 12 else raw_at(0), 4)
+    out["Bull_Signal"] = round(float(vals[vals > 0].max()) if (vals > 0).any() else 0.0, 4)
+    out["Bear_Signal"] = round(abs(float(vals[vals < 0].min())) if (vals < 0).any() else 0.0, 4)
+    out["Overall_Signal"] = round(raw_at(0), 4)
     return out
 
 
@@ -149,13 +150,16 @@ def classify_diff_status(cumsum_diff: float, turning_diff: float, eps: float = 1
     c = 0.0 if pd.isna(cumsum_diff) else float(cumsum_diff)
     t = 0.0 if pd.isna(turning_diff) else float(turning_diff)
 
-    if c > eps and t <= eps:
+    low_turning = abs(t) <= eps
+    high_turning = abs(t) > eps
+
+    if c > eps and low_turning:
         return "PRISTINE_BREAKOUT"
-    if abs(c) <= eps and t <= eps:
+    if abs(c) <= eps and low_turning:
         return "HEALTHY_PAUSE"
-    if c > eps and t > eps:
+    if c > eps and high_turning:
         return "CHURNING_FAKEOUT"
-    if c <= eps and t > eps:
+    if c <= eps and high_turning:
         return "TRUE_EXHAUSTION"
     return "TRANSITION"
 
@@ -180,6 +184,7 @@ def add_dual_engine_matrix(
     out = out.sort_values(["Symbol", "Iteration No"]).reset_index(drop=True)
 
     grouped = out.groupby("Symbol", group_keys=False)
+
     out["CumsumDiff"] = grouped["CumsumPlus"].diff().fillna(0.0)
     out["TurningDiff"] = grouped["Turning"].diff().fillna(0.0)
 
@@ -232,6 +237,11 @@ def add_dual_engine_matrix(
             "EXIT",
         ],
         default="WAIT",
+    )
+
+    out["Diff Status"] = out.apply(
+        lambda r: classify_diff_status(r.get("CumsumDiff"), r.get("TurningDiff"), eps=eps),
+        axis=1,
     )
 
     out["Entry Allowed"] = out["Trade Action"].eq("ENTRY")
@@ -559,14 +569,14 @@ def compute_cumulative_flow_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
 
     vwap_variance = (volume * (typical_price - vwap) ** 2).cumsum() / cum_vol
     vwap_std = np.sqrt(vwap_variance).fillna(0.0)
-    vwap_zscore = np.where(vwap_std > 0, (close - vwap) / vwap_std, 0.0)
+    vwap_z_score = np.where(vwap_std > 0, (close - vwap) / vwap_std, 0.0)
 
     out = pd.DataFrame(
         {
             "Cumulative RSI": rsi,
             "Cumulative OBV": obv,
             "Cumulative VWAP": vwap,
-            "VWAP Z-Score": pd.Series(vwap_zscore, index=df.index).fillna(0.0),
+            "VWAP Z-Score": pd.Series(vwap_z_score, index=df.index).fillna(0.0),
         }
     )
     return pd.concat([df.reset_index(drop=True), out.reset_index(drop=True)], axis=1)
@@ -583,7 +593,7 @@ def compute_price_lead_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
                 "delta_expansion",
                 "price_leading_flag",
                 "price_lead_streak",
-                "PriceLeadStatus",
+                "Price_Lead_Status",
             ]
         )
 
@@ -628,7 +638,7 @@ def compute_price_lead_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
         streak.append(run)
     df["price_lead_streak"] = streak
 
-    df["PriceLeadStatus"] = np.select(
+    df["Price_Lead_Status"] = np.select(
         [
             df["price_leading_flag"] & (df["price_lead_streak"] >= 3),
             df["price_leading_flag"] & (df["price_lead_streak"] >= 2),
@@ -650,7 +660,7 @@ def compute_price_lead_metrics(curr_df: pd.DataFrame) -> pd.DataFrame:
             "delta_expansion",
             "price_leading_flag",
             "price_lead_streak",
-            "PriceLeadStatus",
+            "Price_Lead_Status",
         ]
     ]
 
@@ -749,7 +759,7 @@ def compute_iteration_volume_profile(
         return {}, pd.DataFrame()
 
     curr_df.sort_values("time_only", inplace=True)
-    curr_df["cumvol"] = pd.to_numeric(curr_df["volume"], errors="coerce").fillna(0.0).cumsum()
+    curr_df["cum_vol"] = pd.to_numeric(curr_df["volume"], errors="coerce").fillna(0.0).cumsum()
 
     if prev_close is not None and prev_close != 0:
         curr_df["Iteration Change"] = (
@@ -777,21 +787,21 @@ def compute_iteration_volume_profile(
     total_iters = 0
     last_iter_mins = None
     last_iter_time = None
-    last_cumvol = last_rvol10 = last_rvol20 = 0.0
+    last_cum_vol = last_rvol10 = last_rvol20 = 0.0
 
     for i in range(len(curr_df)):
         total_iters += 1
         row = curr_df.iloc[i]
         t = row["time_only"]
-        cumvol = float(row["cumvol"])
+        cum_vol = float(row["cum_vol"])
 
         h10 = hist_df_10[hist_df_10["time_only"] <= t]
-        avg_cum10 = h10.groupby("date")["volume"].sum().mean() if not h10.empty else 0.0
-        rvol10 = cumvol / avg_cum10 if avg_cum10 > 0 else 0.0
+        avg_cum_10 = h10.groupby("date")["volume"].sum().mean() if not h10.empty else 0.0
+        rvol10 = cum_vol / avg_cum_10 if avg_cum_10 > 0 else 0.0
 
         h20 = hist_df_20[hist_df_20["time_only"] <= t]
-        avg_cum20 = h20.groupby("date")["volume"].sum().mean() if not h20.empty else 0.0
-        rvol20 = cumvol / avg_cum20 if avg_cum20 > 0 else 0.0
+        avg_cum_20 = h20.groupby("date")["volume"].sum().mean() if not h20.empty else 0.0
+        rvol20 = cum_vol / avg_cum_20 if avg_cum_20 > 0 else 0.0
 
         dt_time = datetime.combine(current_date, t)
         market_open = datetime.combine(current_date, time(9, 15))
@@ -808,7 +818,7 @@ def compute_iteration_volume_profile(
                 "Iteration Time": t.strftime("%H:%M"),
                 "LTP": float(row["close"]),
                 "Iteration Change": pct_change_iter,
-                "Current Volume": cumvol,
+                "Current Volume": cum_vol,
                 "Directional": ps["Directional"],
                 "Turning": ps["Turning"],
                 "Stability": ps["Stability"],
@@ -820,16 +830,16 @@ def compute_iteration_volume_profile(
                 "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[i]) if not flow_df.empty else float("nan"),
                 "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[i]) if not flow_df.empty else float("nan"),
                 "VWAP Z-Score": float(flow_df["VWAP Z-Score"].iloc[i]) if not flow_df.empty else float("nan"),
-                "RangeExpansion": float(price_lead_df["range_expansion"].iloc[i]) if not price_lead_df.empty else float("nan"),
-                "VolumeExpansion": float(price_lead_df["volume_expansion"].iloc[i]) if not price_lead_df.empty else float("nan"),
-                "DeltaExpansion": float(price_lead_df["delta_expansion"].iloc[i]) if not price_lead_df.empty else float("nan"),
-                "PriceLeadingFlag": bool(price_lead_df["price_leading_flag"].iloc[i]) if not price_lead_df.empty else False,
-                "PriceLeadStreak": int(price_lead_df["price_lead_streak"].iloc[i]) if not price_lead_df.empty else 0,
-                "PriceLeadStatus": str(price_lead_df["PriceLeadStatus"].iloc[i]) if not price_lead_df.empty else "NORMAL",
+                "Range_Expansion": float(price_lead_df["range_expansion"].iloc[i]) if not price_lead_df.empty else float("nan"),
+                "Volume_Expansion": float(price_lead_df["volume_expansion"].iloc[i]) if not price_lead_df.empty else float("nan"),
+                "Delta_Expansion": float(price_lead_df["delta_expansion"].iloc[i]) if not price_lead_df.empty else float("nan"),
+                "Price_Leading_Flag": bool(price_lead_df["price_leading_flag"].iloc[i]) if not price_lead_df.empty else False,
+                "Price_Lead_Streak": int(price_lead_df["price_lead_streak"].iloc[i]) if not price_lead_df.empty else 0,
+                "Price_Lead_Status": str(price_lead_df["Price_Lead_Status"].iloc[i]) if not price_lead_df.empty else "NORMAL",
             }
         )
 
-        last_cumvol, last_rvol10, last_rvol20 = cumvol, rvol10, rvol20
+        last_cum_vol, last_rvol10, last_rvol20 = cum_vol, rvol10, rvol20
         last_iter_mins = iter_mins
         last_iter_time = t.strftime("%H:%M")
 
@@ -861,7 +871,7 @@ def compute_iteration_volume_profile(
         "CumsumPlus": final_ps.get("CumsumPlus", np.nan),
         "ARIMA Signal": arima_signal_from_series(curr_df["Iteration Change"]),
         "Kalman Signal": kalman_signal_from_series(curr_df["Iteration Change"]),
-        "Current Volume": last_cumvol,
+        "Current Volume": last_cum_vol,
         "10 Day Relative Volume": last_rvol10,
         "20 Day Relative Volume": last_rvol20,
         "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[-1]) if not flow_df.empty else float("nan"),
@@ -883,7 +893,7 @@ def compute_iteration_volume_profile(
         "Volume1hAvg5m": vol_1h_avg_5m,
         "OBV30mDelta": obv_30m_delta,
         "RSI30mDelta": rsi_30m_delta,
-        "PriceLeadStatus": str(price_lead_df["PriceLeadStatus"].iloc[-1]) if not price_lead_df.empty else "NORMAL",
+        "Price_Lead_Status": str(price_lead_df["Price_Lead_Status"].iloc[-1]) if not price_lead_df.empty else "NORMAL",
     }
 
     summary.update(build_signals_from_raw_directional(detail_df))
@@ -902,13 +912,22 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
     rows = []
     iteration_rows = []
+    total = len(symbols)
 
     for idx, sym in enumerate(symbols, start=1):
-        logger.info(f"CORE [{idx}/{len(symbols)}] Processing {sym}")
+        logger.info(f"CORE [{idx}/{total}] Processing {sym}")
 
         fyers_sym = format_fyers_symbol(sym)
-        daily_df = get_fyers_history(fyers_sym, resolution="D", days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
-        intra_df = get_fyers_history(fyers_sym, resolution="5", days_back=INTRADAY_LOOKBACK_DAYS)
+        daily_df = get_fyers_history(
+            fyers_sym,
+            resolution="D",
+            days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS),
+        )
+        intra_df = get_fyers_history(
+            fyers_sym,
+            resolution="5",
+            days_back=INTRADAY_LOOKBACK_DAYS,
+        )
 
         prev_close = float(daily_df["close"].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2) else None
 
@@ -1076,9 +1095,12 @@ def text_color_for_bg(bg: str) -> str:
         "#4b5563",
         "#374151",
         "#7f1d1d",
+        "#a83232",
+        "#b94a48",
         "#7a5c00",
         "#33691e",
         "#2e7d32",
+        "#3f8f45",
         "#991b1b",
         "#166534",
         "#15803d",
@@ -1282,7 +1304,7 @@ def build_history_table(history_df: pd.DataFrame, side: str) -> str:
                     return base + "background:#7f1d1d;color:#fee2e2;font-weight:600;"
             return base
 
-        if col in ["Turning Regime", "Dual Engine State", "Trade Action", "PriceLeadStatus", "Volatility State"]:
+        if col in ["Turning Regime", "Dual Engine State", "Trade Action", "Price_Lead_Status", "Volatility State"]:
             bg = signal_color(val)
             fg = text_color_for_bg(bg)
             return base + f"background:{bg};color:{fg};font-weight:600;"
@@ -1338,7 +1360,8 @@ def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 15) -> str:
         )
 
     header_cells = "".join(
-        f'<th style="padding:8px;border:1px solid #4b5563;background:#111827;color:#f9fafb;white-space:nowrap;">{c}</th>'
+        f'<th style="padding:8px;border:1px solid #4b5563;background:#111827;'
+        f'color:#f9fafb;white-space:nowrap;">{c}</th>'
         for c in cols
     )
 
@@ -1349,7 +1372,7 @@ def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 15) -> str:
         except Exception:
             num = None
 
-        if col in ["% Change", "Directional", "Balanced", "CumsumPlus", "CumsumDiff", "TurningDiff", "BullSignal", "BearSignal", "OverallSignal"]:
+        if col in ["% Change", "Directional", "Balanced", "CumsumPlus", "CumsumDiff", "TurningDiff", "Bull_Signal", "Bear_Signal", "Overall_Signal"]:
             if num is not None:
                 if num > 0:
                     return base + "background:#14532d;color:#dcfce7;font-weight:600;"
@@ -1357,7 +1380,7 @@ def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 15) -> str:
                     return base + "background:#7f1d1d;color:#fee2e2;font-weight:600;"
             return base
 
-        if col in ["Volatility State", "PriceLeadStatus", "Turning Regime", "Dual Engine State", "Trade Action"]:
+        if col in ["Volatility State", "Price_Lead_Status", "Turning Regime", "Dual Engine State", "Trade Action"]:
             bg = signal_color(val)
             fg = text_color_for_bg(bg)
             return base + f"background:{bg};color:{fg};font-weight:600;"
@@ -1478,6 +1501,7 @@ def save_outputs(summary_df: pd.DataFrame, detail_df: pd.DataFrame, prefix: str 
 
     return summary_csv, detail_csv
 
+
 def build_occurrence_table(
     detail_df: pd.DataFrame,
     last_n_iterations: Optional[int] = None,
@@ -1582,7 +1606,6 @@ def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.D
     last10_df = build_occurrence_table(detail_df, last_n_iterations=10, top_n=10)
     all_df = build_occurrence_table(detail_df, last_n_iterations=None, top_n=10)
     return last10_df, all_df
-        
 
 
 def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 10) -> str:
