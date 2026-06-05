@@ -12,6 +12,12 @@ Dual-Engine Matrix integrated:
 2. HEALTHY_PAUSE -> HOLD
 3. CHURNING_FAKEOUT -> BLOCK_ENTRY
 4. TRUE_EXHAUSTION -> EXIT
+
+Email 2 updated:
+- Table 1: Top 10 symbols from last 10 iterations
+- Table 2: Top 10 symbols from all iterations
+- Columns:
+  Symbol, Count, CumsumPlusDiff, TurningDiff, First Occurrence, Current Iteration, Status
 """
 
 import os
@@ -81,6 +87,7 @@ EMAIL_DISPLAY_COLS = [
     "Balanced",
     "CumsumPlus",
     "CumsumDiff",
+    "TurningDiff",
     "Turning Regime",
     "Dual Engine State",
     "Trade Action",
@@ -144,6 +151,21 @@ def build_signals_from_raw_directional(detail_df) -> dict:
     return out
 
 
+def classify_diff_status(cumsum_diff: float, turning_diff: float, eps: float = 1e-9) -> str:
+    c = 0.0 if pd.isna(cumsum_diff) else float(cumsum_diff)
+    t = 0.0 if pd.isna(turning_diff) else float(turning_diff)
+
+    if c > eps and t <= eps:
+        return "PRISTINE_BREAKOUT"
+    if abs(c) <= eps and t <= eps:
+        return "HEALTHY_PAUSE"
+    if c > eps and t > eps:
+        return "CHURNING_FAKEOUT"
+    if c <= eps and t > eps:
+        return "TRUE_EXHAUSTION"
+    return "TRANSITION"
+
+
 def add_dual_engine_matrix(
     detail_df: pd.DataFrame,
     turning_lookback: int = 10,
@@ -166,6 +188,7 @@ def add_dual_engine_matrix(
     grouped = out.groupby("Symbol", group_keys=False)
 
     out["CumsumDiff"] = grouped["CumsumPlus"].diff().fillna(0.0)
+    out["TurningDiff"] = grouped["Turning"].diff().fillna(0.0)
 
     out["Turning Low Band"] = grouped["Turning"].transform(
         lambda s: s.rolling(turning_lookback, min_periods=1).quantile(low_q)
@@ -218,6 +241,11 @@ def add_dual_engine_matrix(
         default="WAIT",
     )
 
+    out["Diff Status"] = out.apply(
+        lambda r: classify_diff_status(r.get("CumsumDiff"), r.get("TurningDiff"), eps=eps),
+        axis=1,
+    )
+
     out["Entry Allowed"] = out["Trade Action"].eq("ENTRY")
     out["Hold Allowed"] = out["Trade Action"].eq("HOLD")
     out["Exit Now"] = out["Trade Action"].eq("EXIT")
@@ -234,6 +262,7 @@ def merge_dual_engine_latest(summary_df: pd.DataFrame, detail_df: pd.DataFrame) 
         "Symbol",
         "Iteration No",
         "CumsumDiff",
+        "TurningDiff",
         "Turning Regime",
         "Dual Engine State",
         "Trade Action",
@@ -244,7 +273,16 @@ def merge_dual_engine_latest(summary_df: pd.DataFrame, detail_df: pd.DataFrame) 
     latest = (
         detail_df.sort_values(["Symbol", "Iteration No"])
         .groupby("Symbol", as_index=False)
-        .tail(1)[["Symbol", "CumsumDiff", "Turning Regime", "Dual Engine State", "Trade Action"]]
+        .tail(1)[
+            [
+                "Symbol",
+                "CumsumDiff",
+                "TurningDiff",
+                "Turning Regime",
+                "Dual Engine State",
+                "Trade Action",
+            ]
+        ]
         .copy()
     )
     return summary_df.merge(latest, on="Symbol", how="left")
@@ -1249,6 +1287,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         "Balanced",
         "CumsumPlus",
         "CumsumDiff",
+        "TurningDiff",
         "10 Day Relative Volume",
         "Last5mVolume",
     ]:
@@ -1285,13 +1324,13 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
             if "Trade Action" in df_side.columns:
                 df_side = df_side[df_side["Trade Action"].isin(["ENTRY", "HOLD", "WAIT"])]
 
-            sort_cols = ["Trade Action Rank", "Directional", "Turning", "CumsumPlus", "CumsumDiff", "Stability"]
-            ascending = [True, False, True, False, False, False]
+            sort_cols = ["Trade Action Rank", "Directional", "Turning", "CumsumPlus", "CumsumDiff", "TurningDiff", "Stability"]
+            ascending = [True, False, True, False, False, True, False]
             df_side = df_side.sort_values(sort_cols, ascending=ascending, na_position="last")
         else:
             df_side = df_side[df_side["Directional"] < 0]
-            sort_cols = ["Directional", "Turning", "CumsumPlus", "Stability"]
-            ascending = [True, True, True, False]
+            sort_cols = ["Directional", "Turning", "CumsumPlus", "CumsumDiff", "TurningDiff", "Stability"]
+            ascending = [True, True, True, True, False, False]
             df_side = df_side.sort_values(sort_cols, ascending=ascending, na_position="last")
 
         return df_side
@@ -1321,6 +1360,7 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
         "Balanced",
         "CumsumPlus",
         "CumsumDiff",
+        "TurningDiff",
     ]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
@@ -1334,8 +1374,8 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     long_top = (
         df[df["Directional"] > 0]
         .sort_values(
-            ["Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"],
-            ascending=[True, False, True, False, False],
+            ["Iteration No", "Directional", "Turning", "CumsumPlus", "CumsumDiff", "TurningDiff", "Stability"],
+            ascending=[True, False, True, False, False, True, False],
             na_position="last",
         )
         .groupby("Iteration No", group_keys=False)
@@ -1346,8 +1386,8 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     short_top = (
         df[df["Directional"] < 0]
         .sort_values(
-            ["Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"],
-            ascending=[True, True, True, False, False],
+            ["Iteration No", "Directional", "Turning", "CumsumPlus", "CumsumDiff", "TurningDiff", "Stability"],
+            ascending=[True, True, True, True, False, False, False],
             na_position="last",
         )
         .groupby("Iteration No", group_keys=False)
@@ -1387,6 +1427,7 @@ def build_history_table(history_df: pd.DataFrame, side: str) -> str:
         "Directional",
         "Turning",
         "CumsumDiff",
+        "TurningDiff",
         "Turning Regime",
         "Dual Engine State",
         "Trade Action",
@@ -1411,7 +1452,7 @@ def build_history_table(history_df: pd.DataFrame, side: str) -> str:
         except Exception:
             num = None
 
-        if col in ["% Change", "Directional", "Balanced", "CumsumPlus", "CumsumDiff"]:
+        if col in ["% Change", "Directional", "Balanced", "CumsumPlus", "CumsumDiff", "TurningDiff"]:
             if num is not None:
                 if num > 0:
                     return base + "background:#14532d;color:#dcfce7;font-weight:600;"
@@ -1494,7 +1535,7 @@ def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 15) -> str:
         except Exception:
             num = None
 
-        if col in ["% Change", "Directional", "Balanced", "CumsumPlus", "CumsumDiff", "Bull_Signal", "Bear_Signal", "Overall_Signal"]:
+        if col in ["% Change", "Directional", "Balanced", "CumsumPlus", "CumsumDiff", "TurningDiff", "Bull_Signal", "Bear_Signal", "Overall_Signal"]:
             if num is not None:
                 if num > 0:
                     return base + "background:#14532d;color:#dcfce7;font-weight:600;"
@@ -1630,116 +1671,83 @@ def save_outputs(summary_df: pd.DataFrame, detail_df: pd.DataFrame, prefix: str 
     return summary_csv, detail_csv
 
 
-def build_velocity_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def _build_occurrence_table(detail_df: pd.DataFrame, last_n_iterations: Optional[int] = None, top_n: int = 10) -> pd.DataFrame:
     cols = [
         "Symbol",
-        "Peak Iteration",
-        "Peak Time",
-        "Velocity3",
-        "Velocity5",
-        "VelocityScore",
+        "Count",
         "CumsumPlusDiff",
-        "Stability",
+        "TurningDiff",
+        "First Occurrence",
+        "Current Iteration",
         "Status",
     ]
     empty = pd.DataFrame(columns=cols)
 
     if detail_df is None or detail_df.empty:
-        return empty, empty
-    if "Symbol" not in detail_df.columns or "Iteration No" not in detail_df.columns:
-        return empty, empty
+        return empty
 
-    rows_all = []
-    rows_last5 = []
+    required = {"Symbol", "Iteration No", "Iteration Time", "CumsumDiff", "TurningDiff"}
+    if not required.issubset(detail_df.columns):
+        return empty
 
-    for sym, g in detail_df.groupby("Symbol", sort=False):
-        g = g.copy().sort_values("Iteration No")
-        if "CumsumPlus" not in g.columns or "Stability" not in g.columns:
-            continue
+    df = detail_df.copy().sort_values(["Iteration No", "Symbol"]).reset_index(drop=True)
+    df["CumsumDiff"] = pd.to_numeric(df["CumsumDiff"], errors="coerce").fillna(0.0)
+    df["TurningDiff"] = pd.to_numeric(df["TurningDiff"], errors="coerce").fillna(0.0)
 
-        g["CumsumPlus"] = pd.to_numeric(g["CumsumPlus"], errors="coerce")
-        g["Stability"] = pd.to_numeric(g["Stability"], errors="coerce").replace(0, np.nan)
+    if last_n_iterations is not None:
+        last_iters = sorted(df["Iteration No"].dropna().astype(int).unique())[-last_n_iterations:]
+        df = df[df["Iteration No"].isin(last_iters)].copy()
 
-        g["CumsumPlusDiff"] = g["CumsumPlus"].diff().fillna(0.0)
-        g["Velocity3"] = g["CumsumPlusDiff"].rolling(3, min_periods=3).sum() / g["Stability"]
-        g["Velocity5"] = g["CumsumPlusDiff"].rolling(5, min_periods=5).sum() / g["Stability"]
-        g["VelocityScore"] = g[["Velocity3", "Velocity5"]].max(axis=1)
+    if df.empty:
+        return empty
 
-        valid = g[g["VelocityScore"].notna()].copy()
-        if valid.empty:
-            continue
+    active = df[(df["CumsumDiff"].abs() > 0) | (df["TurningDiff"].abs() > 0)].copy()
+    if active.empty:
+        return empty
 
-        push = valid["CumsumPlusDiff"] > 0
-        streak = 0
-        streak_map = []
-        prev = False
-        for flag in push.tolist():
-            if flag:
-                streak = streak + 1 if prev else 1
-                prev = True
-            else:
-                streak = 0
-                prev = False
-            streak_map.append(streak)
-        valid["PushStreak"] = streak_map
+    rows = []
+    for sym, g in active.groupby("Symbol", sort=False):
+        g = g.sort_values("Iteration No").copy()
 
-        best_idx = valid.sort_values(["VelocityScore", "Iteration No"], ascending=[False, False]).index[0]
-        best_row = valid.loc[best_idx]
+        first_time = str(g["Iteration Time"].iloc[0]) if "Iteration Time" in g.columns else ""
+        current_time = str(g["Iteration Time"].iloc[-1]) if "Iteration Time" in g.columns else ""
 
-        status = "Fresh Move" if int(best_row.get("PushStreak", 0)) <= 1 else "Continued Accumulation"
+        latest_cumsum = float(g["CumsumDiff"].iloc[-1])
+        latest_turning = float(g["TurningDiff"].iloc[-1])
 
-        row = {
-            "Symbol": sym,
-            "Peak Iteration": int(best_row["Iteration No"]),
-            "Peak Time": best_row["Iteration Time"] if "Iteration Time" in best_row else "",
-            "Velocity3": float(best_row["Velocity3"]) if pd.notna(best_row["Velocity3"]) else np.nan,
-            "Velocity5": float(best_row["Velocity5"]) if pd.notna(best_row["Velocity5"]) else np.nan,
-            "VelocityScore": float(best_row["VelocityScore"]) if pd.notna(best_row["VelocityScore"]) else np.nan,
-            "CumsumPlusDiff": float(best_row["CumsumPlusDiff"]) if pd.notna(best_row["CumsumPlusDiff"]) else np.nan,
-            "Stability": float(best_row["Stability"]) if pd.notna(best_row["Stability"]) else np.nan,
-            "Status": status,
-        }
+        rows.append(
+            {
+                "Symbol": sym,
+                "Count": int(len(g)),
+                "CumsumPlusDiff": latest_cumsum,
+                "TurningDiff": latest_turning,
+                "First Occurrence": first_time,
+                "Current Iteration": current_time,
+                "Status": classify_diff_status(latest_cumsum, latest_turning),
+            }
+        )
 
-        rows_all.append(row)
+    out = pd.DataFrame(rows, columns=cols)
+    if out.empty:
+        return empty
 
-        if len(valid) <= 5:
-            rows_last5.append(row)
-        else:
-            recent = valid.tail(5)
-            recent_best_idx = recent.sort_values(["VelocityScore", "Iteration No"], ascending=[False, False]).index[0]
-            recent_best_row = recent.loc[recent_best_idx]
-            recent_status = "Fresh Move" if int(recent_best_row.get("PushStreak", 0)) <= 1 else "Continued Accumulation"
+    out["_first_occ_sort"] = pd.to_datetime(out["First Occurrence"], format="%H:%M", errors="coerce")
+    out = out.sort_values(
+        ["_first_occ_sort", "Count", "CumsumPlusDiff", "TurningDiff"],
+        ascending=[False, False, False, True],
+        na_position="last",
+    ).drop(columns=["_first_occ_sort"])
 
-            rows_last5.append(
-                {
-                    "Symbol": sym,
-                    "Peak Iteration": int(recent_best_row["Iteration No"]),
-                    "Peak Time": recent_best_row["Iteration Time"] if "Iteration Time" in recent_best_row else "",
-                    "Velocity3": float(recent_best_row["Velocity3"]) if pd.notna(recent_best_row["Velocity3"]) else np.nan,
-                    "Velocity5": float(recent_best_row["Velocity5"]) if pd.notna(recent_best_row["Velocity5"]) else np.nan,
-                    "VelocityScore": float(recent_best_row["VelocityScore"]) if pd.notna(recent_best_row["VelocityScore"]) else np.nan,
-                    "CumsumPlusDiff": float(recent_best_row["CumsumPlusDiff"]) if pd.notna(recent_best_row["CumsumPlusDiff"]) else np.nan,
-                    "Stability": float(recent_best_row["Stability"]) if pd.notna(recent_best_row["Stability"]) else np.nan,
-                    "Status": recent_status,
-                }
-            )
-
-    out_all = pd.DataFrame(rows_all, columns=cols)
-    out_last5 = pd.DataFrame(rows_last5, columns=cols)
-
-    if not out_all.empty:
-        out_all = out_all.sort_values(["VelocityScore", "Peak Iteration"], ascending=[False, False]).reset_index(drop=True)
-    if not out_last5.empty:
-        out_last5 = out_last5.sort_values(["VelocityScore", "Peak Iteration"], ascending=[False, False]).reset_index(drop=True)
-
-    return out_all, out_last5
+    return out.head(top_n).reset_index(drop=True)
 
 
-def build_exceedance_tables(detail_df: pd.DataFrame):
-    return build_velocity_tables(detail_df)
+def build_exceedance_tables(detail_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    last10_df = _build_occurrence_table(detail_df, last_n_iterations=10, top_n=10)
+    all_df = _build_occurrence_table(detail_df, last_n_iterations=None, top_n=10)
+    return last10_df, all_df
 
 
-def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25) -> str:
+def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 10) -> str:
     if df is None or df.empty:
         return (
             f'<h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3>'
@@ -1753,29 +1761,40 @@ def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25
     def fmt(col, val):
         if pd.isna(val):
             return ""
-        if col in ["Symbol", "Status"]:
+        if col in ["Symbol", "Status", "First Occurrence", "Current Iteration"]:
             return str(val)
-        if "Gap" in col or "Velocity" in col or col in ["CumsumPlusDiff", "Stability"]:
-            return f"{float(val):.2f}"
-        if col in ["Peak Iteration", "First Occurrence", "Latest Iteration"]:
+        if col in ["Count"]:
             return str(int(float(val)))
+        if col in ["CumsumPlusDiff", "TurningDiff"]:
+            return f"{float(val):.2f}"
         return str(val)
 
     def cell_style(col, val):
         base = "padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;white-space:nowrap;"
-        if col == "Status":
-            label = str(val).strip()
-            if label == "Fresh Move":
-                return base + "background:#1d4ed8;color:#dbeafe;font-weight:700;"
-            if label == "Continued Accumulation":
-                return base + "background:#14532d;color:#dcfce7;font-weight:700;"
-            return base
-        if col in ["VelocityScore", "CumsumPlusDiff"]:
+
+        if col in ["CumsumPlusDiff", "TurningDiff"]:
             try:
-                if float(val) > 0:
-                    return base + "background:#3f6212;color:#ecfccb;font-weight:700;"
+                num = float(val)
+                if num > 0:
+                    return base + "background:#14532d;color:#dcfce7;font-weight:700;"
+                if num < 0:
+                    return base + "background:#7f1d1d;color:#fee2e2;font-weight:700;"
             except Exception:
                 pass
+            return base
+
+        if col == "Status":
+            bg = signal_color(val)
+            fg = text_color_for_bg(bg)
+            return base + f"background:{bg};color:{fg};font-weight:700;"
+
+        if col == "Count":
+            try:
+                if float(val) > 0:
+                    return base + "background:#1f2937;color:#f9fafb;font-weight:700;"
+            except Exception:
+                pass
+
         return base
 
     header = "".join(
@@ -1808,14 +1827,14 @@ def send_second_email_with_exceedance_tables(
 ) -> bool:
     try:
         scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        combo_html = build_exceedance_table_html(combo_df, "Peak Velocity Score - Last 5 Qualified Symbols", max_rows=25)
-        all_html = build_exceedance_table_html(all_iter_df, "Peak Velocity Score - All Symbols", max_rows=25)
+        combo_html = build_exceedance_table_html(combo_df, "Top 10 Symbols - Last 10 Iterations", max_rows=10)
+        all_html = build_exceedance_table_html(all_iter_df, "Top 10 Symbols - All Iterations", max_rows=10)
 
         html_body = f"""
         <html>
         <body style="margin:0;padding:20px;background:#030712;color:#e5e7eb;font-family:Arial,sans-serif;">
             <div style="max-width:1600px;margin:0 auto;">
-                <h2 style="margin:0 0 12px 0;color:#facc15;">Intraday Vol Iteration Alert - Peak Velocity Tables</h2>
+                <h2 style="margin:0 0 12px 0;color:#facc15;">Intraday Vol Iteration Alert - Diff Occurrence Tables</h2>
                 <div style="margin-bottom:18px;color:#cbd5e1;font-size:14px;">
                     Scan completed at {scan_time}
                 </div>
@@ -1834,7 +1853,7 @@ def send_second_email_with_exceedance_tables(
         """
 
         msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"Intraday Vol Iteration Alert - Peak Velocity Tables - {scan_time}"
+        msg["Subject"] = f"Intraday Vol Iteration Alert - Diff Occurrence Tables - {scan_time}"
         msg["From"] = sender_email
         msg["To"] = recipient_email
         msg.attach(MIMEText(html_body, "html", _charset="utf-8"))
@@ -1854,7 +1873,7 @@ def send_second_email_with_exceedance_tables(
             server.login(sender_email, sender_password)
             server.sendmail(sender_email, recipient_email, msg.as_string())
 
-        logger.info("Second peak velocity email sent successfully.")
+        logger.info("Second diff-occurrence email sent successfully.")
         return True
 
     except Exception as e:
@@ -1881,7 +1900,7 @@ def main():
 
     long_df, short_df = build_candidate_tables(summary_df)
     history_df = load_iteration_history(detail_df)
-    all_iter_exceed_df, combo_exceed_df = build_exceedance_tables(detail_df)
+    last10_occurrence_df, all_occurrence_df = build_exceedance_tables(detail_df)
 
     summary_csv, detail_csv = save_outputs(summary_df, detail_df, prefix="fno")
 
@@ -1894,8 +1913,8 @@ def main():
     )
 
     sent_second = send_second_email_with_exceedance_tables(
-        all_iter_df=all_iter_exceed_df,
-        combo_df=combo_exceed_df,
+        all_iter_df=all_occurrence_df,
+        combo_df=last10_occurrence_df,
         csv_filename=summary_csv,
         detail_csv_filename=detail_csv,
     )
