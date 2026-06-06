@@ -1316,21 +1316,25 @@ def build_occurrence_table(
 
 
 def build_exceedance_tables(detail_df: pd.DataFrame):
-    # Build the full best-chain table for all symbols (no iteration cut)
+    """
+    All-time: best chain per symbol over the whole detail_df.
+    Last-10: best chain per symbol whose START bar is in the last 10 iteration numbers.
+    """
+    # Build full best-chain table (no iteration cut)
     alltime_df = build_occurrence_table(detail_df, last_n_iterations=None, top_n=15)
 
     if alltime_df is None or alltime_df.empty:
+        # Nothing to do
         return alltime_df, alltime_df
 
-    # We need the mapping from Iteration Time -> Iteration No
+    # Build mapping Iteration Time -> Iteration No from the raw detail_df
     df = detail_df.copy()
     df["Iteration No"] = pd.to_numeric(df["Iteration No"], errors="coerce")
     df = df.dropna(subset=["Iteration No"])
     if df.empty or "Iteration Time" not in df.columns:
-        # Fallback: no time mapping possible, so just return the all-time table twice
-        return alltime_df, alltime_df
+        # Cannot map First Occurrence times back to iteration numbers
+        return alltime_df.copy(), alltime_df
 
-    # Build a unique mapping of time string -> iteration number
     iter_map = (
         df[["Iteration No", "Iteration Time"]]
         .dropna()
@@ -1339,11 +1343,10 @@ def build_exceedance_tables(detail_df: pd.DataFrame):
     iter_map["Iteration No"] = iter_map["Iteration No"].astype(int)
     iter_map["Iteration Time"] = iter_map["Iteration Time"].astype(str)
 
-    # Last 10 iterations in the whole day
+    # Last 10 iteration numbers in the whole day
     last_iters = sorted(iter_map["Iteration No"].unique())[-10:]
 
-    # For each chain, recover its start iteration from First Occurrence time
-    # (First Occurrence is a time string like "14:45")
+    # Map First Occurrence time (string) to its Iteration No
     merged = alltime_df.copy()
     merged = merged.merge(
         iter_map.drop_duplicates(subset=["Iteration Time"]),
@@ -1353,16 +1356,26 @@ def build_exceedance_tables(detail_df: pd.DataFrame):
         suffixes=("", "_mapped"),
     )
 
-    # Filter to chains whose START iteration is in the last 10 iterations
+    # Keep only chains whose START iteration lies in the last 10
     recent10_df = merged[merged["Iteration No"].isin(last_iters)].copy()
 
-    # Keep the same columns as the original occurrence table
-    keep_cols = ["Symbol", "Count", "CumsumPlusDiff", "TurningDiff",
-                 "First Occurrence", "Current Iteration", "Status"]
-    recent10_df = recent10_df[keep_cols]
+    # Keep same public columns
+    keep_cols = [
+        "Symbol",
+        "Count",
+        "CumsumPlusDiff",
+        "TurningDiff",
+        "First Occurrence",
+        "Current Iteration",
+        "Status",
+    ]
+    if not recent10_df.empty:
+        recent10_df = recent10_df[keep_cols]
+    else:
+        recent10_df = pd.DataFrame(columns=keep_cols)
 
     return recent10_df, alltime_df
-    
+
 
 def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     if detail_df is None or detail_df.empty:
@@ -1606,59 +1619,81 @@ def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25
         "</table></div>"
     )
 
+send_email_with_tables(...) and edit the HTML body so it does not include “Last 15 Iterations – Top 1 Candidates”. You can also stop building the history HTML.
+
+Before (pattern):
+
+python
+history_long_html = build_history_table(history_df, "long")
+history_short_html = build_history_table(history_df, "short")
+long_html = build_html_table(long_df, "Current Long Candidates", maxrows=15)
+short_html = build_html_table(short_df, "Current Short Candidates", maxrows=15)
+
+html_body = f"""
+<html>
+  <body ...>
+    <h2>Intraday Vol Iteration Alert</h2>
+    <p>Scan completed at {scan_time}</p>
+
+    <h2>Last 15 Iterations - Top 1 Candidates</h2>
+    {history_long_html}
+    {history_short_html}
+
+    <h2>Current Long Candidates</h2>
+    {long_html}
+
+    <h2>Current Short Candidates</h2>
+    {short_html}
+  </body>
+</html>
+"""
+
 def send_email_with_tables(
     long_df: pd.DataFrame,
     short_df: pd.DataFrame,
     history_df: pd.DataFrame,
     csv_filename: str = "",
-    detail_csv_filename: str = ""
+    detail_csv_filename: str = "",
 ) -> bool:
     try:
         scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        history_long_html = build_history_table(history_df, "long")
-        history_short_html = build_history_table(history_df, "short")
-
-        long_html = build_html_table(long_df, "Current Long Candidates", max_rows=15)
-        short_html = build_html_table(short_df, "Current Short Candidates", max_rows=15)
+        # We ignore history_df for the email body now; only current long/short
+        long_html = build_html_table(long_df, "Current Long Candidates", maxrows=15)
+        short_html = build_html_table(short_df, "Current Short Candidates", maxrows=15)
 
         html_body = f"""
-        <html>
-        <body style="margin:0;padding:20px;background:#030712;color:#e5e7eb;font-family:Arial,sans-serif;">
-            <div style="max-width:1600px;margin:0 auto;">
-                <h2 style="margin:0 0 12px 0;color:#facc15;">Intraday Vol Iteration Alert</h2>
-                <div style="margin-bottom:18px;color:#cbd5e1;font-size:14px;">
-                    Scan completed at {scan_time}
-                </div>
+<html>
+  <body style="font-family: Arial, sans-serif; font-size: 14px;">
+    <h2>Intraday Vol Iteration Alert</h2>
+    <p>Scan completed at {scan_time}</p>
 
-                <div style="margin-bottom:24px;padding:14px;border:1px solid #374151;background:#111827;border-radius:10px;">
-                    <h2 style="margin:0 0 14px 0;color:#facc15;">Last 15 Iterations - Top 1 Candidates</h2>
-                    {history_long_html}
-                    <div style="height:14px;"></div>
-                    {history_short_html}
-                </div>
+    <h2>Current Long Candidates</h2>
+    {long_html}
 
-                <div style="margin-bottom:24px;padding:14px;border:1px solid #374151;background:#111827;border-radius:10px;">
-                    {long_html}
-                </div>
+    <h2>Current Short Candidates</h2>
+    {short_html}
+  </body>
+</html>
+"""
 
-                <div style="margin-bottom:24px;padding:14px;border:1px solid #374151;background:#111827;border-radius:10px;">
-                    {short_html}
-                </div>
-
-                <div style="margin-top:18px;color:#94a3b8;font-size:12px;">
-                    Generated by FO_FNO_FYERS_VOL_REL_EMAIL.py
-                </div>
-            </div>
-        </body>
-        </html>
-        """
-
-        msg = MIMEMultipart("alternative")
-        msg["Subject"] = f"Intraday Vol Iteration Alert - {scan_time}"
+        msg = MIMEMultipart()
         msg["From"] = sender_email
         msg["To"] = recipient_email
-        msg.attach(MIMEText(html_body, "html", _charset="utf-8"))
+        msg["Subject"] = f"Intraday Vol Iteration Alert - {scan_time}"
+        msg.attach(MIMEText(html_body, "html"))
+
+        # keep your existing attachment logic, if any
+        ...
+
+
+        msg = MIMEMultipart()
+        msg["From"] = sender_email
+        msg["To"] = recipient_email
+        msg["Subject"] = f"Intraday Vol Iteration Alert - {scan_time}"
+        msg.attach(MIMEText(html_body, "html"))
+
+        
 
         for fname in [csv_filename, detail_csv_filename]:
             if not fname or not os.path.exists(fname):
