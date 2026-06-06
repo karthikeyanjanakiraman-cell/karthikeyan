@@ -1178,10 +1178,6 @@ def build_occurrence_table(
     top_n: int = 15,
     eps: float = 1e-4,
 ) -> pd.DataFrame:
-    # -------------------------------------------------------------
-    # FIXED: PURE BACKWARD ITERATION OVER ALL VALID BLOCKS
-    # Completely separates the "Last 10" from "All Time" tables
-    # -------------------------------------------------------------
     cols = [
         "Symbol",
         "Count",
@@ -1196,13 +1192,25 @@ def build_occurrence_table(
     if detail_df is None or detail_df.empty:
         return empty
 
-    required = {"Symbol", "Iteration No", "Iteration Time", "CumsumDiff", "TurningDiff", "Dual Engine State"}
+    required = {
+        "Symbol",
+        "Iteration No",
+        "Iteration Time",
+        "CumsumDiff",
+        "TurningDiff",
+        "Dual Engine State",
+    }
     if not required.issubset(detail_df.columns):
         return empty
 
     df = detail_df.copy()
     df["Iteration No"] = pd.to_numeric(df["Iteration No"], errors="coerce")
+    df["CumsumDiff"] = pd.to_numeric(df["CumsumDiff"], errors="coerce")
+    df["TurningDiff"] = pd.to_numeric(df["TurningDiff"], errors="coerce")
     df = df.dropna(subset=["Iteration No"]).sort_values(["Symbol", "Iteration No"]).reset_index(drop=True)
+
+    if df.empty:
+        return empty
 
     if last_n_iterations is not None:
         last_iters = sorted(df["Iteration No"].astype(int).unique())[-last_n_iterations:]
@@ -1219,78 +1227,82 @@ def build_occurrence_table(
         if g.empty:
             continue
 
-        # Find contiguous blocks of valid states in the targeted timeframe
-        is_valid = g["Dual Engine State"].isin(valid_states)
-        streak_id = (~is_valid).cumsum()
-        
-        best_streak = None
-        
-        # Iterate over every active valid block in this window
-        for s_id, group in g[is_valid].groupby(streak_id):
-            if group.empty:
-                continue
-                
-            block_indices = group.index.tolist()
-            
-            # Start tracing backwards from the very end of this valid block
-            end_idx = block_indices[-1]
-            chain_idx = []
-            idx = end_idx
-            
-            # Trace backward to count the streak until we hit inception
-            while idx >= block_indices[0]:
-                state = str(g["Dual Engine State"].iloc[idx]).strip()
-                chain_idx.append(idx)
-                
-                if state == "PRISTINE_BREAKOUT":
-                    break
-                    
-                idx -= 1
-                
-            chain = g.iloc[sorted(chain_idx)].copy()
-            
-            # Dead baseline filter (ignores flatlines with no accumulation)
-            if chain["CumsumDiff"].max() <= eps:
+        best = None
+
+        for end_idx in range(len(g)):
+            row = g.iloc[end_idx]
+            state = str(row["Dual Engine State"]).strip()
+
+            if state not in valid_states:
                 continue
 
+            chain_idx = []
+            idx = end_idx
+
+            while idx >= 0:
+                r = g.iloc[idx]
+                st = str(r["Dual Engine State"]).strip()
+                csum_diff = float(r["CumsumDiff"]) if pd.notna(r["CumsumDiff"]) else 0.0
+
+                if st not in valid_states:
+                    break
+
+                if csum_diff <= eps and st != "HEALTHY_PAUSE":
+                    break
+
+                chain_idx.append(idx)
+
+                if st == "PRISTINE_BREAKOUT":
+                    break
+
+                idx -= 1
+
+            if not chain_idx:
+                continue
+
+            chain = g.iloc[sorted(chain_idx)].copy()
             latest = chain.iloc[-1]
+
             cand = {
                 "Symbol": sym,
                 "Count": int(len(chain)),
-                "CumsumPlusDiff": float(latest["CumsumDiff"]),
-                "TurningDiff": float(latest["TurningDiff"]),
-                "First Occurrence": str(chain["Iteration Time"].iloc[0]),
-                "Current Iteration": str(chain["Iteration Time"].iloc[-1]),
+                "CumsumPlusDiff": float(latest["CumsumDiff"]) if pd.notna(latest["CumsumDiff"]) else 0.0,
+                "TurningDiff": float(latest["TurningDiff"]) if pd.notna(latest["TurningDiff"]) else 0.0,
+                "First Occurrence": str(chain.iloc[0]["Iteration Time"]),
+                "Current Iteration": str(chain.iloc[-1]["Iteration Time"]),
                 "Status": str(latest["Dual Engine State"]).strip(),
+                "_end_iter": int(latest["Iteration No"]),
             }
-            
-            # Select the absolute strongest streak for this symbol in this time window
-            if best_streak is None:
-                best_streak = cand
+
+            if best is None:
+                best = cand
             else:
-                if cand["CumsumPlusDiff"] > best_streak["CumsumPlusDiff"]:
-                    best_streak = cand
-                elif cand["CumsumPlusDiff"] == best_streak["CumsumPlusDiff"] and cand["TurningDiff"] < best_streak["TurningDiff"]:
-                    best_streak = cand
+                if cand["Count"] > best["Count"]:
+                    best = cand
+                elif cand["Count"] == best["Count"]:
+                    if cand["CumsumPlusDiff"] > best["CumsumPlusDiff"]:
+                        best = cand
+                    elif cand["CumsumPlusDiff"] == best["CumsumPlusDiff"]:
+                        if cand["TurningDiff"] < best["TurningDiff"]:
+                            best = cand
+                        elif cand["TurningDiff"] == best["TurningDiff"]:
+                            if cand["_end_iter"] > best["_end_iter"]:
+                                best = cand
 
-        if best_streak is not None:
-            rows.append(best_streak)
+        if best is not None:
+            rows.append(best)
 
-    out = pd.DataFrame(rows, columns=cols)
+    out = pd.DataFrame(rows)
     if out.empty:
         return empty
 
-    # -------------------------------------------------------------
-    # SORTING: Strictly by Highest CumsumPlusDiff, then Lowest TurningDiff
-    # -------------------------------------------------------------
     out = out.sort_values(
-        ["CumsumPlusDiff", "TurningDiff", "Count"],
-        ascending=[False, True, False],
+        ["Count", "CumsumPlusDiff", "TurningDiff", "_end_iter"],
+        ascending=[False, False, True, False],
         na_position="last",
-    )
-    
-    return out.head(top_n).reset_index(drop=True)
+    ).head(top_n).reset_index(drop=True)
 
+    return out[cols]
 
 def build_exceedance_tables(detail_df: pd.DataFrame):
     recent_10_df = build_occurrence_table(detail_df, last_n_iterations=10, top_n=15)
