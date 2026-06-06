@@ -1767,12 +1767,12 @@ def main():
         detail_csv_filename=detail_csv
     )
 
-    # sent_second = send_second_email_with_exceedance_tables(
-    #    recent_10_df=recent_10_exceed_df,
-    #    all_time_df=all_time_exceed_df,
-    #    csv_filename=summary_csv,
-    #    detail_csv_filename=detail_csv
-    # )
+    sent_second = send_second_email_with_exceedance_tables(
+       recent_10_df=recent_10_exceed_df,
+       all_time_df=all_time_exceed_df,
+       csv_filename=summary_csv,
+       detail_csv_filename=detail_csv
+    )
 
     if sent and sent_second:
         logger.info("Scan and both emails completed.")
