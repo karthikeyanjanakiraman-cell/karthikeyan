@@ -1217,8 +1217,30 @@ def build_occurrence_table(
     min_iter_no = max(1, max_iter_no - 9)
     last_10_iter_set = set(range(min_iter_no, max_iter_no + 1))
 
-    valid_states = {"PRISTINE_BREAKOUT", "ACTIVE_CONTINUATION"}
+    valid_end_states = {"PRISTINE_BREAKOUT", "ACTIVE_CONTINUATION"}
     all_records = []
+
+    def build_positive_chain(gsym: pd.DataFrame, end_iter_no: int) -> pd.DataFrame:
+        chain_parts = []
+        curr = end_iter_no
+
+        while True:
+            hit = gsym[gsym["Iteration No"] == curr]
+            if hit.empty:
+                break
+
+            r = hit.iloc[-1]
+            cd = float(r["CumsumDiff"]) if pd.notna(r["CumsumDiff"]) else 0.0
+            if cd <= eps:
+                break
+
+            chain_parts.append(r)
+            curr -= 1
+
+        if not chain_parts:
+            return pd.DataFrame()
+
+        return pd.DataFrame(chain_parts).sort_values("Iteration No").reset_index(drop=True)
 
     for sym, g in df.groupby("Symbol", sort=False):
         g = g.sort_values("Iteration No").reset_index(drop=True)
@@ -1233,32 +1255,14 @@ def build_occurrence_table(
             for _, row in g_window.sort_values("Iteration No", ascending=False).iterrows():
                 state = str(row["Dual Engine State"]).strip()
                 cdiff = float(row["CumsumDiff"]) if pd.notna(row["CumsumDiff"]) else 0.0
-                if state not in valid_states or cdiff <= eps:
+
+                if state not in valid_end_states or cdiff <= eps:
                     continue
 
                 curr_iter_no = int(row["Iteration No"])
-                chain_rows = [row]
-                prev_iter_no = curr_iter_no - 1
-
-                while True:
-                    prev_match = g[g["Iteration No"] == prev_iter_no]
-                    if prev_match.empty:
-                        break
-
-                    prev_row = prev_match.iloc[-1]
-                    prev_state = str(prev_row["Dual Engine State"]).strip()
-                    prev_cdiff = float(prev_row["CumsumDiff"]) if pd.notna(prev_row["CumsumDiff"]) else 0.0
-
-                    if prev_state not in valid_states or prev_cdiff <= eps:
-                        break
-
-                    chain_rows.append(prev_row)
-                    if prev_state == "PRISTINE_BREAKOUT":
-                        break
-
-                    prev_iter_no -= 1
-
-                chain_df = pd.DataFrame(chain_rows).sort_values("Iteration No")
+                chain_df = build_positive_chain(g, curr_iter_no)
+                if chain_df.empty:
+                    continue
 
                 all_records.append({
                     "Symbol": sym,
@@ -1278,32 +1282,15 @@ def build_occurrence_table(
             for _, row in g.sort_values("Iteration No", ascending=True).iterrows():
                 state = str(row["Dual Engine State"]).strip()
                 cdiff = float(row["CumsumDiff"]) if pd.notna(row["CumsumDiff"]) else 0.0
-                if state not in valid_states or cdiff <= eps:
+
+                if state not in valid_end_states or cdiff <= eps:
                     continue
 
                 curr_iter_no = int(row["Iteration No"])
-                chain_rows = [row]
-                prev_iter_no = curr_iter_no - 1
+                chain_df = build_positive_chain(g, curr_iter_no)
+                if chain_df.empty:
+                    continue
 
-                while True:
-                    prev_match = g[g["Iteration No"] == prev_iter_no]
-                    if prev_match.empty:
-                        break
-
-                    prev_row = prev_match.iloc[-1]
-                    prev_state = str(prev_row["Dual Engine State"]).strip()
-                    prev_cdiff = float(prev_row["CumsumDiff"]) if pd.notna(prev_row["CumsumDiff"]) else 0.0
-
-                    if prev_state not in valid_states or prev_cdiff <= eps:
-                        break
-
-                    chain_rows.append(prev_row)
-                    if prev_state == "PRISTINE_BREAKOUT":
-                        break
-
-                    prev_iter_no -= 1
-
-                chain_df = pd.DataFrame(chain_rows).sort_values("Iteration No")
                 first_row = chain_df.iloc[0]
 
                 symbol_records.append({
