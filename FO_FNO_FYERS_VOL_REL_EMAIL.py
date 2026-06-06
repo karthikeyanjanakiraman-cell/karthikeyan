@@ -1224,56 +1224,98 @@ def build_occurrence_table(
         if time_window == "last_10":
             start_idx = max(0, n - 10)
             iter_indices = range(n - 1, start_idx - 1, -1)
-        else:
-            iter_indices = range(0, n)
 
-        symbol_records = []
+            for i in iter_indices:
+                row = g.iloc[i]
+                state = str(row["Dual Engine State"]).strip()
 
-        for i in iter_indices:
-            row = g.iloc[i]
-            state = str(row["Dual Engine State"]).strip()
+                if state not in valid_states:
+                    continue
 
-            if state not in valid_states:
-                continue
+                chain_idx = []
+                idx = i
 
-            chain_idx = []
-            idx = i
+                while idx >= 0:
+                    st = str(g.iloc[idx]["Dual Engine State"]).strip()
+                    if st not in valid_states:
+                        break
+                    chain_idx.append(idx)
+                    if st == "PRISTINE_BREAKOUT":
+                        break
+                    idx -= 1
 
-            while idx >= 0:
-                st = str(g.iloc[idx]["Dual Engine State"]).strip()
-                if st not in valid_states:
-                    break
-                chain_idx.append(idx)
-                if st == "PRISTINE_BREAKOUT":
-                    break
-                idx -= 1
+                if not chain_idx:
+                    continue
 
-            if not chain_idx:
-                continue
+                chain = g.iloc[sorted(chain_idx)].copy()
 
-            chain = g.iloc[sorted(chain_idx)].copy()
+                if chain["CumsumDiff"].max() <= eps:
+                    continue
 
-            if chain["CumsumDiff"].max() <= eps:
-                continue
-
-            record = {
-                "Symbol": sym,
-                "Count": int(len(chain)),
-                "CumsumPlusDiff": float(row["CumsumDiff"]),
-                "TurningDiff": float(row["TurningDiff"]),
-                "First Occurrence": str(chain.iloc[0]["Iteration Time"]),
-                "Current Iteration": str(row["Iteration Time"]),
-                "Status": state,
-                "Iteration No": int(row["Iteration No"]),
-            }
-
-            if time_window == "last_10":
-                symbol_records = [record]
+                all_records.append({
+                    "Symbol": sym,
+                    "Count": int(len(chain)),
+                    "CumsumPlusDiff": float(row["CumsumDiff"]),
+                    "TurningDiff": float(row["TurningDiff"]),
+                    "First Occurrence": str(chain.iloc[0]["Iteration Time"]),
+                    "Current Iteration": str(row["Iteration Time"]),
+                    "Status": state,
+                    "Iteration No": int(row["Iteration No"]),
+                })
                 break
 
-            symbol_records.append(record)
+        else:
+            symbol_records = []
 
-        all_records.extend(symbol_records)
+            for i in range(0, n):
+                row = g.iloc[i]
+                state = str(row["Dual Engine State"]).strip()
+
+                if state not in valid_states:
+                    continue
+
+                chain_idx = []
+                idx = i
+
+                while idx >= 0:
+                    st = str(g.iloc[idx]["Dual Engine State"]).strip()
+                    if st not in valid_states:
+                        break
+                    chain_idx.append(idx)
+                    if st == "PRISTINE_BREAKOUT":
+                        break
+                    idx -= 1
+
+                if not chain_idx:
+                    continue
+
+                chain = g.iloc[sorted(chain_idx)].copy()
+
+                if chain["CumsumDiff"].max() <= eps:
+                    continue
+
+                symbol_records.append({
+                    "Symbol": sym,
+                    "Count": int(len(chain)),
+                    "CumsumPlusDiff": float(row["CumsumDiff"]),
+                    "TurningDiff": float(row["TurningDiff"]),
+                    "First Occurrence": str(chain.iloc[0]["Iteration Time"]),
+                    "Current Iteration": str(row["Iteration Time"]),
+                    "Status": state,
+                    "Iteration No": int(row["Iteration No"]),
+                })
+
+            if symbol_records:
+                best = (
+                    pd.DataFrame(symbol_records)
+                    .sort_values(
+                        ["CumsumPlusDiff", "TurningDiff", "Count", "Iteration No"],
+                        ascending=[False, True, False, False],
+                    )
+                    .iloc[0]
+                    .to_dict()
+                )
+                all_records.append(best)
 
     rec_df = pd.DataFrame(all_records)
     if rec_df.empty:
@@ -1285,15 +1327,7 @@ def build_occurrence_table(
             ascending=[False, False, True, False],
         )
     else:
-        best_records = []
-        for sym, grp in rec_df.groupby("Symbol", sort=False):
-            best = grp.sort_values(
-                ["CumsumPlusDiff", "TurningDiff", "Count", "Iteration No"],
-                ascending=[False, True, False, False],
-            ).iloc[0]
-            best_records.append(best)
-
-        out = pd.DataFrame(best_records).sort_values(
+        out = rec_df.sort_values(
             ["CumsumPlusDiff", "TurningDiff", "Count", "Iteration No"],
             ascending=[False, True, False, False],
         )
