@@ -1314,6 +1314,12 @@ def build_occurrence_table(
 
     return out[cols]
 
+
+def build_exceedance_tables(detail_df: pd.DataFrame):
+    recent10_df = build_occurrence_table(detail_df, last_n_iterations=10, top_n=15)
+    alltime_df = build_occurrence_table(detail_df, last_n_iterations=None, top_n=15)
+    return recent10_df, alltime_df
+
 def build_exceedance_tables(detail_df: pd.DataFrame):
     recent10_df = build_occurrence_table(detail_df, last_n_iterations=10, top_n=15)
     alltime_df = build_occurrence_table(detail_df, last_n_iterations=None, top_n=15)
