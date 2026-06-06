@@ -1320,46 +1320,33 @@ def build_exceedance_tables(detail_df: pd.DataFrame):
     All-time: best chain per symbol over the whole detail_df.
     Last-10: best chain per symbol whose START bar is in the last 10 iteration numbers.
     """
-    # Build full best-chain table (no iteration cut)
     alltime_df = build_occurrence_table(detail_df, last_n_iterations=None, top_n=15)
 
     if alltime_df is None or alltime_df.empty:
-        # Nothing to do
         return alltime_df, alltime_df
 
-    # Build mapping Iteration Time -> Iteration No from the raw detail_df
     df = detail_df.copy()
     df["Iteration No"] = pd.to_numeric(df["Iteration No"], errors="coerce")
     df = df.dropna(subset=["Iteration No"])
     if df.empty or "Iteration Time" not in df.columns:
-        # Cannot map First Occurrence times back to iteration numbers
         return alltime_df.copy(), alltime_df
 
-    iter_map = (
-        df[["Iteration No", "Iteration Time"]]
-        .dropna()
-        .copy()
-    )
+    iter_map = df[["Iteration No", "Iteration Time"]].dropna().copy()
     iter_map["Iteration No"] = iter_map["Iteration No"].astype(int)
     iter_map["Iteration Time"] = iter_map["Iteration Time"].astype(str)
 
-    # Last 10 iteration numbers in the whole day
     last_iters = sorted(iter_map["Iteration No"].unique())[-10:]
 
-    # Map First Occurrence time (string) to its Iteration No
     merged = alltime_df.copy()
     merged = merged.merge(
         iter_map.drop_duplicates(subset=["Iteration Time"]),
         left_on="First Occurrence",
         right_on="Iteration Time",
         how="left",
-        suffixes=("", "_mapped"),
     )
 
-    # Keep only chains whose START iteration lies in the last 10
     recent10_df = merged[merged["Iteration No"].isin(last_iters)].copy()
 
-    # Keep same public columns
     keep_cols = [
         "Symbol",
         "Count",
@@ -1375,7 +1362,6 @@ def build_exceedance_tables(detail_df: pd.DataFrame):
         recent10_df = pd.DataFrame(columns=keep_cols)
 
     return recent10_df, alltime_df
-
 
 def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     if detail_df is None or detail_df.empty:
@@ -1619,34 +1605,7 @@ def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25
         "</table></div>"
     )
 
-send_email_with_tables(...) and edit the HTML body so it does not include “Last 15 Iterations – Top 1 Candidates”. You can also stop building the history HTML.
 
-Before (pattern):
-
-python
-history_long_html = build_history_table(history_df, "long")
-history_short_html = build_history_table(history_df, "short")
-long_html = build_html_table(long_df, "Current Long Candidates", maxrows=15)
-short_html = build_html_table(short_df, "Current Short Candidates", maxrows=15)
-
-html_body = f"""
-<html>
-  <body ...>
-    <h2>Intraday Vol Iteration Alert</h2>
-    <p>Scan completed at {scan_time}</p>
-
-    <h2>Last 15 Iterations - Top 1 Candidates</h2>
-    {history_long_html}
-    {history_short_html}
-
-    <h2>Current Long Candidates</h2>
-    {long_html}
-
-    <h2>Current Short Candidates</h2>
-    {short_html}
-  </body>
-</html>
-"""
 
 def send_email_with_tables(
     long_df: pd.DataFrame,
@@ -1658,7 +1617,7 @@ def send_email_with_tables(
     try:
         scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        # We ignore history_df for the email body now; only current long/short
+        # Only current long/short in the email body
         long_html = build_html_table(long_df, "Current Long Candidates", maxrows=15)
         short_html = build_html_table(short_df, "Current Short Candidates", maxrows=15)
 
@@ -1683,19 +1642,8 @@ def send_email_with_tables(
         msg["Subject"] = f"Intraday Vol Iteration Alert - {scan_time}"
         msg.attach(MIMEText(html_body, "html"))
 
-        # keep your existing attachment logic, if any
-        ...
-
-
-        msg = MIMEMultipart()
-        msg["From"] = sender_email
-        msg["To"] = recipient_email
-        msg["Subject"] = f"Intraday Vol Iteration Alert - {scan_time}"
-        msg.attach(MIMEText(html_body, "html"))
-
-        
-
-        for fname in [csv_filename, detail_csv_filename]:
+        # Attach CSVs if provided
+        for fname in (csv_filename, detail_csv_filename):
             if not fname or not os.path.exists(fname):
                 continue
             with open(fname, "rb") as f:
@@ -1704,7 +1652,7 @@ def send_email_with_tables(
             encoders.encode_base64(part)
             part.add_header(
                 "Content-Disposition",
-                f'attachment; filename="{os.path.basename(fname)}"'
+                f"attachment; filename={os.path.basename(fname)}",
             )
             msg.attach(part)
 
@@ -1715,11 +1663,9 @@ def send_email_with_tables(
 
         logger.info("Email sent successfully.")
         return True
-
     except Exception as e:
         logger.error(f"EMAIL Error: {e}")
         return False
-
 
 def save_outputs(summary_df: pd.DataFrame, detail_df: pd.DataFrame, prefix: str = "scan") -> Tuple[str, str]:
     ts = datetime.now().strftime("%Y%m%d_%H%M")
