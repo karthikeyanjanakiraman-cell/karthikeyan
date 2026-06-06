@@ -252,6 +252,7 @@ def merge_dual_engine_latest(summary_df: pd.DataFrame, detail_df: pd.DataFrame) 
     )
     return summary_df.merge(latest, on="Symbol", how="left")
 
+
 def init_fyers():
     global fyers
     try:
@@ -901,6 +902,7 @@ def compute_iteration_volume_profile(
     summary.update(signals)
     return summary, detail_df
 
+
 def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
     symbols = load_fno_symbols_from_sectors("sectors")
     if not symbols:
@@ -1174,7 +1176,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
 
 def build_occurrence_table(
     detail_df: pd.DataFrame,
-    last_n_iterations: Optional[int] = None,
+    time_window: str = "all",
     top_n: int = 15,
     eps: float = 1e-4,
 ) -> pd.DataFrame:
@@ -1200,88 +1202,84 @@ def build_occurrence_table(
     df["Iteration No"] = pd.to_numeric(df["Iteration No"], errors="coerce")
     df = df.dropna(subset=["Iteration No"]).sort_values(["Symbol", "Iteration No"]).reset_index(drop=True)
 
-    if last_n_iterations is not None:
-        last_iters = sorted(df["Iteration No"].astype(int).unique())[-last_n_iterations:]
-        df = df[df["Iteration No"].astype(int).isin(last_iters)].copy()
-
     if df.empty:
         return empty
 
+    max_iter = int(df["Iteration No"].max())
     valid_states = {"PRISTINE_BREAKOUT", "ACTIVE_CONTINUATION", "HEALTHY_PAUSE"}
-    rows = []
+    all_records = []
 
+    # FORWARD ITERATION: Evaluate every single bar from 0 to N
     for sym, g in df.groupby("Symbol", sort=False):
         g = g.sort_values("Iteration No").reset_index(drop=True)
-        if g.empty:
-            continue
 
-        is_valid = g["Dual Engine State"].isin(valid_states)
-        streak_id = (~is_valid).cumsum()
-        
-        best_streak = None
-        
-        for s_id, group in g[is_valid].groupby(streak_id):
-            if group.empty:
+        for i in range(len(g)):
+            row = g.iloc[i]
+            state = str(row["Dual Engine State"]).strip()
+
+            if state not in valid_states:
                 continue
-                
-            block_indices = group.index.tolist()
-            
-            end_idx = block_indices[-1]
+
             chain_idx = []
-            idx = end_idx
-            
-            while idx >= block_indices[0]:
-                state = str(g["Dual Engine State"].iloc[idx]).strip()
-                chain_idx.append(idx)
-                
-                if state == "PRISTINE_BREAKOUT":
+            idx = i
+
+            # From the current forward iteration, trace backward to find inception
+            while idx >= 0:
+                st = str(g["Dual Engine State"].iloc[idx]).strip()
+                if st not in valid_states:
                     break
-                    
+                chain_idx.append(idx)
+                if st == "PRISTINE_BREAKOUT":
+                    break
                 idx -= 1
-                
+
+            if not chain_idx:
+                continue
+
             chain = g.iloc[sorted(chain_idx)].copy()
-            
+
             if chain["CumsumDiff"].max() <= eps:
                 continue
 
-            latest = chain.iloc[-1]
-            cand = {
+            all_records.append({
                 "Symbol": sym,
                 "Count": int(len(chain)),
-                "CumsumPlusDiff": float(latest["CumsumDiff"]),
-                "TurningDiff": float(latest["TurningDiff"]),
-                "First Occurrence": str(chain["Iteration Time"].iloc[0]),
-                "Current Iteration": str(chain["Iteration Time"].iloc[-1]),
-                "Status": str(latest["Dual Engine State"]).strip(),
-            }
-            
-            if best_streak is None:
-                best_streak = cand
-            else:
-                if cand["CumsumPlusDiff"] > best_streak["CumsumPlusDiff"]:
-                    best_streak = cand
-                elif cand["CumsumPlusDiff"] == best_streak["CumsumPlusDiff"] and cand["TurningDiff"] < best_streak["TurningDiff"]:
-                    best_streak = cand
+                "CumsumPlusDiff": float(row["CumsumDiff"]),
+                "TurningDiff": float(row["TurningDiff"]),
+                "First Occurrence": str(chain.iloc[0]["Iteration Time"]),
+                "Current Iteration": str(row["Iteration Time"]),
+                "Status": state,
+                "Iteration No": int(row["Iteration No"])
+            })
 
-        if best_streak is not None:
-            rows.append(best_streak)
-
-    out = pd.DataFrame(rows, columns=cols)
-    if out.empty:
+    rec_df = pd.DataFrame(all_records)
+    if rec_df.empty:
         return empty
 
-    out = out.sort_values(
+    # Time window filter logic
+    if time_window == "last_10":
+        rec_df = rec_df[rec_df["Iteration No"] > max_iter - 10]
+
+    if rec_df.empty:
+        return empty
+
+    # Get the absolute highest momentum record for each symbol in the allowed time window
+    best_records = []
+    for sym, grp in rec_df.groupby("Symbol"):
+        best = grp.sort_values(["CumsumPlusDiff", "TurningDiff", "Count"], ascending=[False, True, False]).iloc[0]
+        best_records.append(best)
+
+    out = pd.DataFrame(best_records).sort_values(
         ["CumsumPlusDiff", "TurningDiff", "Count"],
-        ascending=[False, True, False],
-        na_position="last",
+        ascending=[False, True, False]
     )
-    
-    return out.head(top_n).reset_index(drop=True)
+
+    return out[cols].head(top_n).reset_index(drop=True)
 
 
 def build_exceedance_tables(detail_df: pd.DataFrame):
-    recent_10_df = build_occurrence_table(detail_df, last_n_iterations=10, top_n=15)
-    all_time_df = build_occurrence_table(detail_df, last_n_iterations=None, top_n=15)
+    recent_10_df = build_occurrence_table(detail_df, time_window="last_10", top_n=15)
+    all_time_df = build_occurrence_table(detail_df, time_window="all", top_n=15)
     return recent_10_df, all_time_df
 
 
@@ -1527,6 +1525,7 @@ def build_exceedance_table_html(df: pd.DataFrame, title: str, max_rows: int = 25
         "</table></div>"
     )
 
+
 def send_email_with_tables(
     long_df: pd.DataFrame,
     short_df: pd.DataFrame,
@@ -1724,3 +1723,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
