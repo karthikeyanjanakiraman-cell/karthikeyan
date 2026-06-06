@@ -1618,8 +1618,8 @@ def send_email_with_tables(
         scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         # Only current long/short in the email body
-        long_html = build_html_table(long_df, "Current Long Candidates", maxrows=15)
-        short_html = build_html_table(short_df, "Current Short Candidates", maxrows=15)
+        long_html = build_html_table(long_df, "Current Long Candidates", max_rows=15)
+        short_html = build_html_table(short_df, "Current Short Candidates", max_rows=15)
 
         html_body = f"""
 <html>
