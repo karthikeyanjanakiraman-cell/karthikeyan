@@ -1037,70 +1037,72 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
-    if "Iteration No" not in df.columns:
+    if "Iteration No" not in df.columns or "Symbol" not in df.columns:
         return pd.DataFrame()
 
     last_15_iters = sorted(df["Iteration No"].dropna().astype(int).unique())[-15:]
     df = df[df["Iteration No"].isin(last_15_iters)].copy()
 
-    def pick_backward(g: pd.DataFrame, side: str) -> pd.DataFrame:
-        if g.empty:
+    def pick_positive_chain(g: pd.DataFrame, side: str) -> pd.DataFrame:
+        if g.empty or len(g) < 2:
             return pd.DataFrame()
 
         g = g.sort_values("Iteration No").reset_index(drop=True)
 
-        invalidated = False
+        latest = g.iloc[-1]
+        latest_dir = pd.to_numeric(latest.get("Directional"), errors="coerce")
+
+        if side == "long" and not (pd.notna(latest_dir) and latest_dir > 0):
+            return pd.DataFrame()
+
+        if side == "short" and not (pd.notna(latest_dir) and latest_dir < 0):
+            return pd.DataFrame()
+
+        chain_rows = []
 
         for i in range(len(g) - 1, 0, -1):
             row = g.iloc[i]
             prev = g.iloc[i - 1]
 
-            curr_dir = pd.to_numeric(row.get("Directional"), errors="coerce")
             curr_cp = pd.to_numeric(row.get("CumsumPlus"), errors="coerce")
             prev_cp = pd.to_numeric(prev.get("CumsumPlus"), errors="coerce")
-            curr_tn = pd.to_numeric(row.get("Turning"), errors="coerce")
-            prev_tn = pd.to_numeric(prev.get("Turning"), errors="coerce")
 
-            if pd.isna(curr_cp) or pd.isna(prev_cp) or pd.isna(curr_tn) or pd.isna(prev_tn):
-                continue
-
-            cumsum_plus_diff = curr_cp - prev_cp
-            turning_diff = curr_tn - prev_tn
-
-            # invalidate immediately if any negative diff appears
-            if cumsum_plus_diff < 0 or turning_diff < 0:
-                invalidated = True
+            if pd.isna(curr_cp) or pd.isna(prev_cp):
                 break
 
-            if side == "long":
-                if not (pd.notna(curr_dir) and curr_dir > 0):
-                    continue
-            else:
-                if not (pd.notna(curr_dir) and curr_dir < 0):
-                    continue
+            cumsum_plus_diff = curr_cp - prev_cp
 
-            if cumsum_plus_diff > 0 and turning_diff <= 0:
+            if cumsum_plus_diff > 0:
                 rec = row.copy()
                 rec["CumsumPlusDiff"] = cumsum_plus_diff
-                rec["TurningDiff"] = turning_diff
-                rec["First Occurrence"] = f'{int(row["Iteration No"])} | {row.get("Iteration Time", "")}'
-                rec["Latest"] = f'{int(g.iloc[-1]["Iteration No"])} | {g.iloc[-1].get("Iteration Time", "")}'
-                rec["Current Iteration"] = g.iloc[-1].get("Iteration Time", "")
-                rec["Side"] = "Long" if side == "long" else "Short"
-                return pd.DataFrame([rec])
+                chain_rows.append(rec)
+            else:
+                break
 
-        if invalidated:
+        if not chain_rows:
             return pd.DataFrame()
 
-        return pd.DataFrame()
+        chain_df = pd.DataFrame(chain_rows).sort_values("Iteration No").reset_index(drop=True)
+
+        first_row = chain_df.iloc[0]
+        last_row = chain_df.iloc[-1]
+
+        out = last_row.copy()
+        out["Count"] = int(len(chain_df))
+        out["First Occurrence"] = f'{int(first_row["Iteration No"])} | {first_row.get("Iteration Time", "")}'
+        out["Latest"] = f'{int(last_row["Iteration No"])} | {last_row.get("Iteration Time", "")}'
+        out["Current Iteration"] = latest.get("Iteration Time", "")
+        out["Side"] = "Long" if side == "long" else "Short"
+
+        return pd.DataFrame([out])
 
     out_rows = []
 
     for sym, g in df.groupby("Symbol", sort=False):
         g = g.sort_values("Iteration No").reset_index(drop=True)
 
-        long_pick = pick_backward(g, "long")
-        short_pick = pick_backward(g, "short")
+        long_pick = pick_positive_chain(g, "long")
+        short_pick = pick_positive_chain(g, "short")
 
         if not long_pick.empty:
             out_rows.append(long_pick)
@@ -1113,8 +1115,8 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     out = pd.concat(out_rows, ignore_index=True, sort=False)
 
     out = out.sort_values(
-        ["Side", "Iteration No", "CumsumPlusDiff", "TurningDiff"],
-        ascending=[True, False, False, True],
+        ["Side", "Count", "Iteration No", "CumsumPlusDiff"],
+        ascending=[True, False, False, False],
         na_position="last",
     ).reset_index(drop=True)
 
