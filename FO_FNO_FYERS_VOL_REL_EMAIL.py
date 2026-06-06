@@ -138,7 +138,6 @@ def build_signals_from_raw_directional(detail_df) -> dict:
 
 
 def classify_diff_status(cumsum_diff: float, turning_diff: float, prior_cumsum: float = 0.0, eps: float = 1e-4) -> str:
-    # Strict 1-to-1 zero lag logic
     c = 0.0 if pd.isna(cumsum_diff) else float(cumsum_diff)
     t = 0.0 if pd.isna(turning_diff) else float(turning_diff)
     p = 0.0 if pd.isna(prior_cumsum) else float(prior_cumsum)
@@ -162,7 +161,6 @@ def add_dual_engine_matrix(
     detail_df: pd.DataFrame,
     eps: float = 1e-4,
 ) -> pd.DataFrame:
-    # Removed all rolling() lookbacks. Fully instantaneous state mapping.
     if detail_df is None or detail_df.empty:
         return pd.DataFrame() if detail_df is None else detail_df.copy()
 
@@ -178,19 +176,15 @@ def add_dual_engine_matrix(
 
     grouped = out.groupby("Symbol", group_keys=False)
 
-    # 1. Linear Accumulation (The Gas Pedal)
     out["Current_Step"] = grouped["CumsumPlus"].diff().fillna(0.0)
     out["Prior_Step"] = grouped["Current_Step"].shift(1).fillna(0.0)
-    out["CumsumDiff"] = out["Current_Step"]  # Preserved for downstream compatibility
+    out["CumsumDiff"] = out["Current_Step"]
 
-    # 2. Structural Friction (The Brakes)
     out["Prior_Turning"] = grouped["Turning"].shift(1).fillna(0.0)
     out["TurningDiff"] = out["Turning"] - out["Prior_Turning"]
 
-    # The absolute Zero-Lag Friction test: Is rotational resistance expanding right now?
     out["Friction_Expanding"] = (out["Turning"] > out["Prior_Turning"]) & (out["Turning"] > eps)
 
-    # --- PURE DUAL-ENGINE MATRIX ---
     cond_pristine = (out["Current_Step"] > eps) & (out["Prior_Step"] <= eps) & (~out["Friction_Expanding"])
     cond_exhaustion = (out["Current_Step"] <= eps) & out["Friction_Expanding"]
     cond_trap = (out["Current_Step"] > eps) & out["Friction_Expanding"]
@@ -1085,7 +1079,6 @@ def add_signal_columns(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def signal_color(label) -> str:
-    # Updated to dynamically support the instantaneous Dual Engine states
     try:
         v = float(label)
         if v > 0:
@@ -1182,11 +1175,12 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
 def build_occurrence_table(
     detail_df: pd.DataFrame,
     last_n_iterations: Optional[int] = None,
-    top_n: int = 10,
+    top_n: int = 15,
     eps: float = 1e-4,
 ) -> pd.DataFrame:
     # -------------------------------------------------------------
-    # FIXED: True Backwards Tracking + Velocity First Sorting
+    # FIXED: PURE BACKWARD ITERATION OVER ALL VALID BLOCKS
+    # Completely separates the "Last 10" from "All Time" tables
     # -------------------------------------------------------------
     cols = [
         "Symbol",
@@ -1217,77 +1211,83 @@ def build_occurrence_table(
     if df.empty:
         return empty
 
-    # Only trace backward for things that are CURRENTLY alive or holding.
     valid_states = {"PRISTINE_BREAKOUT", "ACTIVE_CONTINUATION", "HEALTHY_PAUSE"}
-
     rows = []
+
     for sym, g in df.groupby("Symbol", sort=False):
         g = g.sort_values("Iteration No").reset_index(drop=True)
         if g.empty:
             continue
 
-        last_idx = len(g) - 1
-        curr_state = str(g["Dual Engine State"].iloc[last_idx]).strip()
-
-        # FILTER 1: Do not report dead/fakeout stocks as active streaks.
-        if curr_state not in valid_states:
-            continue
-
-        chain_idx = []
-        idx = last_idx
-
-        # Backwards iteration
-        while idx >= 0:
-            state = str(g["Dual Engine State"].iloc[idx]).strip()
-            
-            if state not in valid_states:
-                break  # The streak was broken here! Stop tracing back.
-
-            chain_idx.append(idx)
-            
-            # FILTER 2: Inception Stop. 
-            # If we hit the pure inception point, the trend originated here. Do not trace past Bar 0.
-            if state == "PRISTINE_BREAKOUT":
-                break
-                
-            idx -= 1
-
-        if not chain_idx:
-            continue
-
-        chain = g.iloc[sorted(chain_idx)].copy()
+        # Find contiguous blocks of valid states in the targeted timeframe
+        is_valid = g["Dual Engine State"].isin(valid_states)
+        streak_id = (~is_valid).cumsum()
         
-        # FILTER 3: Dead Zero-Energy Tracker.
-        # If the highest accumulation step in this whole sequence is 0.00, it's NOT a trend. It's a dead stock.
-        if chain["CumsumDiff"].max() <= eps:
-            continue
+        best_streak = None
+        
+        # Iterate over every active valid block in this window
+        for s_id, group in g[is_valid].groupby(streak_id):
+            if group.empty:
+                continue
+                
+            block_indices = group.index.tolist()
+            
+            # Start tracing backwards from the very end of this valid block
+            end_idx = block_indices[-1]
+            chain_idx = []
+            idx = end_idx
+            
+            # Trace backward to count the streak until we hit inception
+            while idx >= block_indices[0]:
+                state = str(g["Dual Engine State"].iloc[idx]).strip()
+                chain_idx.append(idx)
+                
+                if state == "PRISTINE_BREAKOUT":
+                    break
+                    
+                idx -= 1
+                
+            chain = g.iloc[sorted(chain_idx)].copy()
+            
+            # Dead baseline filter (ignores flatlines with no accumulation)
+            if chain["CumsumDiff"].max() <= eps:
+                continue
 
-        latest = chain.iloc[-1]
-        rows.append({
-            "Symbol": sym,
-            "Count": int(len(chain)),
-            "CumsumPlusDiff": float(latest["CumsumDiff"]),
-            "TurningDiff": float(latest["TurningDiff"]),
-            "First Occurrence": str(chain["Iteration Time"].iloc[0]),
-            "Current Iteration": str(chain["Iteration Time"].iloc[-1]),
-            "Status": curr_state,
-        })
+            latest = chain.iloc[-1]
+            cand = {
+                "Symbol": sym,
+                "Count": int(len(chain)),
+                "CumsumPlusDiff": float(latest["CumsumDiff"]),
+                "TurningDiff": float(latest["TurningDiff"]),
+                "First Occurrence": str(chain["Iteration Time"].iloc[0]),
+                "Current Iteration": str(chain["Iteration Time"].iloc[-1]),
+                "Status": str(latest["Dual Engine State"]).strip(),
+            }
+            
+            # Select the absolute strongest streak for this symbol in this time window
+            if best_streak is None:
+                best_streak = cand
+            else:
+                if cand["CumsumPlusDiff"] > best_streak["CumsumPlusDiff"]:
+                    best_streak = cand
+                elif cand["CumsumPlusDiff"] == best_streak["CumsumPlusDiff"] and cand["TurningDiff"] < best_streak["TurningDiff"]:
+                    best_streak = cand
+
+        if best_streak is not None:
+            rows.append(best_streak)
 
     out = pd.DataFrame(rows, columns=cols)
     if out.empty:
         return empty
 
-    out["_curr_iter_sort"] = pd.to_datetime(out["Current Iteration"], format="%H:%M", errors="coerce")
-    
     # -------------------------------------------------------------
-    # FIXED: Velocity First Sorting
-    # Prioritizes actively exploding breakouts (CumsumPlusDiff) over sleeping trades
+    # SORTING: Strictly by Highest CumsumPlusDiff, then Lowest TurningDiff
     # -------------------------------------------------------------
     out = out.sort_values(
-        ["CumsumPlusDiff", "Count", "_curr_iter_sort"],
-        ascending=[False, False, False],
+        ["CumsumPlusDiff", "TurningDiff", "Count"],
+        ascending=[False, True, False],
         na_position="last",
-    ).drop(columns=["_curr_iter_sort"])
+    )
     
     return out.head(top_n).reset_index(drop=True)
 
