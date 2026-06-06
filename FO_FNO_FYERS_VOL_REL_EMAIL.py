@@ -1227,11 +1227,17 @@ def build_occurrence_table(
         else:
             iter_indices = range(0, n)
 
+        seen_rows = set()
+
         for i in iter_indices:
             row = g.iloc[i]
             state = str(row["Dual Engine State"]).strip()
 
             if state not in valid_states:
+                continue
+
+            iter_no = int(row["Iteration No"])
+            if iter_no in seen_rows:
                 continue
 
             chain_idx = []
@@ -1262,8 +1268,9 @@ def build_occurrence_table(
                 "First Occurrence": str(chain.iloc[0]["Iteration Time"]),
                 "Current Iteration": str(row["Iteration Time"]),
                 "Status": state,
-                "Iteration No": int(row["Iteration No"]),
+                "Iteration No": iter_no,
             })
+            seen_rows.add(iter_no)
 
     rec_df = pd.DataFrame(all_records)
     if rec_df.empty:
@@ -1272,18 +1279,17 @@ def build_occurrence_table(
     best_records = []
     for sym, grp in rec_df.groupby("Symbol", sort=False):
         best = grp.sort_values(
-            ["CumsumPlusDiff", "TurningDiff", "Count"],
-            ascending=[False, True, False],
+            ["CumsumPlusDiff", "TurningDiff", "Count", "Iteration No"],
+            ascending=[False, True, False, False],
         ).iloc[0]
         best_records.append(best)
 
     out = pd.DataFrame(best_records).sort_values(
-        ["CumsumPlusDiff", "TurningDiff", "Count"],
-        ascending=[False, True, False],
+        ["CumsumPlusDiff", "TurningDiff", "Count", "Iteration No"],
+        ascending=[False, True, False, False],
     )
 
     return out[cols].head(top_n).reset_index(drop=True)
-
 
 def build_exceedance_tables(detail_df: pd.DataFrame):
     recent_10_df = build_occurrence_table(detail_df, time_window="last_10", top_n=15)
