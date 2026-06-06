@@ -1227,17 +1227,13 @@ def build_occurrence_table(
         else:
             iter_indices = range(0, n)
 
-        seen_rows = set()
+        symbol_records = []
 
         for i in iter_indices:
             row = g.iloc[i]
             state = str(row["Dual Engine State"]).strip()
 
             if state not in valid_states:
-                continue
-
-            iter_no = int(row["Iteration No"])
-            if iter_no in seen_rows:
                 continue
 
             chain_idx = []
@@ -1260,7 +1256,7 @@ def build_occurrence_table(
             if chain["CumsumDiff"].max() <= eps:
                 continue
 
-            all_records.append({
+            record = {
                 "Symbol": sym,
                 "Count": int(len(chain)),
                 "CumsumPlusDiff": float(row["CumsumDiff"]),
@@ -1268,26 +1264,39 @@ def build_occurrence_table(
                 "First Occurrence": str(chain.iloc[0]["Iteration Time"]),
                 "Current Iteration": str(row["Iteration Time"]),
                 "Status": state,
-                "Iteration No": iter_no,
-            })
-            seen_rows.add(iter_no)
+                "Iteration No": int(row["Iteration No"]),
+            }
+
+            if time_window == "last_10":
+                symbol_records = [record]
+                break
+
+            symbol_records.append(record)
+
+        all_records.extend(symbol_records)
 
     rec_df = pd.DataFrame(all_records)
     if rec_df.empty:
         return empty
 
-    best_records = []
-    for sym, grp in rec_df.groupby("Symbol", sort=False):
-        best = grp.sort_values(
+    if time_window == "last_10":
+        out = rec_df.sort_values(
+            ["Iteration No", "CumsumPlusDiff", "TurningDiff", "Count"],
+            ascending=[False, False, True, False],
+        )
+    else:
+        best_records = []
+        for sym, grp in rec_df.groupby("Symbol", sort=False):
+            best = grp.sort_values(
+                ["CumsumPlusDiff", "TurningDiff", "Count", "Iteration No"],
+                ascending=[False, True, False, False],
+            ).iloc[0]
+            best_records.append(best)
+
+        out = pd.DataFrame(best_records).sort_values(
             ["CumsumPlusDiff", "TurningDiff", "Count", "Iteration No"],
             ascending=[False, True, False, False],
-        ).iloc[0]
-        best_records.append(best)
-
-    out = pd.DataFrame(best_records).sort_values(
-        ["CumsumPlusDiff", "TurningDiff", "Count", "Iteration No"],
-        ascending=[False, True, False, False],
-    )
+        )
 
     return out[cols].head(top_n).reset_index(drop=True)
 
