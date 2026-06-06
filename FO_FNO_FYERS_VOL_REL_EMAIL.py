@@ -1173,7 +1173,6 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     short_df = short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     return long_df, short_df
 
-
 def build_occurrence_table(
     detail_df: pd.DataFrame,
     time_window: str = "all",
@@ -1205,15 +1204,23 @@ def build_occurrence_table(
     if df.empty:
         return empty
 
-    max_iter = int(df["Iteration No"].max())
     valid_states = {"PRISTINE_BREAKOUT", "ACTIVE_CONTINUATION", "HEALTHY_PAUSE"}
     all_records = []
 
-    # FORWARD ITERATION: Evaluate every single bar from 0 to N
     for sym, g in df.groupby("Symbol", sort=False):
         g = g.sort_values("Iteration No").reset_index(drop=True)
+        if g.empty:
+            continue
 
-        for i in range(len(g)):
+        n = len(g)
+
+        if time_window == "last_10":
+            start_idx = max(0, n - 10)
+            iter_indices = range(n - 1, start_idx - 1, -1)   # backward over last 10
+        else:
+            iter_indices = range(0, n)                       # forward from iteration 0
+
+        for i in iter_indices:
             row = g.iloc[i]
             state = str(row["Dual Engine State"]).strip()
 
@@ -1223,9 +1230,8 @@ def build_occurrence_table(
             chain_idx = []
             idx = i
 
-            # From the current forward iteration, trace backward to find inception
             while idx >= 0:
-                st = str(g["Dual Engine State"].iloc[idx]).strip()
+                st = str(g.iloc[idx]["Dual Engine State"]).strip()
                 if st not in valid_states:
                     break
                 chain_idx.append(idx)
@@ -1236,7 +1242,8 @@ def build_occurrence_table(
             if not chain_idx:
                 continue
 
-            chain = g.iloc[sorted(chain_idx)].copy()
+            chain_idx = sorted(chain_idx)
+            chain = g.iloc[chain_idx].copy()
 
             if chain["CumsumDiff"].max() <= eps:
                 continue
@@ -1256,17 +1263,12 @@ def build_occurrence_table(
     if rec_df.empty:
         return empty
 
-    # Time window filter logic
-    if time_window == "last_10":
-        rec_df = rec_df[rec_df["Iteration No"] > max_iter - 10]
-
-    if rec_df.empty:
-        return empty
-
-    # Get the absolute highest momentum record for each symbol in the allowed time window
     best_records = []
-    for sym, grp in rec_df.groupby("Symbol"):
-        best = grp.sort_values(["CumsumPlusDiff", "TurningDiff", "Count"], ascending=[False, True, False]).iloc[0]
+    for sym, grp in rec_df.groupby("Symbol", sort=False):
+        best = grp.sort_values(
+            ["CumsumPlusDiff", "TurningDiff", "Count"],
+            ascending=[False, True, False]
+        ).iloc[0]
         best_records.append(best)
 
     out = pd.DataFrame(best_records).sort_values(
