@@ -1316,14 +1316,53 @@ def build_occurrence_table(
 
 
 def build_exceedance_tables(detail_df: pd.DataFrame):
-    recent10_df = build_occurrence_table(detail_df, last_n_iterations=10, top_n=15)
+    # Build the full best-chain table for all symbols (no iteration cut)
     alltime_df = build_occurrence_table(detail_df, last_n_iterations=None, top_n=15)
-    return recent10_df, alltime_df
 
-def build_exceedance_tables(detail_df: pd.DataFrame):
-    recent10_df = build_occurrence_table(detail_df, last_n_iterations=10, top_n=15)
-    alltime_df = build_occurrence_table(detail_df, last_n_iterations=None, top_n=15)
+    if alltime_df is None or alltime_df.empty:
+        return alltime_df, alltime_df
+
+    # We need the mapping from Iteration Time -> Iteration No
+    df = detail_df.copy()
+    df["Iteration No"] = pd.to_numeric(df["Iteration No"], errors="coerce")
+    df = df.dropna(subset=["Iteration No"])
+    if df.empty or "Iteration Time" not in df.columns:
+        # Fallback: no time mapping possible, so just return the all-time table twice
+        return alltime_df, alltime_df
+
+    # Build a unique mapping of time string -> iteration number
+    iter_map = (
+        df[["Iteration No", "Iteration Time"]]
+        .dropna()
+        .copy()
+    )
+    iter_map["Iteration No"] = iter_map["Iteration No"].astype(int)
+    iter_map["Iteration Time"] = iter_map["Iteration Time"].astype(str)
+
+    # Last 10 iterations in the whole day
+    last_iters = sorted(iter_map["Iteration No"].unique())[-10:]
+
+    # For each chain, recover its start iteration from First Occurrence time
+    # (First Occurrence is a time string like "14:45")
+    merged = alltime_df.copy()
+    merged = merged.merge(
+        iter_map.drop_duplicates(subset=["Iteration Time"]),
+        left_on="First Occurrence",
+        right_on="Iteration Time",
+        how="left",
+        suffixes=("", "_mapped"),
+    )
+
+    # Filter to chains whose START iteration is in the last 10 iterations
+    recent10_df = merged[merged["Iteration No"].isin(last_iters)].copy()
+
+    # Keep the same columns as the original occurrence table
+    keep_cols = ["Symbol", "Count", "CumsumPlusDiff", "TurningDiff",
+                 "First Occurrence", "Current Iteration", "Status"]
+    recent10_df = recent10_df[keep_cols]
+
     return recent10_df, alltime_df
+    
 
 def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     if detail_df is None or detail_df.empty:
