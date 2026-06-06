@@ -1049,7 +1049,8 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
 
         g = g.sort_values("Iteration No").reset_index(drop=True)
 
-        picks = []
+        invalidated = False
+
         for i in range(len(g) - 1, 0, -1):
             row = g.iloc[i]
             prev = g.iloc[i - 1]
@@ -1066,6 +1067,11 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
             cumsum_plus_diff = curr_cp - prev_cp
             turning_diff = curr_tn - prev_tn
 
+            # invalidate immediately if any negative diff appears
+            if cumsum_plus_diff < 0 or turning_diff < 0:
+                invalidated = True
+                break
+
             if side == "long":
                 if not (pd.notna(curr_dir) and curr_dir > 0):
                     continue
@@ -1081,13 +1087,12 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
                 rec["Latest"] = f'{int(g.iloc[-1]["Iteration No"])} | {g.iloc[-1].get("Iteration Time", "")}'
                 rec["Current Iteration"] = g.iloc[-1].get("Iteration Time", "")
                 rec["Side"] = "Long" if side == "long" else "Short"
-                picks.append(rec)
-                break  # first valid backward hit only
+                return pd.DataFrame([rec])
 
-        if not picks:
+        if invalidated:
             return pd.DataFrame()
 
-        return pd.DataFrame(picks)
+        return pd.DataFrame()
 
     out_rows = []
 
