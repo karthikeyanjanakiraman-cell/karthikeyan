@@ -1213,15 +1213,9 @@ def build_occurrence_table(
     if df.empty:
         return empty
 
-    all_iter_nos = sorted(df["Iteration No"].dropna().astype(int).unique())
-    last_10_iter_set = set(all_iter_nos[-10:]) if len(all_iter_nos) >= 10 else set(all_iter_nos)
-
-    latest_iter_time = (
-        df.sort_values(["Symbol", "Iteration No"])
-          .groupby("Symbol", as_index=True)["Iteration Time"]
-          .last()
-          .to_dict()
-    )
+    max_iter_no = int(df["Iteration No"].dropna().max())
+    min_iter_no = max(1, max_iter_no - 9)
+    last_10_iter_set = set(range(min_iter_no, max_iter_no + 1))
 
     valid_states = {"PRISTINE_BREAKOUT", "ACTIVE_CONTINUATION"}
     all_records = []
@@ -1265,15 +1259,14 @@ def build_occurrence_table(
                     prev_iter_no -= 1
 
                 chain_df = pd.DataFrame(chain_rows).sort_values("Iteration No")
-                first_row = chain_df.iloc[0]
 
                 all_records.append({
                     "Symbol": sym,
                     "Count": int(len(chain_df)),
                     "CumsumPlusDiff": cdiff,
                     "TurningDiff": float(row["TurningDiff"]) if pd.notna(row["TurningDiff"]) else 0.0,
-                    "First Occurrence": str(first_row["Iteration Time"]),
-                    "Current Iteration": str(latest_iter_time.get(sym, row["Iteration Time"])),
+                    "First Occurrence": str(row["Iteration Time"]),
+                    "Current Iteration": str(row["Iteration Time"]),
                     "Status": state,
                     "Iteration No": curr_iter_no,
                 })
@@ -1319,7 +1312,7 @@ def build_occurrence_table(
                     "CumsumPlusDiff": cdiff,
                     "TurningDiff": float(row["TurningDiff"]) if pd.notna(row["TurningDiff"]) else 0.0,
                     "First Occurrence": str(first_row["Iteration Time"]),
-                    "Current Iteration": str(latest_iter_time.get(sym, row["Iteration Time"])),
+                    "Current Iteration": str(row["Iteration Time"]),
                     "Status": state,
                     "Iteration No": curr_iter_no,
                 })
