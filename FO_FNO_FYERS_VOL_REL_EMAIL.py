@@ -1039,12 +1039,11 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     if "Iteration No" not in df.columns:
         return pd.DataFrame()
 
-    # Pick global max iteration number and walk back 9 → 10 iterations total
     max_iter_no = int(df["Iteration No"].dropna().max())
     min_iter_no = max(1, max_iter_no - 9)
-    last_10_iters = set(range(min_iter_no, max_iter_no + 1))
+    target_iters = set(range(min_iter_no, max_iter_no + 1))
 
-    df = df[df["Iteration No"].isin(last_10_iters)].copy()
+    df = df[df["Iteration No"].isin(target_iters)].copy()
 
     long_top = (
         df[df["Directional"] > 0]
@@ -1076,9 +1075,11 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
 
     out = out.sort_values(["Iteration No", "Side"]).reset_index(drop=True)
     iter_time = out.get("Iteration Time", pd.Series("", index=out.index)).astype(str)
+
     out["Iteration"] = out["Iteration No"].astype("Int64").astype(str) + " | " + iter_time
-    out["First Occurrence"] = out["Iteration No"].astype("Int64").astype(str) + " | " + iter_time
-    out["Latest"] = out["Iteration No"].astype("Int64").astype(str) + " | " + iter_time
+    out["First Occurrence"] = out["Iteration"]
+    out["Latest"] = out["Iteration"]
+
     return out
     
 def build_history_table(history_df: pd.DataFrame, side: str) -> str:
