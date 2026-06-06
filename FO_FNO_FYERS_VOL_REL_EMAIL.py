@@ -1143,7 +1143,7 @@ def build_history_table(history_df: pd.DataFrame, side: str) -> str:
 
     title_color = "#22c55e" if side.lower() == "long" else "#ef4444"
     return f"""
-    <h3 style="color:{title_color};margin:12px 0 6px 0;">Top 1 {side.title()} - Last 15 Iterations</h3>
+    <h3 style="color:{title_color};margin:12px 0 6px 0;">Top 1 {side.title()} - Last 10 Iterations</h3>
     <div style="overflow-x:auto;">
       <table style="border-collapse:collapse;width:100%;background:#030712;">
         <thead><tr>{header}</tr></thead>
@@ -1244,7 +1244,7 @@ def send_email_with_tables(
                 </div>
 
                 <div style="margin-bottom:24px;padding:14px;border:1px solid #374151;background:#111827;border-radius:10px;">
-                    <h2 style="margin:0 0 14px 0;color:#facc15;">Last 15 Iterations - Top 1 Candidates</h2>
+                    <h2 style="margin:0 0 14px 0;color:#facc15;">Last 10 Iterations - Top 1 Candidates</h2>
                     {history_long_html}
                     <div style="height:14px;"></div>
                     {history_short_html}
