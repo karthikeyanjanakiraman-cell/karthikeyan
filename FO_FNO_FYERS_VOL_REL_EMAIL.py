@@ -1039,12 +1039,20 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     if "Iteration No" not in df.columns:
         return pd.DataFrame()
 
-    last_15_iters = sorted(df["Iteration No"].dropna().astype(int).unique())[-15:]
-    df = df[df["Iteration No"].isin(last_15_iters)].copy()
+    # Pick global max iteration number and walk back 9 → 10 iterations total
+    max_iter_no = int(df["Iteration No"].dropna().max())
+    min_iter_no = max(1, max_iter_no - 9)
+    last_10_iters = set(range(min_iter_no, max_iter_no + 1))
+
+    df = df[df["Iteration No"].isin(last_10_iters)].copy()
 
     long_top = (
         df[df["Directional"] > 0]
-        .sort_values(["Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, False, True, False, False], na_position="last")
+        .sort_values(
+            ["Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"],
+            ascending=[True, False, True, False, False],
+            na_position="last",
+        )
         .groupby("Iteration No", group_keys=False)
         .head(1)
         .assign(Side="Long")
@@ -1052,7 +1060,11 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
 
     short_top = (
         df[df["Directional"] < 0]
-        .sort_values(["Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, True, True, False, False], na_position="last")
+        .sort_values(
+            ["Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"],
+            ascending=[True, True, True, False, False],
+            na_position="last",
+        )
         .groupby("Iteration No", group_keys=False)
         .head(1)
         .assign(Side="Short")
@@ -1068,7 +1080,7 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     out["First Occurrence"] = out["Iteration No"].astype("Int64").astype(str) + " | " + iter_time
     out["Latest"] = out["Iteration No"].astype("Int64").astype(str) + " | " + iter_time
     return out
-
+    
 def build_history_table(history_df: pd.DataFrame, side: str) -> str:
     if history_df is None or history_df.empty:
         return "No history yet."
@@ -1090,7 +1102,7 @@ def build_history_table(history_df: pd.DataFrame, side: str) -> str:
     if "Latest" not in df.columns and "Iteration" in df.columns:
         df["Latest"] = df["Iteration"]
     cols = [c for c in cols if c in df.columns]
-    df = df.tail(15)[cols].copy()
+    df = df.tail(10)[cols].copy()
 
     def style_cell(col, val):
         base = "padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;"
