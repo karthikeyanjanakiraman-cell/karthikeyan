@@ -1219,7 +1219,7 @@ def build_occurrence_table(
     if df.empty:
         return empty
 
-    valid_states = {"PRISTINE_BREAKOUT", "ACTIVE_CONTINUATION", "HEALTHY_PAUSE"}
+    valid_states = {"PRISTINE_BREAKOUT", "ACTIVE_CONTINUATION"}
     rows = []
 
     for sym, g in df.groupby("Symbol", sort=False):
@@ -1232,8 +1232,9 @@ def build_occurrence_table(
         for end_idx in range(len(g)):
             row = g.iloc[end_idx]
             state = str(row["Dual Engine State"]).strip()
+            csum = float(row["CumsumDiff"]) if pd.notna(row["CumsumDiff"]) else 0.0
 
-            if state not in valid_states:
+            if state not in valid_states or csum <= eps:
                 continue
 
             chain_idx = []
@@ -1242,12 +1243,12 @@ def build_occurrence_table(
             while idx >= 0:
                 r = g.iloc[idx]
                 st = str(r["Dual Engine State"]).strip()
-                csum_diff = float(r["CumsumDiff"]) if pd.notna(r["CumsumDiff"]) else 0.0
+                cd = float(r["CumsumDiff"]) if pd.notna(r["CumsumDiff"]) else 0.0
 
+                # strict rule: every row in chain must be valid state AND CumsumPlusDiff > 0
                 if st not in valid_states:
                     break
-
-                if csum_diff <= eps and st != "HEALTHY_PAUSE":
+                if cd <= eps:
                     break
 
                 chain_idx.append(idx)
