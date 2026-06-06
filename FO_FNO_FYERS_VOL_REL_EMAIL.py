@@ -1032,53 +1032,92 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = detail_df.copy()
-    for col in ["Iteration No", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus"]:
+
+    for col in ["Iteration No", "LTP", "% Change", "Directional", "Turning", "CumsumPlus"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     if "Iteration No" not in df.columns:
         return pd.DataFrame()
 
-    max_iter_no = int(df["Iteration No"].dropna().max())
-    min_iter_no = max(1, max_iter_no - 9)
-    target_iters = set(range(min_iter_no, max_iter_no + 1))
+    last_15_iters = sorted(df["Iteration No"].dropna().astype(int).unique())[-15:]
+    df = df[df["Iteration No"].isin(last_15_iters)].copy()
 
-    df = df[df["Iteration No"].isin(target_iters)].copy()
+    def pick_backward(g: pd.DataFrame, side: str) -> pd.DataFrame:
+        if g.empty:
+            return pd.DataFrame()
 
-    long_top = (
-        df[df["Directional"] > 0]
-        .sort_values(
-            ["Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"],
-            ascending=[True, False, True, False, False],
-            na_position="last",
-        )
-        .groupby("Iteration No", group_keys=False)
-        .head(1)
-        .assign(Side="Long")
+        g = g.sort_values("Iteration No").reset_index(drop=True)
+
+        picks = []
+        for i in range(len(g) - 1, 0, -1):
+            row = g.iloc[i]
+            prev = g.iloc[i - 1]
+
+            curr_dir = pd.to_numeric(row.get("Directional"), errors="coerce")
+            curr_cp = pd.to_numeric(row.get("CumsumPlus"), errors="coerce")
+            prev_cp = pd.to_numeric(prev.get("CumsumPlus"), errors="coerce")
+            curr_tn = pd.to_numeric(row.get("Turning"), errors="coerce")
+            prev_tn = pd.to_numeric(prev.get("Turning"), errors="coerce")
+
+            if pd.isna(curr_cp) or pd.isna(prev_cp) or pd.isna(curr_tn) or pd.isna(prev_tn):
+                continue
+
+            cumsum_plus_diff = curr_cp - prev_cp
+            turning_diff = curr_tn - prev_tn
+
+            if side == "long":
+                if not (pd.notna(curr_dir) and curr_dir > 0):
+                    continue
+            else:
+                if not (pd.notna(curr_dir) and curr_dir < 0):
+                    continue
+
+            if cumsum_plus_diff > 0 and turning_diff <= 0:
+                rec = row.copy()
+                rec["CumsumPlusDiff"] = cumsum_plus_diff
+                rec["TurningDiff"] = turning_diff
+                rec["First Occurrence"] = f'{int(row["Iteration No"])} | {row.get("Iteration Time", "")}'
+                rec["Latest"] = f'{int(g.iloc[-1]["Iteration No"])} | {g.iloc[-1].get("Iteration Time", "")}'
+                rec["Current Iteration"] = g.iloc[-1].get("Iteration Time", "")
+                rec["Side"] = "Long" if side == "long" else "Short"
+                picks.append(rec)
+                break  # first valid backward hit only
+
+        if not picks:
+            return pd.DataFrame()
+
+        return pd.DataFrame(picks)
+
+    out_rows = []
+
+    for sym, g in df.groupby("Symbol", sort=False):
+        g = g.sort_values("Iteration No").reset_index(drop=True)
+
+        long_pick = pick_backward(g, "long")
+        short_pick = pick_backward(g, "short")
+
+        if not long_pick.empty:
+            out_rows.append(long_pick)
+        if not short_pick.empty:
+            out_rows.append(short_pick)
+
+    if not out_rows:
+        return pd.DataFrame()
+
+    out = pd.concat(out_rows, ignore_index=True, sort=False)
+
+    out = out.sort_values(
+        ["Side", "Iteration No", "CumsumPlusDiff", "TurningDiff"],
+        ascending=[True, False, False, True],
+        na_position="last",
+    ).reset_index(drop=True)
+
+    out["Iteration"] = (
+        out["Iteration No"].astype("Int64").astype(str)
+        + " | "
+        + out.get("Iteration Time", pd.Series("", index=out.index)).astype(str)
     )
-
-    short_top = (
-        df[df["Directional"] < 0]
-        .sort_values(
-            ["Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"],
-            ascending=[True, True, True, False, False],
-            na_position="last",
-        )
-        .groupby("Iteration No", group_keys=False)
-        .head(1)
-        .assign(Side="Short")
-    )
-
-    out = pd.concat([long_top, short_top], ignore_index=True, sort=False)
-    if out.empty:
-        return out
-
-    out = out.sort_values(["Iteration No", "Side"]).reset_index(drop=True)
-    iter_time = out.get("Iteration Time", pd.Series("", index=out.index)).astype(str)
-
-    out["Iteration"] = out["Iteration No"].astype("Int64").astype(str) + " | " + iter_time
-    out["First Occurrence"] = out["Iteration"]
-    out["Latest"] = out["Iteration"]
 
     return out
     
