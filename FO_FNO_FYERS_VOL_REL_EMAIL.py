@@ -1207,7 +1207,11 @@ def build_occurrence_table(
     df["Iteration No"] = pd.to_numeric(df["Iteration No"], errors="coerce")
     df["CumsumDiff"] = pd.to_numeric(df["CumsumDiff"], errors="coerce")
     df["TurningDiff"] = pd.to_numeric(df["TurningDiff"], errors="coerce")
-    df = df.dropna(subset=["Iteration No"]).sort_values(["Symbol", "Iteration No"]).reset_index(drop=True)
+    df = (
+        df.dropna(subset=["Iteration No"])
+          .sort_values(["Symbol", "Iteration No"])
+          .reset_index(drop=True)
+    )
 
     if df.empty:
         return empty
@@ -1245,11 +1249,16 @@ def build_occurrence_table(
                 st = str(r["Dual Engine State"]).strip()
                 cd = float(r["CumsumDiff"]) if pd.notna(r["CumsumDiff"]) else 0.0
 
-                # strict rule: every row in chain must be valid state AND CumsumPlusDiff > 0
                 if st not in valid_states:
                     break
                 if cd <= eps:
                     break
+
+                if chain_idx:
+                    next_iter = int(g.iloc[chain_idx[-1]]["Iteration No"])
+                    curr_iter = int(r["Iteration No"])
+                    if curr_iter != next_iter - 1:
+                        break
 
                 chain_idx.append(idx)
 
@@ -1306,10 +1315,9 @@ def build_occurrence_table(
     return out[cols]
 
 def build_exceedance_tables(detail_df: pd.DataFrame):
-    recent_10_df = build_occurrence_table(detail_df, last_n_iterations=10, top_n=15)
-    all_time_df = build_occurrence_table(detail_df, last_n_iterations=None, top_n=15)
-    return recent_10_df, all_time_df
-
+    recent10_df = build_occurrence_table(detail_df, last_n_iterations=10, top_n=15)
+    alltime_df = build_occurrence_table(detail_df, last_n_iterations=None, top_n=15)
+    return recent10_df, alltime_df
 
 def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     if detail_df is None or detail_df.empty:
