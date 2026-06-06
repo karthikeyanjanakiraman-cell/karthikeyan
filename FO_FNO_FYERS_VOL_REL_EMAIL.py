@@ -1206,12 +1206,26 @@ def build_occurrence_table(
 
     df = detail_df.copy()
     df["Iteration No"] = pd.to_numeric(df["Iteration No"], errors="coerce")
+    df["CumsumDiff"]   = pd.to_numeric(df["CumsumDiff"],   errors="coerce")
+    df["TurningDiff"]  = pd.to_numeric(df["TurningDiff"],  errors="coerce")
     df = df.dropna(subset=["Iteration No"]).sort_values(["Symbol", "Iteration No"]).reset_index(drop=True)
 
     if df.empty:
         return empty
 
-    valid_states = {"PRISTINE_BREAKOUT", "ACTIVE_CONTINUATION", "HEALTHY_PAUSE"}
+    # Last 10 distinct global iteration numbers across ALL symbols
+    all_iter_nos = sorted(df["Iteration No"].unique())
+    last_10_iter_set = set(all_iter_nos[-10:]) if len(all_iter_nos) >= 10 else set(all_iter_nos)
+
+    # Latest iteration time per symbol (for Current Iteration column)
+    latest_iter_time = (
+        df.sort_values("Iteration No")
+          .groupby("Symbol")["Iteration Time"]
+          .last()
+          .to_dict()
+    )
+
+    valid_states = {"PRISTINE_BREAKOUT", "ACTIVE_CONTINUATION"}
     all_records = []
 
     for sym, g in df.groupby("Symbol", sort=False):
@@ -1222,22 +1236,27 @@ def build_occurrence_table(
         n = len(g)
 
         if time_window == "last_10":
-            start_idx = max(0, n - 10)
-            iter_indices = range(n - 1, start_idx - 1, -1)
+            # Only rows whose Iteration No falls in the last 10 global iteration numbers
+            g_window = g[g["Iteration No"].isin(last_10_iter_set)]
+            if g_window.empty:
+                continue
 
-            for i in iter_indices:
-                row = g.iloc[i]
+            # Scan backward within that window
+            for i in g_window.index[::-1]:
+                row   = g.loc[i]
                 state = str(row["Dual Engine State"]).strip()
+                cdiff = float(row["CumsumDiff"]) if pd.notna(row["CumsumDiff"]) else 0.0
 
-                if state not in valid_states:
+                if state not in valid_states or cdiff <= eps:
                     continue
 
+                # Walk back through consecutive valid rows
                 chain_idx = []
                 idx = i
-
                 while idx >= 0:
-                    st = str(g.iloc[idx]["Dual Engine State"]).strip()
-                    if st not in valid_states:
+                    st     = str(g.loc[idx, "Dual Engine State"]).strip()
+                    cd     = float(g.loc[idx, "CumsumDiff"]) if pd.notna(g.loc[idx, "CumsumDiff"]) else 0.0
+                    if st not in valid_states or cd <= eps:
                         break
                     chain_idx.append(idx)
                     if st == "PRISTINE_BREAKOUT":
@@ -1247,39 +1266,36 @@ def build_occurrence_table(
                 if not chain_idx:
                     continue
 
-                chain = g.iloc[sorted(chain_idx)].copy()
-
-                if chain["CumsumDiff"].max() <= eps:
-                    continue
-
+                chain = g.loc[sorted(chain_idx)]
                 all_records.append({
-                    "Symbol": sym,
-                    "Count": int(len(chain)),
-                    "CumsumPlusDiff": float(row["CumsumDiff"]),
-                    "TurningDiff": float(row["TurningDiff"]),
+                    "Symbol":           sym,
+                    "Count":            int(len(chain)),
+                    "CumsumPlusDiff":   cdiff,
+                    "TurningDiff":      float(row["TurningDiff"]) if pd.notna(row["TurningDiff"]) else 0.0,
                     "First Occurrence": str(chain.iloc[0]["Iteration Time"]),
-                    "Current Iteration": str(row["Iteration Time"]),
-                    "Status": state,
-                    "Iteration No": int(row["Iteration No"]),
+                    "Current Iteration": str(latest_iter_time.get(sym, row["Iteration Time"])),
+                    "Status":           state,
+                    "Iteration No":     int(row["Iteration No"]),
                 })
-                break
+                break  # first backward hit only
 
         else:
+            # all: forward scan, best record per symbol
             symbol_records = []
-
-            for i in range(0, n):
-                row = g.iloc[i]
+            for i in range(n):
+                row   = g.iloc[i]
                 state = str(row["Dual Engine State"]).strip()
+                cdiff = float(row["CumsumDiff"]) if pd.notna(row["CumsumDiff"]) else 0.0
 
-                if state not in valid_states:
+                if state not in valid_states or cdiff <= eps:
                     continue
 
                 chain_idx = []
                 idx = i
-
                 while idx >= 0:
                     st = str(g.iloc[idx]["Dual Engine State"]).strip()
-                    if st not in valid_states:
+                    cd = float(g.iloc[idx]["CumsumDiff"]) if pd.notna(g.iloc[idx]["CumsumDiff"]) else 0.0
+                    if st not in valid_states or cd <= eps:
                         break
                     chain_idx.append(idx)
                     if st == "PRISTINE_BREAKOUT":
@@ -1289,20 +1305,16 @@ def build_occurrence_table(
                 if not chain_idx:
                     continue
 
-                chain = g.iloc[sorted(chain_idx)].copy()
-
-                if chain["CumsumDiff"].max() <= eps:
-                    continue
-
+                chain = g.iloc[sorted(chain_idx)]
                 symbol_records.append({
-                    "Symbol": sym,
-                    "Count": int(len(chain)),
-                    "CumsumPlusDiff": float(row["CumsumDiff"]),
-                    "TurningDiff": float(row["TurningDiff"]),
+                    "Symbol":           sym,
+                    "Count":            int(len(chain)),
+                    "CumsumPlusDiff":   cdiff,
+                    "TurningDiff":      float(row["TurningDiff"]) if pd.notna(row["TurningDiff"]) else 0.0,
                     "First Occurrence": str(chain.iloc[0]["Iteration Time"]),
-                    "Current Iteration": str(row["Iteration Time"]),
-                    "Status": state,
-                    "Iteration No": int(row["Iteration No"]),
+                    "Current Iteration": str(latest_iter_time.get(sym, row["Iteration Time"])),
+                    "Status":           state,
+                    "Iteration No":     int(row["Iteration No"]),
                 })
 
             if symbol_records:
