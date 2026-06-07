@@ -1138,24 +1138,29 @@ def format_value(col: str, val):
     return str(val)
 
 def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    # 1. Safety check for empty data
     if df is None or df.empty:
         return (
             pd.DataFrame(columns=EMAIL_DISPLAY_COLS),
             pd.DataFrame(columns=EMAIL_DISPLAY_COLS),
         )
 
-    # 2. Filter using only the Core Institutional "Lie Detector" Logic
-    # No thresholds, no Z-scores, just pure Institutional Flow
-    base = df[
-        (df['OBV30mDelta'] > 0) & 
-        (df['Price_Leading_Flag'] == True)
-    ].copy()
+    base = df.copy()
 
-    # 3. Define the selection logic
+    # 1. Check for the existence of 'Price_Leading_Flag'
+    # If the column is missing, we use a fallback logic so the script doesn't crash
+    if 'Price_Leading_Flag' in base.columns:
+        # Use Surgical Precision Filter
+        base = base[
+            (base['OBV30mDelta'] > 0) & 
+            (base['Price_Leading_Flag'] == True)
+        ].copy()
+    else:
+        # Fallback: Just use OBV if Price_Leading_Flag isn't calculated
+        base = base[base['OBV30mDelta'] > 0].copy()
+
+    # 2. Define the selection logic
     def prep_side(data: pd.DataFrame, direction: str) -> pd.DataFrame:
-        # Sort by institutional strength (OBV30mDelta)
-        # This puts the most aggressive movers (like ADANIGREEN) at the top
+        if data.empty: return data
         if direction == "long":
             filtered = data[data["Directional"] > 0]
             return filtered.sort_values("OBV30mDelta", ascending=False).head(5)
@@ -1163,12 +1168,10 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
             filtered = data[data["Directional"] < 0]
             return filtered.sort_values("OBV30mDelta", ascending=True).head(5)
 
-    # 4. Generate the Top 5 Alpha tables
     long_df = prep_side(base, "long")
     short_df = prep_side(base, "short")
 
-    # 5. Format for email output
-    # Ensure we only return columns that actually exist in the dataframe
+    # 3. Format for email output
     cols = [c for c in EMAIL_DISPLAY_COLS if c in base.columns]
     
     long_final = (long_df[cols] if not long_df.empty else pd.DataFrame(columns=cols))
