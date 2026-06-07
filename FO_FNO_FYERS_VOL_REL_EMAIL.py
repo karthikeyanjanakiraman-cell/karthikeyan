@@ -1137,135 +1137,47 @@ def format_value(col: str, val):
         return f"{float(val):.4f}"
     return str(val)
 
-
 def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    # 1. Safety check for empty data
     if df is None or df.empty:
         return (
             pd.DataFrame(columns=EMAIL_DISPLAY_COLS),
             pd.DataFrame(columns=EMAIL_DISPLAY_COLS),
         )
 
-    base = df.copy()
+    # 2. Filter using only the Core Institutional "Lie Detector" Logic
+    # No thresholds, no Z-scores, just pure Institutional Flow
+    base = df[
+        (df['OBV30mDelta'] > 0) & 
+        (df['Price_Leading_Flag'] == True)
+    ].copy()
 
-    numeric_cols = [
-        "Directional",
-        "Turning",
-        "Stability",
-        "Balanced",
-        "CumsumPlus",
-        "10 Day Relative Volume",
-        "Last5mVolume",
-        "OBV30mDelta",
-    ]
-    for c in numeric_cols:
-        if c in base.columns:
-            base[c] = pd.to_numeric(base[c], errors="coerce")
+    # 3. Define the selection logic
+    def prep_side(data: pd.DataFrame, direction: str) -> pd.DataFrame:
+        # Sort by institutional strength (OBV30mDelta)
+        # This puts the most aggressive movers (like ADANIGREEN) at the top
+        if direction == "long":
+            filtered = data[data["Directional"] > 0]
+            return filtered.sort_values("OBV30mDelta", ascending=False).head(5)
+        else:
+            filtered = data[data["Directional"] < 0]
+            return filtered.sort_values("OBV30mDelta", ascending=True).head(5)
 
-    if "Last Iteration Time" in base.columns:
-        base["time"] = pd.to_datetime(base["Last Iteration Time"], format="%H:%M", errors="coerce").dt.time
-    else:
-        base["time"] = pd.NaT
+    # 4. Generate the Top 5 Alpha tables
+    long_df = prep_side(base, "long")
+    short_df = prep_side(base, "short")
 
-    
-    if "Turning Regime" in base.columns:
-        base["Turning Regime"] = base["Turning Regime"].astype(str).str.upper().str.strip()
-
-    
-    start_count = len(base)
-
-    if "10 Day Relative Volume" in base.columns:
-        pre = len(base)
-        base = base[base["10 Day Relative Volume"].fillna(0) >= 1.0]
-        logger.info(f"CANDIDATES RVOL gate kept {len(base)}/{pre}")
-
-    if "Last5mVolume" in base.columns:
-        pre = len(base)
-        base = base[base["Last5mVolume"].fillna(0) > 0]
-        logger.info(f"CANDIDATES Last5mVolume gate kept {len(base)}/{pre}")
-
-    gate_time = pd.to_datetime("09:45", format="%H:%M").time()
-    bearish_status = {"STRONG_PRICE_LEAD_FADE", "PRICE_LEADING_FADE_RISK"}
-
-    def _apply_long_gate(frame: pd.DataFrame, allow_mixed: bool, relaxed: bool) -> pd.DataFrame:
-        out = frame.copy()
-        if "time" in out.columns:
-            pre = len(out)
-            out = out[out["time"] >= gate_time]
-            logger.info(f"LONG time gate kept {len(out)}/{pre}")
-        if "OBV30mDelta" in out.columns:
-            pre = len(out)
-            out = out[out["OBV30mDelta"].fillna(0) >= (0 if relaxed else 1e-12)] if relaxed else out[out["OBV30mDelta"].fillna(0) > 0]
-            logger.info(f"LONG OBV gate kept {len(out)}/{pre}")
-        if "Turning Regime" in out.columns:
-            pre = len(out)
-            out = out[out["Turning Regime"].isin(["LOW_FRICTION", "EXPANDING_FRICTION"])] if relaxed else out[out["Turning Regime"] == "LOW_FRICTION"]
-            logger.info(f"LONG friction gate kept {len(out)}/{pre}")
-        
-        if "Directional" in out.columns:
-            pre = len(out)
-            out = out[out["Directional"] > 0]
-            logger.info(f"LONG directional gate kept {len(out)}/{pre}")
-        allowed = {"LONG", "MIXED"} if allow_mixed else {"LONG"}
-        pre = len(out)
-        
-        return out
-
-    def _apply_short_gate(frame: pd.DataFrame, allow_mixed: bool, relaxed: bool) -> pd.DataFrame:
-        out = frame.copy()
-        if "time" in out.columns:
-            pre = len(out)
-            out = out[out["time"] >= gate_time]
-            logger.info(f"SHORT time gate kept {len(out)}/{pre}")
-        if "OBV30mDelta" in out.columns:
-            pre = len(out)
-            out = out[out["OBV30mDelta"].fillna(0) <= 0] if relaxed else out[out["OBV30mDelta"].fillna(0) < 0]
-            logger.info(f"SHORT OBV gate kept {len(out)}/{pre}")
-        if "Turning Regime" in out.columns:
-            pre = len(out)
-            out = out[out["Turning Regime"].isin(["LOW_FRICTION", "EXPANDING_FRICTION"])] if relaxed else out[out["Turning Regime"] == "LOW_FRICTION"]
-            logger.info(f"SHORT friction gate kept {len(out)}/{pre}")
-        
-        if "Directional" in out.columns:
-            pre = len(out)
-            out = out[out["Directional"] < 0]
-            logger.info(f"SHORT directional gate kept {len(out)}/{pre}")
-        allowed = {"SHORT", "MIXED"} if allow_mixed else {"SHORT"}
-        pre = len(out)
-        return out
-
-    def _build_side(frame: pd.DataFrame, side: str) -> pd.DataFrame:
-        attempts = [
-            {"allow_mixed": False, "relaxed": False, "label": "strict"},
-            {"allow_mixed": True, "relaxed": False, "label": "strict+mixed"},
-            {"allow_mixed": True, "relaxed": True, "label": "relaxed+mixed"},
-        ]
-        final = pd.DataFrame()
-        for attempt in attempts:
-            logger.info(f"{side.upper()} attempting mode={attempt['label']}")
-            if side == "long":
-                candidate = _apply_long_gate(frame, attempt["allow_mixed"], attempt["relaxed"])
-                candidate = candidate.sort_values(["Directional", "Turning", "CumsumPlus", "Stability"], ascending=[False, True, False, False], na_position="last")
-            else:
-                candidate = _apply_short_gate(frame, attempt["allow_mixed"], attempt["relaxed"])
-                candidate = candidate.sort_values(["Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, True, True, False], na_position="last")
-            candidate = candidate.drop_duplicates(subset=["Symbol"])
-            logger.info(f"{side.upper()} mode={attempt['label']} produced {len(candidate)} rows")
-            if not candidate.empty:
-                final = candidate
-                break
-        return final.head(15)
-
-    logger.info(f"CANDIDATES starting universe size {start_count}")
-    long_df = _build_side(base, "long")
-    short_df = _build_side(base, "short")
+    # 5. Format for email output
+    # Ensure we only return columns that actually exist in the dataframe
     cols = [c for c in EMAIL_DISPLAY_COLS if c in base.columns]
-    long_df = long_df[cols] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-    short_df = short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-    logger.info(f"CANDIDATES final long={len(long_df)} short={len(short_df)}")
-    return long_df, short_df
+    
+    long_final = (long_df[cols] if not long_df.empty else pd.DataFrame(columns=cols))
+    short_final = (short_df[cols] if not short_df.empty else pd.DataFrame(columns=cols))
+
+    return long_final, short_final
 
 
-
+             
 def build_occurrence_table(
     detail_df: pd.DataFrame,
     last_n_iterations: Optional[int] = None,
