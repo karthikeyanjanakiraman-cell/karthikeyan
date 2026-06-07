@@ -1240,15 +1240,23 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         df_side = df_side.copy()
 
         if side == "long":
+            # Apply our strict bullish momentum and volume breakout conditions
             df_side = df_side[
-                (df_side["Directional"] > 0) &
-                (df_side["MTF_ALIGN"] == "LONG")
+                (df_side["Trade Action"].isin(['ENTRY', 'HOLD'])) &
+                (df_side["Turning Regime"].isin(['ACTIVE_CONTINUATION', 'LOW_FRICTION'])) &
+                (df_side["Iteration Change"] > 0) &
+                (df_side["10 Day Relative Volume"] >= 1.0) &
+                (df_side["VWAP Z-Score"] > 0) &
+                (df_side["VWAP Z-Score"] < 3)
             ]
+            
+            # Sort by highest relative volume and highest momentum
             df_side = df_side.sort_values(
-                ["Directional", "Turning", "CumsumPlus", "Stability"],
-                ascending=[False, True, False, False],
+                ["10 Day Relative Volume", "Iteration Change"],
+                ascending=[False, False],
                 na_position="last",
             )
+
         else:
             df_side = df_side[
                 (df_side["Directional"] < 0) &
