@@ -145,13 +145,13 @@ def build_signals_from_raw_directional(detail_df) -> dict:
 
 
 
-def classify_mtf_from_window(win, eps: float = 1e-9) -> int:
+def classify_mtf_from_window(win, eps: float = 1e-9) -> float:
     s = pd.Series(win).dropna().astype(float)
     if len(s) < 3:
-        return 0
+        return float("nan")
     diff1 = s.diff().dropna()
     if len(diff1) < 2:
-        return 0
+        return float("nan")
     x = np.arange(len(s), dtype=float)
     slope = float(np.polyfit(x, s.values, 1)[0])
     net_move = float(s.iloc[-1] - s.iloc[0])
@@ -160,20 +160,20 @@ def classify_mtf_from_window(win, eps: float = 1e-9) -> int:
     cumsum_plus = float(np.clip(diff1, 0, None).sum())
     score = (slope + net_move) + (0.25 * cumsum_plus) - (0.50 * turning) - (0.10 * stability)
     if score > eps:
-        return 1
+        return 1.0
     if score < -eps:
-        return -1
-    return 0
+        return -1.0
+    return 0.0
 
 
 def build_mtf_alignment(detail_df: pd.DataFrame) -> Dict[str, object]:
     out = {
-        "MTF_5m": 0.0,
-        "MTF_15m": 0.0,
-        "MTF_30m": 0.0,
-        "MTF_60m": 0.0,
-        "MTF_SCORE": 0.0,
-        "MTF_ALIGN": "MIXED",
+        "MTF_5m": float("nan"),
+        "MTF_15m": float("nan"),
+        "MTF_30m": float("nan"),
+        "MTF_60m": float("nan"),
+        "MTF_SCORE": float("nan"),
+        "MTF_ALIGN": "NA",
     }
     if detail_df is None or detail_df.empty or "Iteration Change" not in detail_df.columns:
         return out
@@ -181,23 +181,35 @@ def build_mtf_alignment(detail_df: pd.DataFrame) -> Dict[str, object]:
     if "Iteration No" in df.columns:
         df = df.sort_values("Iteration No")
     series = pd.to_numeric(df["Iteration Change"], errors="coerce").dropna().astype(float)
-    if len(series) < 3:
+    n = len(series)
+    if n < 3:
         return out
-    mtf_5 = classify_mtf_from_window(series.tail(3))
-    mtf_15 = classify_mtf_from_window(series.tail(3))
-    mtf_30 = classify_mtf_from_window(series.tail(6))
-    mtf_60 = classify_mtf_from_window(series.tail(12))
-    score = float(mtf_5 + mtf_15 + mtf_30 + mtf_60)
+
+    mtf_5 = classify_mtf_from_window(series.tail(min(3, n)))
+    mtf_15 = classify_mtf_from_window(series.tail(3)) if n >= 3 else float("nan")
+    mtf_30 = classify_mtf_from_window(series.tail(6)) if n >= 6 else float("nan")
+    mtf_60 = classify_mtf_from_window(series.tail(12)) if n >= 12 else float("nan")
+
+    available = [v for v in [mtf_5, mtf_15, mtf_30, mtf_60] if pd.notna(v)]
+    if not available:
+        return out
+
+    score = float(np.nansum([mtf_5, mtf_15, mtf_30, mtf_60]))
     align = "MIXED"
-    if all(v == 1 for v in [mtf_5, mtf_15, mtf_30, mtf_60]):
+    if all(v == 1.0 for v in available):
         align = "LONG"
-    elif all(v == -1 for v in [mtf_5, mtf_15, mtf_30, mtf_60]):
+    elif all(v == -1.0 for v in available):
         align = "SHORT"
+    elif all(v == 0.0 for v in available):
+        align = "MIXED"
+    elif len(available) == 1 and available[0] == 0.0:
+        align = "NA"
+
     out.update({
-        "MTF_5m": float(mtf_5),
-        "MTF_15m": float(mtf_15),
-        "MTF_30m": float(mtf_30),
-        "MTF_60m": float(mtf_60),
+        "MTF_5m": mtf_5,
+        "MTF_15m": mtf_15,
+        "MTF_30m": mtf_30,
+        "MTF_60m": mtf_60,
         "MTF_SCORE": score,
         "MTF_ALIGN": align,
     })
