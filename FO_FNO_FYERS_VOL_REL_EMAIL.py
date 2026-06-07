@@ -1,3 +1,4 @@
+
 #!/usr/bin/env python3
 """
 FO_FNO_FYERS_VOL_REL_EMAIL.py
@@ -1260,17 +1261,25 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
                 na_position="last",
             )
 
-
-        else:
+        else: # if side == "short"
+            # Apply our strict bearish momentum and volume breakdown conditions
             df_side = df_side[
                 (df_side["Directional"] < 0) &
-                (df_side["MTF_ALIGN"] == "SHORT")
+                (df_side["Turning Regime"] == 'LOW_FRICTION') &
+                (df_side["Iteration Change"] < 0) &
+                (df_side["10 Day Relative Volume"] >= 1.0) &
+                (df_side["VWAP Z-Score"] < 0) &
+                (df_side["VWAP Z-Score"] > -3)
             ]
+            
+            # Sort by highest downward momentum first, then highest relative volume
             df_side = df_side.sort_values(
-                ["Directional", "Turning", "CumsumPlus", "Stability"],
-                ascending=[True, True, True, False],
+                ["Iteration Change", "10 Day Relative Volume"],
+                ascending=[True, False],
                 na_position="last",
             )
+         
+        
 
         return df_side
 
