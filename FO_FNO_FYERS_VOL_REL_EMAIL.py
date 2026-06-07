@@ -1207,8 +1207,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
             logger.info(f"LONG directional gate kept {len(out)}/{pre}")
         allowed = {"LONG", "MIXED"} if allow_mixed else {"LONG"}
         pre = len(out)
-        out = out[out["MTF_ALIGN"].isin(allowed)]
-        logger.info(f"LONG MTF gate kept {len(out)}/{pre} using {sorted(allowed)}")
+        
         return out
 
     def _apply_short_gate(frame: pd.DataFrame, allow_mixed: bool, relaxed: bool) -> pd.DataFrame:
@@ -1232,8 +1231,6 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
             logger.info(f"SHORT directional gate kept {len(out)}/{pre}")
         allowed = {"SHORT", "MIXED"} if allow_mixed else {"SHORT"}
         pre = len(out)
-        out = out[out["MTF_ALIGN"].isin(allowed)]
-        logger.info(f"SHORT MTF gate kept {len(out)}/{pre} using {sorted(allowed)}")
         return out
 
     def _build_side(frame: pd.DataFrame, side: str) -> pd.DataFrame:
