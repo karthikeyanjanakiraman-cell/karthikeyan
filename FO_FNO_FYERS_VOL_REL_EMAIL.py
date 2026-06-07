@@ -1138,6 +1138,10 @@ def format_value(col: str, val):
     return str(val)
 
 def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """
+    Filters the F&O universe to isolate 'Elite Alpha' candidates.
+    Filters out 'CHURNING_FAKEOUT' traps and focuses only on Low Friction regimes.
+    """
     if df is None or df.empty:
         return (
             pd.DataFrame(columns=EMAIL_DISPLAY_COLS),
@@ -1146,32 +1150,40 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
 
     base = df.copy()
 
-    # 1. Check for the existence of 'Price_Leading_Flag'
-    # If the column is missing, we use a fallback logic so the script doesn't crash
-    if 'Price_Leading_Flag' in base.columns:
-        # Use Surgical Precision Filter
-        base = base[
-            (base['OBV30mDelta'] > 0) & 
-            (base['Price_Leading_Flag'] == True)
-        ].copy()
-    else:
-        # Fallback: Just use OBV if Price_Leading_Flag isn't calculated
-        base = base[base['OBV30mDelta'] > 0].copy()
+    # 1. SURGICAL FILTER: Eliminate Waste
+    # We filter for 'LOW_FRICTION' regime and avoid 'CHURNING_FAKEOUT' traps.
+    # This ensures we only get stocks with no overhead seller resistance.
+    base = base[
+        (base['Turning Regime'] == 'LOW_FRICTION') &
+        (~base['Dual Engine State'].isin(['CHURNING_FAKEOUT', 'BLOCK_ENTRY']))
+    ].copy()
 
-    # 2. Define the selection logic
+    # 2. Check for optional technical flags safely
+    # If 'OBV30mDelta' or 'Price_Leading_Flag' are missing, the script won't crash.
+    if 'OBV30mDelta' in base.columns:
+        base = base[base['OBV30mDelta'] > 0]
+        
+    if 'Price_Leading_Flag' in base.columns:
+        base = base[base['Price_Leading_Flag'] == True]
+
+    # 3. Define Selection Logic: Focus on Institutional Alpha
     def prep_side(data: pd.DataFrame, direction: str) -> pd.DataFrame:
-        if data.empty: return data
+        if data.empty:
+            return data
+        
+        # Sort by Directional strength to ensure we get the strongest trends
         if direction == "long":
             filtered = data[data["Directional"] > 0]
-            return filtered.sort_values("OBV30mDelta", ascending=False).head(5)
+            return filtered.sort_values("Directional", ascending=False).head(5)
         else:
             filtered = data[data["Directional"] < 0]
-            return filtered.sort_values("OBV30mDelta", ascending=True).head(5)
+            return filtered.sort_values("Directional", ascending=True).head(5)
 
+    # 4. Generate Tables
     long_df = prep_side(base, "long")
     short_df = prep_side(base, "short")
 
-    # 3. Format for email output
+    # 5. Format and Clean Columns
     cols = [c for c in EMAIL_DISPLAY_COLS if c in base.columns]
     
     long_final = (long_df[cols] if not long_df.empty else pd.DataFrame(columns=cols))
@@ -1179,6 +1191,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
 
     return long_final, short_final
 
+    
 
              
 def build_occurrence_table(
