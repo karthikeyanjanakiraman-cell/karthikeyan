@@ -848,7 +848,6 @@ def compute_iteration_volume_profile(
         last_iter_time = t.strftime("%H:%M")
 
     detail_df = pd.DataFrame(rows)
-    detail_df = add_dual_engine_matrix(detail_df)
 
     ltp = float(curr_df["close"].iloc[-1]) if not curr_df.empty else np.nan
     hod = float(curr_df["high"].max()) if not curr_df.empty else float("nan")
@@ -897,16 +896,6 @@ def compute_iteration_volume_profile(
         "RSI30mDelta": rsi_30m_delta,
         "Price_Lead_Status": str(price_lead_df["Price_Lead_Status"].iloc[-1]) if not price_lead_df.empty else "NORMAL",
     }
-
-    if not detail_df.empty:
-        latest_detail = detail_df.sort_values("Iteration No").tail(1).iloc[0]
-        summary.update({
-            "CumsumDiff": latest_detail.get("CumsumDiff", np.nan),
-            "TurningDiff": latest_detail.get("TurningDiff", np.nan),
-            "Turning Regime": latest_detail.get("Turning Regime", ""),
-            "Dual Engine State": latest_detail.get("Dual Engine State", ""),
-            "Trade Action": latest_detail.get("Trade Action", ""),
-        })
 
     signals = build_signals_from_raw_directional(detail_df)
     summary.update(signals)
@@ -958,11 +947,6 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "Stability": iter_summary.get("Stability"),
             "Balanced": iter_summary.get("Balanced"),
             "CumsumPlus": iter_summary.get("CumsumPlus"),
-            "CumsumDiff": iter_summary.get("CumsumDiff"),
-            "TurningDiff": iter_summary.get("TurningDiff"),
-            "Turning Regime": iter_summary.get("Turning Regime"),
-            "Dual Engine State": iter_summary.get("Dual Engine State"),
-            "Trade Action": iter_summary.get("Trade Action"),
             "ARIMA Signal": iter_summary.get("ARIMA Signal"),
             "Kalman Signal": iter_summary.get("Kalman Signal"),
             "5m_Signal": iter_summary.get("5m_Signal"),
@@ -999,15 +983,10 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "Volatility State": iv_info.get("Volatility State"),
         })
 
-    summary_df = pd.DataFrame(rows)
-    detail_df = pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame()
-
-    if not detail_df.empty:
-        detail_df = add_dual_engine_matrix(detail_df)
-        summary_df = merge_dual_engine_latest(summary_df, detail_df)
-
-    return summary_df, detail_df
-
+    return (
+        pd.DataFrame(rows),
+        pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame()
+    )
 
 
 def rank_delta_to_label(delta: float) -> str:
@@ -1161,37 +1140,151 @@ def format_value(col: str, val):
 
 def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df is None or df.empty:
-        return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+        return (
+            pd.DataFrame(columns=EMAIL_DISPLAY_COLS),
+            pd.DataFrame(columns=EMAIL_DISPLAY_COLS),
+        )
 
     base = df.copy()
-    for c in ["Directional", "Turning", "Stability", "Balanced", "CumsumPlus", "10 Day Relative Volume", "Last5mVolume"]:
+
+    numeric_cols = [
+        "Directional",
+        "Turning",
+        "Stability",
+        "Balanced",
+        "CumsumPlus",
+        "10 Day Relative Volume",
+        "Last5mVolume",
+        "OBV30mDelta",
+    ]
+    for c in numeric_cols:
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
 
-    base = base.copy()
+    if "Last Iteration Time" in base.columns:
+        base["time"] = pd.to_datetime(base["Last Iteration Time"], format="%H:%M", errors="coerce").dt.time
+    else:
+        base["time"] = pd.NaT
+
+    if "MTF_ALIGN" not in base.columns:
+        base["MTF_ALIGN"] = ""
+    base["MTF_ALIGN"] = base["MTF_ALIGN"].astype(str).str.upper().str.strip()
+
+    if "Turning Regime" in base.columns:
+        base["Turning Regime"] = base["Turning Regime"].astype(str).str.upper().str.strip()
+
+    if "Price_Leading_Flag" in base.columns:
+        base["Price_Leading_Flag"] = (
+            base["Price_Leading_Flag"].astype(str).str.upper().str.strip().map({"TRUE": True, "FALSE": False}).fillna(False)
+        )
+
+    if "Price_Lead_Status" in base.columns:
+        base["Price_Lead_Status"] = base["Price_Lead_Status"].astype(str).str.upper().str.strip()
+
+    start_count = len(base)
+
     if "10 Day Relative Volume" in base.columns:
+        pre = len(base)
         base = base[base["10 Day Relative Volume"].fillna(0) >= 1.0]
+        logger.info(f"CANDIDATES RVOL gate kept {len(base)}/{pre}")
+
     if "Last5mVolume" in base.columns:
+        pre = len(base)
         base = base[base["Last5mVolume"].fillna(0) > 0]
+        logger.info(f"CANDIDATES Last5mVolume gate kept {len(base)}/{pre}")
 
-    def prep_side(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
-        if df_side.empty:
-            return df_side
-        df_side = df_side.copy()
-        if side == "long":
-            df_side = df_side[df_side["Directional"] > 0]
-            df_side = df_side.sort_values(["Directional", "Turning", "CumsumPlus", "Stability"], ascending=[False, True, False, False], na_position="last")
-        else:
-            df_side = df_side[df_side["Directional"] < 0]
-            df_side = df_side.sort_values(["Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, True, True, False], na_position="last")
-        return df_side
+    gate_time = pd.to_datetime("09:45", format="%H:%M").time()
+    bearish_status = {"STRONG_PRICE_LEAD_FADE", "PRICE_LEADING_FADE_RISK"}
 
-    long_df = prep_side(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
-    short_df = prep_side(base, "short").drop_duplicates(subset=["Symbol"]).head(15)
+    def _apply_long_gate(frame: pd.DataFrame, allow_mixed: bool, relaxed: bool) -> pd.DataFrame:
+        out = frame.copy()
+        if "time" in out.columns:
+            pre = len(out)
+            out = out[out["time"] >= gate_time]
+            logger.info(f"LONG time gate kept {len(out)}/{pre}")
+        if "OBV30mDelta" in out.columns:
+            pre = len(out)
+            out = out[out["OBV30mDelta"].fillna(0) >= (0 if relaxed else 1e-12)] if relaxed else out[out["OBV30mDelta"].fillna(0) > 0]
+            logger.info(f"LONG OBV gate kept {len(out)}/{pre}")
+        if "Turning Regime" in out.columns:
+            pre = len(out)
+            out = out[out["Turning Regime"].isin(["LOW_FRICTION", "EXPANDING_FRICTION"])] if relaxed else out[out["Turning Regime"] == "LOW_FRICTION"]
+            logger.info(f"LONG friction gate kept {len(out)}/{pre}")
+        if "Price_Leading_Flag" in out.columns:
+            pre = len(out)
+            if not relaxed:
+                out = out[out["Price_Leading_Flag"] == True]
+            logger.info(f"LONG lead gate kept {len(out)}/{pre}")
+        if "Directional" in out.columns:
+            pre = len(out)
+            out = out[out["Directional"] > 0]
+            logger.info(f"LONG directional gate kept {len(out)}/{pre}")
+        allowed = {"LONG", "MIXED"} if allow_mixed else {"LONG"}
+        pre = len(out)
+        out = out[out["MTF_ALIGN"].isin(allowed)]
+        logger.info(f"LONG MTF gate kept {len(out)}/{pre} using {sorted(allowed)}")
+        return out
+
+    def _apply_short_gate(frame: pd.DataFrame, allow_mixed: bool, relaxed: bool) -> pd.DataFrame:
+        out = frame.copy()
+        if "time" in out.columns:
+            pre = len(out)
+            out = out[out["time"] >= gate_time]
+            logger.info(f"SHORT time gate kept {len(out)}/{pre}")
+        if "OBV30mDelta" in out.columns:
+            pre = len(out)
+            out = out[out["OBV30mDelta"].fillna(0) <= 0] if relaxed else out[out["OBV30mDelta"].fillna(0) < 0]
+            logger.info(f"SHORT OBV gate kept {len(out)}/{pre}")
+        if "Turning Regime" in out.columns:
+            pre = len(out)
+            out = out[out["Turning Regime"].isin(["LOW_FRICTION", "EXPANDING_FRICTION"])] if relaxed else out[out["Turning Regime"] == "LOW_FRICTION"]
+            logger.info(f"SHORT friction gate kept {len(out)}/{pre}")
+        if "Price_Lead_Status" in out.columns:
+            pre = len(out)
+            if not relaxed:
+                out = out[out["Price_Lead_Status"].isin(bearish_status)]
+            logger.info(f"SHORT lead-status gate kept {len(out)}/{pre}")
+        if "Directional" in out.columns:
+            pre = len(out)
+            out = out[out["Directional"] < 0]
+            logger.info(f"SHORT directional gate kept {len(out)}/{pre}")
+        allowed = {"SHORT", "MIXED"} if allow_mixed else {"SHORT"}
+        pre = len(out)
+        out = out[out["MTF_ALIGN"].isin(allowed)]
+        logger.info(f"SHORT MTF gate kept {len(out)}/{pre} using {sorted(allowed)}")
+        return out
+
+    def _build_side(frame: pd.DataFrame, side: str) -> pd.DataFrame:
+        attempts = [
+            {"allow_mixed": False, "relaxed": False, "label": "strict"},
+            {"allow_mixed": True, "relaxed": False, "label": "strict+mixed"},
+            {"allow_mixed": True, "relaxed": True, "label": "relaxed+mixed"},
+        ]
+        final = pd.DataFrame()
+        for attempt in attempts:
+            logger.info(f"{side.upper()} attempting mode={attempt['label']}")
+            if side == "long":
+                candidate = _apply_long_gate(frame, attempt["allow_mixed"], attempt["relaxed"])
+                candidate = candidate.sort_values(["Directional", "Turning", "CumsumPlus", "Stability"], ascending=[False, True, False, False], na_position="last")
+            else:
+                candidate = _apply_short_gate(frame, attempt["allow_mixed"], attempt["relaxed"])
+                candidate = candidate.sort_values(["Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, True, True, False], na_position="last")
+            candidate = candidate.drop_duplicates(subset=["Symbol"])
+            logger.info(f"{side.upper()} mode={attempt['label']} produced {len(candidate)} rows")
+            if not candidate.empty:
+                final = candidate
+                break
+        return final.head(15)
+
+    logger.info(f"CANDIDATES starting universe size {start_count}")
+    long_df = _build_side(base, "long")
+    short_df = _build_side(base, "short")
     cols = [c for c in EMAIL_DISPLAY_COLS if c in base.columns]
     long_df = long_df[cols] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     short_df = short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    logger.info(f"CANDIDATES final long={len(long_df)} short={len(short_df)}")
     return long_df, short_df
+
 
 
 def build_occurrence_table(
