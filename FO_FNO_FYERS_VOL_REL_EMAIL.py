@@ -1166,10 +1166,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     else:
         base["time"] = pd.NaT
 
-    if "MTF_ALIGN" not in base.columns:
-        base["MTF_ALIGN"] = ""
-    base["MTF_ALIGN"] = base["MTF_ALIGN"].astype(str).str.upper().str.strip()
-
+    
     if "Turning Regime" in base.columns:
         base["Turning Regime"] = base["Turning Regime"].astype(str).str.upper().str.strip()
 
