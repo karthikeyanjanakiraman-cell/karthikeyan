@@ -1253,12 +1253,13 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
                 (df_side["VWAP Z-Score"] < 3)
             ]
             
-            # Sort by highest relative volume and highest momentum
+            # Sort by highest momentum first, then highest relative volume
             df_side = df_side.sort_values(
-                ["10 Day Relative Volume", "Iteration Change"],
+                ["Iteration Change", "10 Day Relative Volume"],
                 ascending=[False, False],
                 na_position="last",
             )
+
 
         else:
             df_side = df_side[
