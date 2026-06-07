@@ -109,13 +109,7 @@ def build_signals_from_raw_directional(detail_df) -> dict:
             "15m_Signal",
             "30m_Signal",
             "60m_Signal",
-    "MTF_5m",
-    "MTF_15m",
-    "MTF_30m",
-    "MTF_60m",
-    "MTF_SCORE",
-    "MTF_ALIGN",
-    "Bull_Signal",
+            "Bull_Signal",
             "Bear_Signal",
             "Overall_Signal",
         )
@@ -148,6 +142,66 @@ def build_signals_from_raw_directional(detail_df) -> dict:
     out["Overall_Signal"] = round(raw_at(0), 4)
     return out
 
+
+
+
+def classify_mtf_from_window(win, eps: float = 1e-9) -> int:
+    s = pd.Series(win).dropna().astype(float)
+    if len(s) < 3:
+        return 0
+    diff1 = s.diff().dropna()
+    if len(diff1) < 2:
+        return 0
+    x = np.arange(len(s), dtype=float)
+    slope = float(np.polyfit(x, s.values, 1)[0])
+    net_move = float(s.iloc[-1] - s.iloc[0])
+    turning = float(np.mean(np.abs(np.diff(s.values, n=2)))) if len(s) >= 3 else 0.0
+    stability = float(np.std(s.values))
+    cumsum_plus = float(np.clip(diff1, 0, None).sum())
+    score = (slope + net_move) + (0.25 * cumsum_plus) - (0.50 * turning) - (0.10 * stability)
+    if score > eps:
+        return 1
+    if score < -eps:
+        return -1
+    return 0
+
+
+def build_mtf_alignment(detail_df: pd.DataFrame) -> Dict[str, object]:
+    out = {
+        "MTF_5m": 0.0,
+        "MTF_15m": 0.0,
+        "MTF_30m": 0.0,
+        "MTF_60m": 0.0,
+        "MTF_SCORE": 0.0,
+        "MTF_ALIGN": "MIXED",
+    }
+    if detail_df is None or detail_df.empty or "Iteration Change" not in detail_df.columns:
+        return out
+    df = detail_df.copy()
+    if "Iteration No" in df.columns:
+        df = df.sort_values("Iteration No")
+    series = pd.to_numeric(df["Iteration Change"], errors="coerce").dropna().astype(float)
+    if len(series) < 3:
+        return out
+    mtf_5 = classify_mtf_from_window(series.tail(3))
+    mtf_15 = classify_mtf_from_window(series.tail(3))
+    mtf_30 = classify_mtf_from_window(series.tail(6))
+    mtf_60 = classify_mtf_from_window(series.tail(12))
+    score = float(mtf_5 + mtf_15 + mtf_30 + mtf_60)
+    align = "MIXED"
+    if all(v == 1 for v in [mtf_5, mtf_15, mtf_30, mtf_60]):
+        align = "LONG"
+    elif all(v == -1 for v in [mtf_5, mtf_15, mtf_30, mtf_60]):
+        align = "SHORT"
+    out.update({
+        "MTF_5m": float(mtf_5),
+        "MTF_15m": float(mtf_15),
+        "MTF_30m": float(mtf_30),
+        "MTF_60m": float(mtf_60),
+        "MTF_SCORE": score,
+        "MTF_ALIGN": align,
+    })
+    return out
 
 def classify_diff_status(cumsum_diff: float, turning_diff: float, prior_cumsum: float = 0.0, eps: float = 1e-4) -> str:
     c = 0.0 if pd.isna(cumsum_diff) else float(cumsum_diff)
@@ -709,92 +763,6 @@ def price_stats_from_series(prices: pd.Series) -> dict:
     }
 
 
-
-def classify_mtf_signal(stats: dict, eps: float = 1e-9) -> int:
-    d = float(stats.get("Directional", np.nan))
-    t = float(stats.get("Turning", np.nan))
-    s = float(stats.get("Stability", np.nan))
-    c = float(stats.get("CumsumPlus", np.nan))
-
-    if any(pd.isna(v) for v in [d, t, s, c]):
-        return 0
-
-    quality_ok = (t <= s) or (abs(t - s) <= eps)
-
-    if d > 0 and c > 0 and quality_ok:
-        return 1
-    if d < 0 and quality_ok:
-        return -1
-    return 0
-
-
-def mtf_stats_from_detail(detail_df: pd.DataFrame, bars: int) -> dict:
-    if detail_df is None or detail_df.empty:
-        return {
-            "Directional": np.nan,
-            "Turning": np.nan,
-            "Stability": np.nan,
-            "Balanced": np.nan,
-            "CumsumPlus": np.nan,
-        }
-
-    df = detail_df.copy()
-    if "Iteration No" in df.columns:
-        df = df.sort_values("Iteration No")
-
-    src = pd.to_numeric(df["Iteration Change"], errors="coerce").dropna().tail(bars)
-
-    if len(src) < 3:
-        return {
-            "Directional": np.nan,
-            "Turning": np.nan,
-            "Stability": np.nan,
-            "Balanced": np.nan,
-            "CumsumPlus": np.nan,
-        }
-
-    return price_stats_from_series(src)
-
-
-def build_mtf_alignment(detail_df: pd.DataFrame) -> dict:
-    out = {
-        "MTF_5m": 0,
-        "MTF_15m": 0,
-        "MTF_30m": 0,
-        "MTF_60m": 0,
-        "MTF_ALIGN": "MIXED",
-        "MTF_SCORE": 0,
-    }
-
-    if detail_df is None or detail_df.empty:
-        return out
-
-    s5 = mtf_stats_from_detail(detail_df, 3)
-    s15 = mtf_stats_from_detail(detail_df, 3)
-    s30 = mtf_stats_from_detail(detail_df, 6)
-    s60 = mtf_stats_from_detail(detail_df, 12)
-
-    tf5 = classify_mtf_signal(s5)
-    tf15 = classify_mtf_signal(s15)
-    tf30 = classify_mtf_signal(s30)
-    tf60 = classify_mtf_signal(s60)
-
-    out["MTF_5m"] = tf5
-    out["MTF_15m"] = tf15
-    out["MTF_30m"] = tf30
-    out["MTF_60m"] = tf60
-    out["MTF_SCORE"] = tf5 + tf15 + tf30 + tf60
-
-    if tf5 == 1 and tf15 == 1 and tf30 == 1 and tf60 == 1:
-        out["MTF_ALIGN"] = "LONG"
-    elif tf5 == -1 and tf15 == -1 and tf30 == -1 and tf60 == -1:
-        out["MTF_ALIGN"] = "SHORT"
-    else:
-        out["MTF_ALIGN"] = "MIXED"
-
-    return out
-
-
 def arima_signal_from_series(prices: pd.Series, order: tuple = (1, 1, 1), window: int = 50) -> float:
     p = pd.to_numeric(prices, errors="coerce").dropna().astype(float)
     if len(p) < max(window // 2, 12):
@@ -996,8 +964,8 @@ def compute_iteration_volume_profile(
     }
 
     signals = build_signals_from_raw_directional(detail_df)
-    summary.update(signals)
     mtf = build_mtf_alignment(detail_df)
+    summary.update(signals)
     summary.update(mtf)
     return summary, detail_df
 
