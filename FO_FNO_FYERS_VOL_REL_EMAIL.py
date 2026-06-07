@@ -275,7 +275,6 @@ def add_dual_engine_matrix(
 
     return out
 
-
 def merge_dual_engine_latest(summary_df: pd.DataFrame, detail_df: pd.DataFrame) -> pd.DataFrame:
     if summary_df is None or summary_df.empty:
         return pd.DataFrame() if summary_df is None else summary_df.copy()
@@ -285,6 +284,7 @@ def merge_dual_engine_latest(summary_df: pd.DataFrame, detail_df: pd.DataFrame) 
     needed = {
         "Symbol",
         "Iteration No",
+        "Iteration Change", 
         "CumsumDiff",
         "TurningDiff",
         "Turning Regime",
@@ -299,6 +299,7 @@ def merge_dual_engine_latest(summary_df: pd.DataFrame, detail_df: pd.DataFrame) 
         .groupby("Symbol", as_index=False)
         .tail(1)[[
             "Symbol",
+            "Iteration Change",
             "CumsumDiff",
             "TurningDiff",
             "Turning Regime",
@@ -308,6 +309,8 @@ def merge_dual_engine_latest(summary_df: pd.DataFrame, detail_df: pd.DataFrame) 
         .copy()
     )
     return summary_df.merge(latest, on="Symbol", how="left")
+
+
 
 def init_fyers():
     global fyers
