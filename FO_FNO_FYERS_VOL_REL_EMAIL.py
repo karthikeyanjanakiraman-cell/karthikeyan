@@ -88,6 +88,7 @@ EMAIL_DISPLAY_COLS = [
     "Bull_Signal",
     "Bear_Signal",
     "Overall_Signal",
+    "MTF_ALIGN",
     "Price_Lead_Status",
     "IVP",
     "Volatility State",
@@ -136,6 +137,21 @@ def build_signals_from_raw_directional(detail_df) -> dict:
     out["Overall_Signal"] = round(raw_at(0), 4)
     return out
 
+
+
+def derive_mtf_align(signals: dict) -> str:
+    vals = []
+    for k in ["5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal"]:
+        v = pd.to_numeric(pd.Series([signals.get(k)]), errors="coerce").iloc[0]
+        if pd.notna(v):
+            vals.append(float(v))
+    if not vals:
+        return ""
+    if all(v > 0 for v in vals):
+        return "LONG"
+    if all(v < 0 for v in vals):
+        return "SHORT"
+    return "MIXED"
 
 def classify_diff_status(cumsum_diff: float, turning_diff: float, prior_cumsum: float = 0.0, eps: float = 1e-4) -> str:
     c = 0.0 if pd.isna(cumsum_diff) else float(cumsum_diff)
@@ -899,6 +915,7 @@ def compute_iteration_volume_profile(
 
     signals = build_signals_from_raw_directional(detail_df)
     summary.update(signals)
+    summary["MTF_ALIGN"] = derive_mtf_align(signals)
     return summary, detail_df
 
 def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
@@ -978,6 +995,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "OBV30mDelta": iter_summary.get("OBV30mDelta"),
             "RSI30mDelta": iter_summary.get("RSI30mDelta"),
             "Price_Lead_Status": iter_summary.get("Price_Lead_Status", "NORMAL"),
+            "MTF_ALIGN": iter_summary.get("MTF_ALIGN", ""),
             "IVP": iv_info.get("IVP"),
             "Volatility State": iv_info.get("Volatility State"),
         })
@@ -1174,8 +1192,6 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     long_df = long_df[cols] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     short_df = short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     return long_df, short_df
-
-
 def build_occurrence_table(
     detail_df: pd.DataFrame,
     last_n_iterations: Optional[int] = None,
