@@ -1214,28 +1214,21 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
 
     base = df.copy()
 
-    for c in [
-        "Directional",
-        "Turning",
-        "Stability",
-        "Balanced",
-        "CumsumPlus",
-        "10 Day Relative Volume",
-        "Last5mVolume",
-    ]:
-        if c in base.columns:
-            base[c] = pd.to_numeric(base[c], errors="coerce")
-
-    if "MTF_ALIGN" not in base.columns:
-        base["MTF_ALIGN"] = ""
-
-    base["MTF_ALIGN"] = base["MTF_ALIGN"].astype(str).str.upper().str.strip()
-
-    if "10 Day Relative Volume" in base.columns:
-        base = base[base["10 Day Relative Volume"].fillna(0) >= 1.0]
-
-    if "Last5mVolume" in base.columns:
-        base = base[base["Last5mVolume"].fillna(0) > 0]
+    # Ensure time is in datetime format for filtering
+    base['time'] = pd.to_datetime(base['Last Iteration Time'], format='%H:%M', errors='coerce').dt.time
+    
+    # SURGICAL PRECISION FILTER:
+    # 1. Post-09:45 AM (Lie Detector Gate)
+    # 2. Institutional Flow (OBV30mDelta > 0)
+    # 3. Seller Exhaustion (LOW_FRICTION)
+    # 4. Momentum Confluence (Price_Leading_Flag == True)
+    
+    base = base[
+        (base['time'] >= pd.to_datetime('09:45', format='%H:%M').time()) &
+        (base['OBV30mDelta'] > 0) & 
+        (base['Turning Regime'] == 'LOW_FRICTION') &
+        (base['Price_Leading_Flag'] == True)
+    ]
 
     def prep_side(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
         if df_side.empty:
@@ -1244,42 +1237,18 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         df_side = df_side.copy()
 
         if side == "long":
-            # Apply our strict bullish momentum and volume breakout conditions
-            df_side = df_side[
-                (df_side["Trade Action"].isin(['ENTRY', 'HOLD'])) &
-                (df_side["Turning Regime"].isin(['ACTIVE_CONTINUATION', 'LOW_FRICTION'])) &
-                (df_side["Iteration Change"] > 0) &
-                (df_side["10 Day Relative Volume"] >= 1.0) &
-                (df_side["VWAP Z-Score"] > 0) &
-                (df_side["VWAP Z-Score"] < 3)
-            ]
-            
-            # Sort by highest momentum first, then highest relative volume
+            df_side = df_side[df_side["Directional"] > 0]
+            # Prioritize Velocity (OBV and Momentum) over just Directional
             df_side = df_side.sort_values(
-                ["Iteration Change", "10 Day Relative Volume"],
-                ascending=[False, False],
-                na_position="last",
+                ["OBV30mDelta", "Delta_Expansion", "Directional"],
+                ascending=[False, False, False],
             )
-
-        else: # if side == "short"
-            # Apply our strict bearish momentum and volume breakdown conditions
-            df_side = df_side[
-                (df_side["Directional"] < 0) &
-                (df_side["Turning Regime"] == 'LOW_FRICTION') &
-                (df_side["Iteration Change"] < 0) &
-                (df_side["10 Day Relative Volume"] >= 1.0) &
-                (df_side["VWAP Z-Score"] < 0) &
-                (df_side["VWAP Z-Score"] > -3)
-            ]
-            
-            # Sort by highest downward momentum first, then highest relative volume
+        else:
+            df_side = df_side[df_side["Directional"] < 0]
             df_side = df_side.sort_values(
-                ["Iteration Change", "10 Day Relative Volume"],
-                ascending=[True, False],
-                na_position="last",
+                ["OBV30mDelta", "Delta_Expansion", "Directional"],
+                ascending=[True, True, True],
             )
-         
-        
 
         return df_side
 
@@ -1288,20 +1257,11 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
 
     cols = [c for c in EMAIL_DISPLAY_COLS if c in base.columns]
 
-    long_df = (
-        long_df[cols] if not long_df.empty
-        else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-    )
-    short_df = (
-        short_df[cols] if not short_df.empty
-        else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-    )
+    long_df = (long_df[cols] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS))
+    short_df = (short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS))
 
     return long_df, short_df
-
-
-    
-
+   
 
 def build_occurrence_table(
     detail_df: pd.DataFrame,
