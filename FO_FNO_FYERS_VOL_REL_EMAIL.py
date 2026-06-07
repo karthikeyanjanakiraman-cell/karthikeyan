@@ -1216,17 +1216,31 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     if "Last5mVolume" in base.columns:
         base = base[base["Last5mVolume"].fillna(0) > 0]
 
-    def prep_side(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
-        if df_side.empty:
-            return df_side
-        df_side = df_side.copy()
-        if side == "long":
-            df_side = df_side[df_side["Directional"] > 0]
-            df_side = df_side.sort_values(["Directional", "Turning", "CumsumPlus", "Stability"], ascending=[False, True, False, False], na_position="last")
-        else:
-            df_side = df_side[df_side["Directional"] < 0]
-            df_side = df_side.sort_values(["Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, True, True, False], na_position="last")
-        return df_side
+    def prepside(dfside: pd.DataFrame, side: str) -> pd.DataFrame:
+    if dfside.empty:
+        return dfside.copy()
+
+    dfside = dfside.copy()
+
+    if side == "long":
+        dfside = dfside[dfside["MTF_ALIGN"].astype(str).str.upper().eq("LONG")]
+        dfside = dfside[dfside["Directional"] > 0]
+        dfside = dfside.sort_values(
+            ["Directional", "Turning", "CumsumPlus", "Stability"],
+            ascending=[False, True, False, False],
+            na_position="last",
+        )
+    else:
+        dfside = dfside[dfside["MTF_ALIGN"].astype(str).str.upper().eq("SHORT")]
+        dfside = dfside[dfside["Directional"] < 0]
+        dfside = dfside.sort_values(
+            ["Directional", "Turning", "CumsumPlus", "Stability"],
+            ascending=[True, True, True, False],
+            na_position="last",
+        )
+
+    return dfside
+    
 
     long_df = prep_side(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
     short_df = prep_side(base, "short").drop_duplicates(subset=["Symbol"]).head(15)
