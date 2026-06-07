@@ -1173,14 +1173,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     if "Turning Regime" in base.columns:
         base["Turning Regime"] = base["Turning Regime"].astype(str).str.upper().str.strip()
 
-    if "Price_Leading_Flag" in base.columns:
-        base["Price_Leading_Flag"] = (
-            base["Price_Leading_Flag"].astype(str).str.upper().str.strip().map({"TRUE": True, "FALSE": False}).fillna(False)
-        )
-
-    if "Price_Lead_Status" in base.columns:
-        base["Price_Lead_Status"] = base["Price_Lead_Status"].astype(str).str.upper().str.strip()
-
+    
     start_count = len(base)
 
     if "10 Day Relative Volume" in base.columns:
@@ -1210,11 +1203,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
             pre = len(out)
             out = out[out["Turning Regime"].isin(["LOW_FRICTION", "EXPANDING_FRICTION"])] if relaxed else out[out["Turning Regime"] == "LOW_FRICTION"]
             logger.info(f"LONG friction gate kept {len(out)}/{pre}")
-        if "Price_Leading_Flag" in out.columns:
-            pre = len(out)
-            if not relaxed:
-                out = out[out["Price_Leading_Flag"] == True]
-            logger.info(f"LONG lead gate kept {len(out)}/{pre}")
+        
         if "Directional" in out.columns:
             pre = len(out)
             out = out[out["Directional"] > 0]
@@ -1239,11 +1228,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
             pre = len(out)
             out = out[out["Turning Regime"].isin(["LOW_FRICTION", "EXPANDING_FRICTION"])] if relaxed else out[out["Turning Regime"] == "LOW_FRICTION"]
             logger.info(f"SHORT friction gate kept {len(out)}/{pre}")
-        if "Price_Lead_Status" in out.columns:
-            pre = len(out)
-            if not relaxed:
-                out = out[out["Price_Lead_Status"].isin(bearish_status)]
-            logger.info(f"SHORT lead-status gate kept {len(out)}/{pre}")
+        
         if "Directional" in out.columns:
             pre = len(out)
             out = out[out["Directional"] < 0]
