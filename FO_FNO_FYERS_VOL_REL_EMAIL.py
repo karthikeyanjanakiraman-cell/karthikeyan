@@ -69,15 +69,15 @@ EMAIL_DISPLAY_COLS = [
     "Symbol",
     "LTP",
     "% Change",
-    "Directional",
-    "Turning",
-    "Stability",
-    "Balanced",
-    "CumsumPlus",
-    "Dual Engine State",
+    "Iteration Change",          # Added for momentum
+    "10 Day Relative Volume",    # Added for breakout volume
+    "VWAP Z-Score",              # Added for extension limit
+    "Turning Regime",            # Added for trend state
     "Trade Action",
+    "Dual Engine State",
     "MTF_ALIGN",
 ]
+
 
 
 def build_signals_from_raw_directional(detail_df) -> dict:
@@ -1805,7 +1805,7 @@ def send_second_email_with_exceedance_tables(recent_10_df: pd.DataFrame, all_tim
         
         combo_html = build_exceedance_table_html(recent_10_df, "Active Trend Matrix - Last 10 Iterations", max_rows=25)
         all_html = build_exceedance_table_html(all_time_df, "Active Trend Matrix - All Time", max_rows=25)
-        
+    
         html_body = (
             '<html><body style="margin:0;padding:20px;background:#030712;color:#e5e7eb;font-family:Arial,sans-serif;">'
             '<div style="max-width:1600px;margin:0 auto;">'
