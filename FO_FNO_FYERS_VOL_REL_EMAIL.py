@@ -1203,44 +1203,223 @@ def format_value(col: str, val):
         return f"{float(val):.4f}"
     return str(val)
 
-
 def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df is None or df.empty:
-        return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+        return (
+            pd.DataFrame(columns=EMAIL_DISPLAY_COLS),
+            pd.DataFrame(columns=EMAIL_DISPLAY_COLS),
+        )
 
     base = df.copy()
-    for c in ["Directional", "Turning", "Stability", "Balanced", "CumsumPlus", "10 Day Relative Volume", "Last5mVolume"]:
+
+    numeric_cols = [
+        "Directional",
+        "Turning",
+        "Stability",
+        "Balanced",
+        "CumsumPlus",
+        "10 Day Relative Volume",
+        "Last5mVolume",
+        "OBV30mDelta",
+    ]
+    for c in numeric_cols:
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
+
+    if "Last Iteration Time" in base.columns:
+        base["time"] = pd.to_datetime(
+            base["Last Iteration Time"],
+            format="%H:%M",
+            errors="coerce"
+        ).dt.time
+    else:
+        base["time"] = pd.NaT
 
     if "MTF_ALIGN" not in base.columns:
         base["MTF_ALIGN"] = ""
     base["MTF_ALIGN"] = base["MTF_ALIGN"].astype(str).str.upper().str.strip()
 
-    base = base.copy()
+    if "Turning Regime" in base.columns:
+        base["Turning Regime"] = (
+            base["Turning Regime"].astype(str).str.upper().str.strip()
+        )
+
+    if "Price_Leading_Flag" in base.columns:
+        base["Price_Leading_Flag"] = (
+            base["Price_Leading_Flag"]
+            .astype(str)
+            .str.upper()
+            .str.strip()
+            .map({"TRUE": True, "FALSE": False})
+            .fillna(False)
+        )
+
+    if "Price_Lead_Status" in base.columns:
+        base["Price_Lead_Status"] = (
+            base["Price_Lead_Status"].astype(str).str.upper().str.strip()
+        )
+
+    start_count = len(base)
+
     if "10 Day Relative Volume" in base.columns:
+        pre = len(base)
         base = base[base["10 Day Relative Volume"].fillna(0) >= 1.0]
+        logger.info(f"CANDIDATES RVOL gate kept {len(base)}/{pre}")
+
     if "Last5mVolume" in base.columns:
+        pre = len(base)
         base = base[base["Last5mVolume"].fillna(0) > 0]
+        logger.info(f"CANDIDATES Last5mVolume gate kept {len(base)}/{pre}")
 
-    def prep_side(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
-        if df_side.empty:
-            return df_side
-        df_side = df_side.copy()
-        if side == "long":
-            df_side = df_side[(df_side["Directional"] > 0) & (df_side["MTF_ALIGN"] == "LONG")]
-            df_side = df_side.sort_values(["Directional", "Turning", "CumsumPlus", "Stability"], ascending=[False, True, False, False], na_position="last")
-        else:
-            df_side = df_side[(df_side["Directional"] < 0) & (df_side["MTF_ALIGN"] == "SHORT")]
-            df_side = df_side.sort_values(["Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, True, True, False], na_position="last")
-        return df_side
+    gate_time = pd.to_datetime("09:45", format="%H:%M").time()
+    bearish_status = {"STRONG_PRICE_LEAD_FADE", "PRICE_LEADING_FADE_RISK"}
 
-    long_df = prep_side(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
-    short_df = prep_side(base, "short").drop_duplicates(subset=["Symbol"]).head(15)
+    def _apply_long_gate(frame: pd.DataFrame, allow_mixed: bool, relaxed: bool) -> pd.DataFrame:
+        out = frame.copy()
+
+        if "time" in out.columns:
+            pre = len(out)
+            out = out[out["time"] >= gate_time]
+            logger.info(f"LONG time gate kept {len(out)}/{pre}")
+
+        if "OBV30mDelta" in out.columns:
+            pre = len(out)
+            if relaxed:
+                out = out[out["OBV30mDelta"].fillna(0) >= 0]
+            else:
+                out = out[out["OBV30mDelta"].fillna(0) > 0]
+            logger.info(f"LONG OBV gate kept {len(out)}/{pre}")
+
+        if "Turning Regime" in out.columns:
+            pre = len(out)
+            if relaxed:
+                out = out[out["Turning Regime"].isin(["LOW_FRICTION", "EXPANDING_FRICTION"])]
+            else:
+                out = out[out["Turning Regime"] == "LOW_FRICTION"]
+            logger.info(f"LONG friction gate kept {len(out)}/{pre}")
+
+        if "Price_Leading_Flag" in out.columns:
+            pre = len(out)
+            if not relaxed:
+                out = out[out["Price_Leading_Flag"] == True]
+            logger.info(f"LONG lead gate kept {len(out)}/{pre}")
+
+        if "Directional" in out.columns:
+            pre = len(out)
+            out = out[out["Directional"] > 0]
+            logger.info(f"LONG directional gate kept {len(out)}/{pre}")
+
+        if "MTF_ALIGN" in out.columns:
+            allowed = {"LONG", "MIXED"} if allow_mixed else {"LONG"}
+            pre = len(out)
+            out = out[out["MTF_ALIGN"].isin(allowed)]
+            logger.info(f"LONG MTF gate kept {len(out)}/{pre} using {sorted(allowed)}")
+
+        return out
+
+    def _apply_short_gate(frame: pd.DataFrame, allow_mixed: bool, relaxed: bool) -> pd.DataFrame:
+        out = frame.copy()
+
+        if "time" in out.columns:
+            pre = len(out)
+            out = out[out["time"] >= gate_time]
+            logger.info(f"SHORT time gate kept {len(out)}/{pre}")
+
+        if "OBV30mDelta" in out.columns:
+            pre = len(out)
+            if relaxed:
+                out = out[out["OBV30mDelta"].fillna(0) <= 0]
+            else:
+                out = out[out["OBV30mDelta"].fillna(0) < 0]
+            logger.info(f"SHORT OBV gate kept {len(out)}/{pre}")
+
+        if "Turning Regime" in out.columns:
+            pre = len(out)
+            if relaxed:
+                out = out[out["Turning Regime"].isin(["LOW_FRICTION", "EXPANDING_FRICTION"])]
+            else:
+                out = out[out["Turning Regime"] == "LOW_FRICTION"]
+            logger.info(f"SHORT friction gate kept {len(out)}/{pre}")
+
+        if "Price_Lead_Status" in out.columns:
+            pre = len(out)
+            if not relaxed:
+                out = out[out["Price_Lead_Status"].isin(bearish_status)]
+            logger.info(f"SHORT lead-status gate kept {len(out)}/{pre}")
+
+        if "Directional" in out.columns:
+            pre = len(out)
+            out = out[out["Directional"] < 0]
+            logger.info(f"SHORT directional gate kept {len(out)}/{pre}")
+
+        if "MTF_ALIGN" in out.columns:
+            allowed = {"SHORT", "MIXED"} if allow_mixed else {"SHORT"}
+            pre = len(out)
+            out = out[out["MTF_ALIGN"].isin(allowed)]
+            logger.info(f"SHORT MTF gate kept {len(out)}/{pre} using {sorted(allowed)}")
+
+        return out
+
+    def _build_side(frame: pd.DataFrame, side: str) -> pd.DataFrame:
+        attempts = [
+            {"allow_mixed": False, "relaxed": False, "label": "strict"},
+            {"allow_mixed": True,  "relaxed": False, "label": "strict+mixed"},
+            {"allow_mixed": True,  "relaxed": True,  "label": "relaxed+mixed"},
+        ]
+
+        final = pd.DataFrame()
+
+        for attempt in attempts:
+            logger.info(f"{side.upper()} attempting mode={attempt['label']}")
+            if side == "long":
+                candidate = _apply_long_gate(
+                    frame,
+                    allow_mixed=attempt["allow_mixed"],
+                    relaxed=attempt["relaxed"],
+                )
+                candidate = candidate.sort_values(
+                    ["Directional", "Turning", "CumsumPlus", "Stability"],
+                    ascending=[False, True, False, False],
+                    na_position="last",
+                )
+            else:
+                candidate = _apply_short_gate(
+                    frame,
+                    allow_mixed=attempt["allow_mixed"],
+                    relaxed=attempt["relaxed"],
+                )
+                candidate = candidate.sort_values(
+                    ["Directional", "Turning", "CumsumPlus", "Stability"],
+                    ascending=[True, True, True, False],
+                    na_position="last",
+                )
+
+            candidate = candidate.drop_duplicates(subset=["Symbol"])
+            logger.info(f"{side.upper()} mode={attempt['label']} produced {len(candidate)} rows")
+
+            if not candidate.empty:
+                final = candidate
+                break
+
+        return final.head(15)
+
+    logger.info(f"CANDIDATES starting universe size {start_count}")
+
+    long_df = _build_side(base, "long")
+    short_df = _build_side(base, "short")
+
     cols = [c for c in EMAIL_DISPLAY_COLS if c in base.columns]
+
     long_df = long_df[cols] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     short_df = short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+
+    logger.info(f"CANDIDATES final long={len(long_df)} short={len(short_df)}")
+
     return long_df, short_df
+
+
+
+    
 def build_occurrence_table(
     detail_df: pd.DataFrame,
     last_n_iterations: Optional[int] = None,
@@ -1434,7 +1613,7 @@ def build_exceedance_tables(detail_df: pd.DataFrame):
 
 def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     if detail_df is None or detail_df.empty:
-        return pd.DataFrame()
+     4   return pd.DataFrame()
 
     df = detail_df.copy()
     for col in ["Iteration No", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus"]:
