@@ -74,6 +74,7 @@ EMAIL_DISPLAY_COLS = [
     "Stability",
     "Balanced",
     "CumsumPlus",
+    "Dual Engine State",
     "Trade Action",
     "MTF_ALIGN",
 ]
