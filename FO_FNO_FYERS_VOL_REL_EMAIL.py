@@ -85,6 +85,12 @@ EMAIL_DISPLAY_COLS = [
     "15m_Signal",
     "30m_Signal",
     "60m_Signal",
+    "MTF_5m",
+    "MTF_15m",
+    "MTF_30m",
+    "MTF_60m",
+    "MTF_SCORE",
+    "MTF_ALIGN",
     "Bull_Signal",
     "Bear_Signal",
     "Overall_Signal",
@@ -136,6 +142,78 @@ def build_signals_from_raw_directional(detail_df) -> dict:
     out["Overall_Signal"] = round(raw_at(0), 4)
     return out
 
+
+
+
+def classify_mtf_from_window(win, eps: float = 1e-9) -> float:
+    s = pd.Series(win).dropna().astype(float)
+    if len(s) < 3:
+        return float("nan")
+    diff1 = s.diff().dropna()
+    if len(diff1) < 2:
+        return float("nan")
+    x = np.arange(len(s), dtype=float)
+    slope = float(np.polyfit(x, s.values, 1)[0])
+    net_move = float(s.iloc[-1] - s.iloc[0])
+    turning = float(np.mean(np.abs(np.diff(s.values, n=2)))) if len(s) >= 3 else 0.0
+    stability = float(np.std(s.values))
+    cumsum_plus = float(np.clip(diff1, 0, None).sum())
+    score = (slope + net_move) + (0.25 * cumsum_plus) - (0.50 * turning) - (0.10 * stability)
+    if score > eps:
+        return 1.0
+    if score < -eps:
+        return -1.0
+    return 0.0
+
+
+def build_mtf_alignment(detail_df: pd.DataFrame) -> Dict[str, object]:
+    out = {
+        "MTF_5m": float("nan"),
+        "MTF_15m": float("nan"),
+        "MTF_30m": float("nan"),
+        "MTF_60m": float("nan"),
+        "MTF_SCORE": float("nan"),
+        "MTF_ALIGN": "NA",
+    }
+    if detail_df is None or detail_df.empty or "Iteration Change" not in detail_df.columns:
+        return out
+    df = detail_df.copy()
+    if "Iteration No" in df.columns:
+        df = df.sort_values("Iteration No")
+    series = pd.to_numeric(df["Iteration Change"], errors="coerce").dropna().astype(float)
+    n = len(series)
+    if n < 3:
+        return out
+
+    mtf_5 = classify_mtf_from_window(series.tail(min(3, n)))
+    mtf_15 = classify_mtf_from_window(series.tail(3)) if n >= 3 else float("nan")
+    mtf_30 = classify_mtf_from_window(series.tail(6)) if n >= 6 else float("nan")
+    mtf_60 = classify_mtf_from_window(series.tail(12)) if n >= 12 else float("nan")
+
+    available = [v for v in [mtf_5, mtf_15, mtf_30, mtf_60] if pd.notna(v)]
+    if not available:
+        return out
+
+    score = float(np.nansum([mtf_5, mtf_15, mtf_30, mtf_60]))
+    align = "MIXED"
+    if all(v == 1.0 for v in available):
+        align = "LONG"
+    elif all(v == -1.0 for v in available):
+        align = "SHORT"
+    elif all(v == 0.0 for v in available):
+        align = "MIXED"
+    elif len(available) == 1 and available[0] == 0.0:
+        align = "NA"
+
+    out.update({
+        "MTF_5m": mtf_5,
+        "MTF_15m": mtf_15,
+        "MTF_30m": mtf_30,
+        "MTF_60m": mtf_60,
+        "MTF_SCORE": score,
+        "MTF_ALIGN": align,
+    })
+    return out
 
 def classify_diff_status(cumsum_diff: float, turning_diff: float, prior_cumsum: float = 0.0, eps: float = 1e-4) -> str:
     c = 0.0 if pd.isna(cumsum_diff) else float(cumsum_diff)
@@ -898,9 +976,10 @@ def compute_iteration_volume_profile(
     }
 
     signals = build_signals_from_raw_directional(detail_df)
+    mtf = build_mtf_alignment(detail_df)
     summary.update(signals)
+    summary.update(mtf)
     return summary, detail_df
-
 
 def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
     symbols = load_fno_symbols_from_sectors("sectors")
@@ -953,6 +1032,12 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "15m_Signal": iter_summary.get("15m_Signal"),
             "30m_Signal": iter_summary.get("30m_Signal"),
             "60m_Signal": iter_summary.get("60m_Signal"),
+            "MTF_5m": iter_summary.get("MTF_5m"),
+            "MTF_15m": iter_summary.get("MTF_15m"),
+            "MTF_30m": iter_summary.get("MTF_30m"),
+            "MTF_60m": iter_summary.get("MTF_60m"),
+            "MTF_SCORE": iter_summary.get("MTF_SCORE"),
+            "MTF_ALIGN": iter_summary.get("MTF_ALIGN"),
             "Bull_Signal": iter_summary.get("Bull_Signal"),
             "Bear_Signal": iter_summary.get("Bear_Signal"),
             "Overall_Signal": iter_summary.get("Overall_Signal"),
@@ -1137,63 +1222,42 @@ def format_value(col: str, val):
         return f"{float(val):.4f}"
     return str(val)
 
+
 def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    Filters the F&O universe to isolate 'Elite Alpha' candidates.
-    Filters out 'CHURNING_FAKEOUT' traps and focuses only on Low Friction regimes.
-    """
     if df is None or df.empty:
-        return (
-            pd.DataFrame(columns=EMAIL_DISPLAY_COLS),
-            pd.DataFrame(columns=EMAIL_DISPLAY_COLS),
-        )
+        return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
 
     base = df.copy()
+    for c in ["Directional", "Turning", "Stability", "Balanced", "CumsumPlus", "10 Day Relative Volume", "Last5mVolume"]:
+        if c in base.columns:
+            base[c] = pd.to_numeric(base[c], errors="coerce")
 
-    # 1. SURGICAL FILTER: Eliminate Waste
-    # We filter for 'LOW_FRICTION' regime and avoid 'CHURNING_FAKEOUT' traps.
-    # This ensures we only get stocks with no overhead seller resistance.
-    base = base[
-        (base['Turning Regime'] == 'LOW_FRICTION') &
-        (~base['Dual Engine State'].isin(['CHURNING_FAKEOUT', 'BLOCK_ENTRY']))
-    ].copy()
+    base = base.copy()
+    if "10 Day Relative Volume" in base.columns:
+        base = base[base["10 Day Relative Volume"].fillna(0) >= 1.0]
+    if "Last5mVolume" in base.columns:
+        base = base[base["Last5mVolume"].fillna(0) > 0]
 
-    # 2. Check for optional technical flags safely
-    # If 'OBV30mDelta' or 'Price_Leading_Flag' are missing, the script won't crash.
-    if 'OBV30mDelta' in base.columns:
-        base = base[base['OBV30mDelta'] > 0]
-        
-    if 'Price_Leading_Flag' in base.columns:
-        base = base[base['Price_Leading_Flag'] == True]
-
-    # 3. Define Selection Logic: Focus on Institutional Alpha
-    def prep_side(data: pd.DataFrame, direction: str) -> pd.DataFrame:
-        if data.empty:
-            return data
-        
-        # Sort by Directional strength to ensure we get the strongest trends
-        if direction == "long":
-            filtered = data[data["Directional"] > 0]
-            return filtered.sort_values("Directional", ascending=False).head(5)
+    def prep_side(df_side: pd.DataFrame, side: str) -> pd.DataFrame:
+        if df_side.empty:
+            return df_side
+        df_side = df_side.copy()
+        if side == "long":
+            df_side = df_side[df_side["Directional"] > 0]
+            df_side = df_side.sort_values(["Directional", "Turning", "CumsumPlus", "Stability"], ascending=[False, True, False, False], na_position="last")
         else:
-            filtered = data[data["Directional"] < 0]
-            return filtered.sort_values("Directional", ascending=True).head(5)
+            df_side = df_side[df_side["Directional"] < 0]
+            df_side = df_side.sort_values(["Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, True, True, False], na_position="last")
+        return df_side
 
-    # 4. Generate Tables
-    long_df = prep_side(base, "long")
-    short_df = prep_side(base, "short")
-
-    # 5. Format and Clean Columns
+    long_df = prep_side(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
+    short_df = prep_side(base, "short").drop_duplicates(subset=["Symbol"]).head(15)
     cols = [c for c in EMAIL_DISPLAY_COLS if c in base.columns]
-    
-    long_final = (long_df[cols] if not long_df.empty else pd.DataFrame(columns=cols))
-    short_final = (short_df[cols] if not short_df.empty else pd.DataFrame(columns=cols))
+    long_df = long_df[cols] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    short_df = short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    return long_df, short_df
 
-    return long_final, short_final
 
-    
-
-             
 def build_occurrence_table(
     detail_df: pd.DataFrame,
     last_n_iterations: Optional[int] = None,
