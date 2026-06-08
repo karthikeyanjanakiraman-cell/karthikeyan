@@ -1217,27 +1217,27 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         base = base[base["Last5mVolume"].fillna(0) > 0]
 
     def prep_side_df(dfside: pd.DataFrame, side: str) -> pd.DataFrame:
-    if dfside.empty:
+        if dfside.empty:
+            return dfside
+        dfside = dfside.copy()
+        if "% Change" in dfside.columns:
+            dfside["% Change"] = pd.to_numeric(dfside["% Change"], errors="coerce")
+    
+        if side == "long":
+            dfside = dfside[dfside["Directional"] > 0]
+            dfside = dfside.sort_values(
+                ["% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
+                ascending=[False, False, True, False, False],  # % Change descending
+                na_position="last"
+            )
+        else:
+            dfside = dfside[dfside["Directional"] < 0]
+            dfside = dfside.sort_values(
+                ["% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
+                ascending=[True, True, True, True, False],     # % Change ascending (most negative first)
+                na_position="last"
+            )
         return dfside
-    dfside = dfside.copy()
-    if "% Change" in dfside.columns:
-        dfside["% Change"] = pd.to_numeric(dfside["% Change"], errors="coerce")
-
-    if side == "long":
-        dfside = dfside[dfside["Directional"] > 0]
-        dfside = dfside.sort_values(
-            ["% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
-            ascending=[False, False, True, False, False],  # % Change descending
-            na_position="last"
-        )
-    else:
-        dfside = dfside[dfside["Directional"] < 0]
-        dfside = dfside.sort_values(
-            ["% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
-            ascending=[True, True, True, True, False],     # % Change ascending (most negative first)
-            na_position="last"
-        )
-    return dfside
 
     long_df = prep_side(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
     short_df = prep_side(base, "short").drop_duplicates(subset=["Symbol"]).head(15)
