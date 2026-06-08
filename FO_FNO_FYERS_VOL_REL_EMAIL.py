@@ -1200,7 +1200,6 @@ def format_value(col: str, val):
         return f"{float(val):.4f}"
     return str(val)
 
-
 def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df is None or df.empty:
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
@@ -1210,7 +1209,6 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
 
-    base = base.copy()
     if "10 Day Relative Volume" in base.columns:
         base = base[base["10 Day Relative Volume"].fillna(0) >= 1.0]
     if "Last5mVolume" in base.columns:
@@ -1222,25 +1220,25 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         dfside = dfside.copy()
         if "% Change" in dfside.columns:
             dfside["% Change"] = pd.to_numeric(dfside["% Change"], errors="coerce")
-    
+
         if side == "long":
             dfside = dfside[dfside["Directional"] > 0]
             dfside = dfside.sort_values(
                 ["% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
-                ascending=[False, False, True, False, False],  # % Change descending
+                ascending=[False, False, True, False, False],
                 na_position="last"
             )
         else:
             dfside = dfside[dfside["Directional"] < 0]
             dfside = dfside.sort_values(
                 ["% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
-                ascending=[True, True, True, True, False],     # % Change ascending (most negative first)
+                ascending=[True, True, True, True, False],
                 na_position="last"
             )
-        return dfside
+        return dfside  # ✅ MOVED inside the function, AFTER the if/else block
 
-    long_df = prep_side(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
-    short_df = prep_side(base, "short").drop_duplicates(subset=["Symbol"]).head(15)
+    long_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]).head(15)   # ✅ renamed
+    short_df = prep_side_df(base, "short").drop_duplicates(subset=["Symbol"]).head(15) # ✅ renamed
     cols = [c for c in EMAIL_DISPLAY_COLS if c in base.columns]
     long_df = long_df[cols] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     short_df = short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
