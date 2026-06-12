@@ -75,7 +75,7 @@ EMAIL_DISPLAY_COLS = [
     "Symbol",
     "LTP",
     "% Change",
-    "ROC_14",          # <-- Added for Gamma Hulk Visibility
+    "ROC_All_Iter",          # <-- Added for Gamma Hulk Visibility
     "ROC_6M_Peak",     # <-- Added for Gamma Hulk Visibility
     "ROC_6M_Bottom",   # <-- Added for Gamma Hulk Visibility
     "MTF_5m",
@@ -91,20 +91,25 @@ EMAIL_DISPLAY_COLS = [
 # ==============================================================================
 # NEW FUNCTION: ASIT BARAN PATI'S 6-MONTH ROC (GAMMA HULK) ENGINE
 # ==============================================================================
-def compute_gamma_hulk_roc(intra_df: pd.DataFrame, roc_period: int = 14) -> pd.DataFrame:
+def compute_gamma_hulk_roc(intra_df: pd.DataFrame) -> pd.DataFrame:
     """
-    Calculates the 14-period ROC and the rolling 6-month historical Peak/Trough.
+    Calculates cumulative ROC from the first available bar to the current bar
+    and the rolling 6-month historical Peak/Trough of that cumulative ROC.
     Uses a dynamic lookback based on the inferred intraday bar interval.
     """
     df = intra_df.copy().sort_values("timestamp").reset_index(drop=True)
-    if df.empty or len(df) < roc_period or "close" not in df.columns:
-        df["ROC_14"] = np.nan
+    if df.empty or "close" not in df.columns:
+        df["ROC_All_Iter"] = np.nan
         df["ROC_6M_Peak"] = np.nan
         df["ROC_6M_Bottom"] = np.nan
         return df
 
     close = pd.to_numeric(df["close"], errors="coerce").astype(float)
-    df["ROC_14"] = close.pct_change(periods=roc_period) * 100.0
+    first_close = close.iloc[0] if len(close) > 0 else np.nan
+    if pd.isna(first_close) or float(first_close) == 0.0:
+        df["ROC_All_Iter"] = np.nan
+    else:
+        df["ROC_All_Iter"] = ((close - float(first_close)) / float(first_close)) * 100.0
 
     timestamps = pd.to_datetime(df["timestamp"], errors="coerce")
     inferred_minutes = 5.0
@@ -115,10 +120,10 @@ def compute_gamma_hulk_roc(intra_df: pd.DataFrame, roc_period: int = 14) -> pd.D
             inferred_minutes = float(deltas.mode().iloc[0])
 
     bars_per_day = max(int(round(375.0 / inferred_minutes)), 1)
-    lookback_bars = max(roc_period, 125 * bars_per_day)
+    lookback_bars = max(2, 125 * bars_per_day)
 
-    df["ROC_6M_Peak"] = df["ROC_14"].shift(1).rolling(window=lookback_bars, min_periods=roc_period).max()
-    df["ROC_6M_Bottom"] = df["ROC_14"].shift(1).rolling(window=lookback_bars, min_periods=roc_period).min()
+    df["ROC_6M_Peak"] = df["ROC_All_Iter"].shift(1).rolling(window=lookback_bars, min_periods=2).max()
+    df["ROC_6M_Bottom"] = df["ROC_All_Iter"].shift(1).rolling(window=lookback_bars, min_periods=2).min()
     return df
 # ==============================================================================
 
@@ -893,7 +898,7 @@ def compute_iteration_volume_profile(
         df["time_only"] = pd.to_datetime(df["time"]).dt.time
         
     # --- Integration of Gamma Hulk Engine ---
-    df = compute_gamma_hulk_roc(df, roc_period=14)
+    df = compute_gamma_hulk_roc(df)
     # ----------------------------------------
 
     dates = sorted(df["date"].unique())
@@ -977,7 +982,7 @@ def compute_iteration_volume_profile(
             "CumsumPlus": ps.get("CumsumPlus", np.nan),
             "10 Day Relative Volume": rvol10,
             "20 Day Relative Volume": rvol20,
-            "ROC_14": float(row.get("ROC_14", np.nan)),               # <-- Appending Gamma Hulk Variables
+            "ROC_All_Iter": float(row.get("ROC_All_Iter", np.nan)),               # <-- Appending Gamma Hulk Variables
             "ROC_6M_Peak": float(row.get("ROC_6M_Peak", np.nan)),     # <-- Appending Gamma Hulk Variables
             "ROC_6M_Bottom": float(row.get("ROC_6M_Bottom", np.nan)), # <-- Appending Gamma Hulk Variables
             "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else float("nan"),
@@ -1024,7 +1029,7 @@ def compute_iteration_volume_profile(
         "Current Volume": last_cum_vol,
         "10 Day Relative Volume": last_rvol10,
         "20 Day Relative Volume": last_rvol20,
-        "ROC_14": float(curr_df["ROC_14"].iloc[-1]) if "ROC_14" in curr_df.columns else np.nan,               # <-- Appending to Summary
+        "ROC_All_Iter": float(curr_df["ROC_All_Iter"].iloc[-1]) if "ROC_All_Iter" in curr_df.columns else np.nan,               # <-- Appending to Summary
         "ROC_6M_Peak": float(curr_df["ROC_6M_Peak"].iloc[-1]) if "ROC_6M_Peak" in curr_df.columns else np.nan,     # <-- Appending to Summary
         "ROC_6M_Bottom": float(curr_df["ROC_6M_Bottom"].iloc[-1]) if "ROC_6M_Bottom" in curr_df.columns else np.nan, # <-- Appending to Summary
         "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[-1]) if not flow_df.empty else float("nan"),
@@ -1100,7 +1105,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "Stability": iter_summary.get("Stability"),
             "Balanced": iter_summary.get("Balanced"),
             "CumsumPlus": iter_summary.get("CumsumPlus"),
-            "ROC_14": iter_summary.get("ROC_14"),                 # <-- Add to main df
+            "ROC_All_Iter": iter_summary.get("ROC_All_Iter"),                 # <-- Add to main df
             "ROC_6M_Peak": iter_summary.get("ROC_6M_Peak"),       # <-- Add to main df
             "ROC_6M_Bottom": iter_summary.get("ROC_6M_Bottom"),   # <-- Add to main df
             "ARIMA Signal": iter_summary.get("ARIMA Signal"),
@@ -1293,7 +1298,7 @@ def format_value(col: str, val):
         return ""
     if col == "% Change":
         return f"{float(val):.2f}%"
-    if col in ["IVP", "ROC_14", "ROC_6M_Peak", "ROC_6M_Bottom"]:
+    if col in ["IVP", "ROC_All_Iter", "ROC_6M_Peak", "ROC_6M_Bottom"]:
         return f"{float(val):.2f}"
     if isinstance(val, (int, float, np.integer, np.floating)):
         return f"{float(val):.4f}"
@@ -1307,7 +1312,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     base = df.copy()
     numeric_cols = [
         "Directional", "Turning", "Stability", "Balanced", "CumsumPlus",
-        "10 Day Relative Volume", "Last5mVolume", "ROC_14", "ROC_6M_Peak",
+        "10 Day Relative Volume", "Last5mVolume", "ROC_All_Iter", "ROC_6M_Peak",
         "ROC_6M_Bottom", "% Change"
     ]
     for c in numeric_cols:
@@ -1321,15 +1326,15 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
 
     def with_gamma_flags(dfside: pd.DataFrame) -> pd.DataFrame:
         out = dfside.copy()
-        if {"ROC_14", "ROC_6M_Peak"}.issubset(out.columns):
+        if {"ROC_All_Iter", "ROC_6M_Peak"}.issubset(out.columns):
             out["Gamma_Long_Breakout"] = (
-                out["ROC_14"].notna() & out["ROC_6M_Peak"].notna() & (out["ROC_14"] > out["ROC_6M_Peak"])
+                out["ROC_All_Iter"].notna() & out["ROC_6M_Peak"].notna() & (out["ROC_All_Iter"] > out["ROC_6M_Peak"])
             )
         else:
             out["Gamma_Long_Breakout"] = False
-        if {"ROC_14", "ROC_6M_Bottom"}.issubset(out.columns):
+        if {"ROC_All_Iter", "ROC_6M_Bottom"}.issubset(out.columns):
             out["Gamma_Short_Breakdown"] = (
-                out["ROC_14"].notna() & out["ROC_6M_Bottom"].notna() & (out["ROC_14"] < out["ROC_6M_Bottom"])
+                out["ROC_All_Iter"].notna() & out["ROC_6M_Bottom"].notna() & (out["ROC_All_Iter"] < out["ROC_6M_Bottom"])
             )
         else:
             out["Gamma_Short_Breakdown"] = False
@@ -1571,7 +1576,7 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     df = detail_df.copy()
     numeric_cols = [
         "Iteration No", "LTP", "% Change", "Directional", "Turning",
-        "Stability", "Balanced", "CumsumPlus", "ROC_14",
+        "Stability", "Balanced", "CumsumPlus", "ROC_All_Iter",
         "ROC_6M_Peak", "ROC_6M_Bottom"
     ]
     for col in numeric_cols:
