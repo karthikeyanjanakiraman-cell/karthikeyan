@@ -54,12 +54,11 @@ logger.addHandler(ch)
 
 warnings.filterwarnings("ignore")
 
-# Adjusted to ensure we fetch enough data for the 6-month ROC calculation (approx 125 trading days)
 DAILY_LOOKBACK_DAYS = 60
-INTRADAY_LOOKBACK_DAYS = 130  
-IVP_LOOKBACK_DAYS = 252
+INTRADAY_LOOKBACK_DAYS = 130
+IVP_LOOKBACK_DAYS = 60
 INDEX_SOFT_BOOST_WEIGHT = 0.25
-HISTORY_API_MAX_SPAN_DAYS = 99
+HISTORY_API_MAX_SPAN_DAYS = 30
 FYERS_RATE_LIMIT_SLEEP = 0.35
 FYERS_RETRY_SLEEP = 2.0
 FYERS_MAX_RETRIES = 2
