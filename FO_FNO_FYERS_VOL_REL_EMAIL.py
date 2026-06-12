@@ -1391,60 +1391,39 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         dfside = dfside.copy()
 
         if side == "long":
+            # Filter 1: Must be structurally Long
             dfside = dfside[dfside["Directional"] > 0]
 
-            confirmed = dfside[dfside["Gamma_Long_Confirmed"]].copy()
-            if not confirmed.empty:
-                confirmed = confirmed.sort_values(
-                    ["Gamma_Long_Confirmed", "% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
-                    ascending=[False, False, False, True, False, False],
-                    na_position="last",
-                )
-                return confirmed
+            # The script originally restricted long candidates strictly to Gamma Breakouts.
+            # We filter down to ONLY stocks where either a confirmed Gamma Hulk exists OR a raw breakout is active.
+            dfside = dfside[dfside["Gamma_Long_Confirmed"] | dfside["Gamma_Long_Breakout"]]
 
-            breakout_only = dfside[dfside["Gamma_Long_Breakout"]].copy()
-            if not breakout_only.empty:
-                breakout_only = breakout_only.sort_values(
-                    ["Gamma_Long_Breakout", "% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
-                    ascending=[False, False, False, True, False, False],
-                    na_position="last",
-                )
-                return breakout_only
+            if dfside.empty:
+                return dfside
 
-            fallback = dfside.sort_values(
-                ["% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
-                ascending=[False, False, True, False, False],
+            # Sort confirmed first, then breakouts, then by stats
+            return dfside.sort_values(
+                ["Gamma_Long_Confirmed", "Gamma_Long_Breakout", "% Change", "Directional"],
+                ascending=[False, False, False, False],
                 na_position="last",
             )
-            return fallback
+
         else:
+            # Filter 1: Must be structurally Short
             dfside = dfside[dfside["Directional"] < 0]
 
-            confirmed = dfside[dfside["Gamma_Short_Confirmed"]].copy()
-            if not confirmed.empty:
-                confirmed = confirmed.sort_values(
-                    ["Gamma_Short_Confirmed", "% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
-                    ascending=[False, True, True, True, True, False],
-                    na_position="last",
-                )
-                return confirmed
+            # Restrict strictly to Gamma Breakdowns
+            dfside = dfside[dfside["Gamma_Short_Confirmed"] | dfside["Gamma_Short_Breakdown"]]
 
-            breakdown_only = dfside[dfside["Gamma_Short_Breakdown"]].copy()
-            if not breakdown_only.empty:
-                breakdown_only = breakdown_only.sort_values(
-                    ["Gamma_Short_Breakdown", "% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
-                    ascending=[False, True, True, True, True, False],
-                    na_position="last",
-                )
-                return breakdown_only
+            if dfside.empty:
+                return dfside
 
-            fallback = dfside.sort_values(
-                ["% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
-                ascending=[True, True, True, True, False],
+            # Sort confirmed first, then breakdowns, then by stats
+            return dfside.sort_values(
+                ["Gamma_Short_Confirmed", "Gamma_Short_Breakdown", "% Change", "Directional"],
+                ascending=[False, False, True, True],
                 na_position="last",
             )
-            return fallback
-
     long_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
     short_df = prep_side_df(base, "short").drop_duplicates(subset=["Symbol"]).head(15)
     cols = [c for c in EMAIL_DISPLAY_COLS if c in base.columns]
