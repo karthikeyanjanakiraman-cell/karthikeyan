@@ -6,7 +6,8 @@ Intraday F&O scanner via Fyers API with email alerts.
 Complete standalone file - no external email.py dependency.
 SORTS CANDIDATES BY DIRECTIONAL COLUMN.
 ALL STATISTICAL SCORES ARE RAW (ORIGINAL FORMULAS).
-Now powered by Zero-Lag Dual Engine Row-vs-Row State Matrices.
+Now powered by Zero-Lag Dual Engine Row-vs-Row State Matrices 
+AND Asit Baran Pati's 6-Month Gamma Hulk ROC Filter.
 """
 
 import os
@@ -52,8 +53,9 @@ logger.addHandler(ch)
 
 warnings.filterwarnings("ignore")
 
+# Adjusted to ensure we fetch enough data for the 6-month ROC calculation (approx 125 trading days)
 DAILY_LOOKBACK_DAYS = 60
-INTRADAY_LOOKBACK_DAYS = 20
+INTRADAY_LOOKBACK_DAYS = 130  
 IVP_LOOKBACK_DAYS = 252
 INDEX_SOFT_BOOST_WEIGHT = 0.25
 
@@ -69,6 +71,9 @@ EMAIL_DISPLAY_COLS = [
     "Symbol",
     "LTP",
     "% Change",
+    "ROC_14",          # <-- Added for Gamma Hulk Visibility
+    "ROC_6M_Peak",     # <-- Added for Gamma Hulk Visibility
+    "ROC_6M_Bottom",   # <-- Added for Gamma Hulk Visibility
     "MTF_5m",
     "MTF_15m",
     "MTF_30m",
@@ -77,6 +82,40 @@ EMAIL_DISPLAY_COLS = [
     "MTF_ALIGN",
     "Last Iteration Time",
 ]
+
+
+# ==============================================================================
+# NEW FUNCTION: ASIT BARAN PATI'S 6-MONTH ROC (GAMMA HULK) ENGINE
+# ==============================================================================
+def compute_gamma_hulk_roc(intra_df: pd.DataFrame, roc_period: int = 14) -> pd.DataFrame:
+    """
+    Calculates the 14-period ROC and the rolling 6-month historical Peak/Trough.
+    Assumes incoming data is 5-minute or 15-minute intraday bars.
+    """
+    df = intra_df.copy().sort_values("timestamp").reset_index(drop=True)
+    if df.empty or len(df) < roc_period:
+        df["ROC_14"] = np.nan
+        df["ROC_6M_Peak"] = np.nan
+        df["ROC_6M_Bottom"] = np.nan
+        return df
+
+    close = pd.to_numeric(df["close"], errors="coerce").astype(float)
+    
+    # Calculate Base Rate of Change (14-period)
+    df["ROC_14"] = close.pct_change(periods=roc_period) * 100.0
+    
+    # 6 Months = approx 125 trading days. 
+    # If standard 5-minute bars (75 bars a day): 125 * 75 = 9375 bars.
+    # If 15-minute bars (25 bars a day): 125 * 25 = 3125 bars.
+    # Assuming this script runs primarily on 5m data pulled in scan_fno_universe:
+    lookback_bars = 9375 
+    
+    # Calculate boundaries anchored to the PREVIOUS bar (.shift(1)) to prevent repainting
+    df["ROC_6M_Peak"] = df["ROC_14"].shift(1).rolling(window=lookback_bars, min_periods=roc_period).max()
+    df["ROC_6M_Bottom"] = df["ROC_14"].shift(1).rolling(window=lookback_bars, min_periods=roc_period).min()
+    
+    return df
+# ==============================================================================
 
 
 def build_signals_from_raw_directional(detail_df) -> dict:
@@ -119,8 +158,6 @@ def build_signals_from_raw_directional(detail_df) -> dict:
     out["Bear_Signal"] = round(abs(float(vals[vals < 0].min())) if (vals < 0).any() else 0.0, 4)
     out["Overall_Signal"] = round(raw_at(0), 4)
     return out
-
-
 
 
 def classify_mtf_from_window(win, eps: float = 1e-9) -> float:
@@ -192,6 +229,7 @@ def build_mtf_alignment(detail_df: pd.DataFrame) -> Dict[str, object]:
         "MTF_ALIGN": align,
     })
     return out
+
 
 def classify_diff_status(cumsum_diff: float, turning_diff: float, prior_cumsum: float = 0.0, eps: float = 1e-4) -> str:
     c = 0.0 if pd.isna(cumsum_diff) else float(cumsum_diff)
@@ -308,6 +346,7 @@ def merge_dual_engine_latest(summary_df: pd.DataFrame, detail_df: pd.DataFrame) 
     )
     return summary_df.merge(latest, on="Symbol", how="left")
 
+
 def init_fyers():
     global fyers
     try:
@@ -355,106 +394,6 @@ def load_fno_symbols_from_sectors(root_dir: str = "sectors") -> List[str]:
                 pass
 
     return sorted(symbols)
-
-
-def load_symbol_to_indices_map(root_dir: str = "sectors") -> Dict[str, List[str]]:
-    mapping: Dict[str, List[str]] = {}
-    search_dirs = [root_dir, "."]
-
-    for base in search_dirs:
-        if not os.path.isdir(base):
-            continue
-        for dirpath, _, filenames in os.walk(base):
-            for fname in filenames:
-                if not fname.lower().endswith(".csv"):
-                    continue
-                path = os.path.join(dirpath, fname)
-                try:
-                    df = pd.read_csv(path)
-                except Exception:
-                    continue
-
-                cols = {str(c).strip().lower(): c for c in df.columns}
-                sym_col = None
-                for key in ["symbol", "symbols", "ticker"]:
-                    if key in cols:
-                        sym_col = cols[key]
-                        break
-
-                idx_col = None
-                for key in ["belongstoindices", "belongs_to_indices", "index name", "index_name", "sector", "indices"]:
-                    if key in cols:
-                        idx_col = cols[key]
-                        break
-
-                if not sym_col or not idx_col:
-                    continue
-
-                for _, row in df[[sym_col, idx_col]].dropna().iterrows():
-                    sym = str(row[sym_col]).strip().upper()
-                    raw_idx = str(row[idx_col]).strip()
-                    if not sym or not raw_idx:
-                        continue
-                    parts = [p.strip() for p in re.split(r"[|;,/]+", raw_idx) if p.strip()]
-                    if not parts:
-                        parts = [raw_idx]
-
-                    current = mapping.setdefault(sym, [])
-                    for part in parts:
-                        if part not in current:
-                            current.append(part)
-
-    return mapping
-
-
-def resolve_universe_csv() -> str:
-    csv_files = []
-    for dirpath, _, filenames in os.walk("."):
-        for fname in filenames:
-            if fname.lower().endswith(".csv"):
-                csv_files.append(os.path.join(dirpath, fname))
-
-    scored = []
-    for path in csv_files:
-        try:
-            df = pd.read_csv(path, nrows=5)
-            cols = {str(c).strip().lower() for c in df.columns}
-            score = 0
-            if "symbol" in cols:
-                score += 5
-            if "belongstoindices" in cols or "belongs_to_indices" in cols:
-                score += 5
-            if "company name" in cols or "company_name" in cols:
-                score += 2
-            if score > 0:
-                scored.append((score, os.path.getmtime(path), path))
-        except Exception:
-            continue
-
-    if scored:
-        scored.sort(reverse=True)
-        chosen = scored[0][2]
-        logger.info(f"CSV Auto-selected universe file: {chosen}")
-        return chosen
-
-    logger.warning("CSV No matching universe CSV found; defaulting to fno_stock_list.csv")
-    return "fno_stock_list.csv"
-
-
-def load_fno_symbols_from_csv(path: str = "fno_stock_list.csv") -> List[str]:
-    if not os.path.exists(path):
-        logger.warning(f"FNO CSV not found at {path}")
-        return []
-
-    try:
-        df = pd.read_csv(path)
-        if "Symbol" not in df.columns:
-            logger.warning("FNO CSV missing 'Symbol' column")
-            return []
-        return sorted(df["Symbol"].dropna().astype(str).str.strip().unique())
-    except Exception as e:
-        logger.error(f"Error reading FNO CSV {path}: {e}")
-        return []
 
 
 def format_fyers_symbol(symbol: str) -> str:
@@ -785,12 +724,6 @@ def kalman_signal_from_series(prices: pd.Series, q: float = 1e-3) -> float:
     return round(gap / scale, 4)
 
 
-def _build_iteration_signals_from_rows(rows: List[Dict]) -> Dict[str, float]:
-    if not rows:
-        return build_signals_from_raw_directional(pd.DataFrame())
-    return build_signals_from_raw_directional(pd.DataFrame(rows))
-
-
 def compute_iteration_volume_profile(
     intra_df: Optional[pd.DataFrame],
     prev_close: Optional[float] = None,
@@ -805,6 +738,10 @@ def compute_iteration_volume_profile(
     else:
         df["date"] = pd.to_datetime(df["time"]).dt.date
         df["time_only"] = pd.to_datetime(df["time"]).dt.time
+        
+    # --- Integration of Gamma Hulk Engine ---
+    df = compute_gamma_hulk_roc(df, roc_period=14)
+    # ----------------------------------------
 
     dates = sorted(df["date"].unique())
     if len(dates) < 2:
@@ -887,6 +824,9 @@ def compute_iteration_volume_profile(
             "CumsumPlus": ps.get("CumsumPlus", np.nan),
             "10 Day Relative Volume": rvol10,
             "20 Day Relative Volume": rvol20,
+            "ROC_14": float(row.get("ROC_14", np.nan)),               # <-- Appending Gamma Hulk Variables
+            "ROC_6M_Peak": float(row.get("ROC_6M_Peak", np.nan)),     # <-- Appending Gamma Hulk Variables
+            "ROC_6M_Bottom": float(row.get("ROC_6M_Bottom", np.nan)), # <-- Appending Gamma Hulk Variables
             "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else float("nan"),
             "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[i]) if not flow_df.empty else float("nan"),
             "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[i]) if not flow_df.empty else float("nan"),
@@ -931,6 +871,9 @@ def compute_iteration_volume_profile(
         "Current Volume": last_cum_vol,
         "10 Day Relative Volume": last_rvol10,
         "20 Day Relative Volume": last_rvol20,
+        "ROC_14": float(curr_df["ROC_14"].iloc[-1]) if "ROC_14" in curr_df.columns else np.nan,               # <-- Appending to Summary
+        "ROC_6M_Peak": float(curr_df["ROC_6M_Peak"].iloc[-1]) if "ROC_6M_Peak" in curr_df.columns else np.nan,     # <-- Appending to Summary
+        "ROC_6M_Bottom": float(curr_df["ROC_6M_Bottom"].iloc[-1]) if "ROC_6M_Bottom" in curr_df.columns else np.nan, # <-- Appending to Summary
         "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[-1]) if not flow_df.empty else float("nan"),
@@ -979,7 +922,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
         )
         intra_df = get_fyers_history(
             fyers_sym,
-            resolution="5",
+            resolution="5", # Pulling intraday bars. If you want true 15M ROC, you can alter to "15" or adjust lookback maths. 
             days_back=INTRADAY_LOOKBACK_DAYS
         )
 
@@ -1004,6 +947,9 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "Stability": iter_summary.get("Stability"),
             "Balanced": iter_summary.get("Balanced"),
             "CumsumPlus": iter_summary.get("CumsumPlus"),
+            "ROC_14": iter_summary.get("ROC_14"),                 # <-- Add to main df
+            "ROC_6M_Peak": iter_summary.get("ROC_6M_Peak"),       # <-- Add to main df
+            "ROC_6M_Bottom": iter_summary.get("ROC_6M_Bottom"),   # <-- Add to main df
             "ARIMA Signal": iter_summary.get("ARIMA Signal"),
             "Kalman Signal": iter_summary.get("Kalman Signal"),
             "5m_Signal": iter_summary.get("5m_Signal"),
@@ -1194,18 +1140,19 @@ def format_value(col: str, val):
         return ""
     if col == "% Change":
         return f"{float(val):.2f}%"
-    if col == "IVP":
+    if col in ["IVP", "ROC_14", "ROC_6M_Peak", "ROC_6M_Bottom"]:
         return f"{float(val):.2f}"
     if isinstance(val, (int, float, np.integer, np.floating)):
         return f"{float(val):.4f}"
     return str(val)
+
 
 def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df is None or df.empty:
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
 
     base = df.copy()
-    for c in ["Directional", "Turning", "Stability", "Balanced", "CumsumPlus", "10 Day Relative Volume", "Last5mVolume"]:
+    for c in ["Directional", "Turning", "Stability", "Balanced", "CumsumPlus", "10 Day Relative Volume", "Last5mVolume", "ROC_14", "ROC_6M_Peak", "ROC_6M_Bottom"]:
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
 
@@ -1222,23 +1169,37 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
             dfside["% Change"] = pd.to_numeric(dfside["% Change"], errors="coerce")
 
         if side == "long":
+            # 1. Filter: Must be structurally Long
             dfside = dfside[dfside["Directional"] > 0]
+            
+            # 2. ASIT BARAN PATI GAMMA HULK FILTER (LONG)
+            # The current ROC must be explicitly crossing ABOVE the 6-Month Historical Peak
+            if "ROC_14" in dfside.columns and "ROC_6M_Peak" in dfside.columns:
+                dfside = dfside[dfside["ROC_14"] > dfside["ROC_6M_Peak"]]
+
             dfside = dfside.sort_values(
                 ["% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
                 ascending=[False, False, True, False, False],
                 na_position="last"
             )
         else:
+            # 1. Filter: Must be structurally Short
             dfside = dfside[dfside["Directional"] < 0]
+
+            # 2. ASIT BARAN PATI GAMMA HULK FILTER (SHORT)
+            # The current ROC must be explicitly crossing BELOW the 6-Month Historical Trough
+            if "ROC_14" in dfside.columns and "ROC_6M_Bottom" in dfside.columns:
+                dfside = dfside[dfside["ROC_14"] < dfside["ROC_6M_Bottom"]]
+
             dfside = dfside.sort_values(
                 ["% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
                 ascending=[True, True, True, True, False],
                 na_position="last"
             )
-        return dfside  # ✅ MOVED inside the function, AFTER the if/else block
+        return dfside
 
-    long_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]).head(15)   # ✅ renamed
-    short_df = prep_side_df(base, "short").drop_duplicates(subset=["Symbol"]).head(15) # ✅ renamed
+    long_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
+    short_df = prep_side_df(base, "short").drop_duplicates(subset=["Symbol"]).head(15)
     cols = [c for c in EMAIL_DISPLAY_COLS if c in base.columns]
     long_df = long_df[cols] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     short_df = short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
@@ -1700,10 +1661,12 @@ def send_email_with_tables(
     <h2>Intraday Vol Iteration Alert</h2>
     <p>Scan completed at {scan_time}</p>
 
-    <h2>Current Long Candidates</h2>
+    <h2>Current Long Candidates (Gamma Hulk Filtered)</h2>
+    <p style="color: #4CAF50;"><i>*Only stocks actively breaking ABOVE their 6-Month ROC Peak.</i></p>
     {long_html}
 
-    <h2>Current Short Candidates</h2>
+    <h2>Current Short Candidates (Gamma Hulk Filtered)</h2>
+    <p style="color: #f44336;"><i>*Only stocks actively breaking BELOW their 6-Month ROC Trough.</i></p>
     {short_html}
   </body>
 </html>
