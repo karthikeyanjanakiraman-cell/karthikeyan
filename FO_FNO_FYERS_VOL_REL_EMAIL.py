@@ -16,6 +16,7 @@ import sys
 import logging
 import warnings
 from datetime import datetime, timedelta, time
+import time as time_module
 from typing import List, Dict, Optional, Tuple
 
 import numpy as np
@@ -58,7 +59,10 @@ DAILY_LOOKBACK_DAYS = 60
 INTRADAY_LOOKBACK_DAYS = 220  
 IVP_LOOKBACK_DAYS = 252
 INDEX_SOFT_BOOST_WEIGHT = 0.25
-HISTORY_API_MAX_SPAN_DAYS = 99
+HISTORY_API_MAX_SPAN_DAYS = 30
+FYERS_RATE_LIMIT_SLEEP = 0.35
+FYERS_RETRY_SLEEP = 2.0
+FYERS_MAX_RETRIES = 2
 
 fyers: Optional[fyersModel.FyersModel] = None
 
@@ -411,6 +415,79 @@ def format_fyers_symbol(symbol: str) -> str:
 
 def get_fyers_history(symbol: str, resolution: str, days_back: int) -> Optional[pd.DataFrame]:
     if not fyers:
+        return None
+
+    try:
+        now = datetime.now()
+        start_date = (now - timedelta(days=days_back)).date()
+        end_date = now.date()
+        all_candles = []
+        current_start = start_date
+
+        while current_start <= end_date:
+            current_end = min(current_start + timedelta(days=HISTORY_API_MAX_SPAN_DAYS), end_date)
+            data = {
+                "symbol": symbol,
+                "resolution": resolution,
+                "date_format": "1",
+                "range_from": current_start.strftime("%Y-%m-%d"),
+                "range_to": current_end.strftime("%Y-%m-%d"),
+                "cont_flag": "1",
+            }
+
+            success = False
+            for attempt in range(1, FYERS_MAX_RETRIES + 1):
+                res = fyers.history(data=data)
+                if res and res.get("s") == "ok":
+                    candles = res.get("candles", [])
+                    if candles:
+                        all_candles.extend(candles)
+                        logger.info(
+                            f"FYERS {symbol} {resolution} fetched {len(candles)} candles for {data['range_from']}->{data['range_to']}"
+                        )
+                    else:
+                        logger.warning(
+                            f"FYERS No candles for {symbol} {resolution} {data['range_from']}->{data['range_to']}"
+                        )
+                    success = True
+                    break
+
+                code = res.get("code") if isinstance(res, dict) else None
+                logger.warning(
+                    f"FYERS Non-ok response for {symbol} {resolution} {data['range_from']}->{data['range_to']} attempt {attempt}: {res}"
+                )
+                if code == 429 and attempt < FYERS_MAX_RETRIES:
+                    time_module.sleep(FYERS_RETRY_SLEEP * attempt)
+                else:
+                    break
+
+            time_module.sleep(FYERS_RATE_LIMIT_SLEEP)
+            current_start = current_end + timedelta(days=1)
+
+        if all_candles:
+            df = pd.DataFrame(
+                all_candles,
+                columns=["timestamp", "open", "high", "low", "close", "volume"],
+            )
+            df["timestamp"] = (
+                pd.to_datetime(df["timestamp"], unit="s")
+                .dt.tz_localize("UTC")
+                .dt.tz_convert("Asia/Kolkata")
+                .dt.tz_localize(None)
+            )
+            df.sort_values("timestamp", inplace=True)
+            df.drop_duplicates(subset=["timestamp"], keep="last", inplace=True)
+            df.reset_index(drop=True, inplace=True)
+            logger.info(
+                f"FYERS {symbol} {resolution} total candles={len(df)} unique_dates={df['timestamp'].dt.date.nunique()}"
+            )
+            return df
+
+        logger.warning(f"FYERS No usable candles for {symbol} {resolution} over last {days_back} days.")
+        return None
+
+    except Exception as e:
+        logger.error(f"FYERS Error fetching {resolution} data for {symbol}: {e}")
         return None
 
     try:
@@ -1291,7 +1368,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
 
     long_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
     short_df = prep_side_df(base, "short").drop_duplicates(subset=["Symbol"]).head(15)
-    cols = [c for c in EMAILDISPLAY_COLS if c in base.columns]
+    cols = [c for c in EMAIL_DISPLAY_COLS if c in base.columns]
     long_df = long_df[cols] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     short_df = short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     return long_df, short_df
@@ -1903,27 +1980,48 @@ def main():
     summary_df = derive_rank_columns(summary_df)
     summary_df = add_signal_columns(summary_df)
 
-    long_df, short_df = build_candidate_tables(summary_df)
-    history_df = load_iteration_history(detail_df)
-    
-    recent_10_exceed_df, all_time_exceed_df = build_exceedance_tables(detail_df)
-
     summary_csv, detail_csv = save_outputs(summary_df, detail_df, prefix="fno")
 
-    sent = send_email_with_tables(
-        long_df=long_df,
-        short_df=short_df,
-        history_df=history_df,
-        csv_filename=summary_csv,
-        detail_csv_filename=detail_csv
-    )
+    try:
+        long_df, short_df = build_candidate_tables(summary_df)
+    except Exception as e:
+        logger.error(f"Candidate build failed: {e}")
+        long_df, short_df = pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
 
-    sent_second = send_second_email_with_exceedance_tables(
-       recent_10_df=recent_10_exceed_df,
-       all_time_df=all_time_exceed_df,
-       csv_filename=summary_csv,
-       detail_csv_filename=detail_csv
-    )
+    try:
+        history_df = load_iteration_history(detail_df)
+    except Exception as e:
+        logger.error(f"History build failed: {e}")
+        history_df = pd.DataFrame()
+
+    try:
+        recent_10_exceed_df, all_time_exceed_df = build_exceedance_tables(detail_df)
+    except Exception as e:
+        logger.error(f"Exceedance build failed: {e}")
+        recent_10_exceed_df, all_time_exceed_df = pd.DataFrame(), pd.DataFrame()
+
+    try:
+        sent = send_email_with_tables(
+            long_df=long_df,
+            short_df=short_df,
+            history_df=history_df,
+            csv_filename=summary_csv,
+            detail_csv_filename=detail_csv,
+        )
+    except Exception as e:
+        logger.error(f"First email failed: {e}")
+        sent = False
+
+    try:
+        sent_second = send_second_email_with_exceedance_tables(
+            recent_10_df=recent_10_exceed_df,
+            all_time_df=all_time_exceed_df,
+            csv_filename=summary_csv,
+            detail_csv_filename=detail_csv,
+        )
+    except Exception as e:
+        logger.error(f"Second email failed: {e}")
+        sent_second = False
 
     if sent and sent_second:
         logger.info("Scan and both emails completed.")
