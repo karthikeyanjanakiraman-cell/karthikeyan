@@ -98,6 +98,7 @@ def compute_gamma_hulk_roc(intra_df: pd.DataFrame) -> pd.DataFrame:
     Uses a dynamic lookback based on the inferred intraday bar interval.
     """
     df = intra_df.copy().sort_values("timestamp").reset_index(drop=True)
+
     if df.empty or "close" not in df.columns:
         df["ROC_All_Iter"] = np.nan
         df["ROC_6M_Peak"] = np.nan
@@ -106,6 +107,7 @@ def compute_gamma_hulk_roc(intra_df: pd.DataFrame) -> pd.DataFrame:
 
     close = pd.to_numeric(df["close"], errors="coerce").astype(float)
     first_close = close.iloc[0] if len(close) > 0 else np.nan
+
     if pd.isna(first_close) or float(first_close) == 0.0:
         df["ROC_All_Iter"] = np.nan
     else:
@@ -122,8 +124,14 @@ def compute_gamma_hulk_roc(intra_df: pd.DataFrame) -> pd.DataFrame:
     bars_per_day = max(int(round(375.0 / inferred_minutes)), 1)
     lookback_bars = max(2, 125 * bars_per_day)
 
-    df["ROC_6M_Peak"] = df["ROC_All_Iter"].shift(1).rolling(window=lookback_bars, min_periods=2).max()
-    df["ROC_6M_Bottom"] = df["ROC_All_Iter"].shift(1).rolling(window=lookback_bars, min_periods=2).min()
+    df["ROC_6M_Peak"] = df["ROC_All_Iter"].shift(1).rolling(
+        window=lookback_bars, min_periods=2
+    ).max()
+
+    df["ROC_6M_Bottom"] = df["ROC_All_Iter"].shift(1).rolling(
+        window=lookback_bars, min_periods=2
+    ).min()
+
     return df
 # ==============================================================================
 
