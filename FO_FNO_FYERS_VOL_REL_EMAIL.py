@@ -55,7 +55,7 @@ warnings.filterwarnings("ignore")
 
 # Adjusted to ensure we fetch enough data for the 6-month ROC calculation (approx 125 trading days)
 DAILY_LOOKBACK_DAYS = 60
-INTRADAY_LOOKBACK_DAYS = 130  
+INTRADAY_LOOKBACK_DAYS = 220  
 IVP_LOOKBACK_DAYS = 252
 INDEX_SOFT_BOOST_WEIGHT = 0.25
 
@@ -90,30 +90,31 @@ EMAIL_DISPLAY_COLS = [
 def compute_gamma_hulk_roc(intra_df: pd.DataFrame, roc_period: int = 14) -> pd.DataFrame:
     """
     Calculates the 14-period ROC and the rolling 6-month historical Peak/Trough.
-    Assumes incoming data is 5-minute or 15-minute intraday bars.
+    Uses a dynamic lookback based on the inferred intraday bar interval.
     """
     df = intra_df.copy().sort_values("timestamp").reset_index(drop=True)
-    if df.empty or len(df) < roc_period:
+    if df.empty or len(df) < roc_period or "close" not in df.columns:
         df["ROC_14"] = np.nan
         df["ROC_6M_Peak"] = np.nan
         df["ROC_6M_Bottom"] = np.nan
         return df
 
     close = pd.to_numeric(df["close"], errors="coerce").astype(float)
-    
-    # Calculate Base Rate of Change (14-period)
     df["ROC_14"] = close.pct_change(periods=roc_period) * 100.0
-    
-    # 6 Months = approx 125 trading days. 
-    # If standard 5-minute bars (75 bars a day): 125 * 75 = 9375 bars.
-    # If 15-minute bars (25 bars a day): 125 * 25 = 3125 bars.
-    # Assuming this script runs primarily on 5m data pulled in scan_fno_universe:
-    lookback_bars = 9375 
-    
-    # Calculate boundaries anchored to the PREVIOUS bar (.shift(1)) to prevent repainting
+
+    timestamps = pd.to_datetime(df["timestamp"], errors="coerce")
+    inferred_minutes = 5.0
+    if timestamps.notna().sum() >= 3:
+        deltas = timestamps.diff().dropna().dt.total_seconds().div(60.0)
+        deltas = deltas[(deltas > 0) & (deltas <= 120)]
+        if not deltas.empty:
+            inferred_minutes = float(deltas.mode().iloc[0])
+
+    bars_per_day = max(int(round(375.0 / inferred_minutes)), 1)
+    lookback_bars = max(roc_period, 125 * bars_per_day)
+
     df["ROC_6M_Peak"] = df["ROC_14"].shift(1).rolling(window=lookback_bars, min_periods=roc_period).max()
     df["ROC_6M_Bottom"] = df["ROC_14"].shift(1).rolling(window=lookback_bars, min_periods=roc_period).min()
-    
     return df
 # ==============================================================================
 
@@ -192,18 +193,25 @@ def build_mtf_alignment(detail_df: pd.DataFrame) -> Dict[str, object]:
     }
     if detail_df is None or detail_df.empty or "Iteration Change" not in detail_df.columns:
         return out
+
     df = detail_df.copy()
     if "Iteration No" in df.columns:
-        df = df.sort_values("Iteration No")
+        df = df.sort_values("Iteration No").reset_index(drop=True)
+
     series = pd.to_numeric(df["Iteration Change"], errors="coerce").dropna().astype(float)
-    n = len(series)
-    if n < 3:
+    if len(series) < 3:
         return out
 
-    mtf_5 = classify_mtf_from_window(series.tail(min(3, n)))
-    mtf_15 = classify_mtf_from_window(series.tail(3)) if n >= 3 else float("nan")
-    mtf_30 = classify_mtf_from_window(series.tail(6)) if n >= 6 else float("nan")
-    mtf_60 = classify_mtf_from_window(series.tail(12)) if n >= 12 else float("nan")
+    def classify_from_tail(s: pd.Series, bars: int) -> float:
+        s = pd.to_numeric(s, errors="coerce").dropna().astype(float)
+        if len(s) < bars:
+            return float("nan")
+        return classify_mtf_from_window(s.tail(bars))
+
+    mtf_5 = classify_from_tail(series, 3)
+    mtf_15 = classify_from_tail(series.iloc[2::3].reset_index(drop=True), 3)
+    mtf_30 = classify_from_tail(series.iloc[5::6].reset_index(drop=True), 3)
+    mtf_60 = classify_from_tail(series.iloc[11::12].reset_index(drop=True), 3)
 
     available = [v for v in [mtf_5, mtf_15, mtf_30, mtf_60] if pd.notna(v)]
     if not available:
@@ -215,8 +223,6 @@ def build_mtf_alignment(detail_df: pd.DataFrame) -> Dict[str, object]:
         align = "LONG"
     elif all(v == -1.0 for v in available):
         align = "SHORT"
-    elif all(v == 0.0 for v in available):
-        align = "MIXED"
     elif len(available) == 1 and available[0] == 0.0:
         align = "NA"
 
@@ -935,7 +941,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
         if not iter_detail.empty:
             iter_detail.insert(0, "Symbol", sym)
-            iter_detail.insert(1, "Daily Change", pct_change)
+            iter_detail.insert(1, "% Change", pct_change)
             iteration_rows.append(iter_detail)
 
         rows.append({
@@ -1402,19 +1408,30 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
         return pd.DataFrame()
 
     df = detail_df.copy()
-    for col in ["Iteration No", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus"]:
+    numeric_cols = [
+        "Iteration No", "LTP", "% Change", "Directional", "Turning",
+        "Stability", "Balanced", "CumsumPlus", "ROC_14",
+        "ROC_6M_Peak", "ROC_6M_Bottom"
+    ]
+    for col in numeric_cols:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
     if "Iteration No" not in df.columns:
         return pd.DataFrame()
 
-    last_15_iters = sorted(df["Iteration No"].dropna().astype(int).unique())[-15:]
-    df = df[df["Iteration No"].isin(last_15_iters)].copy()
+    last15_iters = sorted(df["Iteration No"].dropna().astype(int).unique())[-15:]
+    df = df[df["Iteration No"].astype(int).isin(last15_iters)].copy()
+    if df.empty:
+        return df
 
     long_top = (
         df[df["Directional"] > 0]
-        .sort_values(["Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, False, True, False, False], na_position="last")
+        .sort_values(
+            ["Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"],
+            ascending=[True, False, True, False, False],
+            na_position="last",
+        )
         .groupby("Iteration No", group_keys=False)
         .head(1)
         .assign(Side="Long")
@@ -1422,7 +1439,11 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
 
     short_top = (
         df[df["Directional"] < 0]
-        .sort_values(["Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"], ascending=[True, True, True, False, False], na_position="last")
+        .sort_values(
+            ["Iteration No", "Directional", "Turning", "CumsumPlus", "Stability"],
+            ascending=[True, True, True, False, False],
+            na_position="last",
+        )
         .groupby("Iteration No", group_keys=False)
         .head(1)
         .assign(Side="Short")
@@ -1431,6 +1452,13 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     out = pd.concat([long_top, short_top], ignore_index=True, sort=False)
     if out.empty:
         return out
+
+    out = out.sort_values(["Iteration No", "Side"]).reset_index(drop=True)
+    itertime = out.get("Iteration Time", pd.Series("", index=out.index)).astype(str)
+    out["Iteration"] = out["Iteration No"].astype("Int64").astype(str) + " @ " + itertime
+    out["First Occurrence"] = out["Iteration"]
+    out["Latest"] = out["Iteration"]
+    return out
 
     out = out.sort_values(["Iteration No", "Side"]).reset_index(drop=True)
     iter_time = out.get("Iteration Time", pd.Series("", index=out.index)).astype(str)
@@ -1650,47 +1678,49 @@ def send_email_with_tables(
 ) -> bool:
     try:
         scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-        # Only current long/short in the email body
         long_html = build_html_table(long_df, "Current Long Candidates", max_rows=15)
         short_html = build_html_table(short_df, "Current Short Candidates", max_rows=15)
+        long_history_html = build_history_table(history_df, "long")
+        short_history_html = build_history_table(history_df, "short")
 
         html_body = f"""
-<html>
-  <body style="font-family: Arial, sans-serif; font-size: 14px;">
-    <h2>Intraday Vol Iteration Alert</h2>
-    <p>Scan completed at {scan_time}</p>
-
-    <h2>Current Long Candidates (Gamma Hulk Filtered)</h2>
-    <p style="color: #4CAF50;"><i>*Only stocks actively breaking ABOVE their 6-Month ROC Peak.</i></p>
-    {long_html}
-
-    <h2>Current Short Candidates (Gamma Hulk Filtered)</h2>
-    <p style="color: #f44336;"><i>*Only stocks actively breaking BELOW their 6-Month ROC Trough.</i></p>
-    {short_html}
-  </body>
-</html>
-"""
+        <html>
+        <body style="margin:0;padding:20px;background:#030712;color:#e5e7eb;font-family:Arial,sans-serif;">
+          <div style="max-width:1600px;margin:0 auto;">
+            <h2 style="margin:0 0 12px 0;color:#facc15;">Intraday Vol Iteration Alert</h2>
+            <div style="margin-bottom:18px;color:#cbd5e1;font-size:14px;">Scan completed at {scan_time}</div>
+            <h2>Current Long Candidates - Gamma Hulk Filtered</h2>
+            <p style="color:#4CAF50;"><i>Only stocks actively breaking ABOVE their 6-Month ROC Peak.</i></p>
+            {long_html}
+            <div style="height:18px;"></div>
+            {long_history_html}
+            <div style="height:28px;"></div>
+            <h2>Current Short Candidates - Gamma Hulk Filtered</h2>
+            <p style="color:#f44336;"><i>Only stocks actively breaking BELOW their 6-Month ROC Trough.</i></p>
+            {short_html}
+            <div style="height:18px;"></div>
+            {short_history_html}
+            <div style="margin-top:18px;color:#94a3b8;font-size:12px;">Generated by FO_FNO_FYERS_VOL_REL_EMAIL.py</div>
+          </div>
+        </body>
+        </html>
+        """
 
         msg = MIMEMultipart()
         msg["From"] = sender_email
         msg["To"] = recipient_email
         msg["Subject"] = f"Intraday Vol Iteration Alert - {scan_time}"
-        msg.attach(MIMEText(html_body, "html"))
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
 
-        # Attach CSVs if provided
-        for fname in (csv_filename, detail_csv_filename):
+        for fname in [csv_filename, detail_csv_filename]:
             if not fname or not os.path.exists(fname):
                 continue
             with open(fname, "rb") as f:
                 part = MIMEBase("application", "octet-stream")
                 part.set_payload(f.read())
-            encoders.encode_base64(part)
-            part.add_header(
-                "Content-Disposition",
-                f"attachment; filename={os.path.basename(fname)}",
-            )
-            msg.attach(part)
+                encoders.encode_base64(part)
+                part.add_header("Content-Disposition", f'attachment; filename={os.path.basename(fname)}')
+                msg.attach(part)
 
         with smtplib.SMTP(smtp_host, smtp_port) as server:
             server.starttls()
