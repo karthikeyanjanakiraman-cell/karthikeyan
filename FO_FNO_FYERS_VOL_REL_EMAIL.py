@@ -91,18 +91,18 @@ EMAIL_DISPLAY_COLS = [
 # ==============================================================================
 # NEW FUNCTION: ASIT BARAN PATI'S 6-MONTH ROC (GAMMA HULK) ENGINE
 # ==============================================================================
-def compute_gamma_hulk_roc(intra_df: pd.DataFrame, roc_period: int = 14) -> pd.DataFrame:
+def compute_gamma_hulk_roc(intra_df: pd.DataFrame) -> pd.DataFrame:
     """
     15-minute Gamma Hulk engine:
-    - Computes 14-period ROC
+    - Computes current 15-minute ROC on close
     - Computes 6-month historical ROC peak/trough
     - Detects the breakout candle (ROC crossing 6M boundary)
     - Requires the NEXT candle to close beyond breakout candle high/low
     """
     df = intra_df.copy().sort_values("timestamp").reset_index(drop=True)
 
-    required_cols = {"timestamp", "open", "high", "low", "close"}
-    if df.empty or len(df) < roc_period or not required_cols.issubset(df.columns):
+    required_cols = {"timestamp", "high", "low", "close"}
+    if df.empty or not required_cols.issubset(df.columns):
         df["ROC_14"] = np.nan
         df["ROC_6M_Peak"] = np.nan
         df["ROC_6M_Bottom"] = np.nan
@@ -114,10 +114,10 @@ def compute_gamma_hulk_roc(intra_df: pd.DataFrame, roc_period: int = 14) -> pd.D
         df["Gamma_Breakout_Low"] = np.nan
         return df
 
-    for col in ["open", "high", "low", "close"]:
+    for col in ["high", "low", "close"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
 
-    df["ROC_14"] = df["close"].pct_change(periods=roc_period) * 100.0
+    df["ROC_14"] = ((df["close"] - df["close"].shift(1)) / df["close"].shift(1)) * 100.0
 
     timestamps = pd.to_datetime(df["timestamp"], errors="coerce")
     inferred_minutes = 15.0
@@ -128,49 +128,22 @@ def compute_gamma_hulk_roc(intra_df: pd.DataFrame, roc_period: int = 14) -> pd.D
             inferred_minutes = float(deltas.mode().iloc[0])
 
     bars_per_day = max(int(round(375.0 / inferred_minutes)), 1)
-    lookback_bars = max(roc_period, 125 * bars_per_day)
+    lookback_bars = max(2, 125 * bars_per_day)
 
-    df["ROC_6M_Peak"] = df["ROC_14"].shift(1).rolling(
-        window=lookback_bars, min_periods=roc_period
-    ).max()
-
-    df["ROC_6M_Bottom"] = df["ROC_14"].shift(1).rolling(
-        window=lookback_bars, min_periods=roc_period
-    ).min()
+    df["ROC_6M_Peak"] = df["ROC_14"].shift(1).rolling(window=lookback_bars, min_periods=2).max()
+    df["ROC_6M_Bottom"] = df["ROC_14"].shift(1).rolling(window=lookback_bars, min_periods=2).min()
 
     prev_roc = df["ROC_14"].shift(1)
-
-    df["Gamma_Long_Breakout"] = (
-        df["ROC_14"].notna()
-        & df["ROC_6M_Peak"].notna()
-        & prev_roc.notna()
-        & (prev_roc <= df["ROC_6M_Peak"])
-        & (df["ROC_14"] > df["ROC_6M_Peak"])
-    )
-
-    df["Gamma_Short_Breakdown"] = (
-        df["ROC_14"].notna()
-        & df["ROC_6M_Bottom"].notna()
-        & prev_roc.notna()
-        & (prev_roc >= df["ROC_6M_Bottom"])
-        & (df["ROC_14"] < df["ROC_6M_Bottom"])
-    )
+    df["Gamma_Long_Breakout"] = df["ROC_14"].notna() & df["ROC_6M_Peak"].notna() & prev_roc.notna() & (prev_roc <= df["ROC_6M_Peak"]) & (df["ROC_14"] > df["ROC_6M_Peak"])
+    df["Gamma_Short_Breakdown"] = df["ROC_14"].notna() & df["ROC_6M_Bottom"].notna() & prev_roc.notna() & (prev_roc >= df["ROC_6M_Bottom"]) & (df["ROC_14"] < df["ROC_6M_Bottom"])
 
     df["Gamma_Breakout_High"] = np.where(df["Gamma_Long_Breakout"], df["high"], np.nan)
     df["Gamma_Breakout_Low"] = np.where(df["Gamma_Short_Breakdown"], df["low"], np.nan)
 
     long_trigger_high = df["Gamma_Breakout_High"].shift(1)
     short_trigger_low = df["Gamma_Breakout_Low"].shift(1)
-
-    df["Gamma_Long_Confirmed"] = (
-        long_trigger_high.notna()
-        & (df["close"] > long_trigger_high)
-    )
-
-    df["Gamma_Short_Confirmed"] = (
-        short_trigger_low.notna()
-        & (df["close"] < short_trigger_low)
-    )
+    df["Gamma_Long_Confirmed"] = long_trigger_high.notna() & (df["close"] > long_trigger_high)
+    df["Gamma_Short_Confirmed"] = short_trigger_low.notna() & (df["close"] < short_trigger_low)
 
     return df
 # ==============================================================================
@@ -947,7 +920,7 @@ def compute_iteration_volume_profile(
         df["time_only"] = pd.to_datetime(df["time"]).dt.time
         
     # --- Integration of Gamma Hulk Engine ---
-    df = compute_gamma_hulk_roc(df, roc_period=14)
+    df = compute_gamma_hulk_roc(df)
     # ----------------------------------------
 
     dates = sorted(df["date"].unique())
