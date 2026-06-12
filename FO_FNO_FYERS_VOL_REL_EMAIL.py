@@ -54,7 +54,7 @@ logger.addHandler(ch)
 warnings.filterwarnings("ignore")
 
 # Adjusted to ensure we fetch enough data for the 6-month ROC calculation (approx 125 trading days)
-DAILY_LOOKBACK_DAYS = 60
+DAILY_LOOKBACK_DAYS = 99
 INTRADAY_LOOKBACK_DAYS = 220  
 IVP_LOOKBACK_DAYS = 252
 INDEX_SOFT_BOOST_WEIGHT = 0.25
