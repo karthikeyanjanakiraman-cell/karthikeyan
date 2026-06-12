@@ -75,7 +75,7 @@ EMAIL_DISPLAY_COLS = [
     "Symbol",
     "LTP",
     "% Change",
-    "ROC_All_Iter",          # <-- Added for Gamma Hulk Visibility
+    "ROC_14",          # <-- Added for Gamma Hulk Visibility
     "ROC_6M_Peak",     # <-- Added for Gamma Hulk Visibility
     "ROC_6M_Bottom",   # <-- Added for Gamma Hulk Visibility
     "MTF_5m",
@@ -96,7 +96,7 @@ def compute_gamma_hulk_roc(intra_df: pd.DataFrame, roc_period: int = 14) -> pd.D
     15-minute Gamma Hulk engine:
     - Computes 14-period ROC
     - Computes 6-month historical ROC peak/trough
-    - Detects the breakout candle
+    - Detects the breakout candle (ROC crossing 6M boundary)
     - Requires the NEXT candle to close beyond breakout candle high/low
     """
     df = intra_df.copy().sort_values("timestamp").reset_index(drop=True)
@@ -173,6 +173,7 @@ def compute_gamma_hulk_roc(intra_df: pd.DataFrame, roc_period: int = 14) -> pd.D
     )
 
     return df
+# ==============================================================================
 # ==============================================================================
 
 
@@ -946,7 +947,7 @@ def compute_iteration_volume_profile(
         df["time_only"] = pd.to_datetime(df["time"]).dt.time
         
     # --- Integration of Gamma Hulk Engine ---
-    df = compute_gamma_hulk_roc(df)
+    df = compute_gamma_hulk_roc(df, roc_period=14)
     # ----------------------------------------
 
     dates = sorted(df["date"].unique())
@@ -1030,9 +1031,15 @@ def compute_iteration_volume_profile(
             "CumsumPlus": ps.get("CumsumPlus", np.nan),
             "10 Day Relative Volume": rvol10,
             "20 Day Relative Volume": rvol20,
-            "ROC_All_Iter": float(row.get("ROC_All_Iter", np.nan)),               # <-- Appending Gamma Hulk Variables
+            "ROC_14": float(row.get("ROC_14", np.nan)),               # <-- Appending Gamma Hulk Variables
             "ROC_6M_Peak": float(row.get("ROC_6M_Peak", np.nan)),     # <-- Appending Gamma Hulk Variables
             "ROC_6M_Bottom": float(row.get("ROC_6M_Bottom", np.nan)), # <-- Appending Gamma Hulk Variables
+"Gamma_Long_Breakout": bool(row.get("Gamma_Long_Breakout", False)),
+"Gamma_Short_Breakdown": bool(row.get("Gamma_Short_Breakdown", False)),
+"Gamma_Long_Confirmed": bool(row.get("Gamma_Long_Confirmed", False)),
+"Gamma_Short_Confirmed": bool(row.get("Gamma_Short_Confirmed", False)),
+"Gamma_Breakout_High": float(row.get("Gamma_Breakout_High", np.nan)),
+"Gamma_Breakout_Low": float(row.get("Gamma_Breakout_Low", np.nan)),
             "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else float("nan"),
             "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[i]) if not flow_df.empty else float("nan"),
             "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[i]) if not flow_df.empty else float("nan"),
@@ -1077,9 +1084,15 @@ def compute_iteration_volume_profile(
         "Current Volume": last_cum_vol,
         "10 Day Relative Volume": last_rvol10,
         "20 Day Relative Volume": last_rvol20,
-        "ROC_All_Iter": float(curr_df["ROC_All_Iter"].iloc[-1]) if "ROC_All_Iter" in curr_df.columns else np.nan,               # <-- Appending to Summary
+        "ROC_14": float(curr_df["ROC_14"].iloc[-1]) if "ROC_14" in curr_df.columns else np.nan,               # <-- Appending to Summary
         "ROC_6M_Peak": float(curr_df["ROC_6M_Peak"].iloc[-1]) if "ROC_6M_Peak" in curr_df.columns else np.nan,     # <-- Appending to Summary
         "ROC_6M_Bottom": float(curr_df["ROC_6M_Bottom"].iloc[-1]) if "ROC_6M_Bottom" in curr_df.columns else np.nan, # <-- Appending to Summary
+"Gamma_Long_Breakout": bool(curr_df["Gamma_Long_Breakout"].iloc[-1]) if "Gamma_Long_Breakout" in curr_df.columns else False,
+"Gamma_Short_Breakdown": bool(curr_df["Gamma_Short_Breakdown"].iloc[-1]) if "Gamma_Short_Breakdown" in curr_df.columns else False,
+"Gamma_Long_Confirmed": bool(curr_df["Gamma_Long_Confirmed"].iloc[-1]) if "Gamma_Long_Confirmed" in curr_df.columns else False,
+"Gamma_Short_Confirmed": bool(curr_df["Gamma_Short_Confirmed"].iloc[-1]) if "Gamma_Short_Confirmed" in curr_df.columns else False,
+"Gamma_Breakout_High": float(curr_df["Gamma_Breakout_High"].iloc[-1]) if "Gamma_Breakout_High" in curr_df.columns else np.nan,
+"Gamma_Breakout_Low": float(curr_df["Gamma_Breakout_Low"].iloc[-1]) if "Gamma_Breakout_Low" in curr_df.columns else np.nan,
         "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[-1]) if not flow_df.empty else float("nan"),
@@ -1128,7 +1141,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
         )
         intra_df = get_fyers_history(
             fyers_sym,
-            resolution="15",
+            resolution="5",
             days_back=INTRADAY_LOOKBACK_DAYS
         )
 
@@ -1153,9 +1166,15 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "Stability": iter_summary.get("Stability"),
             "Balanced": iter_summary.get("Balanced"),
             "CumsumPlus": iter_summary.get("CumsumPlus"),
-            "ROC_All_Iter": iter_summary.get("ROC_All_Iter"),                 # <-- Add to main df
+            "ROC_14": iter_summary.get("ROC_14"),                 # <-- Add to main df
             "ROC_6M_Peak": iter_summary.get("ROC_6M_Peak"),       # <-- Add to main df
             "ROC_6M_Bottom": iter_summary.get("ROC_6M_Bottom"),   # <-- Add to main df
+"Gamma_Long_Breakout": iter_summary.get("Gamma_Long_Breakout", False),
+"Gamma_Short_Breakdown": iter_summary.get("Gamma_Short_Breakdown", False),
+"Gamma_Long_Confirmed": iter_summary.get("Gamma_Long_Confirmed", False),
+"Gamma_Short_Confirmed": iter_summary.get("Gamma_Short_Confirmed", False),
+"Gamma_Breakout_High": iter_summary.get("Gamma_Breakout_High"),
+"Gamma_Breakout_Low": iter_summary.get("Gamma_Breakout_Low"),
             "ARIMA Signal": iter_summary.get("ARIMA Signal"),
             "Kalman Signal": iter_summary.get("Kalman Signal"),
             "5m_Signal": iter_summary.get("5m_Signal"),
@@ -1346,7 +1365,7 @@ def format_value(col: str, val):
         return ""
     if col == "% Change":
         return f"{float(val):.2f}%"
-    if col in ["IVP", "ROC_All_Iter", "ROC_6M_Peak", "ROC_6M_Bottom"]:
+    if col in ["IVP", "ROC_14", "ROC_6M_Peak", "ROC_6M_Bottom"]:
         return f"{float(val):.2f}"
     if isinstance(val, (int, float, np.integer, np.floating)):
         return f"{float(val):.4f}"
@@ -1360,7 +1379,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     base = df.copy()
     numeric_cols = [
         "Directional", "Turning", "Stability", "Balanced", "CumsumPlus",
-        "10 Day Relative Volume", "Last5mVolume", "ROC_All_Iter", "ROC_6M_Peak",
+        "10 Day Relative Volume", "Last5mVolume", "ROC_14", "ROC_6M_Peak",
         "ROC_6M_Bottom", "% Change"
     ]
     for c in numeric_cols:
@@ -1374,18 +1393,21 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
 
     def with_gamma_flags(dfside: pd.DataFrame) -> pd.DataFrame:
         out = dfside.copy()
-        if {"ROC_All_Iter", "ROC_6M_Peak"}.issubset(out.columns):
-            out["Gamma_Long_Breakout"] = (
-                out["ROC_All_Iter"].notna() & out["ROC_6M_Peak"].notna() & (out["ROC_All_Iter"] > out["ROC_6M_Peak"])
-            )
-        else:
+
+        if "Gamma_Long_Breakout" not in out.columns:
             out["Gamma_Long_Breakout"] = False
-        if {"ROC_All_Iter", "ROC_6M_Bottom"}.issubset(out.columns):
-            out["Gamma_Short_Breakdown"] = (
-                out["ROC_All_Iter"].notna() & out["ROC_6M_Bottom"].notna() & (out["ROC_All_Iter"] < out["ROC_6M_Bottom"])
-            )
-        else:
+        if "Gamma_Short_Breakdown" not in out.columns:
             out["Gamma_Short_Breakdown"] = False
+        if "Gamma_Long_Confirmed" not in out.columns:
+            out["Gamma_Long_Confirmed"] = False
+        if "Gamma_Short_Confirmed" not in out.columns:
+            out["Gamma_Short_Confirmed"] = False
+
+        out["Gamma_Long_Breakout"] = out["Gamma_Long_Breakout"].fillna(False).astype(bool)
+        out["Gamma_Short_Breakdown"] = out["Gamma_Short_Breakdown"].fillna(False).astype(bool)
+        out["Gamma_Long_Confirmed"] = out["Gamma_Long_Confirmed"].fillna(False).astype(bool)
+        out["Gamma_Short_Confirmed"] = out["Gamma_Short_Confirmed"].fillna(False).astype(bool)
+
         return out
 
     base = with_gamma_flags(base)
@@ -1397,26 +1419,58 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
 
         if side == "long":
             dfside = dfside[dfside["Directional"] > 0]
-            strict = dfside[dfside["Gamma_Long_Breakout"]].copy()
-            if strict.empty:
-                strict = dfside.copy()
-            strict = strict.sort_values(
-                ["Gamma_Long_Breakout", "% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
-                ascending=[False, False, False, True, False, False],
-                na_position="last"
+
+            confirmed = dfside[dfside["Gamma_Long_Confirmed"]].copy()
+            if not confirmed.empty:
+                confirmed = confirmed.sort_values(
+                    ["Gamma_Long_Confirmed", "% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
+                    ascending=[False, False, False, True, False, False],
+                    na_position="last",
+                )
+                return confirmed
+
+            breakout_only = dfside[dfside["Gamma_Long_Breakout"]].copy()
+            if not breakout_only.empty:
+                breakout_only = breakout_only.sort_values(
+                    ["Gamma_Long_Breakout", "% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
+                    ascending=[False, False, False, True, False, False],
+                    na_position="last",
+                )
+                return breakout_only
+
+            fallback = dfside.sort_values(
+                ["% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
+                ascending=[False, False, True, False, False],
+                na_position="last",
             )
-            return strict
+            return fallback
         else:
             dfside = dfside[dfside["Directional"] < 0]
-            strict = dfside[dfside["Gamma_Short_Breakdown"]].copy()
-            if strict.empty:
-                strict = dfside.copy()
-            strict = strict.sort_values(
-                ["Gamma_Short_Breakdown", "% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
-                ascending=[False, True, True, True, True, False],
-                na_position="last"
+
+            confirmed = dfside[dfside["Gamma_Short_Confirmed"]].copy()
+            if not confirmed.empty:
+                confirmed = confirmed.sort_values(
+                    ["Gamma_Short_Confirmed", "% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
+                    ascending=[False, True, True, True, True, False],
+                    na_position="last",
+                )
+                return confirmed
+
+            breakdown_only = dfside[dfside["Gamma_Short_Breakdown"]].copy()
+            if not breakdown_only.empty:
+                breakdown_only = breakdown_only.sort_values(
+                    ["Gamma_Short_Breakdown", "% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
+                    ascending=[False, True, True, True, True, False],
+                    na_position="last",
+                )
+                return breakdown_only
+
+            fallback = dfside.sort_values(
+                ["% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
+                ascending=[True, True, True, True, False],
+                na_position="last",
             )
-            return strict
+            return fallback
 
     long_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
     short_df = prep_side_df(base, "short").drop_duplicates(subset=["Symbol"]).head(15)
@@ -1624,7 +1678,7 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
     df = detail_df.copy()
     numeric_cols = [
         "Iteration No", "LTP", "% Change", "Directional", "Turning",
-        "Stability", "Balanced", "CumsumPlus", "ROC_All_Iter",
+        "Stability", "Balanced", "CumsumPlus", "ROC_14",
         "ROC_6M_Peak", "ROC_6M_Bottom"
     ]
     for col in numeric_cols:
@@ -1904,13 +1958,13 @@ def send_email_with_tables(
             <h2 style="margin:0 0 12px 0;color:#facc15;">Intraday Vol Iteration Alert</h2>
             <div style="margin-bottom:18px;color:#cbd5e1;font-size:14px;">Scan completed at {scan_time}</div>
             <h2>Current Long Candidates</h2>
-            <p style="color:#4CAF50;"><i>Gamma Hulk breakouts are prioritized first; when none exist, the strongest directional long setups are shown.</i></p>
+            <p style="color:#4CAF50;"><i>Gamma Hulk long confirmations are prioritized first; then raw breakout candles; when none exist, the strongest directional long setups are shown.</i></p>
             {long_html}
             <div style="height:18px;"></div>
             {long_history_html}
             <div style="height:28px;"></div>
             <h2>Current Short Candidates</h2>
-            <p style="color:#f44336;"><i>Gamma Hulk breakdowns are prioritized first; when none exist, the strongest directional short setups are shown.</i></p>
+            <p style="color:#f44336;"><i>Gamma Hulk short confirmations are prioritized first; then raw breakdown candles; when none exist, the strongest directional short setups are shown.</i></p>
             {short_html}
             <div style="height:18px;"></div>
             {short_history_html}
