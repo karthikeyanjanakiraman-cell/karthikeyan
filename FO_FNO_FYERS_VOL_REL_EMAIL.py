@@ -58,6 +58,7 @@ DAILY_LOOKBACK_DAYS = 60
 INTRADAY_LOOKBACK_DAYS = 220  
 IVP_LOOKBACK_DAYS = 252
 INDEX_SOFT_BOOST_WEIGHT = 0.25
+HISTORY_API_MAX_SPAN_DAYS = 30
 
 fyers: Optional[fyersModel.FyersModel] = None
 
@@ -410,6 +411,76 @@ def format_fyers_symbol(symbol: str) -> str:
 
 def get_fyers_history(symbol: str, resolution: str, days_back: int) -> Optional[pd.DataFrame]:
     if not fyers:
+        return None
+
+    try:
+        now = datetime.now()
+        start_date = (now - timedelta(days=days_back)).date()
+        end_date = now.date()
+        all_candles = []
+        current_start = start_date
+
+        while current_start <= end_date:
+            current_end = min(current_start + timedelta(days=HISTORY_API_MAX_SPAN_DAYS), end_date)
+            data = {
+                "symbol": symbol,
+                "resolution": resolution,
+                "date_format": "1",
+                "range_from": current_start.strftime("%Y-%m-%d"),
+                "range_to": current_end.strftime("%Y-%m-%d"),
+                "cont_flag": "1",
+            }
+            res = fyers.history(data=data)
+
+            if not res:
+                logger.warning(f"FYERS Empty response for {symbol} {resolution} {data['range_from']}->{data['range_to']}")
+                current_start = current_end + timedelta(days=1)
+                continue
+
+            if res.get("s") != "ok":
+                logger.warning(
+                    f"FYERS Non-ok response for {symbol} {resolution} {data['range_from']}->{data['range_to']}: {res}"
+                )
+                current_start = current_end + timedelta(days=1)
+                continue
+
+            candles = res.get("candles", [])
+            if candles:
+                all_candles.extend(candles)
+                logger.info(
+                    f"FYERS {symbol} {resolution} fetched {len(candles)} candles for {data['range_from']}->{data['range_to']}"
+                )
+            else:
+                logger.warning(
+                    f"FYERS No candles for {symbol} {resolution} {data['range_from']}->{data['range_to']}"
+                )
+
+            current_start = current_end + timedelta(days=1)
+
+        if all_candles:
+            df = pd.DataFrame(
+                all_candles,
+                columns=["timestamp", "open", "high", "low", "close", "volume"],
+            )
+            df["timestamp"] = (
+                pd.to_datetime(df["timestamp"], unit="s")
+                .dt.tz_localize("UTC")
+                .dt.tz_convert("Asia/Kolkata")
+                .dt.tz_localize(None)
+            )
+            df.sort_values("timestamp", inplace=True)
+            df.drop_duplicates(subset=["timestamp"], keep="last", inplace=True)
+            df.reset_index(drop=True, inplace=True)
+            logger.info(
+                f"FYERS {symbol} {resolution} total candles={len(df)} unique_dates={df['timestamp'].dt.date.nunique()}"
+            )
+            return df
+
+        logger.warning(f"FYERS No usable candles for {symbol} {resolution} over last {days_back} days.")
+        return None
+
+    except Exception as e:
+        logger.error(f"FYERS Error fetching {resolution} data for {symbol}: {e}")
         return None
 
     try:
@@ -928,7 +999,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
         )
         intra_df = get_fyers_history(
             fyers_sym,
-            resolution="5", # Pulling intraday bars. If you want true 15M ROC, you can alter to "15" or adjust lookback maths. 
+            resolution="5",
             days_back=INTRADAY_LOOKBACK_DAYS
         )
 
@@ -1158,7 +1229,12 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
 
     base = df.copy()
-    for c in ["Directional", "Turning", "Stability", "Balanced", "CumsumPlus", "10 Day Relative Volume", "Last5mVolume", "ROC_14", "ROC_6M_Peak", "ROC_6M_Bottom"]:
+    numeric_cols = [
+        "Directional", "Turning", "Stability", "Balanced", "CumsumPlus",
+        "10 Day Relative Volume", "Last5mVolume", "ROC_14", "ROC_6M_Peak",
+        "ROC_6M_Bottom", "% Change"
+    ]
+    for c in numeric_cols:
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
 
@@ -1167,46 +1243,55 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     if "Last5mVolume" in base.columns:
         base = base[base["Last5mVolume"].fillna(0) > 0]
 
+    def with_gamma_flags(dfside: pd.DataFrame) -> pd.DataFrame:
+        out = dfside.copy()
+        if {"ROC_14", "ROC_6M_Peak"}.issubset(out.columns):
+            out["Gamma_Long_Breakout"] = (
+                out["ROC_14"].notna() & out["ROC_6M_Peak"].notna() & (out["ROC_14"] > out["ROC_6M_Peak"])
+            )
+        else:
+            out["Gamma_Long_Breakout"] = False
+        if {"ROC_14", "ROC_6M_Bottom"}.issubset(out.columns):
+            out["Gamma_Short_Breakdown"] = (
+                out["ROC_14"].notna() & out["ROC_6M_Bottom"].notna() & (out["ROC_14"] < out["ROC_6M_Bottom"])
+            )
+        else:
+            out["Gamma_Short_Breakdown"] = False
+        return out
+
+    base = with_gamma_flags(base)
+
     def prep_side_df(dfside: pd.DataFrame, side: str) -> pd.DataFrame:
         if dfside.empty:
             return dfside
         dfside = dfside.copy()
-        if "% Change" in dfside.columns:
-            dfside["% Change"] = pd.to_numeric(dfside["% Change"], errors="coerce")
 
         if side == "long":
-            # 1. Filter: Must be structurally Long
             dfside = dfside[dfside["Directional"] > 0]
-            
-            # 2. ASIT BARAN PATI GAMMA HULK FILTER (LONG)
-            # The current ROC must be explicitly crossing ABOVE the 6-Month Historical Peak
-            if "ROC_14" in dfside.columns and "ROC_6M_Peak" in dfside.columns:
-                dfside = dfside[dfside["ROC_14"] > dfside["ROC_6M_Peak"]]
-
-            dfside = dfside.sort_values(
-                ["% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
-                ascending=[False, False, True, False, False],
+            strict = dfside[dfside["Gamma_Long_Breakout"]].copy()
+            if strict.empty:
+                strict = dfside.copy()
+            strict = strict.sort_values(
+                ["Gamma_Long_Breakout", "% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
+                ascending=[False, False, False, True, False, False],
                 na_position="last"
             )
+            return strict
         else:
-            # 1. Filter: Must be structurally Short
             dfside = dfside[dfside["Directional"] < 0]
-
-            # 2. ASIT BARAN PATI GAMMA HULK FILTER (SHORT)
-            # The current ROC must be explicitly crossing BELOW the 6-Month Historical Trough
-            if "ROC_14" in dfside.columns and "ROC_6M_Bottom" in dfside.columns:
-                dfside = dfside[dfside["ROC_14"] < dfside["ROC_6M_Bottom"]]
-
-            dfside = dfside.sort_values(
-                ["% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
-                ascending=[True, True, True, True, False],
+            strict = dfside[dfside["Gamma_Short_Breakdown"]].copy()
+            if strict.empty:
+                strict = dfside.copy()
+            strict = strict.sort_values(
+                ["Gamma_Short_Breakdown", "% Change", "Directional", "Turning", "CumsumPlus", "Stability"],
+                ascending=[False, True, True, True, True, False],
                 na_position="last"
             )
-        return dfside
+            return strict
 
     long_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
     short_df = prep_side_df(base, "short").drop_duplicates(subset=["Symbol"]).head(15)
-    cols = [c for c in EMAIL_DISPLAY_COLS if c in base.columns]
+    cols = [c for c in EMAILDISPLAY_COLS if c in base.columns]
     long_df = long_df[cols] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     short_df = short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     return long_df, short_df
@@ -1689,14 +1774,14 @@ def send_email_with_tables(
           <div style="max-width:1600px;margin:0 auto;">
             <h2 style="margin:0 0 12px 0;color:#facc15;">Intraday Vol Iteration Alert</h2>
             <div style="margin-bottom:18px;color:#cbd5e1;font-size:14px;">Scan completed at {scan_time}</div>
-            <h2>Current Long Candidates - Gamma Hulk Filtered</h2>
-            <p style="color:#4CAF50;"><i>Only stocks actively breaking ABOVE their 6-Month ROC Peak.</i></p>
+            <h2>Current Long Candidates</h2>
+            <p style="color:#4CAF50;"><i>Gamma Hulk breakouts are prioritized first; when none exist, the strongest directional long setups are shown.</i></p>
             {long_html}
             <div style="height:18px;"></div>
             {long_history_html}
             <div style="height:28px;"></div>
-            <h2>Current Short Candidates - Gamma Hulk Filtered</h2>
-            <p style="color:#f44336;"><i>Only stocks actively breaking BELOW their 6-Month ROC Trough.</i></p>
+            <h2>Current Short Candidates</h2>
+            <p style="color:#f44336;"><i>Gamma Hulk breakdowns are prioritized first; when none exist, the strongest directional short setups are shown.</i></p>
             {short_html}
             <div style="height:18px;"></div>
             {short_history_html}
