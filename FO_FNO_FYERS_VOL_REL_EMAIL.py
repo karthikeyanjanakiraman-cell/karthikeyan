@@ -1362,14 +1362,10 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         if dfside.empty:
             return dfside
         if side == "long":
-            dfside = dfside[dfside["Directional"] > 0].copy()
-            dfside["_gamma_rank"] = np.where(dfside["Gamma_Long_Confirmed"], 2, np.where(dfside["Gamma_Long_Breakout"], 1, 0))
-            dfside["_mtf_rank"] = np.where(dfside["MTF_ALIGN"].astype(str).eq("LONG"), 1, 0) if "MTF_ALIGN" in dfside.columns else 0
-            return dfside.sort_values(["_gamma_rank", "_mtf_rank", "Directional", "% Change"], ascending=[False, False, False, False], na_position="last").drop(columns=[c for c in ["_gamma_rank", "_mtf_rank"] if c in dfside.columns])
-        dfside = dfside[dfside["Directional"] < 0].copy()
-        dfside["_gamma_rank"] = np.where(dfside["Gamma_Short_Confirmed"], 2, np.where(dfside["Gamma_Short_Breakdown"], 1, 0))
-        dfside["_mtf_rank"] = np.where(dfside["MTF_ALIGN"].astype(str).eq("SHORT"), 1, 0) if "MTF_ALIGN" in dfside.columns else 0
-        return dfside.sort_values(["_gamma_rank", "_mtf_rank", "Directional", "% Change"], ascending=[False, False, True, True], na_position="last").drop(columns=[c for c in ["_gamma_rank", "_mtf_rank"] if c in dfside.columns])
+            dfside = dfside[(dfside["Directional"] > 0) & (dfside["Gamma_Long_Confirmed"]) & (dfside.get("MTF_ALIGN", "").astype(str).eq("LONG"))].copy()
+            return dfside.sort_values(["Directional", "% Change"], ascending=[False, False], na_position="last")
+        dfside = dfside[(dfside["Directional"] < 0) & (dfside["Gamma_Short_Confirmed"]) & (dfside.get("MTF_ALIGN", "").astype(str).eq("SHORT"))].copy()
+        return dfside.sort_values(["Directional", "% Change"], ascending=[True, True], na_position="last")
 
     longdf = prep_side_df(base, "long")
     shortdf = prep_side_df(base, "short")
