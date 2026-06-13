@@ -1348,89 +1348,37 @@ def format_value(col: str, val):
 def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df is None or df.empty:
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-
     base = df.copy()
-    numeric_cols = [
-        "Directional", "Turning", "Stability", "Balanced", "CumsumPlus",
-        "10 Day Relative Volume", "Last5mVolume", "ROC_14", "ROC_6M_Peak",
-        "ROC_6M_Bottom", "% Change"
-    ]
+    numeric_cols = ["Directional", "Turning", "Stability", "Balanced", "CumsumPlus", "10 Day Relative Volume", "Last5mVolume", "ROC_14", "ROC_6M_Peak", "ROC_6M_Bottom", "% Change"]
     for c in numeric_cols:
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
-
     if "10 Day Relative Volume" in base.columns:
-        base = base[base["10 Day Relative Volume"].fillna(0) >= 1.0]
+        base["10 Day Relative Volume"] = base["10 Day Relative Volume"].fillna(0).clip(lower=0)
     if "Last5mVolume" in base.columns:
-        base = base[base["Last5mVolume"].fillna(0) > 0]
-
-    def with_gamma_flags(dfside: pd.DataFrame) -> pd.DataFrame:
-        out = dfside.copy()
-
-        if "Gamma_Long_Breakout" not in out.columns:
-            out["Gamma_Long_Breakout"] = False
-        if "Gamma_Short_Breakdown" not in out.columns:
-            out["Gamma_Short_Breakdown"] = False
-        if "Gamma_Long_Confirmed" not in out.columns:
-            out["Gamma_Long_Confirmed"] = False
-        if "Gamma_Short_Confirmed" not in out.columns:
-            out["Gamma_Short_Confirmed"] = False
-
-        out["Gamma_Long_Breakout"] = out["Gamma_Long_Breakout"].fillna(False).astype(bool)
-        out["Gamma_Short_Breakdown"] = out["Gamma_Short_Breakdown"].fillna(False).astype(bool)
-        out["Gamma_Long_Confirmed"] = out["Gamma_Long_Confirmed"].fillna(False).astype(bool)
-        out["Gamma_Short_Confirmed"] = out["Gamma_Short_Confirmed"].fillna(False).astype(bool)
-
-        return out
-
-    base = with_gamma_flags(base)
+        base["Last5mVolume"] = base["Last5mVolume"].fillna(0).clip(lower=0)
 
     def prep_side_df(dfside: pd.DataFrame, side: str) -> pd.DataFrame:
         if dfside.empty:
             return dfside
-        dfside = dfside.copy()
-
         if side == "long":
-            # Filter 1: Must be structurally Long
             dfside = dfside[dfside["Directional"] > 0]
-
-            # The script originally restricted long candidates strictly to Gamma Breakouts.
-            # We filter down to ONLY stocks where either a confirmed Gamma Hulk exists OR a raw breakout is active.
-            dfside = dfside[dfside["Gamma_Long_Confirmed"] | dfside["Gamma_Long_Breakout"]]
-
+            dfside = dfside[dfside["Gamma_Long_Confirmed"]]
             if dfside.empty:
                 return dfside
+            return dfside.sort_values(["% Change", "Directional"], ascending=[False, False], na_position="last")
+        dfside = dfside[dfside["Directional"] < 0]
+        dfside = dfside[dfside["Gamma_Short_Confirmed"]]
+        if dfside.empty:
+            return dfside
+        return dfside.sort_values(["% Change", "Directional"], ascending=[True, True], na_position="last")
 
-            # Sort confirmed first, then breakouts, then by stats
-            return dfside.sort_values(
-                ["Gamma_Long_Confirmed", "Gamma_Long_Breakout", "% Change", "Directional"],
-                ascending=[False, False, False, False],
-                na_position="last",
-            )
-
-        else:
-            # Filter 1: Must be structurally Short
-            dfside = dfside[dfside["Directional"] < 0]
-
-            # Restrict strictly to Gamma Breakdowns
-            dfside = dfside[dfside["Gamma_Short_Confirmed"] | dfside["Gamma_Short_Breakdown"]]
-
-            if dfside.empty:
-                return dfside
-
-            # Sort confirmed first, then breakdowns, then by stats
-            return dfside.sort_values(
-                ["Gamma_Short_Confirmed", "Gamma_Short_Breakdown", "% Change", "Directional"],
-                ascending=[False, False, True, True],
-                na_position="last",
-            )
-    long_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
-    short_df = prep_side_df(base, "short").drop_duplicates(subset=["Symbol"]).head(15)
+    longdf = prep_side_df(base, "long")
+    shortdf = prep_side_df(base, "short")
     cols = [c for c in EMAIL_DISPLAY_COLS if c in base.columns]
-    long_df = long_df[cols] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-    short_df = short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
-    return long_df, short_df
-
+    longdf = longdf[cols].drop_duplicates(subset="Symbol").head(15) if not longdf.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    shortdf = shortdf[cols].drop_duplicates(subset="Symbol").head(15) if not shortdf.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    return longdf, shortdf
 
 def build_occurrence_table(
     detail_df: pd.DataFrame,
