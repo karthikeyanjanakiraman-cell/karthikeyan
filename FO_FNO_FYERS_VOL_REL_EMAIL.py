@@ -1363,15 +1363,21 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
             return dfside
         if side == "long":
             dfside = dfside[dfside["Directional"] > 0]
-            dfside = dfside[dfside["Gamma_Long_Confirmed"]]
-            if dfside.empty:
-                return dfside
-            return dfside.sort_values(["% Change", "Directional"], ascending=[False, False], na_position="last")
+            confirmed = dfside[dfside["Gamma_Long_Confirmed"]]
+            breakout = dfside[(~dfside["Gamma_Long_Confirmed"]) & (dfside["Gamma_Long_Breakout"])]
+            fallback = dfside[(~dfside["Gamma_Long_Confirmed"]) & (~dfside["Gamma_Long_Breakout"])]
+            confirmed = confirmed.sort_values(["% Change", "Directional"], ascending=[False, False], na_position="last")
+            breakout = breakout.sort_values(["% Change", "Directional"], ascending=[False, False], na_position="last")
+            fallback = fallback.sort_values(["% Change", "Directional"], ascending=[False, False], na_position="last")
+            return pd.concat([confirmed, breakout, fallback], ignore_index=True)
         dfside = dfside[dfside["Directional"] < 0]
-        dfside = dfside[dfside["Gamma_Short_Confirmed"]]
-        if dfside.empty:
-            return dfside
-        return dfside.sort_values(["% Change", "Directional"], ascending=[True, True], na_position="last")
+        confirmed = dfside[dfside["Gamma_Short_Confirmed"]]
+        breakout = dfside[(~dfside["Gamma_Short_Confirmed"]) & (dfside["Gamma_Short_Breakdown"])]
+        fallback = dfside[(~dfside["Gamma_Short_Confirmed"]) & (~dfside["Gamma_Short_Breakdown"])]
+        confirmed = confirmed.sort_values(["% Change", "Directional"], ascending=[True, True], na_position="last")
+        breakout = breakout.sort_values(["% Change", "Directional"], ascending=[True, True], na_position="last")
+        fallback = fallback.sort_values(["% Change", "Directional"], ascending=[True, True], na_position="last")
+        return pd.concat([confirmed, breakout, fallback], ignore_index=True)
 
     longdf = prep_side_df(base, "long")
     shortdf = prep_side_df(base, "short")
