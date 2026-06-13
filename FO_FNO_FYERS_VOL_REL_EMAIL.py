@@ -91,48 +91,6 @@ EMAIL_DISPLAY_COLS = [
 # ==============================================================================
 # NEW FUNCTION: ASIT BARAN PATI'S 6-MONTH ROC (GAMMA HULK) ENGINE
 # ==============================================================================
-def compute_frama(series: pd.Series, period: int = 16) -> pd.Series:
-    prices = pd.to_numeric(series, errors="coerce").astype(float)
-    n = int(max(period, 2))
-    if len(prices) == 0:
-        return pd.Series(dtype=float, index=series.index)
-    if n % 2 != 0:
-        n += 1
-    half = n // 2
-    frama = pd.Series(np.nan, index=prices.index, dtype=float)
-    first_valid_idx = prices.first_valid_index()
-    if first_valid_idx is None:
-        return frama
-    first_loc = prices.index.get_loc(first_valid_idx)
-    frama.iloc[first_loc] = float(prices.iloc[first_loc])
-    for i in range(first_loc + 1, len(prices)):
-        prev_frama = frama.iloc[i - 1]
-        price_i = prices.iloc[i]
-        if pd.isna(price_i):
-            frama.iloc[i] = prev_frama
-            continue
-        if i < n - 1:
-            frama.iloc[i] = price_i if pd.isna(prev_frama) else prev_frama + (price_i - prev_frama) * 0.5
-            continue
-        window = prices.iloc[i - n + 1:i + 1]
-        first_half = window.iloc[:half]
-        second_half = window.iloc[half:]
-        n1 = (first_half.max() - first_half.min()) / half if first_half.notna().any() else 0.0
-        n2 = (second_half.max() - second_half.min()) / half if second_half.notna().any() else 0.0
-        n3 = (window.max() - window.min()) / n if window.notna().any() else 0.0
-        if n1 > 0 and n2 > 0 and n3 > 0:
-            dim = (np.log(n1 + n2) - np.log(n3)) / np.log(2.0)
-            dim = float(np.clip(dim, 1.0, 2.0))
-            alpha = float(np.exp(-4.6 * (dim - 1.0)))
-        else:
-            alpha = 1.0
-        alpha = float(np.clip(alpha, 0.01, 1.0))
-        if pd.isna(prev_frama):
-            frama.iloc[i] = price_i
-        else:
-            frama.iloc[i] = alpha * price_i + (1.0 - alpha) * prev_frama
-    return frama
-
 def compute_gamma_hulk_roc(intra_df: pd.DataFrame) -> pd.DataFrame:
     """
     15-minute Gamma Hulk engine:
@@ -146,8 +104,6 @@ def compute_gamma_hulk_roc(intra_df: pd.DataFrame) -> pd.DataFrame:
     required_cols = {"timestamp", "high", "low", "close"}
     if df.empty or not required_cols.issubset(df.columns):
         df["ROC_14"] = np.nan
-        df["FRAMA"] = np.nan
-        df["Above_FRAMA"] = False
         df["ROC_6M_Peak"] = np.nan
         df["ROC_6M_Bottom"] = np.nan
         df["Gamma_Long_Breakout"] = False
@@ -161,9 +117,7 @@ def compute_gamma_hulk_roc(intra_df: pd.DataFrame) -> pd.DataFrame:
     for col in ["high", "low", "close"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
 
-    df["FRAMA"] = compute_frama(df["close"], period=16)
-    df["Above_FRAMA"] = df["close"] > df["FRAMA"]
-    df["ROC_14"] = ((df["close"] - df["close"].shift(14)) / df["close"].shift(14)) * 100.0
+    df["ROC_14"] = ((df["close"] - df["close"].shift(1)) / df["close"].shift(1)) * 100.0
 
     timestamps = pd.to_datetime(df["timestamp"], errors="coerce")
     inferred_minutes = 15.0
@@ -192,7 +146,6 @@ def compute_gamma_hulk_roc(intra_df: pd.DataFrame) -> pd.DataFrame:
     df["Gamma_Short_Confirmed"] = short_trigger_low.notna() & (df["close"] < short_trigger_low)
 
     return df
-
 # ==============================================================================
 # ==============================================================================
 
@@ -1438,37 +1391,58 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         dfside = dfside.copy()
 
         if side == "long":
-            # Filter 1: Must be structurally Long
             dfside = dfside[dfside["Directional"] > 0]
-
-            # The script originally restricted long candidates strictly to Gamma Breakouts.
-            # We filter down to ONLY stocks where either a confirmed Gamma Hulk exists OR a raw breakout is active.
-            dfside = dfside[dfside["Gamma_Long_Confirmed"] | dfside["Gamma_Long_Breakout"]]
-
+            if "Above_FRAMA" in dfside.columns:
+                dfside = dfside[dfside["Above_FRAMA"].fillna(False)]
             if dfside.empty:
                 return dfside
 
-            # Sort confirmed first, then breakouts, then by stats
+            confirmed = dfside[dfside["Gamma_Long_Confirmed"]]
+            if not confirmed.empty:
+                return confirmed.sort_values(
+                    ["% Change", "Directional"],
+                    ascending=[False, False],
+                    na_position="last",
+                )
+
+            breakout = dfside[dfside["Gamma_Long_Breakout"]]
+            if not breakout.empty:
+                return breakout.sort_values(
+                    ["% Change", "Directional"],
+                    ascending=[False, False],
+                    na_position="last",
+                )
+
             return dfside.sort_values(
-                ["Gamma_Long_Confirmed", "Gamma_Long_Breakout", "% Change", "Directional"],
-                ascending=[False, False, False, False],
+                ["Directional", "% Change"],
+                ascending=[False, False],
                 na_position="last",
             )
 
         else:
-            # Filter 1: Must be structurally Short
             dfside = dfside[dfside["Directional"] < 0]
-
-            # Restrict strictly to Gamma Breakdowns
-            dfside = dfside[dfside["Gamma_Short_Confirmed"] | dfside["Gamma_Short_Breakdown"]]
-
             if dfside.empty:
                 return dfside
 
-            # Sort confirmed first, then breakdowns, then by stats
+            confirmed = dfside[dfside["Gamma_Short_Confirmed"]]
+            if not confirmed.empty:
+                return confirmed.sort_values(
+                    ["% Change", "Directional"],
+                    ascending=[True, True],
+                    na_position="last",
+                )
+
+            breakdown = dfside[dfside["Gamma_Short_Breakdown"]]
+            if not breakdown.empty:
+                return breakdown.sort_values(
+                    ["% Change", "Directional"],
+                    ascending=[True, True],
+                    na_position="last",
+                )
+
             return dfside.sort_values(
-                ["Gamma_Short_Confirmed", "Gamma_Short_Breakdown", "% Change", "Directional"],
-                ascending=[False, False, True, True],
+                ["Directional", "% Change"],
+                ascending=[True, True],
                 na_position="last",
             )
     long_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
