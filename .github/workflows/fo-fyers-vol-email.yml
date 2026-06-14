@@ -1,20 +1,13 @@
 name: FO-Vol-Rel-Email
 
 on:
-  schedule:
-    # Every 15 minutes, 03:00–10:59 UTC (≈ 08:30–16:29 IST), Monday–Friday
-    - cron: "*/15 3-10 * * 1-5"
-
-jobs:
-  run-script:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      # ... rest of your existing steps
-
-
   workflow_dispatch: {}
-  
+  schedule:
+    # Primary: every 15 min, offset by 7 min to avoid peak load
+    # Runs at 03:07, 03:22, 03:37... 10:52 UTC = ~08:37–16:22 IST, Mon–Fri
+    - cron: "7/15 3-10 * * 1-5"
+    # Backup: single fixed run at 03:47 UTC = 09:17 IST, Mon–Fri
+    - cron: "47 3 * * 1-5"
 
 permissions:
   contents: write
