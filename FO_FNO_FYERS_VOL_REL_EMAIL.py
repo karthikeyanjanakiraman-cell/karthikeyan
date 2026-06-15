@@ -2091,24 +2091,23 @@ def main():
         logger.error(f"First email failed: {e}")
         sent = False
 
-    try:
-        sent_second = send_second_email_with_exceedance_tables(
-            recent_10_df=recent_10_exceed_df,
-            all_time_df=all_time_exceed_df,
-            csv_filename=summary_csv,
-            detail_csv_filename=detail_csv,
-        )
-    except Exception as e:
-        logger.error(f"Second email failed: {e}")
-        sent_second = False
+    # try:
+    #    sent_second = send_second_email_with_exceedance_tables(
+    #        recent_10_df=recent_10_exceed_df,
+    #        all_time_df=all_time_exceed_df,
+    #        csv_filename=summary_csv,
+    #        detail_csv_filename=detail_csv,
+    #    )
+    # except Exception as e:
+    #    logger.error(f"Second email failed: {e}")
+    #    sent_second = False
 
-    if sent and sent_second:
-        logger.info("Scan and both emails completed.")
-    elif sent:
-        logger.warning("Scan completed, first email sent, second email failed.")
-    else:
-        logger.warning("Scan completed but email failed.")
-
+    # if sent and sent_second:
+    #    logger.info("Scan and both emails completed.")
+    # elif sent:
+    #    logger.warning("Scan completed, first email sent, second email failed.")
+    # else:
+    #    logger.warning("Scan completed but email failed.")
 
 if __name__ == "__main__":
     main()
