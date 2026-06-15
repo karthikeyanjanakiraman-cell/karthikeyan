@@ -1344,7 +1344,6 @@ def format_value(col: str, val):
         return f"{float(val):.4f}"
     return str(val)
 
-
 def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df is None or df.empty:
         return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
@@ -1359,7 +1358,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
 
-    # Fill NaNs in columns required for percentile ranking
+    # Fill NaNs in the exact 4 columns required for percentile ranking
     cols_to_fill = ['ROC_14', 'Directional', '10 Day Relative Volume', 'CumsumPlus']
     for c in cols_to_fill:
         if c in base.columns:
@@ -1386,16 +1385,13 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
             if out.empty:
                 return out
 
-            # Cross-Sectional Percentile Rank for Longs (Higher is better)
+            # 4-Factor Cross-Sectional Percentile Rank for Longs (Higher is better)
             out['Rank_ROC'] = out['ROC_14'].rank(pct=True)
             out['Rank_Dir'] = out['Directional'].rank(pct=True)
             out['Rank_Cumsum'] = out['CumsumPlus'].rank(pct=True)
             out['Rank_Vol'] = out['10 Day Relative Volume'].rank(pct=True)
 
-            # Average percentile score (Dynamic Power Score)
             out['Dynamic_Power_Score'] = (out['Rank_ROC'] + out['Rank_Dir'] + out['Rank_Cumsum'] + out['Rank_Vol']) / 4 * 100
-
-            # Sort strictly by Dynamic Power Score descending
             return out.sort_values('Dynamic_Power_Score', ascending=False)
 
         else:
@@ -1403,17 +1399,13 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
             if out.empty:
                 return out
 
-            # Cross-Sectional Percentile Rank for Shorts 
-            # Lower is better for momentum/trend variables, but Volume is still higher=better
+            # 4-Factor Cross-Sectional Percentile Rank for Shorts 
             out['Rank_ROC'] = out['ROC_14'].rank(pct=True, ascending=False)
             out['Rank_Dir'] = out['Directional'].rank(pct=True, ascending=False)
             out['Rank_Cumsum'] = out['CumsumPlus'].rank(pct=True, ascending=False)
             out['Rank_Vol'] = out['10 Day Relative Volume'].rank(pct=True) 
 
-            # Average percentile score (Dynamic Power Score)
             out['Dynamic_Power_Score'] = (out['Rank_ROC'] + out['Rank_Dir'] + out['Rank_Cumsum'] + out['Rank_Vol']) / 4 * 100
-
-            # Sort strictly by Dynamic Power Score descending
             return out.sort_values('Dynamic_Power_Score', ascending=False)
 
     long_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
@@ -1424,6 +1416,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     short_df = short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     
     return long_df, short_df
+
 
 
 def build_occurrence_table(
