@@ -3,8 +3,10 @@
 FO_FNO_FYERS_VOL_REL_EMAIL.py
 
 Optimized Intraday F&O scanner via Fyers API with email alerts.
-- FIXED: Breakout flags trigger ANYTIME the price is outside the flat 6-month horizontal
-  price lines during the whole day, while keeping the anchor ceiling locked to the first breach.
+- FIXED: Added explicit TurningDiff calculation to resolve the KeyError crash.
+- FIXED: Target breakout/breakdown prices are anchored to Yesterday's Close to 
+  form perfectly flat, unmoving horizontal execution thresholds.
+- FIXED: Breakout tracking evaluates price action ANYTIME during the whole day.
 - Fixed 15-minute Gamma Hulk anchor level decay using forward-fill.
 - Realigned multi-timeframe engine for native 15-minute bars.
 - Prioritized Gamma Hulk confirmations at the top of candidate sorting.
@@ -93,8 +95,7 @@ def compute_gamma_hulk_roc(intra_df: pd.DataFrame, prev_close: Optional[float] =
     15-minute Gamma Hulk engine:
     - Extracts a TRUE static horizontal 6-month boundary line from past data.
     - Anchors price targets to Yesterday's Close to maintain flat daily lines.
-    - FIX: Evaluates breakouts/breakdowns based on the absolute price crossing 
-      the flat lines ANYTIME during the whole day.
+    - Evaluates breakouts/breakdowns based on the price crossing flat thresholds ANYTIME.
     """
     df = intra_df.copy().sort_values("timestamp").reset_index(drop=True)
 
@@ -144,7 +145,6 @@ def compute_gamma_hulk_roc(intra_df: pd.DataFrame, prev_close: Optional[float] =
         df["ROC_6M_Peak_Price"] = df["close"].shift(1) * (1 + df["ROC_6M_Peak"] / 100.0)
         df["ROC_6M_Bottom_Price"] = df["close"].shift(1) * (1 + df["ROC_6M_Bottom"] / 100.0)
 
-    # FIX: Catch the first initial breach candle to anchor the trailing ceilings safely
     prev_close_price = df["close"].shift(1)
     is_long_breach = (df["close"] > df["ROC_6M_Peak_Price"]) & (prev_close_price.fillna(df["close"]) <= df["ROC_6M_Peak_Price"])
     is_short_breach = (df["close"] < df["ROC_6M_Bottom_Price"]) & (prev_close_price.fillna(df["close"]) >= df["ROC_6M_Bottom_Price"])
@@ -160,7 +160,6 @@ def compute_gamma_hulk_roc(intra_df: pd.DataFrame, prev_close: Optional[float] =
     df["Gamma_Long_Confirmed"] = long_trigger_high.notna() & (df["close"] > long_trigger_high)
     df["Gamma_Short_Confirmed"] = short_trigger_low.notna() & (df["close"] < short_trigger_low)
 
-    # FIX: Active anytime the live price parameters are trading outside the flat daily lines
     df["Gamma_Long_Breakout"] = df["close"] > df["ROC_6M_Peak_Price"]
     df["Gamma_Short_Breakdown"] = df["close"] < df["ROC_6M_Bottom_Price"]
 
@@ -259,7 +258,11 @@ def add_dual_engine_matrix(detail_df: pd.DataFrame, eps: float = 1e-4) -> pd.Dat
     out["Current_Step"] = grouped["CumsumPlus"].diff().fillna(0.0)
     out["Prior_Step"] = grouped["Current_Step"].shift(1).fillna(0.0)
     out["CumsumDiff"] = out["Current_Step"]
+    
     out["Prior_Turning"] = grouped["Turning"].shift(1).fillna(0.0)
+    # FIX: Calculated TurningDiff to safely eliminate the index KeyError
+    out["TurningDiff"] = out["Turning"] - out["Prior_Turning"]
+    
     out["Friction_Expanding"] = (out["Turning"] > out["Prior_Turning"]) & (out["Turning"] > eps)
 
     cond_pristine = (out["Current_Step"] > eps) & (out["Prior_Step"] <= eps) & (~out["Friction_Expanding"])
