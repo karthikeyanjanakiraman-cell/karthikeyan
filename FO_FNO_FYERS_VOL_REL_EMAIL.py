@@ -140,56 +140,17 @@ def compute_gamma_hulk_roc(intra_df: pd.DataFrame) -> pd.DataFrame:
     df["Gamma_Breakout_High"] = np.where(df["Gamma_Long_Breakout"], df["high"], np.nan)
     df["Gamma_Breakout_Low"] = np.where(df["Gamma_Short_Breakdown"], df["low"], np.nan)
 
+    # CRITICAL FIX: Forward-fill the anchor price barrier so it doesn't decay to NaN on subsequent rows
+    df["Gamma_Breakout_High"] = df["Gamma_Breakout_High"].ffill()
+    df["Gamma_Breakout_Low"] = df["Gamma_Breakout_Low"].ffill()
+
     long_trigger_high = df["Gamma_Breakout_High"].shift(1)
     short_trigger_low = df["Gamma_Breakout_Low"].shift(1)
+    
     df["Gamma_Long_Confirmed"] = long_trigger_high.notna() & (df["close"] > long_trigger_high)
     df["Gamma_Short_Confirmed"] = short_trigger_low.notna() & (df["close"] < short_trigger_low)
 
     return df
-# ==============================================================================
-# ==============================================================================
-
-
-def build_signals_from_raw_directional(detail_df) -> dict:
-    nan = float("nan")
-    out = {
-        k: nan for k in (
-            "5m_Signal",
-            "15m_Signal",
-            "30m_Signal",
-            "60m_Signal",
-            "Bull_Signal",
-            "Bear_Signal",
-            "Overall_Signal",
-        )
-    }
-    if detail_df is None or detail_df.empty:
-        return out
-
-    df = detail_df.copy()
-    if "Iteration No" in df.columns:
-        df = df.sort_values("Iteration No")
-
-    vals = pd.to_numeric(df["Directional"], errors="coerce").dropna().to_numpy(dtype=float)
-    if vals.size == 0:
-        return out
-
-    last = vals.size - 1
-
-    def raw_at(offset: int) -> float:
-        i = last - offset
-        if i < 0:
-            i = 0
-        return float(vals[i])
-
-    out["5m_Signal"] = round(raw_at(0), 4)
-    out["15m_Signal"] = round(raw_at(3) if last >= 3 else raw_at(0), 4)
-    out["30m_Signal"] = round(raw_at(6) if last >= 6 else raw_at(0), 4)
-    out["60m_Signal"] = round(raw_at(12) if last >= 12 else raw_at(0), 4)
-    out["Bull_Signal"] = round(float(vals[vals > 0].max()) if (vals > 0).any() else 0.0, 4)
-    out["Bear_Signal"] = round(abs(float(vals[vals < 0].min())) if (vals < 0).any() else 0.0, 4)
-    out["Overall_Signal"] = round(raw_at(0), 4)
-    return out
 
 
 def classify_mtf_from_window(win, eps: float = 1e-9) -> float:
@@ -1378,14 +1339,31 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
             out = out[out["Directional"] > 0].copy()
             if out.empty:
                 return out
-            # STRICT SORT: MTF_SCORE (4.0 is best) first, then ROC_14 (Speed) second.
-            return out.sort_values(['MTF_SCORE', 'ROC_14'], ascending=[False, False], na_position='last')
+                
+            # Convert booleans to integers so True (1) explicitly sorts above False (0)
+            out["Gamma_Long_Confirmed"] = out["Gamma_Long_Confirmed"].astype(int)
+            out["Gamma_Long_Breakout"] = out["Gamma_Long_Breakout"].astype(int)
+            
+            # CRITICAL FIX: Sort by Gamma Confirmation first, Breakout second, MTF third, ROC fourth
+            return out.sort_values(
+                ['Gamma_Long_Confirmed', 'Gamma_Long_Breakout', 'MTF_SCORE', 'ROC_14'], 
+                ascending=[False, False, False, False], 
+                na_position='last'
+            )
         else:
             out = out[out["Directional"] < 0].copy()
             if out.empty:
                 return out
-            # STRICT SORT: MTF_SCORE (-4.0 is best) first, then ROC_14 (Most negative is best) second.
-            return out.sort_values(['MTF_SCORE', 'ROC_14'], ascending=[True, True], na_position='last')
+                
+            out["Gamma_Short_Confirmed"] = out["Gamma_Short_Confirmed"].astype(int)
+            out["Gamma_Short_Breakdown"] = out["Gamma_Short_Breakdown"].astype(int)
+            
+            # CRITICAL FIX: Sort for Short Side (True/1 at top, then lowest/most negative MTF & ROC)
+            return out.sort_values(
+                ['Gamma_Short_Confirmed', 'Gamma_Short_Breakdown', 'MTF_SCORE', 'ROC_14'], 
+                ascending=[False, False, True, True], 
+                na_position='last'
+            )
 
     long_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
     short_df = prep_side_df(base, "short").drop_duplicates(subset=["Symbol"]).head(15)
@@ -1985,14 +1963,112 @@ def send_second_email_with_exceedance_tables(recent_10_df: pd.DataFrame, all_tim
         logger.error(f"SECOND EMAIL Error: {e}")
         return False
 
-
 def main():
     init_fyers()
     if not fyers:
         logger.error("Fyers not initialized. Exiting.")
         return
 
-    summary_df, detail_df = scan_fno_universe()
+    symbols = load_fno_symbols_from_sectors("sectors")
+    if not symbols:
+        logger.error("CORE No F&O symbols found.")
+        return
+
+    rows, iteration_rows = [], []
+    total = len(symbols)
+
+    for idx, sym in enumerate(symbols, start=1):
+        logger.info(f"CORE [{idx}/{total}] Processing {sym}")
+        fyers_sym = format_fyers_symbol(sym)
+
+        daily_df = get_fyers_history(
+            fyers_sym,
+            resolution="D",
+            days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS)
+        )
+        
+        # CRITICAL FIX: Change resolution from "5" to "15" to sync with the Gamma Hulk engine architecture
+        intra_df = get_fyers_history(
+            fyers_sym,
+            resolution="15", 
+            days_back=INTRADAY_LOOKBACK_DAYS
+        )
+
+        prev_close = float(daily_df["close"].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2) else None
+        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df, prev_close)
+        iv_info = compute_iv_proxies(daily_df)
+
+        ltp = iter_summary.get("LTP")
+        pct_change = ((ltp - prev_close) / prev_close * 100) if (ltp is not None and prev_close and prev_close != 0) else 0.0
+
+        if not iter_detail.empty:
+            iter_detail.insert(0, "Symbol", sym)
+            iter_detail.insert(1, "% Change", pct_change)
+            iteration_rows.append(iter_detail)
+
+        rows.append({
+            "Symbol": sym,
+            "LTP": ltp,
+            "% Change": pct_change,
+            "Directional": iter_summary.get("Directional"),
+            "Turning": iter_summary.get("Turning"),
+            "Stability": iter_summary.get("Stability"),
+            "Balanced": iter_summary.get("Balanced"),
+            "CumsumPlus": iter_summary.get("CumsumPlus"),
+            "ROC_14": iter_summary.get("ROC_14"),                 
+            "ROC_6M_Peak": iter_summary.get("ROC_6M_Peak"),       
+            "ROC_6M_Bottom": iter_summary.get("ROC_6M_Bottom"),   
+            "Gamma_Long_Breakout": iter_summary.get("Gamma_Long_Breakout", False),
+            "Gamma_Short_Breakdown": iter_summary.get("Gamma_Short_Breakdown", False),
+            "Gamma_Long_Confirmed": iter_summary.get("Gamma_Long_Confirmed", False),
+            "Gamma_Short_Confirmed": iter_summary.get("Gamma_Short_Confirmed", False),
+            "Gamma_Breakout_High": iter_summary.get("Gamma_Breakout_High"),
+            "Gamma_Breakout_Low": iter_summary.get("Gamma_Breakout_Low"),
+            "ARIMA Signal": iter_summary.get("ARIMA Signal"),
+            "Kalman Signal": iter_summary.get("Kalman Signal"),
+            "5m_Signal": iter_summary.get("5m_Signal"),
+            "15m_Signal": iter_summary.get("15m_Signal"),
+            "30m_Signal": iter_summary.get("30m_Signal"),
+            "60m_Signal": iter_summary.get("60m_Signal"),
+            "MTF_5m": iter_summary.get("MTF_5m"),
+            "MTF_15m": iter_summary.get("MTF_15m"),
+            "MTF_30m": iter_summary.get("MTF_30m"),
+            "MTF_60m": iter_summary.get("MTF_60m"),
+            "MTF_SCORE": iter_summary.get("MTF_SCORE"),
+            "MTF_ALIGN": iter_summary.get("MTF_ALIGN"),
+            "Bull_Signal": iter_summary.get("Bull_Signal"),
+            "Bear_Signal": iter_summary.get("Bear_Signal"),
+            "Overall_Signal": iter_summary.get("Overall_Signal"),
+            "Current Volume": iter_summary.get("Current Volume"),
+            "10 Day Relative Volume": iter_summary.get("10 Day Relative Volume"),
+            "20 Day Relative Volume": iter_summary.get("20 Day Relative Volume"),
+            "Cumulative RSI": iter_summary.get("Cumulative RSI"),
+            "Cumulative OBV": iter_summary.get("Cumulative OBV"),
+            "Cumulative VWAP": iter_summary.get("Cumulative VWAP"),
+            "VWAP Z-Score": iter_summary.get("VWAP Z-Score"),
+            "Total Iterations": iter_summary.get("Total Iterations"),
+            "Last Iteration Minutes": iter_summary.get("Last Iteration Minutes"),
+            "Last Iteration Time": iter_summary.get("Last Iteration Time"),
+            "Cumulative KER": iter_summary.get("Cumulative KER"),
+            "Cumulative DI": iter_summary.get("Cumulative DI"),
+            "Cumulative -DI": iter_summary.get("Cumulative -DI"),
+            "Cumulative ADX": iter_summary.get("Cumulative ADX"),
+            "Survival Score": iter_summary.get("Survival Score"),
+            "SurvivalNum": iter_summary.get("SurvivalNum"),
+            "HOD": iter_summary.get("HOD"),
+            "StrikeDistance": iter_summary.get("StrikeDistance"),
+            "Last5mVolume": iter_summary.get("Last5mVolume"),
+            "Volume1hAvg5m": iter_summary.get("Volume1hAvg5m"),
+            "OBV30mDelta": iter_summary.get("OBV30mDelta"),
+            "RSI30mDelta": iter_summary.get("RSI30mDelta"),
+            "Price_Lead_Status": iter_summary.get("Price_Lead_Status", "NORMAL"),
+            "IVP": iv_info.get("IVP"),
+            "Volatility State": iv_info.get("Volatility State"),
+        })
+
+    summary_df = pd.DataFrame(rows)
+    detail_df = pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame()
+
     detail_df = add_dual_engine_matrix(detail_df)
     summary_df = merge_dual_engine_latest(summary_df, detail_df)
     summary_df = add_signal_columns(summary_df)
@@ -2018,12 +2094,6 @@ def main():
         history_df = pd.DataFrame()
 
     try:
-        recent_10_exceed_df, all_time_exceed_df = build_exceedance_tables(detail_df)
-    except Exception as e:
-        logger.error(f"Exceedance build failed: {e}")
-        recent_10_exceed_df, all_time_exceed_df = pd.DataFrame(), pd.DataFrame()
-
-    try:
         sent = send_email_with_tables(
             long_df=long_df,
             short_df=short_df,
@@ -2035,23 +2105,7 @@ def main():
         logger.error(f"First email failed: {e}")
         sent = False
 
-    # try:
-    #    sent_second = send_second_email_with_exceedance_tables(
-    #        recent_10_df=recent_10_exceed_df,
-    #        all_time_df=all_time_exceed_df,
-    #        csv_filename=summary_csv,
-    #        detail_csv_filename=detail_csv,
-    #    )
-    # except Exception as e:
-    #    logger.error(f"Second email failed: {e}")
-    #    sent_second = False
 
-    # if sent and sent_second:
-    #    logger.info("Scan and both emails completed.")
-    # elif sent:
-    #    logger.warning("Scan completed, first email sent, second email failed.")
-    # else:
-    #    logger.warning("Scan completed but email failed.")
 
 if __name__ == "__main__":
     main()
