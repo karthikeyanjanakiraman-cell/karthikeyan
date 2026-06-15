@@ -1101,11 +1101,26 @@ def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
 
 
 def build_history_table(history_df: pd.DataFrame, side: str) -> str:
-    if history_df is None or history_df.empty: return "No history yet."
+    if history_df is None or history_df.empty: 
+        return "No history yet."
     df = history_df[history_df["Side"].astype(str).str.lower() == side.lower()].copy()
-    if df.empty: return "No history yet."
+    if df.empty: 
+        return "No history yet."
 
-    cols = ["First Occurrence", "Latest", "Symbol", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus", "Kalman Signal", "Last Iteration Time"]
+    # FIX: Use 'Iteration Time' instead of 'Last Iteration Time', and remove 'Kalman Signal'
+    cols = [
+        "First Occurrence", 
+        "Latest", 
+        "Symbol", 
+        "LTP", 
+        "% Change", 
+        "Directional", 
+        "Turning", 
+        "Stability", 
+        "Balanced", 
+        "CumsumPlus", 
+        "Iteration Time"
+    ]
     df = df.tail(15)[cols].copy()
 
     header = "".join(f'<th style="padding:8px;border:1px solid #4b5563;background:#111827;color:#f9fafb;">{c}</th>' for c in cols)
