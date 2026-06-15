@@ -53,7 +53,7 @@ logger.addHandler(ch)
 warnings.filterwarnings("ignore")
 
 DAILY_LOOKBACK_DAYS = 60
-INTRADAY_LOOKBACK_DAYS = 100
+INTRADAY_LOOKBACK_DAYS = 135
 IVP_LOOKBACK_DAYS = 60
 INDEX_SOFT_BOOST_WEIGHT = 0.0
 HISTORY_API_MAX_SPAN_DAYS = 99
@@ -84,14 +84,12 @@ EMAIL_DISPLAY_COLS = [
     "Last Iteration Time",
 ]
 
-
 def compute_gamma_hulk_roc(intra_df: pd.DataFrame) -> pd.DataFrame:
     """
     15-minute Gamma Hulk engine:
-    - Computes current 15-minute ROC on close
-    - Computes 6-month historical ROC peak/trough
-    - Detects the breakout candle (ROC crossing 6M boundary)
-    - Requires subsequent candles to close beyond breakout candle high/low
+    - Extracts a TRUE static horizontal 6-month boundary line from past data.
+    - Prevents the breakout candle from shifting the benchmark staircase upward.
+    - Tracks confirmation when subsequent candles cross the fixed anchor high/low.
     """
     df = intra_df.copy().sort_values("timestamp").reset_index(drop=True)
 
@@ -111,40 +109,58 @@ def compute_gamma_hulk_roc(intra_df: pd.DataFrame) -> pd.DataFrame:
     for col in ["high", "low", "close"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
 
+    # 1. Compute the raw 15-minute Rate of Change
     df["ROC_14"] = ((df["close"] - df["close"].shift(1)) / df["close"].shift(1)) * 100.0
 
-    timestamps = pd.to_datetime(df["timestamp"], errors="coerce")
-    inferred_minutes = 15.0
-    if timestamps.notna().sum() >= 3:
-        deltas = timestamps.diff().dropna().dt.total_seconds().div(60.0)
-        deltas = deltas[(deltas > 0) & (deltas <= 240)]
-        if not deltas.empty:
-            inferred_minutes = float(deltas.mode().iloc[0])
+    # Extract clean date markers to separate historical envelopes from today's live tape
+    df["_date_only"] = pd.to_datetime(df["timestamp"]).dt.date
+    unique_dates = sorted(df["_date_only"].dropna().unique())
+    
+    if len(unique_dates) >= 2:
+        current_date = unique_dates[-1]
+        # Isolate all data bars from previous days (the pure 6-month historical window)
+        historical_data = df[df["_date_only"] < current_date]
+        
+        if not historical_data.empty and historical_data["ROC_14"].notna().sum() > 2:
+            # FIX: Extract single absolute scalars representing the true static boundaries
+            static_peak = float(historical_data["ROC_14"].max())
+            static_bottom = float(historical_data["ROC_14"].min())
+        else:
+            static_peak = float(df["ROC_14"].rolling(500, min_periods=2).max().shift(1).iloc[-1])
+            static_bottom = float(df["ROC_14"].rolling(500, min_periods=2).min().shift(1).iloc[-1])
+    else:
+        static_peak = float(df["ROC_14"].max())
+        static_bottom = float(df["ROC_14"].min())
 
-    bars_per_day = max(int(round(375.0 / inferred_minutes)), 1)
-    lookback_bars = max(2, 125 * bars_per_day)
+    # 2. Broadcast the boundaries as perfectly straight, flat horizontal lines across today's session
+    df["ROC_6M_Peak"] = static_peak
+    df["ROC_6M_Bottom"] = static_bottom
 
-    df["ROC_6M_Peak"] = df["ROC_14"].shift(1).rolling(window=lookback_bars, min_periods=2).max()
-    df["ROC_6M_Bottom"] = df["ROC_14"].shift(1).rolling(window=lookback_bars, min_periods=2).min()
-
+    # 3. Detect the breakout candle (crosses the locked horizontal threshold)
     prev_roc = df["ROC_14"].shift(1)
-    df["Gamma_Long_Breakout"] = df["ROC_14"].notna() & df["ROC_6M_Peak"].notna() & prev_roc.notna() & (prev_roc <= df["ROC_6M_Peak"]) & (df["ROC_14"] > df["ROC_6M_Peak"])
-    df["Gamma_Short_Breakdown"] = df["ROC_14"].notna() & df["ROC_6M_Bottom"].notna() & prev_roc.notna() & (prev_roc >= df["ROC_6M_Bottom"]) & (df["ROC_14"] < df["ROC_6M_Bottom"])
+    df["Gamma_Long_Breakout"] = df["ROC_14"].notna() & (prev_roc <= df["ROC_6M_Peak"]) & (df["ROC_14"] > df["ROC_6M_Peak"])
+    df["Gamma_Short_Breakdown"] = df["ROC_14"].notna() & (prev_roc >= df["ROC_6M_Bottom"]) & (df["ROC_14"] < df["ROC_6M_Bottom"])
 
+    # 4. Set the price targets based on the breakout candle's extreme points
     df["Gamma_Breakout_High"] = np.where(df["Gamma_Long_Breakout"], df["high"], np.nan)
     df["Gamma_Breakout_Low"] = np.where(df["Gamma_Short_Breakdown"], df["low"], np.nan)
 
-    # FIX: Forward-fill anchor ceilings so levels don't turn into NaN on subsequent candles
+    # Forward-fill the price anchors so they remain locked for confirmation checks
     df["Gamma_Breakout_High"] = df["Gamma_Breakout_High"].ffill()
     df["Gamma_Breakout_Low"] = df["Gamma_Breakout_Low"].ffill()
 
     long_trigger_high = df["Gamma_Breakout_High"].shift(1)
     short_trigger_low = df["Gamma_Breakout_Low"].shift(1)
+    
+    # 5. Confirm trade if a subsequent candle closes outside the breakout high/low barrier
     df["Gamma_Long_Confirmed"] = long_trigger_high.notna() & (df["close"] > long_trigger_high)
     df["Gamma_Short_Confirmed"] = short_trigger_low.notna() & (df["close"] < short_trigger_low)
 
+    df.drop(columns=["_date_only"], inplace=True)
     return df
 
+
+    
 
 def build_signals_from_raw_directional(detail_df) -> dict:
     nan = float("nan")
