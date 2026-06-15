@@ -1196,9 +1196,9 @@ def main():
         return
 
     summary_df, detail_df = scan_fno_universe()
-    if summary_df.empty:0
-         logger.warning("No summary data produced.")
-         return
+    if summary_df.empty:
+        logger.warning("No summary data produced.")
+        return
 
     detail_df = add_dual_engine_matrix(detail_df)
     summary_df = merge_dual_engine_latest(summary_df, detail_df)
@@ -1218,6 +1218,9 @@ def main():
         detail_csv_filename=detail_csv
     )
 
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()
