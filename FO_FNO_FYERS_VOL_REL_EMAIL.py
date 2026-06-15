@@ -242,16 +242,17 @@ def build_mtf_alignment(detail_df: pd.DataFrame) -> Dict[str, object]:
             return float("nan")
         return classify_mtf_from_window(s.tail(bars))
 
-    mtf_5 = classify_from_tail(series, 3)
-    mtf_15 = classify_from_tail(series.iloc[2::3].reset_index(drop=True), 3)
-    mtf_30 = classify_from_tail(series.iloc[5::6].reset_index(drop=True), 3)
-    mtf_60 = classify_from_tail(series.iloc[11::12].reset_index(drop=True), 3)
+    # Realignment matching a 15-minute base resolution data input stream
+    mtf_5 = float("nan")                                                       # 5m is unavailable inside a 15m bar
+    mtf_15 = classify_from_tail(series, 3)                                     # Base bar is already 15-minutes
+    mtf_30 = classify_from_tail(series.iloc[1::2].reset_index(drop=True), 3)   # Every 2nd bar = 30 minutes
+    mtf_60 = classify_from_tail(series.iloc[3::4].reset_index(drop=True), 3)   # Every 4th bar = 60 minutes
 
-    available = [v for v in [mtf_5, mtf_15, mtf_30, mtf_60] if pd.notna(v)]
+    available = [v for v in [mtf_15, mtf_30, mtf_60] if pd.notna(v)]
     if not available:
         return out
 
-    score = float(np.nansum([mtf_5, mtf_15, mtf_30, mtf_60]))
+    score = float(np.nansum([mtf_15, mtf_30, mtf_60]))
     align = "MIXED"
     if all(v == 1.0 for v in available):
         align = "LONG"
@@ -269,6 +270,7 @@ def build_mtf_alignment(detail_df: pd.DataFrame) -> Dict[str, object]:
         "MTF_ALIGN": align,
     })
     return out
+
 
 
 def classify_diff_status(cumsum_diff: float, turning_diff: float, prior_cumsum: float = 0.0, eps: float = 1e-4) -> str:
