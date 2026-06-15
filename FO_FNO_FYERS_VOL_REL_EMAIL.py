@@ -1359,28 +1359,18 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
 
-    if "10 Day Relative Volume" in base.columns:
-        base = base[base["10 Day Relative Volume"].fillna(0) >= 1.0]
-    if "Last5mVolume" in base.columns:
-        base = base[base["Last5mVolume"].fillna(0) > 0]
+    # Fill NaNs in columns required for percentile ranking
+    cols_to_fill = ['ROC_14', 'Directional', '10 Day Relative Volume', 'CumsumPlus']
+    for c in cols_to_fill:
+        if c in base.columns:
+            base[c] = base[c].fillna(0)
 
     def with_gamma_flags(dfside: pd.DataFrame) -> pd.DataFrame:
         out = dfside.copy()
-
-        if "Gamma_Long_Breakout" not in out.columns:
-            out["Gamma_Long_Breakout"] = False
-        if "Gamma_Short_Breakdown" not in out.columns:
-            out["Gamma_Short_Breakdown"] = False
-        if "Gamma_Long_Confirmed" not in out.columns:
-            out["Gamma_Long_Confirmed"] = False
-        if "Gamma_Short_Confirmed" not in out.columns:
-            out["Gamma_Short_Confirmed"] = False
-
-        out["Gamma_Long_Breakout"] = out["Gamma_Long_Breakout"].fillna(False).astype(bool)
-        out["Gamma_Short_Breakdown"] = out["Gamma_Short_Breakdown"].fillna(False).astype(bool)
-        out["Gamma_Long_Confirmed"] = out["Gamma_Long_Confirmed"].fillna(False).astype(bool)
-        out["Gamma_Short_Confirmed"] = out["Gamma_Short_Confirmed"].fillna(False).astype(bool)
-
+        for flag in ["Gamma_Long_Breakout", "Gamma_Short_Breakdown", "Gamma_Long_Confirmed", "Gamma_Short_Confirmed"]:
+            if flag not in out.columns:
+                out[flag] = False
+            out[flag] = out[flag].fillna(False).astype(bool)
         return out
 
     base = with_gamma_flags(base)
@@ -1388,68 +1378,51 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     def prep_side_df(dfside: pd.DataFrame, side: str) -> pd.DataFrame:
         if dfside.empty:
             return dfside
-        dfside = dfside.copy()
+        
+        out = dfside.copy()
 
         if side == "long":
-            dfside = dfside[dfside["Directional"] > 0]
-            if "Above_FRAMA" in dfside.columns:
-                dfside = dfside[dfside["Above_FRAMA"].fillna(False)]
-            if dfside.empty:
-                return dfside
+            out = out[out["Directional"] > 0].copy()
+            if out.empty:
+                return out
 
-            confirmed = dfside[dfside["Gamma_Long_Confirmed"]]
-            if not confirmed.empty:
-                return confirmed.sort_values(
-                    ["% Change", "Directional"],
-                    ascending=[False, False],
-                    na_position="last",
-                )
+            # Cross-Sectional Percentile Rank for Longs (Higher is better)
+            out['Rank_ROC'] = out['ROC_14'].rank(pct=True)
+            out['Rank_Dir'] = out['Directional'].rank(pct=True)
+            out['Rank_Cumsum'] = out['CumsumPlus'].rank(pct=True)
+            out['Rank_Vol'] = out['10 Day Relative Volume'].rank(pct=True)
 
-            breakout = dfside[dfside["Gamma_Long_Breakout"]]
-            if not breakout.empty:
-                return breakout.sort_values(
-                    ["% Change", "Directional"],
-                    ascending=[False, False],
-                    na_position="last",
-                )
+            # Average percentile score (Dynamic Power Score)
+            out['Dynamic_Power_Score'] = (out['Rank_ROC'] + out['Rank_Dir'] + out['Rank_Cumsum'] + out['Rank_Vol']) / 4 * 100
 
-            return dfside.sort_values(
-                ["Directional", "% Change"],
-                ascending=[False, False],
-                na_position="last",
-            )
+            # Sort strictly by Dynamic Power Score descending
+            return out.sort_values('Dynamic_Power_Score', ascending=False)
 
         else:
-            dfside = dfside[dfside["Directional"] < 0]
-            if dfside.empty:
-                return dfside
+            out = out[out["Directional"] < 0].copy()
+            if out.empty:
+                return out
 
-            confirmed = dfside[dfside["Gamma_Short_Confirmed"]]
-            if not confirmed.empty:
-                return confirmed.sort_values(
-                    ["% Change", "Directional"],
-                    ascending=[True, True],
-                    na_position="last",
-                )
+            # Cross-Sectional Percentile Rank for Shorts 
+            # Lower is better for momentum/trend variables, but Volume is still higher=better
+            out['Rank_ROC'] = out['ROC_14'].rank(pct=True, ascending=False)
+            out['Rank_Dir'] = out['Directional'].rank(pct=True, ascending=False)
+            out['Rank_Cumsum'] = out['CumsumPlus'].rank(pct=True, ascending=False)
+            out['Rank_Vol'] = out['10 Day Relative Volume'].rank(pct=True) 
 
-            breakdown = dfside[dfside["Gamma_Short_Breakdown"]]
-            if not breakdown.empty:
-                return breakdown.sort_values(
-                    ["% Change", "Directional"],
-                    ascending=[True, True],
-                    na_position="last",
-                )
+            # Average percentile score (Dynamic Power Score)
+            out['Dynamic_Power_Score'] = (out['Rank_ROC'] + out['Rank_Dir'] + out['Rank_Cumsum'] + out['Rank_Vol']) / 4 * 100
 
-            return dfside.sort_values(
-                ["Directional", "% Change"],
-                ascending=[True, True],
-                na_position="last",
-            )
+            # Sort strictly by Dynamic Power Score descending
+            return out.sort_values('Dynamic_Power_Score', ascending=False)
+
     long_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
     short_df = prep_side_df(base, "short").drop_duplicates(subset=["Symbol"]).head(15)
+    
     cols = [c for c in EMAIL_DISPLAY_COLS if c in base.columns]
     long_df = long_df[cols] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     short_df = short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
+    
     return long_df, short_df
 
 
