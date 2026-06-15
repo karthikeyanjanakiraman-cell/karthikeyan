@@ -152,6 +152,48 @@ def compute_gamma_hulk_roc(intra_df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
+def build_signals_from_raw_directional(detail_df) -> dict:
+    nan = float("nan")
+    out = {
+        k: nan for k in (
+            "5m_Signal",
+            "15m_Signal",
+            "30m_Signal",
+            "60m_Signal",
+            "Bull_Signal",
+            "Bear_Signal",
+            "Overall_Signal",
+        )
+    }
+    if detail_df is None or detail_df.empty:
+        return out
+
+    df = detail_df.copy()
+    if "Iteration No" in df.columns:
+        df = df.sort_values("Iteration No")
+
+    vals = pd.to_numeric(df["Directional"], errors="coerce").dropna().to_numpy(dtype=float)
+    if vals.size == 0:
+        return out
+
+    last = vals.size - 1
+
+    def raw_at(offset: int) -> float:
+        i = last - offset
+        if i < 0:
+            i = 0
+        return float(vals[i])
+
+    out["5m_Signal"] = round(raw_at(0), 4)
+    out["15m_Signal"] = round(raw_at(3) if last >= 3 else raw_at(0), 4)
+    out["30m_Signal"] = round(raw_at(6) if last >= 6 else raw_at(0), 4)
+    out["60m_Signal"] = round(raw_at(12) if last >= 12 else raw_at(0), 4)
+    out["Bull_Signal"] = round(float(vals[vals > 0].max()) if (vals > 0).any() else 0.0, 4)
+    out["Bear_Signal"] = round(abs(float(vals[vals < 0].min())) if (vals < 0).any() else 0.0, 4)
+    out["Overall_Signal"] = round(raw_at(0), 4)
+    return out
+
+
 
 def classify_mtf_from_window(win, eps: float = 1e-9) -> float:
     s = pd.Series(win).dropna().astype(float)
