@@ -1352,17 +1352,11 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     numeric_cols = [
         "Directional", "Turning", "Stability", "Balanced", "CumsumPlus",
         "10 Day Relative Volume", "Last5mVolume", "ROC_14", "ROC_6M_Peak",
-        "ROC_6M_Bottom", "% Change"
+        "ROC_6M_Bottom", "% Change", "MTF_SCORE"
     ]
     for c in numeric_cols:
         if c in base.columns:
             base[c] = pd.to_numeric(base[c], errors="coerce")
-
-    # Fill NaNs in the exact 4 columns required for percentile ranking
-    cols_to_fill = ['ROC_14', 'Directional', '10 Day Relative Volume', 'CumsumPlus']
-    for c in cols_to_fill:
-        if c in base.columns:
-            base[c] = base[c].fillna(0)
 
     def with_gamma_flags(dfside: pd.DataFrame) -> pd.DataFrame:
         out = dfside.copy()
@@ -1384,29 +1378,14 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
             out = out[out["Directional"] > 0].copy()
             if out.empty:
                 return out
-
-            # 4-Factor Cross-Sectional Percentile Rank for Longs (Higher is better)
-            out['Rank_ROC'] = out['ROC_14'].rank(pct=True)
-            out['Rank_Dir'] = out['Directional'].rank(pct=True)
-            out['Rank_Cumsum'] = out['CumsumPlus'].rank(pct=True)
-            out['Rank_Vol'] = out['10 Day Relative Volume'].rank(pct=True)
-
-            out['Dynamic_Power_Score'] = (out['Rank_ROC'] + out['Rank_Dir'] + out['Rank_Cumsum'] + out['Rank_Vol']) / 4 * 100
-            return out.sort_values('Dynamic_Power_Score', ascending=False)
-
+            # STRICT SORT: MTF_SCORE (4.0 is best) first, then ROC_14 (Speed) second.
+            return out.sort_values(['MTF_SCORE', 'ROC_14'], ascending=[False, False], na_position='last')
         else:
             out = out[out["Directional"] < 0].copy()
             if out.empty:
                 return out
-
-            # 4-Factor Cross-Sectional Percentile Rank for Shorts 
-            out['Rank_ROC'] = out['ROC_14'].rank(pct=True, ascending=False)
-            out['Rank_Dir'] = out['Directional'].rank(pct=True, ascending=False)
-            out['Rank_Cumsum'] = out['CumsumPlus'].rank(pct=True, ascending=False)
-            out['Rank_Vol'] = out['10 Day Relative Volume'].rank(pct=True) 
-
-            out['Dynamic_Power_Score'] = (out['Rank_ROC'] + out['Rank_Dir'] + out['Rank_Cumsum'] + out['Rank_Vol']) / 4 * 100
-            return out.sort_values('Dynamic_Power_Score', ascending=False)
+            # STRICT SORT: MTF_SCORE (-4.0 is best) first, then ROC_14 (Most negative is best) second.
+            return out.sort_values(['MTF_SCORE', 'ROC_14'], ascending=[True, True], na_position='last')
 
     long_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
     short_df = prep_side_df(base, "short").drop_duplicates(subset=["Symbol"]).head(15)
@@ -1416,7 +1395,6 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     short_df = short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     
     return long_df, short_df
-
 
 
 def build_occurrence_table(
