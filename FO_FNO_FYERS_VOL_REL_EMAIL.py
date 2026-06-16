@@ -531,14 +531,15 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame], prev_clos
     ltp = float(curr_df["close"].iloc[-1]) if not curr_df.empty else np.nan
     
     # NEW FAILSAFE: Extract absolute daily highs and lows to guarantee accurate 'Anytime' filtering
-    hod = float(curr_df["high"].max()) if not curr_df.empty else float("nan")
-    lod = float(curr_df["low"].min()) if not curr_df.empty else float("nan")
+    hod = float(curr_df["high"].max()) if not curr_df.empty and "high" in curr_df.columns else ltp
+    lod = float(curr_df["low"].min()) if not curr_df.empty and "low" in curr_df.columns else ltp
     
     target_peak_price = float(curr_df["ROC_6M_Peak_Price"].iloc[-1]) if not curr_df.empty and "ROC_6M_Peak_Price" in curr_df.columns else float("nan")
     target_bottom_price = float(curr_df["ROC_6M_Bottom_Price"].iloc[-1]) if not curr_df.empty and "ROC_6M_Bottom_Price" in curr_df.columns else float("nan")
     
-    crossed_long_today = bool(hod > target_peak_price) if pd.notna(hod) and pd.notna(target_peak_price) else False
-    crossed_short_today = bool(lod < target_bottom_price) if pd.notna(lod) and pd.notna(target_bottom_price) else False
+    # Ensure HOD > target logic captures any transient spike during the day or if LTP currently exceeds it
+    crossed_long_today = bool((hod > target_peak_price) or (ltp > target_peak_price)) if pd.notna(target_peak_price) else False
+    crossed_short_today = bool((lod < target_bottom_price) or (ltp < target_bottom_price)) if pd.notna(target_bottom_price) else False
 
     obv_30m_delta = float(flow_df["Cumulative OBV"].iloc[-1]) - float(flow_df["Cumulative OBV"].iloc[-7]) if len(flow_df) >= 7 else 0.0
     rsi_30m_delta = float(flow_df["Cumulative RSI"].iloc[-1]) - float(flow_df["Cumulative RSI"].iloc[-7]) if len(flow_df) >= 7 else 0.0
