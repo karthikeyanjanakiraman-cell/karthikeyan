@@ -3,9 +3,9 @@
 FO_FNO_FYERS_VOL_REL_EMAIL.py
 
 Optimized Intraday F&O scanner via Fyers API with email alerts.
-- NEW STRATEGY: 6-Month Volume Climax Bands.
+- STRATEGY: 6-Month Volume Climax Bands.
 - FRESH CROSSOVER FILTER: Only alerts on stocks breaking the band TODAY.
-  (Yesterday's Close was inside/below the band, Live Price is now breaking it).
+- EMAIL CLEANUP: Removed historical 15-iteration noise tables. Only shows fresh signals.
 """
 
 import os
@@ -323,7 +323,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             if not hist_daily.empty:
                 prev_close = float(hist_daily["close"].iloc[-1])
                 
-                # YOUR LOGIC: Find the single day with the highest volume in the last 6 months
+                # Find the single day with the highest volume in the last 6 months
                 max_vol_idx = hist_daily["volume"].idxmax()
                 climax_day = hist_daily.loc[max_vol_idx]
                 
@@ -402,49 +402,6 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     return (long_df[cols] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)), (short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS))
 
 
-def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
-    if detail_df is None or detail_df.empty: return pd.DataFrame()
-    df = detail_df.copy()
-    if "Iteration No" not in df.columns: return pd.DataFrame()
-
-    last15_iters = sorted(df["Iteration No"].dropna().astype(int).unique())[-15:]
-    df = df[df["Iteration No"].astype(int).isin(last15_iters)].copy()
-
-    long_top = df[df["Directional"] > 0].sort_values(["Iteration No", "Directional"], ascending=[True, False]).groupby("Iteration No").head(1).assign(Side="Long")
-    short_top = df[df["Directional"] < 0].sort_values(["Iteration No", "Directional"], ascending=[True, True]).groupby("Iteration No").head(1).assign(Side="Short")
-    
-    out = pd.concat([long_top, short_top], ignore_index=True, sort=False)
-    if out.empty: return out
-
-    out = out.sort_values(["Iteration No", "Side"]).reset_index(drop=True)
-    out["Iteration"] = out["Iteration No"].astype(str) + " @ " + out["Iteration Time"].astype(str)
-    out["First Occurrence"] = out["Iteration"]
-    out["Latest"] = out["Iteration"]
-    return out
-
-
-def build_history_table(history_df: pd.DataFrame, side: str) -> str:
-    if history_df is None or history_df.empty: return "No history yet."
-    df = history_df[history_df["Side"].astype(str).str.lower() == side.lower()].copy()
-    if df.empty: return "No history yet."
-
-    cols = ["First Occurrence", "Latest", "Symbol", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus", "Iteration Time"]
-    df = df.tail(15)[cols].copy()
-
-    header = "".join(f'<th style="padding:8px;border:1px solid #4b5563;background:#111827;color:#f9fafb;">{c}</th>' for c in cols)
-    body_rows = []
-    for _, r in df.iterrows():
-        try:
-            f_dir = float(r["Directional"])
-            bg = "#14532d" if f_dir > 0 else "#7f1d1d" if f_dir < 0 else "#030712"
-        except Exception:
-            bg = "#030712"
-            
-        tds = "".join(f'<td style="padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;background:{bg}">{format_value(c, r[c])}</td>' for c in cols)
-        body_rows.append(f"<tr>{tds}</tr>")
-    return f'<h3 style="color:{"#22c55e" if side.lower()=="long" else "#ef4444"};margin:12px 0 6px 0;">Top 1 {side.title()} - Last 15 Iterations</h3><table style="border-collapse:collapse;width:100%;background:#030712;"><thead><tr>{header}</tr></thead><tbody>{"".join(body_rows)}</tbody></table>'
-
-
 def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 15) -> str:
     if df is None or df.empty: return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3><div style="padding:12px;background:#111827;color:#d1d5db;">No fresh breakout candidates today.</div>'
     df_slice = df.head(max_rows).copy()
@@ -469,7 +426,7 @@ def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 15) -> str:
     return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3><table style="border-collapse:collapse;width:100%;background:#030712;"><thead><tr>{header_cells}</tr></thead><tbody>{"".join(body_rows)}</tbody></table>'
 
 
-def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, history_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
+def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
     try:
         scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         html_body = f"""
@@ -478,10 +435,8 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, histor
             <h2 style="color:#facc15;">Volume Climax Band Execution Alert</h2>
             <div style="color:#cbd5e1;font-size:14px;margin-bottom:18px;">Scan completed at {scan_time}</div>
             {build_html_table(long_df, "Fresh Long Breakouts (Today Only)")}
-            {build_history_table(history_df, "long")}
             <div style="height:28px;"></div>
             {build_html_table(short_df, "Fresh Short Breakdowns (Today Only)")}
-            {build_history_table(history_df, "short")}
         </body>
         </html>
         """
@@ -530,10 +485,9 @@ def main():
 
     summary_csv, detail_csv = save_outputs(summary_df, detail_df, prefix="fno")
     long_df, short_df = build_candidate_tables(summary_df)
-    history_df = load_iteration_history(detail_df)
 
     send_email_with_tables(
-        long_df=long_df, short_df=short_df, history_df=history_df,
+        long_df=long_df, short_df=short_df,
         csv_filename=summary_csv, detail_csv_filename=detail_csv
     )
 
