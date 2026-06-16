@@ -4,9 +4,8 @@ FO_FNO_FYERS_VOL_REL_EMAIL.py
 
 Optimized Intraday F&O scanner via Fyers API with email alerts.
 - NEW STRATEGY: 6-Month Volume Climax Bands.
-- Identifies the highest volume day in the last 6 months.
-- The High of that day = Top Band (Resistance / Long Trigger).
-- The Low of that day = Bottom Band (Support / Short Trigger / Stop Loss).
+- FRESH CROSSOVER FILTER: Only alerts on stocks breaking the band TODAY.
+  (Yesterday's Close was inside/below the band, Live Price is now breaking it).
 """
 
 import os
@@ -348,6 +347,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
         rows.append({
             "Symbol": sym, "LTP": ltp, "% Change": pct_change,
+            "Prev_Close": prev_close, # Captured for Fresh Crossover Matrix
             "Top_Band": iter_summary.get("Top_Band"),
             "Bottom_Band": iter_summary.get("Bottom_Band"),
             "Climax_Date": iter_summary.get("Climax_Date"),
@@ -375,7 +375,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     if df is None or df.empty: return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     base = df.copy()
     
-    for c in ["LTP", "Top_Band", "Bottom_Band", "% Change", "MTF_SCORE"]:
+    for c in ["LTP", "Prev_Close", "Top_Band", "Bottom_Band", "% Change", "MTF_SCORE"]:
         if c in base.columns: base[c] = pd.to_numeric(base[c], errors="coerce")
 
     def prep_side_df(dfside: pd.DataFrame, side: str) -> pd.DataFrame:
@@ -383,16 +383,16 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         out = dfside.copy()
 
         if side == "long":
-            # YOUR PURE LOGIC: Long if Live Price breaks above the Top Band of the Climax Day
-            if "LTP" in out.columns and "Top_Band" in out.columns:
-                out = out[out["LTP"] > out["Top_Band"]].copy()
+            # FRESH CROSSOVER: Yesterday's close was below or inside the band, but Live Price broke the Top Band TODAY
+            if "LTP" in out.columns and "Top_Band" in out.columns and "Prev_Close" in out.columns:
+                out = out[(out["Prev_Close"] <= out["Top_Band"]) & (out["LTP"] > out["Top_Band"])].copy()
             if out.empty: return out
             return out.sort_values(['MTF_SCORE'], ascending=[False], na_position='last')
         
         else:
-            # YOUR PURE LOGIC: Short if Live Price breaches below the Bottom Band of the Climax Day
-            if "LTP" in out.columns and "Bottom_Band" in out.columns:
-                out = out[out["LTP"] < out["Bottom_Band"]].copy()
+            # FRESH CROSSOVER: Yesterday's close was above or inside the band, but Live Price broke the Bottom Band TODAY
+            if "LTP" in out.columns and "Bottom_Band" in out.columns and "Prev_Close" in out.columns:
+                out = out[(out["Prev_Close"] >= out["Bottom_Band"]) & (out["LTP"] < out["Bottom_Band"])].copy()
             if out.empty: return out
             return out.sort_values(['MTF_SCORE'], ascending=[True], na_position='last')
 
@@ -446,7 +446,7 @@ def build_history_table(history_df: pd.DataFrame, side: str) -> str:
 
 
 def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 15) -> str:
-    if df is None or df.empty: return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3><div style="padding:12px;background:#111827;color:#d1d5db;">No breakout candidates found.</div>'
+    if df is None or df.empty: return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3><div style="padding:12px;background:#111827;color:#d1d5db;">No fresh breakout candidates today.</div>'
     df_slice = df.head(max_rows).copy()
     cols = [c for c in EMAIL_DISPLAY_COLS if c in df_slice.columns]
 
@@ -477,16 +477,16 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, histor
         <body style="background:#030712;color:#e5e7eb;padding:20px;font-family:Arial,sans-serif;">
             <h2 style="color:#facc15;">Volume Climax Band Execution Alert</h2>
             <div style="color:#cbd5e1;font-size:14px;margin-bottom:18px;">Scan completed at {scan_time}</div>
-            {build_html_table(long_df, "Confirmed Long Climax Breakouts")}
+            {build_html_table(long_df, "Fresh Long Breakouts (Today Only)")}
             {build_history_table(history_df, "long")}
             <div style="height:28px;"></div>
-            {build_html_table(short_df, "Confirmed Short Climax Breakdowns")}
+            {build_html_table(short_df, "Fresh Short Breakdowns (Today Only)")}
             {build_history_table(history_df, "short")}
         </body>
         </html>
         """
         msg = MIMEMultipart()
-        msg["From"], msg["To"], msg["Subject"] = sender_email, recipient_email, f"Climax Band Alert - {scan_time}"
+        msg["From"], msg["To"], msg["Subject"] = sender_email, recipient_email, f"Fresh Climax Breakout Alert - {scan_time}"
         msg.attach(MIMEText(html_body, "html", "utf-8"))
 
         for fname in [csv_filename, detail_csv_filename]:
