@@ -3,12 +3,10 @@
 FO_FNO_FYERS_VOL_REL_EMAIL.py
 
 Optimized Intraday F&O scanner via Fyers API with email alerts.
-- FIXED: Uses the 15-minute 6-month Peak/Bottom percentages anchored to 
-  Yesterday's Close to project perfectly flat execution channels.
-- FIXED: Uses absolute High-Of-Day (HOD) and Low-Of-Day (LOD) to trigger 
-  and strictly filter candidates if they crossed the line ANY TIME TODAY.
-- FIXED: Safely extracts Yesterday's Close using calendar dates to prevent 
-  broker data indexing errors.
+- FIXED: 6-Month Lookback applied directly to 15-minute VOLUME bars.
+- FIXED: Triggers anytime today if a 15m volume candle exceeds the 6M historical peak.
+- FIXED: Anti-Fade Shield enforces that the live price (LTP) must be holding 
+  strictly above the Volume Weighted Average Price (VWAP) right now.
 """
 
 import os
@@ -53,8 +51,8 @@ logger.addHandler(ch)
 
 warnings.filterwarnings("ignore")
 
-DAILY_LOOKBACK_DAYS = 135
-INTRADAY_LOOKBACK_DAYS = 135  # Must cover 6 months of 15m candles
+DAILY_LOOKBACK_DAYS = 60
+INTRADAY_LOOKBACK_DAYS = 135  # Extended to grab full 6 months of historical 15m bars
 IVP_LOOKBACK_DAYS = 60
 INDEX_SOFT_BOOST_WEIGHT = 0.0
 HISTORY_API_MAX_SPAN_DAYS = 99
@@ -75,10 +73,8 @@ EMAIL_DISPLAY_COLS = [
     "LTP",
     "% Change",
     "ROC_14",          
-    "ROC_6M_Peak",     
-    "ROC_6M_Peak_Price",    
-    "ROC_6M_Bottom",   
-    "ROC_6M_Bottom_Price",  
+    "VOL_6M_Peak",       # 6-Month Peak Volume Milestone
+    "Current_Bar_Vol",   # Today's live 15m bar volume
     "MTF_15m",
     "MTF_30m",
     "MTF_60m",
@@ -90,21 +86,20 @@ EMAIL_DISPLAY_COLS = [
 
 def compute_gamma_hulk_roc(intra_df: pd.DataFrame, prev_close: Optional[float] = None) -> pd.DataFrame:
     """
-    15-minute Gamma Hulk engine:
-    - Finds the max/min 15m return over the last 6 months.
-    - Projects those targets onto Yesterday's Close as perfectly flat boundaries.
+    6-Month Intraday Volume Breakout Engine:
+    - Finds the absolute maximum 15m volume candle over the last 6 months.
+    - Monitors real-time incoming volume candles against this milestone.
     """
     df = intra_df.copy().sort_values("timestamp").reset_index(drop=True)
 
-    required_cols = {"timestamp", "high", "low", "close"}
+    required_cols = {"timestamp", "high", "low", "close", "volume"}
     if df.empty or not required_cols.issubset(df.columns):
-        for c in ["ROC_14", "ROC_6M_Peak", "ROC_6M_Peak_Price", "ROC_6M_Bottom", "ROC_6M_Bottom_Price", "Gamma_Breakout_High", "Gamma_Breakout_Low"]:
-            df[c] = np.nan
-        for c in ["Gamma_Long_Breakout", "Gamma_Short_Breakdown", "Gamma_Long_Confirmed", "Gamma_Short_Confirmed"]:
-            df[c] = False
+        df["ROC_14"] = np.nan
+        df["VOL_6M_Peak"] = np.nan
+        df["Gamma_Vol_Breakout"] = False
         return df
 
-    for col in ["high", "low", "close"]:
+    for col in ["high", "low", "close", "volume"]:
         df[col] = pd.to_numeric(df[col], errors="coerce").astype(float)
 
     df["ROC_14"] = ((df["close"] - df["close"].shift(1)) / df["close"].shift(1)) * 100.0
@@ -114,27 +109,14 @@ def compute_gamma_hulk_roc(intra_df: pd.DataFrame, prev_close: Optional[float] =
     current_date = unique_dates[-1] if len(unique_dates) > 0 else datetime.now().date()
     
     historical_data = df[df["_date_only"] < current_date]
-    if not historical_data.empty and historical_data["ROC_14"].notna().sum() > 2:
-        df["ROC_6M_Peak"] = float(historical_data["ROC_14"].max())
-        df["ROC_6M_Bottom"] = float(historical_data["ROC_14"].min())
+    if not historical_data.empty and historical_data["volume"].notna().sum() > 2:
+        df["VOL_6M_Peak"] = float(historical_data["volume"].max())
     else:
-        df["ROC_6M_Peak"] = 4.23
-        df["ROC_6M_Bottom"] = -4.23
+        df["VOL_6M_Peak"] = 100000.0  # Safe baseline fallback
 
-    if prev_close and float(prev_close) > 0:
-        df["ROC_6M_Peak_Price"] = float(prev_close) * (1 + df["ROC_6M_Peak"] / 100.0)
-        df["ROC_6M_Bottom_Price"] = float(prev_close) * (1 + df["ROC_6M_Bottom"] / 100.0)
-    else:
-        df["ROC_6M_Peak_Price"] = df["close"].shift(1) * (1 + df["ROC_6M_Peak"] / 100.0)
-        df["ROC_6M_Bottom_Price"] = df["close"].shift(1) * (1 + df["ROC_6M_Bottom"] / 100.0)
+    # Triggered if individual 15-minute volume exceeds 6-month institutional highs
+    df["Gamma_Vol_Breakout"] = df["volume"] > df["VOL_6M_Peak"]
 
-    df["Gamma_Long_Breakout"] = df["close"] > df["ROC_6M_Peak_Price"]
-    df["Gamma_Short_Breakdown"] = df["close"] < df["ROC_6M_Bottom_Price"]
-    
-    df["Gamma_Breakout_High"] = np.nan
-    df["Gamma_Breakout_Low"] = np.nan
-    df["Gamma_Long_Confirmed"] = False
-    df["Gamma_Short_Confirmed"] = False
     df.drop(columns=["_date_only"], inplace=True)
     return df
 
@@ -510,13 +492,9 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame], prev_clos
             "Directional": ps["Directional"], "Turning": ps["Turning"], "Stability": ps["Stability"], "Balanced": ps["Balanced"], "CumsumPlus": ps.get("CumsumPlus"),
             "10 Day Relative Volume": rvol10, "20 Day Relative Volume": rvol20,
             "ROC_14": float(row.get("ROC_14", np.nan)),               
-            "ROC_6M_Peak": float(row.get("ROC_6M_Peak", np.nan)),     
-            "ROC_6M_Peak_Price": float(row.get("ROC_6M_Peak_Price", np.nan)), 
-            "ROC_6M_Bottom": float(row.get("ROC_6M_Bottom", np.nan)), 
-            "ROC_6M_Bottom_Price": float(row.get("ROC_6M_Bottom_Price", np.nan)), 
-            "Gamma_Long_Breakout": bool(row.get("Gamma_Long_Breakout", False)), "Gamma_Short_Breakdown": bool(row.get("Gamma_Short_Breakdown", False)),
-            "Gamma_Long_Confirmed": bool(row.get("Gamma_Long_Confirmed", False)), "Gamma_Short_Confirmed": bool(row.get("Gamma_Short_Confirmed", False)),
-            "Gamma_Breakout_High": float(row.get("Gamma_Breakout_High", np.nan)), "Gamma_Breakout_Low": float(row.get("Gamma_Breakout_Low", np.nan)),
+            "VOL_6M_Peak": float(row.get("VOL_6M_Peak", np.nan)),     
+            "Current_Bar_Vol": float(row.get("volume", 0.0)),
+            "Gamma_Vol_Breakout": bool(row.get("Gamma_Vol_Breakout", False)),
             "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[i]) if not flow_df.empty else float("nan"),
             "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[i]) if not flow_df.empty else float("nan"),
             "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[i]) if not flow_df.empty else float("nan"),
@@ -528,16 +506,7 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame], prev_clos
 
     detail_df = pd.DataFrame(rows)
     ltp = float(curr_df["close"].iloc[-1]) if not curr_df.empty else np.nan
-    
-    # NEW FAILSAFE: Extract absolute daily highs and lows to guarantee accurate 'Anytime' filtering
-    hod = float(curr_df["high"].max()) if not curr_df.empty and "high" in curr_df.columns else ltp
-    lod = float(curr_df["low"].min()) if not curr_df.empty and "low" in curr_df.columns else ltp
-    
-    target_peak_price = float(curr_df["ROC_6M_Peak_Price"].iloc[-1]) if not curr_df.empty and "ROC_6M_Peak_Price" in curr_df.columns else float("nan")
-    target_bottom_price = float(curr_df["ROC_6M_Bottom_Price"].iloc[-1]) if not curr_df.empty and "ROC_6M_Bottom_Price" in curr_df.columns else float("nan")
-    
-    crossed_long_today = bool((hod >= target_peak_price) or (ltp >= target_peak_price)) if pd.notna(target_peak_price) else False
-    crossed_short_today = bool((lod <= target_bottom_price) or (ltp <= target_bottom_price)) if pd.notna(target_bottom_price) else False
+    hod = float(curr_df["high"].max()) if not curr_df.empty else float("nan")
 
     obv_30m_delta = float(flow_df["Cumulative OBV"].iloc[-1]) - float(flow_df["Cumulative OBV"].iloc[-7]) if len(flow_df) >= 7 else 0.0
     rsi_30m_delta = float(flow_df["Cumulative RSI"].iloc[-1]) - float(flow_df["Cumulative RSI"].iloc[-7]) if len(flow_df) >= 7 else 0.0
@@ -549,16 +518,9 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame], prev_clos
         "Kalman Signal": kalman_signal_from_series(curr_df["Iteration Change"]),
         "Current Volume": last_cum_vol, "10 Day Relative Volume": last_rvol10, "20 Day Relative Volume": last_rvol20,
         "ROC_14": float(curr_df["ROC_14"].iloc[-1]) if "ROC_14" in curr_df.columns else np.nan,               
-        "ROC_6M_Peak": float(curr_df["ROC_6M_Peak"].iloc[-1]) if "ROC_6M_Peak" in curr_df.columns else np.nan,     
-        "ROC_6M_Peak_Price": float(curr_df["ROC_6M_Peak_Price"].iloc[-1]) if "ROC_6M_Peak_Price" in curr_df.columns else np.nan, 
-        "ROC_6M_Bottom": float(curr_df["ROC_6M_Bottom"].iloc[-1]) if "ROC_6M_Bottom" in curr_df.columns else np.nan, 
-        "ROC_6M_Bottom_Price": float(curr_df["ROC_6M_Bottom_Price"].iloc[-1]) if "ROC_6M_Bottom_Price" in curr_df.columns else np.nan, 
-        "Crossed_Long_Today": crossed_long_today,
-        "Crossed_Short_Today": crossed_short_today,
-        "Gamma_Long_Confirmed": bool(curr_df["Gamma_Long_Confirmed"].any()) if "Gamma_Long_Confirmed" in curr_df.columns else False,
-        "Gamma_Short_Confirmed": bool(curr_df["Gamma_Short_Confirmed"].any()) if "Gamma_Short_Confirmed" in curr_df.columns else False,
-        "Gamma_Breakout_High": float(curr_df["Gamma_Breakout_High"].iloc[-1]) if "Gamma_Breakout_High" in curr_df.columns else np.nan,
-        "Gamma_Breakout_Low": float(curr_df["Gamma_Breakout_Low"].iloc[-1]) if "Gamma_Breakout_Low" in curr_df.columns else np.nan,
+        "VOL_6M_Peak": float(curr_df["VOL_6M_Peak"].iloc[-1]) if "VOL_6M_Peak" in curr_df.columns else np.nan,     
+        "Current_Bar_Vol": float(curr_df["volume"].iloc[-1]) if not curr_df.empty else 0.0,
+        "Gamma_Vol_Breakout": bool(curr_df["Gamma_Vol_Breakout"].any()) if "Gamma_Vol_Breakout" in curr_df.columns else False,
         "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Cumulative OBV": float(flow_df["Cumulative OBV"].iloc[-1]) if not flow_df.empty else float("nan"),
         "Cumulative VWAP": float(flow_df["Cumulative VWAP"].iloc[-1]) if not flow_df.empty else float("nan"),
@@ -623,10 +585,10 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             "Symbol": sym, "LTP": ltp, "% Change": pct_change,
             "Directional": iter_summary.get("Directional"), "Turning": iter_summary.get("Turning"),
             "Stability": iter_summary.get("Stability"), "Balanced": iter_summary.get("Balanced"), "CumsumPlus": iter_summary.get("CumsumPlus"),
-            "ROC_14": iter_summary.get("ROC_14"), "ROC_6M_Peak": iter_summary.get("ROC_6M_Peak"), "ROC_6M_Peak_Price": iter_summary.get("ROC_6M_Peak_Price"), 
-            "ROC_6M_Bottom": iter_summary.get("ROC_6M_Bottom"), "ROC_6M_Bottom_Price": iter_summary.get("ROC_6M_Bottom_Price"), 
-            "Crossed_Long_Today": iter_summary.get("Crossed_Long_Today", False),
-            "Crossed_Short_Today": iter_summary.get("Crossed_Short_Today", False),
+            "ROC_14": iter_summary.get("ROC_14"), 
+            "VOL_6M_Peak": iter_summary.get("VOL_6M_Peak"),
+            "Current_Bar_Vol": iter_summary.get("Current_Bar_Vol"),
+            "Gamma_Vol_Breakout": iter_summary.get("Gamma_Vol_Breakout", False),
             "Gamma_Long_Confirmed": iter_summary.get("Gamma_Long_Confirmed", False), "Gamma_Short_Confirmed": iter_summary.get("Gamma_Short_Confirmed", False),
             "Gamma_Breakout_High": iter_summary.get("Gamma_Breakout_High"), "Gamma_Breakout_Low": iter_summary.get("Gamma_Breakout_Low"),
             "ARIMA Signal": iter_summary.get("ARIMA Signal"), "Kalman Signal": iter_summary.get("Kalman Signal"),
@@ -701,7 +663,7 @@ def signal_color(label) -> str:
 def format_value(col: str, val):
     if pd.isna(val): return ""
     if col == "% Change": return f"{float(val):.2f}%"
-    if col in ["IVP", "ROC_14", "ROC_6M_Peak", "ROC_6M_Peak_Price", "ROC_6M_Bottom", "ROC_6M_Bottom_Price"]: return f"{float(val):.2f}"
+    if col in ["IVP", "ROC_14", "VOL_6M_Peak", "Current_Bar_Vol"]: return f"{float(val):.0f}" if float(val) > 100 else f"{float(val):.2f}"
     if isinstance(val, (int, float, np.integer, np.floating)): return f"{float(val):.4f}"
     return str(val)
 
@@ -710,25 +672,39 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     if df is None or df.empty: return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     base = df.copy()
     
-    for c in ["Directional", "Turning", "Stability", "Balanced", "CumsumPlus", "10 Day Relative Volume", "Last5mVolume", "ROC_14", "ROC_6M_Peak", "ROC_6M_Peak_Price", "ROC_6M_Bottom", "ROC_6M_Bottom_Price", "% Change", "MTF_SCORE"]:
+    for c in ["Directional", "Turning", "Stability", "Balanced", "CumsumPlus", "10 Day Relative Volume", "Last5mVolume", "ROC_14", "VOL_6M_Peak", "Current_Bar_Vol", "% Change", "MTF_SCORE"]:
         if c in base.columns: base[c] = pd.to_numeric(base[c], errors="coerce")
 
     def prep_side_df(dfside: pd.DataFrame, side: str) -> pd.DataFrame:
         if dfside.empty: return dfside
         out = dfside.copy()
 
+        # STRICT VOLUME-SHOCK CONFIRMATION
+        out = out[out["Gamma_Vol_Breakout"] == True].copy()
+        if out.empty: return out
+
         if side == "long":
-            # STRICT MATHEMATICAL FAILSAFE: Ensure the stock crossed the boundary line today
-            if "Crossed_Long_Today" in out.columns:
-                out = out[out["Crossed_Long_Today"] == True].copy()
+            # ANTI-FADE ANTI-EXHAUSTION CONTROLS (Longs must exhibit bullish hold power above VWAP)
+            if "LTP" in out.columns and "Cumulative VWAP" in out.columns:
+                out = out[out["LTP"] > out["Cumulative VWAP"]].copy()
             if out.empty: return out
+            
+            if "Price_Lead_Status" in out.columns:
+                out = out[~out["Price_Lead_Status"].isin(["STRONG_PRICE_LEAD_FADE", "PRICE_LEADING_FADE_RISK"])].copy()
+            if out.empty: return out
+            
             return out.sort_values(['MTF_SCORE', 'ROC_14'], ascending=[False, False], na_position='last')
         
         else:
-            # STRICT MATHEMATICAL FAILSAFE: Ensure the stock dropped below the boundary line today
-            if "Crossed_Short_Today" in out.columns:
-                out = out[out["Crossed_Short_Today"] == True].copy()
+            # ANTI-FADE CONTROLS (Shorts must hold below VWAP)
+            if "LTP" in out.columns and "Cumulative VWAP" in out.columns:
+                out = out[out["LTP"] < out["Cumulative VWAP"]].copy()
             if out.empty: return out
+            
+            if "Price_Lead_Status" in out.columns:
+                out = out[~out["Price_Lead_Status"].isin(["STRONG_PRICE_LEAD_FADE", "PRICE_LEADING_FADE_RISK"])].copy()
+            if out.empty: return out
+            
             return out.sort_values(['MTF_SCORE', 'ROC_14'], ascending=[False, True], na_position='last')
 
     long_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
@@ -781,7 +757,7 @@ def build_history_table(history_df: pd.DataFrame, side: str) -> str:
 
 
 def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 15) -> str:
-    if df is None or df.empty: return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3><div style="padding:12px;background:#111827;color:#d1d5db;">No candidates found.</div>'
+    if df is None or df.empty: return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3><div style="padding:12px;background:#111827;color:#d1d5db;">No volume shock candidates found holding levels.</div>'
     df_slice = df.head(max_rows).copy()
     cols = [c for c in EMAIL_DISPLAY_COLS if c in df_slice.columns]
 
@@ -813,17 +789,17 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, histor
         <html>
         <body style="background:#030712;color:#e5e7eb;padding:20px;font-family:Arial,sans-serif;">
             <h2 style="color:#facc15;">Intraday Gamma Hulk Execution Alert</h2>
-            <div style="color:#cbd5e1;font-size:14px;margin-bottom:18px;">Scan completed at {scan_time}</div>
-            {build_html_table(long_df, "Current Long Candidates")}
+            <div style="color:#cbd5e1;font-size:14px;margin-bottom:18px;">Volume-Shock Engine completed at {scan_time}</div>
+            {build_html_table(long_df, "Confirmed Long Volume Shocks")}
             {build_history_table(history_df, "long")}
             <div style="height:28px;"></div>
-            {build_html_table(short_df, "Current Short Candidates")}
+            {build_html_table(short_df, "Confirmed Short Volume Shocks")}
             {build_history_table(history_df, "short")}
         </body>
         </html>
         """
         msg = MIMEMultipart()
-        msg["From"], msg["To"], msg["Subject"] = sender_email, recipient_email, f"Intraday Gamma Hulk Alert - {scan_time}"
+        msg["From"], msg["To"], msg["Subject"] = sender_email, recipient_email, f"Volume-Shock Alert - {scan_time}"
         msg.attach(MIMEText(html_body, "html", "utf-8"))
 
         for fname in [csv_filename, detail_csv_filename]:
