@@ -55,7 +55,7 @@ logger.addHandler(ch)
 warnings.filterwarnings("ignore")
 
 DAILY_LOOKBACK_DAYS = 135  # Set to comfortably cover a 6-month Daily chart envelope
-INTRADAY_LOOKBACK_DAYS = 30  # Intraday envelope lookback window
+INTRADAY_LOOKBACK_DAYS = 30  # Intraday lookback window
 IVP_LOOKBACK_DAYS = 60
 INDEX_SOFT_BOOST_WEIGHT = 0.0
 HISTORY_API_MAX_SPAN_DAYS = 99
@@ -242,8 +242,6 @@ def add_dual_engine_matrix(detail_df: pd.DataFrame, eps: float = 1e-4) -> pd.Dat
     out["Prior_Step"] = grouped["Current_Step"].shift(1).fillna(0.0)
     out["CumsumDiff"] = out["Current_Step"]
     out["Prior_Turning"] = grouped["Turning"].shift(1).fillna(0.0)
-    
-    # CORRECTED FIX: Evaluates metric variant directly here to resolve downstream lookups
     out["TurningDiff"] = out["Turning"] - out["Prior_Turning"]
     out["Friction_Expanding"] = (out["Turning"] > out["Prior_Turning"]) & (out["Turning"] > eps)
 
@@ -600,17 +598,21 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
         daily_df = get_fyers_history(fyers_sym, resolution="D", days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
         intra_df = get_fyers_history(fyers_sym, resolution="15", days_back=INTRADAY_LOOKBACK_DAYS)
 
-        # CHOICE B DEFINITIVE FIX: Uses strict calendar comparisons to remove uncompleted live candle risks
+        # CHOICE B DEFINITIVE FIX: Uses calendar conditions to isolate true historical close targets
         if daily_df is not None and len(daily_df) >= 3:
             daily_df["_date_parsed"] = pd.to_datetime(daily_df["timestamp"]).dt.date
             today_date = datetime.now().date()
             
             hist_daily = daily_df[daily_df["_date_parsed"] < today_date].copy()
-            if not hist_daily.empty:
+            if not hist_daily.empty and len(hist_daily) >= 2:
                 prev_close = float(hist_daily["close"].iloc[-1])
                 hist_daily["daily_roc"] = ((hist_daily["close"] - hist_daily["close"].shift(1)) / hist_daily["close"].shift(1)) * 100.0
+                
                 daily_peak_6m = float(hist_daily["daily_roc"].max())
                 daily_bottom_6m = float(hist_daily["daily_roc"].min())
+                
+                if np.isnan(daily_peak_6m) or np.isinf(daily_peak_6m): daily_peak_6m = 4.23
+                if np.isnan(daily_bottom_6m) or np.isinf(daily_bottom_6m): daily_bottom_6m = -4.23
             else:
                 daily_peak_6m, daily_bottom_6m = 4.23, -4.23
                 prev_close = float(daily_df["close"].iloc[-1])
@@ -726,13 +728,11 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         out = dfside.copy()
 
         if side == "long":
-            # HARD FILTER: Enforces that long lists only hold stocks that breached the Daily milestone targets today
             out = out[out["Gamma_Long_Breakout"] == True].copy()
             if out.empty: return out
             out["Gamma_Long_Confirmed"] = out["Gamma_Long_Confirmed"].fillna(False).astype(int)
             return out.sort_values(['Gamma_Long_Confirmed', 'MTF_SCORE', 'ROC_14'], ascending=[False, False, False], na_position='last')
         else:
-            # HARD FILTER: Enforces that short lists only hold stocks that dropped below the Daily milestone targets today
             out = out[out["Gamma_Short_Breakdown"] == True].copy()
             if out.empty: return out
             out["Gamma_Short_Confirmed"] = out["Gamma_Short_Confirmed"].fillna(False).astype(int)
@@ -776,7 +776,13 @@ def build_history_table(history_df: pd.DataFrame, side: str) -> str:
     header = "".join(f'<th style="padding:8px;border:1px solid #4b5563;background:#111827;color:#f9fafb;">{c}</th>' for c in cols)
     body_rows = []
     for _, r in df.iterrows():
-        tds = "".join(f'<td style="padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;background:{"#14532d" if float(r["Directional"]) > 0 else "#7f1d1d" if float(r["Directional"]) < 0 else "#030712"}">{format_value(c, r[c])}</td>' for c in cols)
+        try:
+            f_dir = float(r["Directional"])
+            bg = "#14532d" if f_dir > 0 else "#7f1d1d" if f_dir < 0 else "#030712"
+        except Exception:
+            bg = "#030712"
+            
+        tds = "".join(f'<td style="padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;background:{bg}">{format_value(c, r[c])}</td>' for c in cols)
         body_rows.append(f"<tr>{tds}</tr>")
     return f'<h3 style="color:{"#22c55e" if side.lower()=="long" else "#ef4444"};margin:12px 0 6px 0;">Top 1 {side.title()} - Last 15 Iterations</h3><table style="border-collapse:collapse;width:100%;background:#030712;"><thead><tr>{header}</tr></thead><tbody>{"".join(body_rows)}</tbody></table>'
 
@@ -789,8 +795,21 @@ def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 15) -> str:
     header_cells = "".join(f'<th style="padding:8px;border:1px solid #4b5563;background:#111827;color:#f9fafb;">{c}</th>' for c in cols)
     body_rows = []
     for _, row in df_slice.iterrows():
-        tds = "".join(f'<td style="padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;background:{signal_color(row[col]) if col in ["Volatility State", "Price_Lead_Status"] else "#14532d" if col=="% Change" and float(row[col])>0 else "#7f1d1d" if col=="% Change" and float(row[col])<0 else "#030712"}">{format_value(col, row[col])}</td>' for col in cols)
-        body_rows.append(f"<tr>{tds}</tr>")
+        tds = []
+        for col in cols:
+            if col in ["Volatility State", "Price_Lead_Status"]:
+                bg = signal_color(row[col])
+            elif col == "% Change":
+                try:
+                    f_pct = float(row[col])
+                    bg = "#14532d" if f_pct > 0 else "#7f1d1d" if f_pct < 0 else "#030712"
+                except Exception:
+                    bg = "#030712"
+            else:
+                bg = "#030712"
+                
+            tds.append(f'<td style="padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;background:{bg}">{format_value(col, row[col])}</td>')
+        body_rows.append(f"<tr>{''.join(tds)}</tr>")
     return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3><table style="border-collapse:collapse;width:100%;background:#030712;"><thead><tr>{header_cells}</tr></thead><tbody>{"".join(body_rows)}</tbody></table>'
 
 
