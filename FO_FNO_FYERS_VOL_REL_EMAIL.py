@@ -3,14 +3,13 @@
 FO_FNO_FYERS_VOL_REL_EMAIL.py
 
 Optimized Intraday F&O scanner via Fyers API with email alerts.
-- FIXED: Added explicit TurningDiff calculation to resolve the KeyError crash.
-- FIXED: Target breakout/breakdown prices are anchored to Yesterday's Close to 
-  form perfectly flat, unmoving horizontal execution thresholds.
-- FIXED: Breakout tracking evaluates price action ANYTIME during the whole day.
-- Fixed 15-minute Gamma Hulk anchor level decay using forward-fill.
-- Realigned multi-timeframe engine for native 15-minute bars.
-- Prioritized Gamma Hulk confirmations at the top of candidate sorting.
-- Eliminated ARIMA fitting loop to prevent live market execution lag.
+- CHOICE B STRATEGY: 6-Month Peak/Bottom derived from Daily charts (Close-to-Close returns)
+  and broadcasted as flat horizontal price channels throughout the day.
+- FIXED: Calendar-date query filtering on historical Daily candles bypasses 
+  uncompleted running candle data indexing anomalies (iloc[-1] vs iloc[-2] risk).
+- FIXED: Added explicit TurningDiff calculation to prevent tracking KeyError crashes.
+- FIXED: Filters candidate display tables to exclusively show active boundary breaches.
+- Eliminated statistical fitting processing loops to optimize execution speeds.
 """
 
 import os
@@ -55,8 +54,8 @@ logger.addHandler(ch)
 
 warnings.filterwarnings("ignore")
 
-DAILY_LOOKBACK_DAYS = 60
-INTRADAY_LOOKBACK_DAYS = 135  
+DAILY_LOOKBACK_DAYS = 135  # Set to comfortably cover a 6-month Daily chart envelope
+INTRADAY_LOOKBACK_DAYS = 30  # Intraday envelope lookback window
 IVP_LOOKBACK_DAYS = 60
 INDEX_SOFT_BOOST_WEIGHT = 0.0
 HISTORY_API_MAX_SPAN_DAYS = 99
@@ -78,9 +77,9 @@ EMAIL_DISPLAY_COLS = [
     "% Change",
     "ROC_14",          
     "ROC_6M_Peak",     
-    "ROC_6M_Peak_Price",    
+    "ROC_6M_Peak_Price",    # Locked daily breakout ceiling
     "ROC_6M_Bottom",   
-    "ROC_6M_Bottom_Price",  
+    "ROC_6M_Bottom_Price",  # Locked daily breakdown floor
     "MTF_15m",
     "MTF_30m",
     "MTF_60m",
@@ -90,12 +89,12 @@ EMAIL_DISPLAY_COLS = [
 ]
 
 
-def compute_gamma_hulk_roc(intra_df: pd.DataFrame, prev_close: Optional[float] = None) -> pd.DataFrame:
+def compute_gamma_hulk_roc(intra_df: pd.DataFrame, prev_close: Optional[float] = None, daily_peak_6m: float = 4.0, daily_bottom_6m: float = -4.0) -> pd.DataFrame:
     """
-    15-minute Gamma Hulk engine:
-    - Extracts a TRUE static horizontal 6-month boundary line from past data.
-    - Anchors price targets to Yesterday's Close to maintain flat daily lines.
-    - Evaluates breakouts/breakdowns based on the price crossing flat thresholds ANYTIME.
+    15-minute Gamma Hulk engine (Choice B Alignment):
+    - References pre-computed Daily Close-to-Close returns over the last 6 months.
+    - Projects fixed ceilings and floors anchored directly to Yesterday's Close.
+    - Captures triggers anytime the live price punches out of the channels today.
     """
     df = intra_df.copy().sort_values("timestamp").reset_index(drop=True)
 
@@ -119,24 +118,9 @@ def compute_gamma_hulk_roc(intra_df: pd.DataFrame, prev_close: Optional[float] =
 
     df["ROC_14"] = ((df["close"] - df["close"].shift(1)) / df["close"].shift(1)) * 100.0
 
-    df["_date_only"] = pd.to_datetime(df["timestamp"]).dt.date
-    unique_dates = sorted(df["_date_only"].dropna().unique())
-    
-    if len(unique_dates) >= 2:
-        current_date = unique_dates[-1]
-        historical_data = df[df["_date_only"] < current_date]
-        if not historical_data.empty and historical_data["ROC_14"].notna().sum() > 2:
-            static_peak = float(historical_data["ROC_14"].max())
-            static_bottom = float(historical_data["ROC_14"].min())
-        else:
-            static_peak = float(df["ROC_14"].rolling(500, min_periods=2).max().shift(1).iloc[-1])
-            static_bottom = float(df["ROC_14"].rolling(500, min_periods=2).min().shift(1).iloc[-1])
-    else:
-        static_peak = float(df["ROC_14"].max())
-        static_bottom = float(df["ROC_14"].min())
-
-    df["ROC_6M_Peak"] = static_peak
-    df["ROC_6M_Bottom"] = static_bottom
+    # Assign Daily Close returns calculated in the background scanner loop
+    df["ROC_6M_Peak"] = daily_peak_6m
+    df["ROC_6M_Bottom"] = daily_bottom_6m
 
     if prev_close and float(prev_close) > 0:
         df["ROC_6M_Peak_Price"] = float(prev_close) * (1 + df["ROC_6M_Peak"] / 100.0)
@@ -163,7 +147,6 @@ def compute_gamma_hulk_roc(intra_df: pd.DataFrame, prev_close: Optional[float] =
     df["Gamma_Long_Breakout"] = df["close"] > df["ROC_6M_Peak_Price"]
     df["Gamma_Short_Breakdown"] = df["close"] < df["ROC_6M_Bottom_Price"]
 
-    df.drop(columns=["_date_only"], inplace=True)
     return df
 
 
@@ -258,11 +241,10 @@ def add_dual_engine_matrix(detail_df: pd.DataFrame, eps: float = 1e-4) -> pd.Dat
     out["Current_Step"] = grouped["CumsumPlus"].diff().fillna(0.0)
     out["Prior_Step"] = grouped["Current_Step"].shift(1).fillna(0.0)
     out["CumsumDiff"] = out["Current_Step"]
-    
     out["Prior_Turning"] = grouped["Turning"].shift(1).fillna(0.0)
-    # FIX: Calculated TurningDiff to safely eliminate the index KeyError
-    out["TurningDiff"] = out["Turning"] - out["Prior_Turning"]
     
+    # CORRECTED FIX: Evaluates metric variant directly here to resolve downstream lookups
+    out["TurningDiff"] = out["Turning"] - out["Prior_Turning"]
     out["Friction_Expanding"] = (out["Turning"] > out["Prior_Turning"]) & (out["Turning"] > eps)
 
     cond_pristine = (out["Current_Step"] > eps) & (out["Prior_Step"] <= eps) & (~out["Friction_Expanding"])
@@ -486,14 +468,14 @@ def kalman_signal_from_series(prices: pd.Series, q: float = 1e-3) -> float:
     return round((arr[-1] - x) / (float(p.std()) or 1e-6), 4)
 
 
-def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame], prev_close: Optional[float] = None) -> Tuple[Dict, pd.DataFrame]:
+def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame], prev_close: Optional[float] = None, daily_peak_6m: float = 4.0, daily_bottom_6m: float = -4.0) -> Tuple[Dict, pd.DataFrame]:
     if intra_df is None or intra_df.empty: return {}, pd.DataFrame()
 
     df = intra_df.copy()
     df["date"] = pd.to_datetime(df["timestamp"]).dt.date
     df["time_only"] = pd.to_datetime(df["timestamp"]).dt.time
     
-    df = compute_gamma_hulk_roc(df, prev_close=prev_close)
+    df = compute_gamma_hulk_roc(df, prev_close=prev_close, daily_peak_6m=daily_peak_6m, daily_bottom_6m=daily_bottom_6m)
 
     dates = sorted(df["date"].unique())
     if len(dates) < 2: return {}, pd.DataFrame()
@@ -575,10 +557,10 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame], prev_clos
         "ROC_6M_Peak_Price": float(curr_df["ROC_6M_Peak_Price"].iloc[-1]) if "ROC_6M_Peak_Price" in curr_df.columns else np.nan, 
         "ROC_6M_Bottom": float(curr_df["ROC_6M_Bottom"].iloc[-1]) if "ROC_6M_Bottom" in curr_df.columns else np.nan, 
         "ROC_6M_Bottom_Price": float(curr_df["ROC_6M_Bottom_Price"].iloc[-1]) if "ROC_6M_Bottom_Price" in curr_df.columns else np.nan, 
-        "Gamma_Long_Breakout": bool(curr_df["Gamma_Long_Breakout"].iloc[-1]) if "Gamma_Long_Breakout" in curr_df.columns else False,
-        "Gamma_Short_Breakdown": bool(curr_df["Gamma_Short_Breakdown"].iloc[-1]) if "Gamma_Short_Breakdown" in curr_df.columns else False,
-        "Gamma_Long_Confirmed": bool(curr_df["Gamma_Long_Confirmed"].iloc[-1]) if "Gamma_Long_Confirmed" in curr_df.columns else False,
-        "Gamma_Short_Confirmed": bool(curr_df["Gamma_Short_Confirmed"].iloc[-1]) if "Gamma_Short_Confirmed" in curr_df.columns else False,
+        "Gamma_Long_Breakout": bool(curr_df["Gamma_Long_Breakout"].any()) if "Gamma_Long_Breakout" in curr_df.columns else False,
+        "Gamma_Short_Breakdown": bool(curr_df["Gamma_Short_Breakdown"].any()) if "Gamma_Short_Breakdown" in curr_df.columns else False,
+        "Gamma_Long_Confirmed": bool(curr_df["Gamma_Long_Confirmed"].any()) if "Gamma_Long_Confirmed" in curr_df.columns else False,
+        "Gamma_Short_Confirmed": bool(curr_df["Gamma_Short_Confirmed"].any()) if "Gamma_Short_Confirmed" in curr_df.columns else False,
         "Gamma_Breakout_High": float(curr_df["Gamma_Breakout_High"].iloc[-1]) if "Gamma_Breakout_High" in curr_df.columns else np.nan,
         "Gamma_Breakout_Low": float(curr_df["Gamma_Breakout_Low"].iloc[-1]) if "Gamma_Breakout_Low" in curr_df.columns else np.nan,
         "Cumulative RSI": float(flow_df["Cumulative RSI"].iloc[-1]) if not flow_df.empty else float("nan"),
@@ -605,7 +587,7 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame], prev_clos
 
 
 def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
-    symbols = load_fno_symbols_from_sectors()
+    symbols = load_fno_symbols_from_sectors(root_dir="sectors")
     if not symbols: return pd.DataFrame(), pd.DataFrame()
 
     rows, iteration_rows = [], []
@@ -618,8 +600,25 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
         daily_df = get_fyers_history(fyers_sym, resolution="D", days_back=max(DAILY_LOOKBACK_DAYS, IVP_LOOKBACK_DAYS))
         intra_df = get_fyers_history(fyers_sym, resolution="15", days_back=INTRADAY_LOOKBACK_DAYS)
 
-        prev_close = float(daily_df["close"].iloc[-2]) if (daily_df is not None and len(daily_df) >= 2) else None
-        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df, prev_close)
+        # CHOICE B DEFINITIVE FIX: Uses strict calendar comparisons to remove uncompleted live candle risks
+        if daily_df is not None and len(daily_df) >= 3:
+            daily_df["_date_parsed"] = pd.to_datetime(daily_df["timestamp"]).dt.date
+            today_date = datetime.now().date()
+            
+            hist_daily = daily_df[daily_df["_date_parsed"] < today_date].copy()
+            if not hist_daily.empty:
+                prev_close = float(hist_daily["close"].iloc[-1])
+                hist_daily["daily_roc"] = ((hist_daily["close"] - hist_daily["close"].shift(1)) / hist_daily["close"].shift(1)) * 100.0
+                daily_peak_6m = float(hist_daily["daily_roc"].max())
+                daily_bottom_6m = float(hist_daily["daily_roc"].min())
+            else:
+                daily_peak_6m, daily_bottom_6m = 4.23, -4.23
+                prev_close = float(daily_df["close"].iloc[-1])
+        else:
+            daily_peak_6m, daily_bottom_6m = 4.23, -4.23
+            prev_close = float(daily_df["close"].iloc[-1]) if daily_df is not None and not daily_df.empty else None
+
+        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df, prev_close, daily_peak_6m, daily_bottom_6m)
         iv_info = compute_iv_proxies(daily_df)
 
         ltp = iter_summary.get("LTP")
@@ -727,17 +726,17 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         out = dfside.copy()
 
         if side == "long":
-            out = out[out["Directional"] > 0].copy()
+            # HARD FILTER: Enforces that long lists only hold stocks that breached the Daily milestone targets today
+            out = out[out["Gamma_Long_Breakout"] == True].copy()
             if out.empty: return out
             out["Gamma_Long_Confirmed"] = out["Gamma_Long_Confirmed"].fillna(False).astype(int)
-            out["Gamma_Long_Breakout"] = out["Gamma_Long_Breakout"].fillna(False).astype(int)
-            return out.sort_values(['Gamma_Long_Confirmed', 'Gamma_Long_Breakout', 'MTF_SCORE', 'ROC_14'], ascending=[False, False, False, False], na_position='last')
+            return out.sort_values(['Gamma_Long_Confirmed', 'MTF_SCORE', 'ROC_14'], ascending=[False, False, False], na_position='last')
         else:
-            out = out[out["Directional"] < 0].copy()
+            # HARD FILTER: Enforces that short lists only hold stocks that dropped below the Daily milestone targets today
+            out = out[out["Gamma_Short_Breakdown"] == True].copy()
             if out.empty: return out
             out["Gamma_Short_Confirmed"] = out["Gamma_Short_Confirmed"].fillna(False).astype(int)
-            out["Gamma_Short_Breakdown"] = out["Gamma_Short_Breakdown"].fillna(False).astype(int)
-            return out.sort_values(['Gamma_Short_Confirmed', 'Gamma_Short_Breakdown', 'MTF_SCORE', 'ROC_14'], ascending=[False, False, True, True], na_position='last')
+            return out.sort_values(['Gamma_Short_Confirmed', 'MTF_SCORE', 'ROC_14'], ascending=[False, False, True], na_position='last')
 
     long_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
     short_df = prep_side_df(base, "short").drop_duplicates(subset=["Symbol"]).head(15)
