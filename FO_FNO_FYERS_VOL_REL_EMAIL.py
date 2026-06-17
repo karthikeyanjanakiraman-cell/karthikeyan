@@ -3,9 +3,9 @@
 FO_FNO_FYERS_VOL_REL_EMAIL.py
 
 Optimized Intraday F&O scanner via Fyers API with email alerts.
-- MULTI-TIMEFRAME VOLUME CLIMAX: Simultaneously tracks 1M, 3M, and 6M volume peaks.
-- FRESH CROSSOVER FILTER: Only alerts on stocks breaking their respective bands TODAY.
-- SMART DISPLAY: Identifies and labels the strongest active timeframe breakout in the email.
+- STRATEGY: 6-Month Volume Climax Bands.
+- FRESH CROSSOVER FILTER: Only alerts on stocks breaking the band TODAY.
+- EMAIL CLEANUP: Removed historical 15-iteration noise tables. Only shows fresh signals.
 """
 
 import os
@@ -50,8 +50,9 @@ logger.addHandler(ch)
 
 warnings.filterwarnings("ignore")
 
-DAILY_LOOKBACK_DAYS = 200  # Ensures we capture 135 actual trading days
+DAILY_LOOKBACK_DAYS = 135  # ~6 Months of trading days
 INTRADAY_LOOKBACK_DAYS = 30
+IVP_LOOKBACK_DAYS = 60
 HISTORY_API_MAX_SPAN_DAYS = 99
 FYERS_RATE_LIMIT_SLEEP = 0.31
 FYERS_RETRY_SLEEP = 2.0
@@ -65,15 +66,14 @@ sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
 sender_password = os.environ.get("SENDER_PASSWORD", "password")
 recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
-# Updated Email Columns to reflect the Timeframe tag
+# Updated Email Columns to reflect your Climax Band Strategy
 EMAIL_DISPLAY_COLS = [
     "Symbol",
     "LTP",
     "% Change",
-    "Timeframe",      # Displays '6M', '3M', or '1M'
-    "Top_Band",       # The High of the Climax Day
-    "Bottom_Band",    # The Low of the Climax Day
-    "Climax_Date",    # Date of the climax
+    "Top_Band",       # The High of the Climax Day (Resistance)
+    "Bottom_Band",    # The Low of the Climax Day (Support)
+    "Climax_Date",    # The exact date the massive volume occurred
     "MTF_15m",
     "MTF_30m",
     "MTF_60m",
@@ -242,7 +242,7 @@ def price_stats_from_series(prices: pd.Series) -> dict:
     return {"Directional": directional, "Turning": turning, "Stability": float(np.std(p.values)), "Balanced": directional - turning + float(np.std(p.values)), "CumsumPlus": float(np.sum(np.clip(np.diff(p.values), 0, None)))}
 
 
-def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame], prev_close: Optional[float]) -> Tuple[Dict, pd.DataFrame]:
+def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame], prev_close: Optional[float], top_band: float, bottom_band: float, climax_date: str) -> Tuple[Dict, pd.DataFrame]:
     if intra_df is None or intra_df.empty: return {}, pd.DataFrame()
 
     df = intra_df.copy()
@@ -273,7 +273,10 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame], prev_clos
         rows.append({
             "Iteration No": total_iters, "Iteration Time": t.strftime("%H:%M"),
             "LTP": float(row["close"]), "Iteration Change": float(curr_df["Iteration Change"].iloc[i]),
-            "Directional": ps["Directional"], "Turning": ps["Turning"], "Stability": ps["Stability"], "Balanced": ps["Balanced"], "CumsumPlus": ps.get("CumsumPlus")
+            "Directional": ps["Directional"], "Turning": ps["Turning"], "Stability": ps["Stability"], "Balanced": ps["Balanced"], "CumsumPlus": ps.get("CumsumPlus"),
+            "Top_Band": top_band,
+            "Bottom_Band": bottom_band,
+            "Climax_Date": climax_date
         })
         last_iter_time = t.strftime("%H:%M")
 
@@ -284,6 +287,9 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame], prev_clos
     summary = {
         "LTP": ltp, "Directional": final_ps["Directional"], "Turning": final_ps["Turning"], "Stability": final_ps["Stability"],
         "Balanced": final_ps["Balanced"], "CumsumPlus": final_ps.get("CumsumPlus"), 
+        "Top_Band": top_band,
+        "Bottom_Band": bottom_band,
+        "Climax_Date": climax_date,
         "Total Iterations": total_iters, "Last Iteration Time": last_iter_time,
     }
 
@@ -307,8 +313,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
         intra_df = get_fyers_history(fyers_sym, resolution="15", days_back=INTRADAY_LOOKBACK_DAYS)
 
         prev_close = None
-        t1m = b1m = t3m = b3m = t6m = b6m = float("nan")
-        d1m = d3m = d6m = "N/A"
+        top_band, bottom_band, climax_date = float("inf"), float("-inf"), "N/A"
 
         if daily_df is not None and len(daily_df) >= 3:
             daily_df["_date_parsed"] = pd.to_datetime(daily_df["timestamp"]).dt.date
@@ -318,23 +323,19 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             if not hist_daily.empty:
                 prev_close = float(hist_daily["close"].iloc[-1])
                 
-                # Function to extract the highest volume day over X trading days
-                def get_climax_band(df_hist, trading_days):
-                    df_slice = df_hist.tail(trading_days)
-                    if df_slice.empty: return float("nan"), float("nan"), "N/A"
-                    max_vol_idx = df_slice["volume"].idxmax()
-                    c_day = df_slice.loc[max_vol_idx]
-                    return float(c_day["high"]), float(c_day["low"]), str(c_day["_date_parsed"])
+                # Find the single day with the highest volume in the last 6 months
+                max_vol_idx = hist_daily["volume"].idxmax()
+                climax_day = hist_daily.loc[max_vol_idx]
                 
-                # Extract 1M (~22 days), 3M (~65 days), and 6M (~135 days)
-                t1m, b1m, d1m = get_climax_band(hist_daily, 22)
-                t3m, b3m, d3m = get_climax_band(hist_daily, 65)
-                t6m, b6m, d6m = get_climax_band(hist_daily, 135)
+                # Extract the High (Top Band) and Low (Bottom Band) of that specific day
+                top_band = float(climax_day["high"])
+                bottom_band = float(climax_day["low"])
+                climax_date = str(climax_day["_date_parsed"])
         
         if prev_close is None and daily_df is not None and not daily_df.empty:
             prev_close = float(daily_df["close"].iloc[-1])
 
-        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df, prev_close)
+        iter_summary, iter_detail = compute_iteration_volume_profile(intra_df, prev_close, top_band, bottom_band, climax_date)
 
         ltp = iter_summary.get("LTP")
         pct_change = ((ltp - prev_close) / prev_close * 100) if (ltp is not None and prev_close and prev_close != 0) else 0.0
@@ -346,10 +347,10 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
         rows.append({
             "Symbol": sym, "LTP": ltp, "% Change": pct_change,
-            "Prev_Close": prev_close,
-            "Top_Band_1M": t1m, "Bottom_Band_1M": b1m, "Climax_Date_1M": d1m,
-            "Top_Band_3M": t3m, "Bottom_Band_3M": b3m, "Climax_Date_3M": d3m,
-            "Top_Band_6M": t6m, "Bottom_Band_6M": b6m, "Climax_Date_6M": d6m,
+            "Prev_Close": prev_close, # Captured for Fresh Crossover Matrix
+            "Top_Band": iter_summary.get("Top_Band"),
+            "Bottom_Band": iter_summary.get("Bottom_Band"),
+            "Climax_Date": iter_summary.get("Climax_Date"),
             "Directional": iter_summary.get("Directional"), "Turning": iter_summary.get("Turning"),
             "Stability": iter_summary.get("Stability"), "Balanced": iter_summary.get("Balanced"), "CumsumPlus": iter_summary.get("CumsumPlus"),
             "5m_Signal": iter_summary.get("5m_Signal"), "15m_Signal": iter_summary.get("15m_Signal"), "30m_Signal": iter_summary.get("30m_Signal"), "60m_Signal": iter_summary.get("60m_Signal"),
@@ -363,7 +364,6 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 def format_value(col: str, val):
     if pd.isna(val) or val == float("inf") or val == float("-inf"): return ""
-    if col == "Timeframe": return str(val)
     if col == "% Change": return f"{float(val):.2f}%"
     if col in ["Top_Band", "Bottom_Band"]: return f"{float(val):.2f}"
     if col == "Climax_Date": return str(val)
@@ -375,52 +375,30 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     if df is None or df.empty: return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     base = df.copy()
     
-    for c in ["LTP", "Prev_Close", "Top_Band_1M", "Top_Band_3M", "Top_Band_6M", "Bottom_Band_1M", "Bottom_Band_3M", "Bottom_Band_6M", "% Change", "MTF_SCORE"]:
+    for c in ["LTP", "Prev_Close", "Top_Band", "Bottom_Band", "% Change", "MTF_SCORE"]:
         if c in base.columns: base[c] = pd.to_numeric(base[c], errors="coerce")
 
     def prep_side_df(dfside: pd.DataFrame, side: str) -> pd.DataFrame:
         if dfside.empty: return dfside
         out = dfside.copy()
-        
-        valid_rows = []
-        
-        for _, row in out.iterrows():
-            ltp = row.get("LTP")
-            pc = row.get("Prev_Close")
-            if pd.isna(ltp) or pd.isna(pc): continue
 
-            if side == "long":
-                # Check Timeframes from Strongest (6M) to Fastest (1M)
-                if pd.notna(row.get("Top_Band_6M")) and pc <= row["Top_Band_6M"] and ltp > row["Top_Band_6M"]:
-                    row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = "6M", row["Top_Band_6M"], row["Bottom_Band_6M"], row["Climax_Date_6M"]
-                    valid_rows.append(row)
-                elif pd.notna(row.get("Top_Band_3M")) and pc <= row["Top_Band_3M"] and ltp > row["Top_Band_3M"]:
-                    row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = "3M", row["Top_Band_3M"], row["Bottom_Band_3M"], row["Climax_Date_3M"]
-                    valid_rows.append(row)
-                elif pd.notna(row.get("Top_Band_1M")) and pc <= row["Top_Band_1M"] and ltp > row["Top_Band_1M"]:
-                    row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = "1M", row["Top_Band_1M"], row["Bottom_Band_1M"], row["Climax_Date_1M"]
-                    valid_rows.append(row)
-
-            else: # Short side
-                if pd.notna(row.get("Bottom_Band_6M")) and pc >= row["Bottom_Band_6M"] and ltp < row["Bottom_Band_6M"]:
-                    row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = "6M", row["Top_Band_6M"], row["Bottom_Band_6M"], row["Climax_Date_6M"]
-                    valid_rows.append(row)
-                elif pd.notna(row.get("Bottom_Band_3M")) and pc >= row["Bottom_Band_3M"] and ltp < row["Bottom_Band_3M"]:
-                    row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = "3M", row["Top_Band_3M"], row["Bottom_Band_3M"], row["Climax_Date_3M"]
-                    valid_rows.append(row)
-                elif pd.notna(row.get("Bottom_Band_1M")) and pc >= row["Bottom_Band_1M"] and ltp < row["Bottom_Band_1M"]:
-                    row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = "1M", row["Top_Band_1M"], row["Bottom_Band_1M"], row["Climax_Date_1M"]
-                    valid_rows.append(row)
-
-        res_df = pd.DataFrame(valid_rows)
-        if res_df.empty: return res_df
+        if side == "long":
+            # FRESH CROSSOVER: Yesterday's close was below or inside the band, but Live Price broke the Top Band TODAY
+            if "LTP" in out.columns and "Top_Band" in out.columns and "Prev_Close" in out.columns:
+                out = out[(out["Prev_Close"] <= out["Top_Band"]) & (out["LTP"] > out["Top_Band"])].copy()
+            if out.empty: return out
+            return out.sort_values(['MTF_SCORE'], ascending=[False], na_position='last')
         
-        return res_df.sort_values(['MTF_SCORE'], ascending=[False if side=="long" else True], na_position='last')
+        else:
+            # FRESH CROSSOVER: Yesterday's close was above or inside the band, but Live Price broke the Bottom Band TODAY
+            if "LTP" in out.columns and "Bottom_Band" in out.columns and "Prev_Close" in out.columns:
+                out = out[(out["Prev_Close"] >= out["Bottom_Band"]) & (out["LTP"] < out["Bottom_Band"])].copy()
+            if out.empty: return out
+            return out.sort_values(['MTF_SCORE'], ascending=[True], na_position='last')
 
     long_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
     short_df = prep_side_df(base, "short").drop_duplicates(subset=["Symbol"]).head(15)
-    
-    cols = [c for c in EMAIL_DISPLAY_COLS if c in long_df.columns or c in short_df.columns]
+    cols = [c for c in EMAIL_DISPLAY_COLS if c in base.columns]
     return (long_df[cols] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)), (short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS))
 
 
@@ -434,20 +412,16 @@ def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 15) -> str:
     for _, row in df_slice.iterrows():
         tds = []
         for col in cols:
-            bg = "#030712"
             if col == "% Change":
                 try:
                     f_pct = float(row[col])
                     bg = "#14532d" if f_pct > 0 else "#7f1d1d" if f_pct < 0 else "#030712"
                 except Exception:
-                    pass
-            elif col == "Timeframe":
-                # Color code the timeframes
-                if row[col] == "6M": bg = "#431407" # Deep rust/orange for macro
-                elif row[col] == "3M": bg = "#1e3a8a" # Deep blue for mid
-                elif row[col] == "1M": bg = "#064e3b" # Deep green for fast
+                    bg = "#030712"
+            else:
+                bg = "#030712"
                 
-            tds.append(f'<td style="padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;background:{bg}">{format_value(col, row.get(col, ""))}</td>')
+            tds.append(f'<td style="padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;background:{bg}">{format_value(col, row[col])}</td>')
         body_rows.append(f"<tr>{''.join(tds)}</tr>")
     return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3><table style="border-collapse:collapse;width:100%;background:#030712;"><thead><tr>{header_cells}</tr></thead><tbody>{"".join(body_rows)}</tbody></table>'
 
@@ -458,7 +432,7 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
         html_body = f"""
         <html>
         <body style="background:#030712;color:#e5e7eb;padding:20px;font-family:Arial,sans-serif;">
-            <h2 style="color:#facc15;">Multi-Timeframe Climax Execution Alert</h2>
+            <h2 style="color:#facc15;">Volume Climax Band Execution Alert</h2>
             <div style="color:#cbd5e1;font-size:14px;margin-bottom:18px;">Scan completed at {scan_time}</div>
             {build_html_table(long_df, "Fresh Long Breakouts (Today Only)")}
             <div style="height:28px;"></div>
@@ -467,7 +441,7 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
         </html>
         """
         msg = MIMEMultipart()
-        msg["From"], msg["To"], msg["Subject"] = sender_email, recipient_email, f"Multi-TF Climax Alert - {scan_time}"
+        msg["From"], msg["To"], msg["Subject"] = sender_email, recipient_email, f"Fresh Climax Breakout Alert - {scan_time}"
         msg.attach(MIMEText(html_body, "html", "utf-8"))
 
         for fname in [csv_filename, detail_csv_filename]:
