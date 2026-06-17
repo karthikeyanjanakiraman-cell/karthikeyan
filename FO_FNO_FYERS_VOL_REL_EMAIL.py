@@ -3,9 +3,10 @@
 FO_FNO_FYERS_VOL_REL_EMAIL.py
 
 Optimized Intraday F&O scanner via Fyers API with email alerts.
-- STRATEGY: 6-Month Volume Climax Bands.
-- FRESH CROSSOVER FILTER: Only alerts on stocks breaking the band TODAY.
-- EMAIL CLEANUP: Removed historical 15-iteration noise tables. Only shows fresh signals.
+- NEW STRATEGY: 6-Month Volume Climax Bands.
+- Identifies the highest volume day in the last 6 months.
+- The High of that day = Top Band (Resistance / Long Trigger).
+- The Low of that day = Bottom Band (Support / Short Trigger / Stop Loss).
 """
 
 import os
@@ -323,7 +324,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             if not hist_daily.empty:
                 prev_close = float(hist_daily["close"].iloc[-1])
                 
-                # Find the single day with the highest volume in the last 6 months
+                # YOUR LOGIC: Find the single day with the highest volume in the last 6 months
                 max_vol_idx = hist_daily["volume"].idxmax()
                 climax_day = hist_daily.loc[max_vol_idx]
                 
@@ -347,7 +348,6 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
         rows.append({
             "Symbol": sym, "LTP": ltp, "% Change": pct_change,
-            "Prev_Close": prev_close, # Captured for Fresh Crossover Matrix
             "Top_Band": iter_summary.get("Top_Band"),
             "Bottom_Band": iter_summary.get("Bottom_Band"),
             "Climax_Date": iter_summary.get("Climax_Date"),
@@ -375,7 +375,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     if df is None or df.empty: return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     base = df.copy()
     
-    for c in ["LTP", "Prev_Close", "Top_Band", "Bottom_Band", "% Change", "MTF_SCORE"]:
+    for c in ["LTP", "Top_Band", "Bottom_Band", "% Change", "MTF_SCORE"]:
         if c in base.columns: base[c] = pd.to_numeric(base[c], errors="coerce")
 
     def prep_side_df(dfside: pd.DataFrame, side: str) -> pd.DataFrame:
@@ -383,16 +383,16 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         out = dfside.copy()
 
         if side == "long":
-            # FRESH CROSSOVER: Yesterday's close was below or inside the band, but Live Price broke the Top Band TODAY
-            if "LTP" in out.columns and "Top_Band" in out.columns and "Prev_Close" in out.columns:
-                out = out[(out["Prev_Close"] <= out["Top_Band"]) & (out["LTP"] > out["Top_Band"])].copy()
+            # YOUR PURE LOGIC: Long if Live Price breaks above the Top Band of the Climax Day
+            if "LTP" in out.columns and "Top_Band" in out.columns:
+                out = out[out["LTP"] > out["Top_Band"]].copy()
             if out.empty: return out
             return out.sort_values(['MTF_SCORE'], ascending=[False], na_position='last')
         
         else:
-            # FRESH CROSSOVER: Yesterday's close was above or inside the band, but Live Price broke the Bottom Band TODAY
-            if "LTP" in out.columns and "Bottom_Band" in out.columns and "Prev_Close" in out.columns:
-                out = out[(out["Prev_Close"] >= out["Bottom_Band"]) & (out["LTP"] < out["Bottom_Band"])].copy()
+            # YOUR PURE LOGIC: Short if Live Price breaches below the Bottom Band of the Climax Day
+            if "LTP" in out.columns and "Bottom_Band" in out.columns:
+                out = out[out["LTP"] < out["Bottom_Band"]].copy()
             if out.empty: return out
             return out.sort_values(['MTF_SCORE'], ascending=[True], na_position='last')
 
@@ -402,8 +402,51 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     return (long_df[cols] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)), (short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS))
 
 
+def load_iteration_history(detail_df: pd.DataFrame) -> pd.DataFrame:
+    if detail_df is None or detail_df.empty: return pd.DataFrame()
+    df = detail_df.copy()
+    if "Iteration No" not in df.columns: return pd.DataFrame()
+
+    last15_iters = sorted(df["Iteration No"].dropna().astype(int).unique())[-15:]
+    df = df[df["Iteration No"].astype(int).isin(last15_iters)].copy()
+
+    long_top = df[df["Directional"] > 0].sort_values(["Iteration No", "Directional"], ascending=[True, False]).groupby("Iteration No").head(1).assign(Side="Long")
+    short_top = df[df["Directional"] < 0].sort_values(["Iteration No", "Directional"], ascending=[True, True]).groupby("Iteration No").head(1).assign(Side="Short")
+    
+    out = pd.concat([long_top, short_top], ignore_index=True, sort=False)
+    if out.empty: return out
+
+    out = out.sort_values(["Iteration No", "Side"]).reset_index(drop=True)
+    out["Iteration"] = out["Iteration No"].astype(str) + " @ " + out["Iteration Time"].astype(str)
+    out["First Occurrence"] = out["Iteration"]
+    out["Latest"] = out["Iteration"]
+    return out
+
+
+def build_history_table(history_df: pd.DataFrame, side: str) -> str:
+    if history_df is None or history_df.empty: return "No history yet."
+    df = history_df[history_df["Side"].astype(str).str.lower() == side.lower()].copy()
+    if df.empty: return "No history yet."
+
+    cols = ["First Occurrence", "Latest", "Symbol", "LTP", "% Change", "Directional", "Turning", "Stability", "Balanced", "CumsumPlus", "Iteration Time"]
+    df = df.tail(15)[cols].copy()
+
+    header = "".join(f'<th style="padding:8px;border:1px solid #4b5563;background:#111827;color:#f9fafb;">{c}</th>' for c in cols)
+    body_rows = []
+    for _, r in df.iterrows():
+        try:
+            f_dir = float(r["Directional"])
+            bg = "#14532d" if f_dir > 0 else "#7f1d1d" if f_dir < 0 else "#030712"
+        except Exception:
+            bg = "#030712"
+            
+        tds = "".join(f'<td style="padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;background:{bg}">{format_value(c, r[c])}</td>' for c in cols)
+        body_rows.append(f"<tr>{tds}</tr>")
+    return f'<h3 style="color:{"#22c55e" if side.lower()=="long" else "#ef4444"};margin:12px 0 6px 0;">Top 1 {side.title()} - Last 15 Iterations</h3><table style="border-collapse:collapse;width:100%;background:#030712;"><thead><tr>{header}</tr></thead><tbody>{"".join(body_rows)}</tbody></table>'
+
+
 def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 15) -> str:
-    if df is None or df.empty: return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3><div style="padding:12px;background:#111827;color:#d1d5db;">No fresh breakout candidates today.</div>'
+    if df is None or df.empty: return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3><div style="padding:12px;background:#111827;color:#d1d5db;">No breakout candidates found.</div>'
     df_slice = df.head(max_rows).copy()
     cols = [c for c in EMAIL_DISPLAY_COLS if c in df_slice.columns]
 
@@ -426,7 +469,7 @@ def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 15) -> str:
     return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3><table style="border-collapse:collapse;width:100%;background:#030712;"><thead><tr>{header_cells}</tr></thead><tbody>{"".join(body_rows)}</tbody></table>'
 
 
-def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
+def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, history_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
     try:
         scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         html_body = f"""
@@ -434,14 +477,16 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
         <body style="background:#030712;color:#e5e7eb;padding:20px;font-family:Arial,sans-serif;">
             <h2 style="color:#facc15;">Volume Climax Band Execution Alert</h2>
             <div style="color:#cbd5e1;font-size:14px;margin-bottom:18px;">Scan completed at {scan_time}</div>
-            {build_html_table(long_df, "Fresh Long Breakouts (Today Only)")}
+            {build_html_table(long_df, "Confirmed Long Climax Breakouts")}
+            {build_history_table(history_df, "long")}
             <div style="height:28px;"></div>
-            {build_html_table(short_df, "Fresh Short Breakdowns (Today Only)")}
+            {build_html_table(short_df, "Confirmed Short Climax Breakdowns")}
+            {build_history_table(history_df, "short")}
         </body>
         </html>
         """
         msg = MIMEMultipart()
-        msg["From"], msg["To"], msg["Subject"] = sender_email, recipient_email, f"Fresh Climax Breakout Alert - {scan_time}"
+        msg["From"], msg["To"], msg["Subject"] = sender_email, recipient_email, f"Climax Band Alert - {scan_time}"
         msg.attach(MIMEText(html_body, "html", "utf-8"))
 
         for fname in [csv_filename, detail_csv_filename]:
@@ -485,9 +530,10 @@ def main():
 
     summary_csv, detail_csv = save_outputs(summary_df, detail_df, prefix="fno")
     long_df, short_df = build_candidate_tables(summary_df)
+    history_df = load_iteration_history(detail_df)
 
     send_email_with_tables(
-        long_df=long_df, short_df=short_df,
+        long_df=long_df, short_df=short_df, history_df=history_df,
         csv_filename=summary_csv, detail_csv_filename=detail_csv
     )
 
