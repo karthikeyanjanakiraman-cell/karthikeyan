@@ -4,8 +4,8 @@ FO_FNO_FYERS_VOL_REL_EMAIL.py
 
 Optimized Intraday F&O scanner via Fyers API with email alerts.
 - MULTI-TIMEFRAME VOLUME CLIMAX: Simultaneously tracks 1M, 3M, and 6M volume peaks.
-- 10-DAY BREACH AGE FILTER: Climax Date can be any date, but the price must have broken out/swept within the last 10 days.
-- ALL-INCLUSIVE VIEW: Displays Fresh Sweeps, Fresh Breakouts, and recent Active Trends.
+- 10-DAY BREACH AGE FILTER: Climax Date can be any date, but price must have broken out/swept within <= 10 days.
+- URGENCY & VELOCITY SORTING: Sorted by Signal Type and % Change (MTF_SCORE sorting ignored).
 - VISUALS: Fresh Sweeps are highlighted in gold-amber; timeframes are distinctly color-coded.
 """
 
@@ -408,7 +408,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     if df is None or df.empty: return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     base = df.copy()
     
-    for c in ["LTP", "Prev_Close", "Day_Low", "Day_High", "% Change", "MTF_SCORE"]:
+    for c in ["LTP", "Prev_Close", "Day_Low", "Day_High", "Top_Band_1M", "Top_Band_3M", "Top_Band_6M", "Bottom_Band_1M", "Bottom_Band_3M", "Bottom_Band_6M", "% Change", "MTF_SCORE"]:
         if c in base.columns: base[c] = pd.to_numeric(base[c], errors="coerce")
 
     def prep_side_df(dfside: pd.DataFrame, side: str) -> pd.DataFrame:
@@ -456,7 +456,12 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
 
         res_df = pd.DataFrame(valid_rows)
         if res_df.empty: return res_df
-        return res_df.sort_values(['MTF_SCORE'], ascending=[False if side=="long" else True], na_position='last')
+        
+        # Sorted by Signal_Type hierarchy, with % Change as the definitive velocity tie-breaker
+        if side == "long":
+            return res_df.sort_values(by=['Signal_Type', '% Change'], ascending=[False, False], na_position='last')
+        else:
+            return res_df.sort_values(by=['Signal_Type', '% Change'], ascending=[False, True], na_position='last')
 
     long_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]).head(30)
     short_df = prep_side_df(base, "short").drop_duplicates(subset=["Symbol"]).head(30)
