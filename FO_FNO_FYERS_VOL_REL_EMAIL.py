@@ -5,7 +5,7 @@ FO_FNO_FYERS_VOL_REL_EMAIL.py
 Optimized Intraday F&O scanner via Fyers API with email alerts.
 - MULTI-TIMEFRAME VOLUME CLIMAX: Simultaneously tracks 1M, 3M, and 6M volume peaks.
 - 10-DAY BREACH AGE FILTER: Climax Date can be any date, but price must have broken out/swept within <= 10 days.
-- URGENCY & VELOCITY SORTING: Sorted by Signal Type and % Change (MTF_SCORE sorting ignored).
+- BREACH-VELOCITY HIERARCHY: Single table sorting by days since breach (recency) first, then by % Change (velocity).
 - VISUALS: Fresh Sweeps are highlighted in gold-amber; timeframes are distinctly color-coded.
 """
 
@@ -329,7 +329,6 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
                     c_day = df_slice.loc[max_vol_idx]
                     return float(c_day["high"]), float(c_day["low"]), str(c_day["_date_parsed"])
                 
-                # Extract 1M (~22 days), 3M (~65 days), and 6M (~135 days)
                 t1m, b1m, d1m = get_climax_band(hist_daily, 22)
                 t3m, b3m, d3m = get_climax_band(hist_daily, 65)
                 t6m, b6m, d6m = get_climax_band(hist_daily, 135)
@@ -436,6 +435,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
                             else: row["Signal_Type"] = "Active Trend"
                                 
                             row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = tf, t, b, d
+                            row["Breach_Days"] = bd_days  # Captured for unified hierarchy sort
                             valid_rows.append(row)
                             break
 
@@ -451,17 +451,18 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
                             else: row["Signal_Type"] = "Active Trend"
                                 
                             row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = tf, t, b, d
+                            row["Breach_Days"] = bd_days  # Captured for unified hierarchy sort
                             valid_rows.append(row)
                             break
 
         res_df = pd.DataFrame(valid_rows)
         if res_df.empty: return res_df
         
-        # Sorted by Signal_Type hierarchy, with % Change as the definitive velocity tie-breaker
+        # Unified Sorting: Recency Tier (Breach_Days Ascending) first, then Velocity Volume (% Change) as tiebreaker
         if side == "long":
-            return res_df.sort_values(by=['Signal_Type', '% Change'], ascending=[False, False], na_position='last')
+            return res_df.sort_values(by=['Breach_Days', '% Change'], ascending=[True, False], na_position='last')
         else:
-            return res_df.sort_values(by=['Signal_Type', '% Change'], ascending=[False, True], na_position='last')
+            return res_df.sort_values(by=['Breach_Days', '% Change'], ascending=[True, True], na_position='last')
 
     long_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]).head(30)
     short_df = prep_side_df(base, "short").drop_duplicates(subset=["Symbol"]).head(30)
