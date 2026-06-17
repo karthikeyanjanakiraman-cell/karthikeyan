@@ -4,8 +4,8 @@ FO_FNO_FYERS_VOL_REL_EMAIL.py
 
 Optimized Intraday F&O scanner via Fyers API with email alerts.
 - MULTI-TIMEFRAME VOLUME CLIMAX: Simultaneously tracks 1M, 3M, and 6M volume peaks.
-- 10-DAY RECENCY FILTER: Only allows signals where the climax happened RECENTLY (< 10 days ago).
-- ALL-INCLUSIVE VIEW: Displays Fresh Sweeps, Fresh Breakouts, and Active Trends.
+- 10-DAY BREACH AGE FILTER: Climax Date can be any date, but the price must have broken out/swept within the last 10 days.
+- ALL-INCLUSIVE VIEW: Displays Fresh Sweeps, Fresh Breakouts, and recent Active Trends.
 - VISUALS: Fresh Sweeps are highlighted in gold-amber; timeframes are distinctly color-coded.
 """
 
@@ -321,7 +321,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             if not hist_daily.empty:
                 prev_close = float(hist_daily["close"].iloc[-1])
                 
-                # REVERTED TO YOUR EXACT ORIGINAL LOGIC: Top is High, Bottom is Low of the Climax Day
+                # Function to extract the highest volume day over X trading days
                 def get_climax_band(df_hist, trading_days):
                     df_slice = df_hist.tail(trading_days)
                     if df_slice.empty: return float("nan"), float("nan"), "N/A"
@@ -329,6 +329,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
                     c_day = df_slice.loc[max_vol_idx]
                     return float(c_day["high"]), float(c_day["low"]), str(c_day["_date_parsed"])
                 
+                # Extract 1M (~22 days), 3M (~65 days), and 6M (~135 days)
                 t1m, b1m, d1m = get_climax_band(hist_daily, 22)
                 t3m, b3m, d3m = get_climax_band(hist_daily, 65)
                 t6m, b6m, d6m = get_climax_band(hist_daily, 135)
@@ -344,7 +345,6 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             prev_close = float(daily_df["close"].iloc[-1])
 
         iter_summary, iter_detail = compute_iteration_volume_profile(intra_df, prev_close)
-
         ltp = iter_summary.get("LTP")
         pct_change = ((ltp - prev_close) / prev_close * 100) if (ltp is not None and prev_close and prev_close != 0) else 0.0
 
@@ -353,13 +353,36 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             iter_detail.insert(1, "% Change", pct_change)
             iteration_rows.append(iter_detail)
 
+        # Dynamic calculation of Calendar Days Since Breach
+        bd_l1m = bd_s1m = bd_l3m = bd_s3m = bd_l6m = bd_s6m = 999
+        if daily_df is not None and not daily_df.empty and ltp is not None:
+            today_date = datetime.now().date()
+            history_candles = [(row["_date_parsed"], float(row["close"])) for _, row in daily_df[daily_df["_date_parsed"] < today_date].iterrows()]
+            history_candles.append((today_date, ltp))
+
+            def get_streak_days(t_val, b_val):
+                l_start = s_start = None
+                for d, c in reversed(history_candles):
+                    if pd.notna(t_val) and c > t_val: l_start = d
+                    else: break
+                for d, c in reversed(history_candles):
+                    if pd.notna(b_val) and c < b_val: s_start = d
+                    else: break
+                l_days = (today_date - l_start).days if l_start else 999
+                s_days = (today_date - s_start).days if s_start else 999
+                return l_days, s_days
+
+            bd_l1m, bd_s1m = get_streak_days(t1m, b1m)
+            bd_l3m, bd_s3m = get_streak_days(t3m, b3m)
+            bd_l6m, bd_s6m = get_streak_days(t6m, b6m)
+
         rows.append({
             "Symbol": sym, "LTP": ltp, "% Change": pct_change,
             "Prev_Close": prev_close, "Day_Low": day_low, "Day_High": day_high,
             "Signal_Type": "N/A",
-            "Top_Band_1M": t1m, "Bottom_Band_1M": b1m, "Climax_Date_1M": d1m,
-            "Top_Band_3M": t3m, "Bottom_Band_3M": b3m, "Climax_Date_3M": d3m,
-            "Top_Band_6M": t6m, "Bottom_Band_6M": b6m, "Climax_Date_6M": d6m,
+            "Top_Band_1M": t1m, "Bottom_Band_1M": b1m, "Climax_Date_1M": d1m, "Breach_Days_L_1M": bd_l1m, "Breach_Days_S_1M": bd_s1m,
+            "Top_Band_3M": t3m, "Bottom_Band_3M": b3m, "Climax_Date_3M": d3m, "Breach_Days_L_3M": bd_l3m, "Breach_Days_S_3M": bd_s3m,
+            "Top_Band_6M": t6m, "Bottom_Band_6M": b6m, "Climax_Date_6M": d6m, "Breach_Days_L_6M": bd_l6m, "Breach_Days_S_6M": bd_s6m,
             "Directional": iter_summary.get("Directional"), "Turning": iter_summary.get("Turning"),
             "Stability": iter_summary.get("Stability"), "Balanced": iter_summary.get("Balanced"), "CumsumPlus": iter_summary.get("CumsumPlus"),
             "5m_Signal": iter_summary.get("5m_Signal"), "15m_Signal": iter_summary.get("15m_Signal"), "30m_Signal": iter_summary.get("30m_Signal"), "60m_Signal": iter_summary.get("60m_Signal"),
@@ -385,14 +408,13 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     if df is None or df.empty: return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     base = df.copy()
     
-    for c in ["LTP", "Prev_Close", "Day_Low", "Day_High", "Top_Band_1M", "Top_Band_3M", "Top_Band_6M", "Bottom_Band_1M", "Bottom_Band_3M", "Bottom_Band_6M", "% Change", "MTF_SCORE"]:
+    for c in ["LTP", "Prev_Close", "Day_Low", "Day_High", "% Change", "MTF_SCORE"]:
         if c in base.columns: base[c] = pd.to_numeric(base[c], errors="coerce")
 
     def prep_side_df(dfside: pd.DataFrame, side: str) -> pd.DataFrame:
         if dfside.empty: return dfside
         out = dfside.copy()
         valid_rows = []
-        today_dt = datetime.now().date()
         
         for _, row in out.iterrows():
             ltp = row.get("LTP")
@@ -403,52 +425,34 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
             if pd.isna(ltp) or pd.isna(pc) or pd.isna(d_low) or pd.isna(d_high): continue
 
             if side == "long":
-                for tf, t, b, d in [("6M", row.get("Top_Band_6M"), row.get("Bottom_Band_6M"), row.get("Climax_Date_6M")),
-                                    ("3M", row.get("Top_Band_3M"), row.get("Bottom_Band_3M"), row.get("Climax_Date_3M")),
-                                    ("1M", row.get("Top_Band_1M"), row.get("Bottom_Band_1M"), row.get("Climax_Date_1M"))]:
-                    if pd.notna(t) and ltp > t and d != "N/A":
-                        try:
-                            climax_dt = datetime.strptime(str(d), "%Y-%m-%d").date()
-                            # RECENCY FILTER: If it is 10 days old or older, skip it entirely.
-                            if (today_dt - climax_dt).days >= 10:
-                                continue 
-                        except Exception:
-                            continue
-                            
-                        if d_low <= t:
-                            row["Signal_Type"] = "Fresh Sweep"
-                        elif pc <= t:
-                            row["Signal_Type"] = "Fresh Breakout"
-                        else:
-                            row["Signal_Type"] = "Active Trend"
-                            
-                        row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = tf, t, b, d
-                        valid_rows.append(row)
-                        break
+                for tf, t, b, d, bd_days in [("6M", row.get("Top_Band_6M"), row.get("Bottom_Band_6M"), row.get("Climax_Date_6M"), row.get("Breach_Days_L_6M")),
+                                             ("3M", row.get("Top_Band_3M"), row.get("Bottom_Band_3M"), row.get("Climax_Date_3M"), row.get("Breach_Days_L_3M")),
+                                             ("1M", row.get("Top_Band_1M"), row.get("Bottom_Band_1M"), row.get("Climax_Date_1M"), row.get("Breach_Days_L_1M"))]:
+                    if pd.notna(t) and ltp > t:
+                        # 10-DAY MAXIMUM BREACH AGE WALL
+                        if bd_days is not None and bd_days <= 10:
+                            if d_low <= t: row["Signal_Type"] = "Fresh Sweep"
+                            elif pc <= t: row["Signal_Type"] = "Fresh Breakout"
+                            else: row["Signal_Type"] = "Active Trend"
+                                
+                            row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = tf, t, b, d
+                            valid_rows.append(row)
+                            break
 
             else: # Short side
-                for tf, t, b, d in [("6M", row.get("Top_Band_6M"), row.get("Bottom_Band_6M"), row.get("Climax_Date_6M")),
-                                    ("3M", row.get("Top_Band_3M"), row.get("Bottom_Band_3M"), row.get("Climax_Date_3M")),
-                                    ("1M", row.get("Top_Band_1M"), row.get("Bottom_Band_1M"), row.get("Climax_Date_1M"))]:
-                    if pd.notna(b) and ltp < b and d != "N/A":
-                        try:
-                            climax_dt = datetime.strptime(str(d), "%Y-%m-%d").date()
-                            # RECENCY FILTER: If it is 10 days old or older, skip it entirely.
-                            if (today_dt - climax_dt).days >= 10:
-                                continue 
-                        except Exception:
-                            continue
-                            
-                        if d_high >= b:
-                            row["Signal_Type"] = "Fresh Sweep"
-                        elif pc >= b:
-                            row["Signal_Type"] = "Fresh Breakdown"
-                        else:
-                            row["Signal_Type"] = "Active Trend"
-                            
-                        row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = tf, t, b, d
-                        valid_rows.append(row)
-                        break
+                for tf, t, b, d, bd_days in [("6M", row.get("Top_Band_6M"), row.get("Bottom_Band_6M"), row.get("Climax_Date_6M"), row.get("Breach_Days_S_6M")),
+                                             ("3M", row.get("Top_Band_3M"), row.get("Bottom_Band_3M"), row.get("Climax_Date_3M"), row.get("Breach_Days_S_3M")),
+                                             ("1M", row.get("Top_Band_1M"), row.get("Bottom_Band_1M"), row.get("Climax_Date_1M"), row.get("Breach_Days_S_1M"))]:
+                    if pd.notna(b) and ltp < b:
+                        # 10-DAY MAXIMUM BREACH AGE WALL
+                        if bd_days is not None and bd_days <= 10:
+                            if d_high >= b: row["Signal_Type"] = "Fresh Sweep"
+                            elif pc >= b: row["Signal_Type"] = "Fresh Breakdown"
+                            else: row["Signal_Type"] = "Active Trend"
+                                
+                            row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = tf, t, b, d
+                            valid_rows.append(row)
+                            break
 
         res_df = pd.DataFrame(valid_rows)
         if res_df.empty: return res_df
@@ -462,7 +466,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
 
 
 def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 30) -> str:
-    if df is None or df.empty: return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3><div style="padding:12px;background:#111827;color:#d1d5db;">No candidates met the recency criteria.</div>'
+    if df is None or df.empty: return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3><div style="padding:12px;background:#111827;color:#d1d5db;">No matching candidates breached within last 10 days.</div>'
     df_slice = df.head(max_rows).copy()
     cols = [c for c in EMAIL_DISPLAY_COLS if c in df_slice.columns]
 
@@ -499,11 +503,11 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
         html_body = f"""
         <html>
         <body style="background:#030712;color:#e5e7eb;padding:20px;font-family:Arial,sans-serif;">
-            <h2 style="color:#facc15;">Multi-Timeframe Climax Execution Alert</h2>
+            <h2 style="color:#facc15;">Volume Climax Market Map (Breach Age <= 10 Days)</h2>
             <div style="color:#cbd5e1;font-size:14px;margin-bottom:18px;">Scan completed at {scan_time}</div>
-            {build_html_table(long_df, "Fresh Long Breakouts & Sweeps (Climax < 10 Days Old)")}
+            {build_html_table(long_df, "Active Long Signals & Trends")}
             <div style="height:28px;"></div>
-            {build_html_table(short_df, "Fresh Short Breakdowns & Sweeps (Climax < 10 Days Old)")}
+            {build_html_table(short_df, "Active Short Signals & Trends")}
         </body>
         </html>
         """
