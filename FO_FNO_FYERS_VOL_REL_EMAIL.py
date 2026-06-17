@@ -3,10 +3,9 @@
 FO_FNO_FYERS_VOL_REL_EMAIL.py
 
 Optimized Intraday F&O scanner via Fyers API with email alerts.
-- MULTI-TIMEFRAME CLIMAX: 1M, 3M, 6M Volume Peaks.
-- DUAL EXECUTION: Breakout (Clean) vs. Sweep (Liquidity Trap).
-- VISUALS: Sweeps highlighted in gold-amber.
-- PRESERVED: All original MTF alignment, Iteration Volume Profiling, and CSV exports.
+- MULTI-TIMEFRAME VOLUME CLIMAX: Simultaneously tracks 1M, 3M, and 6M volume peaks.
+- FRESH CROSSOVER FILTER: Only alerts on stocks breaking their respective bands TODAY.
+- SMART DISPLAY: Identifies and labels the strongest active timeframe breakout in the email.
 """
 
 import os
@@ -51,9 +50,8 @@ logger.addHandler(ch)
 
 warnings.filterwarnings("ignore")
 
-DAILY_LOOKBACK_DAYS = 200  # Extended to capture 135 actual trading days
+DAILY_LOOKBACK_DAYS = 200  # Ensures we capture 135 actual trading days
 INTRADAY_LOOKBACK_DAYS = 30
-IVP_LOOKBACK_DAYS = 60
 HISTORY_API_MAX_SPAN_DAYS = 99
 FYERS_RATE_LIMIT_SLEEP = 0.31
 FYERS_RETRY_SLEEP = 2.0
@@ -67,16 +65,15 @@ sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
 sender_password = os.environ.get("SENDER_PASSWORD", "password")
 recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
-# Fully restored columns with new Signal and Timeframe logic
+# Updated Email Columns to reflect the Timeframe tag
 EMAIL_DISPLAY_COLS = [
     "Symbol",
     "LTP",
     "% Change",
-    "Signal_Type",    # 'Breakout' or 'Sweep'
-    "Timeframe",      # '6M', '3M', '1M'
-    "Top_Band",       
-    "Bottom_Band",    
-    "Climax_Date",    
+    "Timeframe",      # Displays '6M', '3M', or '1M'
+    "Top_Band",       # The High of the Climax Day
+    "Bottom_Band",    # The Low of the Climax Day
+    "Climax_Date",    # Date of the climax
     "MTF_15m",
     "MTF_30m",
     "MTF_60m",
@@ -312,7 +309,6 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
         prev_close = None
         t1m = b1m = t3m = b3m = t6m = b6m = float("nan")
         d1m = d3m = d6m = "N/A"
-        day_low = day_high = float("nan")
 
         if daily_df is not None and len(daily_df) >= 3:
             daily_df["_date_parsed"] = pd.to_datetime(daily_df["timestamp"]).dt.date
@@ -322,6 +318,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             if not hist_daily.empty:
                 prev_close = float(hist_daily["close"].iloc[-1])
                 
+                # Function to extract the highest volume day over X trading days
                 def get_climax_band(df_hist, trading_days):
                     df_slice = df_hist.tail(trading_days)
                     if df_slice.empty: return float("nan"), float("nan"), "N/A"
@@ -329,16 +326,10 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
                     c_day = df_slice.loc[max_vol_idx]
                     return float(c_day["high"]), float(c_day["low"]), str(c_day["_date_parsed"])
                 
+                # Extract 1M (~22 days), 3M (~65 days), and 6M (~135 days)
                 t1m, b1m, d1m = get_climax_band(hist_daily, 22)
                 t3m, b3m, d3m = get_climax_band(hist_daily, 65)
                 t6m, b6m, d6m = get_climax_band(hist_daily, 135)
-
-        if intra_df is not None and not intra_df.empty:
-            intra_df["_d"] = pd.to_datetime(intra_df["timestamp"]).dt.date
-            curr_intra = intra_df[intra_df["_d"] == datetime.now().date()]
-            if not curr_intra.empty:
-                day_low = float(curr_intra["low"].min())
-                day_high = float(curr_intra["high"].max())
         
         if prev_close is None and daily_df is not None and not daily_df.empty:
             prev_close = float(daily_df["close"].iloc[-1])
@@ -355,7 +346,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
         rows.append({
             "Symbol": sym, "LTP": ltp, "% Change": pct_change,
-            "Prev_Close": prev_close, "Day_Low": day_low, "Day_High": day_high,
+            "Prev_Close": prev_close,
             "Top_Band_1M": t1m, "Bottom_Band_1M": b1m, "Climax_Date_1M": d1m,
             "Top_Band_3M": t3m, "Bottom_Band_3M": b3m, "Climax_Date_3M": d3m,
             "Top_Band_6M": t6m, "Bottom_Band_6M": b6m, "Climax_Date_6M": d6m,
@@ -372,7 +363,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 def format_value(col: str, val):
     if pd.isna(val) or val == float("inf") or val == float("-inf"): return ""
-    if col in ["Timeframe", "Signal_Type"]: return str(val)
+    if col == "Timeframe": return str(val)
     if col == "% Change": return f"{float(val):.2f}%"
     if col in ["Top_Band", "Bottom_Band"]: return f"{float(val):.2f}"
     if col == "Climax_Date": return str(val)
@@ -384,53 +375,46 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     if df is None or df.empty: return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     base = df.copy()
     
-    for c in ["LTP", "Prev_Close", "Day_Low", "Day_High", "Top_Band_1M", "Top_Band_3M", "Top_Band_6M", "Bottom_Band_1M", "Bottom_Band_3M", "Bottom_Band_6M", "% Change", "MTF_SCORE"]:
+    for c in ["LTP", "Prev_Close", "Top_Band_1M", "Top_Band_3M", "Top_Band_6M", "Bottom_Band_1M", "Bottom_Band_3M", "Bottom_Band_6M", "% Change", "MTF_SCORE"]:
         if c in base.columns: base[c] = pd.to_numeric(base[c], errors="coerce")
 
     def prep_side_df(dfside: pd.DataFrame, side: str) -> pd.DataFrame:
         if dfside.empty: return dfside
         out = dfside.copy()
+        
         valid_rows = []
         
         for _, row in out.iterrows():
             ltp = row.get("LTP")
             pc = row.get("Prev_Close")
-            d_low = row.get("Day_Low")
-            d_high = row.get("Day_High")
-            
-            if pd.isna(ltp) or pd.isna(pc) or pd.isna(d_low) or pd.isna(d_high): continue
+            if pd.isna(ltp) or pd.isna(pc): continue
 
-            # Sweep vs Breakout Evaluation
             if side == "long":
-                for tf, t, b, d in [("6M", row.get("Top_Band_6M"), row.get("Bottom_Band_6M"), row.get("Climax_Date_6M")),
-                                    ("3M", row.get("Top_Band_3M"), row.get("Bottom_Band_3M"), row.get("Climax_Date_3M")),
-                                    ("1M", row.get("Top_Band_1M"), row.get("Bottom_Band_1M"), row.get("Climax_Date_1M"))]:
-                    if pd.notna(t) and ltp > t:
-                        if pc <= t:
-                            row["Signal_Type"], row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = "Breakout", tf, t, b, d
-                            valid_rows.append(row)
-                            break
-                        elif d_low <= t:
-                            row["Signal_Type"], row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = "Sweep", tf, t, b, d
-                            valid_rows.append(row)
-                            break
+                # Check Timeframes from Strongest (6M) to Fastest (1M)
+                if pd.notna(row.get("Top_Band_6M")) and pc <= row["Top_Band_6M"] and ltp > row["Top_Band_6M"]:
+                    row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = "6M", row["Top_Band_6M"], row["Bottom_Band_6M"], row["Climax_Date_6M"]
+                    valid_rows.append(row)
+                elif pd.notna(row.get("Top_Band_3M")) and pc <= row["Top_Band_3M"] and ltp > row["Top_Band_3M"]:
+                    row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = "3M", row["Top_Band_3M"], row["Bottom_Band_3M"], row["Climax_Date_3M"]
+                    valid_rows.append(row)
+                elif pd.notna(row.get("Top_Band_1M")) and pc <= row["Top_Band_1M"] and ltp > row["Top_Band_1M"]:
+                    row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = "1M", row["Top_Band_1M"], row["Bottom_Band_1M"], row["Climax_Date_1M"]
+                    valid_rows.append(row)
 
             else: # Short side
-                for tf, t, b, d in [("6M", row.get("Top_Band_6M"), row.get("Bottom_Band_6M"), row.get("Climax_Date_6M")),
-                                    ("3M", row.get("Top_Band_3M"), row.get("Bottom_Band_3M"), row.get("Climax_Date_3M")),
-                                    ("1M", row.get("Top_Band_1M"), row.get("Bottom_Band_1M"), row.get("Climax_Date_1M"))]:
-                    if pd.notna(b) and ltp < b:
-                        if pc >= b:
-                            row["Signal_Type"], row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = "Breakout", tf, t, b, d
-                            valid_rows.append(row)
-                            break
-                        elif d_high >= b:
-                            row["Signal_Type"], row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = "Sweep", tf, t, b, d
-                            valid_rows.append(row)
-                            break
+                if pd.notna(row.get("Bottom_Band_6M")) and pc >= row["Bottom_Band_6M"] and ltp < row["Bottom_Band_6M"]:
+                    row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = "6M", row["Top_Band_6M"], row["Bottom_Band_6M"], row["Climax_Date_6M"]
+                    valid_rows.append(row)
+                elif pd.notna(row.get("Bottom_Band_3M")) and pc >= row["Bottom_Band_3M"] and ltp < row["Bottom_Band_3M"]:
+                    row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = "3M", row["Top_Band_3M"], row["Bottom_Band_3M"], row["Climax_Date_3M"]
+                    valid_rows.append(row)
+                elif pd.notna(row.get("Bottom_Band_1M")) and pc >= row["Bottom_Band_1M"] and ltp < row["Bottom_Band_1M"]:
+                    row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"] = "1M", row["Top_Band_1M"], row["Bottom_Band_1M"], row["Climax_Date_1M"]
+                    valid_rows.append(row)
 
         res_df = pd.DataFrame(valid_rows)
         if res_df.empty: return res_df
+        
         return res_df.sort_values(['MTF_SCORE'], ascending=[False if side=="long" else True], na_position='last')
 
     long_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]).head(15)
@@ -449,19 +433,21 @@ def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 15) -> str:
     body_rows = []
     for _, row in df_slice.iterrows():
         tds = []
-        # Background logic for "Sweep"
-        row_bg = "#d97706" if row.get("Signal_Type") == "Sweep" else "#030712"
-        text_col = "#000000" if row.get("Signal_Type") == "Sweep" else "#e5e7eb"
-
         for col in cols:
-            bg = row_bg
-            if col == "% Change" and row.get("Signal_Type") != "Sweep":
+            bg = "#030712"
+            if col == "% Change":
                 try:
                     f_pct = float(row[col])
                     bg = "#14532d" if f_pct > 0 else "#7f1d1d" if f_pct < 0 else "#030712"
-                except: pass
-            
-            tds.append(f'<td style="padding:6px 8px;border:1px solid #4b5563;color:{text_col};background:{bg}">{format_value(col, row.get(col, ""))}</td>')
+                except Exception:
+                    pass
+            elif col == "Timeframe":
+                # Color code the timeframes
+                if row[col] == "6M": bg = "#431407" # Deep rust/orange for macro
+                elif row[col] == "3M": bg = "#1e3a8a" # Deep blue for mid
+                elif row[col] == "1M": bg = "#064e3b" # Deep green for fast
+                
+            tds.append(f'<td style="padding:6px 8px;border:1px solid #4b5563;color:#e5e7eb;background:{bg}">{format_value(col, row.get(col, ""))}</td>')
         body_rows.append(f"<tr>{''.join(tds)}</tr>")
     return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3><table style="border-collapse:collapse;width:100%;background:#030712;"><thead><tr>{header_cells}</tr></thead><tbody>{"".join(body_rows)}</tbody></table>'
 
@@ -472,16 +458,16 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
         html_body = f"""
         <html>
         <body style="background:#030712;color:#e5e7eb;padding:20px;font-family:Arial,sans-serif;">
-            <h2 style="color:#facc15;">Multi-Timeframe Climax & Sweep Alert</h2>
+            <h2 style="color:#facc15;">Multi-Timeframe Climax Execution Alert</h2>
             <div style="color:#cbd5e1;font-size:14px;margin-bottom:18px;">Scan completed at {scan_time}</div>
-            {build_html_table(long_df, "Fresh Long Signals")}
+            {build_html_table(long_df, "Fresh Long Breakouts (Today Only)")}
             <div style="height:28px;"></div>
-            {build_html_table(short_df, "Fresh Short Signals")}
+            {build_html_table(short_df, "Fresh Short Breakdowns (Today Only)")}
         </body>
         </html>
         """
         msg = MIMEMultipart()
-        msg["From"], msg["To"], msg["Subject"] = sender_email, recipient_email, f"Climax Alert - {scan_time}"
+        msg["From"], msg["To"], msg["Subject"] = sender_email, recipient_email, f"Multi-TF Climax Alert - {scan_time}"
         msg.attach(MIMEText(html_body, "html", "utf-8"))
 
         for fname in [csv_filename, detail_csv_filename]:
