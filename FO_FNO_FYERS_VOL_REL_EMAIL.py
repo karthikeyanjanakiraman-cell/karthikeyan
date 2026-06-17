@@ -4,8 +4,8 @@ FO_FNO_FYERS_VOL_REL_EMAIL.py
 
 Optimized Intraday F&O scanner via Fyers API with email alerts.
 - MULTI-TIMEFRAME VOLUME CLIMAX: Simultaneously tracks 1M, 3M, and 6M volume peaks.
-- 10-DAY RECENCY FILTER: Only allows signals where the institutional volume peak happened within <= 10 days.
-- ALL-INCLUSIVE VIEW: Displays Fresh Sweeps, Fresh Breakouts, and long-standing Active Trends.
+- 10-DAY RECENCY FILTER: Only allows signals where the climax happened RECENTLY (< 10 days ago).
+- ALL-INCLUSIVE VIEW: Displays Fresh Sweeps, Fresh Breakouts, and Active Trends.
 - VISUALS: Fresh Sweeps are highlighted in gold-amber; timeframes are distinctly color-coded.
 """
 
@@ -321,7 +321,7 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
             if not hist_daily.empty:
                 prev_close = float(hist_daily["close"].iloc[-1])
                 
-                # Function to extract the highest volume day over X trading days
+                # REVERTED TO YOUR EXACT ORIGINAL LOGIC: Top is High, Bottom is Low of the Climax Day
                 def get_climax_band(df_hist, trading_days):
                     df_slice = df_hist.tail(trading_days)
                     if df_slice.empty: return float("nan"), float("nan"), "N/A"
@@ -329,7 +329,6 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
                     c_day = df_slice.loc[max_vol_idx]
                     return float(c_day["high"]), float(c_day["low"]), str(c_day["_date_parsed"])
                 
-                # Extract 1M (~22 days), 3M (~65 days), and 6M (~135 days)
                 t1m, b1m, d1m = get_climax_band(hist_daily, 22)
                 t3m, b3m, d3m = get_climax_band(hist_daily, 65)
                 t6m, b6m, d6m = get_climax_band(hist_daily, 135)
@@ -410,8 +409,8 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
                     if pd.notna(t) and ltp > t and d != "N/A":
                         try:
                             climax_dt = datetime.strptime(str(d), "%Y-%m-%d").date()
-                            # 10-DAY RECENCY WALL
-                            if (today_dt - climax_dt).days > 10:
+                            # RECENCY FILTER: If it is 10 days old or older, skip it entirely.
+                            if (today_dt - climax_dt).days >= 10:
                                 continue 
                         except Exception:
                             continue
@@ -434,8 +433,8 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
                     if pd.notna(b) and ltp < b and d != "N/A":
                         try:
                             climax_dt = datetime.strptime(str(d), "%Y-%m-%d").date()
-                            # 10-DAY RECENCY WALL
-                            if (today_dt - climax_dt).days > 10:
+                            # RECENCY FILTER: If it is 10 days old or older, skip it entirely.
+                            if (today_dt - climax_dt).days >= 10:
                                 continue 
                         except Exception:
                             continue
@@ -463,7 +462,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
 
 
 def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 30) -> str:
-    if df is None or df.empty: return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3><div style="padding:12px;background:#111827;color:#d1d5db;">No active candidates holding beyond recent bands.</div>'
+    if df is None or df.empty: return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3><div style="padding:12px;background:#111827;color:#d1d5db;">No candidates met the recency criteria.</div>'
     df_slice = df.head(max_rows).copy()
     cols = [c for c in EMAIL_DISPLAY_COLS if c in df_slice.columns]
 
@@ -500,11 +499,11 @@ def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, csv_fi
         html_body = f"""
         <html>
         <body style="background:#030712;color:#e5e7eb;padding:20px;font-family:Arial,sans-serif;">
-            <h2 style="color:#facc15;">All-Inclusive Volume Climax Market Map</h2>
+            <h2 style="color:#facc15;">Multi-Timeframe Climax Execution Alert</h2>
             <div style="color:#cbd5e1;font-size:14px;margin-bottom:18px;">Scan completed at {scan_time}</div>
-            {build_html_table(long_df, "Active Long Signals & Trends (Climax <= 10 Days)")}
+            {build_html_table(long_df, "Fresh Long Breakouts & Sweeps (Climax < 10 Days Old)")}
             <div style="height:28px;"></div>
-            {build_html_table(short_df, "Active Short Signals & Trends (Climax <= 10 Days)")}
+            {build_html_table(short_df, "Fresh Short Breakdowns & Sweeps (Climax < 10 Days Old)")}
         </body>
         </html>
         """
