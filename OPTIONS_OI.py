@@ -3,11 +3,10 @@
 FO_FNO_FYERS_VOL_REL_EMAIL.py
 
 Optimized Index & Options Dual-Verification Scanner via Fyers API.
-- CORE INDICES: Tracks Nifty 50, Bank Nifty, Sensex (6M, 3M, 2M, 1M, 2W, 1W peaks).
-- DYNAMIC 20+ STRIKE ROUTING: Generates a 21-strike net (10 ITM, ATM, 10 OTM) for verification.
-- OPTION PREMIUM VERIFICATION: Life-of-Contract (LOC) Volume Climax.
-- THE HOLY GRAIL DIVERGENCE: Cross-references Spot Sweeps against Option Premium strength.
-- BREACH-VELOCITY HIERARCHY: Sorted by recency first, then velocity.
+- CORE INDICES: Tracks Nifty 50, Bank Nifty, Sensex (Multi-timeframe peaks).
+- DYNAMIC 21-STRIKE ROUTING: Generates a 21-strike net for deep verification.
+- HOLY GRAIL DIVERGENCE: Cross-verifies Spot Sweeps against Option Premium behavior.
+- CSV AUDIT: Saves full strike lists to CSV for backtesting.
 """
 
 import os
@@ -54,7 +53,7 @@ logger.addHandler(ch)
 
 warnings.filterwarnings("ignore")
 
-# Global Configuration Parameters
+# Configuration
 DAILY_LOOKBACK_DAYS = 200  
 INTRADAY_LOOKBACK_DAYS = 30
 HISTORY_API_MAX_SPAN_DAYS = 99
@@ -63,12 +62,6 @@ FYERS_RETRY_SLEEP = 2.0
 FYERS_MAX_RETRIES = 2
 
 fyers: Optional[fyersModel.FyersModel] = None
-
-smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
-smtp_port = int(os.environ.get("SMTP_PORT", "587"))
-sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
-sender_password = os.environ.get("SENDER_PASSWORD", "password")
-recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
 INDEX_SYMBOLS = ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX", "BSE:SENSEX-INDEX"]
 
@@ -84,7 +77,7 @@ EMAIL_OPT_COLS = [
 ]
 
 # ==========================================
-# GLOBAL HELPERS & FORMATTERS
+# GLOBAL HELPERS
 # ==========================================
 
 def format_value(col: str, val):
@@ -96,28 +89,23 @@ def format_value(col: str, val):
     if isinstance(val, (int, float, np.integer, np.floating)): return f"{float(val):.4f}"
     return str(val)
 
-
 def get_index_meta(symbol: str) -> Tuple[str, str, int]:
     if "NIFTY50" in symbol: return "NSE", "NIFTY", 50
     elif "NIFTYBANK" in symbol: return "NSE", "BANKNIFTY", 100
     elif "SENSEX" in symbol: return "BSE", "SENSEX", 100
     return "NSE", "NIFTY", 50
 
-
 def get_underlying_spot(opt_symbol: str) -> str:
-    """Reverses an Option Token back to its parent Spot Index for divergence tracking."""
     if "BANKNIFTY" in opt_symbol: return "NSE:NIFTYBANK-INDEX"
     elif "NIFTY" in opt_symbol: return "NSE:NIFTY50-INDEX"
     elif "SENSEX" in opt_symbol: return "BSE:SENSEX-INDEX"
     return ""
-
 
 def get_last_weekday(year: int, month: int, target_weekday: int) -> datetime.date:
     last_day = calendar.monthrange(year, month)[1]
     last_date = datetime(year, month, last_day).date()
     offset = (last_date.weekday() - target_weekday) % 7
     return last_date - timedelta(days=offset)
-
 
 def get_expiry_details(symbol: str) -> Tuple[bool, datetime.date]:
     today = datetime.now().date()
@@ -138,29 +126,17 @@ def get_expiry_details(symbol: str) -> Tuple[bool, datetime.date]:
         expiry = today + timedelta(days=days_ahead)
         return (expiry == get_last_weekday(expiry.year, expiry.month, 3)), expiry
 
-
 def get_options_data(symbol: str, ltp: float, side: str) -> Tuple[float, str, List[str]]:
     exch, base_name, interval = get_index_meta(symbol)
     atm_strike = int(round(ltp / interval) * interval)
-    
     is_monthly, nearest_expiry = get_expiry_details(symbol)
     yy = nearest_expiry.strftime("%y")
-    
-    if is_monthly:
-        expiry_str = nearest_expiry.strftime("%b").upper()
-    else:
-        months_map = {1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7", 8: "8", 9: "9", 10: "O", 11: "N", 12: "D"}
-        m_char = months_map[nearest_expiry.month]
-        dd = nearest_expiry.strftime("%d")
-        expiry_str = f"{m_char}{dd}"
-    
+    expiry_str = nearest_expiry.strftime("%b").upper() if is_monthly else f"{['1','2','3','4','5','6','7','8','9','O','N','D'][nearest_expiry.month-1]}{nearest_expiry.strftime('%d')}"
     opt_type = "CE" if side == "long" else "PE"
     strikes = [atm_strike + (i * interval) for i in range(-10, 11)]
     target_symbols = [f"{exch}:{base_name}{yy}{expiry_str}{s}{opt_type}" for s in strikes]
     display_str = f"21 {opt_type} Contracts (Strikes: {strikes[0]:.2f} to {strikes[-1]:.2f})"
-    
     return float(atm_strike), display_str, target_symbols
-
 
 def get_options_list_from_df(df: pd.DataFrame) -> List[str]:
     symbols = []
@@ -170,9 +146,8 @@ def get_options_list_from_df(df: pd.DataFrame) -> List[str]:
         if isinstance(opt_list, list): symbols.extend(opt_list)
     return list(set(symbols))
 
-
 # ==========================================
-# TECHNICAL SIGNAL MATH & COMPUTATION
+# MATH & API EXECUTION
 # ==========================================
 
 def price_stats_from_series(prices: pd.Series) -> dict:
@@ -286,53 +261,34 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame], prev_clos
     summary.update(build_mtf_alignment(detail_df))
     return summary, detail_df
 
-
-# ==========================================
-# PIPELINE EXECUTION & DATA SCANNERS
-# ==========================================
-
 def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
     rows, iteration_rows = [], []
     total = len(INDEX_SYMBOLS)
-
     for idx, sym in enumerate(INDEX_SYMBOLS, start=1):
         logger.info(f"CORE [{idx}/{total}] Processing Spot Index: {sym}")
-        daily_df = get_fyers_history(sym, resolution="D", days_back=DAILY_LOOKBACK_DAYS)
-        intra_df = get_fyers_history(sym, resolution="15", days_back=INTRADAY_LOOKBACK_DAYS)
-
+        daily_df, intra_df = get_fyers_history(sym, "D", DAILY_LOOKBACK_DAYS), get_fyers_history(sym, "15", INTRADAY_LOOKBACK_DAYS)
         prev_close, day_low, day_high, bands = None, float("nan"), float("nan"), {}
-
         if daily_df is not None and len(daily_df) >= 3:
             daily_df["_date_parsed"] = pd.to_datetime(daily_df["timestamp"]).dt.date
             today_date = datetime.now().date()
-            hist_daily = daily_df[daily_df["_date_parsed"] < today_date].copy()
-            if not hist_daily.empty:
+            if not (hist_daily := daily_df[daily_df["_date_parsed"] < today_date].copy()).empty:
                 prev_close = float(hist_daily["close"].iloc[-1])
                 for label, tf_days in [("6M", 135), ("3M", 65), ("2M", 44), ("1M", 22), ("2W", 10), ("1W", 5)]:
                     df_slice = hist_daily.tail(tf_days)
-                    if df_slice.empty:
-                        bands[f"T_{label}"], bands[f"B_{label}"], bands[f"D_{label}"] = float("nan"), float("nan"), "N/A"
+                    if df_slice.empty: bands[f"T_{label}"], bands[f"B_{label}"], bands[f"D_{label}"] = float("nan"), float("nan"), "N/A"
                     else:
                         max_idx = df_slice["volume"].idxmax() if "volume" in df_slice.columns and (df_slice["volume"] > 0).any() else (df_slice["high"] - df_slice["low"]).idxmax()
                         c_day = df_slice.loc[max_idx]
                         bands[f"T_{label}"], bands[f"B_{label}"], bands[f"D_{label}"] = float(c_day["high"]), float(c_day["low"]), str(c_day["_date_parsed"])
-                
         if intra_df is not None and not intra_df.empty:
             intra_df["_d"] = pd.to_datetime(intra_df["timestamp"]).dt.date
-            if not (curr_intra := intra_df[intra_df["_d"] == datetime.now().date()]).empty:
-                day_low, day_high = float(curr_intra["low"].min()), float(curr_intra["high"].max())
-
+            if not (curr_intra := intra_df[intra_df["_d"] == datetime.now().date()]).empty: day_low, day_high = float(curr_intra["low"].min()), float(curr_intra["high"].max())
         if prev_close is None and daily_df is not None and not daily_df.empty: prev_close = float(daily_df["close"].iloc[-1])
-
         iter_summary, iter_detail = compute_iteration_volume_profile(intra_df, prev_close)
         ltp = iter_summary.get("LTP")
         pct_change = ((ltp - prev_close) / prev_close * 100) if (ltp is not None and prev_close and prev_close != 0) else 0.0
-
         if not iter_detail.empty:
-            iter_detail.insert(0, "Symbol", sym)
-            iter_detail.insert(1, "% Change", pct_change)
-            iteration_rows.append(iter_detail)
-
+            iter_detail.insert(0, "Symbol", sym); iter_detail.insert(1, "% Change", pct_change); iteration_rows.append(iter_detail)
         streak_data = {}
         if daily_df is not None and not daily_df.empty and ltp is not None:
             today_date = datetime.now().date()
@@ -343,13 +299,9 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
                 s_start = next((d for d, c in reversed(history_candles) if pd.notna(b_val) and c < b_val), None)
                 streak_data[f"Days_L_{label}"] = (today_date - l_start).days if l_start else 999
                 streak_data[f"Days_S_{label}"] = (today_date - s_start).days if s_start else 999
-
         res_row = {"Symbol": sym, "LTP": ltp, "% Change": pct_change, "Prev_Close": prev_close, "Day_Low": day_low, "Day_High": day_high, "Signal_Type": "N/A"}
-        res_row.update(bands); res_row.update(streak_data)
-        rows.append(res_row)
-
+        res_row.update(bands); res_row.update(streak_data); rows.append(res_row)
     return pd.DataFrame(rows), (pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame())
-
 
 def scan_options_universe(symbols: List[str]) -> pd.DataFrame:
     rows, total = [], len(symbols)
@@ -357,7 +309,6 @@ def scan_options_universe(symbols: List[str]) -> pd.DataFrame:
         logger.info(f"VERIFICATION [{idx}/{total}] Processing Option Premium: {sym}")
         daily_df, intra_df = get_fyers_history(sym, "D", 60), get_fyers_history(sym, "15", 5)
         ltp, prev_close, day_low, pct_change, bands = np.nan, np.nan, np.nan, 0.0, {}
-
         if daily_df is not None and len(daily_df) >= 2:
             daily_df["_date_parsed"] = pd.to_datetime(daily_df["timestamp"]).dt.date
             today_date = datetime.now().date()
@@ -366,239 +317,131 @@ def scan_options_universe(symbols: List[str]) -> pd.DataFrame:
                 max_idx = hist_daily["volume"].idxmax() if "volume" in hist_daily.columns and (hist_daily["volume"] > 0).any() else (hist_daily["high"] - hist_daily["low"]).idxmax()
                 c_day = hist_daily.loc[max_idx]
                 bands["T_LOC"], bands["D_LOC"] = float(c_day["high"]), str(c_day["_date_parsed"])
-
         if intra_df is not None and not intra_df.empty:
             intra_df["_d"] = pd.to_datetime(intra_df["timestamp"]).dt.date
-            if not (curr_intra := intra_df[intra_df["_d"] == datetime.now().date()]).empty:
-                day_low, ltp = float(curr_intra["low"].min()), float(curr_intra["close"].iloc[-1])
-        
+            if not (curr_intra := intra_df[intra_df["_d"] == datetime.now().date()]).empty: day_low, ltp = float(curr_intra["low"].min()), float(curr_intra["close"].iloc[-1])
         if pd.isna(ltp) and daily_df is not None and not daily_df.empty: ltp = float(daily_df["close"].iloc[-1])
         if pd.notna(ltp) and pd.notna(prev_close) and prev_close != 0: pct_change = ((ltp - prev_close) / prev_close) * 100
-
         streak_data = {}
         if daily_df is not None and not daily_df.empty and pd.notna(ltp):
-            today_date = datetime.now().date()
             history_candles = [(row["_date_parsed"], float(row["close"])) for _, row in daily_df[daily_df["_date_parsed"] < today_date].iterrows()] + [(today_date, ltp)]
-            t_val = bands.get("T_LOC", float("nan"))
-            l_start = next((d for d, c in reversed(history_candles) if pd.notna(t_val) and c > t_val), None)
+            l_start = next((d for d, c in reversed(history_candles) if pd.notna(bands.get("T_LOC")) and c > bands.get("T_LOC")), None)
             streak_data["Days_L_LOC"] = (today_date - l_start).days if l_start else 999
-
         res_row = {"Symbol": sym, "LTP": ltp, "% Change": pct_change, "Prev_Close": prev_close, "Day_Low": day_low, "Signal_Type": "N/A"}
-        res_row.update(bands); res_row.update(streak_data)
-        rows.append(res_row)
-
+        res_row.update(bands); res_row.update(streak_data); rows.append(res_row)
     return pd.DataFrame(rows)
-
 
 def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df is None or df.empty: return pd.DataFrame(columns=EMAIL_DISPLAY_COLS), pd.DataFrame(columns=EMAIL_DISPLAY_COLS)
     base = df.copy()
     for c in ["LTP", "Prev_Close", "Day_Low", "Day_High", "% Change"]:
         if c in base.columns: base[c] = pd.to_numeric(base[c], errors="coerce")
-
     def prep_side_df(dfside: pd.DataFrame, side: str) -> pd.DataFrame:
         if dfside.empty: return dfside
         out, valid_rows = dfside.copy(), []
-        
         for _, row in out.iterrows():
             ltp, pc, d_low, d_high, sym = row.get("LTP"), row.get("Prev_Close"), row.get("Day_Low"), row.get("Day_High"), row.get("Symbol")
             if pd.isna(ltp) or pd.isna(pc) or pd.isna(d_low) or pd.isna(d_high): continue
-
             for tf in ["6M", "3M", "2M", "1M", "2W", "1W"]:
                 t, b, d, bd_days = row.get(f"T_{tf}"), row.get(f"B_{tf}"), row.get(f"D_{tf}"), row.get(f"Days_L_{tf}" if side == "long" else f"Days_S_{tf}")
-                
                 if side == "long" and pd.notna(t) and ltp > t:
                     if bd_days is not None and bd_days <= 10:
                         row["Signal_Type"] = "Fresh Sweep" if d_low <= t else "Fresh Breakout" if pc <= t else "Active Trend"
                         row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"], row["Breach_Days"] = tf, t, b, d, bd_days
                         strike, opt_str, opt_list = get_options_data(sym, ltp, "long")
                         row["ATM_Strike"], row["Option_Contracts"], row["Target_Options"] = strike, opt_str, opt_list
-                        valid_rows.append(row)
-                        break
-                        
+                        valid_rows.append(row); break
                 elif side == "short" and pd.notna(b) and ltp < b:
                     if bd_days is not None and bd_days <= 10:
                         row["Signal_Type"] = "Fresh Sweep" if d_high >= b else "Fresh Breakdown" if pc >= b else "Active Trend"
                         row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"], row["Breach_Days"] = tf, t, b, d, bd_days
                         strike, opt_str, opt_list = get_options_data(sym, ltp, "short")
                         row["ATM_Strike"], row["Option_Contracts"], row["Target_Options"] = strike, opt_str, opt_list
-                        valid_rows.append(row)
-                        break
-
+                        valid_rows.append(row); break
         res_df = pd.DataFrame(valid_rows)
         if res_df.empty: return res_df
         return res_df.sort_values(by=['Breach_Days', '% Change'], ascending=[True, False if side=="long" else True], na_position='last')
-
-    long_df, short_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]).head(30), prep_side_df(base, "short").drop_duplicates(subset=["Symbol"]).head(30)
+    
+    long_df, short_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]), prep_side_df(base, "short").drop_duplicates(subset=["Symbol"])
+    if not long_df.empty and not short_df.empty:
+        common = set(long_df["Symbol"]).intersection(set(short_df["Symbol"]))
+        for sym in common:
+            l_idx, s_idx = long_df.index[long_df["Symbol"] == sym][0], short_df.index[short_df["Symbol"] == sym][0]
+            if long_df.at[l_idx, "Breach_Days"] < short_df.at[s_idx, "Breach_Days"]: short_df = short_df.drop(s_idx)
+            elif short_df.at[s_idx, "Breach_Days"] < long_df.at[l_idx, "Breach_Days"]: long_df = long_df.drop(l_idx)
+            elif float(long_df.at[l_idx, "% Change"]) > 0: short_df = short_df.drop(s_idx)
+            else: long_df = long_df.drop(l_idx)
+            
     cols = [c for c in EMAIL_DISPLAY_COLS if c in long_df.columns or c in short_df.columns]
     return (long_df[cols] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)), (short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS))
-
 
 def build_option_candidate_tables(df: pd.DataFrame, spot_signal_map: dict) -> Tuple[pd.DataFrame, pd.DataFrame]:
     if df is None or df.empty: return pd.DataFrame(columns=EMAIL_OPT_COLS), pd.DataFrame(columns=EMAIL_OPT_COLS)
     base = df.copy()
-    for c in ["LTP", "Prev_Close", "Day_Low", "% Change"]:
-        if c in base.columns: base[c] = pd.to_numeric(base[c], errors="coerce")
-
     valid_rows = []
     for _, row in base.iterrows():
         ltp, pc, d_low, sym = row.get("LTP"), row.get("Prev_Close"), row.get("Day_Low"), row.get("Symbol")
         if pd.isna(ltp) or pd.isna(pc) or pd.isna(d_low): continue
-
         t, d, bd_days = row.get("T_LOC"), row.get("D_LOC"), row.get("Days_L_LOC")
-        
-        if pd.notna(t) and ltp > t:
-            if bd_days is not None and bd_days <= 10:
-                base_signal = "Fresh Sweep" if d_low <= t else "Fresh Breakout" if pc <= t else "Active Trend"
-                
-                # Divergence (Holy Grail) Cross-Verification
-                underlying_spot = get_underlying_spot(sym)
-                spot_signal = spot_signal_map.get(underlying_spot, "")
-                
-                if spot_signal == "Fresh Sweep" and base_signal == "Active Trend":
-                    row["Signal_Type"] = "Divergence (Holy Grail)"
-                elif spot_signal == "Active Trend" and base_signal == "Fresh Sweep":
-                    row["Signal_Type"] = "Premium Sweep Divergence"
-                else:
-                    row["Signal_Type"] = base_signal
-                
-                row["Timeframe"], row["Top_Band"], row["Climax_Date"], row["Breach_Days"] = "LOC", t, d, bd_days
-                valid_rows.append(row)
-
-    res_df = pd.DataFrame(valid_rows)
-    if res_df.empty: return pd.DataFrame(columns=EMAIL_OPT_COLS), pd.DataFrame(columns=EMAIL_OPT_COLS)
-    
-    res_df = res_df.sort_values(by=['Breach_Days', '% Change'], ascending=[True, False], na_position='last')
+        if pd.notna(t) and ltp > t and bd_days is not None and bd_days <= 10:
+            base_signal = "Fresh Sweep" if d_low <= t else "Fresh Breakout" if pc <= t else "Active Trend"
+            spot_signal = spot_signal_map.get(get_underlying_spot(sym), "")
+            row["Signal_Type"] = "Divergence (Holy Grail)" if spot_signal == "Fresh Sweep" and base_signal == "Active Trend" else "Premium Sweep Divergence" if spot_signal == "Active Trend" and base_signal == "Fresh Sweep" else base_signal
+            row["Timeframe"], row["Top_Band"], row["Climax_Date"], row["Breach_Days"] = "LOC", t, d, bd_days
+            valid_rows.append(row)
+    res_df = pd.DataFrame(valid_rows).sort_values(by=['Breach_Days', '% Change'], ascending=[True, False], na_position='last')
     ce_df, pe_df = res_df[res_df["Symbol"].str.endswith("CE")].head(30), res_df[res_df["Symbol"].str.endswith("PE")].head(30)
-    
     cols = [c for c in EMAIL_OPT_COLS if c in res_df.columns]
     return (ce_df[cols] if not ce_df.empty else pd.DataFrame(columns=EMAIL_OPT_COLS)), (pe_df[cols] if not pe_df.empty else pd.DataFrame(columns=EMAIL_OPT_COLS))
 
-
 def build_html_table(df: pd.DataFrame, title: str, display_cols: list, max_rows: int = 30) -> str:
-    if df is None or df.empty: return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3><div style="padding:12px;background:#111827;color:#d1d5db;">No candidates matched setup limits within the last 10 days.</div>'
-    df_slice = df.head(max_rows).copy()
-    cols = [c for c in display_cols if c in df_slice.columns]
-
+    if df is None or df.empty: return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3><div style="padding:12px;background:#111827;color:#d1d5db;">No candidates.</div>'
+    cols = [c for c in display_cols if c in df.columns]
     header_cells = "".join(f'<th style="padding:8px;border:1px solid #4b5563;background:#111827;color:#f9fafb;">{c}</th>' for c in cols)
     body_rows = []
-    
-    for _, row in df_slice.iterrows():
-        tds = []
-        sig = str(row.get("Signal_Type"))
-        is_holy_grail = "Holy Grail" in sig
-        is_sweep = "Sweep" in sig and not is_holy_grail
-        
-        # Dual-Sweep Divergence Custom Highlights
-        if is_holy_grail: row_bg, text_col = "#581c87", "#e9d5ff"  # Royal Purple for the Holy Grail
-        elif is_sweep: row_bg, text_col = "#d97706", "#000000"     # Amber Gold for Standard Sweeps
-        else: row_bg, text_col = "#030712", "#e5e7eb"
-
-        for col in cols:
-            bg = row_bg
-            if col == "% Change" and not is_sweep and not is_holy_grail:
-                try: bg = "#14532d" if float(row[col]) > 0 else "#7f1d1d" if float(row[col]) < 0 else "#030712"
-                except Exception: pass
-            elif col == "Timeframe" and not is_sweep and not is_holy_grail:
-                if row[col] in ["6M", "3M"]: bg = "#431407"
-                elif row[col] in ["2M", "1M"]: bg = "#1e3a8a"
-                elif row[col] == "LOC": bg = "#312e81" 
-                else: bg = "#064e3b" 
-                
-            tds.append(f'<td style="padding:6px 8px;border:1px solid #4b5563;color:{text_col};background:{bg}">{format_value(col, row.get(col, ""))}</td>')
+    for _, row in df.head(max_rows).iterrows():
+        is_holy_grail, is_sweep = "Holy Grail" in str(row.get("Signal_Type")), "Sweep" in str(row.get("Signal_Type")) and "Holy Grail" not in str(row.get("Signal_Type"))
+        row_bg, text_col = ("#581c87", "#e9d5ff") if is_holy_grail else ("#d97706", "#000000") if is_sweep else ("#030712", "#e5e7eb")
+        tds = [f'<td style="padding:6px 8px;border:1px solid #4b5563;color:{text_col};background:{row_bg}">{format_value(col, row.get(col, ""))}</td>' for col in cols]
         body_rows.append(f"<tr>{''.join(tds)}</tr>")
     return f'<h3 style="color:#f9fafb;margin:14px 0 8px 0;">{title}</h3><table style="border-collapse:collapse;width:100%;background:#030712;"><thead><tr>{header_cells}</tr></thead><tbody>{"".join(body_rows)}</tbody></table>'
-
-
-def send_email_with_tables(long_df: pd.DataFrame, short_df: pd.DataFrame, ce_df: pd.DataFrame, pe_df: pd.DataFrame, csv_filename: str = "", detail_csv_filename: str = "") -> bool:
-    try:
-        scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        html_body = f"""
-        <html>
-        <body style="background:#030712;color:#e5e7eb;padding:20px;font-family:Arial,sans-serif;">
-            <h2 style="color:#facc15;">Index Options Strategy Climax Map (Dual Verification)</h2>
-            <div style="color:#cbd5e1;font-size:14px;margin-bottom:18px;">Scan completed at {scan_time}</div>
-            {build_html_table(long_df, "Active Index Long Strategy Matrix", EMAIL_DISPLAY_COLS)}
-            <div style="height:28px;"></div>
-            {build_html_table(ce_df, "Call Options (CE) Climax Verification", EMAIL_OPT_COLS)}
-            <div style="height:36px;"></div>
-            {build_html_table(short_df, "Active Index Short Strategy Matrix", EMAIL_DISPLAY_COLS)}
-            <div style="height:28px;"></div>
-            {build_html_table(pe_df, "Put Options (PE) Climax Verification", EMAIL_OPT_COLS)}
-        </body>
-        </html>
-        """
-        msg = MIMEMultipart()
-        msg["From"], msg["To"], msg["Subject"] = sender_email, recipient_email, f"Index Options Climax Blueprint - {scan_time}"
-        msg.attach(MIMEText(html_body, "html", "utf-8"))
-
-        for fname in [csv_filename, detail_csv_filename]:
-            if fname and os.path.exists(fname):
-                with open(fname, "rb") as f:
-                    part = MIMEBase("application", "octet-stream")
-                    part.set_payload(f.read())
-                    encoders.encode_base64(part)
-                    part.add_header("Content-Disposition", f'attachment; filename={os.path.basename(fname)}')
-                    msg.attach(part)
-
-        with smtplib.SMTP(smtp_host, smtp_port) as server:
-            server.starttls()
-            server.login(sender_email, sender_password)
-            server.sendmail(sender_email, recipient_email, msg.as_string())
-        logger.info("Email sent successfully.")
-        return True
-    except Exception as e:
-        logger.error(f"EMAIL Error: {e}")
-        return False
-
 
 def save_outputs(summary_df: pd.DataFrame, detail_df: pd.DataFrame, prefix: str = "scan") -> Tuple[str, str]:
     ts = datetime.now().strftime("%Y%m%d_%H%M")
     s_csv, d_csv = f"{prefix}_summary_{ts}.csv", f"{prefix}_detail_{ts}.csv"
-    summary_df.to_csv(s_csv, index=False)
-    detail_df.to_csv(d_csv, index=False)
+    storage_df = summary_df.copy()
+    if "Target_Options" in storage_df.columns: storage_df["Target_Options"] = storage_df["Target_Options"].apply(lambda x: ", ".join(x) if isinstance(x, list) else str(x))
+    storage_df.to_csv(s_csv, index=False); detail_df.to_csv(d_csv, index=False)
     return s_csv, d_csv
 
+def send_email_with_tables(long_df, short_df, ce_df, pe_df, csv_filename, detail_csv_filename) -> bool:
+    try:
+        scan_time = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        html_body = f"""<html><body style="background:#030712;color:#e5e7eb;padding:20px;font-family:Arial,sans-serif;"><h2 style="color:#facc15;">Index Options Strategy Climax Map (Dual Verification)</h2><div style="color:#cbd5e1;font-size:14px;margin-bottom:18px;">Scan completed at {scan_time}</div>{build_html_table(long_df, "Active Index Long Strategy Matrix", EMAIL_DISPLAY_COLS)}<div style="height:28px;"></div>{build_html_table(ce_df, "Call Options (CE) Climax Verification", EMAIL_OPT_COLS)}<div style="height:36px;"></div>{build_html_table(short_df, "Active Index Short Strategy Matrix", EMAIL_DISPLAY_COLS)}<div style="height:28px;"></div>{build_html_table(pe_df, "Put Options (PE) Climax Verification", EMAIL_OPT_COLS)}</body></html>"""
+        msg = MIMEMultipart()
+        msg["From"], msg["To"], msg["Subject"] = sender_email, recipient_email, f"Index Options Climax Blueprint - {scan_time}"
+        msg.attach(MIMEText(html_body, "html", "utf-8"))
+        for fname in [csv_filename, detail_csv_filename]:
+            if fname and os.path.exists(fname):
+                with open(fname, "rb") as f:
+                    part = MIMEBase("application", "octet-stream"); part.set_payload(f.read()); encoders.encode_base64(part); part.add_header("Content-Disposition", f'attachment; filename={os.path.basename(fname)}'); msg.attach(part)
+        with smtplib.SMTP(smtp_host, smtp_port) as server: server.starttls(); server.login(sender_email, sender_password); server.sendmail(sender_email, recipient_email, msg.as_string())
+        logger.info("Email sent successfully."); return True
+    except Exception as e: logger.error(f"EMAIL Error: {e}"); return False
 
 def main():
     init_fyers()
-    if not fyers:
-        logger.error("Fyers not initialized. Exiting.")
-        return
-
+    if not fyers: logger.error("Fyers not initialized. Exiting."); return
     summary_df, detail_df = scan_fno_universe()
-    if summary_df.empty:
-        logger.warning("No summary data produced.")
-        return
-
+    if summary_df.empty: logger.warning("No summary data produced."); return
     summary_csv, detail_csv = save_outputs(summary_df, detail_df, prefix="scan")
     long_df, short_df = build_candidate_tables(summary_df)
-
-    # Build the Spot Signal memory map for Divergence testing
-    spot_signal_map = {}
-    if not long_df.empty:
-        for _, r in long_df.iterrows(): spot_signal_map[r["Symbol"]] = r["Signal_Type"]
-    if not short_df.empty:
-        for _, r in short_df.iterrows(): spot_signal_map[r["Symbol"]] = r["Signal_Type"]
-
-    ce_symbols = get_options_list_from_df(long_df)
-    pe_symbols = get_options_list_from_df(short_df)
-    all_opt_symbols = list(set(ce_symbols + pe_symbols))
-    
+    spot_signal_map = {**{r["Symbol"]: r["Signal_Type"] for _, r in long_df.iterrows()}, **{r["Symbol"]: r["Signal_Type"] for _, r in short_df.iterrows()}}
+    all_opt_symbols = list(set(get_options_list_from_df(long_df) + get_options_list_from_df(short_df)))
     ce_opt_df, pe_opt_df = pd.DataFrame(), pd.DataFrame()
     if all_opt_symbols:
-        logger.info(f"Dynamically scanning {len(all_opt_symbols)} targeted Option Contracts...")
-        opt_summary_df = scan_options_universe(all_opt_symbols)
-        ce_opt_df, pe_opt_df = build_option_candidate_tables(opt_summary_df, spot_signal_map)
-    else:
-        logger.info("No spot signals breached. Skipping Option Contract scanning.")
+        logger.info(f"Dynamically scanning {len(all_opt_symbols)} targeted Option Contracts..."); opt_summary_df = scan_options_universe(all_opt_symbols); ce_opt_df, pe_opt_df = build_option_candidate_tables(opt_summary_df, spot_signal_map)
+    else: logger.info("No spot signals breached. Skipping Option Contract scanning.")
+    send_email_with_tables(long_df, short_df, ce_opt_df, pe_opt_df, summary_csv, detail_csv)
 
-    send_email_with_tables(
-        long_df=long_df, short_df=short_df,
-        ce_df=ce_opt_df, pe_df=pe_opt_df,
-        csv_filename=summary_csv, detail_csv_filename=detail_csv
-    )
-
-
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()
