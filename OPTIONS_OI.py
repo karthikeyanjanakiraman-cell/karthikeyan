@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FO_FNO_FYERS_VOL_REL_EMAIL.py - Corrected Production Master
+FO_FNO_FYERS_VOL_REL_EMAIL.py - Corrected Master Implementation
 """
 
 import os
@@ -22,7 +22,7 @@ from email.mime.base import MIMEBase
 from email import encoders
 
 # ==========================================
-# CONFIGURATION
+# CONFIGURATION & CONSTANTS
 # ==========================================
 
 class Config:
@@ -38,6 +38,10 @@ class Config:
 
 cfg = Config()
 
+EMAIL_DISPLAY_COLS = ["Symbol", "LTP", "% Change", "Signal_Type", "Timeframe", "Top_Band", "Bottom_Band", "Climax_Date", "ATM_Strike", "Option_Contracts"]
+EMAIL_OPT_COLS = ["Symbol", "LTP", "% Change", "Signal_Type", "Timeframe", "Top_Band", "Climax_Date", "Breach_Days"]
+
+# Logger Setup
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 if logger.hasHandlers(): logger.handlers.clear()
@@ -225,7 +229,7 @@ def scan_fno_universe(fyers):
             iter_detail.insert(0, "Symbol", sym); iter_detail.insert(1, "% Change", ((iter_s.get("LTP", 0) - prev_close)/prev_close*100) if prev_close else 0); iteration_rows.append(iter_detail)
         row = {"Symbol": sym, "LTP": iter_s.get("LTP"), "% Change": ((iter_s.get("LTP", 0) - prev_close)/prev_close*100) if prev_close else 0}
         row.update(bands); row.update(streak_data); rows.append(row)
-    return pd.DataFrame(rows), pd.concat(iteration_rows, ignore_index=True)
+    return pd.DataFrame(rows), pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame()
 
 def scan_options_universe(fyers, symbols):
     rows = []
@@ -320,3 +324,4 @@ def main():
     logger.info("Cycle complete.")
 
 if __name__ == "__main__": main()
+
