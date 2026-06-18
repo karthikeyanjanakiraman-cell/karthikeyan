@@ -5,7 +5,7 @@ FO_FNO_FYERS_VOL_REL_EMAIL.py
 Optimized Index Options Scanner via Fyers API with email alerts.
 - CORE INDICES: Tracks Nifty 50, Bank Nifty, and Sensex.
 - 6-LAYER VOLUME CLIMAX: Simultaneously tracks 6M, 3M, 2M, 1M, 2W, and 1W peaks.
-- DYNAMIC OPTION CHAIN ROUTING: Pinpoints the exact ATM strike and lists 3 contracts (ITM, ATM, OTM).
+- DYNAMIC OPTION CHAIN ROUTING: Pinpoints the exact ATM strike and dynamically builds Fyers valid Weekly/Monthly tokens.
 - 10-DAY BREACH AGE FILTER: Price must have broken out/swept the band within <= 10 calendar days.
 - BREACH-VELOCITY HIERARCHY: Sorted by days since breach (recency) first, then by % Change (velocity).
 """
@@ -90,7 +90,7 @@ EMAIL_DISPLAY_COLS = [
 
 
 # ==========================================
-# GLOBAL HELPERS & FORMATTERS (Parsed First)
+# GLOBAL HELPERS & FORMATTERS
 # ==========================================
 
 def format_value(col: str, val):
@@ -115,8 +115,8 @@ def get_index_meta(symbol: str) -> Tuple[str, str, int]:
     return "NSE", "NIFTY", 50
 
 
-def get_expiry_details(symbol: str) -> Tuple[str, str, str]:
-    """Calculates nearest weekly date fragments conforming to true Fyers specifications."""
+def get_expiry_details(symbol: str) -> Tuple[bool, datetime]:
+    """Finds the nearest expiry date and determines if it is a Monthly or Weekly contract."""
     today = datetime.now().date()
     if "NIFTYBANK" in symbol:
         target_weekday = 2  # Wednesday Expiry
@@ -130,21 +130,30 @@ def get_expiry_details(symbol: str) -> Tuple[str, str, str]:
         days_ahead += 7
     nearest_expiry = today + timedelta(days=days_ahead)
     
-    yy = nearest_expiry.strftime("%y")
-    m_num = nearest_expiry.month
-    # Weekly options month code format standard
-    months_map = {1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7", 8: "8", 9: "9", 10: "O", 11: "N", 12: "D"}
-    m_char = months_map[m_num]
-    dd = nearest_expiry.strftime("%d")
+    # If adding 7 days pushes us into a new month, this is the last expiry of the current month
+    next_week = nearest_expiry + timedelta(days=7)
+    is_monthly = next_week.month != nearest_expiry.month
     
-    return yy, m_char, dd
+    return is_monthly, nearest_expiry
 
 
 def get_options_string(symbol: str, ltp: float, side: str) -> Tuple[float, str]:
     """Generates authentic executable Fyers V3 option chain symbology string maps."""
     exch, base_name, interval = get_index_meta(symbol)
     atm_strike = int(round(ltp / interval) * interval)
-    yy, m_char, dd = get_expiry_details(symbol)
+    
+    is_monthly, nearest_expiry = get_expiry_details(symbol)
+    yy = nearest_expiry.strftime("%y")
+    
+    if is_monthly:
+        # Fyers Monthly format: NSE:NIFTY24OCT25000CE
+        expiry_str = nearest_expiry.strftime("%b").upper()
+    else:
+        # Fyers Weekly format: NSE:NIFTY24O1025000CE
+        months_map = {1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7", 8: "8", 9: "9", 10: "O", 11: "N", 12: "D"}
+        m_char = months_map[nearest_expiry.month]
+        dd = nearest_expiry.strftime("%d")
+        expiry_str = f"{m_char}{dd}"
     
     if side == "long":
         itm = atm_strike - interval
@@ -155,9 +164,9 @@ def get_options_string(symbol: str, ltp: float, side: str) -> Tuple[float, str]:
         otm = atm_strike - interval
         opt_type = "PE"
         
-    itm_sym = f"{exch}:{base_name}{yy}{m_char}{dd}{itm}{opt_type}"
-    atm_sym = f"{exch}:{base_name}{yy}{m_char}{dd}{atm_strike}{opt_type}"
-    otm_sym = f"{exch}:{base_name}{yy}{m_char}{dd}{otm}{opt_type}"
+    itm_sym = f"{exch}:{base_name}{yy}{expiry_str}{itm}{opt_type}"
+    atm_sym = f"{exch}:{base_name}{yy}{expiry_str}{atm_strike}{opt_type}"
+    otm_sym = f"{exch}:{base_name}{yy}{expiry_str}{otm}{opt_type}"
     
     return float(atm_strike), f"ITM: {itm_sym} | ATM: {atm_sym} | OTM: {otm_sym}"
 
@@ -165,6 +174,23 @@ def get_options_string(symbol: str, ltp: float, side: str) -> Tuple[float, str]:
 # ==========================================
 # TECHNICAL SIGNAL MATH & COMPUTATION
 # ==========================================
+
+def price_stats_from_series(prices: pd.Series) -> dict:
+    """Calculates price action statistics (Restored)."""
+    p = pd.to_numeric(prices, errors="coerce").dropna().astype(float)
+    if len(p) < 3: return {"Directional": np.nan, "Turning": np.nan, "Stability": np.nan, "Balanced": np.nan, "CumsumPlus": np.nan}
+    x = np.arange(len(p), dtype=float)
+    slope = float(np.polyfit(x, p.values, 1)[0])
+    directional = slope + float(p.iloc[-1] - p.iloc[0])
+    turning = float(np.mean(np.abs(np.diff(p.values, n=2))))
+    return {
+        "Directional": directional, 
+        "Turning": turning, 
+        "Stability": float(np.std(p.values)), 
+        "Balanced": directional - turning + float(np.std(p.values)), 
+        "CumsumPlus": float(np.sum(np.clip(np.diff(p.values), 0, None)))
+    }
+
 
 def build_signals_from_raw_directional(detail_df) -> dict:
     nan = float("nan")
