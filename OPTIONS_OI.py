@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-FO_FNO_FYERS_VOL_REL_EMAIL.py - Complete Master Implementation
-Features: Spot/Option Divergence, 21-Strike Net, LOC Climax, CSV Audit
+FO_FNO_FYERS_VOL_REL_EMAIL.py - Corrected Production Master
 """
 
 import os
@@ -221,10 +220,12 @@ def scan_fno_universe(fyers):
                     streak_data[f"Days_L_{label}"] = (today_date - next((d for d, c in reversed(history_candles) if pd.notna(t_val) and c > t_val), today_date)).days
                     streak_data[f"Days_S_{label}"] = (today_date - next((d for d, c in reversed(history_candles) if pd.notna(b_val) and c < b_val), today_date)).days
         
-        iter_s, _ = compute_iteration_volume_profile(intra, prev_close)
+        iter_s, iter_detail = compute_iteration_volume_profile(intra, prev_close)
+        if not iter_detail.empty:
+            iter_detail.insert(0, "Symbol", sym); iter_detail.insert(1, "% Change", ((iter_s.get("LTP", 0) - prev_close)/prev_close*100) if prev_close else 0); iteration_rows.append(iter_detail)
         row = {"Symbol": sym, "LTP": iter_s.get("LTP"), "% Change": ((iter_s.get("LTP", 0) - prev_close)/prev_close*100) if prev_close else 0}
         row.update(bands); row.update(streak_data); rows.append(row)
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows), pd.concat(iteration_rows, ignore_index=True)
 
 def scan_options_universe(fyers, symbols):
     rows = []
@@ -254,7 +255,14 @@ def build_candidate_tables(df):
                 strike, opt_str, opt_list = get_options_data(row["Symbol"], row["LTP"], "short")
                 valid_short.append({**row, "Timeframe": tf, "Bottom_Band": b, "ATM_Strike": strike, "Option_Contracts": opt_str, "Target_Options": opt_list, "Breach_Days": sd, "Signal_Type": "Active Trend"})
                 break
-    return pd.DataFrame(valid_long), pd.DataFrame(valid_short)
+    long_df, short_df = pd.DataFrame(valid_long), pd.DataFrame(valid_short)
+    if not long_df.empty and not short_df.empty:
+        common = set(long_df["Symbol"]).intersection(set(short_df["Symbol"]))
+        for sym in common:
+            l_idx, s_idx = long_df.index[long_df["Symbol"] == sym][0], short_df.index[short_df["Symbol"] == sym][0]
+            if long_df.at[l_idx, "Breach_Days"] < short_df.at[s_idx, "Breach_Days"]: short_df = short_df.drop(s_idx)
+            elif short_df.at[s_idx, "Breach_Days"] < long_df.at[l_idx, "Breach_Days"]: long_df = long_df.drop(l_idx)
+    return long_df, short_df
 
 def build_option_candidate_tables(df, spot_signal_map):
     valid_rows = []
@@ -266,6 +274,7 @@ def build_option_candidate_tables(df, spot_signal_map):
             row["Timeframe"], row["Top_Band"], row["Climax_Date"], row["Breach_Days"] = "LOC", t, d, bd
             valid_rows.append(row)
     res = pd.DataFrame(valid_rows)
+    if res.empty: return pd.DataFrame(), pd.DataFrame()
     return res[res["Symbol"].str.endswith("CE")], res[res["Symbol"].str.endswith("PE")]
 
 def save_outputs(summary_df, detail_df, prefix="scan"):
@@ -280,7 +289,7 @@ def build_html_table(df, title, cols):
     if df.empty: return f"<h3>{title}</h3><p>No candidates.</p>"
     return f"<h3>{title}</h3><table border='1'><tr>" + "".join([f"<th>{c}</th>" for c in cols]) + "</tr>" + "".join([f"<tr>" + "".join([f"<td>{format_value(c, row.get(c))}</td>" for c in cols]) + "</tr>" for _, row in df.head(30).iterrows()]) + "</table>"
 
-def send_email(long_df, short_df, ce_df, pe_df, csv_file, cfg: Config):
+def send_email(long_df, short_df, ce_df, pe_df, csv_file):
     try:
         msg = MIMEMultipart()
         msg["From"], msg["To"], msg["Subject"] = cfg.sender_email, cfg.recipient_email, "Index Options Climax Blueprint"
@@ -289,6 +298,7 @@ def send_email(long_df, short_df, ce_df, pe_df, csv_file, cfg: Config):
         with open(csv_file, "rb") as f:
             part = MIMEBase("application", "octet-stream"); part.set_payload(f.read()); encoders.encode_base64(part); part.add_header("Content-Disposition", f'attachment; filename={os.path.basename(csv_file)}'); msg.attach(part)
         with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port) as s: s.starttls(); s.login(cfg.sender_email, cfg.sender_password); s.sendmail(cfg.sender_email, cfg.recipient_email, msg.as_string())
+        logger.info("Email sent.")
     except Exception as e: logger.error(f"Email Failed: {e}")
 
 def main():
@@ -296,14 +306,17 @@ def main():
     if not fyers: return
     spot_df, detail_df = scan_fno_universe(fyers)
     long_df, short_df = build_candidate_tables(spot_df)
+    
     spot_map = {**{r["Symbol"]: r["Signal_Type"] for _, r in long_df.iterrows()}, **{r["Symbol"]: r["Signal_Type"] for _, r in short_df.iterrows()}}
     all_opt = list(set(get_options_list_from_df(long_df) + get_options_list_from_df(short_df)))
+    
     ce_df, pe_df = pd.DataFrame(), pd.DataFrame()
     if all_opt:
         opt_df = scan_options_universe(fyers, all_opt)
         ce_df, pe_df = build_option_candidate_tables(opt_df, spot_map)
+    
     csv_f, _ = save_outputs(spot_df, detail_df)
-    send_email(long_df, short_df, ce_df, pe_df, csv_f, cfg)
+    send_email(long_df, short_df, ce_df, pe_df, csv_f)
     logger.info("Cycle complete.")
 
 if __name__ == "__main__": main()
