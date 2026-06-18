@@ -4,7 +4,7 @@ FO_FNO_FYERS_VOL_REL_EMAIL.py
 
 Optimized Index & Options Dual-Verification Scanner via Fyers API.
 - CORE INDICES: Tracks Nifty 50, Bank Nifty, and Sensex (6M, 3M, 2M, 1M, 2W, 1W peaks).
-- DYNAMIC OPTION CHAIN ROUTING: Pinpoints ATM strikes using SEBI-compliant Expiry logic.
+- DYNAMIC 20+ STRIKE ROUTING: Generates a 21-strike net (10 ITM, ATM, 10 OTM) for verification.
 - OPTION PREMIUM VERIFICATION: Pulls the option charts and finds 1M, 2W, 1W Climax blocks on the premiums.
 - 10-DAY BREACH AGE FILTER: Price must have broken out/swept the band within <= 10 calendar days.
 - BREACH-VELOCITY HIERARCHY: Sorted by days since breach (recency) first, then by % Change (velocity).
@@ -132,9 +132,11 @@ def get_expiry_details(symbol: str) -> Tuple[bool, datetime.date]:
         return (expiry == get_last_weekday(expiry.year, expiry.month, 3)), expiry
 
 
-def get_options_string(symbol: str, ltp: float, side: str) -> Tuple[float, str]:
+def get_options_data(symbol: str, ltp: float, side: str) -> Tuple[float, str, List[str]]:
+    """Generates a massive 21-strike net (10 ITM, 1 ATM, 10 OTM) for rigorous option sweep tracking."""
     exch, base_name, interval = get_index_meta(symbol)
     atm_strike = int(round(ltp / interval) * interval)
+    
     is_monthly, nearest_expiry = get_expiry_details(symbol)
     yy = nearest_expiry.strftime("%y")
     
@@ -146,29 +148,27 @@ def get_options_string(symbol: str, ltp: float, side: str) -> Tuple[float, str]:
         dd = nearest_expiry.strftime("%d")
         expiry_str = f"{m_char}{dd}"
     
-    if side == "long":
-        itm, otm, opt_type = atm_strike - interval, atm_strike + interval, "CE"
-    else:
-        itm, otm, opt_type = atm_strike + interval, atm_strike - interval, "PE"
-        
-    itm_sym = f"{exch}:{base_name}{yy}{expiry_str}{itm}{opt_type}"
-    atm_sym = f"{exch}:{base_name}{yy}{expiry_str}{atm_strike}{opt_type}"
-    otm_sym = f"{exch}:{base_name}{yy}{expiry_str}{otm}{opt_type}"
+    opt_type = "CE" if side == "long" else "PE"
     
-    return float(atm_strike), f"ITM: {itm_sym} | ATM: {atm_sym} | OTM: {otm_sym}"
+    # Calculate exactly 21 strikes systematically spanning deep ITM to deep OTM
+    strikes = [atm_strike + (i * interval) for i in range(-10, 11)]
+    target_symbols = [f"{exch}:{base_name}{yy}{expiry_str}{s}{opt_type}" for s in strikes]
+    
+    display_str = f"21 {opt_type} Contracts (Strikes: {strikes[0]:.2f} to {strikes[-1]:.2f})"
+    
+    return float(atm_strike), display_str, target_symbols
 
 
 def get_options_list_from_df(df: pd.DataFrame) -> List[str]:
-    """Parses dynamically generated option strings into an actionable Fyers API list."""
+    """Extracts raw API target symbols directly from the hidden Target_Options matrix."""
     symbols = []
-    if df.empty or "Option_Contracts" not in df.columns: return symbols
+    if df.empty or "Target_Options" not in df.columns: return symbols
+    
     for _, row in df.iterrows():
-        contracts_str = str(row["Option_Contracts"])
-        parts = contracts_str.split("|")
-        for p in parts:
-            if ":" in p:
-                sym = p.split(" ")[-1].strip()
-                if sym: symbols.append(sym)
+        opt_list = row.get("Target_Options")
+        if isinstance(opt_list, list):
+            symbols.extend(opt_list)
+            
     return list(set(symbols))
 
 
@@ -442,7 +442,6 @@ def scan_options_universe(symbols: List[str]) -> pd.DataFrame:
                     c_day = df_slice.loc[max_idx]
                     bands[f"T_{label}"], bands[f"D_{label}"] = float(c_day["high"]), str(c_day["_date_parsed"])
 
-                # Reduced Lifespan Options Tracking
                 for label, tf_days in [("1M", 22), ("2W", 10), ("1W", 5)]:
                     extract_opt_bands(hist_daily, tf_days, label)
 
@@ -512,8 +511,10 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
                         elif pc <= t: row["Signal_Type"] = "Fresh Breakout"
                         else: row["Signal_Type"] = "Active Trend"
                         row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"], row["Breach_Days"] = tf, t, b, d, bd_days
-                        strike, opt_str = get_options_string(sym, ltp, "long")
-                        row["ATM_Strike"], row["Option_Contracts"] = strike, opt_str
+                        
+                        # Dynamically generating 21 strikes (10 ITM, 1 ATM, 10 OTM)
+                        strike, opt_str, opt_list = get_options_data(sym, ltp, "long")
+                        row["ATM_Strike"], row["Option_Contracts"], row["Target_Options"] = strike, opt_str, opt_list
                         valid_rows.append(row)
                         break
                         
@@ -523,8 +524,10 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
                         elif pc >= b: row["Signal_Type"] = "Fresh Breakdown"
                         else: row["Signal_Type"] = "Active Trend"
                         row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"], row["Breach_Days"] = tf, t, b, d, bd_days
-                        strike, opt_str = get_options_string(sym, ltp, "short")
-                        row["ATM_Strike"], row["Option_Contracts"] = strike, opt_str
+                        
+                        # Dynamically generating 21 strikes (10 ITM, 1 ATM, 10 OTM)
+                        strike, opt_str, opt_list = get_options_data(sym, ltp, "short")
+                        row["ATM_Strike"], row["Option_Contracts"], row["Target_Options"] = strike, opt_str, opt_list
                         valid_rows.append(row)
                         break
 
@@ -535,6 +538,7 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
     long_df = prep_side_df(base, "long").drop_duplicates(subset=["Symbol"]).head(30)
     short_df = prep_side_df(base, "short").drop_duplicates(subset=["Symbol"]).head(30)
     
+    # Target_Options is purposefully NOT included in EMAIL_DISPLAY_COLS so the massive list stays hidden
     cols = [c for c in EMAIL_DISPLAY_COLS if c in long_df.columns or c in short_df.columns]
     return (long_df[cols] if not long_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS)), (short_df[cols] if not short_df.empty else pd.DataFrame(columns=EMAIL_DISPLAY_COLS))
 
@@ -551,7 +555,6 @@ def build_option_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
         ltp, pc, d_low, sym = row.get("LTP"), row.get("Prev_Close"), row.get("Day_Low"), row.get("Symbol")
         if pd.isna(ltp) or pd.isna(pc) or pd.isna(d_low): continue
 
-        # Both Calls and Puts must break out LONG to be purchased
         for tf in ["1M", "2W", "1W"]:
             t, d, bd_days = row.get(f"T_{tf}"), row.get(f"D_{tf}"), row.get(f"Days_L_{tf}")
             
