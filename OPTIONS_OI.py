@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FO_FNO_FYERS_VOL_REL_EMAIL.py - Corrected Master Implementation
+FO_FNO_FYERS_VOL_REL_EMAIL.py - Colourful Production Master
 """
 
 import os
@@ -22,7 +22,7 @@ from email.mime.base import MIMEBase
 from email import encoders
 
 # ==========================================
-# CONFIGURATION & CONSTANTS
+# CONFIGURATION
 # ==========================================
 
 class Config:
@@ -39,7 +39,7 @@ class Config:
 cfg = Config()
 
 EMAIL_DISPLAY_COLS = ["Symbol", "LTP", "% Change", "Signal_Type", "Timeframe", "Top_Band", "Bottom_Band", "Climax_Date", "ATM_Strike", "Option_Contracts"]
-EMAIL_OPT_COLS = ["Symbol", "LTP", "% Change", "Signal_Type", "Timeframe", "Top_Band", "Climax_Date", "Breach_Days"]
+EMAIL_OPT_COLS = ["Symbol", "LTP", "% Change", "Signal_Type", "Timeframe", "Top_Band", "Bottom_Band", "Climax_Date", "Breach_Days"]
 
 # Logger Setup
 logger = logging.getLogger()
@@ -111,59 +111,6 @@ def get_options_list_from_df(df):
 # MATH & API
 # ==========================================
 
-def price_stats(prices):
-    p = pd.to_numeric(prices, errors="coerce").dropna().astype(float)
-    if len(p) < 3: return {"Directional": np.nan, "Turning": np.nan, "Stability": np.nan, "Balanced": np.nan, "CumsumPlus": np.nan}
-    x = np.arange(len(p), dtype=float)
-    slope = float(np.polyfit(x, p.values, 1)[0])
-    directional = slope + float(p.iloc[-1] - p.iloc[0])
-    turning = float(np.mean(np.abs(np.diff(p.values, n=2))))
-    return {"Directional": directional, "Turning": turning, "Stability": float(np.std(p.values)), "Balanced": directional - turning + float(np.std(p.values)), "CumsumPlus": float(np.sum(np.clip(np.diff(p.values), 0, None)))}
-
-def build_signals_from_raw_directional(detail_df):
-    nan = float("nan")
-    out = {k: nan for k in ("5m_Signal", "15m_Signal", "30m_Signal", "60m_Signal", "Bull_Signal", "Bear_Signal", "Overall_Signal")}
-    if detail_df is None or detail_df.empty: return out
-    df = detail_df.copy()
-    if "Iteration No" in df.columns: df = df.sort_values("Iteration No")
-    vals = pd.to_numeric(df["Directional"], errors="coerce").dropna().to_numpy(dtype=float)
-    if vals.size == 0: return out
-    last = vals.size - 1
-    def raw_at(offset): return float(vals[max(0, last - offset)])
-    out["5m_Signal"], out["15m_Signal"], out["30m_Signal"], out["60m_Signal"] = round(raw_at(0), 4), round(raw_at(3) if last >= 3 else raw_at(0), 4), round(raw_at(6) if last >= 6 else raw_at(0), 4), round(raw_at(12) if last >= 12 else raw_at(0), 4)
-    out["Bull_Signal"] = round(float(vals[vals > 0].max()) if (vals > 0).any() else 0.0, 4)
-    out["Bear_Signal"] = round(abs(float(vals[vals < 0].min())) if (vals < 0).any() else 0.0, 4)
-    out["Overall_Signal"] = round(raw_at(0), 4)
-    return out
-
-def classify_mtf_from_window(win, eps=1e-9):
-    s = pd.Series(win).dropna().astype(float)
-    if len(s) < 3: return float("nan")
-    diff1 = s.diff().dropna()
-    if len(diff1) < 2: return float("nan")
-    x = np.arange(len(s), dtype=float)
-    slope = float(np.polyfit(x, s.values, 1)[0])
-    net_move = float(s.iloc[-1] - s.iloc[0])
-    turning = float(np.mean(np.abs(np.diff(s.values, n=2)))) if len(s) >= 3 else 0.0
-    stability = float(np.std(s.values))
-    score = (slope + net_move) + (0.25 * float(np.clip(diff1, 0, None).sum())) - (0.50 * turning) - (0.10 * stability)
-    return 1.0 if score > eps else -1.0 if score < -eps else 0.0
-
-def build_mtf_alignment(detail_df):
-    out = {"MTF_5m": float("nan"), "MTF_15m": float("nan"), "MTF_30m": float("nan"), "MTF_60m": float("nan"), "MTF_SCORE": float("nan"), "MTF_ALIGN": "NA"}
-    if detail_df is None or detail_df.empty or "Iteration Change" not in detail_df.columns: return out
-    df = detail_df.copy().sort_values("Iteration No").reset_index(drop=True)
-    series = pd.to_numeric(df["Iteration Change"], errors="coerce").dropna().astype(float)
-    if len(series) < 3: return out
-    def classify_from_tail(s, bars): return float("nan") if len(s) < bars else classify_mtf_from_window(s.tail(bars))
-    mtf_15, mtf_30, mtf_60 = classify_from_tail(series, 3), classify_from_tail(series.iloc[1::2].reset_index(drop=True), 3), classify_from_tail(series.iloc[3::4].reset_index(drop=True), 3)   
-    available = [v for v in [mtf_15, mtf_30, mtf_60] if pd.notna(v)]
-    if not available: return out
-    score = float(np.nansum([mtf_15, mtf_30, mtf_60]))
-    align = "LONG" if all(v == 1.0 for v in available) else "SHORT" if all(v == -1.0 for v in available) else "MIXED"
-    out.update({"MTF_15m": mtf_15, "MTF_30m": mtf_30, "MTF_60m": mtf_60, "MTF_SCORE": score, "MTF_ALIGN": align})
-    return out
-
 def init_fyers():
     try:
         return fyersModel.FyersModel(client_id=cfg.client_id, is_async=False, token=cfg.access_token, log_path="")
@@ -182,31 +129,10 @@ def get_history(fyers, symbol, res, days):
         return None
     except Exception as e: return None
 
-def compute_iteration_volume_profile(intra_df, prev_close):
-    if intra_df is None or intra_df.empty: return {}, pd.DataFrame()
-    df = intra_df.copy()
-    df["date"], df["time_only"] = pd.to_datetime(df["timestamp"]).dt.date, pd.to_datetime(df["timestamp"]).dt.time
-    dates = sorted(df["date"].unique())
-    if len(dates) < 2: return {}, pd.DataFrame()
-    curr_df = df[df["date"] == dates[-1]].copy().sort_values("time_only")
-    if curr_df.empty: return {}, pd.DataFrame()
-    curr_df["Iteration Change"] = ((pd.to_numeric(curr_df["close"], errors="coerce") - float(prev_close)) / float(prev_close) * 100.0) if prev_close else 0.0
-    rows = []
-    for i in range(len(curr_df)):
-        ps = price_stats(curr_df["Iteration Change"].iloc[: i + 1])
-        rows.append({"Iteration No": i+1, "Iteration Time": curr_df.iloc[i]["time_only"].strftime("%H:%M"), "LTP": float(curr_df.iloc[i]["close"]), "Iteration Change": float(curr_df["Iteration Change"].iloc[i]), "Directional": ps["Directional"], "Turning": ps["Turning"], "Stability": ps["Stability"], "Balanced": ps["Balanced"], "CumsumPlus": ps.get("CumsumPlus")})
-    detail_df = pd.DataFrame(rows)
-    final_ps = price_stats(curr_df["Iteration Change"])
-    summary = {"LTP": float(curr_df["close"].iloc[-1]), "Directional": final_ps["Directional"], "Turning": final_ps["Turning"], "Stability": final_ps["Stability"], "Balanced": final_ps["Balanced"], "CumsumPlus": final_ps.get("CumsumPlus"), "Total Iterations": len(curr_df), "Last Iteration Time": curr_df.iloc[-1]["time_only"].strftime("%H:%M")}
-    summary.update(build_signals_from_raw_directional(detail_df))
-    summary.update(build_mtf_alignment(detail_df))
-    return summary, detail_df
-
 def scan_fno_universe(fyers):
-    rows, iteration_rows = [], []
+    rows = []
     for idx, sym in enumerate(cfg.index_symbols, start=1):
-        logger.info(f"CORE [{idx}/{len(cfg.index_symbols)}] Processing Spot: {sym}")
-        daily, intra = get_history(fyers, sym, "D", 200), get_history(fyers, sym, "15", 30)
+        daily = get_history(fyers, sym, "D", 200)
         prev_close, bands, streak_data = None, {}, {}
         if daily is not None and len(daily) >= 3:
             today_date = datetime.now().date()
@@ -223,18 +149,14 @@ def scan_fno_universe(fyers):
                     t_val, b_val = bands.get(f"T_{label}"), bands.get(f"B_{label}")
                     streak_data[f"Days_L_{label}"] = (today_date - next((d for d, c in reversed(history_candles) if pd.notna(t_val) and c > t_val), today_date)).days
                     streak_data[f"Days_S_{label}"] = (today_date - next((d for d, c in reversed(history_candles) if pd.notna(b_val) and c < b_val), today_date)).days
-        
-        iter_s, iter_detail = compute_iteration_volume_profile(intra, prev_close)
-        if not iter_detail.empty:
-            iter_detail.insert(0, "Symbol", sym); iter_detail.insert(1, "% Change", ((iter_s.get("LTP", 0) - prev_close)/prev_close*100) if prev_close else 0); iteration_rows.append(iter_detail)
-        row = {"Symbol": sym, "LTP": iter_s.get("LTP"), "% Change": ((iter_s.get("LTP", 0) - prev_close)/prev_close*100) if prev_close else 0}
+        ltp = float(daily["close"].iloc[-1])
+        row = {"Symbol": sym, "LTP": ltp, "% Change": ((ltp - prev_close)/prev_close*100) if prev_close else 0}
         row.update(bands); row.update(streak_data); rows.append(row)
-    return pd.DataFrame(rows), pd.concat(iteration_rows, ignore_index=True) if iteration_rows else pd.DataFrame()
+    return pd.DataFrame(rows)
 
 def scan_options_universe(fyers, symbols):
     rows = []
     for idx, sym in enumerate(symbols, start=1):
-        logger.info(f"VERIFICATION [{idx}/{len(symbols)}] Option: {sym}")
         daily = get_history(fyers, sym, "D", 60)
         if daily is not None and not daily.empty:
             prev_close = float(daily["close"].iloc[-2]) if len(daily) > 1 else float(daily["close"].iloc[-1])
@@ -243,21 +165,27 @@ def scan_options_universe(fyers, symbols):
             today_date = datetime.now().date()
             history_candles = list(zip(daily["timestamp"].dt.date, daily["close"])) + [(today_date, float(daily["close"].iloc[-1]))]
             l_start = next((d for d, c_val in reversed(history_candles) if c_val > float(c["high"])), today_date)
-            rows.append({"Symbol": sym, "LTP": float(daily["close"].iloc[-1]), "T_LOC": float(c["high"]), "D_LOC": str(c["timestamp"].date()), "Days_L_LOC": (today_date - l_start).days, "Prev_Close": prev_close})
+            ltp = float(daily["close"].iloc[-1])
+            rows.append({
+                "Symbol": sym, "LTP": ltp, 
+                "T_LOC": float(c["high"]), "B_LOC": float(c["low"]), "D_LOC": str(pd.to_datetime(c["timestamp"]).date()), 
+                "Days_L_LOC": (today_date - l_start).days, "Prev_Close": prev_close,
+                "% Change": ((ltp - prev_close)/prev_close*100) if prev_close != 0 else 0
+            })
     return pd.DataFrame(rows)
 
 def build_candidate_tables(df):
     valid_long, valid_short = [], []
     for _, row in df.iterrows():
         for tf in ["6M", "3M", "2M", "1M", "2W", "1W"]:
-            t, b, bd = row.get(f"T_{tf}"), row.get(f"B_{tf}"), row.get(f"Days_L_{tf}")
+            t, b, d, bd = row.get(f"T_{tf}"), row.get(f"B_{tf}"), row.get(f"D_{tf}"), row.get(f"Days_L_{tf}")
             if pd.notna(t) and row["LTP"] > t and bd is not None and bd <= 10:
                 strike, opt_str, opt_list = get_options_data(row["Symbol"], row["LTP"], "long")
-                valid_long.append({**row, "Timeframe": tf, "Top_Band": t, "ATM_Strike": strike, "Option_Contracts": opt_str, "Target_Options": opt_list, "Breach_Days": bd, "Signal_Type": "Active Trend"})
+                valid_long.append({**row, "Timeframe": tf, "Top_Band": t, "Bottom_Band": b, "Climax_Date": d, "ATM_Strike": strike, "Option_Contracts": opt_str, "Target_Options": opt_list, "Breach_Days": bd, "Signal_Type": "Active Trend"})
                 break
             elif pd.notna(b) and row["LTP"] < b and (sd := row.get(f"Days_S_{tf}")) is not None and sd <= 10:
                 strike, opt_str, opt_list = get_options_data(row["Symbol"], row["LTP"], "short")
-                valid_short.append({**row, "Timeframe": tf, "Bottom_Band": b, "ATM_Strike": strike, "Option_Contracts": opt_str, "Target_Options": opt_list, "Breach_Days": sd, "Signal_Type": "Active Trend"})
+                valid_short.append({**row, "Timeframe": tf, "Bottom_Band": b, "Top_Band": t, "Climax_Date": d, "ATM_Strike": strike, "Option_Contracts": opt_str, "Target_Options": opt_list, "Breach_Days": sd, "Signal_Type": "Active Trend"})
                 break
     long_df, short_df = pd.DataFrame(valid_long), pd.DataFrame(valid_short)
     if not long_df.empty and not short_df.empty:
@@ -271,33 +199,52 @@ def build_candidate_tables(df):
 def build_option_candidate_tables(df, spot_signal_map):
     valid_rows = []
     for _, row in df.iterrows():
-        t, d, bd = row.get("T_LOC"), row.get("D_LOC"), row.get("Days_L_LOC")
+        t, b, d, bd = row.get("T_LOC"), row.get("B_LOC"), row.get("D_LOC"), row.get("Days_L_LOC")
         if pd.notna(t) and row["LTP"] > t and bd is not None and bd <= 10:
             spot_signal = spot_signal_map.get(get_underlying_spot(row["Symbol"]), "")
             row["Signal_Type"] = "Holy Grail" if spot_signal == "Fresh Sweep" else "Active Trend"
-            row["Timeframe"], row["Top_Band"], row["Climax_Date"], row["Breach_Days"] = "LOC", t, d, bd
+            row["Timeframe"], row["Top_Band"], row["Bottom_Band"], row["Climax_Date"], row["Breach_Days"] = "LOC", t, b, d, bd
             valid_rows.append(row)
     res = pd.DataFrame(valid_rows)
     if res.empty: return pd.DataFrame(), pd.DataFrame()
     return res[res["Symbol"].str.endswith("CE")], res[res["Symbol"].str.endswith("PE")]
 
-def save_outputs(summary_df, detail_df, prefix="scan"):
+def save_outputs(summary_df, prefix="scan"):
     ts = datetime.now().strftime("%Y%m%d_%H%M")
     storage = summary_df.copy()
     if "Target_Options" in storage.columns: storage["Target_Options"] = storage["Target_Options"].apply(lambda x: ", ".join(x) if isinstance(x, list) else str(x))
     storage.to_csv(f"{prefix}_summary_{ts}.csv", index=False)
-    detail_df.to_csv(f"{prefix}_detail_{ts}.csv", index=False)
-    return f"{prefix}_summary_{ts}.csv", f"{prefix}_detail_{ts}.csv"
+    return f"{prefix}_summary_{ts}.csv"
 
 def build_html_table(df, title, cols):
     if df.empty: return f"<h3>{title}</h3><p>No candidates.</p>"
-    return f"<h3>{title}</h3><table border='1'><tr>" + "".join([f"<th>{c}</th>" for c in cols]) + "</tr>" + "".join([f"<tr>" + "".join([f"<td>{format_value(c, row.get(c))}</td>" for c in cols]) + "</tr>" for _, row in df.head(30).iterrows()]) + "</table>"
+    table_html = f"<h3>{title}</h3><table style='border-collapse: collapse; width: 100%; font-family: sans-serif;'>"
+    table_html += "<tr style='background-color: #334155; color: white;'>" + "".join([f"<th style='padding: 8px;'>{c}</th>" for c in cols]) + "</tr>"
+    for i, (_, row) in enumerate(df.head(30).iterrows()):
+        bg_row = "#f8fafc" if i % 2 == 0 else "#e2e8f0"
+        sig = str(row.get("Signal_Type", ""))
+        row_style = f"background-color: {bg_row};"
+        if "Holy Grail" in sig: row_style = "background-color: #f3e8ff;" # Purple
+        elif "Sweep" in sig: row_style = "background-color: #fef3c7;"   # Amber
+        
+        row_html = f"<tr style='{row_style}'>"
+        for c in cols:
+            val = row.get(c)
+            cell_style = "padding: 8px;"
+            if c == "% Change":
+                try: 
+                    num = float(val)
+                    cell_style += " color: #166534;" if num > 0 else " color: #991b1b;" if num < 0 else ""
+                except: pass
+            row_html += f"<td style='{cell_style}'>{format_value(c, val)}</td>"
+        table_html += row_html + "</tr>"
+    return table_html + "</table>"
 
 def send_email(long_df, short_df, ce_df, pe_df, csv_file):
     try:
         msg = MIMEMultipart()
         msg["From"], msg["To"], msg["Subject"] = cfg.sender_email, cfg.recipient_email, "Index Options Climax Blueprint"
-        html = f"<html><body><h2>Index Options Climax</h2>{build_html_table(long_df, 'Long', EMAIL_DISPLAY_COLS)}{build_html_table(ce_df, 'CE Climax', EMAIL_OPT_COLS)}{build_html_table(short_df, 'Short', EMAIL_DISPLAY_COLS)}{build_html_table(pe_df, 'PE Climax', EMAIL_OPT_COLS)}</body></html>"
+        html = f"<html><body>{build_html_table(long_df, 'Long', EMAIL_DISPLAY_COLS)}{build_html_table(ce_df, 'CE Climax', EMAIL_OPT_COLS)}{build_html_table(short_df, 'Short', EMAIL_DISPLAY_COLS)}{build_html_table(pe_df, 'PE Climax', EMAIL_OPT_COLS)}</body></html>"
         msg.attach(MIMEText(html, "html"))
         with open(csv_file, "rb") as f:
             part = MIMEBase("application", "octet-stream"); part.set_payload(f.read()); encoders.encode_base64(part); part.add_header("Content-Disposition", f'attachment; filename={os.path.basename(csv_file)}'); msg.attach(part)
@@ -308,20 +255,16 @@ def send_email(long_df, short_df, ce_df, pe_df, csv_file):
 def main():
     fyers = init_fyers()
     if not fyers: return
-    spot_df, detail_df = scan_fno_universe(fyers)
+    spot_df = scan_fno_universe(fyers)
     long_df, short_df = build_candidate_tables(spot_df)
-    
     spot_map = {**{r["Symbol"]: r["Signal_Type"] for _, r in long_df.iterrows()}, **{r["Symbol"]: r["Signal_Type"] for _, r in short_df.iterrows()}}
     all_opt = list(set(get_options_list_from_df(long_df) + get_options_list_from_df(short_df)))
-    
     ce_df, pe_df = pd.DataFrame(), pd.DataFrame()
     if all_opt:
         opt_df = scan_options_universe(fyers, all_opt)
         ce_df, pe_df = build_option_candidate_tables(opt_df, spot_map)
-    
-    csv_f, _ = save_outputs(spot_df, detail_df)
+    csv_f = save_outputs(spot_df)
     send_email(long_df, short_df, ce_df, pe_df, csv_f)
     logger.info("Cycle complete.")
 
 if __name__ == "__main__": main()
-
