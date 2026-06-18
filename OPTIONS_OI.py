@@ -36,6 +36,7 @@ class UTF8Formatter(logging.Formatter):
         return super().format(record)
 
 
+# Initialize Logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 if logger.hasHandlers():
@@ -52,7 +53,8 @@ logger.addHandler(ch)
 
 warnings.filterwarnings("ignore")
 
-DAILY_LOOKBACK_DAYS = 200  # Ensures we capture 135 actual trading days
+# Global Configuration Parameters
+DAILY_LOOKBACK_DAYS = 200  
 INTRADAY_LOOKBACK_DAYS = 30
 HISTORY_API_MAX_SPAN_DAYS = 99
 FYERS_RATE_LIMIT_SLEEP = 0.31
@@ -73,19 +75,96 @@ EMAIL_DISPLAY_COLS = [
     "Symbol",
     "LTP",
     "% Change",
-    "Signal_Type",       # 'Fresh Sweep', 'Fresh Breakout', or 'Active Trend'
-    "Timeframe",         # '6M', '3M', '2M', '1M', '2W', '1W'
+    "Signal_Type",       
+    "Timeframe",         
     "Top_Band",          
     "Bottom_Band",       
     "Climax_Date",       
-    "ATM_Strike",        # Exact ATM strike level
-    "Option_Contracts",  # Lists the copy-pasteable ITM | ATM | OTM options to trade
+    "ATM_Strike",        
+    "Option_Contracts",  
     "MTF_15m",
     "MTF_30m",
     "MTF_60m",
     "Last Iteration Time",
 ]
 
+
+# ==========================================
+# GLOBAL HELPERS & FORMATTERS (Parsed First)
+# ==========================================
+
+def format_value(col: str, val):
+    """Globally scoped cell data visual text formatting engine."""
+    if pd.isna(val) or val == float("inf") or val == float("-inf"): return ""
+    if col in ["Timeframe", "Signal_Type", "Option_Contracts"]: return str(val)
+    if col == "% Change": return f"{float(val):.2f}%"
+    if col in ["Top_Band", "Bottom_Band", "ATM_Strike"]: return f"{float(val):.2f}"
+    if col == "Climax_Date": return str(val)
+    if isinstance(val, (int, float, np.integer, np.floating)): return f"{float(val):.4f}"
+    return str(val)
+
+
+def get_index_meta(symbol: str) -> Tuple[str, str, int]:
+    """Maps index symbol to proper Fyers naming parameters and rounding intervals."""
+    if "NIFTY50" in symbol:
+        return "NSE", "NIFTY", 50
+    elif "NIFTYBANK" in symbol:
+        return "NSE", "BANKNIFTY", 100
+    elif "SENSEX" in symbol:
+        return "BSE", "SENSEX", 100
+    return "NSE", "NIFTY", 50
+
+
+def get_expiry_details(symbol: str) -> Tuple[str, str, str]:
+    """Calculates nearest weekly date fragments conforming to true Fyers specifications."""
+    today = datetime.now().date()
+    if "NIFTYBANK" in symbol:
+        target_weekday = 2  # Wednesday Expiry
+    elif "SENSEX" in symbol:
+        target_weekday = 4  # Friday Expiry
+    else:
+        target_weekday = 3  # Thursday Expiry (Nifty 50)
+        
+    days_ahead = target_weekday - today.weekday()
+    if days_ahead < 0:
+        days_ahead += 7
+    nearest_expiry = today + timedelta(days=days_ahead)
+    
+    yy = nearest_expiry.strftime("%y")
+    m_num = nearest_expiry.month
+    # Weekly options month code format standard
+    months_map = {1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7", 8: "8", 9: "9", 10: "O", 11: "N", 12: "D"}
+    m_char = months_map[m_num]
+    dd = nearest_expiry.strftime("%d")
+    
+    return yy, m_char, dd
+
+
+def get_options_string(symbol: str, ltp: float, side: str) -> Tuple[float, str]:
+    """Generates authentic executable Fyers V3 option chain symbology string maps."""
+    exch, base_name, interval = get_index_meta(symbol)
+    atm_strike = int(round(ltp / interval) * interval)
+    yy, m_char, dd = get_expiry_details(symbol)
+    
+    if side == "long":
+        itm = atm_strike - interval
+        otm = atm_strike + interval
+        opt_type = "CE"
+    else:
+        itm = atm_strike + interval
+        otm = atm_strike - interval
+        opt_type = "PE"
+        
+    itm_sym = f"{exch}:{base_name}{yy}{m_char}{dd}{itm}{opt_type}"
+    atm_sym = f"{exch}:{base_name}{yy}{m_char}{dd}{atm_strike}{opt_type}"
+    otm_sym = f"{exch}:{base_name}{yy}{m_char}{dd}{otm}{opt_type}"
+    
+    return float(atm_strike), f"ITM: {itm_sym} | ATM: {atm_sym} | OTM: {otm_sym}"
+
+
+# ==========================================
+# TECHNICAL SIGNAL MATH & COMPUTATION
+# ==========================================
 
 def build_signals_from_raw_directional(detail_df) -> dict:
     nan = float("nan")
@@ -214,16 +293,6 @@ def get_fyers_history(symbol: str, resolution: str, days_back: int) -> Optional[
         return None
 
 
-def price_stats_from_series(prices: pd.Series) -> dict:
-    p = pd.to_numeric(prices, errors="coerce").dropna().astype(float)
-    if len(p) < 3: return {"Directional": np.nan, "Turning": np.nan, "Stability": np.nan, "Balanced": np.nan, "CumsumPlus": np.nan}
-    x = np.arange(len(p), dtype=float)
-    slope = float(np.polyfit(x, p.values, 1)[0])
-    directional = slope + float(p.iloc[-1] - p.iloc[0])
-    turning = float(np.mean(np.abs(np.diff(p.values, n=2))))
-    return {"Directional": directional, "Turning": turning, "Stability": float(np.std(p.values)), "Balanced": directional - turning + float(np.std(p.values)), "CumsumPlus": float(np.sum(np.clip(np.diff(p.values), 0, None)))}
-
-
 def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame], prev_close: Optional[float]) -> Tuple[Dict, pd.DataFrame]:
     if intra_df is None or intra_df.empty: return {}, pd.DataFrame()
 
@@ -274,62 +343,9 @@ def compute_iteration_volume_profile(intra_df: Optional[pd.DataFrame], prev_clos
     return summary, detail_df
 
 
-def get_index_meta(symbol: str) -> Tuple[str, str, int]:
-    """Extracts metadata required for option strings based on the Spot Index name."""
-    if "NIFTY50" in symbol:
-        return "NSE", "NIFTY", 50
-    elif "NIFTYBANK" in symbol:
-        return "NSE", "BANKNIFTY", 100
-    elif "SENSEX" in symbol:
-        return "BSE", "SENSEX", 100
-    return "NSE", "NIFTY", 50
-
-
-def get_expiry_details(symbol: str) -> Tuple[str, str, str]:
-    """Calculates weekly string keys based on index target constraints."""
-    today = datetime.now().date()
-    if "NIFTYBANK" in symbol:
-        target_weekday = 2  # Wednesday
-    elif "SENSEX" in symbol:
-        target_weekday = 4  # Friday
-    else:
-        target_weekday = 3  # Thursday (Nifty 50)
-        
-    days_ahead = target_weekday - today.weekday()
-    if days_ahead < 0:
-        days_ahead += 7
-    nearest_expiry = today + timedelta(days=days_ahead)
-    
-    yy = nearest_expiry.strftime("%y")
-    m_num = nearest_expiry.month
-    months_map = {1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7", 8: "8", 9: "9", 10: "O", 11: "N", 12: "D"}
-    m_char = months_map[m_num]
-    dd = nearest_expiry.strftime("%d")
-    
-    return yy, m_char, dd
-
-
-def get_options_string(symbol: str, ltp: float, side: str) -> Tuple[float, str]:
-    """Generates authentic Fyers V3 option symbology parameters for execution maps."""
-    exch, base_name, interval = get_index_meta(symbol)
-    atm_strike = int(round(ltp / interval) * interval)
-    yy, m_char, dd = get_expiry_details(symbol)
-    
-    if side == "long":
-        itm = atm_strike - interval
-        otm = atm_strike + interval
-        opt_type = "CE"
-    else:
-        itm = atm_strike + interval
-        otm = atm_strike - interval
-        opt_type = "PE"
-        
-    itm_sym = f"{exch}:{base_name}{yy}{m_char}{dd}{itm}{opt_type}"
-    atm_sym = f"{exch}:{base_name}{yy}{m_char}{dd}{atm_strike}{opt_type}"
-    otm_sym = f"{exch}:{base_name}{yy}{m_char}{dd}{otm}{opt_type}"
-    
-    return float(atm_strike), f"ITM: {itm_sym} | ATM: {atm_sym} | OTM: {otm_sym}"
-
+# ==========================================
+# PIPELINE EXECUTION & DATA PIPELINES
+# ==========================================
 
 def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
     rows, iteration_rows = [], []
@@ -361,7 +377,6 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
                         bands[f"D_{label}"] = "N/A"
                         return
                     
-                    # Core volume fallback matrix if spot streams lack reporting density
                     if "volume" in df_slice.columns and (df_slice["volume"] > 0).any():
                         max_idx = df_slice["volume"].idxmax()
                     else:
@@ -373,7 +388,6 @@ def scan_fno_universe() -> Tuple[pd.DataFrame, pd.DataFrame]:
                     bands[f"B_{label}"] = float(c_day["low"])
                     bands[f"D_{label}"] = str(c_day["_date_parsed"])
 
-                # Unified 6-Layer Timeframe Matrix Execution
                 for label, tf_days in [("6M", 135), ("3M", 65), ("2M", 44), ("1M", 22), ("2W", 10), ("1W", 5)]:
                     extract_bands(hist_daily, tf_days, label)
                 
@@ -450,7 +464,6 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
             
             if pd.isna(ltp) or pd.isna(pc) or pd.isna(d_low) or pd.isna(d_high): continue
 
-            # Evaluate options linearly from longest parameters to structural micro scales
             timeframes = ["6M", "3M", "2M", "1M", "2W", "1W"]
             for tf in timeframes:
                 t = row.get(f"T_{tf}")
@@ -487,7 +500,6 @@ def build_candidate_tables(df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame
         res_df = pd.DataFrame(valid_rows)
         if res_df.empty: return res_df
         
-        # Breach-Velocity Ranking Strategy Execution
         if side == "long":
             return res_df.sort_values(by=['Breach_Days', '% Change'], ascending=[True, False], na_position='last')
         else:
@@ -525,7 +537,7 @@ def build_html_table(df: pd.DataFrame, title: str, max_rows: int = 30) -> str:
             elif col == "Timeframe" and not is_sweep:
                 if row[col] in ["6M", "3M"]: bg = "#431407"
                 elif row[col] in ["2M", "1M"]: bg = "#1e3a8a"
-                else: bg = "#064e3b" # 2W and 1W fast bounds
+                else: bg = "#064e3b" 
                 
             tds.append(f'<td style="padding:6px 8px;border:1px solid #4b5563;color:{text_col};background:{bg}">{format_value(col, row.get(col, ""))}</td>')
         body_rows.append(f"<tr>{''.join(tds)}</tr>")
