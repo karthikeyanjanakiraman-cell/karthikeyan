@@ -5,7 +5,7 @@ FO_FNO_FYERS_VOL_REL_EMAIL.py
 Optimized Index Options Scanner via Fyers API with email alerts.
 - CORE INDICES: Tracks Nifty 50, Bank Nifty, and Sensex.
 - 6-LAYER VOLUME CLIMAX: Simultaneously tracks 6M, 3M, 2M, 1M, 2W, and 1W peaks.
-- DYNAMIC OPTION CHAIN ROUTING: Pinpoints the exact ATM strike and dynamically builds Fyers valid Weekly/Monthly tokens.
+- DYNAMIC OPTION CHAIN ROUTING: Pinpoints ATM strikes using SEBI-compliant Expiry logic.
 - 10-DAY BREACH AGE FILTER: Price must have broken out/swept the band within <= 10 calendar days.
 - BREACH-VELOCITY HIERARCHY: Sorted by days since breach (recency) first, then by % Change (velocity).
 """
@@ -14,6 +14,7 @@ import os
 import sys
 import logging
 import warnings
+import calendar
 from datetime import datetime, timedelta, time
 import time as time_module
 from typing import List, Dict, Optional, Tuple
@@ -115,26 +116,41 @@ def get_index_meta(symbol: str) -> Tuple[str, str, int]:
     return "NSE", "NIFTY", 50
 
 
-def get_expiry_details(symbol: str) -> Tuple[bool, datetime]:
-    """Finds the nearest expiry date and determines if it is a Monthly or Weekly contract."""
+def get_last_weekday(year: int, month: int, target_weekday: int) -> datetime.date:
+    """Helper to find the precise last weekday of a given month."""
+    last_day = calendar.monthrange(year, month)[1]
+    last_date = datetime(year, month, last_day).date()
+    offset = (last_date.weekday() - target_weekday) % 7
+    return last_date - timedelta(days=offset)
+
+
+def get_expiry_details(symbol: str) -> Tuple[bool, datetime.date]:
+    """Calculates valid SEBI-compliant F&O expiry dates dynamically."""
     today = datetime.now().date()
+    
     if "NIFTYBANK" in symbol:
-        target_weekday = 2  # Wednesday Expiry
-    elif "SENSEX" in symbol:
-        target_weekday = 4  # Friday Expiry
-    else:
-        target_weekday = 3  # Thursday Expiry (Nifty 50)
+        # SEBI Mandate: Bank Nifty only has Monthly Expiries (Last Thursday of the month)
+        expiry = get_last_weekday(today.year, today.month, 3) 
+        if today > expiry:
+            nm, ny = (today.month + 1, today.year) if today.month < 12 else (1, today.year + 1)
+            expiry = get_last_weekday(ny, nm, 3)
+        return True, expiry
         
-    days_ahead = target_weekday - today.weekday()
-    if days_ahead < 0:
-        days_ahead += 7
-    nearest_expiry = today + timedelta(days=days_ahead)
-    
-    # If adding 7 days pushes us into a new month, this is the last expiry of the current month
-    next_week = nearest_expiry + timedelta(days=7)
-    is_monthly = next_week.month != nearest_expiry.month
-    
-    return is_monthly, nearest_expiry
+    elif "SENSEX" in symbol:
+        # Sensex: Weekly expiry remains on Friday
+        days_ahead = 4 - today.weekday()
+        if days_ahead < 0: days_ahead += 7
+        expiry = today + timedelta(days=days_ahead)
+        is_monthly = (expiry == get_last_weekday(expiry.year, expiry.month, 4))
+        return is_monthly, expiry
+        
+    else:
+        # Nifty 50: Weekly expiry remains on Thursday
+        days_ahead = 3 - today.weekday()
+        if days_ahead < 0: days_ahead += 7
+        expiry = today + timedelta(days=days_ahead)
+        is_monthly = (expiry == get_last_weekday(expiry.year, expiry.month, 3))
+        return is_monthly, expiry
 
 
 def get_options_string(symbol: str, ltp: float, side: str) -> Tuple[float, str]:
@@ -146,10 +162,10 @@ def get_options_string(symbol: str, ltp: float, side: str) -> Tuple[float, str]:
     yy = nearest_expiry.strftime("%y")
     
     if is_monthly:
-        # Fyers Monthly format: NSE:NIFTY24OCT25000CE
+        # Fyers Monthly format: NSE:BANKNIFTY26JUN58000CE
         expiry_str = nearest_expiry.strftime("%b").upper()
     else:
-        # Fyers Weekly format: NSE:NIFTY24O1025000CE
+        # Fyers Weekly format: NSE:NIFTY2661824150CE
         months_map = {1: "1", 2: "2", 3: "3", 4: "4", 5: "5", 6: "6", 7: "7", 8: "8", 9: "9", 10: "O", 11: "N", 12: "D"}
         m_char = months_map[nearest_expiry.month]
         dd = nearest_expiry.strftime("%d")
@@ -176,7 +192,6 @@ def get_options_string(symbol: str, ltp: float, side: str) -> Tuple[float, str]:
 # ==========================================
 
 def price_stats_from_series(prices: pd.Series) -> dict:
-    """Calculates price action statistics (Restored)."""
     p = pd.to_numeric(prices, errors="coerce").dropna().astype(float)
     if len(p) < 3: return {"Directional": np.nan, "Turning": np.nan, "Stability": np.nan, "Balanced": np.nan, "CumsumPlus": np.nan}
     x = np.arange(len(p), dtype=float)
@@ -627,7 +642,7 @@ def main():
         logger.warning("No summary data produced.")
         return
 
-    summary_csv, detail_csv = save_outputs(summary_df, detail_df, prefix="fno")
+    summary_csv, detail_csv = save_outputs(summary_df, detail_df, prefix="scan")
     long_df, short_df = build_candidate_tables(summary_df)
 
     send_email_with_tables(
