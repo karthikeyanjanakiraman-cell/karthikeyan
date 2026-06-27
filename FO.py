@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-FO_FNO_FYERS_VOL_REL_EMAIL.py - High-Volume Support/Resistance Index Dashboard
-Updated to dynamically scan the entire NSE F&O Universe + Major Indices.
+FO_FNO_FYERS_VOL_REL_EMAIL.py - High-Volume Support/Resistance Index & F&O Dashboard
 """
 
 import os
@@ -411,7 +410,8 @@ def scan_options_universe(fyers, symbols):
         time.sleep(0.05) # RATE LIMIT GUARD for options
         daily = get_history(fyers, sym, "D", 60)
         
-        if daily is None or daily.empty:
+        # FIX: Ensure we have at least 2 days of data to calculate % Change
+        if daily is None or daily.empty or len(daily) < 2:
             continue
             
         ltp = float(daily["close"].iloc[-1])
@@ -419,10 +419,12 @@ def scan_options_universe(fyers, symbols):
         c = daily.loc[max_idx]
         top_band = float(c["high"])
         bd_l = 999
+        
         if ltp > top_band:
             breaches = daily[daily["close"] <= top_band]
             if not breaches.empty:
                 bd_l = (datetime.now() - breaches.iloc[-1]["timestamp"]).days
+                
         rows.append({
             "Symbol": sym,
             "LTP": ltp,
@@ -433,6 +435,7 @@ def scan_options_universe(fyers, symbols):
             "Prev_Close": float(daily["close"].iloc[-2]),
             "% Change": ((ltp - float(daily["close"].iloc[-2])) / float(daily["close"].iloc[-2]) * 100),
         })
+        
     return pd.DataFrame(rows)
 
 # ==========================================
@@ -619,4 +622,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
