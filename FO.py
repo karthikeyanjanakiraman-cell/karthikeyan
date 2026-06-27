@@ -1,18 +1,9 @@
 #!/usr/bin/env python3
 """
-FO_FNO_FYERS_VOL_REL_EMAIL_flat_ladder.py
-High-volume support/resistance F&O dashboard using FYERS symbol master,
-robust history fetching, and flattened ladder sorting for S1/S2/S3 and R1/R2/R3.
-
-Band construction logic used here:
-- First select the 3 nearest support zones and 3 nearest resistance zones from
-  historical high-volume daily candles.
-- Then flatten each side into 6 edge values.
-- Sort the 6 values.
-- Rebuild them as 3 ordered bands:
-    S1 = v0 / v1, S2 = v2 / v3, S3 = v4 / v5
-    R1 = v0 / v1, R2 = v2 / v3, R3 = v4 / v5
-This produces visually ordered ladders, even though it breaks original candle pairing.
+FO_FNO_FYERS_VOL_REL_EMAIL_two_tables.py
+Simplified FYERS F&O dashboard email with only two tables:
+1) Long Strategy Matrix  -> Long Breakout, Support Sweep
+2) Short Strategy Matrix -> Short Breakdown, Resistance Sweep
 """
 
 import os
@@ -24,6 +15,7 @@ import requests
 from io import StringIO
 from datetime import datetime, timedelta, date
 from typing import Dict, List, Optional, Tuple
+import re
 
 import numpy as np
 import pandas as pd
@@ -34,35 +26,16 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
-import re
 
 FYERS_FO_CSV_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 FYERS_TIMEOUT = 20
 DAILY_HISTORY_CHUNK_DAYS = 360
 MAX_DAILY_LOOKBACK = 730
-OPTION_HISTORY_DAYS = 60
 SCAN_SLEEP_SECONDS = 0.03
-OPTION_STRIKE_STEPS = 5
 ACTIVE_WINDOW_DAYS = 10
 FALLBACK_SPOTS = ["NSE:RELIANCE-EQ", "NSE:HDFCBANK-EQ", "NSE:INFY-EQ"]
 INDEX_SYMBOLS = ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX", "BSE:SENSEX-INDEX"]
-INDEX_UNDERLYING_MAP = {
-    "NIFTY": "NSE:NIFTY50-INDEX",
-    "NIFTY50": "NSE:NIFTY50-INDEX",
-    "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
-    "NIFTYBANK": "NSE:NIFTYBANK-INDEX",
-    "SENSEX": "BSE:SENSEX-INDEX",
-    "FINNIFTY": None,
-    "MIDCPNIFTY": None,
-    "NIFTYNXT50": None,
-}
 IGNORED_UNDERLYINGS = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50", "SENSEX"}
-
-EMAIL_DISPLAY_COLS = [
-    "Symbol", "% Change",
-    "Support-3", "Support-2", "Support-1", "LTP",
-    "Resistance-1", "Resistance-2", "Resistance-3",
-]
 
 EMAIL_CAND_COLS = [
     "Symbol", "% Change",
@@ -70,11 +43,6 @@ EMAIL_CAND_COLS = [
     "Resistance-1", "Resistance-2", "Resistance-3",
     "Climax_Date", "Climax_Range (T/B)",
     "Climax_Volume", "Breach_Days", "Signal_Type",
-]
-
-EMAIL_OPT_COLS = [
-    "Symbol", "LTP", "% Change", "Signal_Type",
-    "Climax_Date", "Climax_Range (T/B)", "Breach_Days"
 ]
 
 logger = logging.getLogger("fno_dashboard")
@@ -86,6 +54,13 @@ handler = logging.StreamHandler(sys.stdout)
 handler.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 logger.addHandler(handler)
 warnings.filterwarnings("ignore")
+
+OPTION_PATTERN = re.compile(r"^(?P<exchange>NSE|BSE):(?P<body>[A-Z0-9\-\&]+?)(?P<strike>\d+)(?P<otype>CE|PE)$")
+DATE_TOKEN_PATTERN = re.compile(r"^(?P<under>[A-Z0-9\-\&]+?)(?P<token>\d{2}[A-Z0-9]{3,})(?P<strike>\d+)(?P<otype>CE|PE)$")
+MONTHLY_TOKEN_PATTERN = re.compile(r"^(?P<yy>\d{2})(?P<mon>[A-Z]{3})$")
+WEEKLY_TOKEN_PATTERN = re.compile(r"^(?P<yy>\d{2})(?P<mcode>[1-9OND])(?P<dd>\d{2})$")
+MONTH_MAP = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6, "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
+M_CODE_MAP = {"1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9, "O": 10, "N": 11, "D": 12}
 
 
 class Config:
@@ -114,23 +89,12 @@ class Config:
 
 cfg = Config()
 
-OPTION_PATTERN = re.compile(r"^(?P<exchange>NSE|BSE):(?P<body>[A-Z0-9\-\&]+?)(?P<strike>\d+)(?P<otype>CE|PE)$")
-DATE_TOKEN_PATTERN = re.compile(r"^(?P<under>[A-Z0-9\-\&]+?)(?P<token>\d{2}[A-Z0-9]{3,})(?P<strike>\d+)(?P<otype>CE|PE)$")
-MONTHLY_TOKEN_PATTERN = re.compile(r"^(?P<yy>\d{2})(?P<mon>[A-Z]{3})$")
-WEEKLY_TOKEN_PATTERN = re.compile(r"^(?P<yy>\d{2})(?P<mcode>[1-9OND])(?P<dd>\d{2})$")
-MONTH_MAP = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6, "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
-M_CODE_MAP = {"1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9, "O": 10, "N": 11, "D": 12}
-
 
 def safe_float(x, default=np.nan):
     try:
         return float(x)
     except Exception:
         return default
-
-
-def normalize_symbol(symbol: str) -> str:
-    return str(symbol).strip().upper()
 
 
 def read_symbol_master() -> pd.DataFrame:
@@ -162,65 +126,6 @@ def build_symbol_master_views(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
     eq = long_df[long_df["symbol"].str.endswith("-EQ")].copy()
     idx = long_df[long_df["symbol"].str.endswith("-INDEX")].copy()
     return eq, idx, deriv
-
-
-def parse_option_symbol(symbol: str) -> Optional[Dict]:
-    symbol = normalize_symbol(symbol)
-    m = OPTION_PATTERN.match(symbol)
-    if not m:
-        return None
-    exchange = m.group("exchange")
-    body = m.group("body")
-    strike = safe_float(m.group("strike"), default=np.nan)
-    otype = m.group("otype")
-
-    dm = DATE_TOKEN_PATTERN.match(body + m.group("strike") + otype)
-    if not dm:
-        return None
-    under = dm.group("under")
-    token = dm.group("token")
-    strike = safe_float(dm.group("strike"), default=np.nan)
-
-    expiry = None
-    mm = MONTHLY_TOKEN_PATTERN.match(token)
-    if mm:
-        yy = int(mm.group("yy")) + 2000
-        mon = MONTH_MAP.get(mm.group("mon"))
-        if mon:
-            expiry = date(yy, mon, 1)
-    else:
-        wm = WEEKLY_TOKEN_PATTERN.match(token)
-        if wm:
-            yy = int(wm.group("yy")) + 2000
-            mon = M_CODE_MAP.get(wm.group("mcode"))
-            dd = int(wm.group("dd"))
-            if mon:
-                try:
-                    expiry = date(yy, mon, dd)
-                except Exception:
-                    expiry = None
-
-    return {
-        "symbol": symbol,
-        "exchange": exchange,
-        "underlying": under,
-        "strike": strike,
-        "option_type": otype,
-        "expiry": expiry,
-    }
-
-
-def build_option_catalog(deriv_symbols: pd.DataFrame) -> pd.DataFrame:
-    rows = []
-    for sym in deriv_symbols["symbol"].tolist():
-        parsed = parse_option_symbol(sym)
-        if parsed:
-            rows.append(parsed)
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-    df = df.dropna(subset=["strike", "option_type"]).copy()
-    return df.sort_values(["underlying", "expiry", "strike", "option_type"]).reset_index(drop=True)
 
 
 def get_dynamic_fno_universe(eq_symbols: pd.DataFrame) -> List[str]:
@@ -263,7 +168,7 @@ def format_value(col, val):
             return ""
     if "(T/B)" in col or "Support" in col or "Resistance" in col:
         return str(val)
-    if col in ["Signal_Type", "Option_Contracts", "Climax_Date", "Symbol"]:
+    if col in ["Signal_Type", "Climax_Date", "Symbol"]:
         return str(val)
     if col == "Breach_Days":
         try:
@@ -273,80 +178,6 @@ def format_value(col, val):
     if isinstance(val, (int, float, np.integer, np.floating)):
         return f"{float(val):.4f}"
     return str(val)
-
-
-def get_symbol_meta(symbol, ltp):
-    exch = symbol.split(":")[0]
-    base_name = symbol.split(":")[1].split("-")[0]
-    if ltp < 150:
-        interval = 1
-    elif ltp < 500:
-        interval = 5
-    elif ltp < 2000:
-        interval = 10
-    elif ltp < 5000:
-        interval = 50
-    else:
-        interval = 100
-    if "NIFTY50" in symbol:
-        interval = 50
-    if "NIFTYBANK" in symbol or "BANKNIFTY" in symbol:
-        interval = 100
-    if "SENSEX" in symbol:
-        interval = 100
-    return exch, base_name, interval
-
-
-def get_underlying_spot(opt_symbol):
-    parsed = parse_option_symbol(opt_symbol)
-    if not parsed:
-        return opt_symbol
-    under = parsed["underlying"]
-    mapped = INDEX_UNDERLYING_MAP.get(under)
-    if mapped:
-        return mapped
-    return f"NSE:{under}-EQ"
-
-
-def nearest_expiry(dts: pd.Series, min_date: date) -> Optional[date]:
-    vals = sorted([x for x in dts.dropna().tolist() if x >= min_date])
-    return vals[0] if vals else None
-
-
-def pick_option_contracts(option_catalog: pd.DataFrame, spot_symbol: str, ltp: float, side: str) -> Tuple[float, str, List[str]]:
-    if option_catalog.empty:
-        return np.nan, "0 Contracts", []
-
-    _, base_name, interval = get_symbol_meta(spot_symbol, ltp)
-    atm_strike = int(round(float(ltp) / interval) * interval)
-    desired_type = "CE" if side == "long" else "PE"
-    underlying = base_name
-
-    subset = option_catalog[(option_catalog["underlying"] == underlying) & (option_catalog["option_type"] == desired_type)].copy()
-    if subset.empty:
-        return float(atm_strike), "0 Contracts", []
-
-    exp = nearest_expiry(subset["expiry"], datetime.now().date())
-    if exp is not None:
-        subset = subset[subset["expiry"] == exp].copy()
-
-    strikes = [atm_strike + (i * interval) for i in range(-OPTION_STRIKE_STEPS, OPTION_STRIKE_STEPS + 1)]
-    subset["dist"] = (subset["strike"] - atm_strike).abs()
-    chosen = subset[subset["strike"].isin(strikes)].sort_values(["strike"]).drop_duplicates("symbol")
-    if chosen.empty:
-        chosen = subset.sort_values(["dist", "strike"]).head(11).sort_values("strike")
-
-    syms = chosen["symbol"].tolist()
-    desc = f"{len(syms)} {desired_type} Contracts"
-    return float(atm_strike), desc, syms
-
-
-def init_fyers():
-    try:
-        return fyersModel.FyersModel(client_id=cfg.client_id, is_async=False, token=cfg.access_token, log_path="")
-    except Exception as e:
-        logger.exception("FYERS init failed: %s", e)
-        return None
 
 
 def fetch_history_chunk(fyers, symbol: str, resolution: str, start_dt: date, end_dt: date) -> Optional[pd.DataFrame]:
@@ -396,13 +227,12 @@ def get_history(fyers, symbol: str, resolution: str = "1D", days: int = 365) -> 
             time.sleep(SCAN_SLEEP_SECONDS)
         if not dfs:
             return None
-        out = pd.concat(dfs, ignore_index=True).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
-        return out
+        return pd.concat(dfs, ignore_index=True).drop_duplicates(subset=["timestamp"]).sort_values("timestamp").reset_index(drop=True)
 
     return fetch_history_chunk(fyers, symbol, resolution, start_dt, end_dt)
 
 
-def build_flat_ladder(side_df: pd.DataFrame, side: str) -> List[Tuple[float, float]]:
+def build_flat_ladder(side_df: pd.DataFrame) -> List[Tuple[float, float]]:
     if side_df is None or side_df.empty:
         return []
     values = []
@@ -414,31 +244,15 @@ def build_flat_ladder(side_df: pd.DataFrame, side: str) -> List[Tuple[float, flo
         if pd.notna(bottom):
             values.append(float(bottom))
     values = sorted(values)
-    if len(values) < 2:
-        return []
     bands = []
     for i in range(0, min(len(values), 6), 2):
         if i + 1 < len(values):
             a, b = values[i], values[i + 1]
-            upper = max(a, b)
-            lower = min(a, b)
-            bands.append((upper, lower))
-    if side == "support":
-        return bands[:3]
+            bands.append((max(a, b), min(a, b)))
     return bands[:3]
 
 
 def scan_fno_universe(fyers):
-    # NOTE ON HOW SUPPORT/RESISTANCE ARE ARRIVED IN THIS VERSION:
-    # 1) Historical daily candles are sorted by volume descending.
-    # 2) Each candle becomes a zone: top=high, bottom=low.
-    # 3) Support candidates are zones whose top is below LTP.
-    # 4) Resistance candidates are zones whose bottom is above LTP.
-    # 5) The nearest 3 raw support/resistance zones are first selected.
-    # 6) Then each side is FLATTENED into 6 values (3 tops + 3 bottoms), sorted,
-    #    and rebuilt into 3 ordered bands:
-    #       S1=v0/v1, S2=v2/v3, S3=v4/v5
-    #       R1=v0/v1, R2=v2/v3, R3=v4/v5
     base_lookback = 90
     max_lookback = MAX_DAILY_LOOKBACK
     step = 30
@@ -482,14 +296,11 @@ def scan_fno_universe(fyers):
                 continue
 
             bands = pd.DataFrame(candidates)
-            raw_supports = bands[bands["top"] < ltp].copy()
-            raw_resistances = bands[bands["bottom"] > ltp].copy()
+            raw_supports = bands[bands["top"] < ltp].copy().sort_values("top", ascending=False).head(3).reset_index(drop=True)
+            raw_resistances = bands[bands["bottom"] > ltp].copy().sort_values("bottom", ascending=True).head(3).reset_index(drop=True)
 
-            raw_supports = raw_supports.sort_values("top", ascending=False).head(3).reset_index(drop=True)
-            raw_resistances = raw_resistances.sort_values("bottom", ascending=True).head(3).reset_index(drop=True)
-
-            support_bands = build_flat_ladder(raw_supports, "support")
-            resistance_bands = build_flat_ladder(raw_resistances, "resistance")
+            support_bands = build_flat_ladder(raw_supports)
+            resistance_bands = build_flat_ladder(raw_resistances)
 
             row: Dict = {"Symbol": sym, "LTP": ltp, "% Change": pct_ch, "Lookback_Used": lookback_days}
 
@@ -552,39 +363,6 @@ def scan_fno_universe(fyers):
     return pd.DataFrame(rows)
 
 
-def scan_options_universe(fyers, symbols):
-    rows = []
-    symbols = list(dict.fromkeys(symbols))
-    logger.info("Scanning %d option candidates...", len(symbols))
-    for sym in symbols:
-        time.sleep(SCAN_SLEEP_SECONDS)
-        daily = get_history(fyers, sym, "1D", OPTION_HISTORY_DAYS)
-        if daily is None or daily.empty or len(daily) < 2:
-            continue
-        ltp = float(daily["close"].iloc[-1])
-        max_idx = daily["volume"].idxmax() if (daily["volume"] > 0).any() else (daily["high"] - daily["low"]).idxmax()
-        c = daily.loc[max_idx]
-        top_band = float(c["high"])
-        bd_l = 999
-        if ltp > top_band:
-            breaches = daily[daily["close"] <= top_band]
-            if not breaches.empty:
-                bd_l = int((pd.Timestamp.now().normalize() - breaches.iloc[-1]["timestamp"].normalize()).days)
-        prev_close = float(daily["close"].iloc[-2])
-        pct_change = ((ltp - prev_close) / prev_close * 100) if prev_close else np.nan
-        rows.append({
-            "Symbol": sym,
-            "LTP": ltp,
-            "T_LOC": top_band,
-            "B_LOC": float(c["low"]),
-            "D_LOC": str(pd.to_datetime(c["timestamp"]).date()),
-            "Days_L_LOC": bd_l,
-            "Prev_Close": prev_close,
-            "% Change": pct_change,
-        })
-    return pd.DataFrame(rows)
-
-
 def get_days_ago(date_str):
     if not date_str or pd.isna(date_str):
         return 999
@@ -594,15 +372,13 @@ def get_days_ago(date_str):
         return 999
 
 
-def build_dashboard_and_candidates(df, option_catalog):
-    dashboard_rows, valid_long, valid_short = [], [], []
+def build_strategy_tables(df):
+    valid_long, valid_short = [], []
     for _, row in df.iterrows():
         r_dict = row.to_dict()
         for i in range(1, 4):
             r_dict[f"Support-{i}"] = format_tb_pair(row["LTP"], row.get(f"SUP_T_{i}"), row.get(f"SUP_B_{i}")) if pd.notna(row.get(f"SUP_T_{i}")) else "-"
             r_dict[f"Resistance-{i}"] = format_tb_pair(row["LTP"], row.get(f"RES_T_{i}"), row.get(f"RES_B_{i}")) if pd.notna(row.get(f"RES_T_{i}")) else "-"
-
-        is_active_candidate = False
 
         sup_t1 = row.get("SUP_T_1")
         sup_b1 = row.get("SUP_B_1")
@@ -615,7 +391,7 @@ def build_dashboard_and_candidates(df, option_catalog):
 
         if is_breakout or is_sup_sweep:
             sig_type = "Long Breakout" if is_breakout else "Support Sweep"
-            cand = {
+            valid_long.append({
                 "Symbol": row["Symbol"],
                 "% Change": row["% Change"],
                 "Support-3": r_dict.get("Support-3", "-"),
@@ -630,10 +406,7 @@ def build_dashboard_and_candidates(df, option_catalog):
                 "Climax_Volume": f"{int(row['SUP_V_1']):,}" if pd.notna(row.get("SUP_V_1")) else "",
                 "Breach_Days": long_breach if is_breakout else sup_sweep,
                 "Signal_Type": sig_type,
-            }
-            _, _, cand["Target_Options"] = pick_option_contracts(option_catalog, row["Symbol"], row["LTP"], "long")
-            valid_long.append(cand)
-            is_active_candidate = True
+            })
 
         res_t1 = row.get("RES_T_1")
         res_b1 = row.get("RES_B_1")
@@ -646,7 +419,7 @@ def build_dashboard_and_candidates(df, option_catalog):
 
         if is_breakdown or is_res_sweep:
             sig_type = "Short Breakdown" if is_breakdown else "Resistance Sweep"
-            cand = {
+            valid_short.append({
                 "Symbol": row["Symbol"],
                 "% Change": row["% Change"],
                 "Support-3": r_dict.get("Support-3", "-"),
@@ -661,36 +434,9 @@ def build_dashboard_and_candidates(df, option_catalog):
                 "Climax_Volume": f"{int(row['RES_V_1']):,}" if pd.notna(row.get("RES_V_1")) else "",
                 "Breach_Days": short_breach if is_breakdown else res_sweep,
                 "Signal_Type": sig_type,
-            }
-            _, _, cand["Target_Options"] = pick_option_contracts(option_catalog, row["Symbol"], row["LTP"], "short")
-            valid_short.append(cand)
-            is_active_candidate = True
+            })
 
-        if is_active_candidate:
-            dashboard_rows.append(r_dict.copy())
-
-    return pd.DataFrame(dashboard_rows), pd.DataFrame(valid_long), pd.DataFrame(valid_short)
-
-
-def build_option_candidate_tables(df, spot_signal_map):
-    if df.empty:
-        return pd.DataFrame(), pd.DataFrame()
-    valid_rows = []
-    for _, row in df.iterrows():
-        t, b, d, bd = row.get("T_LOC"), row.get("B_LOC"), row.get("D_LOC"), row.get("Days_L_LOC")
-        climax_age = get_days_ago(d)
-        if pd.notna(t) and row["LTP"] > t and (bd <= ACTIVE_WINDOW_DAYS or climax_age <= ACTIVE_WINDOW_DAYS):
-            r_dict = row.to_dict()
-            spot_signal = spot_signal_map.get(get_underlying_spot(row["Symbol"]), "")
-            r_dict["Signal_Type"] = "Holy Grail" if "Sweep" in spot_signal else "Active Trend"
-            r_dict["Climax_Date"] = d
-            r_dict["Breach_Days"] = bd
-            r_dict["Climax_Range (T/B)"] = format_tb_pair(row["LTP"], t, b)
-            valid_rows.append(r_dict)
-    res = pd.DataFrame(valid_rows)
-    if res.empty:
-        return pd.DataFrame(), pd.DataFrame()
-    return res[res["Symbol"].str.endswith("CE")], res[res["Symbol"].str.endswith("PE")]
+    return pd.DataFrame(valid_long), pd.DataFrame(valid_short)
 
 
 def build_html_table(df, title, cols):
@@ -702,9 +448,7 @@ def build_html_table(df, title, cols):
         bg_row = "#0f172a" if i % 2 == 0 else "#1e293b"
         sig = str(row.get("Signal_Type", ""))
         row_style = f"background-color:{bg_row}; color:#e2e8f0;"
-        if "Holy Grail" in sig:
-            row_style = "background-color:#581c87; color:#f5d0fe;"
-        elif "Sweep" in sig:
+        if "Sweep" in sig:
             row_style = "background-color:#92400e; color:#fef3c7;"
         table_html += f"<tr style='{row_style}'>"
         for c in cols:
@@ -721,46 +465,36 @@ def build_html_table(df, title, cols):
     return table_html + "</table>"
 
 
-def save_outputs(summary_df, dashboard_df, long_df, short_df, ce_df, pe_df):
+def save_outputs(spot_df, long_df, short_df):
     os.makedirs(cfg.output_dir, exist_ok=True)
     ts = datetime.now().strftime("%Y%m%d_%H%M")
-    paths = {}
-    paths["summary_csv"] = os.path.join(cfg.output_dir, f"scan_summary_{ts}.csv")
-    paths["dashboard_csv"] = os.path.join(cfg.output_dir, f"dashboard_{ts}.csv")
-    paths["long_csv"] = os.path.join(cfg.output_dir, f"long_candidates_{ts}.csv")
-    paths["short_csv"] = os.path.join(cfg.output_dir, f"short_candidates_{ts}.csv")
-    paths["ce_csv"] = os.path.join(cfg.output_dir, f"ce_candidates_{ts}.csv")
-    paths["pe_csv"] = os.path.join(cfg.output_dir, f"pe_candidates_{ts}.csv")
-
-    summary_df.to_csv(paths["summary_csv"], index=False)
-    dashboard_df.to_csv(paths["dashboard_csv"], index=False)
-    long_df.drop(columns=["Target_Options"], errors="ignore").to_csv(paths["long_csv"], index=False)
-    short_df.drop(columns=["Target_Options"], errors="ignore").to_csv(paths["short_csv"], index=False)
-    ce_df.to_csv(paths["ce_csv"], index=False)
-    pe_df.to_csv(paths["pe_csv"], index=False)
+    paths = {
+        "summary_csv": os.path.join(cfg.output_dir, f"scan_summary_{ts}.csv"),
+        "long_csv": os.path.join(cfg.output_dir, f"long_strategy_{ts}.csv"),
+        "short_csv": os.path.join(cfg.output_dir, f"short_strategy_{ts}.csv"),
+    }
+    spot_df.to_csv(paths["summary_csv"], index=False)
+    long_df.to_csv(paths["long_csv"], index=False)
+    short_df.to_csv(paths["short_csv"], index=False)
     return paths
 
 
-def send_email(dashboard_df, long_df, short_df, ce_df, pe_df, attachment_file):
+def send_email(long_df, short_df, attachment_file):
     if not cfg.enable_email:
         logger.info("Email disabled via ENABLE_EMAIL")
         return
-    missing = [x for x in [cfg.sender_email, cfg.sender_password, cfg.recipient_email] if not x]
-    if missing:
+    if not cfg.sender_email or not cfg.sender_password or not cfg.recipient_email:
         logger.warning("Email skipped due to missing SMTP credentials/recipient")
         return
     try:
         msg = MIMEMultipart()
         msg["From"] = cfg.sender_email
         msg["To"] = cfg.recipient_email
-        msg["Subject"] = f"F&O Market Climax Dashboard - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        msg["Subject"] = f"F&O Strategy Matrix - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         html = (
             "<body style='background-color:#030712; padding:20px; font-family:sans-serif;'>"
-            + build_html_table(dashboard_df, "Market Dashboard (Active Signals Only)", EMAIL_DISPLAY_COLS)
             + build_html_table(long_df, "Long Strategy Matrix", EMAIL_CAND_COLS)
             + build_html_table(short_df, "Short Strategy Matrix", EMAIL_CAND_COLS)
-            + build_html_table(ce_df, "Call Options (CE) Climax Verification", EMAIL_OPT_COLS)
-            + build_html_table(pe_df, "Put Options (PE) Climax Verification", EMAIL_OPT_COLS)
             + "</body>"
         )
         msg.attach(MIMEText(html, "html"))
@@ -785,6 +519,14 @@ def send_email(dashboard_df, long_df, short_df, ce_df, pe_df, attachment_file):
         logger.exception("Email failed: %s", e)
 
 
+def init_fyers():
+    try:
+        return fyersModel.FyersModel(client_id=cfg.client_id, is_async=False, token=cfg.access_token, log_path="")
+    except Exception as e:
+        logger.exception("FYERS init failed: %s", e)
+        return None
+
+
 def main():
     start_time = time.time()
     if not cfg.validate():
@@ -793,14 +535,12 @@ def main():
     try:
         raw_master = read_symbol_master()
         eq_df, idx_df, deriv_df = build_symbol_master_views(raw_master)
-        option_catalog = build_option_catalog(deriv_df)
         spot_universe = get_dynamic_fno_universe(eq_df)
         cfg.index_symbols = INDEX_SYMBOLS + spot_universe
-        logger.info("Resolved %d spot symbols and %d option contracts from symbol master", len(spot_universe), len(option_catalog))
+        logger.info("Resolved %d spot symbols from symbol master", len(spot_universe))
     except Exception as e:
         logger.exception("Symbol master processing failed: %s", e)
         cfg.index_symbols = INDEX_SYMBOLS + FALLBACK_SPOTS
-        option_catalog = pd.DataFrame(columns=["symbol", "exchange", "underlying", "strike", "option_type", "expiry"])
 
     fyers = init_fyers()
     if not fyers:
@@ -811,40 +551,12 @@ def main():
         logger.warning("No spot data generated.")
         return
 
-    dashboard_df, long_df, short_df = build_dashboard_and_candidates(spot_df, option_catalog)
-
-    all_opt = []
-    if not long_df.empty and "Target_Options" in long_df.columns:
-        for sublist in long_df["Target_Options"].tolist():
-            if isinstance(sublist, list):
-                all_opt.extend(sublist)
-    if not short_df.empty and "Target_Options" in short_df.columns:
-        for sublist in short_df["Target_Options"].tolist():
-            if isinstance(sublist, list):
-                all_opt.extend(sublist)
-    all_opt = list(dict.fromkeys(all_opt))
-
-    spot_map = {}
-    if not long_df.empty and "Signal_Type" in long_df.columns:
-        spot_map.update({r["Symbol"]: r["Signal_Type"] for _, r in long_df.iterrows()})
-    if not short_df.empty and "Signal_Type" in short_df.columns:
-        spot_map.update({r["Symbol"]: r["Signal_Type"] for _, r in short_df.iterrows()})
-
-    ce_df, pe_df = pd.DataFrame(), pd.DataFrame()
-    if all_opt:
-        opt_df = scan_options_universe(fyers, all_opt)
-        ce_df, pe_df = build_option_candidate_tables(opt_df, spot_map)
-    else:
-        logger.info("No option symbols selected from candidate list")
-
-    paths = save_outputs(spot_df, dashboard_df, long_df, short_df, ce_df, pe_df)
-    send_email(dashboard_df, long_df, short_df, ce_df, pe_df, paths["summary_csv"])
+    long_df, short_df = build_strategy_tables(spot_df)
+    paths = save_outputs(spot_df, long_df, short_df)
+    send_email(long_df, short_df, paths["summary_csv"])
 
     elapsed = time.time() - start_time
-    logger.info(
-        "Done in %.2fs | spot=%d dashboard=%d long=%d short=%d ce=%d pe=%d",
-        elapsed, len(spot_df), len(dashboard_df), len(long_df), len(short_df), len(ce_df), len(pe_df)
-    )
+    logger.info("Done in %.2fs | spot=%d long=%d short=%d", elapsed, len(spot_df), len(long_df), len(short_df))
     logger.info("Saved outputs to %s", cfg.output_dir)
 
 
