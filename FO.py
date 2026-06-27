@@ -1,8 +1,18 @@
 #!/usr/bin/env python3
 """
-FO_FNO_FYERS_VOL_REL_EMAIL_fixed.py
-High-volume support/resistance F&O dashboard with robust FYERS symbol resolution,
-defensive logging, chunked history fetch, and safer email handling.
+FO_FNO_FYERS_VOL_REL_EMAIL_flat_ladder.py
+High-volume support/resistance F&O dashboard using FYERS symbol master,
+robust history fetching, and flattened ladder sorting for S1/S2/S3 and R1/R2/R3.
+
+Band construction logic used here:
+- First select the 3 nearest support zones and 3 nearest resistance zones from
+  historical high-volume daily candles.
+- Then flatten each side into 6 edge values.
+- Sort the 6 values.
+- Rebuild them as 3 ordered bands:
+    S1 = v0 / v1, S2 = v2 / v3, S3 = v4 / v5
+    R1 = v0 / v1, R2 = v2 / v3, R3 = v4 / v5
+This produces visually ordered ladders, even though it breaks original candle pairing.
 """
 
 import os
@@ -24,6 +34,7 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
+import re
 
 FYERS_FO_CSV_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 FYERS_TIMEOUT = 20
@@ -103,6 +114,13 @@ class Config:
 
 cfg = Config()
 
+OPTION_PATTERN = re.compile(r"^(?P<exchange>NSE|BSE):(?P<body>[A-Z0-9\-\&]+?)(?P<strike>\d+)(?P<otype>CE|PE)$")
+DATE_TOKEN_PATTERN = re.compile(r"^(?P<under>[A-Z0-9\-\&]+?)(?P<token>\d{2}[A-Z0-9]{3,})(?P<strike>\d+)(?P<otype>CE|PE)$")
+MONTHLY_TOKEN_PATTERN = re.compile(r"^(?P<yy>\d{2})(?P<mon>[A-Z]{3})$")
+WEEKLY_TOKEN_PATTERN = re.compile(r"^(?P<yy>\d{2})(?P<mcode>[1-9OND])(?P<dd>\d{2})$")
+MONTH_MAP = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6, "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
+M_CODE_MAP = {"1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9, "O": 10, "N": 11, "D": 12}
+
 
 def safe_float(x, default=np.nan):
     try:
@@ -133,7 +151,6 @@ def build_symbol_master_views(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
         ratio = s.str.contains(r"^(NSE|BSE):", regex=True, na=False).mean()
         if ratio > 0.05:
             symbol_like_cols.append(c)
-
     if not symbol_like_cols:
         raise RuntimeError("Could not identify symbol columns in NSE_FO.csv")
 
@@ -145,15 +162,6 @@ def build_symbol_master_views(raw_df: pd.DataFrame) -> Tuple[pd.DataFrame, pd.Da
     eq = long_df[long_df["symbol"].str.endswith("-EQ")].copy()
     idx = long_df[long_df["symbol"].str.endswith("-INDEX")].copy()
     return eq, idx, deriv
-
-
-OPTION_RE = re = __import__('re')
-OPTION_PATTERN = OPTION_RE.compile(r"^(?P<exchange>NSE|BSE):(?P<body>[A-Z0-9\-\&]+?)(?P<strike>\d+)(?P<otype>CE|PE)$")
-DATE_TOKEN_PATTERN = OPTION_RE.compile(r"^(?P<under>[A-Z0-9\-\&]+?)(?P<token>\d{2}[A-Z0-9]{3,})(?P<strike>\d+)(?P<otype>CE|PE)$")
-MONTHLY_TOKEN_PATTERN = OPTION_RE.compile(r"^(?P<yy>\d{2})(?P<mon>[A-Z]{3})$")
-WEEKLY_TOKEN_PATTERN = OPTION_RE.compile(r"^(?P<yy>\d{2})(?P<mcode>[1-9OND])(?P<dd>\d{2})$")
-MONTH_MAP = {"JAN": 1, "FEB": 2, "MAR": 3, "APR": 4, "MAY": 5, "JUN": 6, "JUL": 7, "AUG": 8, "SEP": 9, "OCT": 10, "NOV": 11, "DEC": 12}
-M_CODE_MAP = {"1": 1, "2": 2, "3": 3, "4": 4, "5": 5, "6": 6, "7": 7, "8": 8, "9": 9, "O": 10, "N": 11, "D": 12}
 
 
 def parse_option_symbol(symbol: str) -> Optional[Dict]:
@@ -230,10 +238,12 @@ def get_dynamic_fno_universe(eq_symbols: pd.DataFrame) -> List[str]:
 def format_tb_pair(ltp, top, bottom):
     if pd.isna(top) or pd.isna(bottom):
         return "-"
-    t_str, b_str, ltp_val = f"{float(top):.2f}", f"{float(bottom):.2f}", float(ltp)
-    if ltp_val > float(top):
+    upper = max(float(top), float(bottom))
+    lower = min(float(top), float(bottom))
+    t_str, b_str, ltp_val = f"{upper:.2f}", f"{lower:.2f}", float(ltp)
+    if ltp_val > upper:
         t_str = f"<span style='color: #4ade80; font-weight: bold;'>{t_str}</span>"
-    if ltp_val < float(bottom):
+    if ltp_val < lower:
         b_str = f"<span style='color: #f87171; font-weight: bold;'>{b_str}</span>"
     return f"{t_str} <span style='color: #64748b;'>/</span> {b_str}"
 
@@ -323,7 +333,6 @@ def pick_option_contracts(option_catalog: pd.DataFrame, spot_symbol: str, ltp: f
     strikes = [atm_strike + (i * interval) for i in range(-OPTION_STRIKE_STEPS, OPTION_STRIKE_STEPS + 1)]
     subset["dist"] = (subset["strike"] - atm_strike).abs()
     chosen = subset[subset["strike"].isin(strikes)].sort_values(["strike"]).drop_duplicates("symbol")
-
     if chosen.empty:
         chosen = subset.sort_values(["dist", "strike"]).head(11).sort_values("strike")
 
@@ -393,32 +402,43 @@ def get_history(fyers, symbol: str, resolution: str = "1D", days: int = 365) -> 
     return fetch_history_chunk(fyers, symbol, resolution, start_dt, end_dt)
 
 
+def build_flat_ladder(side_df: pd.DataFrame, side: str) -> List[Tuple[float, float]]:
+    if side_df is None or side_df.empty:
+        return []
+    values = []
+    for _, r in side_df.iterrows():
+        top = safe_float(r.get("top"))
+        bottom = safe_float(r.get("bottom"))
+        if pd.notna(top):
+            values.append(float(top))
+        if pd.notna(bottom):
+            values.append(float(bottom))
+    values = sorted(values)
+    if len(values) < 2:
+        return []
+    bands = []
+    for i in range(0, min(len(values), 6), 2):
+        if i + 1 < len(values):
+            a, b = values[i], values[i + 1]
+            upper = max(a, b)
+            lower = min(a, b)
+            bands.append((upper, lower))
+    if side == "support":
+        return bands[:3]
+    return bands[:3]
+
+
 def scan_fno_universe(fyers):
-    # NOTE ON HOW SUPPORT/RESISTANCE ARE ARRIVED IN THIS CODE:
-    # This implementation does NOT use classic pivot formulas from previous-day OHLC.
-    # It creates custom support/resistance zones from historical daily high-volume candles.
-    #
-    # Step-by-step logic:
-    # 1) Fetch up to ~2 years of daily candles for the symbol.
-    # 2) For each rolling lookback window, sort candles by volume descending
-    #    and then by high descending.
-    # 3) Treat each selected candle as a zone:
-    #       zone_top = candle high
-    #       zone_bottom = candle low
-    # 4) Compare each zone to current LTP:
-    #       Support   => zone_top < LTP
-    #       Resistance=> zone_bottom > LTP
-    # 5) Rank nearest supports by zone_top descending.
-    # 6) Rank nearest resistances by zone_bottom ascending.
-    # 7) Keep the nearest three on each side:
-    #       Support-1/2/3 and Resistance-1/2/3.
-    #
-    # Meaning in this code:
-    # - Support-1 is the closest high-volume historical zone below current price.
-    # - Resistance-1 is the closest high-volume historical zone above current price.
-    # - Support-2/3 and Resistance-2/3 are the next closest zones.
-    #
-    # So these are volume-climax bands, not textbook pivot R1/R2/R3/S1/S2/S3 levels.
+    # NOTE ON HOW SUPPORT/RESISTANCE ARE ARRIVED IN THIS VERSION:
+    # 1) Historical daily candles are sorted by volume descending.
+    # 2) Each candle becomes a zone: top=high, bottom=low.
+    # 3) Support candidates are zones whose top is below LTP.
+    # 4) Resistance candidates are zones whose bottom is above LTP.
+    # 5) The nearest 3 raw support/resistance zones are first selected.
+    # 6) Then each side is FLATTENED into 6 values (3 tops + 3 bottoms), sorted,
+    #    and rebuilt into 3 ordered bands:
+    #       S1=v0/v1, S2=v2/v3, S3=v4/v5
+    #       R1=v0/v1, R2=v2/v3, R3=v4/v5
     base_lookback = 90
     max_lookback = MAX_DAILY_LOOKBACK
     step = 30
@@ -462,45 +482,47 @@ def scan_fno_universe(fyers):
                 continue
 
             bands = pd.DataFrame(candidates)
-            supports = bands[bands["top"] < ltp].copy()
-            resistances = bands[bands["bottom"] > ltp].copy()
+            raw_supports = bands[bands["top"] < ltp].copy()
+            raw_resistances = bands[bands["bottom"] > ltp].copy()
 
-            supports["sort_key"] = supports["top"]
-            supports = supports.sort_values("sort_key", ascending=False).head(3).reset_index(drop=True)
+            raw_supports = raw_supports.sort_values("top", ascending=False).head(3).reset_index(drop=True)
+            raw_resistances = raw_resistances.sort_values("bottom", ascending=True).head(3).reset_index(drop=True)
 
-            resistances["sort_key"] = resistances["bottom"]
-            resistances = resistances.sort_values("sort_key", ascending=True).head(3).reset_index(drop=True)
+            support_bands = build_flat_ladder(raw_supports, "support")
+            resistance_bands = build_flat_ladder(raw_resistances, "resistance")
 
             row: Dict = {"Symbol": sym, "LTP": ltp, "% Change": pct_ch, "Lookback_Used": lookback_days}
 
             for i in range(3):
-                if i < len(supports):
-                    s = supports.iloc[i]
-                    row[f"SUP_T_{i+1}"] = float(s["top"])
-                    row[f"SUP_B_{i+1}"] = float(s["bottom"])
-                    row[f"SUP_D_{i+1}"] = str(s["date"])
-                    row[f"SUP_V_{i+1}"] = float(s["volume"])
+                if i < len(support_bands):
+                    upper, lower = support_bands[i]
+                    src = raw_supports.iloc[min(i, len(raw_supports)-1)] if len(raw_supports) > 0 else None
+                    row[f"SUP_T_{i+1}"] = float(upper)
+                    row[f"SUP_B_{i+1}"] = float(lower)
+                    row[f"SUP_D_{i+1}"] = str(src["date"]) if src is not None else ""
+                    row[f"SUP_V_{i+1}"] = float(src["volume"]) if src is not None else np.nan
                 else:
                     row[f"SUP_T_{i+1}"] = np.nan
                     row[f"SUP_B_{i+1}"] = np.nan
                     row[f"SUP_D_{i+1}"] = ""
                     row[f"SUP_V_{i+1}"] = np.nan
 
-                if i < len(resistances):
-                    r = resistances.iloc[i]
-                    row[f"RES_T_{i+1}"] = float(r["top"])
-                    row[f"RES_B_{i+1}"] = float(r["bottom"])
-                    row[f"RES_D_{i+1}"] = str(r["date"])
-                    row[f"RES_V_{i+1}"] = float(r["volume"])
+                if i < len(resistance_bands):
+                    upper, lower = resistance_bands[i]
+                    src = raw_resistances.iloc[min(i, len(raw_resistances)-1)] if len(raw_resistances) > 0 else None
+                    row[f"RES_T_{i+1}"] = float(upper)
+                    row[f"RES_B_{i+1}"] = float(lower)
+                    row[f"RES_D_{i+1}"] = str(src["date"]) if src is not None else ""
+                    row[f"RES_V_{i+1}"] = float(src["volume"]) if src is not None else np.nan
                 else:
                     row[f"RES_T_{i+1}"] = np.nan
                     row[f"RES_B_{i+1}"] = np.nan
                     row[f"RES_D_{i+1}"] = ""
                     row[f"RES_V_{i+1}"] = np.nan
 
-            if len(supports) > 0:
-                sup_t1 = float(supports.iloc[0]["top"])
-                sup_b1 = float(supports.iloc[0]["bottom"])
+            if len(support_bands) > 0:
+                sup_t1 = float(row.get("SUP_T_1"))
+                sup_b1 = float(row.get("SUP_B_1"))
                 was_below = daily[daily["close"] <= sup_t1]
                 swept_below = daily[daily["low"] < sup_b1]
                 row["Long_Breach_Days"] = int((now_ts.normalize() - was_below.iloc[-1]["timestamp"].normalize()).days) if not was_below.empty else 999
@@ -509,9 +531,9 @@ def scan_fno_universe(fyers):
                 row["Long_Breach_Days"] = 999
                 row["Sup_Sweep_Days"] = 999
 
-            if len(resistances) > 0:
-                res_t1 = float(resistances.iloc[0]["top"])
-                res_b1 = float(resistances.iloc[0]["bottom"])
+            if len(resistance_bands) > 0:
+                res_t1 = float(row.get("RES_T_1"))
+                res_b1 = float(row.get("RES_B_1"))
                 was_above = daily[daily["close"] >= res_b1]
                 swept_above = daily[daily["high"] > res_t1]
                 row["Short_Breach_Days"] = int((now_ts.normalize() - was_above.iloc[-1]["timestamp"].normalize()).days) if not was_above.empty else 999
@@ -521,7 +543,7 @@ def scan_fno_universe(fyers):
                 row["Res_Sweep_Days"] = 999
 
             final_row = row
-            if len(supports) >= 3 and len(resistances) >= 3:
+            if len(support_bands) >= 3 and len(resistance_bands) >= 3:
                 break
 
         if final_row is not None:
