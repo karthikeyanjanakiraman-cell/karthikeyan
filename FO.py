@@ -511,7 +511,7 @@ def main():
     spot_map = {}
     if not long_df.empty and "Signal_Type" in long_df.columns:
         spot_map.update({r["Symbol"]: r["Signal_Type"] for _, r in long_df.iterrows()})
-    if not short_df.empty && "Signal_Type" in short_df.columns:
+    if not short_df.empty and "Signal_Type" in short_df.columns:
         spot_map.update({r["Symbol"]: r["Signal_Type"] for _, r in short_df.iterrows()})
 
     ce_df, pe_df = pd.DataFrame(), pd.DataFrame()
