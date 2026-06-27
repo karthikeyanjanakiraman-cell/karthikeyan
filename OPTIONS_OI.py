@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FO_FNO_FYERS_VOL_REL_EMAIL.py - Calendar-Based Climax Scanner
+FO_FNO_FYERS_VOL_REL_EMAIL.py - Calendar-Based Climax Scanner with Email
 """
 
 import os
@@ -41,11 +41,6 @@ EMAIL_DISPLAY_COLS = [
     "1-Month (T/B)", "3-Month (T/B)", "6-Month (T/B)"
 ]
 
-EMAIL_OPT_COLS = [
-    "Symbol", "LTP", "% Change", "Signal_Type", 
-    "Climax_Date", "Climax_Range (T/B)", "Breach_Days"
-]
-
 # Logger Setup
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
@@ -59,53 +54,15 @@ warnings.filterwarnings("ignore")
 # HELPERS
 # ==========================================
 
-def format_tb_pair(ltp, top, bottom):
+def format_tb_pair(top, bottom):
     if pd.isna(top) or pd.isna(bottom): return "-"
-    t_str, b_str, ltp_val = f"{float(top):.2f}", f"{float(bottom):.2f}", float(ltp)
-    if ltp_val > float(top): t_str = f"<span style='color: #4ade80; font-weight: bold;'>{t_str}</span>"
-    if ltp_val < float(bottom): b_str = f"<span style='color: #f87171; font-weight: bold;'>{b_str}</span>"
-    return f"{t_str} <span style='color: #64748b;'>/</span> {b_str}"
+    return f"{float(top):.2f} / {float(bottom):.2f}"
 
 def format_value(col, val):
-    if pd.isna(val) or val in [float("inf"), float("-inf")]: return ""
+    if pd.isna(val): return ""
     if "(T/B)" in col: return str(val)
-    if col in ["Trigger_TF", "Signal_Type", "Climax_Date"]: return str(val)
-    if col == "Breach_Days": return str(int(val)) if not pd.isna(val) else ""
-    if col == "% Change": return f"{float(val):.2f}%"
     if isinstance(val, (int, float, np.integer, np.floating)): return f"{float(val):.2f}"
     return str(val)
-
-def get_index_meta(symbol):
-    if "NIFTY50" in symbol: return "NSE", "NIFTY", 50
-    if "NIFTYBANK" in symbol: return "NSE", "BANKNIFTY", 100
-    return "BSE", "SENSEX", 100
-
-def get_expiry_details(symbol):
-    today = datetime.now().date()
-    if "NIFTYBANK" in symbol:
-        def last_thu(y, m):
-            last = calendar.monthrange(y, m)[1]
-            d = datetime(y, m, last).date()
-            return d - timedelta(days=(d.weekday() - 3) % 7)
-        expiry = last_thu(today.year, today.month)
-        if today > expiry:
-            m = today.month + 1 if today.month < 12 else 1
-            y = today.year if today.month < 12 else today.year + 1
-            expiry = last_thu(y, m)
-        return True, expiry
-    days_ahead = (3 if "NIFTY" in symbol else 4) - today.weekday()
-    if days_ahead < 0: days_ahead += 7
-    return False, today + timedelta(days=days_ahead)
-
-def get_options_data(symbol, ltp, side):
-    exch, base_name, interval = get_index_meta(symbol)
-    atm_strike = int(round(ltp / interval) * interval)
-    is_monthly, expiry = get_expiry_details(symbol)
-    yy = expiry.strftime("%y")
-    expiry_str = expiry.strftime("%b").upper() if is_monthly else f"{['1','2','3','4','5','6','7','8','9','O','N','D'][expiry.month-1]}{expiry.strftime('%d')}"
-    opt_type = "CE" if side == "long" else "PE"
-    strikes = [atm_strike + (i * interval) for i in range(-10, 11)]
-    return [f"{exch}:{base_name}{yy}{expiry_str}{s}{opt_type}" for s in strikes]
 
 def init_fyers():
     try: return fyersModel.FyersModel(client_id=cfg.client_id, is_async=False, token=cfg.access_token, log_path="")
@@ -130,64 +87,71 @@ def get_history(fyers, symbol, res, days):
 def scan_fno_universe(fyers):
     rows = []
     for sym in cfg.index_symbols:
-        daily = get_history(fyers, sym, "D", 200)
+        daily = get_history(fyers, sym, "D", 200) 
         if daily is not None and not daily.empty:
-            anchor_date = daily["timestamp"].max() # Market-aware anchor
+            anchor_date = daily["timestamp"].max()
             ltp = float(daily["close"].iloc[-1])
             prev_close = float(daily["close"].iloc[-2])
             
             row = {"Symbol": sym, "LTP": ltp, "% Change": ((ltp - prev_close)/prev_close*100)}
             windows = [("1D", 1), ("3D", 3), ("1W", 7), ("1M", 30), ("3M", 90), ("6M", 180)]
             
-            for label, days in windows:
-                start_date = anchor_date - timedelta(days=days)
+            for label, days_back in windows:
+                start_date = anchor_date - timedelta(days=days_back)
                 df_s = daily[daily['timestamp'] >= start_date]
                 
                 if df_s.empty: continue
                 idx_val = df_s["volume"].idxmax() if (df_s["volume"]>0).any() else (df_s["high"]-df_s["low"]).idxmax()
                 c = df_s.loc[idx_val]
                 
-                row.update({f"T_{label}": float(c["high"]), f"B_{label}": float(c["low"]), f"D_{label}": str(c["timestamp"].date())})
-                
-                # Simple Breach Logic
-                bd_l, bd_s = 999, 999
-                if ltp > float(c["high"]):
-                    breach = daily[daily['close'] <= float(c["high"])]
-                    if not breach.empty: bd_l = (anchor_date - breach.iloc[-1]['timestamp']).days
-                if ltp < float(c["low"]):
-                    breach = daily[daily['close'] >= float(c["low"])]
-                    if not breach.empty: bd_s = (anchor_date - breach.iloc[-1]['timestamp']).days
-                
-                row.update({f"Days_L_{label}": bd_l, f"Days_S_{label}": bd_s})
+                row.update({
+                    f"T_{label}": float(c["high"]), 
+                    f"B_{label}": float(c["low"]), 
+                    f"D_{label}": str(c["timestamp"].date())
+                })
             rows.append(row)
     return pd.DataFrame(rows)
 
-def build_dashboard_and_candidates(df):
-    dashboard_rows, valid_long, valid_short = [], [], []
+def build_html_table(df, title, cols):
+    table_html = f"<h3>{title}</h3><table border='1' style='border-collapse: collapse; width: 100%; font-family: sans-serif;'>"
+    table_html += "<tr>" + "".join([f"<th style='padding:8px;'>{c}</th>" for c in cols]) + "</tr>"
     for _, row in df.iterrows():
-        r_dict = row.to_dict()
-        for tf in ["1D", "3D", "1W", "1M", "3M", "6M"]:
-            lbl = f"{tf.replace('D', '-Day').replace('W', '-Week').replace('M', '-Month')}"
-            r_dict[f"{lbl} (T/B)"] = format_tb_pair(row["LTP"], row.get(f"T_{tf}"), row.get(f"B_{tf}"))
-        dashboard_rows.append(r_dict)
-        
-        for tf in ["1D", "3D", "1W", "1M", "3M", "6M"]:
-            t, b, d = row.get(f"T_{tf}"), row.get(f"B_{tf}"), row.get(f"D_{tf}")
-            if pd.notna(t) and row["LTP"] > t and row.get(f"Days_L_{tf}", 999) <= 5:
-                r_dict.update({"Trigger_TF": tf, "Climax_Date": d, "Target_Options": get_options_data(row["Symbol"], row["LTP"], "long"), "Signal_Type": "Active Trend"})
-                valid_long.append(r_dict); break
-    return pd.DataFrame(dashboard_rows), pd.DataFrame(valid_long), pd.DataFrame(valid_short)
+        table_html += "<tr>"
+        for c in cols:
+            val = row.get(c)
+            table_html += f"<td style='padding:8px;'>{format_value(c, val)}</td>"
+        table_html += "</tr>"
+    return table_html + "</table>"
 
-def send_email(dashboard_df, long_df, short_df, csv_file):
-    # (Email logic remains the same, assuming standard structure)
-    pass 
+def send_email(dashboard_df):
+    try:
+        msg = MIMEMultipart()
+        msg["From"], msg["To"], msg["Subject"] = cfg.sender_email, cfg.recipient_email, f"Index Climax Dashboard - {datetime.now().strftime('%Y-%m-%d')}"
+        html = f"<html><body>{build_html_table(dashboard_df, 'Market Dashboard', DISPLAY_COLS)}</body></html>"
+        msg.attach(MIMEText(html, "html"))
+        with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port) as s:
+            s.starttls()
+            s.login(cfg.sender_email, cfg.sender_password)
+            s.sendmail(cfg.sender_email, cfg.recipient_email, msg.as_string())
+        logger.info("Email sent successfully.")
+    except Exception as e: logger.error(f"Email Failed: {e}")
 
 def main():
     fyers = init_fyers()
     if not fyers: return
     spot_df = scan_fno_universe(fyers)
     if spot_df.empty: return
-    dashboard_df, long_df, short_df = build_dashboard_and_candidates(spot_df)
-    # ... Add output logic ...
+    
+    # Process display
+    dashboard_rows = []
+    for _, row in spot_df.iterrows():
+        r_dict = row.to_dict()
+        for tf in ["1D", "3D", "1W", "1M", "3M", "6M"]:
+            lbl = f"{tf.replace('D', '-Day').replace('W', '-Week').replace('M', '-Month')}"
+            r_dict[f"{lbl} (T/B)"] = format_tb_pair(row.get(f"T_{tf}"), row.get(f"B_{tf}"))
+        dashboard_rows.append(r_dict)
+    
+    dashboard_df = pd.DataFrame(dashboard_rows)
+    send_email(dashboard_df)
 
 if __name__ == "__main__": main()
