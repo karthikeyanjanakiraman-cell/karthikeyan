@@ -52,7 +52,8 @@ EMAIL_OPT_COLS = [
 # Logger Setup
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-if logger.hasHandlers(): logger.handlers.clear()
+if logger.hasHandlers():
+    logger.handlers.clear()
 ch = logging.StreamHandler(sys.stdout)
 ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 logger.addHandler(ch)
@@ -63,36 +64,48 @@ warnings.filterwarnings("ignore")
 # ==========================================
 
 def format_tb_pair(ltp, top, bottom):
-    if pd.isna(top) or pd.isna(bottom): return "-"
+    if pd.isna(top) or pd.isna(bottom):
+        return "-"
     t_str, b_str, ltp_val = f"{float(top):.2f}", f"{float(bottom):.2f}", float(ltp)
-    if ltp_val > float(top): t_str = f"<span style='color: #4ade80; font-weight: bold;'>{t_str}</span>"
-    if ltp_val < float(bottom): b_str = f"<span style='color: #f87171; font-weight: bold;'>{b_str}</span>"
+    if ltp_val > float(top):
+        t_str = f"<span style='color: #4ade80; font-weight: bold;'>{t_str}</span>"
+    if ltp_val < float(bottom):
+        b_str = f"<span style='color: #f87171; font-weight: bold;'>{b_str}</span>"
     return f"{t_str} <span style='color: #64748b;'>/</span> {b_str}"
 
 def format_value(col, val):
-    if pd.isna(val) or val in [float("inf"), float("-inf")]: return ""
-    if "(T/B)" in col or col == "Options_Data": return str(val)
-    if col in ["Trigger_TF", "Signal_Type", "Option_Contracts", "Climax_Date"]: return str(val)
-    if col == "Breach_Days": return str(int(val)) if not pd.isna(val) else ""
+    if pd.isna(val) or val in [float("inf"), float("-inf")]:
+        return ""
+    if "(T/B)" in col or col == "Options_Data":
+        return str(val)
+    if col in ["Trigger_TF", "Signal_Type", "Option_Contracts", "Climax_Date"]:
+        return str(val)
+    if col == "Breach_Days":
+        return str(int(val)) if not pd.isna(val) else ""
     if col == "% Change":
-        # FIX #7: guard against NaN before float conversion
         try:
             fval = float(val)
         except (TypeError, ValueError):
             return ""
         return f"{fval:.2f}%"
-    if col.startswith("T_") or col.startswith("B_") or col == "ATM_Strike": return f"{float(val):.2f}"
-    if isinstance(val, (int, float, np.integer, np.floating)): return f"{float(val):.4f}"
+    if col.startswith("T_") or col.startswith("B_") or col == "ATM_Strike":
+        return f"{float(val):.2f}"
+    if isinstance(val, (int, float, np.integer, np.floating)):
+        return f"{float(val):.4f}"
     return str(val)
 
 def get_index_meta(symbol):
-    if "NIFTY50" in symbol: return "NSE", "NIFTY", 50
-    if "NIFTYBANK" in symbol: return "NSE", "BANKNIFTY", 100
+    if "NIFTY50" in symbol:
+        return "NSE", "NIFTY", 50
+    if "NIFTYBANK" in symbol:
+        return "NSE", "BANKNIFTY", 100
     return "BSE", "SENSEX", 100
 
 def get_underlying_spot(opt_symbol):
-    if "BANKNIFTY" in opt_symbol: return "NSE:NIFTYBANK-INDEX"
-    if "NIFTY" in opt_symbol: return "NSE:NIFTY50-INDEX"
+    if "BANKNIFTY" in opt_symbol:
+        return "NSE:NIFTYBANK-INDEX"
+    if "NIFTY" in opt_symbol:
+        return "NSE:NIFTY50-INDEX"
     return "BSE:SENSEX-INDEX"
 
 def get_expiry_details(symbol):
@@ -121,30 +134,43 @@ def get_options_data(symbol, ltp, side):
     atm_strike = int(round(ltp / interval) * interval)
     is_monthly, expiry = get_expiry_details(symbol)
     yy = expiry.strftime("%y")
-    expiry_str = expiry.strftime("%b").upper() if is_monthly else f"{['1','2','3','4','5','6','7','8','9','O','N','D'][expiry.month-1]}{expiry.strftime('%d')}"
+    expiry_code = expiry.strftime("%b").upper() if is_monthly else f"{['1','2','3','4','5','6','7','8','9','O','N','D'][expiry.month-1]}{expiry.strftime('%d')}"
     opt_type = "CE" if side == "long" else "PE"
     strikes = [atm_strike + (i * interval) for i in range(-10, 11)]
-    return float(atm_strike), f"21 {opt_type} Contracts (Strikes: {strikes[0]:.2f} to {strikes[-1]:.2f})", [f"{exch}:{base_name}{yy}{expiry_str}{s}{opt_type}" for s in strikes]
+    symbols = [f"{exch}:{base_name}{yy}{expiry_code}{s}{opt_type}" for s in strikes]
+    desc = f"21 {opt_type} Contracts (Strikes: {strikes[0]:.2f} to {strikes[-1]:.2f})"
+    return float(atm_strike), desc, symbols
 
 # ==========================================
 # CORE SCANNING ENGINE
 # ==========================================
 
 def init_fyers():
-    try: return fyersModel.FyersModel(client_id=cfg.client_id, is_async=False, token=cfg.access_token, log_path="")
-    except Exception as e: logger.warning(f"INIT Failed: {e}"); return None
+    try:
+        return fyersModel.FyersModel(client_id=cfg.client_id, is_async=False, token=cfg.access_token, log_path="")
+    except Exception as e:
+        logger.warning(f"INIT Failed: {e}")
+        return None
 
 def get_history(fyers, symbol, res, days):
     try:
         now = datetime.now()
         start, end = (now - timedelta(days=days)).strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d")
-        res_data = fyers.history(data={"symbol": symbol, "resolution": res, "date_format": "1", "range_from": start, "range_to": end, "cont_flag": "1"})
+        res_data = fyers.history(data={
+            "symbol": symbol,
+            "resolution": res,
+            "date_format": "1",
+            "range_from": start,
+            "range_to": end,
+            "cont_flag": "1",
+        })
         if res_data and "candles" in res_data:
             df = pd.DataFrame(res_data["candles"], columns=["timestamp", "open", "high", "low", "close", "volume"])
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
             return df
         return None
-    except Exception as e: return None
+    except Exception:
+        return None
 
 def scan_fno_universe(fyers):
     rows = []
@@ -157,9 +183,9 @@ def scan_fno_universe(fyers):
         ltp = float(daily["close"].iloc[-1])
         bands, streak_data = {}, {}
 
-        # FIX #1: Each window = last N calendar days (overlapping, cumulative).
-        # Removed the non-overlapping min_d offset â€” every window now goes from
-        # (today - days_back) up to today, giving the true "last N days" high/low.
+        # Cumulative "last N days" windows â€” each band covers the full
+        # look-back period so shorter TFs are always subsets of longer ones.
+        # This prevents the duplicate-band problem (3D==1W, 1M==3M, etc.).
         windows = [
             ("1D",  1),
             ("3D",  3),
@@ -170,44 +196,33 @@ def scan_fno_universe(fyers):
         ]
 
         for label, days_back in windows:
-            start_date = today - timedelta(days=days_back)
-            df_s = daily[daily["timestamp"] > start_date]
-
+            df_s = daily[daily["timestamp"] > (today - timedelta(days=days_back))]
             if df_s.empty:
                 continue
-
-            # Anchor candle: highest-volume day (or widest range as fallback)
             idx_val = df_s["volume"].idxmax() if (df_s["volume"] > 0).any() else (df_s["high"] - df_s["low"]).idxmax()
             c = df_s.loc[idx_val]
-            top_band  = float(c["high"])
-            bot_band  = float(c["low"])
+            top_band = float(c["high"])
+            bot_band = float(c["low"])
             bands[f"T_{label}"] = top_band
             bands[f"B_{label}"] = bot_band
             bands[f"D_{label}"] = str(c["timestamp"].date())
 
-            # Breach / streak logic
-            # bd_l = trading days since price last closed BELOW the top band (breakout age)
-            # bd_s = trading days since price last closed ABOVE the bottom band (breakdown age)
+            # Breach / streak logic: how old is the breakout/breakdown vs this band
             bd_l = bd_s = 999
-
             if ltp > top_band:
-                # Last candle where close was still below (or at) the band top
                 below_top = daily[daily["close"] <= top_band]
                 if not below_top.empty:
                     bd_l = (today - below_top.iloc[-1]["timestamp"]).days
-
             if ltp < bot_band:
-                # Last candle where close was still above (or at) the band bottom
                 above_bot = daily[daily["close"] >= bot_band]
                 if not above_bot.empty:
                     bd_s = (today - above_bot.iloc[-1]["timestamp"]).days
-
             streak_data[f"Days_L_{label}"] = bd_l
             streak_data[f"Days_S_{label}"] = bd_s
 
         row = {
-            "Symbol":   sym,
-            "LTP":      ltp,
+            "Symbol": sym,
+            "LTP": ltp,
             "% Change": ((ltp - float(daily["close"].iloc[-2])) / float(daily["close"].iloc[-2]) * 100),
         }
         row.update(bands)
@@ -232,14 +247,14 @@ def scan_options_universe(fyers, symbols):
             if not breaches.empty:
                 bd_l = (datetime.now() - breaches.iloc[-1]["timestamp"]).days
         rows.append({
-            "Symbol":     sym,
-            "LTP":        ltp,
-            "T_LOC":      top_band,
-            "B_LOC":      float(c["low"]),
-            "D_LOC":      str(pd.to_datetime(c["timestamp"]).date()),
+            "Symbol": sym,
+            "LTP": ltp,
+            "T_LOC": top_band,
+            "B_LOC": float(c["low"]),
+            "D_LOC": str(pd.to_datetime(c["timestamp"]).date()),
             "Days_L_LOC": bd_l,
             "Prev_Close": float(daily["close"].iloc[-2]),
-            "% Change":   ((ltp - float(daily["close"].iloc[-2])) / float(daily["close"].iloc[-2]) * 100),
+            "% Change": ((ltp - float(daily["close"].iloc[-2])) / float(daily["close"].iloc[-2]) * 100),
         })
     return pd.DataFrame(rows)
 
@@ -252,20 +267,14 @@ def build_dashboard_and_candidates(df):
     }
 
     for _, row in df.iterrows():
-        # FIX #4: always initialise Trigger_TF so dashboard table never has a missing cell
         r_dict = row.to_dict()
-        r_dict["Trigger_TF"] = ""
 
-        # Build T/B display columns
-        for tf, display_label in label_map.items():
-            r_dict[f"{display_label} (T/B)"] = format_tb_pair(
-                row["LTP"], row.get(f"T_{tf}"), row.get(f"B_{tf}")
-            )
+        # --- 1) Detect signal first (so Trigger_TF is consistent everywhere) ---
+        trigger_tf: str | None = None
+        trigger_side: str | None = None  # "long" or "short"
+        climax_date = None
+        target_options_list = None
 
-        # FIX #3: append a *copy* of r_dict so dashboard_rows is not mutated later
-        dashboard_rows.append(r_dict.copy())
-
-        # Signal detection â€” first qualifying timeframe wins
         for tf in ["1D", "3D", "1W", "1M", "3M", "6M"]:
             t   = row.get(f"T_{tf}")
             b   = row.get(f"B_{tf}")
@@ -273,48 +282,61 @@ def build_dashboard_and_candidates(df):
             bd_l = row.get(f"Days_L_{tf}", 999)
             bd_s = row.get(f"Days_S_{tf}", 999)
 
+            # Long-side breakout: LTP above top band and breakout is fresh (<=5 days)
             if pd.notna(t) and row["LTP"] > t and bd_l <= 5:
-                strike, opt_str, opt_list = get_options_data(row["Symbol"], row["LTP"], "long")
-                # FIX #3: build a fresh candidate dict so it does NOT alias dashboard_rows[-1]
-                cand = r_dict.copy()
-                cand.update({
-                    "Trigger_TF":     tf,
-                    "Climax_Date":    d,
-                    "Target_Options": opt_list,
-                    "Signal_Type":    "Active Trend",
-                })
-                valid_long.append(cand)
+                trigger_tf = tf
+                trigger_side = "long"
+                climax_date = d
+                _, _, target_options_list = get_options_data(row["Symbol"], row["LTP"], "long")
                 break
 
-            elif pd.notna(b) and row["LTP"] < b and bd_s <= 5:
-                strike, opt_str, opt_list = get_options_data(row["Symbol"], row["LTP"], "short")
-                cand = r_dict.copy()
-                cand.update({
-                    "Trigger_TF":     tf,
-                    "Climax_Date":    d,
-                    "Target_Options": opt_list,
-                    "Signal_Type":    "Active Trend",
-                })
-                valid_short.append(cand)
+            # Short-side breakdown: LTP below bottom band and breakdown is fresh (<=5 days)
+            if pd.notna(b) and row["LTP"] < b and bd_s <= 5:
+                trigger_tf = tf
+                trigger_side = "short"
+                climax_date = d
+                _, _, target_options_list = get_options_data(row["Symbol"], row["LTP"], "short")
                 break
+
+        # --- 2) Build dashboard row (Trigger_TF reflects the detected TF, if any) ---
+        r_dict["Trigger_TF"] = trigger_tf or ""
+        for tf, display_label in label_map.items():
+            r_dict[f"{display_label} (T/B)"] = format_tb_pair(
+                row["LTP"], row.get(f"T_{tf}"), row.get(f"B_{tf}")
+            )
+        dashboard_rows.append(r_dict.copy())
+
+        # --- 3) Build long/short candidate matrices using an independent copy ---
+        if trigger_tf and target_options_list:
+            cand = r_dict.copy()
+            cand["Climax_Date"] = climax_date
+            cand["Target_Options"] = target_options_list
+            cand["Signal_Type"] = "Active Trend"
+            if trigger_side == "long":
+                valid_long.append(cand)
+            elif trigger_side == "short":
+                valid_short.append(cand)
 
     return pd.DataFrame(dashboard_rows), pd.DataFrame(valid_long), pd.DataFrame(valid_short)
 
+
 def build_option_candidate_tables(df, spot_signal_map):
-    if df.empty: return pd.DataFrame(), pd.DataFrame()
+    if df.empty:
+        return pd.DataFrame(), pd.DataFrame()
     valid_rows = []
     for _, row in df.iterrows():
         t, b, d, bd = row.get("T_LOC"), row.get("B_LOC"), row.get("D_LOC"), row.get("Days_L_LOC")
         if pd.notna(t) and row["LTP"] > t and bd <= 10:
             r_dict = row.to_dict()
             spot_signal = spot_signal_map.get(get_underlying_spot(row["Symbol"]), "")
-            r_dict["Signal_Type"]        = "Holy Grail" if spot_signal == "Fresh Sweep" else "Active Trend"
-            r_dict["Climax_Date"]        = d
-            r_dict["Breach_Days"]        = bd
+            r_dict["Signal_Type"] = "Holy Grail" if spot_signal == "Fresh Sweep" else "Active Trend"
+            r_dict["Climax_Date"] = d
+            r_dict["Breach_Days"] = bd
             r_dict["Climax_Range (T/B)"] = format_tb_pair(row["LTP"], t, b)
             valid_rows.append(r_dict)
     res = pd.DataFrame(valid_rows)
-    if res.empty: return pd.DataFrame(), pd.DataFrame()
+    if res.empty:
+        return pd.DataFrame(), pd.DataFrame()
     return res[res["Symbol"].str.endswith("CE")], res[res["Symbol"].str.endswith("PE")]
 
 def build_html_table(df, title, cols):
@@ -337,13 +359,14 @@ def build_html_table(df, title, cols):
         bg_row = "#0f172a" if i % 2 == 0 else "#1e293b"
         sig = str(row.get("Signal_Type", ""))
         row_style = f"background-color: {bg_row}; color: #e2e8f0;"
-        if "Holy Grail" in sig: row_style = "background-color: #581c87; color: #f5d0fe;"
-        elif "Sweep"    in sig: row_style = "background-color: #92400e; color: #fef3c7;"
+        if "Holy Grail" in sig:
+            row_style = "background-color: #581c87; color: #f5d0fe;"
+        elif "Sweep" in sig:
+            row_style = "background-color: #92400e; color: #fef3c7;"
         table_html += f"<tr style='{row_style}'>"
         for c in cols:
             val = row.get(c)
             style = "padding: 8px; border: 1px solid #334155;"
-            # FIX #7: safe NaN guard before float comparison for % Change colouring
             if c == "% Change":
                 try:
                     fval = float(val)
@@ -363,16 +386,16 @@ def save_outputs(summary_df):
 def send_email(dashboard_df, long_df, short_df, ce_df, pe_df, csv_file):
     try:
         msg = MIMEMultipart()
-        msg["From"]    = cfg.sender_email
-        msg["To"]      = cfg.recipient_email
+        msg["From"] = cfg.sender_email
+        msg["To"] = cfg.recipient_email
         msg["Subject"] = f"Index Climax Dashboard - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         html = (
             "<body style='background-color: #030712; padding: 20px; font-family: sans-serif;'>"
-            + build_html_table(dashboard_df, "Market Dashboard",                        EMAIL_DISPLAY_COLS)
-            + build_html_table(long_df,      "Long Strategy Matrix",                    EMAIL_DISPLAY_COLS)
-            + build_html_table(short_df,     "Short Strategy Matrix",                   EMAIL_DISPLAY_COLS)
-            + build_html_table(ce_df,        "Call Options (CE) Climax Verification",   EMAIL_OPT_COLS)
-            + build_html_table(pe_df,        "Put Options (PE) Climax Verification",    EMAIL_OPT_COLS)
+            + build_html_table(dashboard_df, "Market Dashboard", EMAIL_DISPLAY_COLS)
+            + build_html_table(long_df, "Long Strategy Matrix", EMAIL_DISPLAY_COLS)
+            + build_html_table(short_df, "Short Strategy Matrix", EMAIL_DISPLAY_COLS)
+            + build_html_table(ce_df, "Call Options (CE) Climax Verification", EMAIL_OPT_COLS)
+            + build_html_table(pe_df, "Put Options (PE) Climax Verification", EMAIL_OPT_COLS)
             + "</body>"
         )
         msg.attach(MIMEText(html, "html"))
@@ -405,10 +428,12 @@ def main():
     all_opt = []
     if not long_df.empty and "Target_Options" in long_df.columns:
         for sublist in long_df["Target_Options"].tolist():
-            if isinstance(sublist, list): all_opt.extend(sublist)
+            if isinstance(sublist, list):
+                all_opt.extend(sublist)
     if not short_df.empty and "Target_Options" in short_df.columns:
         for sublist in short_df["Target_Options"].tolist():
-            if isinstance(sublist, list): all_opt.extend(sublist)
+            if isinstance(sublist, list):
+                all_opt.extend(sublist)
     all_opt = list(set(all_opt))
 
     spot_map = {}
