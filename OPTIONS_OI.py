@@ -38,10 +38,11 @@ class Config:
 
 cfg = Config()
 
+# Columns reordered: 3-Day comes before 1-Week
 EMAIL_DISPLAY_COLS = [
-    "Symbol", "LTP", "Trigger_TF", "3-Day (T/B)"
-    "1-Week (T/B)", "1-Month (T/B)", 
-    "3-Month (T/B)", "6-Month (T/B)"
+    "Symbol", "LTP", "Trigger_TF", 
+    "6-Month (T/B)", "3-Month (T/B)", "1-Month (T/B)", 
+    "3-Day (T/B)", "1-Week (T/B)"
 ]
 
 EMAIL_OPT_COLS = [
@@ -146,8 +147,9 @@ def scan_fno_universe(fyers):
             ltp = float(daily["close"].iloc[-1])
             bands, streak_data = {}, {}
             
+            # Non-overlapping windows
             timeframe_windows = [
-                ("6M", 135, 66), ("3M", 65, 23), ("1M", 22, 6), ("1W", 5, 4), ("3D", 3, 0)
+                ("6M", 135, 66), ("3M", 65, 23), ("1M", 22, 6), ("3D", 3, 0), ("1W", 5, 4)
             ]
             
             for label, max_days, min_days in timeframe_windows:
@@ -205,10 +207,13 @@ def build_dashboard_and_candidates(df):
     dashboard_rows, valid_long, valid_short = [], [], []
     for _, row in df.iterrows():
         r_dict = row.to_dict()
-        for tf in ["6M", "3M", "1M", "1W", "3D"]:
+        # Order of columns matches EMAIL_DISPLAY_COLS
+        for tf in ["6M", "3M", "1M", "3D", "1W"]:
             label = tf.replace('D','-Day').replace('M','-Month').replace('W','-Week')
             r_dict[f"{label} (T/B)"] = format_tb_pair(row["LTP"], row.get(f"T_{tf}"), row.get(f"B_{tf}"))
         dashboard_rows.append(r_dict)
+        
+        # Strategy check
         for tf in ["6M", "3M", "1M", "1W", "3D"]:
             t, b, d, bd_l, bd_s = row.get(f"T_{tf}"), row.get(f"B_{tf}"), row.get(f"D_{tf}"), row.get(f"Days_L_{tf}"), row.get(f"Days_S_{tf}")
             if pd.notna(t) and row["LTP"] > t and bd_l <= 5:
@@ -286,7 +291,6 @@ def main():
         
     dashboard_df, long_df, short_df = build_dashboard_and_candidates(spot_df)
     
-    # Defensive construction of all_opt to prevent KeyError
     all_opt = []
     if not long_df.empty and "Target_Options" in long_df.columns:
         for sublist in long_df["Target_Options"].tolist():
@@ -296,7 +300,6 @@ def main():
             if isinstance(sublist, list): all_opt.extend(sublist)
     all_opt = list(set(all_opt))
     
-    # Defensive construction of spot_map
     spot_map = {}
     if not long_df.empty and "Signal_Type" in long_df.columns:
         spot_map.update({r["Symbol"]: r["Signal_Type"] for _, r in long_df.iterrows()})
