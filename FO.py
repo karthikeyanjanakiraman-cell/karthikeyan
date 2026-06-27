@@ -198,7 +198,7 @@ def get_history(fyers, symbol, res, days):
 
 def scan_fno_universe(fyers):
     base_lookback = 90
-    max_lookback = 150
+    max_lookback = 730
     step = 30
     dedupe_pct = 0.005
     rows = []
@@ -364,61 +364,58 @@ def build_dashboard_and_candidates(df):
             r_dict[f"Resistance-{i}"] = format_tb_pair(row["LTP"], row.get(f"RES_T_{i}"), row.get(f"RES_B_{i}")) if pd.notna(row.get(f"RES_T_{i}")) else "-"
         
         is_active_candidate = False
-        tol_pct = 0.25 / 100.0
         
-        # --- LONG CHECK ---
-        res_b1 = row.get("RES_B_1")
+        # --- LONG BREAKOUT CHECK ---
+        long_t = row.get("Long_T")
         long_breach = row.get("Long_Breach_Days", 999)
         long_climax_age = get_days_ago(row.get("Long_D"))
         
-        if pd.notna(res_b1) and abs(row["LTP"] - res_b1) / max(row["LTP"], 1.0) <= tol_pct:
-            if long_breach <= 10 or long_climax_age <= 10:
-                cand = {
-                    "Symbol": row["Symbol"],
-                    "% Change": row["% Change"],
-                    "Support-3": r_dict.get("Support-3", "-"),
-                    "Support-2": r_dict.get("Support-2", "-"),
-                    "Support-1": r_dict.get("Support-1", "-"),
-                    "LTP": row["LTP"],
-                    "Resistance-1": r_dict.get("Resistance-1", "-"),
-                    "Resistance-2": r_dict.get("Resistance-2", "-"),
-                    "Resistance-3": r_dict.get("Resistance-3", "-"),
-                    "Climax_Date": row.get("Long_D", ""),
-                    "Climax_Range (T/B)": format_tb_pair(row["LTP"], row.get("Long_T", res_b1), row.get("Long_B", res_b1)),
-                    "Climax_Volume": f"{int(row['Long_V']):,}" if pd.notna(row.get("Long_V")) else "",
-                    "Breach_Days": long_breach,
-                    "Signal_Type": "Long Resistance Test",
-                }
-                _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "long")
-                valid_long.append(cand)
-                is_active_candidate = True
+        if pd.notna(long_t) and row["LTP"] > long_t and (long_breach <= 10 or long_climax_age <= 10):
+            cand = {
+                "Symbol": row["Symbol"],
+                "% Change": row["% Change"],
+                "Support-3": r_dict.get("Support-3", "-"),
+                "Support-2": r_dict.get("Support-2", "-"),
+                "Support-1": r_dict.get("Support-1", "-"),
+                "LTP": row["LTP"],
+                "Resistance-1": r_dict.get("Resistance-1", "-"),
+                "Resistance-2": r_dict.get("Resistance-2", "-"),
+                "Resistance-3": r_dict.get("Resistance-3", "-"),
+                "Climax_Date": row.get("Long_D", ""),
+                "Climax_Range (T/B)": format_tb_pair(row["LTP"], long_t, row.get("Long_B")),
+                "Climax_Volume": f"{int(row['Long_V']):,}" if pd.notna(row.get("Long_V")) else "",
+                "Breach_Days": long_breach,
+                "Signal_Type": "Long Breakout",
+            }
+            _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "long")
+            valid_long.append(cand)
+            is_active_candidate = True
 
-        # --- SHORT CHECK ---
-        sup_t1 = row.get("SUP_T_1")
+        # --- SHORT BREAKDOWN CHECK ---
+        short_b = row.get("Short_B")
         short_breach = row.get("Short_Breach_Days", 999)
         short_climax_age = get_days_ago(row.get("Short_D"))
         
-        if pd.notna(sup_t1) and abs(row["LTP"] - sup_t1) / max(row["LTP"], 1.0) <= tol_pct:
-            if short_breach <= 10 or short_climax_age <= 10:
-                cand = {
-                    "Symbol": row["Symbol"],
-                    "% Change": row["% Change"],
-                    "Support-3": r_dict.get("Support-3", "-"),
-                    "Support-2": r_dict.get("Support-2", "-"),
-                    "Support-1": r_dict.get("Support-1", "-"),
-                    "LTP": row["LTP"],
-                    "Resistance-1": r_dict.get("Resistance-1", "-"),
-                    "Resistance-2": r_dict.get("Resistance-2", "-"),
-                    "Resistance-3": r_dict.get("Resistance-3", "-"),
-                    "Climax_Date": row.get("Short_D", ""),
-                    "Climax_Range (T/B)": format_tb_pair(row["LTP"], row.get("Short_T", sup_t1), row.get("Short_B", sup_t1)),
-                    "Climax_Volume": f"{int(row['Short_V']):,}" if pd.notna(row.get("Short_V")) else "",
-                    "Breach_Days": short_breach,
-                    "Signal_Type": "Short Support Test",
-                }
-                _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "short")
-                valid_short.append(cand)
-                is_active_candidate = True
+        if pd.notna(short_b) and row["LTP"] < short_b and (short_breach <= 10 or short_climax_age <= 10):
+            cand = {
+                "Symbol": row["Symbol"],
+                "% Change": row["% Change"],
+                "Support-3": r_dict.get("Support-3", "-"),
+                "Support-2": r_dict.get("Support-2", "-"),
+                "Support-1": r_dict.get("Support-1", "-"),
+                "LTP": row["LTP"],
+                "Resistance-1": r_dict.get("Resistance-1", "-"),
+                "Resistance-2": r_dict.get("Resistance-2", "-"),
+                "Resistance-3": r_dict.get("Resistance-3", "-"),
+                "Climax_Date": row.get("Short_D", ""),
+                "Climax_Range (T/B)": format_tb_pair(row["LTP"], row.get("Short_T"), short_b),
+                "Climax_Volume": f"{int(row['Short_V']):,}" if pd.notna(row.get("Short_V")) else "",
+                "Breach_Days": short_breach,
+                "Signal_Type": "Short Breakdown",
+            }
+            _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "short")
+            valid_short.append(cand)
+            is_active_candidate = True
 
         if is_active_candidate:
             dashboard_rows.append(r_dict.copy())
