@@ -194,7 +194,7 @@ def scan_fno_universe(fyers):
     rows = []
 
     for sym in cfg.index_symbols:
-        daily = get_history(fyers, sym, "D", 182)   # ~6 months
+        daily = get_history(fyers, sym, "D", 90)   # ~6 months
         if daily is None or daily.empty:
             continue
 
