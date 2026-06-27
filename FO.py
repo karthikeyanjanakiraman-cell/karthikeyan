@@ -93,7 +93,6 @@ def format_tb_pair(ltp, top, bottom):
 def format_value(col, val):
     if pd.isna(val) or val in [float("inf"), float("-inf")]:
         return ""
-    # FIX: Lock to 2 decimals first to prevent bypass
     if col == "% Change":
         try:
             return f"{float(val):.2f}%"
@@ -321,6 +320,7 @@ def scan_fno_universe(fyers):
 
 def scan_options_universe(fyers, symbols):
     rows = []
+    symbols = list(set(symbols))
     for sym in symbols:
         time.sleep(0.05)
         daily = get_history(fyers, sym, "D", 60)
@@ -372,8 +372,7 @@ def build_dashboard_and_candidates(df):
         long_climax_age = get_days_ago(row.get("Long_D"))
         
         if pd.notna(res_b1) and abs(row["LTP"] - res_b1) / max(row["LTP"], 1.0) <= tol_pct:
-            # FIX: Only trigger if the Breach OR the Climax Date is 5 days or less
-            if long_breach <= 5 or long_climax_age <= 5:
+            if long_breach <= 10 or long_climax_age <= 10:
                 cand = {
                     "Symbol": row["Symbol"],
                     "% Change": row["% Change"],
@@ -400,8 +399,7 @@ def build_dashboard_and_candidates(df):
         short_climax_age = get_days_ago(row.get("Short_D"))
         
         if pd.notna(sup_t1) and abs(row["LTP"] - sup_t1) / max(row["LTP"], 1.0) <= tol_pct:
-            # FIX: Only trigger if the Breach OR the Climax Date is 5 days or less
-            if short_breach <= 5 or short_climax_age <= 5:
+            if short_breach <= 10 or short_climax_age <= 10:
                 cand = {
                     "Symbol": row["Symbol"],
                     "% Change": row["% Change"],
@@ -422,7 +420,6 @@ def build_dashboard_and_candidates(df):
                 valid_short.append(cand)
                 is_active_candidate = True
 
-        # FIX: The general Dashboard will ONLY include stocks that passed the active 5-day checks above
         if is_active_candidate:
             dashboard_rows.append(r_dict.copy())
 
@@ -436,8 +433,7 @@ def build_option_candidate_tables(df, spot_signal_map):
         t, b, d, bd = row.get("T_LOC"), row.get("B_LOC"), row.get("D_LOC"), row.get("Days_L_LOC")
         climax_age = get_days_ago(d)
         
-        # FIX: Options forced strictly to <= 5 days
-        if pd.notna(t) and row["LTP"] > t and (bd <= 5 or climax_age <= 5):
+        if pd.notna(t) and row["LTP"] > t and (bd <= 10 or climax_age <= 10):
             r_dict = row.to_dict()
             spot_signal = spot_signal_map.get(get_underlying_spot(row["Symbol"]), "")
             r_dict["Signal_Type"] = "Holy Grail" if spot_signal == "Fresh Sweep" else "Active Trend"
@@ -452,7 +448,7 @@ def build_option_candidate_tables(df, spot_signal_map):
 
 def build_html_table(df, title, cols):
     if df.empty:
-        return f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top: 25px;'>{title}</h3><p style='color:#94a3b8; font-family:sans-serif;'>No candidates within 5 days.</p>"
+        return f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top: 25px;'>{title}</h3><p style='color:#94a3b8; font-family:sans-serif;'>No candidates within 10 days.</p>"
     table_html = f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top: 25px;'>{title}</h3><table style='border-collapse: collapse; width: 100%; font-family: sans-serif; font-size: 13px; text-align: left; background-color: #0f172a;'>"
     table_html += "<tr style='background-color: #1e293b; color: #f1f5f9;'>" + "".join([f"<th style='padding: 10px; border: 1px solid #334155;'>{c}</th>" for c in cols]) + "</tr>"
     for i, (_, row) in enumerate(df.iterrows()):
