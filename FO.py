@@ -248,7 +248,6 @@ def scan_fno_universe(fyers):
             bands = pd.DataFrame(candidates)
             supports = bands[bands["top"] < ltp].copy()
             resistances = bands[bands["bottom"] > ltp].copy()
-            current_zone = bands[(bands["bottom"] <= ltp) & (bands["top"] >= ltp)].copy()
 
             supports["sort_key"] = supports["top"]
             supports = supports.sort_values("sort_key", ascending=False).head(3).reset_index(drop=True)
@@ -283,31 +282,49 @@ def scan_fno_universe(fyers):
                     row[f"RES_D_{i+1}"] = ""
                     row[f"RES_V_{i+1}"] = np.nan
 
+            # --- RESISTANCE LOGIC (Breakouts & Sweeps) ---
             if len(resistances) > 0:
                 top_band = float(resistances.iloc[0]["top"])
                 below = daily[daily["close"] <= top_band]
+                swept_above = daily[daily["high"] > top_band] # Wick above the resistance line
+                
                 row["Long_T"] = top_band
                 row["Long_B"] = float(resistances.iloc[0]["bottom"])
                 row["Long_D"] = str(resistances.iloc[0]["date"])
                 row["Long_V"] = float(resistances.iloc[0]["volume"])
+                
+                # Standard Breakout (Price entirely above zone)
                 row["Long_Breach_Days"] = (today - below.iloc[-1]["timestamp"]).days if (ltp > top_band and not below.empty) else 999
+                
+                # Bearish Sweep (Wick above, but closed below/inside)
+                row["Res_Sweep_Days"] = (today - swept_above.iloc[-1]["timestamp"]).days if (ltp <= top_band and not swept_above.empty) else 999
             else:
                 row["Long_T"] = row["Long_B"] = row["Long_V"] = np.nan
                 row["Long_D"] = ""
                 row["Long_Breach_Days"] = 999
+                row["Res_Sweep_Days"] = 999
 
+            # --- SUPPORT LOGIC (Breakdowns & Sweeps) ---
             if len(supports) > 0:
                 bot_band = float(supports.iloc[0]["bottom"])
                 above = daily[daily["close"] >= bot_band]
+                swept_below = daily[daily["low"] < bot_band] # Wick below the support line
+                
                 row["Short_T"] = float(supports.iloc[0]["top"])
                 row["Short_B"] = bot_band
                 row["Short_D"] = str(supports.iloc[0]["date"])
                 row["Short_V"] = float(supports.iloc[0]["volume"])
+                
+                # Standard Breakdown (Price entirely below zone)
                 row["Short_Breach_Days"] = (today - above.iloc[-1]["timestamp"]).days if (ltp < bot_band and not above.empty) else 999
+                
+                # Bullish Sweep (Wick below, but closed above/inside)
+                row["Sup_Sweep_Days"] = (today - swept_below.iloc[-1]["timestamp"]).days if (ltp >= bot_band and not swept_below.empty) else 999
             else:
                 row["Short_T"] = row["Short_B"] = row["Short_V"] = np.nan
                 row["Short_D"] = ""
                 row["Short_Breach_Days"] = 999
+                row["Sup_Sweep_Days"] = 999
 
             final_row = row
             if len(supports) >= 3 and len(resistances) >= 3:
@@ -365,12 +382,35 @@ def build_dashboard_and_candidates(df):
         
         is_active_candidate = False
         
-        # --- LONG BREAKOUT CHECK ---
+        # ===============================================
+        # LONG CANDIDATES (Bullish Setup)
+        # ===============================================
+        # Check 1: Did it break out above Resistance?
         long_t = row.get("Long_T")
         long_breach = row.get("Long_Breach_Days", 999)
         long_climax_age = get_days_ago(row.get("Long_D"))
+        is_breakout = pd.notna(long_t) and row["LTP"] > long_t and (long_breach <= 10 or long_climax_age <= 10)
         
-        if pd.notna(long_t) and row["LTP"] > long_t and (long_breach <= 10 or long_climax_age <= 10):
+        # Check 2: Did it wicked below Support and recover?
+        short_b = row.get("Short_B")
+        sup_sweep = row.get("Sup_Sweep_Days", 999)
+        is_sup_sweep = pd.notna(short_b) and row["LTP"] >= short_b and sup_sweep <= 10
+
+        if is_breakout or is_sup_sweep:
+            sig_type = "Long Breakout" if is_breakout else "Support Sweep"
+            
+            # Map variables dynamically based on which signal triggered
+            if is_breakout:
+                c_date = row.get("Long_D", "")
+                c_range = format_tb_pair(row["LTP"], long_t, row.get("Long_B"))
+                c_vol = f"{int(row['Long_V']):,}" if pd.notna(row.get("Long_V")) else ""
+                b_days = long_breach
+            else:
+                c_date = row.get("Short_D", "")
+                c_range = format_tb_pair(row["LTP"], row.get("Short_T"), short_b)
+                c_vol = f"{int(row['Short_V']):,}" if pd.notna(row.get("Short_V")) else ""
+                b_days = sup_sweep
+
             cand = {
                 "Symbol": row["Symbol"],
                 "% Change": row["% Change"],
@@ -381,22 +421,43 @@ def build_dashboard_and_candidates(df):
                 "Resistance-1": r_dict.get("Resistance-1", "-"),
                 "Resistance-2": r_dict.get("Resistance-2", "-"),
                 "Resistance-3": r_dict.get("Resistance-3", "-"),
-                "Climax_Date": row.get("Long_D", ""),
-                "Climax_Range (T/B)": format_tb_pair(row["LTP"], long_t, row.get("Long_B")),
-                "Climax_Volume": f"{int(row['Long_V']):,}" if pd.notna(row.get("Long_V")) else "",
-                "Breach_Days": long_breach,
-                "Signal_Type": "Long Breakout",
+                "Climax_Date": c_date,
+                "Climax_Range (T/B)": c_range,
+                "Climax_Volume": c_vol,
+                "Breach_Days": b_days,
+                "Signal_Type": sig_type,
             }
             _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "long")
             valid_long.append(cand)
             is_active_candidate = True
 
-        # --- SHORT BREAKDOWN CHECK ---
-        short_b = row.get("Short_B")
+
+        # ===============================================
+        # SHORT CANDIDATES (Bearish Setup)
+        # ===============================================
+        # Check 1: Did it breakdown below Support?
         short_breach = row.get("Short_Breach_Days", 999)
         short_climax_age = get_days_ago(row.get("Short_D"))
-        
-        if pd.notna(short_b) and row["LTP"] < short_b and (short_breach <= 10 or short_climax_age <= 10):
+        is_breakdown = pd.notna(short_b) and row["LTP"] < short_b and (short_breach <= 10 or short_climax_age <= 10)
+
+        # Check 2: Did it wick above Resistance and reject?
+        res_sweep = row.get("Res_Sweep_Days", 999)
+        is_res_sweep = pd.notna(long_t) and row["LTP"] <= long_t and res_sweep <= 10
+
+        if is_breakdown or is_res_sweep:
+            sig_type = "Short Breakdown" if is_breakdown else "Resistance Sweep"
+
+            if is_breakdown:
+                c_date = row.get("Short_D", "")
+                c_range = format_tb_pair(row["LTP"], row.get("Short_T"), short_b)
+                c_vol = f"{int(row['Short_V']):,}" if pd.notna(row.get("Short_V")) else ""
+                b_days = short_breach
+            else:
+                c_date = row.get("Long_D", "")
+                c_range = format_tb_pair(row["LTP"], long_t, row.get("Long_B"))
+                c_vol = f"{int(row['Long_V']):,}" if pd.notna(row.get("Long_V")) else ""
+                b_days = res_sweep
+
             cand = {
                 "Symbol": row["Symbol"],
                 "% Change": row["% Change"],
@@ -407,11 +468,11 @@ def build_dashboard_and_candidates(df):
                 "Resistance-1": r_dict.get("Resistance-1", "-"),
                 "Resistance-2": r_dict.get("Resistance-2", "-"),
                 "Resistance-3": r_dict.get("Resistance-3", "-"),
-                "Climax_Date": row.get("Short_D", ""),
-                "Climax_Range (T/B)": format_tb_pair(row["LTP"], row.get("Short_T"), short_b),
-                "Climax_Volume": f"{int(row['Short_V']):,}" if pd.notna(row.get("Short_V")) else "",
-                "Breach_Days": short_breach,
-                "Signal_Type": "Short Breakdown",
+                "Climax_Date": c_date,
+                "Climax_Range (T/B)": c_range,
+                "Climax_Volume": c_vol,
+                "Breach_Days": b_days,
+                "Signal_Type": sig_type,
             }
             _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "short")
             valid_short.append(cand)
@@ -433,7 +494,9 @@ def build_option_candidate_tables(df, spot_signal_map):
         if pd.notna(t) and row["LTP"] > t and (bd <= 10 or climax_age <= 10):
             r_dict = row.to_dict()
             spot_signal = spot_signal_map.get(get_underlying_spot(row["Symbol"]), "")
-            r_dict["Signal_Type"] = "Holy Grail" if spot_signal == "Fresh Sweep" else "Active Trend"
+            
+            # Label as Holy Grail if the spot signal was a liquidity Sweep
+            r_dict["Signal_Type"] = "Holy Grail" if "Sweep" in spot_signal else "Active Trend"
             r_dict["Climax_Date"] = d
             r_dict["Breach_Days"] = bd
             r_dict["Climax_Range (T/B)"] = format_tb_pair(row["LTP"], t, b)
@@ -542,3 +605,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
