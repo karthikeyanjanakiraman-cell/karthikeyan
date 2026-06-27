@@ -38,7 +38,6 @@ class Config:
 
 cfg = Config()
 
-# Display columns
 EMAIL_DISPLAY_COLS = [
     "Symbol", "LTP", "Trigger_TF", 
     "1-Week (T/B)", "1-Month (T/B)", 
@@ -147,7 +146,6 @@ def scan_fno_universe(fyers):
             ltp = float(daily["close"].iloc[-1])
             bands, streak_data = {}, {}
             
-            # Non-overlapping windows
             timeframe_windows = [
                 ("6M", 135, 66), ("3M", 65, 23), ("1M", 22, 6), ("1W", 5, 4), ("3D", 3, 0)
             ]
@@ -159,7 +157,6 @@ def scan_fno_universe(fyers):
                 c = df_s.loc[idx_val]
                 bands.update({f"T_{label}": float(c["high"]), f"B_{label}": float(c["low"]), f"D_{label}": str(c["timestamp"].date())})
                 
-                # Logic for streaks
                 bd_l, bd_s = 999, 999
                 if ltp > float(c["high"]):
                     idx = len(daily) - 1
@@ -281,15 +278,36 @@ def send_email(dashboard_df, long_df, short_df, ce_df, pe_df, csv_file):
 def main():
     fyers = init_fyers()
     if not fyers: return
+    
     spot_df = scan_fno_universe(fyers)
-    if spot_df.empty: return
+    if spot_df.empty: 
+        logger.warning("No spot data generated.")
+        return
+        
     dashboard_df, long_df, short_df = build_dashboard_and_candidates(spot_df)
-    spot_map = {**{r["Symbol"]: r["Signal_Type"] for _, r in long_df.iterrows()}, **{r["Symbol"]: r["Signal_Type"] for _, r in short_df.iterrows()}}
-    all_opt = list(set([sym for sublist in long_df["Target_Options"].tolist() + short_df["Target_Options"].tolist() for sym in sublist]))
+    
+    # Defensive construction of all_opt to prevent KeyError
+    all_opt = []
+    if not long_df.empty and "Target_Options" in long_df.columns:
+        for sublist in long_df["Target_Options"].tolist():
+            if isinstance(sublist, list): all_opt.extend(sublist)
+    if not short_df.empty and "Target_Options" in short_df.columns:
+        for sublist in short_df["Target_Options"].tolist():
+            if isinstance(sublist, list): all_opt.extend(sublist)
+    all_opt = list(set(all_opt))
+    
+    # Defensive construction of spot_map
+    spot_map = {}
+    if not long_df.empty and "Signal_Type" in long_df.columns:
+        spot_map.update({r["Symbol"]: r["Signal_Type"] for _, r in long_df.iterrows()})
+    if not short_df.empty and "Signal_Type" in short_df.columns:
+        spot_map.update({r["Symbol"]: r["Signal_Type"] for _, r in short_df.iterrows()})
+        
     ce_df, pe_df = pd.DataFrame(), pd.DataFrame()
     if all_opt:
         opt_df = scan_options_universe(fyers, all_opt)
         ce_df, pe_df = build_option_candidate_tables(opt_df, spot_map)
+        
     csv_f = save_outputs(spot_df)
     send_email(dashboard_df, long_df, short_df, ce_df, pe_df, csv_f)
 
