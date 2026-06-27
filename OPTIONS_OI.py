@@ -38,10 +38,18 @@ class Config:
 
 cfg = Config()
 
+# Top-5 volume climax levels â€” compact: one "Level-N" column per level
+# Each cell shows:  DATE  |  Top / Bottom  (vol)
 EMAIL_DISPLAY_COLS = [
-    "Symbol", "LTP", "Trigger_TF",
-    "1-Day (T/B)", "3-Day (T/B)", "1-Week (T/B)",
-    "1-Month (T/B)", "3-Month (T/B)", "6-Month (T/B)"
+    "Symbol", "LTP", "% Change",
+    "Level-1", "Level-2", "Level-3", "Level-4", "Level-5",
+]
+
+# Candidate matrix columns (long / short)
+EMAIL_CAND_COLS = [
+    "Symbol", "LTP", "% Change",
+    "Climax_Date", "Climax_Range (T/B)",
+    "Climax_Volume", "Breach_Days", "Signal_Type",
 ]
 
 EMAIL_OPT_COLS = [
@@ -173,63 +181,68 @@ def get_history(fyers, symbol, res, days):
         return None
 
 def scan_fno_universe(fyers):
+    """
+    For each index, fetch 6 months of daily data.
+    Rank ALL candles by volume descending and keep the top 5.
+    Each top-5 candle becomes a 'climax level' (High = Top band, Low = Bottom band).
+    Also compute:
+      - Days since LTP last closed BELOW the band top  (bd_l)
+      - Days since LTP last closed ABOVE the band bot  (bd_s)
+    Sorted newestâ†’oldest within the top-5 by date (after volume ranking).
+    """
+    TOP_N = 5
     rows = []
+
     for sym in cfg.index_symbols:
-        daily = get_history(fyers, sym, "D", 365)
+        daily = get_history(fyers, sym, "D", 182)   # ~6 months
         if daily is None or daily.empty:
             continue
 
-        today = datetime.now()
-        ltp = float(daily["close"].iloc[-1])
-        bands, streak_data = {}, {}
+        today  = datetime.now()
+        ltp    = float(daily["close"].iloc[-1])
+        pct_ch = ((ltp - float(daily["close"].iloc[-2])) / float(daily["close"].iloc[-2]) * 100)
 
-        # Cumulative "last N days" windows â€” each band covers the full
-        # look-back period so shorter TFs are always subsets of longer ones.
-        # This prevents the duplicate-band problem (3D==1W, 1M==3M, etc.).
-        windows = [
-            ("1D",  1),
-            ("3D",  3),
-            ("1W",  7),
-            ("1M",  30),
-            ("3M",  90),
-            ("6M",  180),
-        ]
+        # â”€â”€ Rank by volume, pick top N; then re-sort by proximity of band
+        #    to LTP (nearest band edge wins) so the most actionable level
+        #    always appears as Rank-1 in the email. â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        top_vol = daily.sort_values("volume", ascending=False).head(TOP_N).copy()
 
-        for label, days_back in windows:
-            df_s = daily[daily["timestamp"] > (today - timedelta(days=days_back))]
-            if df_s.empty:
-                continue
-            idx_val = df_s["volume"].idxmax() if (df_s["volume"] > 0).any() else (df_s["high"] - df_s["low"]).idxmax()
-            c = df_s.loc[idx_val]
+        # Proximity = min distance from LTP to either edge of the candle range
+        top_vol["_proximity"] = top_vol.apply(
+            lambda r: min(abs(ltp - r["high"]), abs(ltp - r["low"])), axis=1
+        )
+        ranked = top_vol.sort_values("_proximity", ascending=True).reset_index(drop=True)
+
+        row: Dict = {"Symbol": sym, "LTP": ltp, "% Change": pct_ch}
+
+        for rank, (_, c) in enumerate(ranked.iterrows(), start=1):
             top_band = float(c["high"])
             bot_band = float(c["low"])
-            bands[f"T_{label}"] = top_band
-            bands[f"B_{label}"] = bot_band
-            bands[f"D_{label}"] = str(c["timestamp"].date())
+            vol      = float(c["volume"])
+            date_str = str(c["timestamp"].date())
 
-            # Breach / streak logic: how old is the breakout/breakdown vs this band
+            row[f"T_R{rank}"]    = top_band
+            row[f"B_R{rank}"]    = bot_band
+            row[f"D_R{rank}"]    = date_str
+            row[f"Vol_R{rank}"]  = vol
+
             bd_l = bd_s = 999
             if ltp > top_band:
-                below_top = daily[daily["close"] <= top_band]
-                if not below_top.empty:
-                    bd_l = (today - below_top.iloc[-1]["timestamp"]).days
+                below = daily[daily["close"] <= top_band]
+                if not below.empty:
+                    bd_l = (today - below.iloc[-1]["timestamp"]).days
             if ltp < bot_band:
-                above_bot = daily[daily["close"] >= bot_band]
-                if not above_bot.empty:
-                    bd_s = (today - above_bot.iloc[-1]["timestamp"]).days
-            streak_data[f"Days_L_{label}"] = bd_l
-            streak_data[f"Days_S_{label}"] = bd_s
+                above = daily[daily["close"] >= bot_band]
+                if not above.empty:
+                    bd_s = (today - above.iloc[-1]["timestamp"]).days
 
-        row = {
-            "Symbol": sym,
-            "LTP": ltp,
-            "% Change": ((ltp - float(daily["close"].iloc[-2])) / float(daily["close"].iloc[-2]) * 100),
-        }
-        row.update(bands)
-        row.update(streak_data)
+            row[f"BdL_R{rank}"] = bd_l
+            row[f"BdS_R{rank}"] = bd_s
+
         rows.append(row)
 
     return pd.DataFrame(rows)
+
 
 def scan_options_universe(fyers, symbols):
     rows = []
@@ -259,62 +272,74 @@ def scan_options_universe(fyers, symbols):
     return pd.DataFrame(rows)
 
 def build_dashboard_and_candidates(df):
+    """
+    Build:
+      1) dashboard_df  â€” one row per symbol, showing all 5 climax levels
+      2) long_df       â€” symbols where LTP broke above a climax top (fresh, <=5 days)
+      3) short_df      â€” symbols where LTP broke below a climax bottom (fresh, <=5 days)
+    Signal fires on the HIGHEST-RANKED (largest volume) qualifying level.
+    """
     dashboard_rows, valid_long, valid_short = [], [], []
-
-    label_map = {
-        "1D": "1-Day", "3D": "3-Day", "1W": "1-Week",
-        "1M": "1-Month", "3M": "3-Month", "6M": "6-Month",
-    }
 
     for _, row in df.iterrows():
         r_dict = row.to_dict()
 
-        # --- 1) Detect signal first (so Trigger_TF is consistent everywhere) ---
-        trigger_tf: str | None = None
-        trigger_side: str | None = None  # "long" or "short"
-        climax_date = None
-        target_options_list = None
+        # â”€â”€ Format top-5 as T/B only â€” no date, no volume inside cell â”€â”€â”€â”€â”€â”€â”€â”€â”€
+        for rank in range(1, 6):
+            t = row.get(f"T_R{rank}")
+            b = row.get(f"B_R{rank}")
+            r_dict[f"Level-{rank}"] = format_tb_pair(row["LTP"], t, b) if pd.notna(t) and pd.notna(b) else "-"
 
-        for tf in ["1D", "3D", "1W", "1M", "3M", "6M"]:
-            t   = row.get(f"T_{tf}")
-            b   = row.get(f"B_{tf}")
-            d   = row.get(f"D_{tf}")
-            bd_l = row.get(f"Days_L_{tf}", 999)
-            bd_s = row.get(f"Days_S_{tf}", 999)
+        # â”€â”€ Signal detection: scan rank-1 â†’ rank-5, first qualifying wins â”€â”€â”€â”€
+        active_rank   = None
+        trigger_side  = None
+        climax_date   = None
+        climax_top    = None
+        climax_bot    = None
+        climax_vol    = None
+        target_opts   = None
 
-            # Long-side breakout: LTP above top band and breakout is fresh (<=5 days)
+        for rank in range(1, 6):
+            t    = row.get(f"T_R{rank}")
+            b    = row.get(f"B_R{rank}")
+            d    = row.get(f"D_R{rank}")
+            bd_l = row.get(f"BdL_R{rank}", 999)
+            bd_s = row.get(f"BdS_R{rank}", 999)
+            vol  = row.get(f"Vol_R{rank}")
+
             if pd.notna(t) and row["LTP"] > t and bd_l <= 5:
-                trigger_tf = tf
+                active_rank  = rank
                 trigger_side = "long"
-                climax_date = d
-                _, _, target_options_list = get_options_data(row["Symbol"], row["LTP"], "long")
+                climax_date  = d
+                climax_top   = t
+                climax_bot   = b
+                climax_vol   = vol
+                _, _, target_opts = get_options_data(row["Symbol"], row["LTP"], "long")
                 break
 
-            # Short-side breakdown: LTP below bottom band and breakdown is fresh (<=5 days)
             if pd.notna(b) and row["LTP"] < b and bd_s <= 5:
-                trigger_tf = tf
+                active_rank  = rank
                 trigger_side = "short"
-                climax_date = d
-                _, _, target_options_list = get_options_data(row["Symbol"], row["LTP"], "short")
+                climax_date  = d
+                climax_top   = t
+                climax_bot   = b
+                climax_vol   = vol
+                _, _, target_opts = get_options_data(row["Symbol"], row["LTP"], "short")
                 break
 
-        # --- 2) Build dashboard row (Trigger_TF reflects the detected TF, if any) ---
-        r_dict["Trigger_TF"] = trigger_tf or ""
-        for tf, display_label in label_map.items():
-            r_dict[f"{display_label} (T/B)"] = format_tb_pair(
-                row["LTP"], row.get(f"T_{tf}"), row.get(f"B_{tf}")
-            )
+        r_dict["Signal_Type"]  = f"L{active_rank} Long" if (active_rank and trigger_side=="long") else (f"L{active_rank} Short" if active_rank else "")
         dashboard_rows.append(r_dict.copy())
 
-        # --- 3) Build long/short candidate matrices using an independent copy ---
-        if trigger_tf and target_options_list:
+        if active_rank and target_opts:
             cand = r_dict.copy()
-            cand["Climax_Date"] = climax_date
-            cand["Target_Options"] = target_options_list
-            cand["Signal_Type"] = "Active Trend"
+            cand["Climax_Date"]        = climax_date
+            cand["Climax_Range (T/B)"] = format_tb_pair(row["LTP"], climax_top, climax_bot)
+            cand["Climax_Volume"]      = f"{int(climax_vol):,}" if climax_vol else ""
+            cand["Breach_Days"]        = row.get(f"BdL_R{active_rank}" if trigger_side == "long" else f"BdS_R{active_rank}", 999)
+            cand["Target_Options"]     = target_opts
             if trigger_side == "long":
                 valid_long.append(cand)
-            elif trigger_side == "short":
+            else:
                 valid_short.append(cand)
 
     return pd.DataFrame(dashboard_rows), pd.DataFrame(valid_long), pd.DataFrame(valid_short)
@@ -392,8 +417,8 @@ def send_email(dashboard_df, long_df, short_df, ce_df, pe_df, csv_file):
         html = (
             "<body style='background-color: #030712; padding: 20px; font-family: sans-serif;'>"
             + build_html_table(dashboard_df, "Market Dashboard", EMAIL_DISPLAY_COLS)
-            + build_html_table(long_df, "Long Strategy Matrix", EMAIL_DISPLAY_COLS)
-            + build_html_table(short_df, "Short Strategy Matrix", EMAIL_DISPLAY_COLS)
+            + build_html_table(long_df, "Long Strategy Matrix", EMAIL_CAND_COLS)
+            + build_html_table(short_df, "Short Strategy Matrix", EMAIL_CAND_COLS)
             + build_html_table(ce_df, "Call Options (CE) Climax Verification", EMAIL_OPT_COLS)
             + build_html_table(pe_df, "Put Options (PE) Climax Verification", EMAIL_OPT_COLS)
             + "</body>"
