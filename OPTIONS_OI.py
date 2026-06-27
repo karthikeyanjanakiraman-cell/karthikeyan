@@ -38,12 +38,13 @@ class Config:
 
 cfg = Config()
 
+# Removed "Options_Data" from the display columns for the Spot Matrices
 EMAIL_DISPLAY_COLS = [
     "Symbol", "LTP", "Trigger_TF", 
     "1-Week (T/B)", "1-Month (T/B)", 
-    "3-Month (T/B)", "6-Month (T/B)", 
-    "Options_Data"
+    "3-Month (T/B)", "6-Month (T/B)"
 ]
+
 EMAIL_OPT_COLS = [
     "Symbol", "LTP", "% Change", "Signal_Type", 
     "Climax_Date", "Climax_Range (T/B)", "Breach_Days"
@@ -82,7 +83,7 @@ def format_tb_pair(ltp, top, bottom):
 def format_value(col, val):
     if pd.isna(val) or val in [float("inf"), float("-inf")]: return ""
     
-    # NEW: Let our custom HTML columns pass through untouched
+    # Custom HTML columns pass through untouched
     if "(T/B)" in col or col == "Options_Data": 
         return str(val)
         
@@ -172,10 +173,27 @@ def scan_fno_universe(fyers):
             ltp = float(daily["close"].iloc[-1])
             bands, streak_data = {}, {}
             
-            for label, tf in [("6M", 135), ("3M", 65), ("1M", 22), ("1W", 5)]:
-                df_s = daily.tail(tf)
+            # Define exact windows: (Label, Max_Days_Back, Min_Days_Back)
+            timeframe_windows = [
+                ("6M", 135, 65),  # Grabs day 135 down to day 66
+                ("3M", 65, 22),   # Grabs day 65 down to day 23
+                ("1M", 22, 5),    # Grabs day 22 down to day 6
+                ("1W", 5, 0)      # Grabs the most recent 5 days
+            ]
+            
+            for label, max_days, min_days in timeframe_windows:
+                # Slice the dataframe strictly into non-overlapping windows
+                if min_days == 0:
+                    df_s = daily.iloc[-max_days:]
+                else:
+                    df_s = daily.iloc[-max_days:-min_days]
+                
+                # Safeguard in case the slice doesn't have enough data
+                if df_s.empty: continue
+                
                 idx_val = df_s["volume"].idxmax() if (df_s["volume"]>0).any() else (df_s["high"]-df_s["low"]).idxmax()
                 c = df_s.loc[idx_val]
+                
                 bands.update({f"T_{label}": float(c["high"]), f"B_{label}": float(c["low"]), f"D_{label}": str(c["timestamp"].date())})
                 
                 # Strict Linear Crossover Logic to Prevent Stale Data Representation
