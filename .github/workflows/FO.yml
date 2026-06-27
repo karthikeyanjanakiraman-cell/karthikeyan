@@ -1,0 +1,45 @@
+name: Options-OI
+
+on:
+  schedule:
+    - cron: "*/15 3-10 * * 1-5"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  run-options-oi-rank-scanner:
+    runs-on: ubuntu-latest
+    env:
+      CLIENT_ID: ${{ secrets.CLIENT_ID }}
+      ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+      SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+      SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+      RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+      SMTP_PORT: ${{ secrets.SMTP_PORT }}
+      ACTIVE_EXPIRY: ${{ secrets.ACTIVE_EXPIRY }}
+      ATM_STRIKE_RANGE: ${{ secrets.ATM_STRIKE_RANGE }}
+      TZ: Asia/Kolkata
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas numpy fyers-apiv3 scipy yfinance ta
+
+    
+      
+
+      - name: Send CE/PE Momentum Buy Email
+        run: FO.py
