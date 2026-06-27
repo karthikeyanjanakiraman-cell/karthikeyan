@@ -394,6 +394,31 @@ def get_history(fyers, symbol: str, resolution: str = "1D", days: int = 365) -> 
 
 
 def scan_fno_universe(fyers):
+    # NOTE ON HOW SUPPORT/RESISTANCE ARE ARRIVED IN THIS CODE:
+    # This implementation does NOT use classic pivot formulas from previous-day OHLC.
+    # It creates custom support/resistance zones from historical daily high-volume candles.
+    #
+    # Step-by-step logic:
+    # 1) Fetch up to ~2 years of daily candles for the symbol.
+    # 2) For each rolling lookback window, sort candles by volume descending
+    #    and then by high descending.
+    # 3) Treat each selected candle as a zone:
+    #       zone_top = candle high
+    #       zone_bottom = candle low
+    # 4) Compare each zone to current LTP:
+    #       Support   => zone_top < LTP
+    #       Resistance=> zone_bottom > LTP
+    # 5) Rank nearest supports by zone_top descending.
+    # 6) Rank nearest resistances by zone_bottom ascending.
+    # 7) Keep the nearest three on each side:
+    #       Support-1/2/3 and Resistance-1/2/3.
+    #
+    # Meaning in this code:
+    # - Support-1 is the closest high-volume historical zone below current price.
+    # - Resistance-1 is the closest high-volume historical zone above current price.
+    # - Support-2/3 and Resistance-2/3 are the next closest zones.
+    #
+    # So these are volume-climax bands, not textbook pivot R1/R2/R3/S1/S2/S3 levels.
     base_lookback = 90
     max_lookback = MAX_DAILY_LOOKBACK
     step = 30
