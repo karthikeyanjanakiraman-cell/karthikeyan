@@ -208,13 +208,19 @@ def scan_fno_universe(fyers):
             continue
 
         bands = pd.DataFrame(candidates)
-        supports = bands[bands["bottom"] < ltp].copy()
-        resistances = bands[bands["top"] > ltp].copy()
 
-        supports["sort_key"] = supports["bottom"]
+        # Strict separation:
+        # support  => full band below LTP
+        # resistance => full band above LTP
+        # overlapping/current zone => contains LTP, excluded from both
+        supports = bands[bands["top"] < ltp].copy()
+        resistances = bands[bands["bottom"] > ltp].copy()
+        current_zone = bands[(bands["bottom"] <= ltp) & (bands["top"] >= ltp)].copy()
+
+        supports["sort_key"] = supports["top"]
         supports = supports.sort_values("sort_key", ascending=False).head(3).reset_index(drop=True)
 
-        resistances["sort_key"] = resistances["top"]
+        resistances["sort_key"] = resistances["bottom"]
         resistances = resistances.sort_values("sort_key", ascending=True).head(3).reset_index(drop=True)
 
         row: Dict = {"Symbol": sym, "LTP": ltp, "% Change": pct_ch}
