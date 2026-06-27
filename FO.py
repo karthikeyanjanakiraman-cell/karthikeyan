@@ -53,7 +53,7 @@ class Config:
         self.max_symbols = int(os.environ.get("MAX_SYMBOLS", "0"))
         self.scan_sleep = float(os.environ.get("SCAN_SLEEP", "0.05"))
         self.option_scan_sleep = float(os.environ.get("OPTION_SCAN_SLEEP", "0.03"))
-        self.breakout_breach_days = int(os.environ.get("BREACH_DAYS_SPOT", "5"))
+        self.breakout_breach_days = int(os.environ.get("BREACH_DAYS_SPOT", "10"))
         self.option_breach_days = int(os.environ.get("BREACH_DAYS_OPTION", "10"))
 
 
@@ -88,6 +88,14 @@ ch = logging.StreamHandler(sys.stdout)
 ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 logger.addHandler(ch)
 warnings.filterwarnings("ignore")
+
+def days_since_date(date_str):
+    try:
+        d = pd.to_datetime(date_str).date()
+        return (datetime.now().date() - d).days
+    except Exception:
+        return 999
+
 
 
 def format_tb_pair(ltp, top, bottom):
@@ -346,7 +354,7 @@ def build_dashboard_and_candidates(df):
             r_dict[f"Resistance-{i}"] = format_tb_pair(row["LTP"], row.get(f"RES_T_{i}"), row.get(f"RES_B_{i}")) if pd.notna(row.get(f"RES_T_{i}")) else "-"
         dashboard_rows.append(r_dict.copy())
 
-        if pd.notna(row.get("Long_T")) and row["LTP"] > row["Long_T"] and row.get("Long_Breach_Days", 999) <= cfg.breakout_breach_days:
+        if pd.notna(row.get("Long_T")) and row["LTP"] > row["Long_T"] and days_since_date(row.get("Long_D", "")) <= 5:
             cand = r_dict.copy()
             cand.update({
                 "Climax_Date": row.get("Long_D", ""),
@@ -358,7 +366,7 @@ def build_dashboard_and_candidates(df):
             _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "long")
             valid_long.append(cand)
 
-        if pd.notna(row.get("Short_B")) and row["LTP"] < row["Short_B"] and row.get("Short_Breach_Days", 999) <= cfg.breakout_breach_days:
+        if pd.notna(row.get("Short_B")) and row["LTP"] < row["Short_B"] and days_since_date(row.get("Short_D", "")) <= 5:
             cand = r_dict.copy()
             cand.update({
                 "Climax_Date": row.get("Short_D", ""),
@@ -385,7 +393,7 @@ def build_option_candidate_tables(df):
     valid_rows = []
     for _, row in df.iterrows():
         t, b, d, bd = row.get("T_LOC"), row.get("B_LOC"), row.get("D_LOC"), row.get("Days_L_LOC")
-        if pd.notna(t) and row["LTP"] > t and bd <= cfg.option_breach_days:
+        if pd.notna(t) and row["LTP"] > t and days_since_date(d) <= 5:
             r_dict = row.to_dict()
             r_dict["Signal_Type"] = "Active Trend"
             r_dict["Climax_Date"] = d
@@ -439,11 +447,11 @@ def send_email(dashboard_df, long_df, short_df, ce_df, pe_df, csv_file):
     msg["Subject"] = f"F&O Market Dashboard {datetime.now().strftime('%Y-%m-%d')}"
     html = (
         f"<html><body style='background:#030712; color:#fff; padding:20px;'>"
-        f"{build_html_table(dashboard_df, 'Market Dashboard', EMAIL_DISPLAY_COLS)}"
         f"{build_html_table(long_df, 'Long Strategy Matrix', EMAIL_CAND_COLS)}"
         f"{build_html_table(short_df, 'Short Strategy Matrix', EMAIL_CAND_COLS)}"
         f"{build_html_table(ce_df, 'Call Options (CE) Climax Verification', EMAIL_OPT_COLS)}"
         f"{build_html_table(pe_df, 'Put Options (PE) Climax Verification', EMAIL_OPT_COLS)}"
+        f"{build_html_table(dashboard_df, 'Market Dashboard', EMAIL_DISPLAY_COLS)}"
         f"</body></html>"
     )
     msg.attach(MIMEText(html, "html"))
