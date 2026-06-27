@@ -35,13 +35,15 @@ class Config:
 cfg = Config()
 
 EMAIL_DISPLAY_COLS = [
-    "Symbol", "LTP", "% Change",
-    "Support-1", "Support-2", "Support-3",
+    "Symbol", "% Change",
+    "Support-3", "Support-2", "Support-1", "LTP",
     "Resistance-1", "Resistance-2", "Resistance-3",
 ]
 
 EMAIL_CAND_COLS = [
-    "Symbol", "LTP", "% Change",
+    "Symbol", "% Change",
+    "Support-3", "Support-2", "Support-1", "LTP",
+    "Resistance-1", "Resistance-2", "Resistance-3",
     "Climax_Date", "Climax_Range (T/B)",
     "Climax_Volume", "Breach_Days", "Signal_Type",
 ]
@@ -82,6 +84,11 @@ def format_value(col, val):
     if col == "% Change":
         try:
             return f"{float(val):.2f}%"
+        except (TypeError, ValueError):
+            return ""
+    if col == "LTP":
+        try:
+            return f"{float(val):.2f}"
         except (TypeError, ValueError):
             return ""
     if isinstance(val, (int, float, np.integer, np.floating)):
@@ -319,8 +326,14 @@ def build_dashboard_and_candidates(df):
         if pd.notna(row.get("Long_T")) and row["LTP"] > row["Long_T"] and row.get("Long_Breach_Days", 999) <= 5:
             cand = {
                 "Symbol": row["Symbol"],
-                "LTP": row["LTP"],
                 "% Change": row["% Change"],
+                "Support-3": r_dict.get("Support-3", "-"),
+                "Support-2": r_dict.get("Support-2", "-"),
+                "Support-1": r_dict.get("Support-1", "-"),
+                "LTP": row["LTP"],
+                "Resistance-1": r_dict.get("Resistance-1", "-"),
+                "Resistance-2": r_dict.get("Resistance-2", "-"),
+                "Resistance-3": r_dict.get("Resistance-3", "-"),
                 "Climax_Date": row["Long_D"],
                 "Climax_Range (T/B)": format_tb_pair(row["LTP"], row["Long_T"], row["Long_B"]),
                 "Climax_Volume": f"{int(row['Long_V']):,}" if pd.notna(row.get("Long_V")) else "",
@@ -333,8 +346,14 @@ def build_dashboard_and_candidates(df):
         if pd.notna(row.get("Short_B")) and row["LTP"] < row["Short_B"] and row.get("Short_Breach_Days", 999) <= 5:
             cand = {
                 "Symbol": row["Symbol"],
-                "LTP": row["LTP"],
                 "% Change": row["% Change"],
+                "Support-3": r_dict.get("Support-3", "-"),
+                "Support-2": r_dict.get("Support-2", "-"),
+                "Support-1": r_dict.get("Support-1", "-"),
+                "LTP": row["LTP"],
+                "Resistance-1": r_dict.get("Resistance-1", "-"),
+                "Resistance-2": r_dict.get("Resistance-2", "-"),
+                "Resistance-3": r_dict.get("Resistance-3", "-"),
                 "Climax_Date": row["Short_D"],
                 "Climax_Range (T/B)": format_tb_pair(row["LTP"], row["Short_T"], row["Short_B"]),
                 "Climax_Volume": f"{int(row['Short_V']):,}" if pd.notna(row.get("Short_V")) else "",
