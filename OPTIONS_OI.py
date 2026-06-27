@@ -168,122 +168,123 @@ def get_history(fyers, symbol, res, days):
         return None
 
 def scan_fno_universe(fyers):
-    LOOKBACK_DAYS = 90
-    POOL_SIZE = 20
-    DEDUPE_PCT = 0.005
+    base_lookback = 90
+    max_lookback = 150
+    step = 30
+    dedupe_pct = 0.005
     rows = []
 
     for sym in cfg.index_symbols:
-        daily = get_history(fyers, sym, "D", LOOKBACK_DAYS)
-        if daily is None or daily.empty or len(daily) < 5:
-            continue
+        final_row = None
 
-        today = datetime.now()
-        ltp = float(daily["close"].iloc[-1])
-        prev_close = float(daily["close"].iloc[-2])
-        pct_ch = ((ltp - prev_close) / prev_close) * 100
+        for lookback_days in range(base_lookback, max_lookback + 1, step):
+            daily = get_history(fyers, sym, "D", lookback_days)
+            if daily is None or daily.empty or len(daily) < 5:
+                continue
 
-        work = daily.sort_values(["volume", "high"], ascending=[False, False]).reset_index(drop=True)
-        candidates = []
+            today = datetime.now()
+            ltp = float(daily["close"].iloc[-1])
+            prev_close = float(daily["close"].iloc[-2])
+            pct_ch = ((ltp - prev_close) / prev_close) * 100
 
-        for _, c in work.iterrows():
-            top_band = float(c["high"])
-            bot_band = float(c["low"])
-            mid_band = (top_band + bot_band) / 2.0
-            keep = True
+            work = daily.sort_values(["volume", "high"], ascending=[False, False]).reset_index(drop=True)
+            candidates = []
 
-            for s in candidates:
-                s_mid = (s["top"] + s["bottom"]) / 2.0
-                mid_close = abs(mid_band - s_mid) / max(abs(ltp), 1.0) <= DEDUPE_PCT
-                overlap = not (top_band < s["bottom"] or bot_band > s["top"])
-                if mid_close or overlap:
-                    keep = False
-                    break
+            for _, c in work.iterrows():
+                top_band = float(c["high"])
+                bot_band = float(c["low"])
+                mid_band = (top_band + bot_band) / 2.0
+                keep = True
 
-            if keep:
-                candidates.append({
-                    "top": top_band,
-                    "bottom": bot_band,
-                    "date": str(pd.to_datetime(c["timestamp"]).date()),
-                    "volume": float(c["volume"]),
-                })
+                for s in candidates:
+                    s_mid = (s["top"] + s["bottom"]) / 2.0
+                    mid_close = abs(mid_band - s_mid) / max(abs(ltp), 1.0) <= dedupe_pct
+                    overlap = not (top_band < s["bottom"] or bot_band > s["top"])
+                    if mid_close or overlap:
+                        keep = False
+                        break
 
-            if len(candidates) >= POOL_SIZE:
+                if keep:
+                    candidates.append({
+                        "top": top_band,
+                        "bottom": bot_band,
+                        "date": str(pd.to_datetime(c["timestamp"]).date()),
+                        "volume": float(c["volume"]),
+                    })
+
+            if not candidates:
+                continue
+
+            bands = pd.DataFrame(candidates)
+            supports = bands[bands["top"] < ltp].copy()
+            resistances = bands[bands["bottom"] > ltp].copy()
+            current_zone = bands[(bands["bottom"] <= ltp) & (bands["top"] >= ltp)].copy()
+
+            supports["sort_key"] = supports["top"]
+            supports = supports.sort_values("sort_key", ascending=False).head(3).reset_index(drop=True)
+
+            resistances["sort_key"] = resistances["bottom"]
+            resistances = resistances.sort_values("sort_key", ascending=True).head(3).reset_index(drop=True)
+
+            row: Dict = {"Symbol": sym, "LTP": ltp, "% Change": pct_ch, "Lookback_Used": lookback_days}
+
+            for i in range(3):
+                if i < len(supports):
+                    s = supports.iloc[i]
+                    row[f"SUP_T_{i+1}"] = float(s["top"])
+                    row[f"SUP_B_{i+1}"] = float(s["bottom"])
+                    row[f"SUP_D_{i+1}"] = str(s["date"])
+                    row[f"SUP_V_{i+1}"] = float(s["volume"])
+                else:
+                    row[f"SUP_T_{i+1}"] = np.nan
+                    row[f"SUP_B_{i+1}"] = np.nan
+                    row[f"SUP_D_{i+1}"] = ""
+                    row[f"SUP_V_{i+1}"] = np.nan
+
+                if i < len(resistances):
+                    r = resistances.iloc[i]
+                    row[f"RES_T_{i+1}"] = float(r["top"])
+                    row[f"RES_B_{i+1}"] = float(r["bottom"])
+                    row[f"RES_D_{i+1}"] = str(r["date"])
+                    row[f"RES_V_{i+1}"] = float(r["volume"])
+                else:
+                    row[f"RES_T_{i+1}"] = np.nan
+                    row[f"RES_B_{i+1}"] = np.nan
+                    row[f"RES_D_{i+1}"] = ""
+                    row[f"RES_V_{i+1}"] = np.nan
+
+            if len(resistances) > 0:
+                top_band = float(resistances.iloc[0]["top"])
+                below = daily[daily["close"] <= top_band]
+                row["Long_T"] = top_band
+                row["Long_B"] = float(resistances.iloc[0]["bottom"])
+                row["Long_D"] = str(resistances.iloc[0]["date"])
+                row["Long_V"] = float(resistances.iloc[0]["volume"])
+                row["Long_Breach_Days"] = (today - below.iloc[-1]["timestamp"]).days if (ltp > top_band and not below.empty) else 999
+            else:
+                row["Long_T"] = row["Long_B"] = row["Long_V"] = np.nan
+                row["Long_D"] = ""
+                row["Long_Breach_Days"] = 999
+
+            if len(supports) > 0:
+                bot_band = float(supports.iloc[0]["bottom"])
+                above = daily[daily["close"] >= bot_band]
+                row["Short_T"] = float(supports.iloc[0]["top"])
+                row["Short_B"] = bot_band
+                row["Short_D"] = str(supports.iloc[0]["date"])
+                row["Short_V"] = float(supports.iloc[0]["volume"])
+                row["Short_Breach_Days"] = (today - above.iloc[-1]["timestamp"]).days if (ltp < bot_band and not above.empty) else 999
+            else:
+                row["Short_T"] = row["Short_B"] = row["Short_V"] = np.nan
+                row["Short_D"] = ""
+                row["Short_Breach_Days"] = 999
+
+            final_row = row
+            if len(supports) >= 3 and len(resistances) >= 3:
                 break
 
-        if not candidates:
-            continue
-
-        bands = pd.DataFrame(candidates)
-
-        # Strict separation:
-        # support  => full band below LTP
-        # resistance => full band above LTP
-        # overlapping/current zone => contains LTP, excluded from both
-        supports = bands[bands["top"] < ltp].copy()
-        resistances = bands[bands["bottom"] > ltp].copy()
-        current_zone = bands[(bands["bottom"] <= ltp) & (bands["top"] >= ltp)].copy()
-
-        supports["sort_key"] = supports["top"]
-        supports = supports.sort_values("sort_key", ascending=False).head(3).reset_index(drop=True)
-
-        resistances["sort_key"] = resistances["bottom"]
-        resistances = resistances.sort_values("sort_key", ascending=True).head(3).reset_index(drop=True)
-
-        row: Dict = {"Symbol": sym, "LTP": ltp, "% Change": pct_ch}
-
-        for i in range(3):
-            if i < len(supports):
-                s = supports.iloc[i]
-                row[f"SUP_T_{i+1}"] = float(s["top"])
-                row[f"SUP_B_{i+1}"] = float(s["bottom"])
-                row[f"SUP_D_{i+1}"] = str(s["date"])
-                row[f"SUP_V_{i+1}"] = float(s["volume"])
-            else:
-                row[f"SUP_T_{i+1}"] = np.nan
-                row[f"SUP_B_{i+1}"] = np.nan
-                row[f"SUP_D_{i+1}"] = ""
-                row[f"SUP_V_{i+1}"] = np.nan
-
-            if i < len(resistances):
-                r = resistances.iloc[i]
-                row[f"RES_T_{i+1}"] = float(r["top"])
-                row[f"RES_B_{i+1}"] = float(r["bottom"])
-                row[f"RES_D_{i+1}"] = str(r["date"])
-                row[f"RES_V_{i+1}"] = float(r["volume"])
-            else:
-                row[f"RES_T_{i+1}"] = np.nan
-                row[f"RES_B_{i+1}"] = np.nan
-                row[f"RES_D_{i+1}"] = ""
-                row[f"RES_V_{i+1}"] = np.nan
-
-        if len(resistances) > 0:
-            top_band = float(resistances.iloc[0]["top"])
-            below = daily[daily["close"] <= top_band]
-            row["Long_T"] = top_band
-            row["Long_B"] = float(resistances.iloc[0]["bottom"])
-            row["Long_D"] = str(resistances.iloc[0]["date"])
-            row["Long_V"] = float(resistances.iloc[0]["volume"])
-            row["Long_Breach_Days"] = (today - below.iloc[-1]["timestamp"]).days if (ltp > top_band and not below.empty) else 999
-        else:
-            row["Long_T"] = row["Long_B"] = row["Long_V"] = np.nan
-            row["Long_D"] = ""
-            row["Long_Breach_Days"] = 999
-
-        if len(supports) > 0:
-            bot_band = float(supports.iloc[0]["bottom"])
-            above = daily[daily["close"] >= bot_band]
-            row["Short_T"] = float(supports.iloc[0]["top"])
-            row["Short_B"] = bot_band
-            row["Short_D"] = str(supports.iloc[0]["date"])
-            row["Short_V"] = float(supports.iloc[0]["volume"])
-            row["Short_Breach_Days"] = (today - above.iloc[-1]["timestamp"]).days if (ltp < bot_band and not above.empty) else 999
-        else:
-            row["Short_T"] = row["Short_B"] = row["Short_V"] = np.nan
-            row["Short_D"] = ""
-            row["Short_Breach_Days"] = 999
-
-        rows.append(row)
+        if final_row is not None:
+            rows.append(final_row)
 
     return pd.DataFrame(rows)
 
@@ -323,7 +324,9 @@ def build_dashboard_and_candidates(df):
             r_dict[f"Resistance-{i}"] = format_tb_pair(row["LTP"], row.get(f"RES_T_{i}"), row.get(f"RES_B_{i}")) if pd.notna(row.get(f"RES_T_{i}")) else "-"
         dashboard_rows.append(r_dict.copy())
 
-        if pd.notna(row.get("Long_T")) and row["LTP"] > row["Long_T"] and row.get("Long_Breach_Days", 999) <= 5:
+        tol_pct = 0.25 / 100.0
+        res_b1 = row.get("RES_B_1")
+        if pd.notna(res_b1) and abs(row["LTP"] - res_b1) / max(row["LTP"], 1.0) <= tol_pct:
             cand = {
                 "Symbol": row["Symbol"],
                 "% Change": row["% Change"],
@@ -334,16 +337,18 @@ def build_dashboard_and_candidates(df):
                 "Resistance-1": r_dict.get("Resistance-1", "-"),
                 "Resistance-2": r_dict.get("Resistance-2", "-"),
                 "Resistance-3": r_dict.get("Resistance-3", "-"),
-                "Climax_Date": row["Long_D"],
-                "Climax_Range (T/B)": format_tb_pair(row["LTP"], row["Long_T"], row["Long_B"]),
+                "Climax_Date": row.get("Long_D", ""),
+                "Climax_Range (T/B)": format_tb_pair(row["LTP"], row.get("Long_T", res_b1), row.get("Long_B", res_b1)),
                 "Climax_Volume": f"{int(row['Long_V']):,}" if pd.notna(row.get("Long_V")) else "",
-                "Breach_Days": row["Long_Breach_Days"],
-                "Signal_Type": "Long Breakout",
+                "Breach_Days": row.get("Long_Breach_Days", 999),
+                "Signal_Type": "Long Resistance Test",
             }
             _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "long")
             valid_long.append(cand)
 
-        if pd.notna(row.get("Short_B")) and row["LTP"] < row["Short_B"] and row.get("Short_Breach_Days", 999) <= 5:
+        tol_pct = 0.25 / 100.0
+        sup_t1 = row.get("SUP_T_1")
+        if pd.notna(sup_t1) and abs(row["LTP"] - sup_t1) / max(row["LTP"], 1.0) <= tol_pct:
             cand = {
                 "Symbol": row["Symbol"],
                 "% Change": row["% Change"],
@@ -354,11 +359,11 @@ def build_dashboard_and_candidates(df):
                 "Resistance-1": r_dict.get("Resistance-1", "-"),
                 "Resistance-2": r_dict.get("Resistance-2", "-"),
                 "Resistance-3": r_dict.get("Resistance-3", "-"),
-                "Climax_Date": row["Short_D"],
-                "Climax_Range (T/B)": format_tb_pair(row["LTP"], row["Short_T"], row["Short_B"]),
+                "Climax_Date": row.get("Short_D", ""),
+                "Climax_Range (T/B)": format_tb_pair(row["LTP"], row.get("Short_T", sup_t1), row.get("Short_B", sup_t1)),
                 "Climax_Volume": f"{int(row['Short_V']):,}" if pd.notna(row.get("Short_V")) else "",
-                "Breach_Days": row["Short_Breach_Days"],
-                "Signal_Type": "Short Breakdown",
+                "Breach_Days": row.get("Short_Breach_Days", 999),
+                "Signal_Type": "Short Support Test",
             }
             _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "short")
             valid_short.append(cand)
