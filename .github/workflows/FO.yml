@@ -42,4 +42,4 @@ jobs:
       
 
       - name: Send CE/PE Momentum Buy Email
-        run: FO.py
+        run: python FO.py
