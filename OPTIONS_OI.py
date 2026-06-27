@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FO_FNO_FYERS_VOL_REL_EMAIL.py - Final Gap-Free Dark Theme Master
+FO_FNO_FYERS_VOL_REL_EMAIL.py - Final Gap-Free Dark Theme Master with Compact UI
 """
 
 import os
@@ -38,8 +38,16 @@ class Config:
 
 cfg = Config()
 
-EMAIL_DISPLAY_COLS = ["Symbol", "LTP", "% Change", "Signal_Type", "Timeframe", "Top_Band", "Bottom_Band", "Climax_Date", "ATM_Strike", "Option_Contracts"]
-EMAIL_OPT_COLS = ["Symbol", "LTP", "% Change", "Signal_Type", "Timeframe", "Top_Band", "Bottom_Band", "Climax_Date", "Breach_Days"]
+EMAIL_DISPLAY_COLS = [
+    "Symbol", "LTP", "Trigger_TF", 
+    "1-Week (T/B)", "1-Month (T/B)", 
+    "3-Month (T/B)", "6-Month (T/B)", 
+    "Options_Data"
+]
+EMAIL_OPT_COLS = [
+    "Symbol", "LTP", "% Change", "Signal_Type", 
+    "Climax_Date", "Climax_Range (T/B)", "Breach_Days"
+]
 
 # Logger Setup
 logger = logging.getLogger()
@@ -54,12 +62,38 @@ warnings.filterwarnings("ignore")
 # HELPERS
 # ==========================================
 
+def format_tb_pair(ltp, top, bottom):
+    """Formats the Top/Bottom pair and highlights breached levels."""
+    if pd.isna(top) or pd.isna(bottom): return "-"
+    
+    t_str, b_str, ltp_val = f"{float(top):.2f}", f"{float(bottom):.2f}", float(ltp)
+    
+    # Highlight Top Band if LTP broke above it (Neon Green)
+    if ltp_val > float(top): 
+        t_str = f"<span style='color: #4ade80; font-weight: bold;'>{t_str}</span>"
+        
+    # Highlight Bottom Band if LTP broke below it (Coral Red)
+    if ltp_val < float(bottom): 
+        b_str = f"<span style='color: #f87171; font-weight: bold;'>{b_str}</span>"
+        
+    # Combine with a muted slash
+    return f"{t_str} <span style='color: #64748b;'>/</span> {b_str}"
+
 def format_value(col, val):
     if pd.isna(val) or val in [float("inf"), float("-inf")]: return ""
-    if col in ["Timeframe", "Signal_Type", "Option_Contracts", "Climax_Date"]: return str(val)
+    
+    # NEW: Let our custom HTML columns pass through untouched
+    if "(T/B)" in col or col == "Options_Data": 
+        return str(val)
+        
+    if col in ["Trigger_TF", "Signal_Type", "Option_Contracts", "Climax_Date"]: return str(val)
     if col == "Breach_Days": return str(int(val)) if not pd.isna(val) else ""
     if col == "% Change": return f"{float(val):.2f}%"
-    if col in ["Top_Band", "Bottom_Band", "ATM_Strike"]: return f"{float(val):.2f}"
+    
+    # Catch any remaining standalone Top/Bottom/Strike columns dynamically
+    if col.startswith("T_") or col.startswith("B_") or col == "ATM_Strike": 
+        return f"{float(val):.2f}"
+        
     if isinstance(val, (int, float, np.integer, np.floating)): return f"{float(val):.4f}"
     return str(val)
 
@@ -208,16 +242,27 @@ def build_candidate_tables(df):
         for tf in ["6M", "3M", "1M", "1W"]:
             t, b, d, bd_l, bd_s = row.get(f"T_{tf}"), row.get(f"B_{tf}"), row.get(f"D_{tf}"), row.get(f"Days_L_{tf}"), row.get(f"Days_S_{tf}")
             r_dict = row.to_dict()
+            
+            # Pre-build the HTML formatting for all Timeframes
+            r_dict["1-Week (T/B)"] = format_tb_pair(row["LTP"], row.get("T_1W"), row.get("B_1W"))
+            r_dict["1-Month (T/B)"] = format_tb_pair(row["LTP"], row.get("T_1M"), row.get("B_1M"))
+            r_dict["3-Month (T/B)"] = format_tb_pair(row["LTP"], row.get("T_3M"), row.get("B_3M"))
+            r_dict["6-Month (T/B)"] = format_tb_pair(row["LTP"], row.get("T_6M"), row.get("B_6M"))
+            
+            # LONG SCENARIO
             if pd.notna(t) and row["LTP"] > t and bd_l <= 10:
                 strike, opt_str, opt_list = get_options_data(row["Symbol"], row["LTP"], "long")
-                r_dict.update({"Timeframe": tf, "Top_Band": t, "Bottom_Band": b, "Climax_Date": d, "ATM_Strike": strike, "Option_Contracts": opt_str, "Target_Options": opt_list, "Breach_Days": bd_l, "Signal_Type": "Active Trend"})
+                r_dict.update({"Trigger_TF": tf, "Climax_Date": d, "Options_Data": f"<b>{strike:.2f} CE</b><br><span style='font-size: 11px; color: #94a3b8;'>{opt_str}</span>", "Target_Options": opt_list, "Breach_Days": bd_l, "Signal_Type": "Active Trend"})
                 valid_long.append(r_dict)
                 break
+                
+            # SHORT SCENARIO
             elif pd.notna(b) and row["LTP"] < b and bd_s <= 10:
                 strike, opt_str, opt_list = get_options_data(row["Symbol"], row["LTP"], "short")
-                r_dict.update({"Timeframe": tf, "Top_Band": t, "Bottom_Band": b, "Climax_Date": d, "ATM_Strike": strike, "Option_Contracts": opt_str, "Target_Options": opt_list, "Breach_Days": bd_s, "Signal_Type": "Active Trend"})
+                r_dict.update({"Trigger_TF": tf, "Climax_Date": d, "Options_Data": f"<b>{strike:.2f} PE</b><br><span style='font-size: 11px; color: #94a3b8;'>{opt_str}</span>", "Target_Options": opt_list, "Breach_Days": bd_s, "Signal_Type": "Active Trend"})
                 valid_short.append(r_dict)
                 break
+                
     long_df, short_df = pd.DataFrame(valid_long), pd.DataFrame(valid_short)
     if not long_df.empty and not short_df.empty:
         common = set(long_df["Symbol"]).intersection(set(short_df["Symbol"]))
@@ -236,8 +281,11 @@ def build_option_candidate_tables(df, spot_signal_map):
             r_dict = row.to_dict()
             spot_signal = spot_signal_map.get(get_underlying_spot(row["Symbol"]), "")
             r_dict["Signal_Type"] = "Holy Grail" if spot_signal == "Fresh Sweep" else "Active Trend"
-            r_dict["Timeframe"], r_dict["Top_Band"], r_dict["Bottom_Band"], r_dict["Climax_Date"], r_dict["Breach_Days"] = "LOC", t, b, d, bd
+            r_dict["Climax_Date"] = d
+            r_dict["Breach_Days"] = bd
+            r_dict["Climax_Range (T/B)"] = format_tb_pair(row["LTP"], t, b)
             valid_rows.append(r_dict)
+            
     res = pd.DataFrame(valid_rows)
     if res.empty: return pd.DataFrame(), pd.DataFrame()
     return res[res["Symbol"].str.endswith("CE")], res[res["Symbol"].str.endswith("PE")]
@@ -303,3 +351,4 @@ def main():
     send_email(long_df, short_df, ce_df, pe_df, csv_f)
 
 if __name__ == "__main__": main()
+
