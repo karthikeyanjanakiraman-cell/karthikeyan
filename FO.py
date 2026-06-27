@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FO_FNO_FYERS_VOL_REL_EMAIL.py - High-Volume Support/Resistance F&O Stock Dashboard
+FO_FNO_FYERS_VOL_REL_EMAIL.py - High-Volume Support/Resistance F&O Dashboard
 """
 
 import os
@@ -25,25 +25,17 @@ from email.mime.base import MIMEBase
 from email import encoders
 
 def get_dynamic_fno_universe():
-    """
-    Downloads the Fyers NSE F&O Symbol Master, extracts all unique underlying 
-    stock tickers using regex, and formats them for the spot market scanner.
-    """
     url = "https://public.fyers.in/sym_details/NSE_FO.csv"
     try:
         response = requests.get(url, timeout=15)
         response.raise_for_status()
-        # Matches standard monthly F&O symbols: NSE:<TICKER><YY><MMM>...
         pattern = re.compile(r"NSE:([A-Z0-9&\-]+)\d{2}[A-Z]{3}")
         matches = set(pattern.findall(response.text))
-        
-        # Exclude specific market index identifiers to leave equity tokens only
         indices = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
         fno_stocks = [f"NSE:{t}-EQ" for t in matches if t not in indices]
         return sorted(fno_stocks)
     except Exception:
-        # Robust fallback array in case endpoint times out
-        return ["NSE:RELIANCE-EQ", "NSE:HDFCBANK-EQ", "NSE:INFY-EQ", "NSE:TCS-EQ"]
+        return ["NSE:RELIANCE-EQ", "NSE:HDFCBANK-EQ", "NSE:INFY-EQ"]
 
 class Config:
     def __init__(self):
@@ -54,8 +46,9 @@ class Config:
         self.sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
         self.sender_password = os.environ.get("SENDER_PASSWORD", "password")
         self.recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
-        # Populated dynamically via Fyers Master File
-        self.index_symbols = get_dynamic_fno_universe()
+        
+        fno_stocks = get_dynamic_fno_universe()
+        self.index_symbols = ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX", "BSE:SENSEX-INDEX"] + fno_stocks
 
 cfg = Config()
 
@@ -100,12 +93,7 @@ def format_tb_pair(ltp, top, bottom):
 def format_value(col, val):
     if pd.isna(val) or val in [float("inf"), float("-inf")]:
         return ""
-    if "(T/B)" in col or col in EMAIL_DISPLAY_COLS:
-        return str(val)
-    if col in ["Signal_Type", "Option_Contracts", "Climax_Date"]:
-        return str(val)
-    if col == "Breach_Days":
-        return str(int(val)) if not pd.isna(val) else ""
+    # FIX: Lock to 2 decimals first to prevent bypass
     if col == "% Change":
         try:
             return f"{float(val):.2f}%"
@@ -116,27 +104,36 @@ def format_value(col, val):
             return f"{float(val):.2f}"
         except (TypeError, ValueError):
             return ""
+            
+    if "(T/B)" in col or "Support" in col or "Resistance" in col:
+        return str(val)
+    if col in ["Signal_Type", "Option_Contracts", "Climax_Date", "Symbol"]:
+        return str(val)
+    if col == "Breach_Days":
+        return str(int(val)) if not pd.isna(val) else ""
     if isinstance(val, (int, float, np.integer, np.floating)):
         return f"{float(val):.4f}"
     return str(val)
 
 def get_symbol_meta(symbol, ltp):
-    """Calculates strike price steps dynamically based on stock spot pricing tiers."""
     exch = symbol.split(":")[0]
     base_name = symbol.split(":")[1].split("-")[0]
-    
     if ltp < 150: interval = 1
     elif ltp < 500: interval = 5
     elif ltp < 2000: interval = 10
     elif ltp < 5000: interval = 50
     else: interval = 100
-    
+    if "NIFTY50" in symbol: interval = 50
+    if "NIFTYBANK" in symbol: interval = 100
+    if "SENSEX" in symbol: interval = 100
     return exch, base_name, interval
 
 def get_underlying_spot(opt_symbol):
+    if "BANKNIFTY" in opt_symbol: return "NSE:NIFTYBANK-INDEX"
+    if "NIFTY" in opt_symbol: return "NSE:NIFTY50-INDEX"
+    if "SENSEX" in opt_symbol: return "BSE:SENSEX-INDEX"
     match = re.match(r"^([A-Z0-9&\-]+)\d+", opt_symbol.split(":")[1])
-    if match:
-        return f"NSE:{match.group(1)}-EQ"
+    if match: return f"NSE:{match.group(1)}-EQ"
     return opt_symbol
 
 def get_expiry_details(symbol):
@@ -145,24 +142,29 @@ def get_expiry_details(symbol):
         last = calendar.monthrange(y, m)[1]
         d = datetime(y, m, last).date()
         return d - timedelta(days=(d.weekday() - 3) % 7)
-    
-    # Equity derivatives explicitly trade on monthly option cycles expiring on the last Thursday
-    expiry = last_thu(today.year, today.month)
-    if today > expiry:
-        m = today.month + 1 if today.month < 12 else 1
-        y = today.year if today.month < 12 else today.year + 1
-        expiry = last_thu(y, m)
-    return True, expiry
+    if "-EQ" in symbol or "NIFTYBANK" in symbol:
+        expiry = last_thu(today.year, today.month)
+        if today > expiry:
+            m = today.month + 1 if today.month < 12 else 1
+            y = today.year if today.month < 12 else today.year + 1
+            expiry = last_thu(y, m)
+        return True, expiry
+    exp_weekday = 3 if "NIFTY" in symbol else 4
+    days_ahead = (exp_weekday - today.weekday()) % 7
+    if days_ahead == 0: days_ahead = 7
+    return False, today + timedelta(days=days_ahead)
 
 def get_options_data(symbol, ltp, side):
     exch, base_name, interval = get_symbol_meta(symbol, ltp)
     atm_strike = int(round(ltp / interval) * interval)
     is_monthly, expiry = get_expiry_details(symbol)
-    yy = expiry.strftime("%y")
-    expiry_code = expiry.strftime("%b").upper()
+    yy = str(expiry.year)[-2:]
+    if is_monthly:
+        expiry_code = expiry.strftime("%b").upper()
+    else:
+        months = ['1','2','3','4','5','6','7','8','9','O','N','D']
+        expiry_code = f"{months[expiry.month-1]}{expiry.strftime('%d')}"
     opt_type = "CE" if side == "long" else "PE"
-    
-    # Restrict slice width down to 11 strikes to avoid exceeding network request rates on ~185 assets
     strikes = [atm_strike + (i * interval) for i in range(-5, 6)]
     symbols = [f"{exch}:{base_name}{yy}{expiry_code}{s}{opt_type}" for s in strikes]
     desc = f"11 {opt_type} Contracts (Strikes: {strikes[0]:.2f} to {strikes[-1]:.2f})"
@@ -202,14 +204,9 @@ def scan_fno_universe(fyers):
     dedupe_pct = 0.005
     rows = []
 
-    logger.info(f"Scanning {len(cfg.index_symbols)} F&O Equity Spot Charts...")
-    for idx, sym in enumerate(cfg.index_symbols):
-        if idx % 25 == 0 and idx > 0:
-            logger.info(f"Progress Status: Scanned {idx}/{len(cfg.index_symbols)} symbols...")
-            
-        # Pacing throttle to stay clear of server-side rate drops
-        time.sleep(0.1)
+    for sym in cfg.index_symbols:
         final_row = None
+        time.sleep(0.1) 
 
         for lookback_days in range(base_lookback, max_lookback + 1, step):
             daily = get_history(fyers, sym, "D", lookback_days)
@@ -324,9 +321,8 @@ def scan_fno_universe(fyers):
 
 def scan_options_universe(fyers, symbols):
     rows = []
-    symbols = list(set(symbols))
     for sym in symbols:
-        time.sleep(0.05) # Local safety delay inside specific option iterations
+        time.sleep(0.05)
         daily = get_history(fyers, sym, "D", 60)
         if daily is None or daily.empty or len(daily) < 2:
             continue
@@ -351,6 +347,14 @@ def scan_options_universe(fyers, symbols):
         })
     return pd.DataFrame(rows)
 
+def get_days_ago(date_str):
+    if not date_str or pd.isna(date_str):
+        return 999
+    try:
+        return (datetime.now().date() - pd.to_datetime(date_str).date()).days
+    except:
+        return 999
+
 def build_dashboard_and_candidates(df):
     dashboard_rows, valid_long, valid_short = [], [], []
     for _, row in df.iterrows():
@@ -358,51 +362,69 @@ def build_dashboard_and_candidates(df):
         for i in range(1, 4):
             r_dict[f"Support-{i}"] = format_tb_pair(row["LTP"], row.get(f"SUP_T_{i}"), row.get(f"SUP_B_{i}")) if pd.notna(row.get(f"SUP_T_{i}")) else "-"
             r_dict[f"Resistance-{i}"] = format_tb_pair(row["LTP"], row.get(f"RES_T_{i}"), row.get(f"RES_B_{i}")) if pd.notna(row.get(f"RES_T_{i}")) else "-"
-        dashboard_rows.append(r_dict.copy())
-
+        
+        is_active_candidate = False
         tol_pct = 0.25 / 100.0
+        
+        # --- LONG CHECK ---
         res_b1 = row.get("RES_B_1")
+        long_breach = row.get("Long_Breach_Days", 999)
+        long_climax_age = get_days_ago(row.get("Long_D"))
+        
         if pd.notna(res_b1) and abs(row["LTP"] - res_b1) / max(row["LTP"], 1.0) <= tol_pct:
-            cand = {
-                "Symbol": row["Symbol"],
-                "% Change": row["% Change"],
-                "Support-3": r_dict.get("Support-3", "-"),
-                "Support-2": r_dict.get("Support-2", "-"),
-                "Support-1": r_dict.get("Support-1", "-"),
-                "LTP": row["LTP"],
-                "Resistance-1": r_dict.get("Resistance-1", "-"),
-                "Resistance-2": r_dict.get("Resistance-2", "-"),
-                "Resistance-3": r_dict.get("Resistance-3", "-"),
-                "Climax_Date": row.get("Long_D", ""),
-                "Climax_Range (T/B)": format_tb_pair(row["LTP"], row.get("Long_T", res_b1), row.get("Long_B", res_b1)),
-                "Climax_Volume": f"{int(row['Long_V']):,}" if pd.notna(row.get("Long_V")) else "",
-                "Breach_Days": row.get("Long_Breach_Days", 999),
-                "Signal_Type": "Long Resistance Test",
-            }
-            _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "long")
-            valid_long.append(cand)
+            # FIX: Only trigger if the Breach OR the Climax Date is 5 days or less
+            if long_breach <= 5 or long_climax_age <= 5:
+                cand = {
+                    "Symbol": row["Symbol"],
+                    "% Change": row["% Change"],
+                    "Support-3": r_dict.get("Support-3", "-"),
+                    "Support-2": r_dict.get("Support-2", "-"),
+                    "Support-1": r_dict.get("Support-1", "-"),
+                    "LTP": row["LTP"],
+                    "Resistance-1": r_dict.get("Resistance-1", "-"),
+                    "Resistance-2": r_dict.get("Resistance-2", "-"),
+                    "Resistance-3": r_dict.get("Resistance-3", "-"),
+                    "Climax_Date": row.get("Long_D", ""),
+                    "Climax_Range (T/B)": format_tb_pair(row["LTP"], row.get("Long_T", res_b1), row.get("Long_B", res_b1)),
+                    "Climax_Volume": f"{int(row['Long_V']):,}" if pd.notna(row.get("Long_V")) else "",
+                    "Breach_Days": long_breach,
+                    "Signal_Type": "Long Resistance Test",
+                }
+                _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "long")
+                valid_long.append(cand)
+                is_active_candidate = True
 
-        tol_pct = 0.25 / 100.0
+        # --- SHORT CHECK ---
         sup_t1 = row.get("SUP_T_1")
+        short_breach = row.get("Short_Breach_Days", 999)
+        short_climax_age = get_days_ago(row.get("Short_D"))
+        
         if pd.notna(sup_t1) and abs(row["LTP"] - sup_t1) / max(row["LTP"], 1.0) <= tol_pct:
-            cand = {
-                "Symbol": row["Symbol"],
-                "% Change": row["% Change"],
-                "Support-3": r_dict.get("Support-3", "-"),
-                "Support-2": r_dict.get("Support-2", "-"),
-                "Support-1": r_dict.get("Support-1", "-"),
-                "LTP": row["LTP"],
-                "Resistance-1": r_dict.get("Resistance-1", "-"),
-                "Resistance-2": r_dict.get("Resistance-2", "-"),
-                "Resistance-3": r_dict.get("Resistance-3", "-"),
-                "Climax_Date": row.get("Short_D", ""),
-                "Climax_Range (T/B)": format_tb_pair(row["LTP"], row.get("Short_T", sup_t1), row.get("Short_B", sup_t1)),
-                "Climax_Volume": f"{int(row['Short_V']):,}" if pd.notna(row.get("Short_V")) else "",
-                "Breach_Days": row.get("Short_Breach_Days", 999),
-                "Signal_Type": "Short Support Test",
-            }
-            _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "short")
-            valid_short.append(cand)
+            # FIX: Only trigger if the Breach OR the Climax Date is 5 days or less
+            if short_breach <= 5 or short_climax_age <= 5:
+                cand = {
+                    "Symbol": row["Symbol"],
+                    "% Change": row["% Change"],
+                    "Support-3": r_dict.get("Support-3", "-"),
+                    "Support-2": r_dict.get("Support-2", "-"),
+                    "Support-1": r_dict.get("Support-1", "-"),
+                    "LTP": row["LTP"],
+                    "Resistance-1": r_dict.get("Resistance-1", "-"),
+                    "Resistance-2": r_dict.get("Resistance-2", "-"),
+                    "Resistance-3": r_dict.get("Resistance-3", "-"),
+                    "Climax_Date": row.get("Short_D", ""),
+                    "Climax_Range (T/B)": format_tb_pair(row["LTP"], row.get("Short_T", sup_t1), row.get("Short_B", sup_t1)),
+                    "Climax_Volume": f"{int(row['Short_V']):,}" if pd.notna(row.get("Short_V")) else "",
+                    "Breach_Days": short_breach,
+                    "Signal_Type": "Short Support Test",
+                }
+                _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "short")
+                valid_short.append(cand)
+                is_active_candidate = True
+
+        # FIX: The general Dashboard will ONLY include stocks that passed the active 5-day checks above
+        if is_active_candidate:
+            dashboard_rows.append(r_dict.copy())
 
     return pd.DataFrame(dashboard_rows), pd.DataFrame(valid_long), pd.DataFrame(valid_short)
 
@@ -412,7 +434,10 @@ def build_option_candidate_tables(df, spot_signal_map):
     valid_rows = []
     for _, row in df.iterrows():
         t, b, d, bd = row.get("T_LOC"), row.get("B_LOC"), row.get("D_LOC"), row.get("Days_L_LOC")
-        if pd.notna(t) and row["LTP"] > t and bd <= 10:
+        climax_age = get_days_ago(d)
+        
+        # FIX: Options forced strictly to <= 5 days
+        if pd.notna(t) and row["LTP"] > t and (bd <= 5 or climax_age <= 5):
             r_dict = row.to_dict()
             spot_signal = spot_signal_map.get(get_underlying_spot(row["Symbol"]), "")
             r_dict["Signal_Type"] = "Holy Grail" if spot_signal == "Fresh Sweep" else "Active Trend"
@@ -427,7 +452,7 @@ def build_option_candidate_tables(df, spot_signal_map):
 
 def build_html_table(df, title, cols):
     if df.empty:
-        return f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top: 25px;'>{title}</h3><p style='color:#94a3b8; font-family:sans-serif;'>No candidates.</p>"
+        return f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top: 25px;'>{title}</h3><p style='color:#94a3b8; font-family:sans-serif;'>No candidates within 5 days.</p>"
     table_html = f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top: 25px;'>{title}</h3><table style='border-collapse: collapse; width: 100%; font-family: sans-serif; font-size: 13px; text-align: left; background-color: #0f172a;'>"
     table_html += "<tr style='background-color: #1e293b; color: #f1f5f9;'>" + "".join([f"<th style='padding: 10px; border: 1px solid #334155;'>{c}</th>" for c in cols]) + "</tr>"
     for i, (_, row) in enumerate(df.iterrows()):
@@ -444,7 +469,7 @@ def build_html_table(df, title, cols):
             style = "padding: 8px; border: 1px solid #334155;"
             if c == "% Change":
                 try:
-                    fval = float(val)
+                    fval = float(str(val).replace('%', ''))
                     style += " color: #4ade80; font-weight: bold;" if fval > 0 else " color: #f87171; font-weight: bold;"
                 except (TypeError, ValueError):
                     pass
@@ -466,7 +491,7 @@ def send_email(dashboard_df, long_df, short_df, ce_df, pe_df, csv_file):
         msg["Subject"] = f"F&O Market Climax Dashboard - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         html = (
             "<body style='background-color: #030712; padding: 20px; font-family: sans-serif;'>"
-            + build_html_table(dashboard_df, "Market Dashboard", EMAIL_DISPLAY_COLS)
+            + build_html_table(dashboard_df, "Market Dashboard (Active Signals Only)", EMAIL_DISPLAY_COLS)
             + build_html_table(long_df, "Long Strategy Matrix", EMAIL_CAND_COLS)
             + build_html_table(short_df, "Short Strategy Matrix", EMAIL_CAND_COLS)
             + build_html_table(ce_df, "Call Options (CE) Climax Verification", EMAIL_OPT_COLS)
