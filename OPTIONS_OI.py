@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FO_FNO_FYERS_VOL_REL_EMAIL.py - Comprehensive Calendar-Based Index Dashboard
+FO_FNO_FYERS_VOL_REL_EMAIL.py - High-Volume Support/Resistance Index Dashboard
 """
 
 import os
@@ -9,7 +9,7 @@ import logging
 import warnings
 import calendar
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional, Tuple
+from typing import Dict
 
 import numpy as np
 import pandas as pd
@@ -20,10 +20,6 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
-
-# ==========================================
-# CONFIGURATION
-# ==========================================
 
 class Config:
     def __init__(self):
@@ -38,14 +34,12 @@ class Config:
 
 cfg = Config()
 
-# Top-5 volume climax levels â€” compact: one "Level-N" column per level
-# Each cell shows:  DATE  |  Top / Bottom  (vol)
 EMAIL_DISPLAY_COLS = [
     "Symbol", "LTP", "% Change",
-    "Level-1", "Level-2", "Level-3", "Level-4", "Level-5",
+    "Support-1", "Support-2", "Support-3",
+    "Resistance-1", "Resistance-2", "Resistance-3",
 ]
 
-# Candidate matrix columns (long / short)
 EMAIL_CAND_COLS = [
     "Symbol", "LTP", "% Change",
     "Climax_Date", "Climax_Range (T/B)",
@@ -57,7 +51,6 @@ EMAIL_OPT_COLS = [
     "Climax_Date", "Climax_Range (T/B)", "Breach_Days"
 ]
 
-# Logger Setup
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
 if logger.hasHandlers():
@@ -66,10 +59,6 @@ ch = logging.StreamHandler(sys.stdout)
 ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 logger.addHandler(ch)
 warnings.filterwarnings("ignore")
-
-# ==========================================
-# HELPERS
-# ==========================================
 
 def format_tb_pair(ltp, top, bottom):
     if pd.isna(top) or pd.isna(bottom):
@@ -84,20 +73,17 @@ def format_tb_pair(ltp, top, bottom):
 def format_value(col, val):
     if pd.isna(val) or val in [float("inf"), float("-inf")]:
         return ""
-    if "(T/B)" in col or col == "Options_Data":
+    if "(T/B)" in col or col in EMAIL_DISPLAY_COLS:
         return str(val)
-    if col in ["Trigger_TF", "Signal_Type", "Option_Contracts", "Climax_Date"]:
+    if col in ["Signal_Type", "Option_Contracts", "Climax_Date"]:
         return str(val)
     if col == "Breach_Days":
         return str(int(val)) if not pd.isna(val) else ""
     if col == "% Change":
         try:
-            fval = float(val)
+            return f"{float(val):.2f}%"
         except (TypeError, ValueError):
             return ""
-        return f"{fval:.2f}%"
-    if col.startswith("T_") or col.startswith("B_") or col == "ATM_Strike":
-        return f"{float(val):.2f}"
     if isinstance(val, (int, float, np.integer, np.floating)):
         return f"{float(val):.4f}"
     return str(val)
@@ -129,10 +115,8 @@ def get_expiry_details(symbol):
             y = today.year if today.month < 12 else today.year + 1
             expiry = last_thu(y, m)
         return True, expiry
-    # Weekly expiry (NIFTY=Thursday, SENSEX=Friday)
     exp_weekday = 3 if "NIFTY" in symbol else 4
     days_ahead = (exp_weekday - today.weekday()) % 7
-    # If today IS the expiry day, use next week's expiry (expired after market close)
     if days_ahead == 0:
         days_ahead = 7
     return False, today + timedelta(days=days_ahead)
@@ -148,10 +132,6 @@ def get_options_data(symbol, ltp, side):
     symbols = [f"{exch}:{base_name}{yy}{expiry_code}{s}{opt_type}" for s in strikes]
     desc = f"21 {opt_type} Contracts (Strikes: {strikes[0]:.2f} to {strikes[-1]:.2f})"
     return float(atm_strike), desc, symbols
-
-# ==========================================
-# CORE SCANNING ENGINE
-# ==========================================
 
 def init_fyers():
     try:
@@ -181,68 +161,118 @@ def get_history(fyers, symbol, res, days):
         return None
 
 def scan_fno_universe(fyers):
-    """
-    For each index, fetch 6 months of daily data.
-    Rank ALL candles by volume descending and keep the top 5.
-    Each top-5 candle becomes a 'climax level' (High = Top band, Low = Bottom band).
-    Also compute:
-      - Days since LTP last closed BELOW the band top  (bd_l)
-      - Days since LTP last closed ABOVE the band bot  (bd_s)
-    Sorted newestâ†’oldest within the top-5 by date (after volume ranking).
-    """
-    TOP_N = 5
+    LOOKBACK_DAYS = 90
+    POOL_SIZE = 20
+    DEDUPE_PCT = 0.005
     rows = []
 
     for sym in cfg.index_symbols:
-        daily = get_history(fyers, sym, "D", 90)   # ~6 months
-        if daily is None or daily.empty:
+        daily = get_history(fyers, sym, "D", LOOKBACK_DAYS)
+        if daily is None or daily.empty or len(daily) < 5:
             continue
 
-        today  = datetime.now()
-        ltp    = float(daily["close"].iloc[-1])
-        pct_ch = ((ltp - float(daily["close"].iloc[-2])) / float(daily["close"].iloc[-2]) * 100)
+        today = datetime.now()
+        ltp = float(daily["close"].iloc[-1])
+        prev_close = float(daily["close"].iloc[-2])
+        pct_ch = ((ltp - prev_close) / prev_close) * 100
 
-        # â”€â”€ Rank by volume, pick top N; then re-sort by proximity of band
-        #    to LTP (nearest band edge wins) so the most actionable level
-        #    always appears as Rank-1 in the email. â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        top_vol = daily.sort_values("volume", ascending=False).head(TOP_N).copy()
+        work = daily.sort_values(["volume", "high"], ascending=[False, False]).reset_index(drop=True)
+        candidates = []
 
-        # Proximity = min distance from LTP to either edge of the candle range
-        top_vol["_proximity"] = top_vol.apply(
-            lambda r: min(abs(ltp - r["high"]), abs(ltp - r["low"])), axis=1
-        )
-        ranked = top_vol.sort_values("_proximity", ascending=True).reset_index(drop=True)
+        for _, c in work.iterrows():
+            top_band = float(c["high"])
+            bot_band = float(c["low"])
+            mid_band = (top_band + bot_band) / 2.0
+            keep = True
+
+            for s in candidates:
+                s_mid = (s["top"] + s["bottom"]) / 2.0
+                mid_close = abs(mid_band - s_mid) / max(abs(ltp), 1.0) <= DEDUPE_PCT
+                overlap = not (top_band < s["bottom"] or bot_band > s["top"])
+                if mid_close or overlap:
+                    keep = False
+                    break
+
+            if keep:
+                candidates.append({
+                    "top": top_band,
+                    "bottom": bot_band,
+                    "date": str(pd.to_datetime(c["timestamp"]).date()),
+                    "volume": float(c["volume"]),
+                })
+
+            if len(candidates) >= POOL_SIZE:
+                break
+
+        if not candidates:
+            continue
+
+        bands = pd.DataFrame(candidates)
+        supports = bands[bands["bottom"] < ltp].copy()
+        resistances = bands[bands["top"] > ltp].copy()
+
+        supports["sort_key"] = supports["bottom"]
+        supports = supports.sort_values("sort_key", ascending=False).head(3).reset_index(drop=True)
+
+        resistances["sort_key"] = resistances["top"]
+        resistances = resistances.sort_values("sort_key", ascending=True).head(3).reset_index(drop=True)
 
         row: Dict = {"Symbol": sym, "LTP": ltp, "% Change": pct_ch}
 
-        for rank, (_, c) in enumerate(ranked.iterrows(), start=1):
-            top_band = float(c["high"])
-            bot_band = float(c["low"])
-            vol      = float(c["volume"])
-            date_str = str(c["timestamp"].date())
+        for i in range(3):
+            if i < len(supports):
+                s = supports.iloc[i]
+                row[f"SUP_T_{i+1}"] = float(s["top"])
+                row[f"SUP_B_{i+1}"] = float(s["bottom"])
+                row[f"SUP_D_{i+1}"] = str(s["date"])
+                row[f"SUP_V_{i+1}"] = float(s["volume"])
+            else:
+                row[f"SUP_T_{i+1}"] = np.nan
+                row[f"SUP_B_{i+1}"] = np.nan
+                row[f"SUP_D_{i+1}"] = ""
+                row[f"SUP_V_{i+1}"] = np.nan
 
-            row[f"T_R{rank}"]    = top_band
-            row[f"B_R{rank}"]    = bot_band
-            row[f"D_R{rank}"]    = date_str
-            row[f"Vol_R{rank}"]  = vol
+            if i < len(resistances):
+                r = resistances.iloc[i]
+                row[f"RES_T_{i+1}"] = float(r["top"])
+                row[f"RES_B_{i+1}"] = float(r["bottom"])
+                row[f"RES_D_{i+1}"] = str(r["date"])
+                row[f"RES_V_{i+1}"] = float(r["volume"])
+            else:
+                row[f"RES_T_{i+1}"] = np.nan
+                row[f"RES_B_{i+1}"] = np.nan
+                row[f"RES_D_{i+1}"] = ""
+                row[f"RES_V_{i+1}"] = np.nan
 
-            bd_l = bd_s = 999
-            if ltp > top_band:
-                below = daily[daily["close"] <= top_band]
-                if not below.empty:
-                    bd_l = (today - below.iloc[-1]["timestamp"]).days
-            if ltp < bot_band:
-                above = daily[daily["close"] >= bot_band]
-                if not above.empty:
-                    bd_s = (today - above.iloc[-1]["timestamp"]).days
+        if len(resistances) > 0:
+            top_band = float(resistances.iloc[0]["top"])
+            below = daily[daily["close"] <= top_band]
+            row["Long_T"] = top_band
+            row["Long_B"] = float(resistances.iloc[0]["bottom"])
+            row["Long_D"] = str(resistances.iloc[0]["date"])
+            row["Long_V"] = float(resistances.iloc[0]["volume"])
+            row["Long_Breach_Days"] = (today - below.iloc[-1]["timestamp"]).days if (ltp > top_band and not below.empty) else 999
+        else:
+            row["Long_T"] = row["Long_B"] = row["Long_V"] = np.nan
+            row["Long_D"] = ""
+            row["Long_Breach_Days"] = 999
 
-            row[f"BdL_R{rank}"] = bd_l
-            row[f"BdS_R{rank}"] = bd_s
+        if len(supports) > 0:
+            bot_band = float(supports.iloc[0]["bottom"])
+            above = daily[daily["close"] >= bot_band]
+            row["Short_T"] = float(supports.iloc[0]["top"])
+            row["Short_B"] = bot_band
+            row["Short_D"] = str(supports.iloc[0]["date"])
+            row["Short_V"] = float(supports.iloc[0]["volume"])
+            row["Short_Breach_Days"] = (today - above.iloc[-1]["timestamp"]).days if (ltp < bot_band and not above.empty) else 999
+        else:
+            row["Short_T"] = row["Short_B"] = row["Short_V"] = np.nan
+            row["Short_D"] = ""
+            row["Short_Breach_Days"] = 999
 
         rows.append(row)
 
     return pd.DataFrame(rows)
-
 
 def scan_options_universe(fyers, symbols):
     rows = []
@@ -272,78 +302,43 @@ def scan_options_universe(fyers, symbols):
     return pd.DataFrame(rows)
 
 def build_dashboard_and_candidates(df):
-    """
-    Build:
-      1) dashboard_df  â€” one row per symbol, showing all 5 climax levels
-      2) long_df       â€” symbols where LTP broke above a climax top (fresh, <=5 days)
-      3) short_df      â€” symbols where LTP broke below a climax bottom (fresh, <=5 days)
-    Signal fires on the HIGHEST-RANKED (largest volume) qualifying level.
-    """
     dashboard_rows, valid_long, valid_short = [], [], []
-
     for _, row in df.iterrows():
         r_dict = row.to_dict()
-
-        # â”€â”€ Format top-5 as T/B only â€” no date, no volume inside cell â”€â”€â”€â”€â”€â”€â”€â”€â”€
-        for rank in range(1, 6):
-            t = row.get(f"T_R{rank}")
-            b = row.get(f"B_R{rank}")
-            r_dict[f"Level-{rank}"] = format_tb_pair(row["LTP"], t, b) if pd.notna(t) and pd.notna(b) else "-"
-
-        # â”€â”€ Signal detection: scan rank-1 â†’ rank-5, first qualifying wins â”€â”€â”€â”€
-        active_rank   = None
-        trigger_side  = None
-        climax_date   = None
-        climax_top    = None
-        climax_bot    = None
-        climax_vol    = None
-        target_opts   = None
-
-        for rank in range(1, 6):
-            t    = row.get(f"T_R{rank}")
-            b    = row.get(f"B_R{rank}")
-            d    = row.get(f"D_R{rank}")
-            bd_l = row.get(f"BdL_R{rank}", 999)
-            bd_s = row.get(f"BdS_R{rank}", 999)
-            vol  = row.get(f"Vol_R{rank}")
-
-            if pd.notna(t) and row["LTP"] > t and bd_l <= 5:
-                active_rank  = rank
-                trigger_side = "long"
-                climax_date  = d
-                climax_top   = t
-                climax_bot   = b
-                climax_vol   = vol
-                _, _, target_opts = get_options_data(row["Symbol"], row["LTP"], "long")
-                break
-
-            if pd.notna(b) and row["LTP"] < b and bd_s <= 5:
-                active_rank  = rank
-                trigger_side = "short"
-                climax_date  = d
-                climax_top   = t
-                climax_bot   = b
-                climax_vol   = vol
-                _, _, target_opts = get_options_data(row["Symbol"], row["LTP"], "short")
-                break
-
-        r_dict["Signal_Type"]  = f"L{active_rank} Long" if (active_rank and trigger_side=="long") else (f"L{active_rank} Short" if active_rank else "")
+        for i in range(1, 4):
+            r_dict[f"Support-{i}"] = format_tb_pair(row["LTP"], row.get(f"SUP_T_{i}"), row.get(f"SUP_B_{i}")) if pd.notna(row.get(f"SUP_T_{i}")) else "-"
+            r_dict[f"Resistance-{i}"] = format_tb_pair(row["LTP"], row.get(f"RES_T_{i}"), row.get(f"RES_B_{i}")) if pd.notna(row.get(f"RES_T_{i}")) else "-"
         dashboard_rows.append(r_dict.copy())
 
-        if active_rank and target_opts:
-            cand = r_dict.copy()
-            cand["Climax_Date"]        = climax_date
-            cand["Climax_Range (T/B)"] = format_tb_pair(row["LTP"], climax_top, climax_bot)
-            cand["Climax_Volume"]      = f"{int(climax_vol):,}" if climax_vol else ""
-            cand["Breach_Days"]        = row.get(f"BdL_R{active_rank}" if trigger_side == "long" else f"BdS_R{active_rank}", 999)
-            cand["Target_Options"]     = target_opts
-            if trigger_side == "long":
-                valid_long.append(cand)
-            else:
-                valid_short.append(cand)
+        if pd.notna(row.get("Long_T")) and row["LTP"] > row["Long_T"] and row.get("Long_Breach_Days", 999) <= 5:
+            cand = {
+                "Symbol": row["Symbol"],
+                "LTP": row["LTP"],
+                "% Change": row["% Change"],
+                "Climax_Date": row["Long_D"],
+                "Climax_Range (T/B)": format_tb_pair(row["LTP"], row["Long_T"], row["Long_B"]),
+                "Climax_Volume": f"{int(row['Long_V']):,}" if pd.notna(row.get("Long_V")) else "",
+                "Breach_Days": row["Long_Breach_Days"],
+                "Signal_Type": "Long Breakout",
+            }
+            _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "long")
+            valid_long.append(cand)
+
+        if pd.notna(row.get("Short_B")) and row["LTP"] < row["Short_B"] and row.get("Short_Breach_Days", 999) <= 5:
+            cand = {
+                "Symbol": row["Symbol"],
+                "LTP": row["LTP"],
+                "% Change": row["% Change"],
+                "Climax_Date": row["Short_D"],
+                "Climax_Range (T/B)": format_tb_pair(row["LTP"], row["Short_T"], row["Short_B"]),
+                "Climax_Volume": f"{int(row['Short_V']):,}" if pd.notna(row.get("Short_V")) else "",
+                "Breach_Days": row["Short_Breach_Days"],
+                "Signal_Type": "Short Breakdown",
+            }
+            _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "short")
+            valid_short.append(cand)
 
     return pd.DataFrame(dashboard_rows), pd.DataFrame(valid_long), pd.DataFrame(valid_short)
-
 
 def build_option_candidate_tables(df, spot_signal_map):
     if df.empty:
@@ -366,20 +361,9 @@ def build_option_candidate_tables(df, spot_signal_map):
 
 def build_html_table(df, title, cols):
     if df.empty:
-        return (
-            f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top: 25px;'>{title}</h3>"
-            "<p style='color:#94a3b8; font-family:sans-serif;'>No candidates.</p>"
-        )
-    table_html = (
-        f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top: 25px;'>{title}</h3>"
-        "<table style='border-collapse: collapse; width: 100%; font-family: sans-serif; "
-        "font-size: 13px; text-align: left; background-color: #0f172a;'>"
-    )
-    table_html += (
-        "<tr style='background-color: #1e293b; color: #f1f5f9;'>"
-        + "".join([f"<th style='padding: 10px; border: 1px solid #334155;'>{c}</th>" for c in cols])
-        + "</tr>"
-    )
+        return f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top: 25px;'>{title}</h3><p style='color:#94a3b8; font-family:sans-serif;'>No candidates.</p>"
+    table_html = f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top: 25px;'>{title}</h3><table style='border-collapse: collapse; width: 100%; font-family: sans-serif; font-size: 13px; text-align: left; background-color: #0f172a;'>"
+    table_html += "<tr style='background-color: #1e293b; color: #f1f5f9;'>" + "".join([f"<th style='padding: 10px; border: 1px solid #334155;'>{c}</th>" for c in cols]) + "</tr>"
     for i, (_, row) in enumerate(df.iterrows()):
         bg_row = "#0f172a" if i % 2 == 0 else "#1e293b"
         sig = str(row.get("Signal_Type", ""))
@@ -442,14 +426,11 @@ def main():
     fyers = init_fyers()
     if not fyers:
         return
-
     spot_df = scan_fno_universe(fyers)
     if spot_df.empty:
         logger.warning("No spot data generated.")
         return
-
     dashboard_df, long_df, short_df = build_dashboard_and_candidates(spot_df)
-
     all_opt = []
     if not long_df.empty and "Target_Options" in long_df.columns:
         for sublist in long_df["Target_Options"].tolist():
