@@ -39,9 +39,9 @@ class Config:
 cfg = Config()
 
 EMAIL_DISPLAY_COLS = [
-    "Symbol", "LTP", "Trigger_TF", 
+    "Symbol", "LTP", "Trigger_TF", "3-Day (T/B)"
     "1-Week (T/B)", "1-Month (T/B)", 
-    "3-Month (T/B)", "6-Month (T/B)", "3-Day (T/B)"
+    "3-Month (T/B)", "6-Month (T/B)"
 ]
 
 EMAIL_OPT_COLS = [
