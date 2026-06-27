@@ -1,13 +1,16 @@
 #!/usr/bin/env python3
 """
-FO_FNO_FYERS_VOL_REL_EMAIL.py - High-Volume Support/Resistance Index Dashboard
+FO_FNO_FYERS_VOL_REL_EMAIL.py - High-Volume Support/Resistance F&O Stock Dashboard
 """
 
 import os
 import sys
+import time
 import logging
 import warnings
 import calendar
+import requests
+import re
 from datetime import datetime, timedelta
 from typing import Dict
 
@@ -21,6 +24,27 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 
+def get_dynamic_fno_universe():
+    """
+    Downloads the Fyers NSE F&O Symbol Master, extracts all unique underlying 
+    stock tickers using regex, and formats them for the spot market scanner.
+    """
+    url = "https://public.fyers.in/sym_details/NSE_FO.csv"
+    try:
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+        # Matches standard monthly F&O symbols: NSE:<TICKER><YY><MMM>...
+        pattern = re.compile(r"NSE:([A-Z0-9&\-]+)\d{2}[A-Z]{3}")
+        matches = set(pattern.findall(response.text))
+        
+        # Exclude specific market index identifiers to leave equity tokens only
+        indices = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50"}
+        fno_stocks = [f"NSE:{t}-EQ" for t in matches if t not in indices]
+        return sorted(fno_stocks)
+    except Exception:
+        # Robust fallback array in case endpoint times out
+        return ["NSE:RELIANCE-EQ", "NSE:HDFCBANK-EQ", "NSE:INFY-EQ", "NSE:TCS-EQ"]
+
 class Config:
     def __init__(self):
         self.client_id = os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID")
@@ -30,21 +54,20 @@ class Config:
         self.sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
         self.sender_password = os.environ.get("SENDER_PASSWORD", "password")
         self.recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
-        self.index_symbols = ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX", "BSE:SENSEX-INDEX"]
+        # Populated dynamically via Fyers Master File
+        self.index_symbols = get_dynamic_fno_universe()
 
 cfg = Config()
 
 EMAIL_DISPLAY_COLS = [
     "Symbol", "% Change",
-    "S3", "S2", "S1", "LTP", "R1", "R2", "R3",
-    "Support-3", "Support-2", "Support-1",
+    "Support-3", "Support-2", "Support-1", "LTP",
     "Resistance-1", "Resistance-2", "Resistance-3",
 ]
 
 EMAIL_CAND_COLS = [
     "Symbol", "% Change",
-    "S3", "S2", "S1", "LTP", "R1", "R2", "R3",
-    "Support-3", "Support-2", "Support-1",
+    "Support-3", "Support-2", "Support-1", "LTP",
     "Resistance-1", "Resistance-2", "Resistance-3",
     "Climax_Date", "Climax_Range (T/B)",
     "Climax_Volume", "Breach_Days", "Signal_Type",
@@ -97,49 +120,52 @@ def format_value(col, val):
         return f"{float(val):.4f}"
     return str(val)
 
-def get_index_meta(symbol):
-    if "NIFTY50" in symbol:
-        return "NSE", "NIFTY", 50
-    if "NIFTYBANK" in symbol:
-        return "NSE", "BANKNIFTY", 100
-    return "BSE", "SENSEX", 100
+def get_symbol_meta(symbol, ltp):
+    """Calculates strike price steps dynamically based on stock spot pricing tiers."""
+    exch = symbol.split(":")[0]
+    base_name = symbol.split(":")[1].split("-")[0]
+    
+    if ltp < 150: interval = 1
+    elif ltp < 500: interval = 5
+    elif ltp < 2000: interval = 10
+    elif ltp < 5000: interval = 50
+    else: interval = 100
+    
+    return exch, base_name, interval
 
 def get_underlying_spot(opt_symbol):
-    if "BANKNIFTY" in opt_symbol:
-        return "NSE:NIFTYBANK-INDEX"
-    if "NIFTY" in opt_symbol:
-        return "NSE:NIFTY50-INDEX"
-    return "BSE:SENSEX-INDEX"
+    match = re.match(r"^([A-Z0-9&\-]+)\d+", opt_symbol.split(":")[1])
+    if match:
+        return f"NSE:{match.group(1)}-EQ"
+    return opt_symbol
 
 def get_expiry_details(symbol):
     today = datetime.now().date()
-    if "NIFTYBANK" in symbol:
-        def last_thu(y, m):
-            last = calendar.monthrange(y, m)[1]
-            d = datetime(y, m, last).date()
-            return d - timedelta(days=(d.weekday() - 3) % 7)
-        expiry = last_thu(today.year, today.month)
-        if today > expiry:
-            m = today.month + 1 if today.month < 12 else 1
-            y = today.year if today.month < 12 else today.year + 1
-            expiry = last_thu(y, m)
-        return True, expiry
-    exp_weekday = 3 if "NIFTY" in symbol else 4
-    days_ahead = (exp_weekday - today.weekday()) % 7
-    if days_ahead == 0:
-        days_ahead = 7
-    return False, today + timedelta(days=days_ahead)
+    def last_thu(y, m):
+        last = calendar.monthrange(y, m)[1]
+        d = datetime(y, m, last).date()
+        return d - timedelta(days=(d.weekday() - 3) % 7)
+    
+    # Equity derivatives explicitly trade on monthly option cycles expiring on the last Thursday
+    expiry = last_thu(today.year, today.month)
+    if today > expiry:
+        m = today.month + 1 if today.month < 12 else 1
+        y = today.year if today.month < 12 else today.year + 1
+        expiry = last_thu(y, m)
+    return True, expiry
 
 def get_options_data(symbol, ltp, side):
-    exch, base_name, interval = get_index_meta(symbol)
+    exch, base_name, interval = get_symbol_meta(symbol, ltp)
     atm_strike = int(round(ltp / interval) * interval)
     is_monthly, expiry = get_expiry_details(symbol)
     yy = expiry.strftime("%y")
-    expiry_code = expiry.strftime("%b").upper() if is_monthly else f"{['1','2','3','4','5','6','7','8','9','O','N','D'][expiry.month-1]}{expiry.strftime('%d')}"
+    expiry_code = expiry.strftime("%b").upper()
     opt_type = "CE" if side == "long" else "PE"
-    strikes = [atm_strike + (i * interval) for i in range(-10, 11)]
+    
+    # Restrict slice width down to 11 strikes to avoid exceeding network request rates on ~185 assets
+    strikes = [atm_strike + (i * interval) for i in range(-5, 6)]
     symbols = [f"{exch}:{base_name}{yy}{expiry_code}{s}{opt_type}" for s in strikes]
-    desc = f"21 {opt_type} Contracts (Strikes: {strikes[0]:.2f} to {strikes[-1]:.2f})"
+    desc = f"11 {opt_type} Contracts (Strikes: {strikes[0]:.2f} to {strikes[-1]:.2f})"
     return float(atm_strike), desc, symbols
 
 def init_fyers():
@@ -169,28 +195,6 @@ def get_history(fyers, symbol, res, days):
     except Exception:
         return None
 
-def get_fno_spot_symbols_from_fyers() -> list:
-    try:
-        url = "https://public.fyers.in/sym_details/NSE_FO_sym_master.json"
-        resp = requests.get(url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-        underlyings = set()
-        for rec in data:
-            sym = rec.get("symbol", "")
-            if not sym.startswith("NSE:"):
-                continue
-            base = sym.split(":", 1)[1]
-            idx = 0
-            while idx < len(base) and not base[idx].isdigit():
-                idx += 1
-            underlying = base[:idx]
-            if underlying:
-                underlyings.add(f"NSE:{underlying}-EQ")
-        return sorted(underlyings)
-    except Exception:
-        return []
-
 def scan_fno_universe(fyers):
     base_lookback = 90
     max_lookback = 150
@@ -198,7 +202,13 @@ def scan_fno_universe(fyers):
     dedupe_pct = 0.005
     rows = []
 
-    for sym in cfg.index_symbols:
+    logger.info(f"Scanning {len(cfg.index_symbols)} F&O Equity Spot Charts...")
+    for idx, sym in enumerate(cfg.index_symbols):
+        if idx % 25 == 0 and idx > 0:
+            logger.info(f"Progress Status: Scanned {idx}/{len(cfg.index_symbols)} symbols...")
+            
+        # Pacing throttle to stay clear of server-side rate drops
+        time.sleep(0.1)
         final_row = None
 
         for lookback_days in range(base_lookback, max_lookback + 1, step):
@@ -314,9 +324,11 @@ def scan_fno_universe(fyers):
 
 def scan_options_universe(fyers, symbols):
     rows = []
+    symbols = list(set(symbols))
     for sym in symbols:
+        time.sleep(0.05) # Local safety delay inside specific option iterations
         daily = get_history(fyers, sym, "D", 60)
-        if daily is None or daily.empty:
+        if daily is None or daily.empty or len(daily) < 2:
             continue
         ltp = float(daily["close"].iloc[-1])
         max_idx = daily["volume"].idxmax() if (daily["volume"] > 0).any() else (daily["high"] - daily["low"]).idxmax()
@@ -451,7 +463,7 @@ def send_email(dashboard_df, long_df, short_df, ce_df, pe_df, csv_file):
         msg = MIMEMultipart()
         msg["From"] = cfg.sender_email
         msg["To"] = cfg.recipient_email
-        msg["Subject"] = f"Index Climax Dashboard - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        msg["Subject"] = f"F&O Market Climax Dashboard - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         html = (
             "<body style='background-color: #030712; padding: 20px; font-family: sans-serif;'>"
             + build_html_table(dashboard_df, "Market Dashboard", EMAIL_DISPLAY_COLS)
@@ -499,7 +511,7 @@ def main():
     spot_map = {}
     if not long_df.empty and "Signal_Type" in long_df.columns:
         spot_map.update({r["Symbol"]: r["Signal_Type"] for _, r in long_df.iterrows()})
-    if not short_df.empty and "Signal_Type" in short_df.columns:
+    if not short_df.empty && "Signal_Type" in short_df.columns:
         spot_map.update({r["Symbol"]: r["Signal_Type"] for _, r in short_df.iterrows()})
 
     ce_df, pe_df = pd.DataFrame(), pd.DataFrame()
