@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FO_FNO_FYERS_VOL_REL_EMAIL.py - High-Volume Support/Resistance F&O Dashboard
+FO_FNO_FYERS_VOL_REL_EMAIL.py - High-Volume Support/Resistance F&O Dashboard (High Speed)
 """
 
 import os
@@ -94,15 +94,11 @@ def format_value(col, val):
     if pd.isna(val) or val in [float("inf"), float("-inf")]:
         return ""
     if col == "% Change":
-        try:
-            return f"{float(val):.2f}%"
-        except (TypeError, ValueError):
-            return ""
+        try: return f"{float(val):.2f}%"
+        except: return ""
     if col == "LTP":
-        try:
-            return f"{float(val):.2f}"
-        except (TypeError, ValueError):
-            return ""
+        try: return f"{float(val):.2f}"
+        except: return ""
             
     if "(T/B)" in col or "Support" in col or "Resistance" in col:
         return str(val)
@@ -202,16 +198,32 @@ def scan_fno_universe(fyers):
     step = 30
     rows = []
 
-    for sym in cfg.index_symbols:
+    logger.info(f"High-Speed Scanning {len(cfg.index_symbols)} Charts...")
+    
+    for idx, sym in enumerate(cfg.index_symbols):
+        if idx % 25 == 0 and idx > 0:
+            logger.info(f"Processed {idx}/{len(cfg.index_symbols)} symbols...")
+            
+        time.sleep(0.05)
         final_row = None
-        time.sleep(0.1) 
+        
+        # ==============================================================
+        # CRITICAL FIX: We fetch 2 years of data exactly ONE time per stock
+        # ==============================================================
+        full_history = get_history(fyers, sym, "D", max_lookback)
+        if full_history is None or full_history.empty:
+            continue
+            
+        today = datetime.now()
 
         for lookback_days in range(base_lookback, max_lookback + 1, step):
-            daily = get_history(fyers, sym, "D", lookback_days)
-            if daily is None or daily.empty or len(daily) < 5:
+            # We slice the data locally in memory instead of asking the Fyers server
+            cutoff_date = today - timedelta(days=lookback_days)
+            daily = full_history[full_history["timestamp"] >= cutoff_date].copy()
+            
+            if daily.empty or len(daily) < 5:
                 continue
 
-            today = datetime.now()
             ltp = float(daily["close"].iloc[-1])
             prev_close = float(daily["close"].iloc[-2])
             pct_ch = ((ltp - prev_close) / prev_close) * 100
@@ -219,12 +231,11 @@ def scan_fno_universe(fyers):
             work = daily.sort_values(["volume", "high"], ascending=[False, False]).reset_index(drop=True)
             candidates = []
 
-            # Raw pull of all high volume days. No deduplication logic.
             for _, c in work.iterrows():
                 candidates.append({
                     "top": float(c["high"]),
                     "bottom": float(c["low"]),
-                    "date": str(pd.to_datetime(c["timestamp"]).date()),
+                    "date": str(c["timestamp"].date()),
                     "volume": float(c["volume"]),
                 })
 
@@ -268,43 +279,27 @@ def scan_fno_universe(fyers):
                     row[f"RES_D_{i+1}"] = ""
                     row[f"RES_V_{i+1}"] = np.nan
 
-            # --- RESISTANCE LOGIC (Breakouts & Sweeps) ---
-            if len(resistances) > 0:
-                top_band = float(resistances.iloc[0]["top"])
-                below = daily[daily["close"] <= top_band]
-                swept_above = daily[daily["high"] > top_band]
-                
-                row["Long_T"] = top_band
-                row["Long_B"] = float(resistances.iloc[0]["bottom"])
-                row["Long_D"] = str(resistances.iloc[0]["date"])
-                row["Long_V"] = float(resistances.iloc[0]["volume"])
-                
-                row["Long_Breach_Days"] = (today - below.iloc[-1]["timestamp"]).days if (ltp > top_band and not below.empty) else 999
-                row["Res_Sweep_Days"] = (today - swept_above.iloc[-1]["timestamp"]).days if (ltp <= top_band and not swept_above.empty) else 999
-            else:
-                row["Long_T"] = row["Long_B"] = row["Long_V"] = np.nan
-                row["Long_D"] = ""
-                row["Long_Breach_Days"] = 999
-                row["Res_Sweep_Days"] = 999
-
-            # --- SUPPORT LOGIC (Breakdowns & Sweeps) ---
             if len(supports) > 0:
-                bot_band = float(supports.iloc[0]["bottom"])
-                above = daily[daily["close"] >= bot_band]
-                swept_below = daily[daily["low"] < bot_band]
-                
-                row["Short_T"] = float(supports.iloc[0]["top"])
-                row["Short_B"] = bot_band
-                row["Short_D"] = str(supports.iloc[0]["date"])
-                row["Short_V"] = float(supports.iloc[0]["volume"])
-                
-                row["Short_Breach_Days"] = (today - above.iloc[-1]["timestamp"]).days if (ltp < bot_band and not above.empty) else 999
-                row["Sup_Sweep_Days"] = (today - swept_below.iloc[-1]["timestamp"]).days if (ltp >= bot_band and not swept_below.empty) else 999
+                sup_t1 = float(supports.iloc[0]["top"])
+                sup_b1 = float(supports.iloc[0]["bottom"])
+                was_below = daily[daily["close"] <= sup_t1] 
+                swept_below = daily[daily["low"] < sup_b1]  
+                row["Long_Breach_Days"] = (today - was_below.iloc[-1]["timestamp"]).days if not was_below.empty else 999
+                row["Sup_Sweep_Days"] = (today - swept_below.iloc[-1]["timestamp"]).days if not swept_below.empty else 999
             else:
-                row["Short_T"] = row["Short_B"] = row["Short_V"] = np.nan
-                row["Short_D"] = ""
-                row["Short_Breach_Days"] = 999
+                row["Long_Breach_Days"] = 999
                 row["Sup_Sweep_Days"] = 999
+
+            if len(resistances) > 0:
+                res_t1 = float(resistances.iloc[0]["top"])
+                res_b1 = float(resistances.iloc[0]["bottom"])
+                was_above = daily[daily["close"] >= res_b1] 
+                swept_above = daily[daily["high"] > res_t1] 
+                row["Short_Breach_Days"] = (today - was_above.iloc[-1]["timestamp"]).days if not was_above.empty else 999
+                row["Res_Sweep_Days"] = (today - swept_above.iloc[-1]["timestamp"]).days if not swept_above.empty else 999
+            else:
+                row["Short_Breach_Days"] = 999
+                row["Res_Sweep_Days"] = 999
 
             final_row = row
             if len(supports) >= 3 and len(resistances) >= 3:
@@ -318,6 +313,7 @@ def scan_fno_universe(fyers):
 def scan_options_universe(fyers, symbols):
     rows = []
     symbols = list(set(symbols))
+    logger.info(f"Scanning {len(symbols)} Options Candidates...")
     for sym in symbols:
         time.sleep(0.05)
         daily = get_history(fyers, sym, "D", 60)
@@ -363,31 +359,21 @@ def build_dashboard_and_candidates(df):
         is_active_candidate = False
         
         # ===============================================
-        # LONG CANDIDATES (Bullish Setup)
+        # LONG CANDIDATES (Evaluated on Support-1)
         # ===============================================
-        long_t = row.get("Long_T")
-        long_breach = row.get("Long_Breach_Days", 999)
-        long_climax_age = get_days_ago(row.get("Long_D"))
-        is_breakout = pd.notna(long_t) and row["LTP"] > long_t and (long_breach <= 10 or long_climax_age <= 10)
+        sup_t1 = row.get("SUP_T_1")
+        sup_b1 = row.get("SUP_B_1")
         
-        short_b = row.get("Short_B")
+        long_breach = row.get("Long_Breach_Days", 999)
         sup_sweep = row.get("Sup_Sweep_Days", 999)
-        is_sup_sweep = pd.notna(short_b) and row["LTP"] >= short_b and sup_sweep <= 10
+        long_climax_age = get_days_ago(row.get("SUP_D_1"))
+        
+        is_breakout = pd.notna(sup_t1) and (long_breach <= 10 or long_climax_age <= 10)
+        is_sup_sweep = pd.notna(sup_b1) and sup_sweep <= 10
 
         if is_breakout or is_sup_sweep:
             sig_type = "Long Breakout" if is_breakout else "Support Sweep"
             
-            if is_breakout:
-                c_date = row.get("Long_D", "")
-                c_range = format_tb_pair(row["LTP"], long_t, row.get("Long_B"))
-                c_vol = f"{int(row['Long_V']):,}" if pd.notna(row.get("Long_V")) else ""
-                b_days = long_breach
-            else:
-                c_date = row.get("Short_D", "")
-                c_range = format_tb_pair(row["LTP"], row.get("Short_T"), short_b)
-                c_vol = f"{int(row['Short_V']):,}" if pd.notna(row.get("Short_V")) else ""
-                b_days = sup_sweep
-
             cand = {
                 "Symbol": row["Symbol"],
                 "% Change": row["% Change"],
@@ -398,10 +384,10 @@ def build_dashboard_and_candidates(df):
                 "Resistance-1": r_dict.get("Resistance-1", "-"),
                 "Resistance-2": r_dict.get("Resistance-2", "-"),
                 "Resistance-3": r_dict.get("Resistance-3", "-"),
-                "Climax_Date": c_date,
-                "Climax_Range (T/B)": c_range,
-                "Climax_Volume": c_vol,
-                "Breach_Days": b_days,
+                "Climax_Date": row.get("SUP_D_1", ""),
+                "Climax_Range (T/B)": format_tb_pair(row["LTP"], sup_t1, sup_b1),
+                "Climax_Volume": f"{int(row['SUP_V_1']):,}" if pd.notna(row.get("SUP_V_1")) else "",
+                "Breach_Days": long_breach if is_breakout else sup_sweep,
                 "Signal_Type": sig_type,
             }
             _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "long")
@@ -410,28 +396,20 @@ def build_dashboard_and_candidates(df):
 
 
         # ===============================================
-        # SHORT CANDIDATES (Bearish Setup)
+        # SHORT CANDIDATES (Evaluated on Resistance-1)
         # ===============================================
+        res_t1 = row.get("RES_T_1")
+        res_b1 = row.get("RES_B_1")
+        
         short_breach = row.get("Short_Breach_Days", 999)
-        short_climax_age = get_days_ago(row.get("Short_D"))
-        is_breakdown = pd.notna(short_b) and row["LTP"] < short_b and (short_breach <= 10 or short_climax_age <= 10)
-
         res_sweep = row.get("Res_Sweep_Days", 999)
-        is_res_sweep = pd.notna(long_t) and row["LTP"] <= long_t and res_sweep <= 10
+        short_climax_age = get_days_ago(row.get("RES_D_1"))
+
+        is_breakdown = pd.notna(res_b1) and (short_breach <= 10 or short_climax_age <= 10)
+        is_res_sweep = pd.notna(res_t1) and res_sweep <= 10
 
         if is_breakdown or is_res_sweep:
             sig_type = "Short Breakdown" if is_breakdown else "Resistance Sweep"
-
-            if is_breakdown:
-                c_date = row.get("Short_D", "")
-                c_range = format_tb_pair(row["LTP"], row.get("Short_T"), short_b)
-                c_vol = f"{int(row['Short_V']):,}" if pd.notna(row.get("Short_V")) else ""
-                b_days = short_breach
-            else:
-                c_date = row.get("Long_D", "")
-                c_range = format_tb_pair(row["LTP"], long_t, row.get("Long_B"))
-                c_vol = f"{int(row['Long_V']):,}" if pd.notna(row.get("Long_V")) else ""
-                b_days = res_sweep
 
             cand = {
                 "Symbol": row["Symbol"],
@@ -443,10 +421,10 @@ def build_dashboard_and_candidates(df):
                 "Resistance-1": r_dict.get("Resistance-1", "-"),
                 "Resistance-2": r_dict.get("Resistance-2", "-"),
                 "Resistance-3": r_dict.get("Resistance-3", "-"),
-                "Climax_Date": c_date,
-                "Climax_Range (T/B)": c_range,
-                "Climax_Volume": c_vol,
-                "Breach_Days": b_days,
+                "Climax_Date": row.get("RES_D_1", ""),
+                "Climax_Range (T/B)": format_tb_pair(row["LTP"], res_t1, res_b1),
+                "Climax_Volume": f"{int(row['RES_V_1']):,}" if pd.notna(row.get("RES_V_1")) else "",
+                "Breach_Days": short_breach if is_breakdown else res_sweep,
                 "Signal_Type": sig_type,
             }
             _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "short")
@@ -544,6 +522,7 @@ def send_email(dashboard_df, long_df, short_df, ce_df, pe_df, csv_file):
         logger.error(f"Email Failed: {e}")
 
 def main():
+    start_time = time.time()
     fyers = init_fyers()
     if not fyers:
         return
@@ -576,6 +555,9 @@ def main():
 
     csv_f = save_outputs(spot_df)
     send_email(dashboard_df, long_df, short_df, ce_df, pe_df, csv_f)
+    
+    elapsed = time.time() - start_time
+    logger.info(f"Execution finished in {elapsed:.2f} seconds.")
 
 if __name__ == "__main__":
     main()
