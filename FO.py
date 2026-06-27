@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
 """
-FO_FNO_FYERS_VOL_REL_EMAIL_clean.py
-Writes separate CSVs for dashboard, long/short matrices, CE/PE candidates.
+FO_FNO_FYERS_VOL_REL_EMAIL.py - High-Volume Support/Resistance Index Dashboard
 """
 
 import os
@@ -10,7 +9,7 @@ import logging
 import warnings
 import calendar
 from datetime import datetime, timedelta
-from typing import List, Dict, Optional
+from typing import Dict
 
 import numpy as np
 import pandas as pd
@@ -22,7 +21,6 @@ from email.mime.text import MIMEText
 from email.mime.base import MIMEBase
 from email import encoders
 
-# CONFIG
 class Config:
     def __init__(self):
         self.client_id = os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID")
@@ -36,71 +34,81 @@ class Config:
 
 cfg = Config()
 
-# Fixed column schemas
-DASHBOARD_COLS = [
+EMAIL_DISPLAY_COLS = [
     "Symbol", "% Change",
+    "S3", "S2", "S1", "LTP", "R1", "R2", "R3",
     "Support-3", "Support-2", "Support-1",
-    "LTP",
-    "Resistance-1", "Resistance-2", "Resistance-3"
+    "Resistance-1", "Resistance-2", "Resistance-3",
 ]
 
-STRATEGY_COLS = [
-    "Symbol", "LTP", "Trigger_TF",
-    "1-Day (T/B)", "3-Day (T/B)", "1-Week (T/B)",
-    "1-Month (T/B)", "3-Month (T/B)", "6-Month (T/B)"
+EMAIL_CAND_COLS = [
+    "Symbol", "% Change",
+    "S3", "S2", "S1", "LTP", "R1", "R2", "R3",
+    "Support-3", "Support-2", "Support-1",
+    "Resistance-1", "Resistance-2", "Resistance-3",
+    "Climax_Date", "Climax_Range (T/B)",
+    "Climax_Volume", "Breach_Days", "Signal_Type",
 ]
 
-OPT_COLS = [
+EMAIL_OPT_COLS = [
     "Symbol", "LTP", "% Change", "Signal_Type",
     "Climax_Date", "Climax_Range (T/B)", "Breach_Days"
 ]
 
-EMAIL_DISPLAY_COLS = ["Symbol", "LTP", "Trigger_TF",
-    "1-Day (T/B)", "3-Day (T/B)", "1-Week (T/B)",
-    "1-Month (T/B)", "3-Month (T/B)", "6-Month (T/B)"]
-
-EMAIL_OPT_COLS = OPT_COLS
-
-# Logging
 logger = logging.getLogger()
 logger.setLevel(logging.INFO)
-if logger.hasHandlers(): logger.handlers.clear()
+if logger.hasHandlers():
+    logger.handlers.clear()
 ch = logging.StreamHandler(sys.stdout)
 ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
 logger.addHandler(ch)
 warnings.filterwarnings("ignore")
 
-# Helpers
 def format_tb_pair(ltp, top, bottom):
-    if pd.isna(top) or pd.isna(bottom): return "-"
+    if pd.isna(top) or pd.isna(bottom):
+        return "-"
     t_str, b_str, ltp_val = f"{float(top):.2f}", f"{float(bottom):.2f}", float(ltp)
-    if ltp_val > float(top): t_str = f"<span style='color: #4ade80; font-weight: bold;'>{t_str}</span>"
-    if ltp_val < float(bottom): b_str = f"<span style='color: #f87171; font-weight: bold;'>{b_str}</span>"
+    if ltp_val > float(top):
+        t_str = f"<span style='color: #4ade80; font-weight: bold;'>{t_str}</span>"
+    if ltp_val < float(bottom):
+        b_str = f"<span style='color: #f87171; font-weight: bold;'>{b_str}</span>"
     return f"{t_str} <span style='color: #64748b;'>/</span> {b_str}"
 
 def format_value(col, val):
-    if pd.isna(val) or val in [float("inf"), float("-inf")]: return ""
-    if "(T/B)" in col or col == "Options_Data": return str(val)
-    if col in ["Trigger_TF", "Signal_Type", "Option_Contracts", "Climax_Date"]: return str(val)
-    if col == "Breach_Days": return str(int(val)) if not pd.isna(val) else ""
+    if pd.isna(val) or val in [float("inf"), float("-inf")]:
+        return ""
+    if "(T/B)" in col or col in EMAIL_DISPLAY_COLS:
+        return str(val)
+    if col in ["Signal_Type", "Option_Contracts", "Climax_Date"]:
+        return str(val)
+    if col == "Breach_Days":
+        return str(int(val)) if not pd.isna(val) else ""
     if col == "% Change":
         try:
-            f = float(val)
-            return f"{f:.2f}%"
-        except Exception:
+            return f"{float(val):.2f}%"
+        except (TypeError, ValueError):
             return ""
-    if col.startswith("T_") or col.startswith("B_") or col == "ATM_Strike": return f"{float(val):.2f}"
-    if isinstance(val, (int, float, np.integer, np.floating)): return f"{float(val):.4f}"
+    if col == "LTP":
+        try:
+            return f"{float(val):.2f}"
+        except (TypeError, ValueError):
+            return ""
+    if isinstance(val, (int, float, np.integer, np.floating)):
+        return f"{float(val):.4f}"
     return str(val)
 
 def get_index_meta(symbol):
-    if "NIFTY50" in symbol: return "NSE", "NIFTY", 50
-    if "NIFTYBANK" in symbol: return "NSE", "BANKNIFTY", 100
+    if "NIFTY50" in symbol:
+        return "NSE", "NIFTY", 50
+    if "NIFTYBANK" in symbol:
+        return "NSE", "BANKNIFTY", 100
     return "BSE", "SENSEX", 100
 
 def get_underlying_spot(opt_symbol):
-    if "BANKNIFTY" in opt_symbol: return "NSE:NIFTYBANK-INDEX"
-    if "NIFTY" in opt_symbol: return "NSE:NIFTY50-INDEX"
+    if "BANKNIFTY" in opt_symbol:
+        return "NSE:NIFTYBANK-INDEX"
+    if "NIFTY" in opt_symbol:
+        return "NSE:NIFTY50-INDEX"
     return "BSE:SENSEX-INDEX"
 
 def get_expiry_details(symbol):
@@ -118,7 +126,8 @@ def get_expiry_details(symbol):
         return True, expiry
     exp_weekday = 3 if "NIFTY" in symbol else 4
     days_ahead = (exp_weekday - today.weekday()) % 7
-    if days_ahead == 0: days_ahead = 7
+    if days_ahead == 0:
+        days_ahead = 7
     return False, today + timedelta(days=days_ahead)
 
 def get_options_data(symbol, ltp, side):
@@ -130,9 +139,9 @@ def get_options_data(symbol, ltp, side):
     opt_type = "CE" if side == "long" else "PE"
     strikes = [atm_strike + (i * interval) for i in range(-10, 11)]
     symbols = [f"{exch}:{base_name}{yy}{expiry_code}{s}{opt_type}" for s in strikes]
-    return float(atm_strike), f"21 {opt_type} Contracts", symbols
+    desc = f"21 {opt_type} Contracts (Strikes: {strikes[0]:.2f} to {strikes[-1]:.2f})"
+    return float(atm_strike), desc, symbols
 
-# Fyers & history
 def init_fyers():
     try:
         return fyersModel.FyersModel(client_id=cfg.client_id, is_async=False, token=cfg.access_token, log_path="")
@@ -144,7 +153,14 @@ def get_history(fyers, symbol, res, days):
     try:
         now = datetime.now()
         start, end = (now - timedelta(days=days)).strftime("%Y-%m-%d"), now.strftime("%Y-%m-%d")
-        res_data = fyers.history(data={"symbol": symbol, "resolution": res, "date_format": "1", "range_from": start, "range_to": end, "cont_flag": "1"})
+        res_data = fyers.history(data={
+            "symbol": symbol,
+            "resolution": res,
+            "date_format": "1",
+            "range_from": start,
+            "range_to": end,
+            "cont_flag": "1",
+        })
         if res_data and "candles" in res_data:
             df = pd.DataFrame(res_data["candles"], columns=["timestamp", "open", "high", "low", "close", "volume"])
             df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
@@ -153,61 +169,147 @@ def get_history(fyers, symbol, res, days):
     except Exception:
         return None
 
-# SCAN
+def get_fno_spot_symbols_from_fyers() -> list:
+    try:
+        url = "https://public.fyers.in/sym_details/NSE_FO_sym_master.json"
+        resp = requests.get(url, timeout=10)
+        resp.raise_for_status()
+        data = resp.json()
+        underlyings = set()
+        for rec in data:
+            sym = rec.get("symbol", "")
+            if not sym.startswith("NSE:"):
+                continue
+            base = sym.split(":", 1)[1]
+            idx = 0
+            while idx < len(base) and not base[idx].isdigit():
+                idx += 1
+            underlying = base[:idx]
+            if underlying:
+                underlyings.add(f"NSE:{underlying}-EQ")
+        return sorted(underlyings)
+    except Exception:
+        return []
+
 def scan_fno_universe(fyers):
+    base_lookback = 90
+    max_lookback = 150
+    step = 30
+    dedupe_pct = 0.005
     rows = []
+
     for sym in cfg.index_symbols:
-        daily = get_history(fyers, sym, "D", 365)
-        if daily is None or daily.empty:
-            continue
-        today = datetime.now()
-        ltp = float(daily["close"].iloc[-1])
-        # build supports/resistances via calendar windows
-        windows = [("6M",180,90),("3M",90,30),("1M",30,7),("1W",7,3),("3D",3,1),("1D",1,0)]
-        supports = {}
-        resistances = {}
-        for label,max_d,min_d in windows:
-            start_date = today - timedelta(days=max_d)
-            end_date = today - timedelta(days=min_d)
-            df_s = daily[(daily['timestamp'] > start_date) & (daily['timestamp'] <= end_date)]
-            if df_s.empty: continue
-            idx_val = df_s["volume"].idxmax() if (df_s["volume"]>0).any() else (df_s["high"]-df_s["low"]).idxmax()
-            c = df_s.loc[idx_val]
-            top = float(c["high"]); bot = float(c["low"])
-            supports[label] = (top, bot, str(c["timestamp"].date()))
-            resistances[label] = (top, bot, str(c["timestamp"].date()))
-        # map to dashboard columns (3 levels each side)
-        def pick_levels(map_dict):
-            # choose three meaningful levels sorted by timeframe priority (1M/3M/6M)
-            lbls = ["1M","3M","6M","1W","3D","1D"]
-            picked = []
-            for l in lbls:
-                if l in map_dict:
-                    picked.append(map_dict[l])
-                if len(picked) == 3:
-                    break
-            # format as "top / bot"
-            out = []
-            for t,b,d in picked:
-                out.append(f"{t:.2f} / {b:.2f}")
-            while len(out) < 3:
-                out.append("")
-            return out
-        res_levels = pick_levels(resistances)
-        sup_levels = pick_levels(supports)
-        pct_change = ((ltp - float(daily["close"].iloc[-2]))/float(daily["close"].iloc[-2]) * 100) if len(daily) > 1 else 0.0
-        row = {
-            "Symbol": sym,
-            "% Change": f"{pct_change:.2f}%",
-            "Support-3": sup_levels[0],
-            "Support-2": sup_levels[1],
-            "Support-1": sup_levels[2],
-            "LTP": ltp,
-            "Resistance-1": res_levels[0],
-            "Resistance-2": res_levels[1],
-            "Resistance-3": res_levels[2],
-        }
-        rows.append(row)
+        final_row = None
+
+        for lookback_days in range(base_lookback, max_lookback + 1, step):
+            daily = get_history(fyers, sym, "D", lookback_days)
+            if daily is None or daily.empty or len(daily) < 5:
+                continue
+
+            today = datetime.now()
+            ltp = float(daily["close"].iloc[-1])
+            prev_close = float(daily["close"].iloc[-2])
+            pct_ch = ((ltp - prev_close) / prev_close) * 100
+
+            work = daily.sort_values(["volume", "high"], ascending=[False, False]).reset_index(drop=True)
+            candidates = []
+
+            for _, c in work.iterrows():
+                top_band = float(c["high"])
+                bot_band = float(c["low"])
+                mid_band = (top_band + bot_band) / 2.0
+                keep = True
+
+                for s in candidates:
+                    s_mid = (s["top"] + s["bottom"]) / 2.0
+                    mid_close = abs(mid_band - s_mid) / max(abs(ltp), 1.0) <= dedupe_pct
+                    overlap = not (top_band < s["bottom"] or bot_band > s["top"])
+                    if mid_close or overlap:
+                        keep = False
+                        break
+
+                if keep:
+                    candidates.append({
+                        "top": top_band,
+                        "bottom": bot_band,
+                        "date": str(pd.to_datetime(c["timestamp"]).date()),
+                        "volume": float(c["volume"]),
+                    })
+
+            if not candidates:
+                continue
+
+            bands = pd.DataFrame(candidates)
+            supports = bands[bands["top"] < ltp].copy()
+            resistances = bands[bands["bottom"] > ltp].copy()
+            current_zone = bands[(bands["bottom"] <= ltp) & (bands["top"] >= ltp)].copy()
+
+            supports["sort_key"] = supports["top"]
+            supports = supports.sort_values("sort_key", ascending=False).head(3).reset_index(drop=True)
+
+            resistances["sort_key"] = resistances["bottom"]
+            resistances = resistances.sort_values("sort_key", ascending=True).head(3).reset_index(drop=True)
+
+            row: Dict = {"Symbol": sym, "LTP": ltp, "% Change": pct_ch, "Lookback_Used": lookback_days}
+
+            for i in range(3):
+                if i < len(supports):
+                    s = supports.iloc[i]
+                    row[f"SUP_T_{i+1}"] = float(s["top"])
+                    row[f"SUP_B_{i+1}"] = float(s["bottom"])
+                    row[f"SUP_D_{i+1}"] = str(s["date"])
+                    row[f"SUP_V_{i+1}"] = float(s["volume"])
+                else:
+                    row[f"SUP_T_{i+1}"] = np.nan
+                    row[f"SUP_B_{i+1}"] = np.nan
+                    row[f"SUP_D_{i+1}"] = ""
+                    row[f"SUP_V_{i+1}"] = np.nan
+
+                if i < len(resistances):
+                    r = resistances.iloc[i]
+                    row[f"RES_T_{i+1}"] = float(r["top"])
+                    row[f"RES_B_{i+1}"] = float(r["bottom"])
+                    row[f"RES_D_{i+1}"] = str(r["date"])
+                    row[f"RES_V_{i+1}"] = float(r["volume"])
+                else:
+                    row[f"RES_T_{i+1}"] = np.nan
+                    row[f"RES_B_{i+1}"] = np.nan
+                    row[f"RES_D_{i+1}"] = ""
+                    row[f"RES_V_{i+1}"] = np.nan
+
+            if len(resistances) > 0:
+                top_band = float(resistances.iloc[0]["top"])
+                below = daily[daily["close"] <= top_band]
+                row["Long_T"] = top_band
+                row["Long_B"] = float(resistances.iloc[0]["bottom"])
+                row["Long_D"] = str(resistances.iloc[0]["date"])
+                row["Long_V"] = float(resistances.iloc[0]["volume"])
+                row["Long_Breach_Days"] = (today - below.iloc[-1]["timestamp"]).days if (ltp > top_band and not below.empty) else 999
+            else:
+                row["Long_T"] = row["Long_B"] = row["Long_V"] = np.nan
+                row["Long_D"] = ""
+                row["Long_Breach_Days"] = 999
+
+            if len(supports) > 0:
+                bot_band = float(supports.iloc[0]["bottom"])
+                above = daily[daily["close"] >= bot_band]
+                row["Short_T"] = float(supports.iloc[0]["top"])
+                row["Short_B"] = bot_band
+                row["Short_D"] = str(supports.iloc[0]["date"])
+                row["Short_V"] = float(supports.iloc[0]["volume"])
+                row["Short_Breach_Days"] = (today - above.iloc[-1]["timestamp"]).days if (ltp < bot_band and not above.empty) else 999
+            else:
+                row["Short_T"] = row["Short_B"] = row["Short_V"] = np.nan
+                row["Short_D"] = ""
+                row["Short_Breach_Days"] = 999
+
+            final_row = row
+            if len(supports) >= 3 and len(resistances) >= 3:
+                break
+
+        if final_row is not None:
+            rows.append(final_row)
+
     return pd.DataFrame(rows)
 
 def scan_options_universe(fyers, symbols):
@@ -219,188 +321,194 @@ def scan_options_universe(fyers, symbols):
         ltp = float(daily["close"].iloc[-1])
         max_idx = daily["volume"].idxmax() if (daily["volume"] > 0).any() else (daily["high"] - daily["low"]).idxmax()
         c = daily.loc[max_idx]
-        t = float(c["high"]); b = float(c["low"])
-        bd = 999
-        if ltp > t:
-            breaches = daily[daily['close'] <= t]
+        top_band = float(c["high"])
+        bd_l = 999
+        if ltp > top_band:
+            breaches = daily[daily["close"] <= top_band]
             if not breaches.empty:
-                bd = (datetime.now() - breaches.iloc[-1]['timestamp']).days
-        pct_change = ((ltp - float(daily["close"].iloc[-2]))/float(daily["close"].iloc[-2]) * 100) if len(daily) > 1 else 0.0
+                bd_l = (datetime.now() - breaches.iloc[-1]["timestamp"]).days
         rows.append({
             "Symbol": sym,
             "LTP": ltp,
-            "T_LOC": t,
-            "B_LOC": b,
+            "T_LOC": top_band,
+            "B_LOC": float(c["low"]),
             "D_LOC": str(pd.to_datetime(c["timestamp"]).date()),
-            "Days_L_LOC": bd,
-            "Prev_Close": float(daily["close"].iloc[-2]) if len(daily) > 1 else np.nan,
-            "% Change": pct_change
+            "Days_L_LOC": bd_l,
+            "Prev_Close": float(daily["close"].iloc[-2]),
+            "% Change": ((ltp - float(daily["close"].iloc[-2])) / float(daily["close"].iloc[-2]) * 100),
         })
     return pd.DataFrame(rows)
 
-# BUILD tables & candidates (cleaned, separate outputs)
-def build_dashboard_and_candidates(spot_df):
-    dashboard_rows = []
-    long_rows = []
-    short_rows = []
-    label_map = {"1D":"1-Day","3D":"3-Day","1W":"1-Week","1M":"1-Month","3M":"3-Month","6M":"6-Month"}
-    for _, r in spot_df.iterrows():
-        sym = r["Symbol"]; ltp = r["LTP"]
-        # prepare dashboard row with supports/resistances empty by default
-        dash = {"Symbol": sym, "% Change": r.get("% Change",""), "Support-3":"", "Support-2":"", "Support-1":"", "LTP": ltp, "Resistance-1":"", "Resistance-2":"", "Resistance-3":""}
-        # build TB pairs columns for email display
-        for tf in ["1D","3D","1W","1M","3M","6M"]:
-            dash[f"{label_map[tf]} (T/B)"] = format_tb_pair(ltp, r.get(f"T_{tf}"), r.get(f"B_{tf}"))
-        dashboard_rows.append(dash)
-        # detect triggers (small window threshold)
-        trigger_tf = None; trigger_side = None; climax_date=None; target_options=None
-        for tf in ["1D","3D","1W","1M","3M","6M"]:
-            t = r.get(f"T_{tf}"); b = r.get(f"B_{tf}")
-            bd_l = r.get(f"Days_L_{tf}", 999); bd_s = r.get(f"Days_S_{tf}", 999)
-            if pd.notna(t) and ltp > t and bd_l <= 5:
-                trigger_tf = tf; trigger_side="long"; climax_date = r.get(f"D_{tf}"); _,_,target_options = get_options_data(sym, ltp, "long"); break
-            if pd.notna(b) and ltp < b and bd_s <= 5:
-                trigger_tf = tf; trigger_side="short"; climax_date = r.get(f"D_{tf}"); _,_,target_options = get_options_data(sym, ltp, "short"); break
-        if trigger_tf:
-            cand = {"Symbol": sym, "LTP": ltp, "Trigger_TF": trigger_tf}
-            # add TB pairs for cand table too
-            for tf in ["1D","3D","1W","1M","3M","6M"]:
-                cand[f"{label_map[tf]} (T/B)"] = format_tb_pair(ltp, r.get(f"T_{tf}"), r.get(f"B_{tf}"))
-            if trigger_side == "long":
-                long_rows.append(cand)
-            else:
-                short_rows.append(cand)
-    return pd.DataFrame(dashboard_rows), pd.DataFrame(long_rows), pd.DataFrame(short_rows)
+def build_dashboard_and_candidates(df):
+    dashboard_rows, valid_long, valid_short = [], [], []
+    for _, row in df.iterrows():
+        r_dict = row.to_dict()
+        for i in range(1, 4):
+            r_dict[f"Support-{i}"] = format_tb_pair(row["LTP"], row.get(f"SUP_T_{i}"), row.get(f"SUP_B_{i}")) if pd.notna(row.get(f"SUP_T_{i}")) else "-"
+            r_dict[f"Resistance-{i}"] = format_tb_pair(row["LTP"], row.get(f"RES_T_{i}"), row.get(f"RES_B_{i}")) if pd.notna(row.get(f"RES_T_{i}")) else "-"
+        dashboard_rows.append(r_dict.copy())
 
-def build_option_candidate_tables(opt_df, spot_signal_map):
-    if opt_df is None or opt_df.empty:
+        tol_pct = 0.25 / 100.0
+        res_b1 = row.get("RES_B_1")
+        if pd.notna(res_b1) and abs(row["LTP"] - res_b1) / max(row["LTP"], 1.0) <= tol_pct:
+            cand = {
+                "Symbol": row["Symbol"],
+                "% Change": row["% Change"],
+                "Support-3": r_dict.get("Support-3", "-"),
+                "Support-2": r_dict.get("Support-2", "-"),
+                "Support-1": r_dict.get("Support-1", "-"),
+                "LTP": row["LTP"],
+                "Resistance-1": r_dict.get("Resistance-1", "-"),
+                "Resistance-2": r_dict.get("Resistance-2", "-"),
+                "Resistance-3": r_dict.get("Resistance-3", "-"),
+                "Climax_Date": row.get("Long_D", ""),
+                "Climax_Range (T/B)": format_tb_pair(row["LTP"], row.get("Long_T", res_b1), row.get("Long_B", res_b1)),
+                "Climax_Volume": f"{int(row['Long_V']):,}" if pd.notna(row.get("Long_V")) else "",
+                "Breach_Days": row.get("Long_Breach_Days", 999),
+                "Signal_Type": "Long Resistance Test",
+            }
+            _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "long")
+            valid_long.append(cand)
+
+        tol_pct = 0.25 / 100.0
+        sup_t1 = row.get("SUP_T_1")
+        if pd.notna(sup_t1) and abs(row["LTP"] - sup_t1) / max(row["LTP"], 1.0) <= tol_pct:
+            cand = {
+                "Symbol": row["Symbol"],
+                "% Change": row["% Change"],
+                "Support-3": r_dict.get("Support-3", "-"),
+                "Support-2": r_dict.get("Support-2", "-"),
+                "Support-1": r_dict.get("Support-1", "-"),
+                "LTP": row["LTP"],
+                "Resistance-1": r_dict.get("Resistance-1", "-"),
+                "Resistance-2": r_dict.get("Resistance-2", "-"),
+                "Resistance-3": r_dict.get("Resistance-3", "-"),
+                "Climax_Date": row.get("Short_D", ""),
+                "Climax_Range (T/B)": format_tb_pair(row["LTP"], row.get("Short_T", sup_t1), row.get("Short_B", sup_t1)),
+                "Climax_Volume": f"{int(row['Short_V']):,}" if pd.notna(row.get("Short_V")) else "",
+                "Breach_Days": row.get("Short_Breach_Days", 999),
+                "Signal_Type": "Short Support Test",
+            }
+            _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "short")
+            valid_short.append(cand)
+
+    return pd.DataFrame(dashboard_rows), pd.DataFrame(valid_long), pd.DataFrame(valid_short)
+
+def build_option_candidate_tables(df, spot_signal_map):
+    if df.empty:
         return pd.DataFrame(), pd.DataFrame()
-    ce_rows=[]; pe_rows=[]
-    for _, r in opt_df.iterrows():
-        t, b, d, bd = r.get("T_LOC"), r.get("B_LOC"), r.get("D_LOC"), r.get("Days_L_LOC", 999)
-        if pd.notna(t) and r["LTP"] > t and bd <= 10:
-            row = {"Symbol": r["Symbol"], "LTP": r["LTP"], "% Change": r.get("% Change",""), "Climax_Date": d, "Breach_Days": bd, "Climax_Range (T/B)": format_tb_pair(r["LTP"], t, b)}
-            spot_sig = spot_signal_map.get(get_underlying_spot(r["Symbol"]), "")
-            row["Signal_Type"] = "Holy Grail" if spot_sig == "Fresh Sweep" else "Active Trend"
-            if r["Symbol"].endswith("CE"):
-                ce_rows.append(row)
-            elif r["Symbol"].endswith("PE"):
-                pe_rows.append(row)
-    return pd.DataFrame(ce_rows), pd.DataFrame(pe_rows)
+    valid_rows = []
+    for _, row in df.iterrows():
+        t, b, d, bd = row.get("T_LOC"), row.get("B_LOC"), row.get("D_LOC"), row.get("Days_L_LOC")
+        if pd.notna(t) and row["LTP"] > t and bd <= 10:
+            r_dict = row.to_dict()
+            spot_signal = spot_signal_map.get(get_underlying_spot(row["Symbol"]), "")
+            r_dict["Signal_Type"] = "Holy Grail" if spot_signal == "Fresh Sweep" else "Active Trend"
+            r_dict["Climax_Date"] = d
+            r_dict["Breach_Days"] = bd
+            r_dict["Climax_Range (T/B)"] = format_tb_pair(row["LTP"], t, b)
+            valid_rows.append(r_dict)
+    res = pd.DataFrame(valid_rows)
+    if res.empty:
+        return pd.DataFrame(), pd.DataFrame()
+    return res[res["Symbol"].str.endswith("CE")], res[res["Symbol"].str.endswith("PE")]
 
-# Finalize DataFrame with fixed columns
-def finalize_df(df, cols):
-    if df is None or df.empty:
-        return pd.DataFrame(columns=cols)
-    df2 = df.copy()
-    for c in cols:
-        if c not in df2.columns:
-            df2[c] = ""
-    return df2.reindex(columns=cols).fillna("")
-
-# HTML table builders (same styling; use finalized tables for safe access)
 def build_html_table(df, title, cols):
-    if df is None or df.empty:
-        return f"<h3 style='color:#fbbf24'>{title}</h3><p style='color:#94a3b8'>No candidates.</p>"
-    table_html = f"<h3 style='color:#fbbf24'>{title}</h3><table style='width:100%;background:#0f172a;color:#e2e8f0;font-family:sans-serif;font-size:13px;border-collapse:collapse'>"
-    table_html += "<tr style='background:#1e293b;color:#f1f5f9'>" + "".join([f"<th style='padding:8px;border:1px solid #334155'>{c}</th>" for c in cols]) + "</tr>"
+    if df.empty:
+        return f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top: 25px;'>{title}</h3><p style='color:#94a3b8; font-family:sans-serif;'>No candidates.</p>"
+    table_html = f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top: 25px;'>{title}</h3><table style='border-collapse: collapse; width: 100%; font-family: sans-serif; font-size: 13px; text-align: left; background-color: #0f172a;'>"
+    table_html += "<tr style='background-color: #1e293b; color: #f1f5f9;'>" + "".join([f"<th style='padding: 10px; border: 1px solid #334155;'>{c}</th>" for c in cols]) + "</tr>"
     for i, (_, row) in enumerate(df.iterrows()):
-        bg = "#0f172a" if i%2==0 else "#1e293b"
-        table_html += f"<tr style='background:{bg};color:#e2e8f0'>"
+        bg_row = "#0f172a" if i % 2 == 0 else "#1e293b"
+        sig = str(row.get("Signal_Type", ""))
+        row_style = f"background-color: {bg_row}; color: #e2e8f0;"
+        if "Holy Grail" in sig:
+            row_style = "background-color: #581c87; color: #f5d0fe;"
+        elif "Sweep" in sig:
+            row_style = "background-color: #92400e; color: #fef3c7;"
+        table_html += f"<tr style='{row_style}'>"
         for c in cols:
-            val = row.get(c, "")
-            table_html += f"<td style='padding:8px;border:1px solid #334155'>{format_value(c, val)}</td>"
+            val = row.get(c)
+            style = "padding: 8px; border: 1px solid #334155;"
+            if c == "% Change":
+                try:
+                    fval = float(val)
+                    style += " color: #4ade80; font-weight: bold;" if fval > 0 else " color: #f87171; font-weight: bold;"
+                except (TypeError, ValueError):
+                    pass
+            table_html += f"<td style='{style}'>{format_value(c, val)}</td>"
         table_html += "</tr>"
-    table_html += "</table>"
-    return table_html
+    return table_html + "</table>"
 
-# Save outputs as separate CSVs
-def save_outputs(dashboard_df, long_df, short_df, ce_df, pe_df):
+def save_outputs(summary_df):
     ts = datetime.now().strftime("%Y%m%d_%H%M")
-    out = "output"
-    os.makedirs(out, exist_ok=True)
-    db = finalize_df(dashboard_df, DASHBOARD_COLS)
-    lg = finalize_df(long_df, STRATEGY_COLS)
-    sh = finalize_df(short_df, STRATEGY_COLS)
-    ce = finalize_df(ce_df, OPT_COLS)
-    pe = finalize_df(pe_df, OPT_COLS)
-    f_db = os.path.join(out, f"market_dashboard_{ts}.csv")
-    f_lg = os.path.join(out, f"long_strategy_{ts}.csv")
-    f_sh = os.path.join(out, f"short_strategy_{ts}.csv")
-    f_ce = os.path.join(out, f"ce_candidates_{ts}.csv")
-    f_pe = os.path.join(out, f"pe_candidates_{ts}.csv")
-    db.to_csv(f_db, index=False, na_rep="")
-    lg.to_csv(f_lg, index=False, na_rep="")
-    sh.to_csv(f_sh, index=False, na_rep="")
-    ce.to_csv(f_ce, index=False, na_rep="")
-    pe.to_csv(f_pe, index=False, na_rep="")
-    return f_db, f_lg, f_sh, f_ce, f_pe
+    csv_file = f"scan_summary_{ts}.csv"
+    summary_df.to_csv(csv_file, index=False)
+    return csv_file
 
-# Email
-def send_email(dashboard_df, long_df, short_df, ce_df, pe_df, csv_files):
+def send_email(dashboard_df, long_df, short_df, ce_df, pe_df, csv_file):
     try:
         msg = MIMEMultipart()
         msg["From"] = cfg.sender_email
         msg["To"] = cfg.recipient_email
         msg["Subject"] = f"Index Climax Dashboard - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        html = "<body style='background:#030712;padding:20px;font-family:sans-serif'>"
-        html += build_html_table(finalize_df(dashboard_df, DASHBOARD_COLS), "Market Dashboard", EMAIL_DISPLAY_COLS)
-        html += build_html_table(finalize_df(long_df, STRATEGY_COLS), "Long Strategy Matrix", EMAIL_DISPLAY_COLS)
-        html += build_html_table(finalize_df(short_df, STRATEGY_COLS), "Short Strategy Matrix", EMAIL_DISPLAY_COLS)
-        html += build_html_table(finalize_df(ce_df, OPT_COLS), "Call Options (CE) Climax Verification", EMAIL_OPT_COLS)
-        html += build_html_table(finalize_df(pe_df, OPT_COLS), "Put Options (PE) Climax Verification", EMAIL_OPT_COLS)
-        html += "</body>"
+        html = (
+            "<body style='background-color: #030712; padding: 20px; font-family: sans-serif;'>"
+            + build_html_table(dashboard_df, "Market Dashboard", EMAIL_DISPLAY_COLS)
+            + build_html_table(long_df, "Long Strategy Matrix", EMAIL_CAND_COLS)
+            + build_html_table(short_df, "Short Strategy Matrix", EMAIL_CAND_COLS)
+            + build_html_table(ce_df, "Call Options (CE) Climax Verification", EMAIL_OPT_COLS)
+            + build_html_table(pe_df, "Put Options (PE) Climax Verification", EMAIL_OPT_COLS)
+            + "</body>"
+        )
         msg.attach(MIMEText(html, "html"))
-        # attach CSVs
-        for f in csv_files:
-            with open(f, "rb") as fh:
-                part = MIMEBase("application","octet-stream")
-                part.set_payload(fh.read())
-                encoders.encode_base64(part)
-                part.add_header("Content-Disposition", f'attachment; filename={os.path.basename(f)}')
-                msg.attach(part)
+        with open(csv_file, "rb") as f:
+            part = MIMEBase("application", "octet-stream")
+            part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f"attachment; filename={os.path.basename(csv_file)}")
+            msg.attach(part)
         with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port) as s:
             s.starttls()
             s.login(cfg.sender_email, cfg.sender_password)
             s.sendmail(cfg.sender_email, cfg.recipient_email, msg.as_string())
-        logger.info("Email sent.")
+        logger.info("Email sent successfully.")
     except Exception as e:
-        logger.error(f"Email failed: {e}")
+        logger.error(f"Email Failed: {e}")
 
 def main():
     fyers = init_fyers()
     if not fyers:
-        logger.error("Fyers init failed; exiting.")
         return
-    # spot scan (this produces intermediate columns like T_1M, Days_L_1M etc. expected from original logic)
     spot_df = scan_fno_universe(fyers)
-    if spot_df is None or spot_df.empty:
-        logger.warning("No spot data; exiting.")
+    if spot_df.empty:
+        logger.warning("No spot data generated.")
         return
-    # dashboard + candidate matrices
     dashboard_df, long_df, short_df = build_dashboard_and_candidates(spot_df)
-    # collect option symbols from candidates
-    opt_symbols = []
-    for df in [long_df, short_df]:
-        if df is not None and not df.empty and "Target_Options" in df.columns:
-            for sub in df["Target_Options"].tolist():
-                if isinstance(sub, list):
-                    opt_symbols.extend(sub)
-    opt_symbols = list(set(opt_symbols))
+    all_opt = []
+    if not long_df.empty and "Target_Options" in long_df.columns:
+        for sublist in long_df["Target_Options"].tolist():
+            if isinstance(sublist, list):
+                all_opt.extend(sublist)
+    if not short_df.empty and "Target_Options" in short_df.columns:
+        for sublist in short_df["Target_Options"].tolist():
+            if isinstance(sublist, list):
+                all_opt.extend(sublist)
+    all_opt = list(set(all_opt))
+
     spot_map = {}
-    if long_df is not None and not long_df.empty and "Trigger_TF" in long_df.columns:
-        spot_map.update({r["Symbol"]: r.get("Signal_Type","Active Trend") for _, r in long_df.iterrows()})
-    if short_df is not None and not short_df.empty and "Trigger_TF" in short_df.columns:
-        spot_map.update({r["Symbol"]: r.get("Signal_Type","Active Trend") for _, r in short_df.iterrows()})
-    ce_df = pd.DataFrame(); pe_df = pd.DataFrame()
-    if opt_symbols:
-        opt_scan = scan_options_universe(fyers, opt_symbols)
-        ce_df, pe_df = build_option_candidate_tables(opt_scan, spot_map)
-    # Save outputs (separate CSVs)
-    csv_files = save_outputs(dashboard_df, long_df, short_df, ce_df, pe_df)
-    # send email with inline HTML + attachments
-    send_email(dashboard_df, long_df, short_df, ce_df, pe_df, csv_files)
-    logger.info("Done.")
+    if not long_df.empty and "Signal_Type" in long_df.columns:
+        spot_map.update({r["Symbol"]: r["Signal_Type"] for _, r in long_df.iterrows()})
+    if not short_df.empty and "Signal_Type" in short_df.columns:
+        spot_map.update({r["Symbol"]: r["Signal_Type"] for _, r in short_df.iterrows()})
+
+    ce_df, pe_df = pd.DataFrame(), pd.DataFrame()
+    if all_opt:
+        opt_df = scan_options_universe(fyers, all_opt)
+        ce_df, pe_df = build_option_candidate_tables(opt_df, spot_map)
+
+    csv_f = save_outputs(spot_df)
+    send_email(dashboard_df, long_df, short_df, ce_df, pe_df, csv_f)
 
 if __name__ == "__main__":
     main()
