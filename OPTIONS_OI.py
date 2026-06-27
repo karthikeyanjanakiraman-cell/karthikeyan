@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FO_FNO_FYERS_VOL_REL_EMAIL.py - Final Comprehensive Index Dashboard & Strategy Scanner
+FO_FNO_FYERS_VOL_REL_EMAIL.py - Comprehensive Index Dashboard & Strategy Scanner
 """
 
 import os
@@ -38,11 +38,11 @@ class Config:
 
 cfg = Config()
 
-# Column order updated as requested
+# Columns reordered: 1-Day, 3-Day, 1-Week, etc.
 EMAIL_DISPLAY_COLS = [
     "Symbol", "LTP", "Trigger_TF", 
-    "3-Day (T/B)", "1-Week (T/B)", "1-Month (T/B)", 
-    "3-Month (T/B)", "6-Month (T/B)"
+    "1-Day (T/B)", "3-Day (T/B)", "1-Week (T/B)", 
+    "1-Month (T/B)", "3-Month (T/B)", "6-Month (T/B)"
 ]
 
 EMAIL_OPT_COLS = [
@@ -147,13 +147,13 @@ def scan_fno_universe(fyers):
             ltp = float(daily["close"].iloc[-1])
             bands, streak_data = {}, {}
             
-            # Non-overlapping windows in requested order
+            # Non-overlapping windows
             timeframe_windows = [
-                ("3D", 3, 0), ("1W", 5, 3), ("1M", 22, 6), ("3M", 65, 23), ("6M", 135, 66)
+                ("1D", 2, 1), ("3D", 5, 2), ("1W", 10, 5), ("1M", 25, 10), ("3M", 70, 25), ("6M", 140, 70)
             ]
             
             for label, max_days, min_days in timeframe_windows:
-                df_s = daily.iloc[-max_days:-min_days] if min_days > 0 else daily.iloc[-max_days:]
+                df_s = daily.iloc[-max_days:-min_days]
                 if df_s.empty: continue
                 idx_val = df_s["volume"].idxmax() if (df_s["volume"]>0).any() else (df_s["high"]-df_s["low"]).idxmax()
                 c = df_s.loc[idx_val]
@@ -208,13 +208,14 @@ def build_dashboard_and_candidates(df):
     for _, row in df.iterrows():
         r_dict = row.to_dict()
         # Order matches EMAIL_DISPLAY_COLS
-        for tf in ["3D", "1W", "1M", "3M", "6M"]:
-            label = tf.replace('D','-Day').replace('M','-Month').replace('W','-Week')
-            r_dict[f"{label} (T/B)"] = format_tb_pair(row["LTP"], row.get(f"T_{tf}"), row.get(f"B_{tf}"))
+        for tf in ["1D", "3D", "1W", "1M", "3M", "6M"]:
+            label_map = {"1D": "1-Day", "3D": "3-Day", "1W": "1-Week", "1M": "1-Month", "3M": "3-Month", "6M": "6-Month"}
+            display_label = label_map.get(tf, tf)
+            r_dict[f"{display_label} (T/B)"] = format_tb_pair(row["LTP"], row.get(f"T_{tf}"), row.get(f"B_{tf}"))
         dashboard_rows.append(r_dict)
         
         # Strategy check
-        for tf in ["3D", "1W", "1M", "3M", "6M"]:
+        for tf in ["1D", "3D", "1W", "1M", "3M", "6M"]:
             t, b, d, bd_l, bd_s = row.get(f"T_{tf}"), row.get(f"B_{tf}"), row.get(f"D_{tf}"), row.get(f"Days_L_{tf}"), row.get(f"Days_S_{tf}")
             if pd.notna(t) and row["LTP"] > t and bd_l <= 5:
                 strike, opt_str, opt_list = get_options_data(row["Symbol"], row["LTP"], "long")
