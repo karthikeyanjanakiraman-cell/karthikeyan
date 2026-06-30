@@ -1,8 +1,7 @@
 #!/usr/bin/env python3
 """
 FO_FNO_FYERS_CONFLUENCE_EMAIL.py
-Index & Stock Confluence Screener
-LTP is set to the 9:15 AM candle OPEN.
+Index & Stock Confluence Screener using HV/LV price confluence.
 """
 
 import os
@@ -11,7 +10,6 @@ import logging
 import warnings
 import smtplib
 from datetime import datetime, timedelta
-from html import escape
 
 import numpy as np
 import pandas as pd
@@ -34,6 +32,7 @@ class Config:
         self.lookback_days = int(os.environ.get("LOOKBACK_DAYS", "150"))
         self.top_n = int(os.environ.get("TOP_N", "60"))
         self.dedupe_pct = float(os.environ.get("DEDUPE_PCT", "0.005"))
+        self.match_tolerance = float(os.environ.get("MATCH_TOLERANCE", "0.005"))
 
         self.index_symbols = [
             "NSE:NIFTY50-INDEX",
@@ -58,48 +57,27 @@ class Config:
 cfg = Config()
 
 EMAIL_DISPLAY_COLS = [
-    "Symbol",
-    "% Change",
-    "Conf_Below-3",
-    "Conf_Below-2",
-    "Conf_Below-1",
+    "Symbol", "% Change",
+    "Conf_Below-3", "Conf_Below-2", "Conf_Below-1",
     "LTP",
-    "Conf_Above-1",
-    "Conf_Above-2",
-    "Conf_Above-3",
+    "Conf_Above-1", "Conf_Above-2", "Conf_Above-3"
 ]
 
 RESULT_COLS = [
-    "Symbol",
-    "Anchor_915",
-    "LTP",
-    "Current_Price",
-    "% Change",
-    "Signal",
-    "Conf_Below-3",
-    "Conf_Below-2",
-    "Conf_Below-1",
-    "Conf_Above-1",
-    "Conf_Above-2",
-    "Conf_Above-3",
-    "Support",
-    "Resistance",
-    "Support_Gap_Pct",
-    "Resistance_Gap_Pct",
+    "Symbol", "Anchor_915", "LTP", "% Change", "Signal",
+    "Conf_Below-3", "Conf_Below-2", "Conf_Below-1",
+    "Conf_Above-1", "Conf_Above-2", "Conf_Above-3",
+    "Support", "Resistance", "Support_Gap_Pct", "Resistance_Gap_Pct"
 ]
 
-logger = logging.getLogger("lowvol")
+logger = logging.getLogger("confluence")
 logger.setLevel(logging.INFO)
 logger.handlers.clear()
 
-stream_handler = logging.StreamHandler(sys.stdout)
-stream_handler.setFormatter(
-    logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(message)s",
-        datefmt="%Y-%m-%d %H:%M:%S",
-    )
-)
-logger.addHandler(stream_handler)
+ch = logging.StreamHandler(sys.stdout)
+ch.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+logger.addHandler(ch)
+
 warnings.filterwarnings("ignore")
 
 
@@ -113,40 +91,38 @@ def safe_float(val):
 
 
 def format_value(val):
-    if val is None or pd.isna(val):
+    if pd.isna(val) or val in [float("inf"), float("-inf")]:
         return "-"
     if isinstance(val, (int, float, np.integer, np.floating)):
-        if np.isinf(val):
-            return "-"
         return f"{float(val):.2f}"
-    return escape(str(val))
+    return str(val)
 
 
 def format_change(val):
-    val = safe_float(val)
-    if pd.isna(val):
+    try:
+        return f"{float(val):.2f}%"
+    except (TypeError, ValueError):
         return "-"
-    return f"{val:.2f}%"
 
 
 def init_fyers():
-    if not cfg.client_id or not cfg.access_token:
-        logger.error("Missing CLIENT_ID/ACCESS_TOKEN.")
-        return None
-
     try:
+        if not cfg.client_id or not cfg.access_token:
+            logger.error("Missing CLIENT_ID/ACCESS_TOKEN.")
+            return None
+
         return fyersModel.FyersModel(
             client_id=cfg.client_id,
             is_async=False,
             token=cfg.access_token,
-            log_path="",
+            log_path=""
         )
     except Exception as e:
-        logger.error(f"INIT Failed: {e}")
+        logger.warning(f"INIT Failed: {e}")
         return None
 
 
-def get_history(fyers, symbol, resolution, days):
+def get_history(fyers, symbol, res, days):
     try:
         now = datetime.now()
         start = (now - timedelta(days=days)).strftime("%Y-%m-%d")
@@ -154,36 +130,35 @@ def get_history(fyers, symbol, resolution, days):
 
         res_data = fyers.history(data={
             "symbol": symbol,
-            "resolution": resolution,
+            "resolution": res,
             "date_format": "1",
             "range_from": start,
             "range_to": end,
             "cont_flag": "1",
         })
 
-        candles = res_data.get("candles", []) if isinstance(res_data, dict) else []
-        if not candles:
-            return None
+        if res_data and "candles" in res_data:
+            df = pd.DataFrame(
+                res_data["candles"],
+                columns=["timestamp", "open", "high", "low", "close", "volume"]
+            )
+            df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
+            df = df.sort_values("timestamp").reset_index(drop=True)
 
-        df = pd.DataFrame(
-            candles,
-            columns=["timestamp", "open", "high", "low", "close", "volume"]
-        )
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
-        df = df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
+            for col in ["open", "high", "low", "close", "volume"]:
+                df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        for col in ["open", "high", "low", "close", "volume"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
+            return df
 
-        return df
+        return None
     except Exception as e:
-        logger.warning(f"History fetch failed for {symbol} [{resolution}]: {e}")
+        logger.warning(f"History fetch failed for {symbol} [{res}]: {e}")
         return None
 
 
 def get_opening_anchor(fyers, symbol):
     """
-    Uses the OPEN of the first 5-minute candle of the day as the 9:15 AM reference.
+    Uses the OPEN of the first 5-minute candle as 9:15 anchor.
     """
     try:
         today = datetime.now().strftime("%Y-%m-%d")
@@ -196,61 +171,64 @@ def get_opening_anchor(fyers, symbol):
             "cont_flag": "1"
         })
 
-        candles = data.get("candles", []) if isinstance(data, dict) else []
-        if not candles:
-            return None
+        if data and "candles" in data and len(data["candles"]) > 0:
+            return float(data["candles"][0][1])
 
-        df = pd.DataFrame(
-            candles,
-            columns=["timestamp", "open", "high", "low", "close", "volume"]
-        )
-        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
-        df = df.sort_values("timestamp").reset_index(drop=True)
-
-        return safe_float(df.iloc[0]["open"])
+        return None
     except Exception as e:
         logger.warning(f"Opening anchor fetch failed for {symbol}: {e}")
         return None
 
 
 def dedupe_levels(levels, tolerance_pct):
-    vals = sorted([
+    values = sorted([
         safe_float(x) for x in levels
         if not pd.isna(safe_float(x)) and safe_float(x) > 0
     ])
 
-    if not vals:
+    if not values:
         return []
 
-    grouped = [[vals[0]]]
-    for val in vals[1:]:
-        ref = float(np.mean(grouped[-1]))
+    groups = [[values[0]]]
+    for val in values[1:]:
+        ref = float(np.mean(groups[-1]))
         if ref > 0 and abs(val - ref) / ref <= tolerance_pct:
-            grouped[-1].append(val)
+            groups[-1].append(val)
         else:
-            grouped.append([val])
+            groups.append([val])
 
-    return [round(float(np.mean(group)), 2) for group in grouped]
+    return [round(float(np.mean(group)), 2) for group in groups]
+
+
+def build_price_levels(df):
+    raw_levels = []
+    raw_levels.extend(df["high"].dropna().tolist())
+    raw_levels.extend(df["low"].dropna().tolist())
+    raw_levels.extend(df["close"].dropna().tolist())
+    return raw_levels
 
 
 def extract_confluence_levels(df):
     if df is None or df.empty:
         return []
 
-    work = df.copy()
-    if "volume" not in work.columns:
-        work["volume"] = 0
+    work = df.dropna(subset=["high", "low", "close", "volume"]).copy()
+    if work.empty:
+        return []
 
     hv_work = work.sort_values(["volume", "high"], ascending=[False, False]).head(cfg.top_n)
     lv_work = work.sort_values(["volume", "high"], ascending=[True, False]).head(cfg.top_n)
 
-    raw_levels = []
-    for part in [hv_work, lv_work]:
-        raw_levels.extend(part["high"].dropna().tolist())
-        raw_levels.extend(part["low"].dropna().tolist())
-        raw_levels.extend(part["close"].dropna().tolist())
+    hv_levels = dedupe_levels(build_price_levels(hv_work), cfg.dedupe_pct)
+    lv_levels = dedupe_levels(build_price_levels(lv_work), cfg.dedupe_pct)
 
-    return dedupe_levels(raw_levels, cfg.dedupe_pct)
+    confluence = []
+    for hv in hv_levels:
+        for lv in lv_levels:
+            if hv > 0 and abs(hv - lv) / hv <= cfg.match_tolerance:
+                confluence.append(round((hv + lv) / 2.0, 2))
+
+    return dedupe_levels(confluence, cfg.dedupe_pct)
 
 
 def nearest_levels(levels, ref_price, count=3):
@@ -267,28 +245,27 @@ def nearest_levels(levels, ref_price, count=3):
     return below_vals, above_vals
 
 
-def nearest_support_resistance(levels, current_price):
+def nearest_support_resistance(levels, ltp):
     levels = sorted(set(levels))
-    support = max([x for x in levels if x < current_price], default=np.nan)
-    resistance = min([x for x in levels if x > current_price], default=np.nan)
+    support = max([x for x in levels if x < ltp], default=np.nan)
+    resistance = min([x for x in levels if x > ltp], default=np.nan)
     return support, resistance
 
 
-def build_row(symbol, anchor_price, current_price, levels):
-    below_vals, above_vals = nearest_levels(levels, anchor_price, count=3)
-    support, resistance = nearest_support_resistance(levels, current_price)
+def build_row(symbol, anchor_price, ltp, levels):
+    below_vals, above_vals = nearest_levels(levels, ltp, count=3)
+    support, resistance = nearest_support_resistance(levels, ltp)
 
-    pct_change = ((current_price - anchor_price) / anchor_price * 100.0) if anchor_price else np.nan
+    pct_change = ((ltp - anchor_price) / anchor_price * 100.0) if anchor_price else np.nan
     signal = "Long" if not pd.isna(pct_change) and pct_change >= 0 else "Short"
 
-    support_gap_pct = ((current_price - support) / current_price * 100.0) if not pd.isna(support) and current_price else np.nan
-    resistance_gap_pct = ((resistance - current_price) / current_price * 100.0) if not pd.isna(resistance) and current_price else np.nan
+    support_gap_pct = ((ltp - support) / ltp * 100.0) if not pd.isna(support) and ltp else np.nan
+    resistance_gap_pct = ((resistance - ltp) / ltp * 100.0) if not pd.isna(resistance) and ltp else np.nan
 
     return {
         "Symbol": symbol,
         "Anchor_915": round(anchor_price, 2),
-        "LTP": round(anchor_price, 2),
-        "Current_Price": round(current_price, 2),
+        "LTP": round(ltp, 2),
         "% Change": round(pct_change, 2) if not pd.isna(pct_change) else np.nan,
         "Signal": signal,
         "Conf_Below-3": below_vals[0],
@@ -319,26 +296,23 @@ def scan_universe(fyers, symbol_list, is_stock=False):
                 logger.info(f"Skipping {sym}: no daily history.")
                 continue
 
-            daily = daily.dropna(subset=["high", "low", "close"]).copy()
-            if daily.empty:
-                logger.info(f"Skipping {sym}: invalid price history.")
-                continue
-
             valid_daily = daily[daily["volume"].fillna(0) > 0].copy()
             if valid_daily.empty:
-                valid_daily = daily.copy()
+                logger.info(f"Skipping {sym}: no valid daily rows.")
+                continue
 
             levels = extract_confluence_levels(valid_daily)
             if not levels:
-                logger.info(f"Skipping {sym}: no confluence levels.")
+                logger.info(f"Skipping {sym}: no HV/LV confluence levels.")
                 continue
 
-            current_price = safe_float(valid_daily["close"].iloc[-1])
-            if pd.isna(current_price):
-                logger.info(f"Skipping {sym}: invalid current price.")
+            ltp = safe_float(valid_daily["close"].iloc[-1])
+            if pd.isna(ltp):
+                logger.info(f"Skipping {sym}: invalid LTP.")
                 continue
 
-            rows.append(build_row(sym, anchor_price, current_price, levels))
+            row = build_row(sym, anchor_price, ltp, levels)
+            rows.append(row)
 
         except Exception as e:
             logger.warning(f"Scan failed for {sym}: {e}")
@@ -346,90 +320,76 @@ def scan_universe(fyers, symbol_list, is_stock=False):
     if not rows:
         return pd.DataFrame(columns=RESULT_COLS)
 
-    df = pd.DataFrame(rows)
+    out = pd.DataFrame(rows)
     for col in RESULT_COLS:
-        if col not in df.columns:
-            df[col] = np.nan
+        if col not in out.columns:
+            out[col] = np.nan
 
-    return df[RESULT_COLS]
+    return out[RESULT_COLS]
 
 
 def build_html_table(df, title, cols):
     if df is None or df.empty:
         return (
-            f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top:25px;'>{escape(title)}</h3>"
+            f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top:25px;'>{title}</h3>"
             "<p style='color:#94a3b8; font-family:sans-serif;'>No candidates found today.</p>"
         )
 
-    work = df.copy()
-    for col in cols:
-        if col not in work.columns:
-            work[col] = np.nan
-
     table_html = (
-        f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top:25px;'>{escape(title)}</h3>"
+        f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top:25px;'>{title}</h3>"
         "<table style='border-collapse:collapse; width:100%; font-family:sans-serif; "
         "font-size:13px; text-align:left; background-color:#0f172a;'>"
     )
 
     table_html += (
         "<tr style='background-color:#1e293b; color:#f1f5f9;'>"
-        + "".join(
-            f"<th style='padding:10px; border:1px solid #334155;'>{escape(c)}</th>"
-            for c in cols
-        )
+        + "".join([f"<th style='padding:10px; border:1px solid #334155;'>{c}</th>" for c in cols])
         + "</tr>"
     )
 
-    for i, (_, row) in enumerate(work.iterrows()):
+    for i, (_, row) in enumerate(df.iterrows()):
         bg_row = "#0f172a" if i % 2 == 0 else "#1e293b"
         table_html += f"<tr style='background-color:{bg_row}; color:#e2e8f0;'>"
 
         for c in cols:
+            val = row.get(c, "-")
             style = "padding:8px; border:1px solid #334155;"
-            val = row.get(c, np.nan)
 
             if c == "% Change":
-                num = safe_float(val)
-                val_str = format_change(num)
-                if not pd.isna(num):
-                    style += " color:#4ade80; font-weight:bold;" if num >= 0 else " color:#f87171; font-weight:bold;"
+                val_num = safe_float(val)
+                val_str = format_change(val_num)
+                if not pd.isna(val_num):
+                    style += " color:#4ade80; font-weight:bold;" if val_num > 0 else " color:#f87171; font-weight:bold;"
                 table_html += f"<td style='{style}'>{val_str}</td>"
             else:
                 table_html += f"<td style='{style}'>{format_value(val)}</td>"
 
         table_html += "</tr>"
 
-    table_html += "</table>"
-    return table_html
+    return table_html + "</table>"
 
 
 def send_email(index_df, long_df, short_df):
     try:
-        recipients = [x.strip() for x in cfg.recipient_email.split(",") if x.strip()]
-        if not recipients:
-            raise ValueError("RECIPIENT_EMAIL is empty.")
-
-        msg = MIMEMultipart("alternative")
+        msg = MIMEMultipart()
         msg["From"] = cfg.sender_email
-        msg["To"] = ", ".join(recipients)
+        msg["To"] = cfg.recipient_email
         msg["Subject"] = f"Confluence Trade Setups - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 
         html = (
-            "<html><body style='background-color:#030712; padding:20px; font-family:sans-serif;'>"
-            "<h2 style='color:#e2e8f0;'>Confluence Dashboard</h2>"
-            f"{build_html_table(index_df, 'Market Index Confluence Dashboard', EMAIL_DISPLAY_COLS)}"
-            f"{build_html_table(long_df, 'F&O Long Candidates (Ordered by Proximity to Support)', EMAIL_DISPLAY_COLS)}"
-            f"{build_html_table(short_df, 'F&O Short Candidates (Ordered by Proximity to Resistance)', EMAIL_DISPLAY_COLS)}"
-            "</body></html>"
+            "<body style='background-color:#030712; padding:20px; font-family:sans-serif;'>"
+            + build_html_table(index_df, "Market Index Confluence Dashboard", EMAIL_DISPLAY_COLS)
+            + build_html_table(long_df, "F&O Long Candidates (Ordered by Proximity to Support)", EMAIL_DISPLAY_COLS)
+            + build_html_table(short_df, "F&O Short Candidates (Ordered by Proximity to Resistance)", EMAIL_DISPLAY_COLS)
+            + "</body>"
         )
 
         msg.attach(MIMEText(html, "html"))
 
-        with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port) as server:
-            server.starttls()
-            server.login(cfg.sender_email, cfg.sender_password)
-            server.sendmail(cfg.sender_email, recipients, msg.as_string())
+        with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port) as s:
+            s.starttls()
+            s.login(cfg.sender_email, cfg.sender_password)
+            s.sendmail(cfg.sender_email, cfg.recipient_email, msg.as_string())
 
         logger.info("Confluence Email sent successfully.")
     except Exception as e:
@@ -467,13 +427,6 @@ def main():
                 ascending=[True, True],
                 na_position="last",
             )
-
-    if not index_df.empty:
-        index_df = index_df.sort_values(
-            by=["% Change", "Symbol"],
-            ascending=[False, True],
-            na_position="last",
-        )
 
     send_email(index_df, long_stocks, short_stocks)
 
