@@ -303,39 +303,25 @@ def fetch_text(url, timeout=30):
     return resp.text
 
 
-def detect_underlying_column(df):
-    best_col = None
-    best_score = float("-inf")
-    for col in df.columns:
-        s = df[col].astype(str).str.strip().str.upper()
-        alpha_like = s.str.fullmatch(r"[A-Z][A-Z0-9&\-]{1,30}").fillna(False).sum()
-        too_numeric = s.str.contains(r"\d{2,}", regex=True, na=False).sum()
-        score = alpha_like - 0.25 * too_numeric
-        if score > best_score:
-            best_col = col
-            best_score = score
-    return best_col
-
-
 def get_live_fno_symbols():
     exclude_exact = {
         "", "SYMBOL", "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY",
-        "NIFTYNXT50", "SENSEX", "BANKEX"
+        "NIFTYNXT50", "SENSEX", "BANKEX", "CE", "PE", "XX", "FUT"
     }
     try:
         text = fetch_text(FYERS_FO_MASTER_URL)
         raw = pd.read_csv(StringIO(text), header=None)
         if raw.empty:
             raise ValueError("NSE_FO.csv is empty")
+        if raw.shape[1] <= 13:
+            raise ValueError(f"Unexpected NSE_FO.csv shape: {raw.shape}")
 
-        col = detect_underlying_column(raw)
-        if col is None:
-            raise ValueError("Could not detect underlying column")
+        # FYERS community example shows underlying at column 13 in NSE_FO.csv.
+        underlying = raw[13].astype(str).str.strip().str.upper()
 
-        series = raw[col].astype(str).str.strip().str.upper()
         symbols = set()
-        for sym in series.dropna().unique():
-            if sym in exclude_exact:
+        for sym in underlying.dropna().unique():
+            if not sym or sym in exclude_exact:
                 continue
             if any(x in sym for x in ["NIFTY", "SENSEX", "BANKEX"]):
                 continue
@@ -431,7 +417,7 @@ def build_row(symbol, anchor_price, ltp_price, levels):
     }
 
 
-def scan_universe(fyers, symbol_list):
+def scan_universe(fyers, symbol_list, use_quotes_only=False):
     rows = []
     if not symbol_list:
         return pd.DataFrame(columns=RESULT_COLS)
@@ -441,10 +427,16 @@ def scan_universe(fyers, symbol_list):
 
     for sym in symbol_list:
         try:
-            anchor_price = get_opening_anchor(fyers, sym)
-            if pd.isna(anchor_price):
-                logger.info(f"Skipping {sym}: no valid 09:15 anchor.")
-                continue
+            if use_quotes_only:
+                anchor_price = safe_float(quotes_map.get(sym))
+                if pd.isna(anchor_price):
+                    logger.info(f"Skipping {sym}: no valid quote anchor.")
+                    continue
+            else:
+                anchor_price = get_opening_anchor(fyers, sym)
+                if pd.isna(anchor_price):
+                    logger.info(f"Skipping {sym}: no valid 09:15 anchor.")
+                    continue
 
             daily = get_history(fyers, sym, "D", days=cfg.lookback_days)
             if daily is None or daily.empty:
@@ -527,7 +519,7 @@ def send_email(index_df, long_df, short_df):
         html = (
             "<html><body style='background-color:#030712; padding:20px; font-family:sans-serif;'>"
             "<h2 style='color:#e2e8f0;'>FYERS Confluence Dashboard</h2>"
-            "<p style='color:#94a3b8;'>Anchor_915 is the 9:15 AM candle open. % Change is computed from Anchor_915 to live Quotes API LTP.</p>"
+            "<p style='color:#94a3b8;'>For stocks, Anchor_915 is the 9:15 AM candle open. For indexes, anchor falls back to current quote because FYERS intraday history for some index symbols can intermittently fail. % Change is computed from anchor to live Quotes API LTP.</p>"
             f"{build_html_table(index_df, 'Market Index Nodes', EMAIL_DISPLAY_COLS)}"
             f"{build_html_table(long_df, 'F&O Long Candidates (Closest Support First)', EMAIL_DISPLAY_COLS)}"
             f"{build_html_table(short_df, 'F&O Short Candidates (Closest Resistance First)', EMAIL_DISPLAY_COLS)}"
@@ -552,7 +544,7 @@ def main():
         return
 
     logger.info("Starting index scan...")
-    index_df = scan_universe(fyers, cfg.index_symbols)
+    index_df = scan_universe(fyers, cfg.index_symbols, use_quotes_only=True)
 
     logger.info("Fetching live F&O stock universe from Fyers Master CSV...")
     live_stock_symbols = get_live_fno_symbols()
