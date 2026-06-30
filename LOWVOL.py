@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 FO_FNO_FYERS_CONFLUENCE_EMAIL.py
-Index & Stock Confluence Screener using HV/LV overlap zones.
+Index & Stock Confluence Screener using live NSE F&O universe
+from NSE page/API (no CSV) and HV/LV overlap zones.
 LTP is the 9:15 AM candle OPEN.
 """
 
@@ -14,6 +15,7 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
+import requests
 from fyers_apiv3 import fyersModel
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -41,7 +43,7 @@ class Config:
             "BSE:SENSEX-INDEX",
         ]
 
-        self.stock_symbols = [
+        self.fallback_stock_symbols = [
             "NSE:RELIANCE-EQ",
             "NSE:HDFCBANK-EQ",
             "NSE:ICICIBANK-EQ",
@@ -198,6 +200,97 @@ def get_opening_anchor(fyers, symbol):
         return None
 
 
+def get_live_fno_symbols():
+    """
+    Fetch live NSE F&O underlyings using NSE page/API endpoints.
+    No CSV is used.
+    Falls back to cfg.fallback_stock_symbols if nothing works.
+    """
+    urls = [
+        "https://www.nseindia.com/api/underlying-information",
+        "https://www.nseindia.com/api/equity-stockIndices?index=SECURITIES%20IN%20F%26O",
+    ]
+
+    headers = {
+        "User-Agent": "Mozilla/5.0",
+        "Accept": "application/json,text/plain,*/*",
+        "Referer": "https://www.nseindia.com/",
+        "Origin": "https://www.nseindia.com",
+    }
+
+    exclude = {
+        "", "SYMBOL", "NIFTY", "BANKNIFTY", "FINNIFTY",
+        "MIDCPNIFTY", "NIFTYNXT50", "SENSEX", "BANKEX"
+    }
+
+    session = requests.Session()
+    session.headers.update(headers)
+
+    try:
+        session.get("https://www.nseindia.com/", timeout=10)
+
+        for url in urls:
+            try:
+                resp = session.get(url, timeout=15)
+                if resp.status_code != 200:
+                    continue
+
+                data = resp.json()
+                symbols = set()
+
+                if isinstance(data, dict):
+                    for key in ["data", "value", "underlyings", "stocks"]:
+                        rows = data.get(key)
+                        if isinstance(rows, list):
+                            for row in rows:
+                                if not isinstance(row, dict):
+                                    continue
+
+                                sym = (
+                                    row.get("symbol")
+                                    or row.get("underlying")
+                                    or row.get("metadata", {}).get("symbol")
+                                )
+                                if sym:
+                                    sym = str(sym).strip().upper()
+                                    if (
+                                        sym not in exclude
+                                        and "NIFTY" not in sym
+                                        and "SENSEX" not in sym
+                                        and "BANKEX" not in sym
+                                    ):
+                                        symbols.add(f"NSE:{sym}-EQ")
+
+                elif isinstance(data, list):
+                    for row in data:
+                        if not isinstance(row, dict):
+                            continue
+                        sym = row.get("symbol") or row.get("underlying")
+                        if sym:
+                            sym = str(sym).strip().upper()
+                            if (
+                                sym not in exclude
+                                and "NIFTY" not in sym
+                                and "SENSEX" not in sym
+                                and "BANKEX" not in sym
+                            ):
+                                symbols.add(f"NSE:{sym}-EQ")
+
+                if symbols:
+                    out = sorted(symbols)
+                    logger.info(f"Fetched live F&O universe from NSE API/page: {len(out)} symbols")
+                    return out
+
+            except Exception as inner_e:
+                logger.warning(f"NSE endpoint failed {url}: {inner_e}")
+
+    except Exception as e:
+        logger.warning(f"Live NSE session init failed: {e}")
+
+    logger.warning("Falling back to configured stock universe.")
+    return cfg.fallback_stock_symbols
+
+
 def dedupe_levels(levels, tolerance_pct):
     values = sorted([
         safe_float(x) for x in levels
@@ -271,7 +364,7 @@ def nearest_support_resistance(levels, ref_price):
 
 
 def build_row(symbol, anchor_price, current_close, levels):
-    display_ltp = anchor_price  # LTP should be 9:15 open
+    display_ltp = anchor_price
     below_vals, above_vals = nearest_levels(levels, display_ltp, count=3)
     support, resistance = nearest_support_resistance(levels, display_ltp)
 
@@ -429,8 +522,11 @@ def main():
     logger.info("Starting Index Scan...")
     index_df = scan_universe(fyers, cfg.index_symbols, is_stock=False)
 
-    logger.info("Starting F&O Stock Scan...")
-    stock_df = scan_universe(fyers, cfg.stock_symbols, is_stock=True)
+    logger.info("Fetching live F&O stock universe from NSE page/API...")
+    live_stock_symbols = get_live_fno_symbols()
+
+    logger.info(f"Starting F&O Stock Scan on {len(live_stock_symbols)} symbols...")
+    stock_df = scan_universe(fyers, live_stock_symbols, is_stock=True)
 
     long_stocks = pd.DataFrame(columns=RESULT_COLS)
     short_stocks = pd.DataFrame(columns=RESULT_COLS)
