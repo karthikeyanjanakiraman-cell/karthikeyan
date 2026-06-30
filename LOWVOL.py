@@ -32,8 +32,8 @@ class Config:
         self.sender_password = os.environ.get("SENDER_PASSWORD", "password")
         self.recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
-        self.lookback_days = int(os.environ.get("LOOKBACK_DAYS", "150"))
-        self.top_n = int(os.environ.get("TOP_N", "60"))
+        self.lookback_days = int(os.environ.get("LOOKBACK_DAYS", "253"))
+        self.top_n = int(os.environ.get("TOP_N", "253"))
         self.dedupe_pct = float(os.environ.get("DEDUPE_PCT", "0.005"))
         self.match_tolerance = float(os.environ.get("MATCH_TOLERANCE", "0.005"))
 
