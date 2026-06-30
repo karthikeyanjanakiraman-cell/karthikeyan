@@ -5,11 +5,12 @@ FO_FNO_FYERS_CONFLUENCE_EMAIL_FIXED.py
 Production-hardened index and F&O stock screener using FYERS API v3.
 
 Key behavior:
+- Anchor_915 always represents the 09:15 AM candle OPEN for stocks.
+- Quote fallback is used only for calculations when 09:15 anchor is unavailable.
+- Index rows use quote anchor because FYERS index intraday history is often unstable.
 - Uses last completed trading session when run before market open.
-- Uses Quotes API for live prices.
-- Uses Quotes API fallback anchor when intraday 5m history is unavailable.
 - Uses FYERS NSE_FO.csv underlying column defensively.
-- Keeps email dashboard output compatible with original workflow.
+- Sends HTML email dashboard.
 """
 
 import os
@@ -21,7 +22,7 @@ import smtplib
 from io import StringIO
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime, timedelta, date
+from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
@@ -32,7 +33,7 @@ IST = "Asia/Kolkata"
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
-VERSION = "2026-07-01-r3"
+VERSION = "2026-07-01-r4"
 
 
 class Config:
@@ -77,11 +78,13 @@ cfg = Config()
 
 EMAIL_DISPLAY_COLS = [
     "Symbol",
+    "Anchor_Source",
     "% Change",
     "Conf_Below-3",
     "Conf_Below-2",
     "Conf_Below-1",
     "Anchor_915",
+    "LTP",
     "Conf_Above-1",
     "Conf_Above-2",
     "Conf_Above-3",
@@ -90,6 +93,8 @@ EMAIL_DISPLAY_COLS = [
 RESULT_COLS = [
     "Symbol",
     "Anchor_915",
+    "Anchor_Source",
+    "Calc_Anchor",
     "LTP",
     "Current_Close",
     "% Change",
@@ -398,18 +403,21 @@ def nearest_support_resistance(levels, ref_price):
     return support, resistance
 
 
-def build_row(symbol, anchor_price, ltp_price, levels):
-    below_vals, above_vals = nearest_levels(levels, anchor_price, count=3)
-    support, resistance = nearest_support_resistance(levels, anchor_price)
+def build_row(symbol, anchor_915, anchor_source, calc_anchor, ltp_price, levels):
+    ref_price = calc_anchor if not pd.isna(calc_anchor) else anchor_915
+    below_vals, above_vals = nearest_levels(levels, ref_price, count=3)
+    support, resistance = nearest_support_resistance(levels, ref_price)
 
-    pct_change = ((ltp_price - anchor_price) / anchor_price * 100.0) if anchor_price and not pd.isna(ltp_price) else np.nan
+    pct_change = ((ltp_price - calc_anchor) / calc_anchor * 100.0) if calc_anchor and not pd.isna(ltp_price) else np.nan
     signal = "Long" if not pd.isna(pct_change) and pct_change >= 0 else "Short"
-    support_gap_pct = ((anchor_price - support) / anchor_price * 100.0) if not pd.isna(support) and anchor_price else np.nan
-    resistance_gap_pct = ((resistance - anchor_price) / anchor_price * 100.0) if not pd.isna(resistance) and anchor_price else np.nan
+    support_gap_pct = ((ref_price - support) / ref_price * 100.0) if not pd.isna(support) and ref_price else np.nan
+    resistance_gap_pct = ((resistance - ref_price) / ref_price * 100.0) if not pd.isna(resistance) and ref_price else np.nan
 
     return {
         "Symbol": symbol,
-        "Anchor_915": round(anchor_price, 2),
+        "Anchor_915": round(anchor_915, 2) if not pd.isna(anchor_915) else np.nan,
+        "Anchor_Source": anchor_source,
+        "Calc_Anchor": round(calc_anchor, 2) if not pd.isna(calc_anchor) else np.nan,
         "LTP": round(ltp_price, 2) if not pd.isna(ltp_price) else np.nan,
         "Current_Close": round(ltp_price, 2) if not pd.isna(ltp_price) else np.nan,
         "% Change": round(pct_change, 2) if not pd.isna(pct_change) else np.nan,
@@ -438,20 +446,26 @@ def scan_universe(fyers, symbol_list, use_quotes_only=False, session_date=None):
 
     for sym in symbol_list:
         try:
+            ltp = safe_float(quotes_map.get(sym))
             if use_quotes_only:
-                anchor_price = safe_float(quotes_map.get(sym))
-                if pd.isna(anchor_price):
+                anchor_915 = np.nan
+                calc_anchor = ltp
+                anchor_source = "QUOTE_INDEX"
+                if pd.isna(calc_anchor):
                     logger.info(f"Skipping {sym}: no valid quote anchor.")
                     continue
             else:
-                anchor_price = get_opening_anchor(fyers, sym, session_date)
-                if pd.isna(anchor_price):
-                    anchor_price = safe_float(quotes_map.get(sym))
-                    if not pd.isna(anchor_price):
-                        logger.info(f"Intraday anchor unavailable for {sym}; using quote fallback anchor.")
-                    else:
+                anchor_915 = get_opening_anchor(fyers, sym, session_date)
+                if not pd.isna(anchor_915):
+                    calc_anchor = anchor_915
+                    anchor_source = "OPEN_915"
+                else:
+                    calc_anchor = ltp
+                    anchor_source = "QUOTE_FALLBACK"
+                    if pd.isna(calc_anchor):
                         logger.info(f"Skipping {sym}: no valid 09:15 anchor and no quote fallback.")
                         continue
+                    logger.info(f"Intraday anchor unavailable for {sym}; using quote fallback for calculations.")
 
             daily = get_history(fyers, sym, "D", days=cfg.lookback_days)
             if daily is None or daily.empty:
@@ -463,7 +477,6 @@ def scan_universe(fyers, symbol_list, use_quotes_only=False, session_date=None):
                 logger.info(f"Skipping {sym}: no nodes found.")
                 continue
 
-            ltp = safe_float(quotes_map.get(sym))
             if pd.isna(ltp):
                 ltp = safe_float(daily["close"].iloc[-1])
                 logger.info(f"Quote fallback used for {sym}: {ltp}")
@@ -471,7 +484,7 @@ def scan_universe(fyers, symbol_list, use_quotes_only=False, session_date=None):
                 logger.info(f"Skipping {sym}: invalid live price.")
                 continue
 
-            rows.append(build_row(sym, anchor_price, ltp, levels))
+            rows.append(build_row(sym, anchor_915, anchor_source, calc_anchor, ltp, levels))
         except Exception as e:
             logger.warning(f"Scan failed for {sym}: {e}")
 
@@ -535,7 +548,7 @@ def send_email(index_df, long_df, short_df, session_date):
             "<html><body style='background-color:#030712; padding:20px; font-family:sans-serif;'>"
             f"<h2 style='color:#e2e8f0;'>FYERS Confluence Dashboard</h2>"
             f"<p style='color:#94a3b8;'>Session date: {session_date}. Script version: {VERSION}.</p>"
-            "<p style='color:#94a3b8;'>For stocks, Anchor_915 uses the 9:15 AM candle open when available; otherwise the script uses a quote fallback anchor. For indexes, anchor uses the quote fallback path. % Change is computed from anchor to live Quotes API LTP.</p>"
+            "<p style='color:#94a3b8;'>Anchor_915 is strictly the 9:15 AM candle open for stocks. When unavailable, the script keeps Anchor_915 blank and uses a quote fallback only for calculations. Anchor_Source shows whether the row used OPEN_915, QUOTE_FALLBACK, or QUOTE_INDEX.</p>"
             f"{build_html_table(index_df, 'Market Index Nodes', EMAIL_DISPLAY_COLS)}"
             f"{build_html_table(long_df, 'F&O Long Candidates (Closest Support First)', EMAIL_DISPLAY_COLS)}"
             f"{build_html_table(short_df, 'F&O Short Candidates (Closest Resistance First)', EMAIL_DISPLAY_COLS)}"
@@ -584,15 +597,15 @@ def main():
 
         if not long_stocks.empty:
             long_stocks = long_stocks.sort_values(
-                by=["Support_Gap_Pct", "% Change"],
-                ascending=[True, False],
+                by=["Anchor_Source", "Support_Gap_Pct", "% Change"],
+                ascending=[True, True, False],
                 na_position="last",
             )
 
         if not short_stocks.empty:
             short_stocks = short_stocks.sort_values(
-                by=["Resistance_Gap_Pct", "% Change"],
-                ascending=[True, True],
+                by=["Anchor_Source", "Resistance_Gap_Pct", "% Change"],
+                ascending=[True, True, True],
                 na_position="last",
             )
 
