@@ -109,6 +109,7 @@ def scan_universe(fyers, symbol_list, is_stock=False):
     for sym in symbol_list:
         logger.info(f"Scanning {sym}...")
         daily = get_history(fyers, sym, "D", lookback_days)
+        daily = daily.iloc[:-1]
         if daily is None or daily.empty or len(daily) < 10:
             continue
 
