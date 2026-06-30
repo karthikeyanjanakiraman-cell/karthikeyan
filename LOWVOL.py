@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
-LOWVOL.py
-Fyers-based confluence screener with 9:15 anchor and HTML email output.
+FO_FNO_FYERS_CONFLUENCE_EMAIL.py
+Index & Stock Confluence Screener
+LTP is set to the 9:15 AM candle close.
 """
 
 import os
@@ -9,10 +10,8 @@ import sys
 import logging
 import warnings
 import smtplib
-from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from html import escape
-from typing import List, Optional
 
 import numpy as np
 import pandas as pd
@@ -21,40 +20,39 @@ from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 
-@dataclass
 class Config:
-    client_id: Optional[str] = field(default_factory=lambda: os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID"))
-    access_token: Optional[str] = field(default_factory=lambda: os.environ.get("ACCESS_TOKEN") or os.environ.get("ACCESSTOKEN"))
+    def __init__(self):
+        self.client_id = os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID")
+        self.access_token = os.environ.get("ACCESS_TOKEN") or os.environ.get("ACCESSTOKEN")
 
-    smtp_host: str = field(default_factory=lambda: os.environ.get("SMTP_HOST", "smtp.gmail.com"))
-    smtp_port: int = field(default_factory=lambda: int(os.environ.get("SMTP_PORT", "587")))
-    sender_email: str = field(default_factory=lambda: os.environ.get("SENDER_EMAIL", "you@example.com"))
-    sender_password: str = field(default_factory=lambda: os.environ.get("SENDER_PASSWORD", "password"))
-    recipient_email: str = field(default_factory=lambda: os.environ.get("RECIPIENT_EMAIL", "you@example.com"))
+        self.smtp_host = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+        self.smtp_port = int(os.environ.get("SMTP_PORT", "587"))
+        self.sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
+        self.sender_password = os.environ.get("SENDER_PASSWORD", "password")
+        self.recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
-    lookback_days: int = field(default_factory=lambda: int(os.environ.get("LOOKBACK_DAYS", "150")))
-    top_n: int = field(default_factory=lambda: int(os.environ.get("TOP_N", "60")))
-    dedupe_pct: float = field(default_factory=lambda: float(os.environ.get("DEDUPE_PCT", "0.005")))
-    match_tolerance: float = field(default_factory=lambda: float(os.environ.get("MATCH_TOLERANCE", "0.005")))
+        self.lookback_days = int(os.environ.get("LOOKBACK_DAYS", "150"))
+        self.top_n = int(os.environ.get("TOP_N", "60"))
+        self.dedupe_pct = float(os.environ.get("DEDUPE_PCT", "0.005"))
 
-    index_symbols: List[str] = field(default_factory=lambda: [
-        "NSE:NIFTY50-INDEX",
-        "NSE:NIFTYBANK-INDEX",
-        "BSE:SENSEX-INDEX",
-    ])
+        self.index_symbols = [
+            "NSE:NIFTY50-INDEX",
+            "NSE:NIFTYBANK-INDEX",
+            "BSE:SENSEX-INDEX",
+        ]
 
-    stock_symbols: List[str] = field(default_factory=lambda: [
-        "NSE:RELIANCE-EQ",
-        "NSE:HDFCBANK-EQ",
-        "NSE:ICICIBANK-EQ",
-        "NSE:INFY-EQ",
-        "NSE:TCS-EQ",
-        "NSE:SBIN-EQ",
-        "NSE:ITC-EQ",
-        "NSE:LT-EQ",
-        "NSE:AXISBANK-EQ",
-        "NSE:KOTAKBANK-EQ",
-    ])
+        self.stock_symbols = [
+            "NSE:RELIANCE-EQ",
+            "NSE:HDFCBANK-EQ",
+            "NSE:ICICIBANK-EQ",
+            "NSE:INFY-EQ",
+            "NSE:TCS-EQ",
+            "NSE:SBIN-EQ",
+            "NSE:ITC-EQ",
+            "NSE:LT-EQ",
+            "NSE:AXISBANK-EQ",
+            "NSE:KOTAKBANK-EQ",
+        ]
 
 
 cfg = Config()
@@ -71,10 +69,11 @@ EMAIL_DISPLAY_COLS = [
     "Conf_Above-3",
 ]
 
-ALL_RESULT_COLS = [
+RESULT_COLS = [
     "Symbol",
     "Anchor_915",
     "LTP",
+    "Current_Price",
     "% Change",
     "Signal",
     "Conf_Below-3",
@@ -93,15 +92,14 @@ logger = logging.getLogger("lowvol")
 logger.setLevel(logging.INFO)
 logger.handlers.clear()
 
-handler = logging.StreamHandler(sys.stdout)
-handler.setFormatter(
+stream_handler = logging.StreamHandler(sys.stdout)
+stream_handler.setFormatter(
     logging.Formatter(
         "%(asctime)s | %(levelname)s | %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 )
-logger.addHandler(handler)
-
+logger.addHandler(stream_handler)
 warnings.filterwarnings("ignore")
 
 
@@ -133,7 +131,7 @@ def format_change(val):
 
 def init_fyers():
     if not cfg.client_id or not cfg.access_token:
-        logger.error("Missing CLIENT_ID/ACCESS_TOKEN environment variables.")
+        logger.error("Missing CLIENT_ID/ACCESS_TOKEN.")
         return None
 
     try:
@@ -144,7 +142,7 @@ def init_fyers():
             log_path="",
         )
     except Exception as e:
-        logger.error(f"FYERS init failed: {e}")
+        logger.error(f"INIT Failed: {e}")
         return None
 
 
@@ -154,30 +152,27 @@ def get_history(fyers, symbol, resolution, days):
         start = (now - timedelta(days=days)).strftime("%Y-%m-%d")
         end = now.strftime("%Y-%m-%d")
 
-        res = fyers.history(
-            data={
-                "symbol": symbol,
-                "resolution": resolution,
-                "date_format": "1",
-                "range_from": start,
-                "range_to": end,
-                "cont_flag": "1",
-            }
-        )
+        res_data = fyers.history(data={
+            "symbol": symbol,
+            "resolution": resolution,
+            "date_format": "1",
+            "range_from": start,
+            "range_to": end,
+            "cont_flag": "1",
+        })
 
-        candles = res.get("candles", []) if isinstance(res, dict) else []
+        candles = res_data.get("candles", []) if isinstance(res_data, dict) else []
         if not candles:
             return None
 
         df = pd.DataFrame(
             candles,
-            columns=["timestamp", "open", "high", "low", "close", "volume"],
+            columns=["timestamp", "open", "high", "low", "close", "volume"]
         )
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
         df = df.sort_values("timestamp").drop_duplicates("timestamp").reset_index(drop=True)
 
-        numeric_cols = ["open", "high", "low", "close", "volume"]
-        for col in numeric_cols:
+        for col in ["open", "high", "low", "close", "volume"]:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
         return df
@@ -187,55 +182,56 @@ def get_history(fyers, symbol, resolution, days):
 
 
 def get_opening_anchor(fyers, symbol):
+    """
+    Uses the first 5-minute candle close of the day as the 9:15 AM reference.
+    This value is also used as LTP in the final output.
+    """
     try:
         today = datetime.now().strftime("%Y-%m-%d")
-        res = fyers.history(
-            data={
-                "symbol": symbol,
-                "resolution": "5",
-                "date_format": "1",
-                "range_from": today,
-                "range_to": today,
-                "cont_flag": "1",
-            }
-        )
+        data = fyers.history(data={
+            "symbol": symbol,
+            "resolution": "5",
+            "date_format": "1",
+            "range_from": today,
+            "range_to": today,
+            "cont_flag": "1"
+        })
 
-        candles = res.get("candles", []) if isinstance(res, dict) else []
+        candles = data.get("candles", []) if isinstance(data, dict) else []
         if not candles:
             return None
 
         df = pd.DataFrame(
             candles,
-            columns=["timestamp", "open", "high", "low", "close", "volume"],
+            columns=["timestamp", "open", "high", "low", "close", "volume"]
         )
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
         df = df.sort_values("timestamp").reset_index(drop=True)
 
-        first_close = safe_float(df.iloc[0]["close"])
-        return None if pd.isna(first_close) else first_close
+        return safe_float(df.iloc[0]["close"])
     except Exception as e:
         logger.warning(f"Opening anchor fetch failed for {symbol}: {e}")
         return None
 
 
 def dedupe_levels(levels, tolerance_pct):
-    cleaned = sorted(
+    vals = sorted([
         safe_float(x) for x in levels
         if not pd.isna(safe_float(x)) and safe_float(x) > 0
-    )
+    ])
 
-    if not cleaned:
+    if not vals:
         return []
 
-    groups = [[cleaned[0]]]
-    for level in cleaned[1:]:
-        ref = np.mean(groups[-1])
-        if ref > 0 and abs(level - ref) / ref <= tolerance_pct:
-            groups[-1].append(level)
+    grouped = [[vals[0]]]
+    for val in vals[1:]:
+        ref = float(np.mean(grouped[-1]))
+        if ref > 0 and abs(val - ref) / ref <= tolerance_pct:
+            grouped[-1].append(val)
         else:
-            groups.append([level])
+            grouped.append([val])
 
-    return [round(float(np.mean(group)), 2) for group in groups]
+    return [round(float(np.mean(group)), 2) for group in grouped]
 
 
 def extract_confluence_levels(df):
@@ -250,7 +246,7 @@ def extract_confluence_levels(df):
     lv_work = work.sort_values(["volume", "high"], ascending=[True, False]).head(cfg.top_n)
 
     raw_levels = []
-    for part in (hv_work, lv_work):
+    for part in [hv_work, lv_work]:
         raw_levels.extend(part["high"].dropna().tolist())
         raw_levels.extend(part["low"].dropna().tolist())
         raw_levels.extend(part["close"].dropna().tolist())
@@ -258,41 +254,42 @@ def extract_confluence_levels(df):
     return dedupe_levels(raw_levels, cfg.dedupe_pct)
 
 
-def nearest_levels_around_reference(levels, reference, n=3):
+def nearest_levels(levels, ref_price, count=3):
     levels = sorted(set(levels))
-    below = [x for x in levels if x < reference]
-    above = [x for x in levels if x > reference]
+    below = [x for x in levels if x < ref_price]
+    above = [x for x in levels if x > ref_price]
 
-    below_vals = below[-n:]
-    above_vals = above[:n]
+    below_vals = below[-count:]
+    above_vals = above[:count]
 
-    below_vals = [np.nan] * (n - len(below_vals)) + below_vals
-    above_vals = above_vals + [np.nan] * (n - len(above_vals))
+    below_vals = [np.nan] * (count - len(below_vals)) + below_vals
+    above_vals = above_vals + [np.nan] * (count - len(above_vals))
 
     return below_vals, above_vals
 
 
-def find_support_resistance(levels, ltp):
+def nearest_support_resistance(levels, current_price):
     levels = sorted(set(levels))
-    support = max([x for x in levels if x < ltp], default=np.nan)
-    resistance = min([x for x in levels if x > ltp], default=np.nan)
+    support = max([x for x in levels if x < current_price], default=np.nan)
+    resistance = min([x for x in levels if x > current_price], default=np.nan)
     return support, resistance
 
 
-def build_row(symbol, anchor_price, ltp, levels):
-    below_vals, above_vals = nearest_levels_around_reference(levels, anchor_price, n=3)
-    support, resistance = find_support_resistance(levels, ltp)
+def build_row(symbol, anchor_price, current_price, levels):
+    below_vals, above_vals = nearest_levels(levels, anchor_price, count=3)
+    support, resistance = nearest_support_resistance(levels, current_price)
 
-    pct_change = ((ltp - anchor_price) / anchor_price * 100.0) if anchor_price else np.nan
+    pct_change = ((current_price - anchor_price) / anchor_price * 100.0) if anchor_price else np.nan
     signal = "Long" if not pd.isna(pct_change) and pct_change >= 0 else "Short"
 
-    support_gap_pct = ((ltp - support) / ltp * 100.0) if not pd.isna(support) and ltp else np.nan
-    resistance_gap_pct = ((resistance - ltp) / ltp * 100.0) if not pd.isna(resistance) and ltp else np.nan
+    support_gap_pct = ((current_price - support) / current_price * 100.0) if not pd.isna(support) and current_price else np.nan
+    resistance_gap_pct = ((resistance - current_price) / current_price * 100.0) if not pd.isna(resistance) and current_price else np.nan
 
     return {
         "Symbol": symbol,
         "Anchor_915": round(anchor_price, 2),
-        "LTP": round(ltp, 2),
+        "LTP": round(anchor_price, 2),  # 9:15 AM price as requested
+        "Current_Price": round(current_price, 2),
         "% Change": round(pct_change, 2) if not pd.isna(pct_change) else np.nan,
         "Signal": signal,
         "Conf_Below-3": below_vals[0],
@@ -325,7 +322,7 @@ def scan_universe(fyers, symbol_list, is_stock=False):
 
             daily = daily.dropna(subset=["high", "low", "close"]).copy()
             if daily.empty:
-                logger.info(f"Skipping {sym}: invalid daily history.")
+                logger.info(f"Skipping {sym}: invalid price history.")
                 continue
 
             valid_daily = daily[daily["volume"].fillna(0) > 0].copy()
@@ -337,26 +334,25 @@ def scan_universe(fyers, symbol_list, is_stock=False):
                 logger.info(f"Skipping {sym}: no confluence levels.")
                 continue
 
-            ltp = safe_float(valid_daily["close"].iloc[-1])
-            if pd.isna(ltp):
-                logger.info(f"Skipping {sym}: invalid LTP.")
+            current_price = safe_float(valid_daily["close"].iloc[-1])
+            if pd.isna(current_price):
+                logger.info(f"Skipping {sym}: invalid current price.")
                 continue
 
-            row = build_row(sym, anchor_price, ltp, levels)
-            rows.append(row)
+            rows.append(build_row(sym, anchor_price, current_price, levels))
 
         except Exception as e:
             logger.warning(f"Scan failed for {sym}: {e}")
 
     if not rows:
-        return pd.DataFrame(columns=ALL_RESULT_COLS)
+        return pd.DataFrame(columns=RESULT_COLS)
 
     df = pd.DataFrame(rows)
-    for col in ALL_RESULT_COLS:
+    for col in RESULT_COLS:
         if col not in df.columns:
             df[col] = np.nan
 
-    return df[ALL_RESULT_COLS]
+    return df[RESULT_COLS]
 
 
 def build_html_table(df, title, cols):
@@ -436,9 +432,9 @@ def send_email(index_df, long_df, short_df):
             server.login(cfg.sender_email, cfg.sender_password)
             server.sendmail(cfg.sender_email, recipients, msg.as_string())
 
-        logger.info("Confluence email sent successfully.")
+        logger.info("Confluence Email sent successfully.")
     except Exception as e:
-        logger.error(f"Email failed: {e}")
+        logger.error(f"Email Failed: {e}")
 
 
 def main():
@@ -446,14 +442,14 @@ def main():
     if not fyers:
         return
 
-    logger.info("Starting index scan...")
+    logger.info("Starting Index Scan...")
     index_df = scan_universe(fyers, cfg.index_symbols, is_stock=False)
 
-    logger.info("Starting F&O stock scan...")
+    logger.info("Starting F&O Stock Scan...")
     stock_df = scan_universe(fyers, cfg.stock_symbols, is_stock=True)
 
-    long_stocks = pd.DataFrame(columns=ALL_RESULT_COLS)
-    short_stocks = pd.DataFrame(columns=ALL_RESULT_COLS)
+    long_stocks = pd.DataFrame(columns=RESULT_COLS)
+    short_stocks = pd.DataFrame(columns=RESULT_COLS)
 
     if not stock_df.empty:
         long_stocks = stock_df[stock_df["Signal"] == "Long"].copy()
@@ -474,7 +470,11 @@ def main():
             )
 
     if not index_df.empty:
-        index_df = index_df.sort_values(by=["% Change", "Symbol"], ascending=[False, True], na_position="last")
+        index_df = index_df.sort_values(
+            by=["% Change", "Symbol"],
+            ascending=[False, True],
+            na_position="last",
+        )
 
     send_email(index_df, long_stocks, short_stocks)
 
