@@ -32,7 +32,7 @@ IST = "Asia/Kolkata"
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
-VERSION = "2026-07-01-r5"
+VERSION = "2026-07-01-r6"
 
 
 class Config:
@@ -343,7 +343,7 @@ def get_live_fno_symbols():
                 continue
             if len(sym) < 2:
                 continue
-            if not pd.Series([sym]).str.fullmatch(r"[A-Z][A-Z0-9&\-]{1,30}").iloc[0]:
+            if not pd.Series([sym]).str.fullmatch(r"[A-Z][A-Z0-9&-]{1,30}").iloc[0]:
                 continue
             symbols.add(f"NSE:{sym}-EQ")
 
@@ -436,18 +436,9 @@ def build_row(symbol, anchor_915, anchor_source, calc_anchor, ltp_price, levels)
     }
 
 
-def get_reference_ltp_for_session(fyers, symbol, live_quote, session_date):
-    if session_is_today(session_date) and not pd.isna(live_quote):
-        return live_quote
-    daily = get_history(fyers, symbol, "D", days=10)
-    if daily is not None and not daily.empty:
-        daily = daily[daily["timestamp"].dt.date <= session_date].copy()
-        if not daily.empty:
-            return safe_float(daily.iloc[-1]["close"])
-    return live_quote
 
 
-def scan_universe(fyers, symbol_list, use_quotes_only=False, session_date=None):
+def scan_universe(fyers, symbol_list, session_date=None):
     rows = []
     if not symbol_list:
         return pd.DataFrame(columns=RESULT_COLS)
@@ -459,28 +450,13 @@ def scan_universe(fyers, symbol_list, use_quotes_only=False, session_date=None):
     for sym in symbol_list:
         try:
             live_quote = safe_float(quotes_map.get(sym))
-            ltp = get_reference_ltp_for_session(fyers, sym, live_quote, session_date)
+            anchor_915 = get_opening_anchor(fyers, sym, session_date)
+            anchor_source = "OPEN_915"
+            if pd.isna(anchor_915):
+                logger.info(f"Skipping {sym}: no valid 09:15 anchor.")
+                continue
 
-            if use_quotes_only:
-                anchor_915 = np.nan
-                calc_anchor = ltp
-                anchor_source = "QUOTE_INDEX"
-                if pd.isna(calc_anchor):
-                    logger.info(f"Skipping {sym}: no valid quote anchor.")
-                    continue
-            else:
-                anchor_915 = get_opening_anchor(fyers, sym, session_date)
-                if not pd.isna(anchor_915):
-                    calc_anchor = anchor_915
-                    anchor_source = "OPEN_915"
-                else:
-                    calc_anchor = ltp
-                    anchor_source = "QUOTE_FALLBACK"
-                    if pd.isna(calc_anchor):
-                        logger.info(f"Skipping {sym}: no valid 09:15 anchor and no quote fallback.")
-                        continue
-                    logger.info(f"Intraday anchor unavailable for {sym}; moved to fallback watchlist.")
-
+            calc_anchor = anchor_915
             daily = get_history(fyers, sym, "D", days=cfg.lookback_days)
             if daily is None or daily.empty:
                 logger.info(f"Skipping {sym}: no daily history.")
@@ -491,8 +467,12 @@ def scan_universe(fyers, symbol_list, use_quotes_only=False, session_date=None):
                 logger.info(f"Skipping {sym}: no nodes found.")
                 continue
 
+            ltp = live_quote
             if pd.isna(ltp):
-                logger.info(f"Skipping {sym}: invalid reference price.")
+                ltp = safe_float(daily["close"].iloc[-1])
+                logger.info(f"Quote fallback used for {sym}: {ltp}")
+            if pd.isna(ltp):
+                logger.info(f"Skipping {sym}: invalid live price.")
                 continue
 
             rows.append(build_row(sym, anchor_915, anchor_source, calc_anchor, ltp, levels))
@@ -592,21 +572,21 @@ def main():
         index_df = pd.DataFrame(columns=RESULT_COLS)
     else:
         logger.info("Starting index scan...")
-        index_df = scan_universe(fyers, cfg.index_symbols, use_quotes_only=True, session_date=session_date)
+        index_df = scan_universe(fyers, cfg.index_symbols, session_date=session_date)
 
     logger.info("Fetching live F&O stock universe from Fyers Master CSV...")
     live_stock_symbols = get_live_fno_symbols()
 
     logger.info(f"Starting stock scan on {len(live_stock_symbols)} symbols...")
-    stock_df = scan_universe(fyers, live_stock_symbols, use_quotes_only=False, session_date=session_date)
+    stock_df = scan_universe(fyers, live_stock_symbols, session_date=session_date)
 
     long_stocks = pd.DataFrame(columns=RESULT_COLS)
     short_stocks = pd.DataFrame(columns=RESULT_COLS)
-    fallback_stocks = pd.DataFrame(columns=RESULT_COLS)
+    fallback_df = pd.DataFrame(columns=RESULT_COLS)
 
     if not stock_df.empty:
         valid_df = stock_df[stock_df["Anchor_Source"] == "OPEN_915"].copy()
-        fallback_stocks = stock_df[stock_df["Anchor_Source"] != "OPEN_915"].copy()
+        fallback_df = stock_df[stock_df["Anchor_Source"] != "OPEN_915"].copy()
 
         if not valid_df.empty:
             long_stocks = valid_df[valid_df["Signal"] == "Long"].copy()
@@ -626,8 +606,8 @@ def main():
                     na_position="last",
                 )
 
-        if not fallback_stocks.empty:
-            fallback_stocks = fallback_stocks.sort_values(
+        if not fallback_df.empty:
+            fallback_df = fallback_df.sort_values(
                 by=["Anchor_Source", "% Change", "Symbol"],
                 ascending=[True, False, True],
                 na_position="last",
@@ -640,7 +620,7 @@ def main():
             na_position="last",
         )
 
-    send_email(index_df, long_stocks, short_stocks, fallback_stocks, session_date)
+    send_email(index_df, long_stocks, short_stocks, fallback_df, session_date)
 
 
 if __name__ == "__main__":
