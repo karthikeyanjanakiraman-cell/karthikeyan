@@ -35,9 +35,10 @@ class Config:
 cfg = Config()
 
 EMAIL_DISPLAY_COLS = [
-    "Symbol", "LTP", "% Change",
-    "Conf_Above-1", "Conf_Above-2", "Conf_Above-3",
-    "Conf_Below-1", "Conf_Below-2", "Conf_Below-3"
+    "Symbol", "% Change",
+    "Conf_Below-3", "Conf_Below-2", "Conf_Below-1", 
+    "LTP", 
+    "Conf_Above-1", "Conf_Above-2", "Conf_Above-3"
 ]
 
 logger = logging.getLogger()
