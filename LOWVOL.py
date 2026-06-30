@@ -4,8 +4,8 @@ FO_FNO_FYERS_CONFLUENCE_EMAIL.py
 Index & Stock Confluence Screener using live NSE F&O universe
 from Fyers Symbol Master CSV and HV/LV overlap zones.
 LTP is the 9:15 AM candle OPEN.
-Static percentage thresholds have been entirely removed and replaced 
-with a dynamic Volume-Weighted Percentage Range (VWPR).
+Static percentage thresholds have been replaced with a dynamic, 
+volume-weighted 'Rejection Zone' (Wick) tolerance logic.
 """
 
 import os
@@ -33,12 +33,9 @@ class Config:
         self.sender_password = os.environ.get("SENDER_PASSWORD", "password")
         self.recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
-        # UPDATED: 253 trading days (1 year) and Top 100 for HV/LV limits
+        # 253 trading days (1 year) and Top 100 for HV/LV limits
         self.lookback_days = int(os.environ.get("LOOKBACK_DAYS", "253"))
-        self.top_n = int(os.environ.get("TOP_N", "506"))
-        
-        # NOTE: Static DEDUPE_PCT and MATCH_TOLERANCE variables have been intentionally removed.
-        # Tolerance is now 100% dynamic based on stock volume data.
+        self.top_n = int(os.environ.get("TOP_N", "100"))
 
         self.index_symbols = [
             "NSE:NIFTY50-INDEX",
@@ -206,7 +203,6 @@ def get_opening_anchor(fyers, symbol):
 def get_live_fno_symbols():
     """
     Fetches the live F&O universe using the official Fyers Symbol Master CSV.
-    This replaces the NSE scraper and completely avoids WAF/IP blocking issues.
     """
     url = "https://public.fyers.in/sym_details/NSE_FO.csv"
     
@@ -216,18 +212,12 @@ def get_live_fno_symbols():
     }
     
     try:
-        # Fyers Symbol Master has no headers.
-        # Column index 13 contains the 'short_sym' (underlying symbol, e.g., 'RELIANCE').
         df = pd.read_csv(url, header=None, usecols=[13], names=["underlying"])
-        
-        # Extract unique underlying symbols
         unique_syms = df["underlying"].dropna().unique()
         
         symbols = set()
         for sym in unique_syms:
             sym = str(sym).strip().upper()
-            
-            # Apply safety filters to exclude indices and malformed strings
             if (
                 sym not in exclude
                 and "NIFTY" not in sym
@@ -250,26 +240,32 @@ def get_live_fno_symbols():
 
 def get_pure_volume_tolerance(df):
     """
-    Calculates price tolerance purely driven by Volume and Price action.
-    ZERO static numbers, multipliers, or limits.
+    Calculates tolerance organically derived from price action and volume.
+    Tightened to 25% to represent wick rejections, not entire daily ranges.
     """
     if df is None or df.empty:
-        return 0.0  # Failsafe if data is missing
+        return 0.003  # Failsafe
 
-    # Calculate the daily percentage range (High - Low) / Close
+    # 1. Calculate the daily percentage range (High - Low)
     daily_pct_range = (df["high"] - df["low"]) / df["close"]
-    
-    # Calculate the volume weight of each day against the total volume
     total_volume = df["volume"].sum()
+    
+    # 2. Derive the organic range (handles zero-volume Indices gracefully)
     if total_volume == 0:
-        return 0.0
+        # Indices: Use pure price-action average if volume is zero
+        organic_range = daily_pct_range.mean()
+    else:
+        # Stocks: Use Volume-Weighted range
+        volume_weights = df["volume"] / total_volume
+        organic_range = (daily_pct_range * volume_weights).sum()
         
-    volume_weights = df["volume"] / total_volume
+    # 3. The Fix: Divide by 4 (25%). 
+    # We only want to group prices that sit inside the 'wick' rejection zones, 
+    # preventing massive 1000-point clusters on the indices.
+    tight_tolerance = float(organic_range * 0.25)
     
-    # Multiply the daily range by its volume weight and sum it up
-    dynamic_tol = (daily_pct_range * volume_weights).sum()
-    
-    return float(dynamic_tol)
+    # Prevent the radius from becoming literally invisible on completely dead days
+    return max(0.002, tight_tolerance)
 
 
 def dedupe_levels(levels, tolerance_pct):
@@ -304,9 +300,17 @@ def extract_confluence_levels(df, dynamic_tol):
     if df is None or df.empty or dynamic_tol == 0.0:
         return []
 
-    work = df.dropna(subset=["high", "low", "close", "volume"]).copy()
+    # Keeping rows valid for price, volume isn't strictly necessary for indices 
+    # but we handle index volume=0 in the tolerance function
+    work = df.dropna(subset=["high", "low", "close"]).copy()
     if work.empty:
         return []
+        
+    # Ensure volume column exists for sorting; fill NA with 0
+    if "volume" not in work.columns:
+        work["volume"] = 0
+    else:
+        work["volume"] = work["volume"].fillna(0)
 
     hv_work = work.sort_values(["volume", "high"], ascending=[False, False]).head(cfg.top_n)
     lv_work = work.sort_values(["volume", "high"], ascending=[True, False]).head(cfg.top_n)
@@ -390,16 +394,14 @@ def scan_universe(fyers, symbol_list, is_stock=False):
                 logger.info(f"Skipping {sym}: no daily history.")
                 continue
 
-            valid_daily = daily[daily["volume"].fillna(0) > 0].copy()
+            # Ensure we have data to work with
+            valid_daily = daily.copy()
             if valid_daily.empty:
                 logger.info(f"Skipping {sym}: no valid daily rows.")
                 continue
 
-            # NEW: Calculate 100% data-driven volume tolerance
+            # NEW: Calculate 100% data-driven volume tolerance (with 25% wick limit)
             stock_tolerance = get_pure_volume_tolerance(valid_daily)
-            
-            # (Optional) Uncomment the line below to monitor the dynamic percentages while scanning
-            # logger.info(f"{sym} VWPR Tolerance Calculated: {stock_tolerance:.4f}")
 
             # NEW: Pass the organic tolerance into the extractor
             levels = extract_confluence_levels(valid_daily, stock_tolerance)
