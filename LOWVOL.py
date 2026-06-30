@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-FO_FNO_FYERS_CONFLUENCE_EMAIL.py - Structural Confluence Screener (High Volume + Low Volume Overlap)
+FO_FNO_FYERS_CONFLUENCE_EMAIL.py - Index & Stock Confluence Screener (No Thresholds)
 """
 
 import os
 import sys
 import logging
 import warnings
-import calendar
 from datetime import datetime, timedelta
 from typing import Dict
 
@@ -30,10 +29,20 @@ class Config:
         self.sender_email = os.environ.get("SENDER_EMAIL", "you@example.com")
         self.sender_password = os.environ.get("SENDER_PASSWORD", "password")
         self.recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
+        
+        # 1. The Indices (Always shown in the dashboard)
         self.index_symbols = ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX", "BSE:SENSEX-INDEX"]
+        
+        # 2. Add your F&O Stocks here
+        self.stock_symbols = [
+            "NSE:RELIANCE-EQ", "NSE:HDFCBANK-EQ", "NSE:ICICIBANK-EQ",
+            "NSE:INFY-EQ", "NSE:TCS-EQ", "NSE:SBIN-EQ", 
+            "NSE:ITC-EQ", "NSE:LT-EQ", "NSE:AXISBANK-EQ", "NSE:KOTAKBANK-EQ"
+        ]
 
 cfg = Config()
 
+# The clean layout you requested
 EMAIL_DISPLAY_COLS = [
     "Symbol", "% Change",
     "Conf_Below-3", "Conf_Below-2", "Conf_Below-1", 
@@ -90,14 +99,15 @@ def get_history(fyers, symbol, res, days):
     except Exception:
         return None
 
-def scan_fno_universe(fyers):
+def scan_universe(fyers, symbol_list, is_stock=False):
     lookback_days = 150
     dedupe_pct = 0.005
-    # MODIFIED: Widened match tolerance to 0.5% to capture Nifty 50 and Sensex overlaps
-    match_tolerance = 0.005  
+    match_tolerance = 0.005  # 0.5% tolerance for structural overlap
+    
     rows = []
 
-    for sym in cfg.index_symbols:
+    for sym in symbol_list:
+        logger.info(f"Scanning {sym}...")
         daily = get_history(fyers, sym, "D", lookback_days)
         if daily is None or daily.empty or len(daily) < 10:
             continue
@@ -109,13 +119,9 @@ def scan_fno_universe(fyers):
         # Filter out 0-volume data glitches
         valid_daily = daily[daily["volume"] > 0]
         
-        # 1. Map High Volume Structure (MODIFIED: Look at top 60 days)
         hv_work = valid_daily.sort_values(["volume", "high"], ascending=[False, False]).head(60)
-        
-        # 2. Map Low Volume Voids (MODIFIED: Look at quietest 60 days)
         lv_work = valid_daily.sort_values(["volume", "high"], ascending=[True, False]).head(60)
 
-        # Helper to extract clean deduplicated boundary bands
         def extract_bands(work_df):
             candidates = []
             for _, c in work_df.iterrows():
@@ -136,7 +142,6 @@ def scan_fno_universe(fyers):
 
         unique_confluences = []
 
-        # 3. Cross-Reference: Find exact overlaps between High Volume and Low Volume boundaries
         for hv in hv_bands:
             for lv in lv_bands:
                 matches = [
@@ -149,13 +154,10 @@ def scan_fno_universe(fyers):
                     diff = abs(hv_price - lv_price) / max(hv_price, 1.0)
                     if diff <= match_tolerance:
                         conf_p = (hv_price + lv_price) / 2.0
-                        
-                        # Ensure we don't save duplicate Confluence lines sitting next to each other
                         is_duplicate = any(abs(conf_p - u) / max(conf_p, 1.0) <= dedupe_pct for u in unique_confluences)
                         if not is_duplicate:
                             unique_confluences.append(conf_p)
 
-        # 4. Split and Sort based on current Last Traded Price (LTP)
         above_ltp = sorted([p for p in unique_confluences if p > ltp])
         below_ltp = sorted([p for p in unique_confluences if p < ltp], reverse=True)
 
@@ -163,25 +165,46 @@ def scan_fno_universe(fyers):
             "Symbol": sym, 
             "LTP": ltp, 
             "% Change": pct_ch,
+            "Signal": "Neutral",
+            "Distance_Pct": 999.0 # Used purely for sorting, not displaying
         }
 
-        # Save closest 3 targets ABOVE price
         for i in range(3):
             row[f"Conf_Above-{i+1}"] = format_value(above_ltp[i]) if i < len(above_ltp) else "-"
-            
-        # Save closest 3 targets BELOW price
-        for i in range(3):
             row[f"Conf_Below-{i+1}"] = format_value(below_ltp[i]) if i < len(below_ltp) else "-"
+
+        # Sort Logic for F&O Stocks (Determine Long vs Short and Distance)
+        if is_stock:
+            # Calculate distance to closest support and closest resistance
+            dist_below = (ltp - below_ltp[0]) / ltp if len(below_ltp) > 0 else float('inf')
+            dist_above = (above_ltp[0] - ltp) / ltp if len(above_ltp) > 0 else float('inf')
+            
+            # If both exist, determine which is closer
+            if dist_below != float('inf') or dist_above != float('inf'):
+                if dist_below <= dist_above:
+                    row["Signal"] = "Long"
+                    row["Distance_Pct"] = dist_below
+                else:
+                    row["Signal"] = "Short"
+                    row["Distance_Pct"] = dist_above
 
         rows.append(row)
 
-    return pd.DataFrame(rows)
+    # Convert to DataFrame
+    df = pd.DataFrame(rows)
+    
+    # Sort stocks so the ones closest to their levels are at the top of the email
+    if is_stock and not df.empty and "Distance_Pct" in df.columns:
+        df = df.sort_values(by="Distance_Pct", ascending=True)
+        
+    return df
 
 def build_html_table(df, title, cols):
     if df.empty:
-        return f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top: 25px;'>{title}</h3><p style='color:#94a3b8; font-family:sans-serif;'>No candidates.</p>"
+        return f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top: 25px;'>{title}</h3><p style='color:#94a3b8; font-family:sans-serif;'>No candidates found today.</p>"
     table_html = f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top: 25px;'>{title}</h3><table style='border-collapse: collapse; width: 100%; font-family: sans-serif; font-size: 13px; text-align: left; background-color: #0f172a;'>"
     table_html += "<tr style='background-color: #1e293b; color: #f1f5f9;'>" + "".join([f"<th style='padding: 10px; border: 1px solid #334155;'>{c}</th>" for c in cols]) + "</tr>"
+    
     for i, (_, row) in enumerate(df.iterrows()):
         bg_row = "#0f172a" if i % 2 == 0 else "#1e293b"
         table_html += f"<tr style='background-color: {bg_row}; color: #e2e8f0;'>"
@@ -197,15 +220,18 @@ def build_html_table(df, title, cols):
         table_html += "</tr>"
     return table_html + "</table>"
 
-def send_email(dashboard_df):
+def send_email(index_df, long_df, short_df):
     try:
         msg = MIMEMultipart()
         msg["From"] = cfg.sender_email
         msg["To"] = cfg.recipient_email
-        msg["Subject"] = f"Index Confluence Pivot Points - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        msg["Subject"] = f"Confluence Trade Setups - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        
         html = (
             "<body style='background-color: #030712; padding: 20px; font-family: sans-serif;'>"
-            + build_html_table(dashboard_df, "Ultimate Confluence Zones (HV/LV Overlap)", EMAIL_DISPLAY_COLS)
+            + build_html_table(index_df, "Market Index Confluence Dashboard", EMAIL_DISPLAY_COLS)
+            + build_html_table(long_df, "F&O Long Candidates (Ordered by Proximity to Support)", EMAIL_DISPLAY_COLS)
+            + build_html_table(short_df, "F&O Short Candidates (Ordered by Proximity to Resistance)", EMAIL_DISPLAY_COLS)
             + "</body>"
         )
         msg.attach(MIMEText(html, "html"))
@@ -221,12 +247,24 @@ def main():
     fyers = init_fyers()
     if not fyers:
         return
-    spot_df = scan_fno_universe(fyers)
-    if spot_df.empty:
-        logger.warning("No spot data generated.")
-        return
     
-    send_email(spot_df)
+    # 1. Scan the Indices (Always display these)
+    logger.info("Starting Index Scan...")
+    index_df = scan_universe(fyers, cfg.index_symbols, is_stock=False)
+    
+    # 2. Scan the F&O Stocks 
+    logger.info("Starting F&O Stock Scan...")
+    stock_df = scan_universe(fyers, cfg.stock_symbols, is_stock=True)
+
+    long_stocks = pd.DataFrame()
+    short_stocks = pd.DataFrame()
+
+    # 3. Split the stocks into Long and Short (No filtering, just sorting)
+    if not stock_df.empty:
+        long_stocks = stock_df[stock_df["Signal"] == "Long"]
+        short_stocks = stock_df[stock_df["Signal"] == "Short"]
+
+    send_email(index_df, long_stocks, short_stocks)
 
 if __name__ == "__main__":
     main()
