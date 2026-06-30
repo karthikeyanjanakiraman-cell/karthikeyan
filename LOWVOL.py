@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
 FO_FNO_FYERS_CONFLUENCE_EMAIL.py
-Index & Stock Confluence Screener using live NSE F&O universe
-from Fyers Symbol Master CSV and HV/LV overlap zones.
+Index & Stock Screener using live NSE F&O universe from Fyers Symbol Master CSV.
 LTP is the 9:15 AM candle OPEN.
-Static percentage thresholds have been replaced with a dynamic, 
-volume-weighted 'Rejection Zone' (Wick) tolerance logic.
+Support and Resistance levels are generated using a pure Volume Profile 
+algorithm to locate institutional High Volume Nodes (HVNs) across the last 253 days.
 """
 
 import os
@@ -33,9 +32,8 @@ class Config:
         self.sender_password = os.environ.get("SENDER_PASSWORD", "password")
         self.recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
-        # 253 trading days (1 year) and Top 100 for HV/LV limits
+        # 253 trading days (1 full year)
         self.lookback_days = int(os.environ.get("LOOKBACK_DAYS", "253"))
-        self.top_n = int(os.environ.get("TOP_N", "100"))
 
         self.index_symbols = [
             "NSE:NIFTY50-INDEX",
@@ -90,7 +88,7 @@ RESULT_COLS = [
     "Resistance_Gap_Pct",
 ]
 
-logger = logging.getLogger("confluence")
+logger = logging.getLogger("volume_profile")
 logger.setLevel(logging.INFO)
 logger.handlers.clear()
 
@@ -178,7 +176,7 @@ def get_history(fyers, symbol, res, days):
 
 def get_opening_anchor(fyers, symbol):
     """
-    Uses the OPEN of the first 5-minute candle as 9:15 anchor.
+    Uses the OPEN of the first 5-minute candle as the 9:15 anchor.
     """
     try:
         today = datetime.now().strftime("%Y-%m-%d")
@@ -238,93 +236,48 @@ def get_live_fno_symbols():
     return cfg.fallback_stock_symbols
 
 
-def get_pure_volume_tolerance(df):
+def extract_volume_profile_levels(df):
     """
-    Calculates tolerance organically derived from price action and volume.
-    Tightened to 25% to represent wick rejections, not entire daily ranges.
+    Calculates High Volume Nodes (HVNs) by mapping volume density across the yearly price range.
+    These nodes act as highly reliable support and resistance targets.
     """
     if df is None or df.empty:
-        return 0.003  # Failsafe
+        return []
 
-    # 1. Calculate the daily percentage range (High - Low)
-    daily_pct_range = (df["high"] - df["low"]) / df["close"]
-    total_volume = df["volume"].sum()
+    # 1. Use Typical Price to represent the day's fair value
+    typical_price = (df["high"] + df["low"] + df["close"]) / 3.0
     
-    # 2. Derive the organic range (handles zero-volume Indices gracefully)
-    if total_volume == 0:
-        # Indices: Use pure price-action average if volume is zero
-        organic_range = daily_pct_range.mean()
-    else:
-        # Stocks: Use Volume-Weighted range
-        volume_weights = df["volume"] / total_volume
-        organic_range = (daily_pct_range * volume_weights).sum()
-        
-    # 3. The Fix: Divide by 4 (25%). 
-    # We only want to group prices that sit inside the 'wick' rejection zones, 
-    # preventing massive 1000-point clusters on the indices.
-    tight_tolerance = float(organic_range * 0.25)
+    min_p = typical_price.min()
+    max_p = typical_price.max()
     
-    # Prevent the radius from becoming literally invisible on completely dead days
-    return max(0.002, tight_tolerance)
-
-
-def dedupe_levels(levels, tolerance_pct):
-    values = sorted([
-        safe_float(x) for x in levels
-        if not pd.isna(safe_float(x)) and safe_float(x) > 0
-    ])
-
-    if not values:
+    if pd.isna(min_p) or pd.isna(max_p) or min_p == max_p:
         return []
 
-    groups = [[values[0]]]
-    for val in values[1:]:
-        ref = float(np.mean(groups[-1]))
-        if ref > 0 and abs(val - ref) / ref <= tolerance_pct:
-            groups[-1].append(val)
-        else:
-            groups.append([val])
-
-    return [round(float(np.mean(group)), 2) for group in groups]
-
-
-def build_price_levels(df):
-    raw_levels = []
-    raw_levels.extend(df["high"].dropna().tolist())
-    raw_levels.extend(df["low"].dropna().tolist())
-    raw_levels.extend(df["close"].dropna().tolist())
-    return raw_levels
-
-
-def extract_confluence_levels(df, dynamic_tol):
-    if df is None or df.empty or dynamic_tol == 0.0:
-        return []
-
-    # Keeping rows valid for price, volume isn't strictly necessary for indices 
-    # but we handle index volume=0 in the tolerance function
-    work = df.dropna(subset=["high", "low", "close"]).copy()
-    if work.empty:
-        return []
-        
-    # Ensure volume column exists for sorting; fill NA with 0
-    if "volume" not in work.columns:
-        work["volume"] = 0
+    # 2. Slice the yearly range into 100 dynamic price bins
+    bins = np.linspace(min_p, max_p, 100)
+    
+    # 3. Handle Zero-Volume Indices gracefully (fallback to pure price-time density)
+    if "volume" not in df.columns:
+        weights = None
     else:
-        work["volume"] = work["volume"].fillna(0)
-
-    hv_work = work.sort_values(["volume", "high"], ascending=[False, False]).head(cfg.top_n)
-    lv_work = work.sort_values(["volume", "high"], ascending=[True, False]).head(cfg.top_n)
-
-    hv_levels = dedupe_levels(build_price_levels(hv_work), dynamic_tol)
-    lv_levels = dedupe_levels(build_price_levels(lv_work), dynamic_tol)
-
-    confluence = []
-    for hv in hv_levels:
-        for lv in lv_levels:
-            if hv > 0 and abs(hv - lv) / hv <= dynamic_tol:
-                confluence.append(round((hv + lv) / 2.0, 2))
-
-    return dedupe_levels(confluence, dynamic_tol)
+        weights = df["volume"] if df["volume"].sum() > 0 else None
+    
+    # 4. Map the volume into the price bins
+    hist, bin_edges = np.histogram(typical_price, bins=bins, weights=weights)
+    
+    # 5. Identify the Heavy Liquidity Peaks (HVNs)
+    mean_vol = np.mean(hist)
+    hvns = []
+    
+    for i in range(1, len(hist) - 1):
+        # Find local peaks (bins with more volume than the ones directly next to them)
+        if hist[i] > hist[i-1] and hist[i] > hist[i+1]:
+            # Filter out minor noise (must be above-average volume)
+            if hist[i] > mean_vol:
+                center_price = round((bin_edges[i] + bin_edges[i+1]) / 2.0, 2)
+                hvns.append(center_price)
+                
+    return hvns
 
 
 def nearest_levels(levels, ref_price, count=3):
@@ -400,14 +353,11 @@ def scan_universe(fyers, symbol_list, is_stock=False):
                 logger.info(f"Skipping {sym}: no valid daily rows.")
                 continue
 
-            # NEW: Calculate 100% data-driven volume tolerance (with 25% wick limit)
-            stock_tolerance = get_pure_volume_tolerance(valid_daily)
-
-            # NEW: Pass the organic tolerance into the extractor
-            levels = extract_confluence_levels(valid_daily, stock_tolerance)
+            # NEW: Extract Volume Profile Nodes (Institutional Support/Resistance)
+            levels = extract_volume_profile_levels(valid_daily)
             
             if not levels:
-                logger.info(f"Skipping {sym}: no HV/LV confluence levels.")
+                logger.info(f"Skipping {sym}: no Volume Profile nodes found.")
                 continue
 
             current_close = safe_float(valid_daily["close"].iloc[-1])
@@ -482,12 +432,12 @@ def send_email(index_df, long_df, short_df):
         msg = MIMEMultipart("alternative")
         msg["From"] = cfg.sender_email
         msg["To"] = ", ".join(recipients)
-        msg["Subject"] = f"Confluence Trade Setups - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        msg["Subject"] = f"Volume Profile Trade Setups - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 
         html = (
             "<html><body style='background-color:#030712; padding:20px; font-family:sans-serif;'>"
-            "<h2 style='color:#e2e8f0;'>Confluence Dashboard</h2>"
-            f"{build_html_table(index_df, 'Market Index Confluence Dashboard', EMAIL_DISPLAY_COLS)}"
+            "<h2 style='color:#e2e8f0;'>Volume Profile Dashboard</h2>"
+            f"{build_html_table(index_df, 'Market Index Volume Profile', EMAIL_DISPLAY_COLS)}"
             f"{build_html_table(long_df, 'F&O Long Candidates (Ordered by Proximity to Support)', EMAIL_DISPLAY_COLS)}"
             f"{build_html_table(short_df, 'F&O Short Candidates (Ordered by Proximity to Resistance)', EMAIL_DISPLAY_COLS)}"
             "</body></html>"
@@ -500,7 +450,7 @@ def send_email(index_df, long_df, short_df):
             s.login(cfg.sender_email, cfg.sender_password)
             s.sendmail(cfg.sender_email, recipients, msg.as_string())
 
-        logger.info("Confluence Email sent successfully.")
+        logger.info("Volume Profile Email sent successfully.")
     except Exception as e:
         logger.error(f"Email Failed: {e}")
 
