@@ -338,9 +338,9 @@ def build_dashboard_and_candidates(df):
             r_dict[f"Resistance-{i}"] = format_tb_pair(row["LTP"], row.get(f"RES_T_{i}"), row.get(f"RES_B_{i}")) if pd.notna(row.get(f"RES_T_{i}")) else "-"
         dashboard_rows.append(r_dict.copy())
 
-        tol_pct = 0.25 / 100.0
+        # LONG STRATEGY (Overhead Resistance) - Removed tol_pct filter
         res_b1 = row.get("RES_B_1")
-        if pd.notna(res_b1) and abs(row["LTP"] - res_b1) / max(row["LTP"], 1.0) <= tol_pct:
+        if pd.notna(res_b1):
             cand = {
                 "Symbol": row["Symbol"],
                 "% Change": row["% Change"],
@@ -355,14 +355,14 @@ def build_dashboard_and_candidates(df):
                 "Climax_Range (T/B)": format_tb_pair(row["LTP"], row.get("Long_T", res_b1), row.get("Long_B", res_b1)),
                 "Climax_Volume": f"{int(row['Long_V']):,}" if pd.notna(row.get("Long_V")) else "",
                 "Breach_Days": row.get("Long_Breach_Days", 999),
-                "Signal_Type": "Long Resistance Test",
+                "Signal_Type": "Tracking Resistance",
             }
             _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "long")
             valid_long.append(cand)
 
-        tol_pct = 0.25 / 100.0
+        # SHORT STRATEGY (Underlying Support) - Removed tol_pct filter
         sup_t1 = row.get("SUP_T_1")
-        if pd.notna(sup_t1) and abs(row["LTP"] - sup_t1) / max(row["LTP"], 1.0) <= tol_pct:
+        if pd.notna(sup_t1):
             cand = {
                 "Symbol": row["Symbol"],
                 "% Change": row["% Change"],
@@ -377,13 +377,13 @@ def build_dashboard_and_candidates(df):
                 "Climax_Range (T/B)": format_tb_pair(row["LTP"], row.get("Short_T", sup_t1), row.get("Short_B", sup_t1)),
                 "Climax_Volume": f"{int(row['Short_V']):,}" if pd.notna(row.get("Short_V")) else "",
                 "Breach_Days": row.get("Short_Breach_Days", 999),
-                "Signal_Type": "Short Support Test",
+                "Signal_Type": "Tracking Support",
             }
             _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "short")
             valid_short.append(cand)
 
     return pd.DataFrame(dashboard_rows), pd.DataFrame(valid_long), pd.DataFrame(valid_short)
-
+    
 def build_option_candidate_tables(df, spot_signal_map):
     if df.empty:
         return pd.DataFrame(), pd.DataFrame()
