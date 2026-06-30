@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 FO_FNO_FYERS_CONFLUENCE_EMAIL.py
-Index & Stock Confluence Screener using HV/LV price confluence.
+Index & Stock Confluence Screener using HV/LV overlap zones.
+LTP is the 9:15 AM candle OPEN.
 """
 
 import os
@@ -57,17 +58,34 @@ class Config:
 cfg = Config()
 
 EMAIL_DISPLAY_COLS = [
-    "Symbol", "% Change",
-    "Conf_Below-3", "Conf_Below-2", "Conf_Below-1",
+    "Symbol",
+    "% Change",
+    "Conf_Below-3",
+    "Conf_Below-2",
+    "Conf_Below-1",
     "LTP",
-    "Conf_Above-1", "Conf_Above-2", "Conf_Above-3"
+    "Conf_Above-1",
+    "Conf_Above-2",
+    "Conf_Above-3",
 ]
 
 RESULT_COLS = [
-    "Symbol", "Anchor_915", "LTP", "% Change", "Signal",
-    "Conf_Below-3", "Conf_Below-2", "Conf_Below-1",
-    "Conf_Above-1", "Conf_Above-2", "Conf_Above-3",
-    "Support", "Resistance", "Support_Gap_Pct", "Resistance_Gap_Pct"
+    "Symbol",
+    "Anchor_915",
+    "LTP",
+    "Current_Close",
+    "% Change",
+    "Signal",
+    "Conf_Below-3",
+    "Conf_Below-2",
+    "Conf_Below-1",
+    "Conf_Above-1",
+    "Conf_Above-2",
+    "Conf_Above-3",
+    "Support",
+    "Resistance",
+    "Support_Gap_Pct",
+    "Resistance_Gap_Pct",
 ]
 
 logger = logging.getLogger("confluence")
@@ -172,7 +190,7 @@ def get_opening_anchor(fyers, symbol):
         })
 
         if data and "candles" in data and len(data["candles"]) > 0:
-            return float(data["candles"][0][1])
+            return float(data["candles"][0][1])  # 9:15 OPEN
 
         return None
     except Exception as e:
@@ -245,27 +263,29 @@ def nearest_levels(levels, ref_price, count=3):
     return below_vals, above_vals
 
 
-def nearest_support_resistance(levels, ltp):
+def nearest_support_resistance(levels, ref_price):
     levels = sorted(set(levels))
-    support = max([x for x in levels if x < ltp], default=np.nan)
-    resistance = min([x for x in levels if x > ltp], default=np.nan)
+    support = max([x for x in levels if x < ref_price], default=np.nan)
+    resistance = min([x for x in levels if x > ref_price], default=np.nan)
     return support, resistance
 
 
-def build_row(symbol, anchor_price, ltp, levels):
-    below_vals, above_vals = nearest_levels(levels, ltp, count=3)
-    support, resistance = nearest_support_resistance(levels, ltp)
+def build_row(symbol, anchor_price, current_close, levels):
+    display_ltp = anchor_price  # LTP should be 9:15 open
+    below_vals, above_vals = nearest_levels(levels, display_ltp, count=3)
+    support, resistance = nearest_support_resistance(levels, display_ltp)
 
-    pct_change = ((ltp - anchor_price) / anchor_price * 100.0) if anchor_price else np.nan
+    pct_change = ((current_close - anchor_price) / anchor_price * 100.0) if anchor_price else np.nan
     signal = "Long" if not pd.isna(pct_change) and pct_change >= 0 else "Short"
 
-    support_gap_pct = ((ltp - support) / ltp * 100.0) if not pd.isna(support) and ltp else np.nan
-    resistance_gap_pct = ((resistance - ltp) / ltp * 100.0) if not pd.isna(resistance) and ltp else np.nan
+    support_gap_pct = ((display_ltp - support) / display_ltp * 100.0) if not pd.isna(support) and display_ltp else np.nan
+    resistance_gap_pct = ((resistance - display_ltp) / display_ltp * 100.0) if not pd.isna(resistance) and display_ltp else np.nan
 
     return {
         "Symbol": symbol,
         "Anchor_915": round(anchor_price, 2),
-        "LTP": round(ltp, 2),
+        "LTP": round(display_ltp, 2),
+        "Current_Close": round(current_close, 2),
         "% Change": round(pct_change, 2) if not pd.isna(pct_change) else np.nan,
         "Signal": signal,
         "Conf_Below-3": below_vals[0],
@@ -306,12 +326,12 @@ def scan_universe(fyers, symbol_list, is_stock=False):
                 logger.info(f"Skipping {sym}: no HV/LV confluence levels.")
                 continue
 
-            ltp = safe_float(valid_daily["close"].iloc[-1])
-            if pd.isna(ltp):
-                logger.info(f"Skipping {sym}: invalid LTP.")
+            current_close = safe_float(valid_daily["close"].iloc[-1])
+            if pd.isna(current_close):
+                logger.info(f"Skipping {sym}: invalid close.")
                 continue
 
-            row = build_row(sym, anchor_price, ltp, levels)
+            row = build_row(sym, anchor_price, current_close, levels)
             rows.append(row)
 
         except Exception as e:
@@ -371,17 +391,22 @@ def build_html_table(df, title, cols):
 
 def send_email(index_df, long_df, short_df):
     try:
-        msg = MIMEMultipart()
+        recipients = [x.strip() for x in cfg.recipient_email.split(",") if x.strip()]
+        if not recipients:
+            raise ValueError("RECIPIENT_EMAIL is empty.")
+
+        msg = MIMEMultipart("alternative")
         msg["From"] = cfg.sender_email
-        msg["To"] = cfg.recipient_email
+        msg["To"] = ", ".join(recipients)
         msg["Subject"] = f"Confluence Trade Setups - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
 
         html = (
-            "<body style='background-color:#030712; padding:20px; font-family:sans-serif;'>"
-            + build_html_table(index_df, "Market Index Confluence Dashboard", EMAIL_DISPLAY_COLS)
-            + build_html_table(long_df, "F&O Long Candidates (Ordered by Proximity to Support)", EMAIL_DISPLAY_COLS)
-            + build_html_table(short_df, "F&O Short Candidates (Ordered by Proximity to Resistance)", EMAIL_DISPLAY_COLS)
-            + "</body>"
+            "<html><body style='background-color:#030712; padding:20px; font-family:sans-serif;'>"
+            "<h2 style='color:#e2e8f0;'>Confluence Dashboard</h2>"
+            f"{build_html_table(index_df, 'Market Index Confluence Dashboard', EMAIL_DISPLAY_COLS)}"
+            f"{build_html_table(long_df, 'F&O Long Candidates (Ordered by Proximity to Support)', EMAIL_DISPLAY_COLS)}"
+            f"{build_html_table(short_df, 'F&O Short Candidates (Ordered by Proximity to Resistance)', EMAIL_DISPLAY_COLS)}"
+            "</body></html>"
         )
 
         msg.attach(MIMEText(html, "html"))
@@ -389,7 +414,7 @@ def send_email(index_df, long_df, short_df):
         with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port) as s:
             s.starttls()
             s.login(cfg.sender_email, cfg.sender_password)
-            s.sendmail(cfg.sender_email, cfg.recipient_email, msg.as_string())
+            s.sendmail(cfg.sender_email, recipients, msg.as_string())
 
         logger.info("Confluence Email sent successfully.")
     except Exception as e:
@@ -427,6 +452,13 @@ def main():
                 ascending=[True, True],
                 na_position="last",
             )
+
+    if not index_df.empty:
+        index_df = index_df.sort_values(
+            by=["% Change", "Symbol"],
+            ascending=[False, True],
+            na_position="last",
+        )
 
     send_email(index_df, long_stocks, short_stocks)
 
