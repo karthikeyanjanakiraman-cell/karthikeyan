@@ -4,12 +4,12 @@ FO_FNO_FYERS_CONFLUENCE_EMAIL_FIXED.py
 
 Production-hardened index and F&O stock screener using FYERS API v3.
 
-Fixes applied:
-- 09:15 anchor is selected by exact candle timestamp, not array position.
-- Live price comes from Quotes API; daily history is only for node extraction.
-- F&O universe parsing is more defensive.
-- Retry, throttling, fallback, and logging are improved.
-- Email dashboard keeps your original style, but Anchor_915 is shown honestly.
+Key behavior:
+- Uses last completed trading session when run before market open.
+- Uses Quotes API for live prices.
+- Uses Quotes API fallback anchor when intraday 5m history is unavailable.
+- Uses FYERS NSE_FO.csv underlying column defensively.
+- Keeps email dashboard output compatible with original workflow.
 """
 
 import os
@@ -21,7 +21,7 @@ import smtplib
 from io import StringIO
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, date
 
 import numpy as np
 import pandas as pd
@@ -30,6 +30,9 @@ from fyers_apiv3 import fyersModel
 
 IST = "Asia/Kolkata"
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
+MARKET_OPEN = "09:15:00"
+MARKET_CLOSE = "15:30:00"
+VERSION = "2026-07-01-r3"
 
 
 class Config:
@@ -44,10 +47,11 @@ class Config:
         self.recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
         self.lookback_days = int(os.environ.get("LOOKBACK_DAYS", "253"))
-        self.history_pause_sec = float(os.environ.get("HISTORY_PAUSE_SEC", "0.12"))
+        self.history_pause_sec = float(os.environ.get("HISTORY_PAUSE_SEC", "0.15"))
         self.quotes_pause_sec = float(os.environ.get("QUOTES_PAUSE_SEC", "0.20"))
         self.max_retries = int(os.environ.get("MAX_RETRIES", "3"))
         self.stock_limit = int(os.environ.get("STOCK_LIMIT", "0"))
+        self.disable_index_scan = os.environ.get("DISABLE_INDEX_SCAN", "0") == "1"
 
         self.index_symbols = [
             "NSE:NIFTY50-INDEX",
@@ -145,6 +149,16 @@ def now_ist():
     return pd.Timestamp.now(tz=IST)
 
 
+def current_session_date():
+    now = now_ist()
+    d = now.date()
+    if now.time() < pd.Timestamp(MARKET_OPEN).time():
+        d = d - timedelta(days=1)
+    while pd.Timestamp(d).weekday() >= 5:
+        d = d - timedelta(days=1)
+    return d
+
+
 def init_fyers():
     try:
         if not cfg.client_id or not cfg.access_token:
@@ -217,12 +231,10 @@ def get_history(fyers, symbol, resolution, days=None, range_from=None, range_to=
         return None
 
 
-def get_opening_anchor(fyers, symbol):
+def get_opening_anchor(fyers, symbol, session_date):
     try:
-        today = now_ist().date()
-        session_start = int(pd.Timestamp(f"{today} 09:15:00", tz=IST).timestamp())
-        session_end = int(pd.Timestamp(f"{today} 15:30:00", tz=IST).timestamp())
-
+        session_start = int(pd.Timestamp(f"{session_date} {MARKET_OPEN}", tz=IST).timestamp())
+        session_end = int(pd.Timestamp(f"{session_date} {MARKET_CLOSE}", tz=IST).timestamp())
         intraday = get_history(
             fyers,
             symbol,
@@ -234,19 +246,19 @@ def get_opening_anchor(fyers, symbol):
         if intraday is None or intraday.empty:
             return np.nan
 
-        intraday = intraday[intraday["timestamp"].dt.date == today].copy()
+        intraday = intraday[intraday["timestamp"].dt.date == session_date].copy()
         if intraday.empty:
-            logger.info(f"No same-day intraday rows for {symbol}")
+            logger.info(f"No same-session intraday rows for {symbol} on {session_date}")
             return np.nan
 
-        target = pd.Timestamp(f"{today} 09:15:00")
+        target = pd.Timestamp(f"{session_date} {MARKET_OPEN}")
         row = intraday.loc[intraday["timestamp"] == target]
         if not row.empty:
             return safe_float(row.iloc[0]["open"])
 
         market_rows = intraday[
-            (intraday["timestamp"].dt.time >= pd.Timestamp("09:15:00").time())
-            & (intraday["timestamp"].dt.time <= pd.Timestamp("15:30:00").time())
+            (intraday["timestamp"].dt.time >= pd.Timestamp(MARKET_OPEN).time())
+            & (intraday["timestamp"].dt.time <= pd.Timestamp(MARKET_CLOSE).time())
         ].copy()
         if not market_rows.empty:
             market_rows = market_rows.sort_values("timestamp")
@@ -316,9 +328,7 @@ def get_live_fno_symbols():
         if raw.shape[1] <= 13:
             raise ValueError(f"Unexpected NSE_FO.csv shape: {raw.shape}")
 
-        # FYERS community example shows underlying at column 13 in NSE_FO.csv.
         underlying = raw[13].astype(str).str.strip().str.upper()
-
         symbols = set()
         for sym in underlying.dropna().unique():
             if not sym or sym in exclude_exact:
@@ -417,11 +427,12 @@ def build_row(symbol, anchor_price, ltp_price, levels):
     }
 
 
-def scan_universe(fyers, symbol_list, use_quotes_only=False):
+def scan_universe(fyers, symbol_list, use_quotes_only=False, session_date=None):
     rows = []
     if not symbol_list:
         return pd.DataFrame(columns=RESULT_COLS)
 
+    session_date = session_date or current_session_date()
     logger.info(f"Fetching quotes for {len(symbol_list)} symbols...")
     quotes_map = get_quotes_map(fyers, symbol_list)
 
@@ -433,10 +444,14 @@ def scan_universe(fyers, symbol_list, use_quotes_only=False):
                     logger.info(f"Skipping {sym}: no valid quote anchor.")
                     continue
             else:
-                anchor_price = get_opening_anchor(fyers, sym)
+                anchor_price = get_opening_anchor(fyers, sym, session_date)
                 if pd.isna(anchor_price):
-                    logger.info(f"Skipping {sym}: no valid 09:15 anchor.")
-                    continue
+                    anchor_price = safe_float(quotes_map.get(sym))
+                    if not pd.isna(anchor_price):
+                        logger.info(f"Intraday anchor unavailable for {sym}; using quote fallback anchor.")
+                    else:
+                        logger.info(f"Skipping {sym}: no valid 09:15 anchor and no quote fallback.")
+                        continue
 
             daily = get_history(fyers, sym, "D", days=cfg.lookback_days)
             if daily is None or daily.empty:
@@ -505,7 +520,7 @@ def build_html_table(df, title, cols):
     return table_html + "</table>"
 
 
-def send_email(index_df, long_df, short_df):
+def send_email(index_df, long_df, short_df, session_date):
     try:
         recipients = [x.strip() for x in cfg.recipient_email.split(",") if x.strip()]
         if not recipients:
@@ -518,8 +533,9 @@ def send_email(index_df, long_df, short_df):
 
         html = (
             "<html><body style='background-color:#030712; padding:20px; font-family:sans-serif;'>"
-            "<h2 style='color:#e2e8f0;'>FYERS Confluence Dashboard</h2>"
-            "<p style='color:#94a3b8;'>For stocks, Anchor_915 is the 9:15 AM candle open. For indexes, anchor falls back to current quote because FYERS intraday history for some index symbols can intermittently fail. % Change is computed from anchor to live Quotes API LTP.</p>"
+            f"<h2 style='color:#e2e8f0;'>FYERS Confluence Dashboard</h2>"
+            f"<p style='color:#94a3b8;'>Session date: {session_date}. Script version: {VERSION}.</p>"
+            "<p style='color:#94a3b8;'>For stocks, Anchor_915 uses the 9:15 AM candle open when available; otherwise the script uses a quote fallback anchor. For indexes, anchor uses the quote fallback path. % Change is computed from anchor to live Quotes API LTP.</p>"
             f"{build_html_table(index_df, 'Market Index Nodes', EMAIL_DISPLAY_COLS)}"
             f"{build_html_table(long_df, 'F&O Long Candidates (Closest Support First)', EMAIL_DISPLAY_COLS)}"
             f"{build_html_table(short_df, 'F&O Short Candidates (Closest Resistance First)', EMAIL_DISPLAY_COLS)}"
@@ -543,14 +559,21 @@ def main():
     if not fyers:
         return
 
-    logger.info("Starting index scan...")
-    index_df = scan_universe(fyers, cfg.index_symbols, use_quotes_only=True)
+    session_date = current_session_date()
+    logger.info(f"Starting FYERS confluence scan | version={VERSION} | session_date={session_date}")
+
+    if cfg.disable_index_scan:
+        logger.info("Index scan disabled by configuration.")
+        index_df = pd.DataFrame(columns=RESULT_COLS)
+    else:
+        logger.info("Starting index scan...")
+        index_df = scan_universe(fyers, cfg.index_symbols, use_quotes_only=True, session_date=session_date)
 
     logger.info("Fetching live F&O stock universe from Fyers Master CSV...")
     live_stock_symbols = get_live_fno_symbols()
 
     logger.info(f"Starting stock scan on {len(live_stock_symbols)} symbols...")
-    stock_df = scan_universe(fyers, live_stock_symbols)
+    stock_df = scan_universe(fyers, live_stock_symbols, use_quotes_only=False, session_date=session_date)
 
     long_stocks = pd.DataFrame(columns=RESULT_COLS)
     short_stocks = pd.DataFrame(columns=RESULT_COLS)
@@ -580,7 +603,7 @@ def main():
             na_position="last",
         )
 
-    send_email(index_df, long_stocks, short_stocks)
+    send_email(index_df, long_stocks, short_stocks, session_date)
 
 
 if __name__ == "__main__":
