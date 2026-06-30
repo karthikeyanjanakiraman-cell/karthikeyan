@@ -4,6 +4,8 @@ FO_FNO_FYERS_CONFLUENCE_EMAIL.py
 Index & Stock Confluence Screener using live NSE F&O universe
 from Fyers Symbol Master CSV and HV/LV overlap zones.
 LTP is the 9:15 AM candle OPEN.
+Static percentage thresholds have been entirely removed and replaced 
+with a dynamic Volume-Weighted Percentage Range (VWPR).
 """
 
 import os
@@ -15,7 +17,6 @@ from datetime import datetime, timedelta
 
 import numpy as np
 import pandas as pd
-import requests
 from fyers_apiv3 import fyersModel
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -32,10 +33,12 @@ class Config:
         self.sender_password = os.environ.get("SENDER_PASSWORD", "password")
         self.recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
+        # UPDATED: 253 trading days (1 year) and Top 100 for HV/LV limits
         self.lookback_days = int(os.environ.get("LOOKBACK_DAYS", "253"))
-        self.top_n = int(os.environ.get("TOP_N", "253"))
-        self.dedupe_pct = float(os.environ.get("DEDUPE_PCT", "0.005"))
-        self.match_tolerance = float(os.environ.get("MATCH_TOLERANCE", "0.005"))
+        self.top_n = int(os.environ.get("TOP_N", "100"))
+        
+        # NOTE: Static DEDUPE_PCT and MATCH_TOLERANCE variables have been intentionally removed.
+        # Tolerance is now 100% dynamic based on stock volume data.
 
         self.index_symbols = [
             "NSE:NIFTY50-INDEX",
@@ -245,6 +248,30 @@ def get_live_fno_symbols():
     return cfg.fallback_stock_symbols
 
 
+def get_pure_volume_tolerance(df):
+    """
+    Calculates price tolerance purely driven by Volume and Price action.
+    ZERO static numbers, multipliers, or limits.
+    """
+    if df is None or df.empty:
+        return 0.0  # Failsafe if data is missing
+
+    # Calculate the daily percentage range (High - Low) / Close
+    daily_pct_range = (df["high"] - df["low"]) / df["close"]
+    
+    # Calculate the volume weight of each day against the total volume
+    total_volume = df["volume"].sum()
+    if total_volume == 0:
+        return 0.0
+        
+    volume_weights = df["volume"] / total_volume
+    
+    # Multiply the daily range by its volume weight and sum it up
+    dynamic_tol = (daily_pct_range * volume_weights).sum()
+    
+    return float(dynamic_tol)
+
+
 def dedupe_levels(levels, tolerance_pct):
     values = sorted([
         safe_float(x) for x in levels
@@ -273,8 +300,8 @@ def build_price_levels(df):
     return raw_levels
 
 
-def extract_confluence_levels(df):
-    if df is None or df.empty:
+def extract_confluence_levels(df, dynamic_tol):
+    if df is None or df.empty or dynamic_tol == 0.0:
         return []
 
     work = df.dropna(subset=["high", "low", "close", "volume"]).copy()
@@ -284,16 +311,16 @@ def extract_confluence_levels(df):
     hv_work = work.sort_values(["volume", "high"], ascending=[False, False]).head(cfg.top_n)
     lv_work = work.sort_values(["volume", "high"], ascending=[True, False]).head(cfg.top_n)
 
-    hv_levels = dedupe_levels(build_price_levels(hv_work), cfg.dedupe_pct)
-    lv_levels = dedupe_levels(build_price_levels(lv_work), cfg.dedupe_pct)
+    hv_levels = dedupe_levels(build_price_levels(hv_work), dynamic_tol)
+    lv_levels = dedupe_levels(build_price_levels(lv_work), dynamic_tol)
 
     confluence = []
     for hv in hv_levels:
         for lv in lv_levels:
-            if hv > 0 and abs(hv - lv) / hv <= cfg.match_tolerance:
+            if hv > 0 and abs(hv - lv) / hv <= dynamic_tol:
                 confluence.append(round((hv + lv) / 2.0, 2))
 
-    return dedupe_levels(confluence, cfg.dedupe_pct)
+    return dedupe_levels(confluence, dynamic_tol)
 
 
 def nearest_levels(levels, ref_price, count=3):
@@ -368,7 +395,15 @@ def scan_universe(fyers, symbol_list, is_stock=False):
                 logger.info(f"Skipping {sym}: no valid daily rows.")
                 continue
 
-            levels = extract_confluence_levels(valid_daily)
+            # NEW: Calculate 100% data-driven volume tolerance
+            stock_tolerance = get_pure_volume_tolerance(valid_daily)
+            
+            # (Optional) Uncomment the line below to monitor the dynamic percentages while scanning
+            # logger.info(f"{sym} VWPR Tolerance Calculated: {stock_tolerance:.4f}")
+
+            # NEW: Pass the organic tolerance into the extractor
+            levels = extract_confluence_levels(valid_daily, stock_tolerance)
+            
             if not levels:
                 logger.info(f"Skipping {sym}: no HV/LV confluence levels.")
                 continue
