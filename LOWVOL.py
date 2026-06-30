@@ -2,7 +2,7 @@
 """
 FO_FNO_FYERS_CONFLUENCE_EMAIL.py
 Index & Stock Confluence Screener
-LTP is set to the 9:15 AM candle close.
+LTP is set to the 9:15 AM candle OPEN.
 """
 
 import os
@@ -183,8 +183,7 @@ def get_history(fyers, symbol, resolution, days):
 
 def get_opening_anchor(fyers, symbol):
     """
-    Uses the first 5-minute candle close of the day as the 9:15 AM reference.
-    This value is also used as LTP in the final output.
+    Uses the OPEN of the first 5-minute candle of the day as the 9:15 AM reference.
     """
     try:
         today = datetime.now().strftime("%Y-%m-%d")
@@ -208,7 +207,7 @@ def get_opening_anchor(fyers, symbol):
         df["timestamp"] = pd.to_datetime(df["timestamp"], unit="s")
         df = df.sort_values("timestamp").reset_index(drop=True)
 
-        return safe_float(df.iloc[0]["close"])
+        return safe_float(df.iloc[0]["open"])
     except Exception as e:
         logger.warning(f"Opening anchor fetch failed for {symbol}: {e}")
         return None
@@ -288,7 +287,7 @@ def build_row(symbol, anchor_price, current_price, levels):
     return {
         "Symbol": symbol,
         "Anchor_915": round(anchor_price, 2),
-        "LTP": round(anchor_price, 2),  # 9:15 AM price as requested
+        "LTP": round(anchor_price, 2),
         "Current_Price": round(current_price, 2),
         "% Change": round(pct_change, 2) if not pd.isna(pct_change) else np.nan,
         "Signal": signal,
