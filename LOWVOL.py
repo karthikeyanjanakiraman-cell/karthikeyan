@@ -35,7 +35,7 @@ class Config:
 
         # UPDATED: 253 trading days (1 year) and Top 100 for HV/LV limits
         self.lookback_days = int(os.environ.get("LOOKBACK_DAYS", "253"))
-        self.top_n = int(os.environ.get("TOP_N", "253"))
+        self.top_n = int(os.environ.get("TOP_N", "20"))
         
         # NOTE: Static DEDUPE_PCT and MATCH_TOLERANCE variables have been intentionally removed.
         # Tolerance is now 100% dynamic based on stock volume data.
