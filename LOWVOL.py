@@ -2,15 +2,14 @@
 """
 FO_FNO_FYERS_CONFLUENCE_EMAIL_FIXED.py
 
-Production-hardened index and F&O stock screener using FYERS API v3.
+Strict FYERS confluence screener.
 
-Key behavior:
-- Anchor_915 always represents the 09:15 AM candle OPEN for stocks.
-- Quote fallback is used only for calculations when 09:15 anchor is unavailable.
-- Index rows use quote anchor because FYERS index intraday history is often unstable.
-- Uses last completed trading session when run before market open.
-- Uses FYERS NSE_FO.csv underlying column defensively.
-- Sends HTML email dashboard.
+Design rules:
+- Anchor_915 is ONLY the 09:15 candle open for stocks.
+- Only rows with Anchor_Source=OPEN_915 are eligible for ranked Long/Short candidate tables.
+- Quote fallback rows are sent to a separate watchlist section.
+- Index rows use quote-based anchors because index intraday history can be unstable on FYERS.
+- Before market open, the script works on the last completed trading session.
 """
 
 import os
@@ -33,7 +32,7 @@ IST = "Asia/Kolkata"
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
-VERSION = "2026-07-01-r4"
+VERSION = "2026-07-01-r5"
 
 
 class Config:
@@ -164,6 +163,10 @@ def current_session_date():
     return d
 
 
+def session_is_today(session_date):
+    return session_date == now_ist().date()
+
+
 def init_fyers():
     try:
         if not cfg.client_id or not cfg.access_token:
@@ -253,7 +256,6 @@ def get_opening_anchor(fyers, symbol, session_date):
 
         intraday = intraday[intraday["timestamp"].dt.date == session_date].copy()
         if intraday.empty:
-            logger.info(f"No same-session intraday rows for {symbol} on {session_date}")
             return np.nan
 
         target = pd.Timestamp(f"{session_date} {MARKET_OPEN}")
@@ -272,7 +274,6 @@ def get_opening_anchor(fyers, symbol, session_date):
             logger.info(f"09:15 exact candle missing for {symbol}; fallback first intraday candle={first_ts}")
             return first_open
 
-        logger.info(f"09:15 candle not found for {symbol}; returned={intraday['timestamp'].dt.strftime('%H:%M:%S').tolist()[:10]}")
         return np.nan
     except Exception as e:
         logger.warning(f"Opening anchor fetch failed for {symbol}: {e}")
@@ -404,7 +405,7 @@ def nearest_support_resistance(levels, ref_price):
 
 
 def build_row(symbol, anchor_915, anchor_source, calc_anchor, ltp_price, levels):
-    ref_price = calc_anchor if not pd.isna(calc_anchor) else anchor_915
+    ref_price = anchor_915 if not pd.isna(anchor_915) else calc_anchor
     below_vals, above_vals = nearest_levels(levels, ref_price, count=3)
     support, resistance = nearest_support_resistance(levels, ref_price)
 
@@ -435,6 +436,17 @@ def build_row(symbol, anchor_915, anchor_source, calc_anchor, ltp_price, levels)
     }
 
 
+def get_reference_ltp_for_session(fyers, symbol, live_quote, session_date):
+    if session_is_today(session_date) and not pd.isna(live_quote):
+        return live_quote
+    daily = get_history(fyers, symbol, "D", days=10)
+    if daily is not None and not daily.empty:
+        daily = daily[daily["timestamp"].dt.date <= session_date].copy()
+        if not daily.empty:
+            return safe_float(daily.iloc[-1]["close"])
+    return live_quote
+
+
 def scan_universe(fyers, symbol_list, use_quotes_only=False, session_date=None):
     rows = []
     if not symbol_list:
@@ -446,7 +458,9 @@ def scan_universe(fyers, symbol_list, use_quotes_only=False, session_date=None):
 
     for sym in symbol_list:
         try:
-            ltp = safe_float(quotes_map.get(sym))
+            live_quote = safe_float(quotes_map.get(sym))
+            ltp = get_reference_ltp_for_session(fyers, sym, live_quote, session_date)
+
             if use_quotes_only:
                 anchor_915 = np.nan
                 calc_anchor = ltp
@@ -465,7 +479,7 @@ def scan_universe(fyers, symbol_list, use_quotes_only=False, session_date=None):
                     if pd.isna(calc_anchor):
                         logger.info(f"Skipping {sym}: no valid 09:15 anchor and no quote fallback.")
                         continue
-                    logger.info(f"Intraday anchor unavailable for {sym}; using quote fallback for calculations.")
+                    logger.info(f"Intraday anchor unavailable for {sym}; moved to fallback watchlist.")
 
             daily = get_history(fyers, sym, "D", days=cfg.lookback_days)
             if daily is None or daily.empty:
@@ -478,10 +492,7 @@ def scan_universe(fyers, symbol_list, use_quotes_only=False, session_date=None):
                 continue
 
             if pd.isna(ltp):
-                ltp = safe_float(daily["close"].iloc[-1])
-                logger.info(f"Quote fallback used for {sym}: {ltp}")
-            if pd.isna(ltp):
-                logger.info(f"Skipping {sym}: invalid live price.")
+                logger.info(f"Skipping {sym}: invalid reference price.")
                 continue
 
             rows.append(build_row(sym, anchor_915, anchor_source, calc_anchor, ltp, levels))
@@ -533,7 +544,7 @@ def build_html_table(df, title, cols):
     return table_html + "</table>"
 
 
-def send_email(index_df, long_df, short_df, session_date):
+def send_email(index_df, long_df, short_df, fallback_df, session_date):
     try:
         recipients = [x.strip() for x in cfg.recipient_email.split(",") if x.strip()]
         if not recipients:
@@ -548,10 +559,11 @@ def send_email(index_df, long_df, short_df, session_date):
             "<html><body style='background-color:#030712; padding:20px; font-family:sans-serif;'>"
             f"<h2 style='color:#e2e8f0;'>FYERS Confluence Dashboard</h2>"
             f"<p style='color:#94a3b8;'>Session date: {session_date}. Script version: {VERSION}.</p>"
-            "<p style='color:#94a3b8;'>Anchor_915 is strictly the 9:15 AM candle open for stocks. When unavailable, the script keeps Anchor_915 blank and uses a quote fallback only for calculations. Anchor_Source shows whether the row used OPEN_915, QUOTE_FALLBACK, or QUOTE_INDEX.</p>"
-            f"{build_html_table(index_df, 'Market Index Nodes', EMAIL_DISPLAY_COLS)}"
-            f"{build_html_table(long_df, 'F&O Long Candidates (Closest Support First)', EMAIL_DISPLAY_COLS)}"
-            f"{build_html_table(short_df, 'F&O Short Candidates (Closest Resistance First)', EMAIL_DISPLAY_COLS)}"
+            "<p style='color:#94a3b8;'>Only OPEN_915 rows are ranked in Long/Short candidate tables. QUOTE_FALLBACK rows are isolated in a watchlist section. Index rows use QUOTE_INDEX anchors.</p>"
+            f"{build_html_table(index_df, 'Market Index Snapshot', EMAIL_DISPLAY_COLS)}"
+            f"{build_html_table(long_df, 'F&O Long Candidates (Valid 09:15 Anchors Only)', EMAIL_DISPLAY_COLS)}"
+            f"{build_html_table(short_df, 'F&O Short Candidates (Valid 09:15 Anchors Only)', EMAIL_DISPLAY_COLS)}"
+            f"{build_html_table(fallback_df, 'Fallback Watchlist (Not Ranked as Valid 09:15 Setups)', EMAIL_DISPLAY_COLS)}"
             "</body></html>"
         )
 
@@ -590,22 +602,34 @@ def main():
 
     long_stocks = pd.DataFrame(columns=RESULT_COLS)
     short_stocks = pd.DataFrame(columns=RESULT_COLS)
+    fallback_stocks = pd.DataFrame(columns=RESULT_COLS)
 
     if not stock_df.empty:
-        long_stocks = stock_df[stock_df["Signal"] == "Long"].copy()
-        short_stocks = stock_df[stock_df["Signal"] == "Short"].copy()
+        valid_df = stock_df[stock_df["Anchor_Source"] == "OPEN_915"].copy()
+        fallback_stocks = stock_df[stock_df["Anchor_Source"] != "OPEN_915"].copy()
 
-        if not long_stocks.empty:
-            long_stocks = long_stocks.sort_values(
-                by=["Anchor_Source", "Support_Gap_Pct", "% Change"],
-                ascending=[True, True, False],
-                na_position="last",
-            )
+        if not valid_df.empty:
+            long_stocks = valid_df[valid_df["Signal"] == "Long"].copy()
+            short_stocks = valid_df[valid_df["Signal"] == "Short"].copy()
 
-        if not short_stocks.empty:
-            short_stocks = short_stocks.sort_values(
-                by=["Anchor_Source", "Resistance_Gap_Pct", "% Change"],
-                ascending=[True, True, True],
+            if not long_stocks.empty:
+                long_stocks = long_stocks.sort_values(
+                    by=["Support_Gap_Pct", "% Change"],
+                    ascending=[True, False],
+                    na_position="last",
+                )
+
+            if not short_stocks.empty:
+                short_stocks = short_stocks.sort_values(
+                    by=["Resistance_Gap_Pct", "% Change"],
+                    ascending=[True, True],
+                    na_position="last",
+                )
+
+        if not fallback_stocks.empty:
+            fallback_stocks = fallback_stocks.sort_values(
+                by=["Anchor_Source", "% Change", "Symbol"],
+                ascending=[True, False, True],
                 na_position="last",
             )
 
@@ -616,7 +640,7 @@ def main():
             na_position="last",
         )
 
-    send_email(index_df, long_stocks, short_stocks, session_date)
+    send_email(index_df, long_stocks, short_stocks, fallback_stocks, session_date)
 
 
 if __name__ == "__main__":
