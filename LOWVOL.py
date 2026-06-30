@@ -2,7 +2,7 @@
 """
 FO_FNO_FYERS_CONFLUENCE_EMAIL.py
 Index & Stock Confluence Screener using live NSE F&O universe
-from NSE page/API (no CSV) and HV/LV overlap zones.
+from Fyers Symbol Master CSV and HV/LV overlap zones.
 LTP is the 9:15 AM candle OPEN.
 """
 
@@ -202,90 +202,44 @@ def get_opening_anchor(fyers, symbol):
 
 def get_live_fno_symbols():
     """
-    Fetch live NSE F&O underlyings using NSE page/API endpoints.
-    No CSV is used.
-    Falls back to cfg.fallback_stock_symbols if nothing works.
+    Fetches the live F&O universe using the official Fyers Symbol Master CSV.
+    This replaces the NSE scraper and completely avoids WAF/IP blocking issues.
     """
-    urls = [
-        "https://www.nseindia.com/api/underlying-information",
-        "https://www.nseindia.com/api/equity-stockIndices?index=SECURITIES%20IN%20F%26O",
-    ]
-
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept": "application/json,text/plain,*/*",
-        "Referer": "https://www.nseindia.com/",
-        "Origin": "https://www.nseindia.com",
-    }
-
+    url = "https://public.fyers.in/sym_details/NSE_FO.csv"
+    
     exclude = {
         "", "SYMBOL", "NIFTY", "BANKNIFTY", "FINNIFTY",
         "MIDCPNIFTY", "NIFTYNXT50", "SENSEX", "BANKEX"
     }
-
-    session = requests.Session()
-    session.headers.update(headers)
-
+    
     try:
-        session.get("https://www.nseindia.com/", timeout=10)
-
-        for url in urls:
-            try:
-                resp = session.get(url, timeout=15)
-                if resp.status_code != 200:
-                    continue
-
-                data = resp.json()
-                symbols = set()
-
-                if isinstance(data, dict):
-                    for key in ["data", "value", "underlyings", "stocks"]:
-                        rows = data.get(key)
-                        if isinstance(rows, list):
-                            for row in rows:
-                                if not isinstance(row, dict):
-                                    continue
-
-                                sym = (
-                                    row.get("symbol")
-                                    or row.get("underlying")
-                                    or row.get("metadata", {}).get("symbol")
-                                )
-                                if sym:
-                                    sym = str(sym).strip().upper()
-                                    if (
-                                        sym not in exclude
-                                        and "NIFTY" not in sym
-                                        and "SENSEX" not in sym
-                                        and "BANKEX" not in sym
-                                    ):
-                                        symbols.add(f"NSE:{sym}-EQ")
-
-                elif isinstance(data, list):
-                    for row in data:
-                        if not isinstance(row, dict):
-                            continue
-                        sym = row.get("symbol") or row.get("underlying")
-                        if sym:
-                            sym = str(sym).strip().upper()
-                            if (
-                                sym not in exclude
-                                and "NIFTY" not in sym
-                                and "SENSEX" not in sym
-                                and "BANKEX" not in sym
-                            ):
-                                symbols.add(f"NSE:{sym}-EQ")
-
-                if symbols:
-                    out = sorted(symbols)
-                    logger.info(f"Fetched live F&O universe from NSE API/page: {len(out)} symbols")
-                    return out
-
-            except Exception as inner_e:
-                logger.warning(f"NSE endpoint failed {url}: {inner_e}")
-
+        # Fyers Symbol Master has no headers.
+        # Column index 13 contains the 'short_sym' (underlying symbol, e.g., 'RELIANCE').
+        df = pd.read_csv(url, header=None, usecols=[13], names=["underlying"])
+        
+        # Extract unique underlying symbols
+        unique_syms = df["underlying"].dropna().unique()
+        
+        symbols = set()
+        for sym in unique_syms:
+            sym = str(sym).strip().upper()
+            
+            # Apply safety filters to exclude indices and malformed strings
+            if (
+                sym not in exclude
+                and "NIFTY" not in sym
+                and "SENSEX" not in sym
+                and "BANKEX" not in sym
+            ):
+                symbols.add(f"NSE:{sym}-EQ")
+                
+        if symbols:
+            out = sorted(list(symbols))
+            logger.info(f"Fetched live F&O universe from Fyers Master: {len(out)} symbols")
+            return out
+            
     except Exception as e:
-        logger.warning(f"Live NSE session init failed: {e}")
+        logger.warning(f"Fyers Symbol Master fetch failed: {e}")
 
     logger.warning("Falling back to configured stock universe.")
     return cfg.fallback_stock_symbols
@@ -522,7 +476,7 @@ def main():
     logger.info("Starting Index Scan...")
     index_df = scan_universe(fyers, cfg.index_symbols, is_stock=False)
 
-    logger.info("Fetching live F&O stock universe from NSE page/API...")
+    logger.info("Fetching live F&O stock universe from Fyers Master CSV...")
     live_stock_symbols = get_live_fno_symbols()
 
     logger.info(f"Starting F&O Stock Scan on {len(live_stock_symbols)} symbols...")
