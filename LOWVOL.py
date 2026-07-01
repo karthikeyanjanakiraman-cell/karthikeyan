@@ -558,26 +558,16 @@ def send_email(index_df, long_df, short_df, fallback_df, session_date):
     except Exception as e:
         logger.error(f"Email failed: {e}")
 
-
 def main():
     fyers = init_fyers()
     if not fyers:
         return
 
     session_date = current_session_date()
-    logger.info(f"Starting FYERS confluence scan | version={VERSION} | session_date={session_date}")
+    logger.info(f"Starting FYERS confluence scan | session_date={session_date}")
 
-    if cfg.disable_index_scan:
-        logger.info("Index scan disabled by configuration.")
-        index_df = pd.DataFrame(columns=RESULT_COLS)
-    else:
-        logger.info("Starting index scan...")
-        index_df = scan_universe(fyers, cfg.index_symbols, session_date=session_date)
-
-    logger.info("Fetching live F&O stock universe from Fyers Master CSV...")
+    index_df = scan_universe(fyers, cfg.index_symbols, session_date=session_date) if not cfg.disable_index_scan else pd.DataFrame()
     live_stock_symbols = get_live_fno_symbols()
-
-    logger.info(f"Starting stock scan on {len(live_stock_symbols)} symbols...")
     stock_df = scan_universe(fyers, live_stock_symbols, session_date=session_date)
 
     long_stocks = pd.DataFrame(columns=RESULT_COLS)
@@ -588,40 +578,28 @@ def main():
         valid_df = stock_df[stock_df["Anchor_Source"] == "OPEN_915"].copy()
         fallback_df = stock_df[stock_df["Anchor_Source"] != "OPEN_915"].copy()
 
+        # APPLY ALIGNMENT FILTERS
         if not valid_df.empty:
-            long_stocks = valid_df[valid_df["Signal"] == "Long"].copy()
-            short_stocks = valid_df[valid_df["Signal"] == "Short"].copy()
+            # Long Filter: LTP/Anchor must be near a 'Conf_Above' node (Resistance)
+            # OR clearly above a 'Conf_Below' node (Support)
+            long_candidates = valid_df[
+                (valid_df["Signal"] == "Long") & 
+                (valid_df["LTP"] >= valid_df["Conf_Below-1"].fillna(0))
+            ].copy()
 
-            if not long_stocks.empty:
-                long_stocks = long_stocks.sort_values(
-                    by=["Support_Gap_Pct", "% Change"],
-                    ascending=[True, False],
-                    na_position="last",
-                )
+            # Short Filter: LTP/Anchor must be below a 'Conf_Above' node (Resistance)
+            short_candidates = valid_df[
+                (valid_df["Signal"] == "Short") & 
+                (valid_df["LTP"] <= valid_df["Conf_Above-1"].fillna(999999))
+            ].copy()
 
-            if not short_stocks.empty:
-                short_stocks = short_stocks.sort_values(
-                    by=["Resistance_Gap_Pct", "% Change"],
-                    ascending=[True, True],
-                    na_position="last",
-                )
+            long_stocks = long_candidates.sort_values(by=["Support_Gap_Pct"], ascending=[True])
+            short_stocks = short_candidates.sort_values(by=["Resistance_Gap_Pct"], ascending=[True])
 
         if not fallback_df.empty:
-            fallback_df = fallback_df.sort_values(
-                by=["Anchor_Source", "% Change", "Symbol"],
-                ascending=[True, False, True],
-                na_position="last",
-            )
-
-    if not index_df.empty:
-        index_df = index_df.sort_values(
-            by=["% Change", "Symbol"],
-            ascending=[False, True],
-            na_position="last",
-        )
+            fallback_df = fallback_df.sort_values(by=["% Change"], ascending=[False])
 
     send_email(index_df, long_stocks, short_stocks, fallback_df, session_date)
-
-
+  
 if __name__ == "__main__":
     main()
