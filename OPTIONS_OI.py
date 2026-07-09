@@ -324,49 +324,86 @@ def build_dashboard_and_candidates(df):
             r_dict[f"Resistance-{i}"] = format_tb_pair(row["LTP"], row.get(f"RES_T_{i}"), row.get(f"RES_B_{i}")) if pd.notna(row.get(f"RES_T_{i}")) else "-"
         dashboard_rows.append(r_dict.copy())
 
+        # Safely capture the current LTP as a math float
+        try:
+            ltp_val = float(row["LTP"])
+        except (ValueError, TypeError):
+            continue
+
+        # Get the row values
         res_b1 = row.get("RES_B_1")
         res_b2 = row.get("RES_B_2")
-        if pd.notna(res_b1) and pd.notna(res_b2) and row["LTP"] > res_b1 and row["LTP"] < res_b2:
-            cand = {
-                "Symbol": row["Symbol"],
-                "% Change": row["% Change"],
-                "Support-3": r_dict.get("Support-3", "-"),
-                "Support-2": r_dict.get("Support-2", "-"),
-                "Support-1": r_dict.get("Support-1", "-"),
-                "LTP": row["LTP"],
-                "Resistance-1": r_dict.get("Resistance-1", "-"),
-                "Resistance-2": r_dict.get("Resistance-2", "-"),
-                "Resistance-3": r_dict.get("Resistance-3", "-"),
-                "Climax_Date": row.get("Long_D", ""),
-                "Climax_Range (T/B)": format_tb_pair(row["LTP"], row.get("Long_T", res_b1), row.get("Long_B", res_b1)),
-                "Climax_Volume": f"{int(row['Long_V']):,}" if pd.notna(row.get("Long_V")) else "",
-                "Breach_Days": row.get("Long_Breach_Days", 999),
-                "Signal_Type": "Long Resistance Test",
-            }
-            _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "long")
-            valid_long.append(cand)
+        
+        # Safely convert to math floats, otherwise set as NaN
+        try:
+            res_b1_val = float(res_b1) if pd.notna(res_b1) and str(res_b1).strip() != "" else np.nan
+        except:
+            res_b1_val = np.nan
+            
+        try:
+            res_b2_val = float(res_b2) if pd.notna(res_b2) and str(res_b2).strip() != "" else np.nan
+        except:
+            res_b2_val = np.nan
+
+        # --- STRICT LONG LOGIC ---
+        if pd.notna(res_b1_val):
+            # If RES_B_2 exists, LTP must be less than it. If it doesn't exist, allow it.
+            if ltp_val > res_b1_val and (pd.isna(res_b2_val) or ltp_val < res_b2_val):
+                cand = {
+                    "Symbol": row["Symbol"],
+                    "% Change": row["% Change"],
+                    "Support-3": r_dict.get("Support-3", "-"),
+                    "Support-2": r_dict.get("Support-2", "-"),
+                    "Support-1": r_dict.get("Support-1", "-"),
+                    "LTP": row["LTP"],
+                    "Resistance-1": r_dict.get("Resistance-1", "-"),
+                    "Resistance-2": r_dict.get("Resistance-2", "-"),
+                    "Resistance-3": r_dict.get("Resistance-3", "-"),
+                    "Climax_Date": row.get("Long_D", ""),
+                    "Climax_Range (T/B)": format_tb_pair(row["LTP"], row.get("Long_T", res_b1), row.get("Long_B", res_b1)),
+                    "Climax_Volume": f"{int(row['Long_V']):,}" if pd.notna(row.get("Long_V")) else "",
+                    "Breach_Days": row.get("Long_Breach_Days", 999),
+                    "Signal_Type": "Long Resistance Test",
+                }
+                _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "long")
+                valid_long.append(cand)
+
 
         sup_t1 = row.get("SUP_T_1")
         sup_t2 = row.get("SUP_T_2")
-        if pd.notna(sup_t1) and pd.notna(sup_t2) and row["LTP"] < sup_t1 and row["LTP"] >= sup_t2:
-            cand = {
-                "Symbol": row["Symbol"],
-                "% Change": row["% Change"],
-                "Support-3": r_dict.get("Support-3", "-"),
-                "Support-2": r_dict.get("Support-2", "-"),
-                "Support-1": r_dict.get("Support-1", "-"),
-                "LTP": row["LTP"],
-                "Resistance-1": r_dict.get("Resistance-1", "-"),
-                "Resistance-2": r_dict.get("Resistance-2", "-"),
-                "Resistance-3": r_dict.get("Resistance-3", "-"),
-                "Climax_Date": row.get("Short_D", ""),
-                "Climax_Range (T/B)": format_tb_pair(row["LTP"], row.get("Short_T", sup_t1), row.get("Short_B", sup_t1)),
-                "Climax_Volume": f"{int(row['Short_V']):,}" if pd.notna(row.get("Short_V")) else "",
-                "Breach_Days": row.get("Short_Breach_Days", 999),
-                "Signal_Type": "Short Support Test",
-            }
-            _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "short")
-            valid_short.append(cand)
+        
+        try:
+            sup_t1_val = float(sup_t1) if pd.notna(sup_t1) and str(sup_t1).strip() != "" else np.nan
+        except:
+            sup_t1_val = np.nan
+            
+        try:
+            sup_t2_val = float(sup_t2) if pd.notna(sup_t2) and str(sup_t2).strip() != "" else np.nan
+        except:
+            sup_t2_val = np.nan
+
+        # --- STRICT SHORT LOGIC ---
+        if pd.notna(sup_t1_val):
+            # If SUP_T_2 exists, LTP must be >= it. If it doesn't exist, allow it.
+            if ltp_val < sup_t1_val and (pd.isna(sup_t2_val) or ltp_val >= sup_t2_val):
+                cand = {
+                    "Symbol": row["Symbol"],
+                    "% Change": row["% Change"],
+                    "Support-3": r_dict.get("Support-3", "-"),
+                    "Support-2": r_dict.get("Support-2", "-"),
+                    "Support-1": r_dict.get("Support-1", "-"),
+                    "LTP": row["LTP"],
+                    "Resistance-1": r_dict.get("Resistance-1", "-"),
+                    "Resistance-2": r_dict.get("Resistance-2", "-"),
+                    "Resistance-3": r_dict.get("Resistance-3", "-"),
+                    "Climax_Date": row.get("Short_D", ""),
+                    "Climax_Range (T/B)": format_tb_pair(row["LTP"], row.get("Short_T", sup_t1), row.get("Short_B", sup_t1)),
+                    "Climax_Volume": f"{int(row['Short_V']):,}" if pd.notna(row.get("Short_V")) else "",
+                    "Breach_Days": row.get("Short_Breach_Days", 999),
+                    "Signal_Type": "Short Support Test",
+                }
+                _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "short")
+                valid_short.append(cand)
 
     return pd.DataFrame(dashboard_rows), pd.DataFrame(valid_long), pd.DataFrame(valid_short)
 
