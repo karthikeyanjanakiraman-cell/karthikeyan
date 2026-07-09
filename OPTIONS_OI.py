@@ -314,111 +314,154 @@ def scan_options_universe(fyers, symbols):
             "% Change": ((ltp - float(daily["close"].iloc[-2])) / float(daily["close"].iloc[-2]) * 100),
         })
     return pd.DataFrame(rows)
-
 def build_dashboard_and_candidates(df):
+    """
+    Build:
+      - dashboard_rows: full support/resistance view
+      - valid_long: F&O long candidates
+      - valid_short: F&O short candidates
+
+    Long candidates:
+        LTP > Conf_Above-1  (RES_B_1)
+        LTP < Conf_Above-2  (RES_B_2)
+
+    Short candidates:
+        LTP < Conf_Above-1  (RES_B_1)
+        LTP > Conf_Below-2  (SUP_B_2)
+
+    If Conf_Above-2 / Conf_Below-2 do not exist, the trade is blocked.
+    """
     dashboard_rows, valid_long, valid_short = [], [], []
+
     for _, row in df.iterrows():
         r_dict = row.to_dict()
+
+        # Build human-readable support/resistance strings
         for i in range(1, 4):
-            r_dict[f"Support-{i}"] = format_tb_pair(row["LTP"], row.get(f"SUP_T_{i}"), row.get(f"SUP_B_{i}")) if pd.notna(row.get(f"SUP_T_{i}")) else "-"
-            r_dict[f"Resistance-{i}"] = format_tb_pair(row["LTP"], row.get(f"RES_T_{i}"), row.get(f"RES_B_{i}")) if pd.notna(row.get(f"RES_T_{i}")) else "-"
+            r_dict[f"Support-{i}"] = (
+                format_tb_pair(row["LTP"], row.get(f"SUP_T_{i}"), row.get(f"SUP_B_{i}"))
+                if pd.notna(row.get(f"SUP_T_{i}"))
+                else "-"
+            )
+            r_dict[f"Resistance-{i}"] = (
+                format_tb_pair(row["LTP"], row.get(f"RES_T_{i}"), row.get(f"RES_B_{i}"))
+                if pd.notna(row.get(f"RES_T_{i}"))
+                else "-"
+            )
+
         dashboard_rows.append(r_dict.copy())
 
-        # Safely capture the current LTP as a math float
+        # Numeric LTP
         try:
             ltp_val = float(row["LTP"])
         except (ValueError, TypeError):
             continue
 
-        res_b1 = row.get("RES_B_1")
-        res_b2 = row.get("RES_B_2")
-        
+        # --------------------
+        # LONG: LTP in (Conf_Above-1, Conf_Above-2)
+        # --------------------
+        res_b1 = row.get("RES_B_1")  # Conf_Above-1
+        res_b2 = row.get("RES_B_2")  # Conf_Above-2
+
         try:
             res_b1_val = float(res_b1) if pd.notna(res_b1) and str(res_b1).strip() != "" else np.nan
-        except:
+        except Exception:
             res_b1_val = np.nan
-            
+
         try:
             res_b2_val = float(res_b2) if pd.notna(res_b2) and str(res_b2).strip() != "" else np.nan
-        except:
+        except Exception:
             res_b2_val = np.nan
 
-        if pd.notna(res_b1_val):
-            # STRICT LONG LOGIC: LTP must be > Resistance-1. 
-            # If Resistance-2 exists, LTP must be < Resistance-2.
-            # If Resistance-2 DOES NOT exist, we block the trade to prevent chasing overextended moves.
-            is_valid_long = False
-            if ltp_val > res_b1_val:
-                if pd.notna(res_b2_val) and ltp_val < res_b2_val:
-                    is_valid_long = True
-                elif pd.isna(res_b2_val): # No second resistance found
-                    is_valid_long = False # Block it.
+        is_valid_long = False
+        if pd.notna(res_b1_val) and pd.notna(res_b2_val):
+            # Your spec: LTP > Conf_Above-1 AND LTP < Conf_Above-2
+            if (ltp_val > res_b1_val) and (ltp_val < res_b2_val):
+                is_valid_long = True
 
-            if is_valid_long:
-                cand = {
-                    "Symbol": row["Symbol"],
-                    "% Change": row["% Change"],
-                    "Support-3": r_dict.get("Support-3", "-"),
-                    "Support-2": r_dict.get("Support-2", "-"),
-                    "Support-1": r_dict.get("Support-1", "-"),
-                    "LTP": row["LTP"],
-                    "Resistance-1": r_dict.get("Resistance-1", "-"),
-                    "Resistance-2": r_dict.get("Resistance-2", "-"),
-                    "Resistance-3": r_dict.get("Resistance-3", "-"),
-                    "Climax_Date": row.get("Long_D", ""),
-                    "Climax_Range (T/B)": format_tb_pair(row["LTP"], row.get("Long_T", res_b1), row.get("Long_B", res_b1)),
-                    "Climax_Volume": f"{int(row['Long_V']):,}" if pd.notna(row.get("Long_V")) else "",
-                    "Breach_Days": row.get("Long_Breach_Days", 999),
-                    "Signal_Type": "Long Resistance Test",
-                }
-                _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "long")
-                valid_long.append(cand)
+        if is_valid_long:
+            cand_long = {
+                "Symbol": row["Symbol"],
+                "% Change": row["% Change"],
+                "Support-3": r_dict.get("Support-3", "-"),
+                "Support-2": r_dict.get("Support-2", "-"),
+                "Support-1": r_dict.get("Support-1", "-"),
+                "LTP": row["LTP"],
+                "Resistance-1": r_dict.get("Resistance-1", "-"),
+                "Resistance-2": r_dict.get("Resistance-2", "-"),
+                "Resistance-3": r_dict.get("Resistance-3", "-"),
+                "Climax_Date": row.get("Long_D", ""),
+                "Climax_Range (T/B)": format_tb_pair(
+                    row["LTP"],
+                    row.get("Long_T", res_b1),
+                    row.get("Long_B", res_b1),
+                ),
+                "Climax_Volume": (
+                    f"{int(row['Long_V']):,}"
+                    if pd.notna(row.get("Long_V"))
+                    else ""
+                ),
+                "Breach_Days": row.get("Long_Breach_Days", 999),
+                "Signal_Type": "Long Resistance Test",
+            }
+            _, _, cand_long["Target_Options"] = get_options_data(
+                row["Symbol"], row["LTP"], "long"
+            )
+            valid_long.append(cand_long)
 
-        sup_t1 = row.get("SUP_T_1")
-        sup_t2 = row.get("SUP_T_2")
-        
+        # --------------------
+        # SHORT: LTP in (Conf_Below-2, Conf_Above-1)
+        # --------------------
+        # Conf_Above-1: RES_B_1 (same as above)
+        # Conf_Below-2: SUP_B_2
+        sup_b2 = row.get("SUP_B_2")  # Conf_Below-2
+
         try:
-            sup_t1_val = float(sup_t1) if pd.notna(sup_t1) and str(sup_t1).strip() != "" else np.nan
-        except:
-            sup_t1_val = np.nan
-            
-        try:
-            sup_t2_val = float(sup_t2) if pd.notna(sup_t2) and str(sup_t2).strip() != "" else np.nan
-        except:
-            sup_t2_val = np.nan
+            sup_b2_val = float(sup_b2) if pd.notna(sup_b2) and str(sup_b2).strip() != "" else np.nan
+        except Exception:
+            sup_b2_val = np.nan
 
-        if pd.notna(sup_t1_val):
-            # STRICT SHORT LOGIC: LTP must be < Support-1. 
-            # If Support-2 exists, LTP must be >= Support-2.
-            # If Support-2 DOES NOT exist, we block the trade to prevent chasing.
-            is_valid_short = False
-            if ltp_val < sup_t1_val:
-                if pd.notna(sup_t2_val) and ltp_val >= sup_t2_val:
-                    is_valid_short = True
-                elif pd.isna(sup_t2_val): # No second support found
-                    is_valid_short = False # Block it.
+        is_valid_short = False
+        if pd.notna(res_b1_val) and pd.notna(sup_b2_val):
+            # Your spec: LTP < Conf_Above-1 AND LTP > Conf_Below-2
+            if (ltp_val < res_b1_val) and (ltp_val > sup_b2_val):
+                is_valid_short = True
 
-            if is_valid_short:
-                cand = {
-                    "Symbol": row["Symbol"],
-                    "% Change": row["% Change"],
-                    "Support-3": r_dict.get("Support-3", "-"),
-                    "Support-2": r_dict.get("Support-2", "-"),
-                    "Support-1": r_dict.get("Support-1", "-"),
-                    "LTP": row["LTP"],
-                    "Resistance-1": r_dict.get("Resistance-1", "-"),
-                    "Resistance-2": r_dict.get("Resistance-2", "-"),
-                    "Resistance-3": r_dict.get("Resistance-3", "-"),
-                    "Climax_Date": row.get("Short_D", ""),
-                    "Climax_Range (T/B)": format_tb_pair(row["LTP"], row.get("Short_T", sup_t1), row.get("Short_B", sup_t1)),
-                    "Climax_Volume": f"{int(row['Short_V']):,}" if pd.notna(row.get("Short_V")) else "",
-                    "Breach_Days": row.get("Short_Breach_Days", 999),
-                    "Signal_Type": "Short Support Test",
-                }
-                _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "short")
-                valid_short.append(cand)
+        if is_valid_short:
+            cand_short = {
+                "Symbol": row["Symbol"],
+                "% Change": row["% Change"],
+                "Support-3": r_dict.get("Support-3", "-"),
+                "Support-2": r_dict.get("Support-2", "-"),
+                "Support-1": r_dict.get("Support-1", "-"),
+                "LTP": row["LTP"],
+                "Resistance-1": r_dict.get("Resistance-1", "-"),
+                "Resistance-2": r_dict.get("Resistance-2", "-"),
+                "Resistance-3": r_dict.get("Resistance-3", "-"),
+                "Climax_Date": row.get("Short_D", ""),
+                "Climax_Range (T/B)": format_tb_pair(
+                    row["LTP"],
+                    row.get("Short_T", res_b1),
+                    row.get("Short_B", res_b1),
+                ),
+                "Climax_Volume": (
+                    f"{int(row['Short_V']):,}"
+                    if pd.notna(row.get("Short_V"))
+                    else ""
+                ),
+                "Breach_Days": row.get("Short_Breach_Days", 999),
+                "Signal_Type": "Short Support Test",
+            }
+            _, _, cand_short["Target_Options"] = get_options_data(
+                row["Symbol"], row["LTP"], "short"
+            )
+            valid_short.append(cand_short)
 
-    return pd.DataFrame(dashboard_rows), pd.DataFrame(valid_long), pd.DataFrame(valid_short)
+    return (
+        pd.DataFrame(dashboard_rows),
+        pd.DataFrame(valid_long),
+        pd.DataFrame(valid_short),
+    )
 
 def build_option_candidate_tables(df, spot_signal_map):
     if df.empty:
