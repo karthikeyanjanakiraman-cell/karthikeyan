@@ -321,11 +321,11 @@ def build_dashboard_and_candidates(df):
       - valid_long: F&O long candidates
       - valid_short: F&O short candidates
 
-    Long candidates:
+    Long (F&O Long Candidates):
         LTP > Conf_Above-1  (RES_B_1)
         LTP < Conf_Above-2  (RES_B_2)
 
-    Short candidates:
+    Short (F&O Short Candidates):
         LTP < Conf_Above-1  (RES_B_1)
         LTP > Conf_Below-2  (SUP_B_2)
 
@@ -336,7 +336,7 @@ def build_dashboard_and_candidates(df):
     for _, row in df.iterrows():
         r_dict = row.to_dict()
 
-        # Build human-readable support/resistance strings
+        # Build human-readable Support/Resistance strings
         for i in range(1, 4):
             r_dict[f"Support-{i}"] = (
                 format_tb_pair(row["LTP"], row.get(f"SUP_T_{i}"), row.get(f"SUP_B_{i}"))
@@ -359,9 +359,11 @@ def build_dashboard_and_candidates(df):
 
         # --------------------
         # LONG: LTP in (Conf_Above-1, Conf_Above-2)
+        # Conf_Above-1 -> RES_B_1
+        # Conf_Above-2 -> RES_B_2
         # --------------------
-        res_b1 = row.get("RES_B_1")  # Conf_Above-1
-        res_b2 = row.get("RES_B_2")  # Conf_Above-2
+        res_b1 = row.get("RES_B_1")
+        res_b2 = row.get("RES_B_2")
 
         try:
             res_b1_val = float(res_b1) if pd.notna(res_b1) and str(res_b1).strip() != "" else np.nan
@@ -411,10 +413,10 @@ def build_dashboard_and_candidates(df):
 
         # --------------------
         # SHORT: LTP in (Conf_Below-2, Conf_Above-1)
+        # Conf_Above-1 -> RES_B_1  (same as above)
+        # Conf_Below-2 -> SUP_B_2
         # --------------------
-        # Conf_Above-1: RES_B_1 (same as above)
-        # Conf_Below-2: SUP_B_2
-        sup_b2 = row.get("SUP_B_2")  # Conf_Below-2
+        sup_b2 = row.get("SUP_B_2")
 
         try:
             sup_b2_val = float(sup_b2) if pd.notna(sup_b2) and str(sup_b2).strip() != "" else np.nan
