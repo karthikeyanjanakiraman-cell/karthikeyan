@@ -559,6 +559,37 @@ def send_email(index_df, long_df, short_df, fallback_df, session_date):
         logger.error(f"Email failed: {e}")
 
 
+def get_breach_time(fyers, symbol, session_date, level, direction="above"):
+    """
+    Returns the timestamp (pd.Timestamp) of the first 5-min candle where
+    the close crossed the given level in the specified direction.
+    direction: "above" -> first close > level
+               "below" -> first close < level
+    Returns pd.NaT if no breach found or data unavailable.
+    """
+    if pd.isna(level):
+        return pd.NaT
+    try:
+        session_start = int(pd.Timestamp(f"{session_date} {MARKET_OPEN}", tz=IST).timestamp())
+        session_end = int(pd.Timestamp(f"{session_date} {MARKET_CLOSE}", tz=IST).timestamp())
+        intraday = get_history(
+            fyers, symbol, resolution="5",
+            range_from=session_start, range_to=session_end, date_format="0",
+        )
+        if intraday is None or intraday.empty:
+            return pd.NaT
+        intraday = intraday[intraday["timestamp"].dt.date == session_date].sort_values("timestamp")
+        if direction == "above":
+            hits = intraday[intraday["close"] > level]
+        else:
+            hits = intraday[intraday["close"] < level]
+        if hits.empty:
+            return pd.NaT
+        return hits.iloc[0]["timestamp"]
+    except Exception as e:
+        logger.warning(f"Breach time fetch failed for {symbol}: {e}")
+        return pd.NaT
+
 def main():
     fyers = init_fyers()
     if not fyers:
@@ -593,9 +624,6 @@ def main():
         fallback_df = stock_df[stock_df["Anchor_Source"] != "OPEN_915"].copy()
 
         # APPLY STRICT BAND + DIRECTIONAL SIGNAL FILTERS
-        # LONG: Signal="Long" AND LTP strictly between Conf_Above-1 and Conf_Above-2
-        # SHORT: Signal="Short" AND LTP strictly between Conf_Below-2 and Conf_Below-1
-        # If the required second confirmation level is missing, the candidate is blocked.
         if not valid_df.empty:
             conf_above_1 = valid_df["Conf_Above-1"]
             conf_above_2 = valid_df["Conf_Above-2"]
@@ -621,9 +649,29 @@ def main():
             )
             short_candidates = valid_df[short_mask].copy()
 
-            # Sort by strength of move
-            long_stocks = long_candidates.sort_values(by=["% Change"], ascending=[False])
-            short_stocks = short_candidates.sort_values(by=["% Change"], ascending=[True])
+            # Compute breach time for each qualifying candidate only (bounded API cost)
+            if not long_candidates.empty:
+                long_candidates["Breach_Time"] = long_candidates.apply(
+                    lambda r: get_breach_time(
+                        fyers, r["Symbol"], session_date, r["Conf_Above-1"], direction="above"
+                    ),
+                    axis=1,
+                )
+                # Earliest breach first = most established breakout
+                long_stocks = long_candidates.sort_values(
+                    by=["Breach_Time"], ascending=[True], na_position="last"
+                )
+
+            if not short_candidates.empty:
+                short_candidates["Breach_Time"] = short_candidates.apply(
+                    lambda r: get_breach_time(
+                        fyers, r["Symbol"], session_date, r["Conf_Below-1"], direction="below"
+                    ),
+                    axis=1,
+                )
+                short_stocks = short_candidates.sort_values(
+                    by=["Breach_Time"], ascending=[True], na_position="last"
+                )
 
         # Prepare Fallback
         if not fallback_df.empty:
