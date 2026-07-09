@@ -624,6 +624,9 @@ def main():
         fallback_df = stock_df[stock_df["Anchor_Source"] != "OPEN_915"].copy()
 
         # APPLY STRICT BAND + DIRECTIONAL SIGNAL FILTERS
+        # LONG: Signal="Long" AND LTP strictly between Conf_Above-1 and Conf_Above-2
+        # SHORT: Signal="Short" AND LTP strictly between Conf_Below-2 and Conf_Below-1
+        # If the required second confirmation level is missing, the candidate is blocked.
         if not valid_df.empty:
             conf_above_1 = valid_df["Conf_Above-1"]
             conf_above_2 = valid_df["Conf_Above-2"]
@@ -649,7 +652,7 @@ def main():
             )
             short_candidates = valid_df[short_mask].copy()
 
-            # Compute breach time for each qualifying candidate only (bounded API cost)
+            # Compute breach time only for qualifying candidates (bounded extra API cost)
             if not long_candidates.empty:
                 long_candidates["Breach_Time"] = long_candidates.apply(
                     lambda r: get_breach_time(
@@ -669,6 +672,7 @@ def main():
                     ),
                     axis=1,
                 )
+                # Earliest breach first = most established breakdown
                 short_stocks = short_candidates.sort_values(
                     by=["Breach_Time"], ascending=[True], na_position="last"
                 )
