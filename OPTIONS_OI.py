@@ -344,8 +344,17 @@ def build_dashboard_and_candidates(df):
             res_b2_val = np.nan
 
         if pd.notna(res_b1_val):
-            # Strict Long Logic: LTP > Conf_Above-1 and LTP < Conf_Above-2
-            if ltp_val > res_b1_val and (pd.isna(res_b2_val) or ltp_val < res_b2_val):
+            # STRICT LONG LOGIC: LTP must be > Resistance-1. 
+            # If Resistance-2 exists, LTP must be < Resistance-2.
+            # If Resistance-2 DOES NOT exist, we block the trade to prevent chasing overextended moves.
+            is_valid_long = False
+            if ltp_val > res_b1_val:
+                if pd.notna(res_b2_val) and ltp_val < res_b2_val:
+                    is_valid_long = True
+                elif pd.isna(res_b2_val): # No second resistance found
+                    is_valid_long = False # Block it.
+
+            if is_valid_long:
                 cand = {
                     "Symbol": row["Symbol"],
                     "% Change": row["% Change"],
@@ -379,8 +388,17 @@ def build_dashboard_and_candidates(df):
             sup_t2_val = np.nan
 
         if pd.notna(sup_t1_val):
-            # Strict Short Logic: LTP < Conf_Below-1 and LTP >= Conf_Below-2
-            if ltp_val < sup_t1_val and (pd.isna(sup_t2_val) or ltp_val >= sup_t2_val):
+            # STRICT SHORT LOGIC: LTP must be < Support-1. 
+            # If Support-2 exists, LTP must be >= Support-2.
+            # If Support-2 DOES NOT exist, we block the trade to prevent chasing.
+            is_valid_short = False
+            if ltp_val < sup_t1_val:
+                if pd.notna(sup_t2_val) and ltp_val >= sup_t2_val:
+                    is_valid_short = True
+                elif pd.isna(sup_t2_val): # No second support found
+                    is_valid_short = False # Block it.
+
+            if is_valid_short:
                 cand = {
                     "Symbol": row["Symbol"],
                     "% Change": row["% Change"],
