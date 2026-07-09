@@ -330,11 +330,9 @@ def build_dashboard_and_candidates(df):
         except (ValueError, TypeError):
             continue
 
-        # Get the row values
         res_b1 = row.get("RES_B_1")
         res_b2 = row.get("RES_B_2")
         
-        # Safely convert to math floats, otherwise set as NaN
         try:
             res_b1_val = float(res_b1) if pd.notna(res_b1) and str(res_b1).strip() != "" else np.nan
         except:
@@ -345,9 +343,8 @@ def build_dashboard_and_candidates(df):
         except:
             res_b2_val = np.nan
 
-        # --- STRICT LONG LOGIC ---
         if pd.notna(res_b1_val):
-            # If RES_B_2 exists, LTP must be less than it. If it doesn't exist, allow it.
+            # Strict Long Logic: LTP > Conf_Above-1 and LTP < Conf_Above-2
             if ltp_val > res_b1_val and (pd.isna(res_b2_val) or ltp_val < res_b2_val):
                 cand = {
                     "Symbol": row["Symbol"],
@@ -368,7 +365,6 @@ def build_dashboard_and_candidates(df):
                 _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "long")
                 valid_long.append(cand)
 
-
         sup_t1 = row.get("SUP_T_1")
         sup_t2 = row.get("SUP_T_2")
         
@@ -382,9 +378,8 @@ def build_dashboard_and_candidates(df):
         except:
             sup_t2_val = np.nan
 
-        # --- STRICT SHORT LOGIC ---
         if pd.notna(sup_t1_val):
-            # If SUP_T_2 exists, LTP must be >= it. If it doesn't exist, allow it.
+            # Strict Short Logic: LTP < Conf_Below-1 and LTP >= Conf_Below-2
             if ltp_val < sup_t1_val and (pd.isna(sup_t2_val) or ltp_val >= sup_t2_val):
                 cand = {
                     "Symbol": row["Symbol"],
