@@ -324,9 +324,9 @@ def build_dashboard_and_candidates(df):
             r_dict[f"Resistance-{i}"] = format_tb_pair(row["LTP"], row.get(f"RES_T_{i}"), row.get(f"RES_B_{i}")) if pd.notna(row.get(f"RES_T_{i}")) else "-"
         dashboard_rows.append(r_dict.copy())
 
-        tol_pct = 0.25 / 100.0
         res_b1 = row.get("RES_B_1")
-        if pd.notna(res_b1) and abs(row["LTP"] - res_b1) / max(row["LTP"], 1.0) <= tol_pct:
+        res_b2 = row.get("RES_B_2")
+        if pd.notna(res_b1) and pd.notna(res_b2) and row["LTP"] > res_b1 and row["LTP"] < res_b2:
             cand = {
                 "Symbol": row["Symbol"],
                 "% Change": row["% Change"],
@@ -346,9 +346,9 @@ def build_dashboard_and_candidates(df):
             _, _, cand["Target_Options"] = get_options_data(row["Symbol"], row["LTP"], "long")
             valid_long.append(cand)
 
-        tol_pct = 0.25 / 100.0
         sup_t1 = row.get("SUP_T_1")
-        if pd.notna(sup_t1) and abs(row["LTP"] - sup_t1) / max(row["LTP"], 1.0) <= tol_pct:
+        sup_t2 = row.get("SUP_T_2")
+        if pd.notna(sup_t1) and pd.notna(sup_t2) and row["LTP"] < sup_t1 and row["LTP"] >= sup_t2:
             cand = {
                 "Symbol": row["Symbol"],
                 "% Change": row["% Change"],
