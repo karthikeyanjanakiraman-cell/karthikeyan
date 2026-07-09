@@ -660,9 +660,9 @@ def main():
                     ),
                     axis=1,
                 )
-                # Earliest breach first = most established breakout
+                # Most recent breach first = freshest breakout
                 long_stocks = long_candidates.sort_values(
-                    by=["Breach_Time"], ascending=[True], na_position="last"
+                    by=["Breach_Time"], ascending=[False], na_position="last"
                 )
 
             if not short_candidates.empty:
@@ -672,9 +672,9 @@ def main():
                     ),
                     axis=1,
                 )
-                # Earliest breach first = most established breakdown
+                # Most recent breach first = freshest breakdown
                 short_stocks = short_candidates.sort_values(
-                    by=["Breach_Time"], ascending=[True], na_position="last"
+                    by=["Breach_Time"], ascending=[False], na_position="last"
                 )
 
         # Prepare Fallback
