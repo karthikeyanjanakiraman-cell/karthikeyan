@@ -591,25 +591,31 @@ def main():
         valid_df = stock_df[stock_df["Anchor_Source"] == "OPEN_915"].copy()
         fallback_df = stock_df[stock_df["Anchor_Source"] != "OPEN_915"].copy()
 
-        # APPLY STRICT BREAKOUT/BREAKDOWN FILTERS
+        # APPLY STRICT BAND FILTERS
+        # LONG: LTP must be strictly between Conf_Above-1 and Conf_Above-2
+        # SHORT: LTP must be strictly between Conf_Below-2 and Conf_Above-1
+        # If the required second confirmation level is missing, the candidate is blocked.
         if not valid_df.empty:
-            # LONG: LTP or Anchor > Conf_Above-1
-            long_candidates = valid_df[
-                (valid_df["Signal"] == "Long") & 
-                (
-                    (valid_df["LTP"] > valid_df["Conf_Above-1"].fillna(np.inf)) | 
-                    (valid_df["Anchor_915"] > valid_df["Conf_Above-1"].fillna(np.inf))
-                )
-            ].copy()
+            conf_above_1 = valid_df["Conf_Above-1"]
+            conf_above_2 = valid_df["Conf_Above-2"]
+            conf_below_2 = valid_df["Conf_Below-2"]
+            ltp = valid_df["LTP"]
 
-            # SHORT: LTP or Anchor < Conf_Below-1
-            short_candidates = valid_df[
-                (valid_df["Signal"] == "Short") & 
-                (
-                    (valid_df["LTP"] < valid_df["Conf_Below-1"].fillna(-np.inf)) | 
-                    (valid_df["Anchor_915"] < valid_df["Conf_Below-1"].fillna(-np.inf))
-                )
-            ].copy()
+            long_mask = (
+                conf_above_1.notna() &
+                conf_above_2.notna() &
+                (ltp > conf_above_1) &
+                (ltp < conf_above_2)
+            )
+            long_candidates = valid_df[long_mask].copy()
+
+            short_mask = (
+                conf_above_1.notna() &
+                conf_below_2.notna() &
+                (ltp < conf_above_1) &
+                (ltp > conf_below_2)
+            )
+            short_candidates = valid_df[short_mask].copy()
 
             # Sort by strength of move
             long_stocks = long_candidates.sort_values(by=["% Change"], ascending=[False])
@@ -625,6 +631,6 @@ def main():
 
     send_email(index_df, long_stocks, short_stocks, fallback_df, session_date)
 
-  
+
 if __name__ == "__main__":
     main()
