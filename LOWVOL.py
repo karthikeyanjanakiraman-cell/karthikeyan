@@ -558,6 +558,7 @@ def send_email(index_df, long_df, short_df, fallback_df, session_date):
     except Exception as e:
         logger.error(f"Email failed: {e}")
 
+
 def main():
     fyers = init_fyers()
     if not fyers:
@@ -591,17 +592,19 @@ def main():
         valid_df = stock_df[stock_df["Anchor_Source"] == "OPEN_915"].copy()
         fallback_df = stock_df[stock_df["Anchor_Source"] != "OPEN_915"].copy()
 
-        # APPLY STRICT BAND FILTERS
-        # LONG: LTP must be strictly between Conf_Above-1 and Conf_Above-2
-        # SHORT: LTP must be strictly between Conf_Below-2 and Conf_Above-1
+        # APPLY STRICT BAND + DIRECTIONAL SIGNAL FILTERS
+        # LONG: Signal="Long" AND LTP strictly between Conf_Above-1 and Conf_Above-2
+        # SHORT: Signal="Short" AND LTP strictly between Conf_Below-2 and Conf_Below-1
         # If the required second confirmation level is missing, the candidate is blocked.
         if not valid_df.empty:
             conf_above_1 = valid_df["Conf_Above-1"]
             conf_above_2 = valid_df["Conf_Above-2"]
+            conf_below_1 = valid_df["Conf_Below-1"]
             conf_below_2 = valid_df["Conf_Below-2"]
             ltp = valid_df["LTP"]
 
             long_mask = (
+                (valid_df["Signal"] == "Long") &
                 conf_above_1.notna() &
                 conf_above_2.notna() &
                 (ltp > conf_above_1) &
@@ -610,9 +613,10 @@ def main():
             long_candidates = valid_df[long_mask].copy()
 
             short_mask = (
-                conf_above_1.notna() &
+                (valid_df["Signal"] == "Short") &
+                conf_below_1.notna() &
                 conf_below_2.notna() &
-                (ltp < conf_above_1) &
+                (ltp < conf_below_1) &
                 (ltp > conf_below_2)
             )
             short_candidates = valid_df[short_mask].copy()
