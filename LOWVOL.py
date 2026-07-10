@@ -48,7 +48,6 @@ class Config:
         self.sender_password = os.environ.get("SENDER_PASSWORD", "password")
         self.recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
-        # 365 calendar days = ~253 trading sessions
         self.lookback_days = int(os.environ.get("LOOKBACK_DAYS", "365"))
         self.history_pause_sec = float(os.environ.get("HISTORY_PAUSE_SEC", "0.15"))
         self.quotes_pause_sec = float(os.environ.get("QUOTES_PAUSE_SEC", "0.20"))
@@ -71,7 +70,7 @@ cfg = Config()
 EMAIL_DISPLAY_COLS = [
     "Symbol", "Anchor_Source", "% Change", "Conf_Below-3",
     "Conf_Below-2", "Conf_Below-1", "Anchor_915", "LTP",
-    "Conf_Above-1", "Conf_Above-2", "Conf_Above-3", "Breach_Time"
+    "Conf_Above-1", "Conf_Above-2", "Conf_Above-3"
 ]
 
 RESULT_COLS = [
@@ -267,7 +266,7 @@ def extract_volume_weighted_nodes(df, bins=120, peak_quantile=0.60):
 
 def nearest_levels(levels, ref_price, count=3):
     levels = sorted(set([x for x in levels if not pd.isna(x)]))
-    below = [x for x in levels if x <= ref_price] # Fixed boundary exclusion
+    below = [x for x in levels if x <= ref_price]
     above = [x for x in levels if x >= ref_price]
     below_vals = [np.nan] * max(0, count - len(below[-count:])) + below[-count:]
     above_vals = above[:count] + [np.nan] * max(0, count - len(above[:count]))
@@ -281,12 +280,11 @@ def nearest_support_resistance(levels, ref_price):
 
 def build_row(symbol, anchor_915, anchor_source, calc_anchor, ltp_price, levels):
     below_vals, above_vals = nearest_levels(levels, calc_anchor, count=3)
-    support, resistance = nearest_support_resistance(levels, ltp_price) # Dynamic RR
+    support, resistance = nearest_support_resistance(levels, ltp_price)
 
     pct_change = ((ltp_price - calc_anchor) / calc_anchor * 100.0) if calc_anchor and not pd.isna(ltp_price) else np.nan
     signal = "-" if pd.isna(pct_change) else ("Long" if pct_change >= 0 else "Short")
     
-    # Dynamic gap calculated from Live Price, not Anchor
     support_gap_pct = ((ltp_price - support) / ltp_price * 100.0) if not pd.isna(support) and ltp_price else np.nan
     res_gap_pct = ((resistance - ltp_price) / ltp_price * 100.0) if not pd.isna(resistance) and ltp_price else np.nan
 
@@ -318,7 +316,6 @@ def scan_universe(fyers, symbol_list, session_date, is_index=False):
             daily = get_history(fyers, sym, "D", days=cfg.lookback_days)
             if daily is None or daily.empty: continue
 
-            # Prevent forward data leak by dropping today's live candle
             if daily.iloc[-1]["timestamp"].date() >= session_date:
                 hist_daily = daily.iloc[:-1].copy()
             else:
@@ -360,14 +357,14 @@ def get_breach_time(fyers, symbol, session_date, level, direction="above"):
         if intraday is None or intraday.empty: return pd.NaT
         intraday = intraday[intraday["timestamp"].dt.date == session_date].sort_values("timestamp")
         
-        # Look for live crossovers, not just the first breach
+        # Fill shift(1) missing values so morning gap-ups register as immediate crossovers
         if direction == "above":
-            hits = intraday[(intraday["close"] > level) & (intraday["close"].shift(1) <= level)]
+            hits = intraday[(intraday["close"] > level) & (intraday["close"].shift(1).fillna(0) <= level)]
         else:
-            hits = intraday[(intraday["close"] < level) & (intraday["close"].shift(1) >= level)]
+            hits = intraday[(intraday["close"] < level) & (intraday["close"].shift(1).fillna(float('inf')) >= level)]
             
         if hits.empty: return pd.NaT
-        return hits.iloc[-1]["timestamp"] # Freshest breakout
+        return hits.iloc[-1]["timestamp"]
     except Exception:
         return pd.NaT
 
@@ -389,10 +386,6 @@ def build_html_table(df, title, cols):
                 val_num, val_str = safe_float(val), format_change(val)
                 if not pd.isna(val_num): style += " color:#4ade80; font-weight:bold;" if val_num > 0 else " color:#f87171; font-weight:bold;"
                 html += f"<td style='{style}'>{val_str}</td>"
-            elif c == "Breach_Time" and pd.isna(val):
-                html += f"<td style='{style}'>-</td>"
-            elif c == "Breach_Time":
-                html += f"<td style='{style}'>{val.strftime('%H:%M')}</td>"
             else:
                 html += f"<td style='{style}'>{format_value(val)}</td>"
         html += "</tr>"
