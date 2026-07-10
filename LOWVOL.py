@@ -667,9 +667,9 @@ def main():
         # If the required second confirmation level is missing, the candidate is blocked.
         if not valid_df.empty:
             conf_above_1 = valid_df["Conf_Above-1"]
-            conf_above_2 = valid_df["Conf_Above-3"]
+            conf_above_2 = valid_df["Conf_Above-2"]
             conf_below_1 = valid_df["Conf_Below-1"]
-            conf_below_2 = valid_df["Conf_Below-3"]
+            conf_below_2 = valid_df["Conf_Below-2"]
             ltp = valid_df["LTP"]
 
             long_mask = (
@@ -698,9 +698,12 @@ def main():
                     ),
                     axis=1,
                 )
-                # Most recent breach first = freshest breakout
+                # Primary: Most recent breach first = freshest breakout
+                # Secondary: % Change descending (tiebreaker when Breach_Time ties or is NaT)
                 long_stocks = long_candidates.sort_values(
-                    by=["Breach_Time"], ascending=[False], na_position="last"
+                    by=["Breach_Time", "% Change"],
+                    ascending=[False, False],
+                    na_position="last"
                 )
 
             if not short_candidates.empty:
@@ -710,9 +713,12 @@ def main():
                     ),
                     axis=1,
                 )
-                # Most recent breach first = freshest breakdown
+                # Primary: Most recent breach first = freshest breakdown
+                # Secondary: % Change descending (tiebreaker when Breach_Time ties or is NaT)
                 short_stocks = short_candidates.sort_values(
-                    by=["Breach_Time"], ascending=[False], na_position="last"
+                    by=["Breach_Time", "% Change"],
+                    ascending=[False, False],
+                    na_position="last"
                 )
 
         # Prepare Fallback
