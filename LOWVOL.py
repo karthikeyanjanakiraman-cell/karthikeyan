@@ -716,7 +716,7 @@ def main():
                 # Primary: Most recent breach first = freshest breakdown
                 # Secondary: % Change descending (tiebreaker when Breach_Time ties or is NaT)
                 short_stocks = short_candidates.sort_values(
-                    by=["Breach_Time", "% Change"],
+                    by=["% Change","Breach_Time"],
                     ascending=[False, False],
                     na_position="last"
                 )
