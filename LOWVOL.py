@@ -590,6 +590,44 @@ def get_breach_time(fyers, symbol, session_date, level, direction="above"):
         logger.warning(f"Breach time fetch failed for {symbol}: {e}")
         return pd.NaT
 
+# Patch logic for FYERS Confluence Dashboard rendering
+
+def build_dashboard_sections(rows):
+    index_rows = []
+    long_rows = []
+    short_rows = []
+    fallback_rows = []
+
+    for r in rows:
+        src = str(r.get('Anchor_Source', '')).upper()
+        side = str(r.get('Side', '')).upper()
+
+        if src == 'QUOTE_INDEX':
+            index_rows.append(r)
+        elif src == 'QUOTE_FALLBACK':
+            fallback_rows.append(r)
+        elif src == 'OPEN_915':
+            if side == 'LONG':
+                long_rows.append(r)
+            elif side == 'SHORT':
+                short_rows.append(r)
+
+    return {
+        'market_index_snapshot': index_rows,
+        'fno_long_candidates': long_rows,
+        'fno_short_candidates': short_rows,
+        'fallback_watchlist': fallback_rows,
+    }
+
+
+def render_dashboard(sections):
+    blocks = []
+    blocks.append(('Market Index Snapshot', sections['market_index_snapshot']))
+    blocks.append(('F&O Long Candidates', sections['fno_long_candidates']))
+    blocks.append(('F&O Short Candidates', sections['fno_short_candidates']))
+    blocks.append(('Fallback Watchlist', sections['fallback_watchlist']))
+    return blocks
+
 def main():
     fyers = init_fyers()
     if not fyers:
