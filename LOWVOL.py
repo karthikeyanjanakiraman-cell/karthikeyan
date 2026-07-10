@@ -629,9 +629,9 @@ def main():
         # If the required second confirmation level is missing, the candidate is blocked.
         if not valid_df.empty:
             conf_above_1 = valid_df["Conf_Above-1"]
-            conf_above_2 = valid_df["Conf_Above-2"]
+            conf_above_2 = valid_df["Conf_Above-3"]
             conf_below_1 = valid_df["Conf_Below-1"]
-            conf_below_2 = valid_df["Conf_Below-2"]
+            conf_below_2 = valid_df["Conf_Below-3"]
             ltp = valid_df["LTP"]
 
             long_mask = (
