@@ -2,23 +2,25 @@
 """
 FO_FNO_FYERS_CONFLUENCE_EMAIL_FIXED.py
 
-Strict FYERS confluence screener.
+Strict FYERS confluence screener - Production Version
 
 Design rules:
 - Anchor_915 is ONLY the 09:15 candle open for stocks.
-- Only rows with Anchor_Source=OPEN_915 are eligible for ranked Long/Short candidate tables.
+- Only rows with Anchor_Source=OPEN_915 are eligible for ranked Long/Short tables.
 - Quote fallback rows are sent to a separate watchlist section.
-- Index rows use quote-based anchors because index intraday history can be unstable on FYERS.
-- Before market open, the script works on the last completed trading session.
+- Index rows use quote-based anchors (Open Price).
+- Automated Cron Safeguards: Market hours gating, JSON state tracking to prevent duplicate emails.
 """
 
 import os
 import sys
 import time
+import json
 import logging
 import warnings
 import smtplib
 from io import StringIO
+from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta
@@ -32,8 +34,8 @@ IST = "Asia/Kolkata"
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
-VERSION = "2026-07-01-r6"
-
+VERSION = "2026-07-10-prod"
+STATE_FILE = Path("fyers_state.json")
 
 class Config:
     def __init__(self):
@@ -46,7 +48,8 @@ class Config:
         self.sender_password = os.environ.get("SENDER_PASSWORD", "password")
         self.recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
-        self.lookback_days = int(os.environ.get("LOOKBACK_DAYS", "253"))
+        # 365 calendar days = ~253 trading sessions
+        self.lookback_days = int(os.environ.get("LOOKBACK_DAYS", "365"))
         self.history_pause_sec = float(os.environ.get("HISTORY_PAUSE_SEC", "0.15"))
         self.quotes_pause_sec = float(os.environ.get("QUOTES_PAUSE_SEC", "0.20"))
         self.max_retries = int(os.environ.get("MAX_RETRIES", "3"))
@@ -58,56 +61,25 @@ class Config:
             "NSE:NIFTYBANK-INDEX",
             "BSE:SENSEX-INDEX",
         ]
-
         self.fallback_stock_symbols = [
-            "NSE:RELIANCE-EQ",
-            "NSE:HDFCBANK-EQ",
-            "NSE:ICICIBANK-EQ",
-            "NSE:INFY-EQ",
-            "NSE:TCS-EQ",
-            "NSE:SBIN-EQ",
-            "NSE:ITC-EQ",
-            "NSE:LT-EQ",
-            "NSE:AXISBANK-EQ",
-            "NSE:KOTAKBANK-EQ",
+            "NSE:RELIANCE-EQ", "NSE:HDFCBANK-EQ", "NSE:ICICIBANK-EQ", 
+            "NSE:INFY-EQ", "NSE:TCS-EQ", "NSE:SBIN-EQ"
         ]
-
 
 cfg = Config()
 
 EMAIL_DISPLAY_COLS = [
-    "Symbol",
-    "Anchor_Source",
-    "% Change",
-    "Conf_Below-3",
-    "Conf_Below-2",
-    "Conf_Below-1",
-    "Anchor_915",
-    "LTP",
-    "Conf_Above-1",
-    "Conf_Above-2",
-    "Conf_Above-3",
+    "Symbol", "Anchor_Source", "% Change", "Conf_Below-3",
+    "Conf_Below-2", "Conf_Below-1", "Anchor_915", "LTP",
+    "Conf_Above-1", "Conf_Above-2", "Conf_Above-3", "Breach_Time"
 ]
 
 RESULT_COLS = [
-    "Symbol",
-    "Anchor_915",
-    "Anchor_Source",
-    "Calc_Anchor",
-    "LTP",
-    "Current_Close",
-    "% Change",
-    "Signal",
-    "Conf_Below-3",
-    "Conf_Below-2",
-    "Conf_Below-1",
-    "Conf_Above-1",
-    "Conf_Above-2",
-    "Conf_Above-3",
-    "Support",
-    "Resistance",
-    "Support_Gap_Pct",
-    "Resistance_Gap_Pct",
+    "Symbol", "Anchor_915", "Anchor_Source", "Calc_Anchor",
+    "LTP", "Current_Close", "% Change", "Signal",
+    "Conf_Below-3", "Conf_Below-2", "Conf_Below-1",
+    "Conf_Above-1", "Conf_Above-2", "Conf_Above-3",
+    "Support", "Resistance", "Support_Gap_Pct", "Resistance_Gap_Pct"
 ]
 
 logger = logging.getLogger("fyers_confluence")
@@ -116,42 +88,54 @@ logger.handlers.clear()
 stream = logging.StreamHandler(sys.stdout)
 stream.setFormatter(logging.Formatter("%(asctime)s | %(levelname)s | %(message)s", "%Y-%m-%d %H:%M:%S"))
 logger.addHandler(stream)
-
 warnings.filterwarnings("ignore")
 
+# --- State Management for Cron ---
+def load_state(session_date):
+    date_str = str(session_date)
+    if STATE_FILE.exists():
+        try:
+            with open(STATE_FILE, "r") as f:
+                data = json.load(f)
+                if data.get("date") == date_str:
+                    return set(data.get("seen", []))
+        except Exception as e:
+            logger.error(f"Error loading state: {e}")
+    return set()
 
+def save_state(session_date, seen_set):
+    try:
+        with open(STATE_FILE, "w") as f:
+            json.dump({"date": str(session_date), "seen": list(seen_set)}, f)
+    except Exception as e:
+        logger.error(f"Error saving state: {e}")
+
+# --- Utility Functions ---
 def safe_float(val):
     try:
-        if val is None or pd.isna(val):
-            return np.nan
+        if val is None or pd.isna(val): return np.nan
         return float(val)
     except Exception:
         return np.nan
 
-
 def format_value(val):
-    if pd.isna(val) or val in [float("inf"), float("-inf")]:
-        return "-"
-    if isinstance(val, (int, float, np.integer, np.floating)):
-        return f"{float(val):.2f}"
+    if pd.isna(val) or val in [float("inf"), float("-inf")]: return "-"
+    if isinstance(val, (int, float, np.integer, np.floating)): return f"{float(val):.2f}"
     return str(val)
-
 
 def format_change(val):
     try:
+        if pd.isna(val): return "-"
         return f"{float(val):.2f}%"
     except Exception:
         return "-"
-
 
 def chunked(seq, size):
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
 
-
 def now_ist():
     return pd.Timestamp.now(tz=IST)
-
 
 def current_session_date():
     now = now_ist()
@@ -162,26 +146,16 @@ def current_session_date():
         d = d - timedelta(days=1)
     return d
 
-
-def session_is_today(session_date):
-    return session_date == now_ist().date()
-
-
+# --- FYERS API ---
 def init_fyers():
     try:
         if not cfg.client_id or not cfg.access_token:
             logger.error("Missing CLIENT_ID/ACCESS_TOKEN.")
             return None
-        return fyersModel.FyersModel(
-            client_id=cfg.client_id,
-            is_async=False,
-            token=cfg.access_token,
-            log_path=""
-        )
+        return fyersModel.FyersModel(client_id=cfg.client_id, is_async=False, token=cfg.access_token, log_path="")
     except Exception as e:
         logger.error(f"FYERS init failed: {e}")
         return None
-
 
 def call_with_retries(func, *args, **kwargs):
     last_err = None
@@ -195,10 +169,8 @@ def call_with_retries(func, *args, **kwargs):
             last_err = e
             wait = min(2 ** (attempt - 1), 5)
             logger.warning(f"Attempt {attempt}/{cfg.max_retries} failed: {e}")
-            if attempt < cfg.max_retries:
-                time.sleep(wait)
+            if attempt < cfg.max_retries: time.sleep(wait)
     raise RuntimeError(last_err)
-
 
 def normalize_history_df(candles):
     df = pd.DataFrame(candles, columns=["timestamp", "open", "high", "low", "close", "volume"])
@@ -207,94 +179,49 @@ def normalize_history_df(candles):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df.sort_values("timestamp").drop_duplicates(subset=["timestamp"]).reset_index(drop=True)
 
-
 def get_history(fyers, symbol, resolution, days=None, range_from=None, range_to=None, date_format="1"):
     try:
         if date_format == "1":
-            if range_from is None or range_to is None:
-                now = datetime.now()
-                start = (now - timedelta(days=days or cfg.lookback_days)).strftime("%Y-%m-%d")
-                end = now.strftime("%Y-%m-%d")
-            else:
-                start, end = range_from, range_to
+            now = pd.Timestamp.now(tz=IST)
+            start = (now - timedelta(days=days or cfg.lookback_days)).strftime("%Y-%m-%d")
+            end = now.strftime("%Y-%m-%d")
         else:
             start, end = str(range_from), str(range_to)
 
-        payload = {
-            "symbol": symbol,
-            "resolution": str(resolution),
-            "date_format": str(date_format),
-            "range_from": start,
-            "range_to": end,
-            "cont_flag": "1",
-        }
+        payload = {"symbol": symbol, "resolution": str(resolution), "date_format": str(date_format), "range_from": start, "range_to": end, "cont_flag": "1"}
         res = call_with_retries(fyers.history, data=payload)
         time.sleep(cfg.history_pause_sec)
         candles = res.get("candles", []) if isinstance(res, dict) else []
-        if not candles:
-            return None
+        if not candles: return None
         return normalize_history_df(candles)
     except Exception as e:
-        logger.warning(f"History fetch failed for {symbol} [{resolution}]: {e}")
+        logger.warning(f"History fetch failed for {symbol}: {e}")
         return None
-
 
 def get_opening_anchor(fyers, symbol, session_date):
     try:
         session_start = int(pd.Timestamp(f"{session_date} {MARKET_OPEN}", tz=IST).timestamp())
         session_end = int(pd.Timestamp(f"{session_date} {MARKET_CLOSE}", tz=IST).timestamp())
-        intraday = get_history(
-            fyers,
-            symbol,
-            resolution="5",
-            range_from=session_start,
-            range_to=session_end,
-            date_format="0",
-        )
-        if intraday is None or intraday.empty:
-            return np.nan
+        intraday = get_history(fyers, symbol, resolution="5", range_from=session_start, range_to=session_end, date_format="0")
+        if intraday is None or intraday.empty: return np.nan
 
         intraday = intraday[intraday["timestamp"].dt.date == session_date].copy()
-        if intraday.empty:
-            return np.nan
-
         target = pd.Timestamp(f"{session_date} {MARKET_OPEN}")
         row = intraday.loc[intraday["timestamp"] == target]
         if not row.empty:
             return safe_float(row.iloc[0]["open"])
-
-        market_rows = intraday[
-            (intraday["timestamp"].dt.time >= pd.Timestamp(MARKET_OPEN).time())
-            & (intraday["timestamp"].dt.time <= pd.Timestamp(MARKET_CLOSE).time())
-        ].copy()
-        if not market_rows.empty:
-            market_rows = market_rows.sort_values("timestamp")
-            first_ts = market_rows.iloc[0]["timestamp"]
-            first_open = safe_float(market_rows.iloc[0]["open"])
-            logger.info(f"09:15 exact candle missing for {symbol}; fallback first intraday candle={first_ts}")
-            return first_open
-
+            
         return np.nan
     except Exception as e:
-        logger.warning(f"Opening anchor fetch failed for {symbol}: {e}")
         return np.nan
 
-
-def extract_quote_ltp(quote_item):
-    if not isinstance(quote_item, dict):
-        return np.nan
-    direct_keys = ["lp", "ltp", "last_price", "last_traded_price"]
-    for key in direct_keys:
-        val = safe_float(quote_item.get(key))
-        if not pd.isna(val):
-            return val
-    nested = quote_item.get("v") if isinstance(quote_item.get("v"), dict) else {}
-    for key in direct_keys:
-        val = safe_float(nested.get(key))
-        if not pd.isna(val):
-            return val
-    return np.nan
-
+def extract_quote_data(quote_item):
+    if not isinstance(quote_item, dict): return {"ltp": np.nan, "open": np.nan}
+    nested = quote_item.get("v") if isinstance(quote_item.get("v"), dict) else quote_item
+    return {
+        "ltp": safe_float(nested.get("lp") or nested.get("last_price")),
+        "open": safe_float(nested.get("open_price"))
+    }
 
 def get_quotes_map(fyers, symbols):
     out = {}
@@ -306,113 +233,62 @@ def get_quotes_map(fyers, symbols):
             for item in items:
                 symbol = item.get("n") or item.get("symbol")
                 if symbol:
-                    out[symbol] = extract_quote_ltp(item)
-        except Exception as e:
-            logger.warning(f"Quotes batch failed: {e}")
-            for sym in batch:
-                out.setdefault(sym, np.nan)
+                    out[symbol] = extract_quote_data(item)
+        except Exception:
+            for sym in batch: out.setdefault(sym, {"ltp": np.nan, "open": np.nan})
     return out
 
-
-def fetch_text(url, timeout=30):
-    headers = {"User-Agent": "Mozilla/5.0"}
-    resp = requests.get(url, timeout=timeout, headers=headers)
-    resp.raise_for_status()
-    return resp.text
-
-
-def get_live_fno_symbols():
-    exclude_exact = {
-        "", "SYMBOL", "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY",
-        "NIFTYNXT50", "SENSEX", "BANKEX", "CE", "PE", "XX", "FUT"
-    }
-    try:
-        text = fetch_text(FYERS_FO_MASTER_URL)
-        raw = pd.read_csv(StringIO(text), header=None)
-        if raw.empty:
-            raise ValueError("NSE_FO.csv is empty")
-        if raw.shape[1] <= 13:
-            raise ValueError(f"Unexpected NSE_FO.csv shape: {raw.shape}")
-
-        underlying = raw[13].astype(str).str.strip().str.upper()
-        symbols = set()
-        for sym in underlying.dropna().unique():
-            if not sym or sym in exclude_exact:
-                continue
-            if any(x in sym for x in ["NIFTY", "SENSEX", "BANKEX"]):
-                continue
-            if len(sym) < 2:
-                continue
-            if not pd.Series([sym]).str.fullmatch(r"[A-Z][A-Z0-9&-]{1,30}").iloc[0]:
-                continue
-            symbols.add(f"NSE:{sym}-EQ")
-
-        out = sorted(symbols)
-        if cfg.stock_limit > 0:
-            out = out[:cfg.stock_limit]
-        if out:
-            logger.info(f"Fetched live F&O universe from Fyers Master: {len(out)} symbols")
-            return out
-        raise ValueError("No valid symbols extracted")
-    except Exception as e:
-        logger.warning(f"Fyers Symbol Master fetch/parse failed: {e}")
-        logger.warning("Falling back to configured stock universe.")
-        return cfg.fallback_stock_symbols
-
-
+# --- Strategy Math ---
 def extract_volume_weighted_nodes(df, bins=120, peak_quantile=0.60):
-    if df is None or df.empty:
-        return []
-
-    work = df[["high", "low", "close", "volume"]].dropna().copy()
-    if work.empty:
-        return []
+    if df is None or df.empty: return []
+    work = df[["high", "low", "close", "volume"]].copy()
+    work["volume"] = work["volume"].fillna(0) # Prevent index wipeout
+    work = work.dropna()
+    if work.empty: return []
 
     typical_price = (work["high"] + work["low"] + work["close"]) / 3.0
-    min_p = safe_float(typical_price.min())
-    max_p = safe_float(typical_price.max())
-    if pd.isna(min_p) or pd.isna(max_p) or min_p >= max_p:
-        return []
+    min_p, max_p = safe_float(typical_price.min()), safe_float(typical_price.max())
+    if pd.isna(min_p) or pd.isna(max_p) or min_p >= max_p: return []
 
     edges = np.linspace(min_p, max_p, bins)
     weights = work["volume"] if work["volume"].sum() > 0 else None
     hist, bin_edges = np.histogram(typical_price, bins=edges, weights=weights)
-    if len(hist) < 3 or np.nansum(hist) <= 0:
-        return []
-
+    
     threshold = np.nanquantile(hist, peak_quantile)
     nodes = []
     for i in range(1, len(hist) - 1):
         if hist[i] >= hist[i - 1] and hist[i] >= hist[i + 1] and hist[i] >= threshold and hist[i] > 0:
             nodes.append(round((bin_edges[i] + bin_edges[i + 1]) / 2.0, 2))
+            
+    # Recursive fallback for tight consolidations
+    if not nodes and peak_quantile > 0.30:
+        return extract_volume_weighted_nodes(df, bins, 0.30)
     return sorted(set(nodes))
-
 
 def nearest_levels(levels, ref_price, count=3):
     levels = sorted(set([x for x in levels if not pd.isna(x)]))
-    below = [x for x in levels if x < ref_price]
-    above = [x for x in levels if x > ref_price]
+    below = [x for x in levels if x <= ref_price] # Fixed boundary exclusion
+    above = [x for x in levels if x >= ref_price]
     below_vals = [np.nan] * max(0, count - len(below[-count:])) + below[-count:]
     above_vals = above[:count] + [np.nan] * max(0, count - len(above[:count]))
     return below_vals, above_vals
 
-
 def nearest_support_resistance(levels, ref_price):
     levels = sorted(set([x for x in levels if not pd.isna(x)]))
-    support = max([x for x in levels if x < ref_price], default=np.nan)
-    resistance = min([x for x in levels if x > ref_price], default=np.nan)
+    support = max([x for x in levels if x <= ref_price], default=np.nan)
+    resistance = min([x for x in levels if x >= ref_price], default=np.nan)
     return support, resistance
 
-
 def build_row(symbol, anchor_915, anchor_source, calc_anchor, ltp_price, levels):
-    ref_price = anchor_915 if not pd.isna(anchor_915) else calc_anchor
-    below_vals, above_vals = nearest_levels(levels, ref_price, count=3)
-    support, resistance = nearest_support_resistance(levels, ref_price)
+    below_vals, above_vals = nearest_levels(levels, calc_anchor, count=3)
+    support, resistance = nearest_support_resistance(levels, ltp_price) # Dynamic RR
 
     pct_change = ((ltp_price - calc_anchor) / calc_anchor * 100.0) if calc_anchor and not pd.isna(ltp_price) else np.nan
-    signal = "Long" if not pd.isna(pct_change) and pct_change >= 0 else "Short"
-    support_gap_pct = ((ref_price - support) / ref_price * 100.0) if not pd.isna(support) and ref_price else np.nan
-    resistance_gap_pct = ((resistance - ref_price) / ref_price * 100.0) if not pd.isna(resistance) and ref_price else np.nan
+    signal = "-" if pd.isna(pct_change) else ("Long" if pct_change >= 0 else "Short")
+    
+    # Dynamic gap calculated from Live Price, not Anchor
+    support_gap_pct = ((ltp_price - support) / ltp_price * 100.0) if not pd.isna(support) and ltp_price else np.nan
+    res_gap_pct = ((resistance - ltp_price) / ltp_price * 100.0) if not pd.isna(resistance) and ltp_price else np.nan
 
     return {
         "Symbol": symbol,
@@ -423,314 +299,209 @@ def build_row(symbol, anchor_915, anchor_source, calc_anchor, ltp_price, levels)
         "Current_Close": round(ltp_price, 2) if not pd.isna(ltp_price) else np.nan,
         "% Change": round(pct_change, 2) if not pd.isna(pct_change) else np.nan,
         "Signal": signal,
-        "Conf_Below-3": below_vals[0],
-        "Conf_Below-2": below_vals[1],
-        "Conf_Below-1": below_vals[2],
-        "Conf_Above-1": above_vals[0],
-        "Conf_Above-2": above_vals[1],
-        "Conf_Above-3": above_vals[2],
-        "Support": support,
-        "Resistance": resistance,
+        "Conf_Below-3": below_vals[0], "Conf_Below-2": below_vals[1], "Conf_Below-1": below_vals[2],
+        "Conf_Above-1": above_vals[0], "Conf_Above-2": above_vals[1], "Conf_Above-3": above_vals[2],
+        "Support": support, "Resistance": resistance,
         "Support_Gap_Pct": round(support_gap_pct, 2) if not pd.isna(support_gap_pct) else np.nan,
-        "Resistance_Gap_Pct": round(resistance_gap_pct, 2) if not pd.isna(resistance_gap_pct) else np.nan,
+        "Resistance_Gap_Pct": round(res_gap_pct, 2) if not pd.isna(res_gap_pct) else np.nan,
     }
 
-
-
-
-def scan_universe(fyers, symbol_list, session_date=None):
+def scan_universe(fyers, symbol_list, session_date, is_index=False):
     rows = []
-    if not symbol_list:
-        return pd.DataFrame(columns=RESULT_COLS)
-
-    session_date = session_date or current_session_date()
-    logger.info(f"Fetching quotes for {len(symbol_list)} symbols...")
+    if not symbol_list: return pd.DataFrame(columns=RESULT_COLS)
     quotes_map = get_quotes_map(fyers, symbol_list)
 
     for sym in symbol_list:
         try:
-            live_quote = safe_float(quotes_map.get(sym))
-            anchor_915 = get_opening_anchor(fyers, sym, session_date)
-            anchor_source = "OPEN_915"
-            if pd.isna(anchor_915):
-                logger.info(f"Skipping {sym}: no valid 09:15 anchor.")
-                continue
-
-            calc_anchor = anchor_915
+            q_data = quotes_map.get(sym, {})
+            live_quote, open_quote = q_data.get("ltp"), q_data.get("open")
             daily = get_history(fyers, sym, "D", days=cfg.lookback_days)
-            if daily is None or daily.empty:
-                logger.info(f"Skipping {sym}: no daily history.")
-                continue
+            if daily is None or daily.empty: continue
 
-            levels = extract_volume_weighted_nodes(daily)
-            if not levels:
-                logger.info(f"Skipping {sym}: no nodes found.")
-                continue
+            # Prevent forward data leak by dropping today's live candle
+            if daily.iloc[-1]["timestamp"].date() >= session_date:
+                hist_daily = daily.iloc[:-1].copy()
+            else:
+                hist_daily = daily.copy()
+            
+            levels = extract_volume_weighted_nodes(hist_daily)
+            if not levels: continue
 
-            ltp = live_quote
-            if pd.isna(ltp):
-                ltp = safe_float(daily["close"].iloc[-1])
-                logger.info(f"Quote fallback used for {sym}: {ltp}")
-            if pd.isna(ltp):
-                logger.info(f"Skipping {sym}: invalid live price.")
-                continue
+            prev_close = safe_float(hist_daily["close"].iloc[-1]) if not hist_daily.empty else np.nan
+
+            if is_index:
+                anchor_915, anchor_source = np.nan, "QUOTE_INDEX"
+                calc_anchor = open_quote if not pd.isna(open_quote) else prev_close
+            else:
+                anchor_915 = get_opening_anchor(fyers, sym, session_date)
+                if pd.isna(anchor_915):
+                    anchor_source, calc_anchor = "QUOTE_FALLBACK", prev_close
+                else:
+                    anchor_source, calc_anchor = "OPEN_915", anchor_915
+
+            ltp = live_quote if not pd.isna(live_quote) else prev_close
+            if pd.isna(ltp): continue
 
             rows.append(build_row(sym, anchor_915, anchor_source, calc_anchor, ltp, levels))
         except Exception as e:
             logger.warning(f"Scan failed for {sym}: {e}")
 
-    if not rows:
-        return pd.DataFrame(columns=RESULT_COLS)
-
-    out = pd.DataFrame(rows)
+    out = pd.DataFrame(rows) if rows else pd.DataFrame(columns=RESULT_COLS)
     for col in RESULT_COLS:
-        if col not in out.columns:
-            out[col] = np.nan
+        if col not in out.columns: out[col] = np.nan
     return out[RESULT_COLS]
 
+def get_breach_time(fyers, symbol, session_date, level, direction="above"):
+    if pd.isna(level): return pd.NaT
+    try:
+        session_start = int(pd.Timestamp(f"{session_date} {MARKET_OPEN}", tz=IST).timestamp())
+        session_end = int(pd.Timestamp(f"{session_date} {MARKET_CLOSE}", tz=IST).timestamp())
+        intraday = get_history(fyers, symbol, resolution="5", range_from=session_start, range_to=session_end, date_format="0")
+        if intraday is None or intraday.empty: return pd.NaT
+        intraday = intraday[intraday["timestamp"].dt.date == session_date].sort_values("timestamp")
+        
+        # Look for live crossovers, not just the first breach
+        if direction == "above":
+            hits = intraday[(intraday["close"] > level) & (intraday["close"].shift(1) <= level)]
+        else:
+            hits = intraday[(intraday["close"] < level) & (intraday["close"].shift(1) >= level)]
+            
+        if hits.empty: return pd.NaT
+        return hits.iloc[-1]["timestamp"] # Freshest breakout
+    except Exception:
+        return pd.NaT
 
+# --- Execution & Rendering ---
 def build_html_table(df, title, cols):
     if df is None or df.empty:
-        return (
-            f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top:25px;'>{title}</h3>"
-            "<p style='color:#94a3b8; font-family:sans-serif;'>No candidates found today.</p>"
-        )
+        return f"<h3 style='color:#fbbf24; font-family:sans-serif;'>{title}</h3><p style='color:#94a3b8;'>No candidates found.</p>"
 
-    table_html = (
-        f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top:25px;'>{title}</h3>"
-        "<table style='border-collapse:collapse; width:100%; font-family:sans-serif; font-size:13px; text-align:left; background-color:#0f172a;'>"
-    )
-    table_html += (
-        "<tr style='background-color:#1e293b; color:#f1f5f9;'>"
-        + "".join([f"<th style='padding:10px; border:1px solid #334155;'>{c}</th>" for c in cols])
-        + "</tr>"
-    )
+    html = f"<h3 style='color:#fbbf24; font-family:sans-serif; margin-top:25px;'>{title}</h3><table style='border-collapse:collapse; width:100%; font-family:sans-serif; font-size:13px; text-align:left; background-color:#0f172a;'>"
+    html += "<tr style='background-color:#1e293b; color:#f1f5f9;'>" + "".join([f"<th style='padding:10px; border:1px solid #334155;'>{c}</th>" for c in cols]) + "</tr>"
 
     for i, (_, row) in enumerate(df.iterrows()):
-        bg_row = "#0f172a" if i % 2 == 0 else "#1e293b"
-        table_html += f"<tr style='background-color:{bg_row}; color:#e2e8f0;'>"
+        bg = "#0f172a" if i % 2 == 0 else "#1e293b"
+        html += f"<tr style='background-color:{bg}; color:#e2e8f0;'>"
         for c in cols:
             val = row.get(c, "-")
             style = "padding:8px; border:1px solid #334155;"
             if c == "% Change":
-                val_num = safe_float(val)
-                val_str = format_change(val_num)
-                if not pd.isna(val_num):
-                    style += " color:#4ade80; font-weight:bold;" if val_num > 0 else " color:#f87171; font-weight:bold;"
-                table_html += f"<td style='{style}'>{val_str}</td>"
+                val_num, val_str = safe_float(val), format_change(val)
+                if not pd.isna(val_num): style += " color:#4ade80; font-weight:bold;" if val_num > 0 else " color:#f87171; font-weight:bold;"
+                html += f"<td style='{style}'>{val_str}</td>"
+            elif c == "Breach_Time" and pd.isna(val):
+                html += f"<td style='{style}'>-</td>"
+            elif c == "Breach_Time":
+                html += f"<td style='{style}'>{val.strftime('%H:%M')}</td>"
             else:
-                table_html += f"<td style='{style}'>{format_value(val)}</td>"
-        table_html += "</tr>"
-    return table_html + "</table>"
-
+                html += f"<td style='{style}'>{format_value(val)}</td>"
+        html += "</tr>"
+    return html + "</table>"
 
 def send_email(index_df, long_df, short_df, fallback_df, session_date):
+    if long_df.empty and short_df.empty:
+        logger.info("No new actionable candidates. Skipping email.")
+        return
+
+    recipients = [x.strip() for x in cfg.recipient_email.split(",") if x.strip()]
+    if not recipients: return
+
+    msg = MIMEMultipart("alternative")
+    msg["From"] = cfg.sender_email
+    msg["To"] = ", ".join(recipients)
+    msg["Subject"] = f"FYERS Alert: {len(long_df) + len(short_df)} New Candidates - {datetime.now().strftime('%H:%M')}"
+
+    html = f"<html><body style='background-color:#030712; padding:20px; font-family:sans-serif;'><h2 style='color:#e2e8f0;'>FYERS Confluence</h2>"
+    html += f"{build_html_table(index_df, 'Market Index Snapshot', EMAIL_DISPLAY_COLS)}"
+    html += f"{build_html_table(long_df, 'New Long Candidates', EMAIL_DISPLAY_COLS)}"
+    html += f"{build_html_table(short_df, 'New Short Candidates', EMAIL_DISPLAY_COLS)}"
+    html += f"{build_html_table(fallback_df, 'Watchlist (Missing Open)', EMAIL_DISPLAY_COLS)}</body></html>"
+
+    msg.attach(MIMEText(html, "html"))
     try:
-        recipients = [x.strip() for x in cfg.recipient_email.split(",") if x.strip()]
-        if not recipients:
-            raise ValueError("RECIPIENT_EMAIL is empty.")
-
-        msg = MIMEMultipart("alternative")
-        msg["From"] = cfg.sender_email
-        msg["To"] = ", ".join(recipients)
-        msg["Subject"] = f"FYERS Confluence Dashboard - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-
-        html = (
-            "<html><body style='background-color:#030712; padding:20px; font-family:sans-serif;'>"
-            f"<h2 style='color:#e2e8f0;'>FYERS Confluence Dashboard</h2>"
-            f"<p style='color:#94a3b8;'>Session date: {session_date}. Script version: {VERSION}.</p>"
-            "<p style='color:#94a3b8;'>Only OPEN_915 rows are ranked in Long/Short candidate tables. QUOTE_FALLBACK rows are isolated in a watchlist section. Index rows use QUOTE_INDEX anchors.</p>"
-            f"{build_html_table(index_df, 'Market Index Snapshot', EMAIL_DISPLAY_COLS)}"
-            f"{build_html_table(long_df, 'F&O Long Candidates (Valid 09:15 Anchors Only)', EMAIL_DISPLAY_COLS)}"
-            f"{build_html_table(short_df, 'F&O Short Candidates (Valid 09:15 Anchors Only)', EMAIL_DISPLAY_COLS)}"
-            f"{build_html_table(fallback_df, 'Fallback Watchlist (Not Ranked as Valid 09:15 Setups)', EMAIL_DISPLAY_COLS)}"
-            "</body></html>"
-        )
-
-        msg.attach(MIMEText(html, "html"))
-
         with smtplib.SMTP(cfg.smtp_host, cfg.smtp_port) as s:
             s.starttls()
             s.login(cfg.sender_email, cfg.sender_password)
             s.sendmail(cfg.sender_email, recipients, msg.as_string())
-
-        logger.info("Email sent successfully.")
+        logger.info("Email sent.")
     except Exception as e:
         logger.error(f"Email failed: {e}")
 
-
-def get_breach_time(fyers, symbol, session_date, level, direction="above"):
-    """
-    Returns the timestamp (pd.Timestamp) of the first 5-min candle where
-    the close crossed the given level in the specified direction.
-    direction: "above" -> first close > level
-               "below" -> first close < level
-    Returns pd.NaT if no breach found or data unavailable.
-    """
-    if pd.isna(level):
-        return pd.NaT
+def get_live_fno_symbols():
     try:
-        session_start = int(pd.Timestamp(f"{session_date} {MARKET_OPEN}", tz=IST).timestamp())
-        session_end = int(pd.Timestamp(f"{session_date} {MARKET_CLOSE}", tz=IST).timestamp())
-        intraday = get_history(
-            fyers, symbol, resolution="5",
-            range_from=session_start, range_to=session_end, date_format="0",
-        )
-        if intraday is None or intraday.empty:
-            return pd.NaT
-        intraday = intraday[intraday["timestamp"].dt.date == session_date].sort_values("timestamp")
-        if direction == "above":
-            hits = intraday[intraday["close"] > level]
-        else:
-            hits = intraday[intraday["close"] < level]
-        if hits.empty:
-            return pd.NaT
-        return hits.iloc[0]["timestamp"]
-    except Exception as e:
-        logger.warning(f"Breach time fetch failed for {symbol}: {e}")
-        return pd.NaT
-
-# Patch logic for FYERS Confluence Dashboard rendering
-
-def build_dashboard_sections(rows):
-    index_rows = []
-    long_rows = []
-    short_rows = []
-    fallback_rows = []
-
-    for r in rows:
-        src = str(r.get('Anchor_Source', '')).upper()
-        side = str(r.get('Side', '')).upper()
-
-        if src == 'QUOTE_INDEX':
-            index_rows.append(r)
-        elif src == 'QUOTE_FALLBACK':
-            fallback_rows.append(r)
-        elif src == 'OPEN_915':
-            if side == 'LONG':
-                long_rows.append(r)
-            elif side == 'SHORT':
-                short_rows.append(r)
-
-    return {
-        'market_index_snapshot': index_rows,
-        'fno_long_candidates': long_rows,
-        'fno_short_candidates': short_rows,
-        'fallback_watchlist': fallback_rows,
-    }
-
-
-def render_dashboard(sections):
-    blocks = []
-    blocks.append(('Market Index Snapshot', sections['market_index_snapshot']))
-    blocks.append(('F&O Long Candidates', sections['fno_long_candidates']))
-    blocks.append(('F&O Short Candidates', sections['fno_short_candidates']))
-    blocks.append(('Fallback Watchlist', sections['fallback_watchlist']))
-    return blocks
+        text = requests.get(FYERS_FO_MASTER_URL, timeout=30).text
+        raw = pd.read_csv(StringIO(text), header=None)
+        underlying = raw[13].astype(str).str.strip().str.upper().dropna().unique()
+        symbols = [f"NSE:{sym}-EQ" for sym in underlying if len(sym) >= 2 and sym not in {"", "SYMBOL"} and not any(x in sym for x in ["NIFTY", "SENSEX", "BANKEX"])]
+        out = sorted(set(symbols))
+        return out[:cfg.stock_limit] if cfg.stock_limit > 0 else out
+    except Exception:
+        return cfg.fallback_stock_symbols
 
 def main():
-    fyers = init_fyers()
-    if not fyers:
+    now = now_ist()
+    market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
+    market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
+    
+    # Cron Gate: Prevent execution outside market hours
+    if now < market_open or now > market_close:
+        logger.info("Outside market hours. Scanner sleeping.")
         return
 
+    fyers = init_fyers()
+    if not fyers: return
+
     session_date = current_session_date()
-    logger.info(f"Starting FYERS confluence scan | version={VERSION} | session_date={session_date}")
+    seen_candidates = load_state(session_date)
 
-    # 1. Fetch Index Data
-    if cfg.disable_index_scan:
-        logger.info("Index scan disabled by configuration.")
-        index_df = pd.DataFrame(columns=RESULT_COLS)
-    else:
-        logger.info("Starting index scan...")
-        index_df = scan_universe(fyers, cfg.index_symbols, session_date=session_date)
-
-    # 2. Fetch Stock Universe
-    logger.info("Fetching live F&O stock universe from Fyers Master CSV...")
+    index_df = pd.DataFrame(columns=RESULT_COLS) if cfg.disable_index_scan else scan_universe(fyers, cfg.index_symbols, session_date, is_index=True)
     live_stock_symbols = get_live_fno_symbols()
+    stock_df = scan_universe(fyers, live_stock_symbols, session_date)
 
-    # 3. Scan Stocks
-    logger.info(f"Starting stock scan on {len(live_stock_symbols)} symbols...")
-    stock_df = scan_universe(fyers, live_stock_symbols, session_date=session_date)
-
-    long_stocks = pd.DataFrame(columns=RESULT_COLS)
-    short_stocks = pd.DataFrame(columns=RESULT_COLS)
+    long_stocks, short_stocks = pd.DataFrame(columns=RESULT_COLS), pd.DataFrame(columns=RESULT_COLS)
     fallback_df = pd.DataFrame(columns=RESULT_COLS)
+    new_seen = set()
 
     if not stock_df.empty:
-        # Separate Valid Anchors from Fallbacks
         valid_df = stock_df[stock_df["Anchor_Source"] == "OPEN_915"].copy()
         fallback_df = stock_df[stock_df["Anchor_Source"] != "OPEN_915"].copy()
 
-        # APPLY STRICT BAND + DIRECTIONAL SIGNAL FILTERS
-        # LONG: Signal="Long" AND LTP strictly between Conf_Above-1 and Conf_Above-2
-        # SHORT: Signal="Short" AND LTP strictly between Conf_Below-2 and Conf_Below-1
-        # If the required second confirmation level is missing, the candidate is blocked.
         if not valid_df.empty:
-            conf_above_1 = valid_df["Conf_Above-1"]
-            conf_above_2 = valid_df["Conf_Above-3"]
-            conf_below_1 = valid_df["Conf_Below-1"]
-            conf_below_2 = valid_df["Conf_Below-3"]
+            c_a1, c_a2 = valid_df["Conf_Above-1"], valid_df["Conf_Above-2"]
+            c_b1, c_b2 = valid_df["Conf_Below-1"], valid_df["Conf_Below-2"]
             ltp = valid_df["LTP"]
 
-            long_mask = (
-                (valid_df["Signal"] == "Long") &
-                conf_above_1.notna() &
-                conf_above_2.notna() &
-                (ltp > conf_above_1) &
-                (ltp < conf_above_2)
-            )
+            long_mask = (valid_df["Signal"] == "Long") & c_a1.notna() & c_a2.notna() & (ltp > c_a1) & (ltp < c_a2)
+            short_mask = (valid_df["Signal"] == "Short") & c_b1.notna() & c_b2.notna() & (ltp < c_b1) & (ltp > c_b2)
+            
             long_candidates = valid_df[long_mask].copy()
-
-            short_mask = (
-                (valid_df["Signal"] == "Short") &
-                conf_below_1.notna() &
-                conf_below_2.notna() &
-                (ltp < conf_below_1) &
-                (ltp > conf_below_2)
-            )
             short_candidates = valid_df[short_mask].copy()
 
-            # Compute breach time only for qualifying candidates (bounded extra API cost)
+            # Filter out stocks we already emailed today
+            long_candidates = long_candidates[~long_candidates["Symbol"].isin(seen_candidates)]
+            short_candidates = short_candidates[~short_candidates["Symbol"].isin(seen_candidates)]
+
             if not long_candidates.empty:
-                long_candidates["Breach_Time"] = long_candidates.apply(
-                    lambda r: get_breach_time(
-                        fyers, r["Symbol"], session_date, r["Conf_Above-1"], direction="above"
-                    ),
-                    axis=1,
-                )
-                # Primary: Most recent breach first = freshest breakout
-                # Secondary: % Change descending (tiebreaker when Breach_Time ties or is NaT)
-                long_stocks = long_candidates.sort_values(
-                    by=["% Change","Breach_Time"],
-                    ascending=[False, False],
-                    na_position="last"
-                )
+                long_candidates["Breach_Time"] = long_candidates.apply(lambda r: get_breach_time(fyers, r["Symbol"], session_date, r["Conf_Above-1"], "above"), axis=1)
+                long_stocks = long_candidates.sort_values(by=["Breach_Time", "% Change"], ascending=[False, False], na_position="last")
+                new_seen.update(long_stocks["Symbol"].tolist())
 
             if not short_candidates.empty:
-                short_candidates["Breach_Time"] = short_candidates.apply(
-                    lambda r: get_breach_time(
-                        fyers, r["Symbol"], session_date, r["Conf_Below-1"], direction="below"
-                    ),
-                    axis=1,
-                )
-                # Primary: Most recent breach first = freshest breakdown
-                # Secondary: % Change descending (tiebreaker when Breach_Time ties or is NaT)
-                short_stocks = short_candidates.sort_values(
-                    by=["% Change","Breach_Time"],
-                    ascending=[True, True],
-                    na_position="last"
-                )
+                short_candidates["Breach_Time"] = short_candidates.apply(lambda r: get_breach_time(fyers, r["Symbol"], session_date, r["Conf_Below-1"], "below"), axis=1)
+                short_stocks = short_candidates.sort_values(by=["Breach_Time", "% Change"], ascending=[False, True], na_position="last")
+                new_seen.update(short_stocks["Symbol"].tolist())
 
-        # Prepare Fallback
         if not fallback_df.empty:
             fallback_df = fallback_df.sort_values(by=["% Change"], ascending=[False])
 
-    # 4. Final Formatting for Email
     if not index_df.empty:
         index_df = index_df.sort_values(by=["% Change"], ascending=[False])
 
     send_email(index_df, long_stocks, short_stocks, fallback_df, session_date)
-
+    
+    # Save state for the next cron execution
+    seen_candidates.update(new_seen)
+    save_state(session_date, seen_candidates)
 
 if __name__ == "__main__":
     main()
