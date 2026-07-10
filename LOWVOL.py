@@ -443,11 +443,6 @@ def main():
     market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
     market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
     
-    # Cron Gate: Prevent execution outside market hours
-    if now < market_open or now > market_close:
-        logger.info("Outside market hours. Scanner sleeping.")
-        return
-
     fyers = init_fyers()
     if not fyers: return
 
