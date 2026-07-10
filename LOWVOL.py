@@ -571,12 +571,6 @@ def main():
     market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
     market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
 
-    if (now < market_open or now > market_close) and not cfg.force_run:
-        logger.info("Outside market hours. Scanner sleeping.")
-        return
-    elif cfg.force_run:
-        logger.info("FORCE_RUN enabled: Bypassing market hours check for testing.")
-
     fyers = init_fyers()
     if not fyers:
         return
