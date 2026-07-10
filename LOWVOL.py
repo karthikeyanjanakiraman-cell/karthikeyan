@@ -717,7 +717,7 @@ def main():
                 # Secondary: % Change descending (tiebreaker when Breach_Time ties or is NaT)
                 short_stocks = short_candidates.sort_values(
                     by=["% Change","Breach_Time"],
-                    ascending=[False, False],
+                    ascending=[True, True],
                     na_position="last"
                 )
 
