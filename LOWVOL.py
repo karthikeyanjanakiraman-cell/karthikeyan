@@ -654,7 +654,7 @@ def main():
                 short_candidates["Breach_Type"] = breach_results.apply(lambda x: x[1])
                 short_candidates["_type_rank"] = short_candidates["Breach_Type"].map({"Intraday": 0, "GapOpen": 1, "None": 2})
                 short_stocks = short_candidates.sort_values(
-                    by=["_type_rank", "% Change", "Breach_Time"], ascending=[True, False, False], na_position="last"
+                    by=["_type_rank", "% Change", "Breach_Time"], ascending=[True, True, False], na_position="last"
                 ).drop(columns=["_type_rank"])
                 new_seen.update(short_stocks["Symbol"].tolist())
 
