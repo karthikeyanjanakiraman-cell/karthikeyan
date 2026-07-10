@@ -39,7 +39,7 @@ IST = "Asia/Kolkata"
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
-VERSION = "2026-07-10-prod-v2"
+VERSION = "2026-07-10-prod-v3"
 STATE_FILE = Path("fyers_state.json")
 
 # Non-equity underlyings that can appear in NSE_FO.csv but have no *-EQ symbol
@@ -95,7 +95,7 @@ cfg = Config()
 EMAIL_DISPLAY_COLS = [
     "Symbol", "Anchor_Source", "% Change", "Conf_Below-3",
     "Conf_Below-2", "Conf_Below-1", "Anchor_915", "LTP",
-    "Conf_Above-1", "Conf_Above-2", "Conf_Above-3", "Breach_Time"
+    "Conf_Above-1", "Conf_Above-2", "Conf_Above-3", "Breach_Time", "Breach_Type"
 ]
 
 RESULT_COLS = [
@@ -452,25 +452,34 @@ def scan_universe(fyers, symbol_list, session_date, is_index=False):
 
 def get_breach_time(fyers, symbol, session_date, level, direction="above"):
     """
-    Returns the last genuine intraday crossover of `level`.
-    The FIRST candle of the day is never counted as a crossover on its own
-    (fixes the gap-open false positive where a stock opening beyond the level
-    would otherwise always show a 09:15-09:20 breach time).
+    Returns (breach_time, breach_type) for `level`.
+
+    breach_type is one of:
+      - "Intraday": a genuine mid-day crossover (candle[i] vs candle[i-1], i >= 1).
+      - "GapOpen":  price already beyond the level on the very first candle of the
+                    day (real gap, no prior reference candle to compare against) -
+                    still reported with its actual timestamp, just tagged separately
+                    so it is not confused with / over-prioritized above a true
+                    intraday breakout during sorting.
+      - "None":     level was never breached at all -> (pd.NaT, "None").
+
+    This avoids the two failure modes seen previously:
+      1) Treating every gap-open as a "crossover" (old bug: always sorted to top).
+      2) Reporting NO breach time at all for genuine gap-driven moves (regression
+         introduced by naively excluding the first candle from ALL detection).
     """
     if pd.isna(level):
-        return pd.NaT
+        return pd.NaT, "None"
     try:
         session_start = int(pd.Timestamp(f"{session_date} {MARKET_OPEN}", tz=IST).timestamp())
         session_end = int(pd.Timestamp(f"{session_date} {MARKET_CLOSE}", tz=IST).timestamp())
         intraday = get_history(fyers, symbol, resolution="5", range_from=session_start, range_to=session_end, date_format="0")
         if intraday is None or intraday.empty:
-            return pd.NaT
+            return pd.NaT, "None"
         intraday = intraday[intraday["timestamp"].dt.date == session_date].sort_values("timestamp").reset_index(drop=True)
-        if len(intraday) < 2:
-            return pd.NaT
+        if intraday.empty:
+            return pd.NaT, "None"
 
-        # Drop the first candle from crossover eligibility; only compare candle[i] vs candle[i-1]
-        # for i >= 1, using the actual previous close (no fillna(0)/fillna(inf) sentinel hack).
         prev_close = intraday["close"].shift(1)
         curr_close = intraday["close"]
 
@@ -479,11 +488,22 @@ def get_breach_time(fyers, symbol, session_date, level, direction="above"):
         else:
             hits = intraday[(curr_close < level) & (prev_close >= level) & prev_close.notna()]
 
-        if hits.empty:
-            return pd.NaT
-        return hits.iloc[-1]["timestamp"]
+        if not hits.empty:
+            return hits.iloc[-1]["timestamp"], "Intraday"
+
+        # No true intraday crossover found. Check if the first candle already
+        # opened/closed beyond the level -> genuine gap, report its time as GapOpen.
+        first = intraday.iloc[0]
+        first_close = safe_float(first["close"])
+        if not pd.isna(first_close):
+            if direction == "above" and first_close > level:
+                return first["timestamp"], "GapOpen"
+            if direction == "below" and first_close < level:
+                return first["timestamp"], "GapOpen"
+
+        return pd.NaT, "None"
     except Exception:
-        return pd.NaT
+        return pd.NaT, "None"
 
 
 # --- Execution & Rendering ---
@@ -509,6 +529,11 @@ def build_html_table(df, title, cols):
                 html += f"<td style='{style}'>-</td>"
             elif c == "Breach_Time":
                 html += f"<td style='{style}'>{val.strftime('%H:%M')}</td>"
+            elif c == "Breach_Type" and (pd.isna(val) or val == "-" or val == "None"):
+                html += f"<td style='{style}'>-</td>"
+            elif c == "Breach_Type":
+                tag_color = "#facc15" if val == "GapOpen" else "#38bdf8"
+                html += f"<td style='{style} color:{tag_color}; font-weight:600;'>{val}</td>"
             else:
                 html += f"<td style='{style}'>{format_value(val)}</td>"
         html += "</tr>"
@@ -571,6 +596,12 @@ def main():
     market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
     market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
 
+    if (now < market_open or now > market_close) and not cfg.force_run:
+        logger.info("Outside market hours. Scanner sleeping.")
+        return
+    elif cfg.force_run:
+        logger.info("FORCE_RUN enabled: Bypassing market hours check for testing.")
+
     fyers = init_fyers()
     if not fyers:
         return
@@ -609,17 +640,28 @@ def main():
             short_candidates = short_candidates[~short_candidates["Symbol"].isin(seen_candidates)]
 
             if not long_candidates.empty:
-                long_candidates["Breach_Time"] = long_candidates.apply(
+                breach_results = long_candidates.apply(
                     lambda r: get_breach_time(fyers, r["Symbol"], session_date, r["Conf_Above-1"], "above"), axis=1
                 )
-                long_stocks = long_candidates.sort_values(by=["Breach_Time", "% Change"], ascending=[False, False], na_position="last")
+                long_candidates["Breach_Time"] = breach_results.apply(lambda x: x[0])
+                long_candidates["Breach_Type"] = breach_results.apply(lambda x: x[1])
+                # Rank genuine intraday breakouts above gap-opens; within each group, most recent first.
+                long_candidates["_type_rank"] = long_candidates["Breach_Type"].map({"Intraday": 0, "GapOpen": 1, "None": 2})
+                long_stocks = long_candidates.sort_values(
+                    by=["_type_rank", "Breach_Time", "% Change"], ascending=[True, False, False], na_position="last"
+                ).drop(columns=["_type_rank"])
                 new_seen.update(long_stocks["Symbol"].tolist())
 
             if not short_candidates.empty:
-                short_candidates["Breach_Time"] = short_candidates.apply(
+                breach_results = short_candidates.apply(
                     lambda r: get_breach_time(fyers, r["Symbol"], session_date, r["Conf_Below-1"], "below"), axis=1
                 )
-                short_stocks = short_candidates.sort_values(by=["Breach_Time", "% Change"], ascending=[False, True], na_position="last")
+                short_candidates["Breach_Time"] = breach_results.apply(lambda x: x[0])
+                short_candidates["Breach_Type"] = breach_results.apply(lambda x: x[1])
+                short_candidates["_type_rank"] = short_candidates["Breach_Type"].map({"Intraday": 0, "GapOpen": 1, "None": 2})
+                short_stocks = short_candidates.sort_values(
+                    by=["_type_rank", "Breach_Time", "% Change"], ascending=[True, False, True], na_position="last"
+                ).drop(columns=["_type_rank"])
                 new_seen.update(short_stocks["Symbol"].tolist())
 
         if not fallback_df.empty:
