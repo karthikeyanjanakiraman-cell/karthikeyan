@@ -5,9 +5,9 @@ FO_FNO_FYERS_CONFLUENCE_EMAIL_FIXED.py
 Strict FYERS confluence screener - Production Version
 
 Design rules:
-- Anchor_915 is ONLY the 09:15 candle open for stocks.
+- Anchor_915 is ONLY the 09:15 candle open for stocks. (Falls back to first available intraday candle if illiquid).
 - Only rows with Anchor_Source=OPEN_915 are eligible for ranked Long/Short tables.
-- Quote fallback rows are sent to a separate watchlist section.
+- Quote fallback rows are sent to a separate watchlist section, anchored to Live Quote Open.
 - Index rows use quote-based anchors (Open Price).
 - Automated Cron Safeguards: Market hours gating, JSON state tracking to prevent duplicate emails.
 """
@@ -53,7 +53,9 @@ class Config:
         self.quotes_pause_sec = float(os.environ.get("QUOTES_PAUSE_SEC", "0.20"))
         self.max_retries = int(os.environ.get("MAX_RETRIES", "3"))
         self.stock_limit = int(os.environ.get("STOCK_LIMIT", "0"))
+        
         self.disable_index_scan = os.environ.get("DISABLE_INDEX_SCAN", "0") == "1"
+        self.force_run = os.environ.get("FORCE_RUN", "0") == "1"
 
         self.index_symbols = [
             "NSE:NIFTY50-INDEX",
@@ -70,7 +72,7 @@ cfg = Config()
 EMAIL_DISPLAY_COLS = [
     "Symbol", "Anchor_Source", "% Change", "Conf_Below-3",
     "Conf_Below-2", "Conf_Below-1", "Anchor_915", "LTP",
-    "Conf_Above-1", "Conf_Above-2", "Conf_Above-3"
+    "Conf_Above-1", "Conf_Above-2", "Conf_Above-3", "Breach_Time"
 ]
 
 RESULT_COLS = [
@@ -205,13 +207,22 @@ def get_opening_anchor(fyers, symbol, session_date):
         if intraday is None or intraday.empty: return np.nan
 
         intraday = intraday[intraday["timestamp"].dt.date == session_date].copy()
+        if intraday.empty: return np.nan
+        
+        # Try exact 09:15 candle first
         target = pd.Timestamp(f"{session_date} {MARKET_OPEN}")
         row = intraday.loc[intraday["timestamp"] == target]
         if not row.empty:
             return safe_float(row.iloc[0]["open"])
             
+        # Flexible fallback: Get the first available intraday candle of the day
+        market_rows = intraday.sort_values("timestamp")
+        if not market_rows.empty:
+            logger.info(f"09:15 exact candle missing for {symbol}; fallback first intraday candle used.")
+            return safe_float(market_rows.iloc[0]["open"])
+
         return np.nan
-    except Exception as e:
+    except Exception:
         return np.nan
 
 def extract_quote_data(quote_item):
@@ -332,7 +343,8 @@ def scan_universe(fyers, symbol_list, session_date, is_index=False):
             else:
                 anchor_915 = get_opening_anchor(fyers, sym, session_date)
                 if pd.isna(anchor_915):
-                    anchor_source, calc_anchor = "QUOTE_FALLBACK", prev_close
+                    anchor_source = "QUOTE_FALLBACK"
+                    calc_anchor = open_quote if not pd.isna(open_quote) else prev_close
                 else:
                     anchor_source, calc_anchor = "OPEN_915", anchor_915
 
@@ -357,7 +369,7 @@ def get_breach_time(fyers, symbol, session_date, level, direction="above"):
         if intraday is None or intraday.empty: return pd.NaT
         intraday = intraday[intraday["timestamp"].dt.date == session_date].sort_values("timestamp")
         
-        # Fill shift(1) missing values so morning gap-ups register as immediate crossovers
+        # Fill shift missing values so morning gap-ups register as crossovers
         if direction == "above":
             hits = intraday[(intraday["close"] > level) & (intraday["close"].shift(1).fillna(0) <= level)]
         else:
@@ -386,6 +398,10 @@ def build_html_table(df, title, cols):
                 val_num, val_str = safe_float(val), format_change(val)
                 if not pd.isna(val_num): style += " color:#4ade80; font-weight:bold;" if val_num > 0 else " color:#f87171; font-weight:bold;"
                 html += f"<td style='{style}'>{val_str}</td>"
+            elif c == "Breach_Time" and (pd.isna(val) or val == "-"):
+                html += f"<td style='{style}'>-</td>"
+            elif c == "Breach_Time":
+                html += f"<td style='{style}'>{val.strftime('%H:%M')}</td>"
             else:
                 html += f"<td style='{style}'>{format_value(val)}</td>"
         html += "</tr>"
@@ -436,6 +452,13 @@ def main():
     market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
     market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
     
+    # Cron Gate: Prevent execution outside market hours unless FORCE_RUN is set
+    if (now < market_open or now > market_close) and not cfg.force_run:
+        logger.info("Outside market hours. Scanner sleeping.")
+        return
+    elif cfg.force_run:
+        logger.info("FORCE_RUN enabled: Bypassing market hours check for testing.")
+        
     fyers = init_fyers()
     if not fyers: return
 
