@@ -642,7 +642,7 @@ def main():
                 # Rank genuine intraday breakouts above gap-opens; within each group, most recent first.
                 long_candidates["_type_rank"] = long_candidates["Breach_Type"].map({"Intraday": 0, "GapOpen": 1, "None": 2})
                 long_stocks = long_candidates.sort_values(
-                    by=["_type_rank", "Breach_Time", "% Change"], ascending=[True, False, False], na_position="last"
+                    by=["_type_rank", "% Change", "Breach_Time"], ascending=[True, False, False], na_position="last"
                 ).drop(columns=["_type_rank"])
                 new_seen.update(long_stocks["Symbol"].tolist())
 
@@ -654,7 +654,7 @@ def main():
                 short_candidates["Breach_Type"] = breach_results.apply(lambda x: x[1])
                 short_candidates["_type_rank"] = short_candidates["Breach_Type"].map({"Intraday": 0, "GapOpen": 1, "None": 2})
                 short_stocks = short_candidates.sort_values(
-                    by=["_type_rank", "Breach_Time", "% Change"], ascending=[True, False, True], na_position="last"
+                    by=["_type_rank", "% Change", "Breach_Time"], ascending=[True, False, False], na_position="last"
                 ).drop(columns=["_type_rank"])
                 new_seen.update(short_stocks["Symbol"].tolist())
 
