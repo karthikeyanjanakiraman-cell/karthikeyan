@@ -620,8 +620,8 @@ def main():
         fallback_df = stock_df[~stock_df["Anchor_Source"].isin(eligible_sources)].copy()
 
         if not valid_df.empty:
-            c_a1, c_a2 = valid_df["Conf_Above-1"], valid_df["Conf_Above-2"]
-            c_b1, c_b2 = valid_df["Conf_Below-1"], valid_df["Conf_Below-2"]
+            c_a1, c_a2 = valid_df["Conf_Above-1"], valid_df["Conf_Above-3"]
+            c_b1, c_b2 = valid_df["Conf_Below-1"], valid_df["Conf_Below-3"]
             ltp = valid_df["LTP"]
 
             long_mask = (valid_df["Signal"] == "Long") & c_a1.notna() & c_a2.notna() & (ltp > c_a1) & (ltp < c_a2)
