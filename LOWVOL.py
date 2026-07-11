@@ -2,13 +2,13 @@
 """
 FO_FNO_FYERS_CONFLUENCE_EMAIL_FIXED.py
 
-Strict FYERS confluence screener - Production Version with Dynamic Vol Multiples
+Strict FYERS confluence screener - Production Version with Backward 10k Vol Speeds
 
 Design rules:
 - Anchor_915 is ONLY the 09:15 candle open for stocks.
 - Only rows with Anchor_Source=OPEN_915 are eligible for ranked Long/Short tables.
 - Breach detection tracks genuine intraday crosses vs gap-open false positives.
-- Post-breach volume velocity dynamically scales across multiples of 10,000 shares.
+- Backward volume momentum: Tracks how fast each 10k block filled starting from LTP back to breach.
 """
 
 import os
@@ -33,7 +33,7 @@ IST = "Asia/Kolkata"
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
-VERSION = "2026-07-11-prod-v5"
+VERSION = "2026-07-11-prod-v6"
 STATE_FILE = Path("fyers_state.json")
 
 NON_EQUITY_UNDERLYINGS = {
@@ -430,8 +430,8 @@ def scan_universe(fyers, symbol_list, session_date, is_index=False):
 def get_breach_metrics(fyers, symbol, session_date, level, direction="above"):
     """
     Returns (breach_time, breach_type, vol_speed_10k)
-    Tracks cumulative volume post-breach, calculating the maximum multiple of 10,000 shares 
-    reached along with the total time taken to reach that specific volume checkpoint.
+    Iterates backwards from the most recent 5-min candle down to the breach_time.
+    Calculates how many minutes it took to fill each 10,000-share block reading from newest to oldest.
     """
     if pd.isna(level):
         return pd.NaT, "None", "-"
@@ -470,25 +470,40 @@ def get_breach_metrics(fyers, symbol, session_date, level, direction="above"):
                     breach_time = first["timestamp"]
                     breach_type = "GapOpen"
 
-        # Track rolling volume multipliers post-breach
+        # Track rolling volume multipliers backwards from LTP to Breach
         vol_speed_10k = "-"
         if not pd.isna(breach_time):
-            post_breach_df = intraday[intraday["timestamp"] >= breach_time].sort_values("timestamp")
-            cumulative_vol = 0
-            max_multiple = 0
-            time_taken_m = 0
+            # Sort descending: row 0 is the most recent candle
+            post_breach_df = intraday[intraday["timestamp"] >= breach_time].sort_values("timestamp", ascending=False)
+            
+            speeds = []
+            current_bucket_vol = 0
+            candles_since_last_block = 0
             
             for _, row in post_breach_df.iterrows():
-                cumulative_vol += safe_float(row["volume"])
-                current_multiple = int(cumulative_vol // 10000)
-                if current_multiple > max_multiple:
-                    max_multiple = current_multiple
-                    time_taken_m = int((row["timestamp"] - breach_time).total_seconds() / 60) + 5
-            
-            if max_multiple > 0:
-                vol_speed_10k = f"{max_multiple * 10}k in {time_taken_m}m"
+                candles_since_last_block += 1
+                current_bucket_vol += safe_float(row["volume"])
+                
+                # Each time we hit 10k cumulative volume, log the speed and reset
+                while current_bucket_vol >= 10000:
+                    speeds.append(candles_since_last_block * 5)
+                    current_bucket_vol -= 10000
+                    candles_since_last_block = 0  # Any remainder volume applies to the same candle timeframe (<5m)
+                    
+            if not speeds:
+                vol_speed_10k = "Slow (<10k total)"
             else:
-                vol_speed_10k = "Slow (<10k)"
+                formatted_speeds = []
+                # Render the first 5 speeds for the email column (Newest -> Oldest)
+                for s in speeds[:5]:
+                    if s == 0:
+                        formatted_speeds.append("<5m")
+                    else:
+                        formatted_speeds.append(f"{s}m")
+                
+                vol_speed_10k = ", ".join(formatted_speeds)
+                if len(speeds) > 5:
+                    vol_speed_10k += f" ...({len(speeds)} blks)"
 
         return breach_time, breach_type, vol_speed_10k
     except Exception:
@@ -524,12 +539,13 @@ def build_html_table(df, title, cols):
                 html += f"<td style='{style} color:{tag_color}; font-weight:600;'>{val}</td>"
             elif c == "Vol_Speed_10k":
                 val_str = str(val)
+                # Apply bright green highlighting if recent volume is printing fast (<5m or 5m blocks)
                 if "Slow" in val_str or val_str == "-":
-                    speed_color = "#94a3b8"  # Muted color for illiquid fills
-                elif "in 5m" in val_str or "in 10m" in val_str:
-                    speed_color = "#4ade80"  # Bright green for rapid institutional momentum
+                    speed_color = "#94a3b8"
+                elif "<5m" in val_str or "5m" in val_str:
+                    speed_color = "#4ade80"  
                 else:
-                    speed_color = "#38bdf8"  # Sky blue for steady large milestone prints
+                    speed_color = "#38bdf8"  
                 html += f"<td style='{style} color:{speed_color}; font-weight:600;'>{val_str}</td>"
             else:
                 html += f"<td style='{style}'>{format_value(val)}</td>"
