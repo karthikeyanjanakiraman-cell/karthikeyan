@@ -1,20 +1,14 @@
-
 #!/usr/bin/env python3
 """
 FO_FNO_FYERS_CONFLUENCE_EMAIL_FIXED.py
 
-Strict FYERS confluence screener - Production Version
+Strict FYERS confluence screener - Production Version with Dynamic Vol Multiples
 
 Design rules:
-- Anchor_915 is ONLY the 09:15 candle open for stocks. (Falls back to first available intraday candle if illiquid).
+- Anchor_915 is ONLY the 09:15 candle open for stocks.
 - Only rows with Anchor_Source=OPEN_915 are eligible for ranked Long/Short tables.
-  Rows where the 09:15 candle was missing and a later candle was used as fallback are
-  tagged Anchor_Source=OPEN_915_LATE so they can be excluded/flagged separately.
-- Quote fallback rows are sent to a separate watchlist section, anchored to Live Quote Open.
-- Index rows use quote-based anchors (Open Price).
-- Automated Cron Safeguards: Market hours gating, JSON state tracking to prevent duplicate emails.
-- Breach detection excludes gap-open false positives: the first candle of the day is never
-  treated as a "crossover", only genuine intraday crosses count.
+- Breach detection tracks genuine intraday crosses vs gap-open false positives.
+- Post-breach volume velocity dynamically scales across multiples of 10,000 shares.
 """
 
 import os
@@ -39,10 +33,9 @@ IST = "Asia/Kolkata"
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
-VERSION = "2026-07-10-prod-v3"
+VERSION = "2026-07-11-prod-v5"
 STATE_FILE = Path("fyers_state.json")
 
-# Non-equity underlyings that can appear in NSE_FO.csv but have no *-EQ symbol
 NON_EQUITY_UNDERLYINGS = {
     "NIFTY", "NIFTY50", "NIFTYNXT50", "BANKNIFTY", "NIFTYBANK",
     "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "SENSEX50",
@@ -67,16 +60,10 @@ class Config:
         self.max_retries = int(os.environ.get("MAX_RETRIES", "3"))
         self.stock_limit = int(os.environ.get("STOCK_LIMIT", "0"))
 
-        # Basic proactive throttle: max requests/sec to FYERS across the whole run
         self.max_requests_per_sec = float(os.environ.get("MAX_REQ_PER_SEC", "6"))
-
         self.disable_index_scan = os.environ.get("DISABLE_INDEX_SCAN", "0") == "1"
         self.force_run = os.environ.get("FORCE_RUN", "0") == "1"
-
-        # Include late-anchor (fallback-to-first-candle) rows in ranked tables too
         self.include_late_anchor_in_ranked = os.environ.get("INCLUDE_LATE_ANCHOR", "0") == "1"
-
-        # Always send watchlist email even if no long/short candidates
         self.always_send_watchlist = os.environ.get("ALWAYS_SEND_WATCHLIST", "1") == "1"
 
         self.index_symbols = [
@@ -95,7 +82,7 @@ cfg = Config()
 EMAIL_DISPLAY_COLS = [
     "Symbol", "Anchor_Source", "% Change", "Conf_Below-3",
     "Conf_Below-2", "Conf_Below-1", "Anchor_915", "LTP",
-    "Conf_Above-1", "Conf_Above-2", "Conf_Above-3", "Breach_Time", "Breach_Type"
+    "Conf_Above-1", "Conf_Above-2", "Conf_Above-3", "Breach_Time", "Breach_Type", "Vol_Speed_10k"
 ]
 
 RESULT_COLS = [
@@ -103,7 +90,7 @@ RESULT_COLS = [
     "LTP", "Current_Close", "% Change", "Signal",
     "Conf_Below-3", "Conf_Below-2", "Conf_Below-1",
     "Conf_Above-1", "Conf_Above-2", "Conf_Above-3",
-    "Support", "Resistance", "Support_Gap_Pct", "Resistance_Gap_Pct"
+    "Support", "Resistance", "Support_Gap_Pct", "Resistance_Gap_Pct", "Vol_Speed_10k"
 ]
 
 logger = logging.getLogger("fyers_confluence")
@@ -115,7 +102,6 @@ logger.addHandler(stream)
 warnings.filterwarnings("ignore")
 
 
-# --- Simple global rate limiter (proactive, not just reactive backoff) ---
 class RateLimiter:
     def __init__(self, max_per_sec):
         self.min_interval = 1.0 / max_per_sec if max_per_sec > 0 else 0.0
@@ -134,7 +120,6 @@ class RateLimiter:
 rate_limiter = RateLimiter(cfg.max_requests_per_sec)
 
 
-# --- State Management for Cron ---
 def load_state(session_date):
     date_str = str(session_date)
     if STATE_FILE.exists():
@@ -156,7 +141,6 @@ def save_state(session_date, seen_set):
         logger.error(f"Error saving state: {e}")
 
 
-# --- Utility Functions ---
 def safe_float(val):
     try:
         if val is None or pd.isna(val):
@@ -202,7 +186,6 @@ def current_session_date():
     return d
 
 
-# --- FYERS API ---
 def init_fyers():
     try:
         if not cfg.client_id or not cfg.access_token:
@@ -265,10 +248,6 @@ def get_history(fyers, symbol, resolution, days=None, range_from=None, range_to=
 
 
 def get_opening_anchor(fyers, symbol, session_date):
-    """
-    Returns (anchor_value, is_exact_915) so callers can distinguish a true
-    09:15 anchor from a fallback-to-first-available-candle anchor.
-    """
     try:
         session_start = int(pd.Timestamp(f"{session_date} {MARKET_OPEN}", tz=IST).timestamp())
         session_end = int(pd.Timestamp(f"{session_date} {MARKET_CLOSE}", tz=IST).timestamp())
@@ -322,7 +301,6 @@ def get_quotes_map(fyers, symbols):
     return out
 
 
-# --- Strategy Math ---
 def extract_volume_weighted_nodes(df, bins=120, peak_quantile=0.60):
     if df is None or df.empty:
         return []
@@ -392,6 +370,7 @@ def build_row(symbol, anchor_915, anchor_source, calc_anchor, ltp_price, levels)
         "Support": support, "Resistance": resistance,
         "Support_Gap_Pct": round(support_gap_pct, 2) if not pd.isna(support_gap_pct) else np.nan,
         "Resistance_Gap_Pct": round(res_gap_pct, 2) if not pd.isna(res_gap_pct) else np.nan,
+        "Vol_Speed_10k": "-"
     }
 
 
@@ -431,8 +410,6 @@ def scan_universe(fyers, symbol_list, session_date, is_index=False):
                 elif is_exact:
                     anchor_source, calc_anchor = "OPEN_915", anchor_915
                 else:
-                    # 09:15 candle missing; used first available intraday candle instead.
-                    # Tagged distinctly so it is NOT silently treated as a true 09:15 anchor.
                     anchor_source, calc_anchor = "OPEN_915_LATE", anchor_915
 
             ltp = live_quote if not pd.isna(live_quote) else prev_close
@@ -450,38 +427,29 @@ def scan_universe(fyers, symbol_list, session_date, is_index=False):
     return out[RESULT_COLS]
 
 
-def get_breach_time(fyers, symbol, session_date, level, direction="above"):
+def get_breach_metrics(fyers, symbol, session_date, level, direction="above"):
     """
-    Returns (breach_time, breach_type) for `level`.
-
-    breach_type is one of:
-      - "Intraday": a genuine mid-day crossover (candle[i] vs candle[i-1], i >= 1).
-      - "GapOpen":  price already beyond the level on the very first candle of the
-                    day (real gap, no prior reference candle to compare against) -
-                    still reported with its actual timestamp, just tagged separately
-                    so it is not confused with / over-prioritized above a true
-                    intraday breakout during sorting.
-      - "None":     level was never breached at all -> (pd.NaT, "None").
-
-    This avoids the two failure modes seen previously:
-      1) Treating every gap-open as a "crossover" (old bug: always sorted to top).
-      2) Reporting NO breach time at all for genuine gap-driven moves (regression
-         introduced by naively excluding the first candle from ALL detection).
+    Returns (breach_time, breach_type, vol_speed_10k)
+    Tracks cumulative volume post-breach, calculating the maximum multiple of 10,000 shares 
+    reached along with the total time taken to reach that specific volume checkpoint.
     """
     if pd.isna(level):
-        return pd.NaT, "None"
+        return pd.NaT, "None", "-"
     try:
         session_start = int(pd.Timestamp(f"{session_date} {MARKET_OPEN}", tz=IST).timestamp())
         session_end = int(pd.Timestamp(f"{session_date} {MARKET_CLOSE}", tz=IST).timestamp())
         intraday = get_history(fyers, symbol, resolution="5", range_from=session_start, range_to=session_end, date_format="0")
         if intraday is None or intraday.empty:
-            return pd.NaT, "None"
+            return pd.NaT, "None", "-"
         intraday = intraday[intraday["timestamp"].dt.date == session_date].sort_values("timestamp").reset_index(drop=True)
         if intraday.empty:
-            return pd.NaT, "None"
+            return pd.NaT, "None", "-"
 
         prev_close = intraday["close"].shift(1)
         curr_close = intraday["close"]
+
+        breach_time = pd.NaT
+        breach_type = "None"
 
         if direction == "above":
             hits = intraday[(curr_close > level) & (prev_close <= level) & prev_close.notna()]
@@ -489,24 +457,44 @@ def get_breach_time(fyers, symbol, session_date, level, direction="above"):
             hits = intraday[(curr_close < level) & (prev_close >= level) & prev_close.notna()]
 
         if not hits.empty:
-            return hits.iloc[-1]["timestamp"], "Intraday"
+            breach_time = hits.iloc[-1]["timestamp"]
+            breach_type = "Intraday"
+        else:
+            first = intraday.iloc[0]
+            first_close = safe_float(first["close"])
+            if not pd.isna(first_close):
+                if direction == "above" and first_close > level:
+                    breach_time = first["timestamp"]
+                    breach_type = "GapOpen"
+                elif direction == "below" and first_close < level:
+                    breach_time = first["timestamp"]
+                    breach_type = "GapOpen"
 
-        # No true intraday crossover found. Check if the first candle already
-        # opened/closed beyond the level -> genuine gap, report its time as GapOpen.
-        first = intraday.iloc[0]
-        first_close = safe_float(first["close"])
-        if not pd.isna(first_close):
-            if direction == "above" and first_close > level:
-                return first["timestamp"], "GapOpen"
-            if direction == "below" and first_close < level:
-                return first["timestamp"], "GapOpen"
+        # Track rolling volume multipliers post-breach
+        vol_speed_10k = "-"
+        if not pd.isna(breach_time):
+            post_breach_df = intraday[intraday["timestamp"] >= breach_time].sort_values("timestamp")
+            cumulative_vol = 0
+            max_multiple = 0
+            time_taken_m = 0
+            
+            for _, row in post_breach_df.iterrows():
+                cumulative_vol += safe_float(row["volume"])
+                current_multiple = int(cumulative_vol // 10000)
+                if current_multiple > max_multiple:
+                    max_multiple = current_multiple
+                    time_taken_m = int((row["timestamp"] - breach_time).total_seconds() / 60) + 5
+            
+            if max_multiple > 0:
+                vol_speed_10k = f"{max_multiple * 10}k in {time_taken_m}m"
+            else:
+                vol_speed_10k = "Slow (<10k)"
 
-        return pd.NaT, "None"
+        return breach_time, breach_type, vol_speed_10k
     except Exception:
-        return pd.NaT, "None"
+        return pd.NaT, "None", "-"
 
 
-# --- Execution & Rendering ---
 def build_html_table(df, title, cols):
     if df is None or df.empty:
         return f"<h3 style='color:#fbbf24; font-family:sans-serif;'>{title}</h3><p style='color:#94a3b8;'>No candidates found.</p>"
@@ -534,6 +522,15 @@ def build_html_table(df, title, cols):
             elif c == "Breach_Type":
                 tag_color = "#facc15" if val == "GapOpen" else "#38bdf8"
                 html += f"<td style='{style} color:{tag_color}; font-weight:600;'>{val}</td>"
+            elif c == "Vol_Speed_10k":
+                val_str = str(val)
+                if "Slow" in val_str or val_str == "-":
+                    speed_color = "#94a3b8"  # Muted color for illiquid fills
+                elif "in 5m" in val_str or "in 10m" in val_str:
+                    speed_color = "#4ade80"  # Bright green for rapid institutional momentum
+                else:
+                    speed_color = "#38bdf8"  # Sky blue for steady large milestone prints
+                html += f"<td style='{style} color:{speed_color}; font-weight:600;'>{val_str}</td>"
             else:
                 html += f"<td style='{style}'>{format_value(val)}</td>"
         html += "</tr>"
@@ -592,10 +589,6 @@ def get_live_fno_symbols():
 
 
 def main():
-    now = now_ist()
-    market_open = now.replace(hour=9, minute=15, second=0, microsecond=0)
-    market_close = now.replace(hour=15, minute=30, second=0, microsecond=0)
-
     fyers = init_fyers()
     if not fyers:
         return
@@ -635,11 +628,12 @@ def main():
 
             if not long_candidates.empty:
                 breach_results = long_candidates.apply(
-                    lambda r: get_breach_time(fyers, r["Symbol"], session_date, r["Conf_Above-1"], "above"), axis=1
+                    lambda r: get_breach_metrics(fyers, r["Symbol"], session_date, r["Conf_Above-1"], "above"), axis=1
                 )
                 long_candidates["Breach_Time"] = breach_results.apply(lambda x: x[0])
                 long_candidates["Breach_Type"] = breach_results.apply(lambda x: x[1])
-                # Rank genuine intraday breakouts above gap-opens; within each group, most recent first.
+                long_candidates["Vol_Speed_10k"] = breach_results.apply(lambda x: x[2])
+                
                 long_candidates["_type_rank"] = long_candidates["Breach_Type"].map({"Intraday": 0, "GapOpen": 1, "None": 2})
                 long_stocks = long_candidates.sort_values(
                     by=["_type_rank", "% Change", "Breach_Time"], ascending=[True, False, False], na_position="last"
@@ -648,10 +642,12 @@ def main():
 
             if not short_candidates.empty:
                 breach_results = short_candidates.apply(
-                    lambda r: get_breach_time(fyers, r["Symbol"], session_date, r["Conf_Below-1"], "below"), axis=1
+                    lambda r: get_breach_metrics(fyers, r["Symbol"], session_date, r["Conf_Below-1"], "below"), axis=1
                 )
                 short_candidates["Breach_Time"] = breach_results.apply(lambda x: x[0])
                 short_candidates["Breach_Type"] = breach_results.apply(lambda x: x[1])
+                short_candidates["Vol_Speed_10k"] = breach_results.apply(lambda x: x[2])
+                
                 short_candidates["_type_rank"] = short_candidates["Breach_Type"].map({"Intraday": 0, "GapOpen": 1, "None": 2})
                 short_stocks = short_candidates.sort_values(
                     by=["_type_rank", "% Change", "Breach_Time"], ascending=[True, True, False], na_position="last"
