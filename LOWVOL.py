@@ -2,12 +2,13 @@
 """
 FO_FNO_FYERS_CONFLUENCE_EMAIL_FIXED.py
 
-Strict FYERS confluence screener - Production Version with Forward Interval Speeds
+Strict FYERS confluence screener - Production Version with Exact Interpolated Volume Speed
 
 Design rules:
 - Anchor_915 is ONLY the 09:15 candle open for stocks.
 - Hard filter: Automatically removes candidates with < 20 blocks.
-- Volume Speed: Tracks forward from the breach, logging the time taken for EACH successive 10k block.
+- Backward volume momentum: Calculates the EXACT time (down to the second) 
+  it took for each 10k block to pass, moving backward from LTP.
 """
 
 import os
@@ -32,7 +33,7 @@ IST = "Asia/Kolkata"
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
-VERSION = "2026-07-11-prod-v10"
+VERSION = "2026-07-11-prod-v11"
 STATE_FILE = Path("fyers_state.json")
 
 NON_EQUITY_UNDERLYINGS = {
@@ -429,8 +430,8 @@ def scan_universe(fyers, symbol_list, session_date, is_index=False):
 def get_breach_metrics(fyers, symbol, session_date, level, direction="above"):
     """
     Returns (breach_time, breach_type, vol_speed_10k, total_blocks)
-    Calculates the exact speed (in minutes) it took to fill EACH sequential 10k block,
-    moving forward from the moment of the breach.
+    Calculates exact speed by mathematically dividing Time elapsed by Volume.
+    Moves backwards from LTP to give you the precise speed of the most recent blocks.
     """
     if pd.isna(level):
         return pd.NaT, "None", "-", 0
@@ -471,47 +472,69 @@ def get_breach_metrics(fyers, symbol, session_date, level, direction="above"):
                     breach_time = first["timestamp"]
                     breach_type = "GapOpen"
 
-        # --- Calculate Forward Interval Speeds ---
+        # --- Calculate EXACT Interpolated Backward Speed ---
         vol_speed_10k = "-"
         total_blocks = 0
         
         if not pd.isna(breach_time):
-            # Sort Ascending: Start exactly at the breach and move forward through the day
-            post_breach_df = intraday[intraday["timestamp"] >= breach_time].sort_values("timestamp", ascending=True)
+            # Sort Descending (Start at NEWEST candle, read backwards to the breach)
+            post_breach_df = intraday[intraday["timestamp"] >= breach_time].sort_values("timestamp", ascending=False)
             
             speeds = []
-            current_bucket_vol = 0
-            candles_spent = 0
+            bucket_vol = 0
+            bucket_time = 0
+            
+            overall_vol = 0
+            overall_time = 0
             
             for _, row in post_breach_df.iterrows():
-                current_bucket_vol += safe_float(row["volume"])
-                candles_spent += 1
+                vol = safe_float(row["volume"])
+                time_added = 5.0
                 
-                # Every time the running bucket hits 10k volume
-                while current_bucket_vol >= 10000:
-                    speed_minutes = candles_spent * 5
+                overall_vol += vol
+                overall_time += time_added
+                
+                # If the combined bucket volume crosses 10k, calculate the exact speed
+                if bucket_vol + vol >= 10000:
+                    total_vol_in_bucket = bucket_vol + vol
+                    total_time_in_bucket = bucket_time + time_added
                     
-                    if speed_minutes == 0:
-                        speeds.append("<5m")
-                    else:
-                        speeds.append(f"{speed_minutes}m")
-                        
-                    current_bucket_vol -= 10000
-                    # Reset the candle timer for the NEXT 10k block
-                    candles_spent = 0
+                    # Rate = Minutes spent per 10k block
+                    rate_mins = total_time_in_bucket / (total_vol_in_bucket / 10000.0)
                     
-            total_blocks = len(speeds)
+                    # Log this speed for however many full blocks fit in this bucket
+                    full_blocks = int(total_vol_in_bucket // 10000)
+                    for _ in range(full_blocks):
+                        speeds.append(rate_mins)
+                    
+                    # Carry forward the remainder volume and proportional remainder time
+                    bucket_vol = total_vol_in_bucket - (full_blocks * 10000)
+                    bucket_time = rate_mins * (bucket_vol / 10000.0)
+                else:
+                    bucket_vol += vol
+                    bucket_time += time_added
+                    
+            total_blocks = int(overall_vol // 10000)
+            
+            # Format numbers to be highly readable (convert fast minutes into seconds)
+            def fmt_rate(r):
+                if r < 1.0:
+                    return f"{max(1, int(r * 60))}s"
+                elif r >= 10:
+                    return f"{int(r)}m"
+                else:
+                    return f"{r:.1f}m"
             
             if total_blocks == 0:
                 vol_speed_10k = "Slow (<10k total)"
             else:
-                # Display the first 5 block speeds (e.g., 10m, 5m, <5m, <5m, 5m)
-                base_str = ", ".join(speeds[:5])
+                # Display the 4 most recent speeds (Newest to Oldest)
+                recent_strs = [fmt_rate(s) for s in speeds[:4]]
                 
-                if total_blocks > 5:
-                    base_str += f" ...({total_blocks} blks)"
-                    
-                vol_speed_10k = base_str
+                # Calculate True Average Speed for the entire post-breach session
+                avg_rate = overall_time / (overall_vol / 10000.0)
+                
+                vol_speed_10k = ", ".join(recent_strs) + f" | Avg: {fmt_rate(avg_rate)}"
                 
     except Exception as e:
         logger.warning(f"Error calculating precise metrics for {symbol}: {e}")
@@ -549,10 +572,10 @@ def build_html_table(df, title, cols):
                 html += f"<td style='{style} color:{tag_color}; font-weight:600;'>{val}</td>"
             elif c == "Vol_Speed_10k":
                 val_str = str(val)
-                # Highlight in bright green if the initial breakout blocks were fast
+                # Highlight green if any of the recent speeds were under 1 minute (measured in seconds "s")
                 if "Slow" in val_str or val_str == "-":
                     speed_color = "#94a3b8"
-                elif val_str.startswith("<5m") or val_str.startswith("5m"):
+                elif "s" in val_str.split("|")[0]:
                     speed_color = "#4ade80"  
                 else:
                     speed_color = "#38bdf8"  
@@ -661,7 +684,7 @@ def main():
                 long_candidates["Vol_Speed_10k"] = breach_results.apply(lambda x: x[2])
                 long_candidates["Total_Blocks"] = breach_results.apply(lambda x: x[3])
                 
-                # Institutional Quality Threshold Filter (>= 20 Blocks)
+                # Hard Filter: Removes illiquid false breakouts
                 long_candidates = long_candidates[long_candidates["Total_Blocks"] >= 20]
                 
                 if not long_candidates.empty:
@@ -679,7 +702,7 @@ def main():
                 short_candidates["Vol_Speed_10k"] = breach_results.apply(lambda x: x[2])
                 short_candidates["Total_Blocks"] = breach_results.apply(lambda x: x[3])
                 
-                # Institutional Quality Threshold Filter (>= 20 Blocks)
+                # Hard Filter: Removes illiquid false breakdowns
                 short_candidates = short_candidates[short_candidates["Total_Blocks"] >= 20]
                 
                 if not short_candidates.empty:
