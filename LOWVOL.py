@@ -705,4 +705,14 @@ def main():
         if not fallback_df.empty:
             fallback_df = fallback_df.sort_values(by=["% Change"], ascending=[False])
 
-    if
+    if not index_df.empty:
+        index_df = index_df.sort_values(by=["% Change"], ascending=[False])
+
+    send_email(index_df, long_stocks, short_stocks, fallback_df, session_date)
+
+    seen_candidates.update(new_seen)
+    save_state(session_date, seen_candidates)
+
+
+if __name__ == "__main__":
+    main()
