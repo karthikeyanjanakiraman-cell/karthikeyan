@@ -2,13 +2,12 @@
 """
 FO_FNO_FYERS_CONFLUENCE_EMAIL_FIXED.py
 
-Strict FYERS confluence screener - Production Version with Institutional Volume Filtering
+Strict FYERS confluence screener - Production Version with Forward Interval Speeds
 
 Design rules:
 - Anchor_915 is ONLY the 09:15 candle open for stocks.
-- Hard filter: Automatically removes candidates with < 20 blocks or labeled Slow.
-- Sorting: Ranks candidates by total post-breach volume block count descending.
-- Backward volume momentum: Tracks block filling speed from newest to oldest.
+- Hard filter: Automatically removes candidates with < 20 blocks.
+- Volume Speed: Tracks forward from the breach, logging the time taken for EACH successive 10k block.
 """
 
 import os
@@ -33,7 +32,7 @@ IST = "Asia/Kolkata"
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
-VERSION = "2026-07-11-prod-v7"
+VERSION = "2026-07-11-prod-v10"
 STATE_FILE = Path("fyers_state.json")
 
 NON_EQUITY_UNDERLYINGS = {
@@ -430,16 +429,19 @@ def scan_universe(fyers, symbol_list, session_date, is_index=False):
 def get_breach_metrics(fyers, symbol, session_date, level, direction="above"):
     """
     Returns (breach_time, breach_type, vol_speed_10k, total_blocks)
-    Scans backward from LTP to breach_time. Calculates historical filling metrics.
+    Calculates the exact speed (in minutes) it took to fill EACH sequential 10k block,
+    moving forward from the moment of the breach.
     """
     if pd.isna(level):
         return pd.NaT, "None", "-", 0
     try:
         session_start = int(pd.Timestamp(f"{session_date} {MARKET_OPEN}", tz=IST).timestamp())
         session_end = int(pd.Timestamp(f"{session_date} {MARKET_CLOSE}", tz=IST).timestamp())
+        
         intraday = get_history(fyers, symbol, resolution="5", range_from=session_start, range_to=session_end, date_format="0")
         if intraday is None or intraday.empty:
             return pd.NaT, "None", "-", 0
+            
         intraday = intraday[intraday["timestamp"].dt.date == session_date].sort_values("timestamp").reset_index(drop=True)
         if intraday.empty:
             return pd.NaT, "None", "-", 0
@@ -469,40 +471,53 @@ def get_breach_metrics(fyers, symbol, session_date, level, direction="above"):
                     breach_time = first["timestamp"]
                     breach_type = "GapOpen"
 
+        # --- Calculate Forward Interval Speeds ---
         vol_speed_10k = "-"
         total_blocks = 0
+        
         if not pd.isna(breach_time):
-            post_breach_df = intraday[intraday["timestamp"] >= breach_time].sort_values("timestamp", ascending=False)
+            # Sort Ascending: Start exactly at the breach and move forward through the day
+            post_breach_df = intraday[intraday["timestamp"] >= breach_time].sort_values("timestamp", ascending=True)
             
             speeds = []
             current_bucket_vol = 0
-            candles_since_last_block = 0
+            candles_spent = 0
             
             for _, row in post_breach_df.iterrows():
-                candles_since_last_block += 1
                 current_bucket_vol += safe_float(row["volume"])
+                candles_spent += 1
                 
+                # Every time the running bucket hits 10k volume
                 while current_bucket_vol >= 10000:
-                    speeds.append(candles_since_last_block * 5)
+                    speed_minutes = candles_spent * 5
+                    
+                    if speed_minutes == 0:
+                        speeds.append("<5m")
+                    else:
+                        speeds.append(f"{speed_minutes}m")
+                        
                     current_bucket_vol -= 10000
-                    candles_since_last_block = 0
+                    # Reset the candle timer for the NEXT 10k block
+                    candles_spent = 0
                     
             total_blocks = len(speeds)
-            if not speeds:
+            
+            if total_blocks == 0:
                 vol_speed_10k = "Slow (<10k total)"
             else:
-                formatted_speeds = []
-                for s in speeds[:5]:
-                    if s == 0:
-                        formatted_speeds.append("<5m")
-                    else:
-                        formatted_speeds.append(f"{s}m")
+                # Display the first 5 block speeds (e.g., 10m, 5m, <5m, <5m, 5m)
+                base_str = ", ".join(speeds[:5])
                 
-                vol_speed_10k = ", ".join(formatted_speeds) + f" ...({total_blocks} blks)"
-
-        return breach_time, breach_type, vol_speed_10k, total_blocks
-    except Exception:
+                if total_blocks > 5:
+                    base_str += f" ...({total_blocks} blks)"
+                    
+                vol_speed_10k = base_str
+                
+    except Exception as e:
+        logger.warning(f"Error calculating precise metrics for {symbol}: {e}")
         return pd.NaT, "None", "-", 0
+
+    return breach_time, breach_type, vol_speed_10k, total_blocks
 
 
 def build_html_table(df, title, cols):
@@ -534,9 +549,10 @@ def build_html_table(df, title, cols):
                 html += f"<td style='{style} color:{tag_color}; font-weight:600;'>{val}</td>"
             elif c == "Vol_Speed_10k":
                 val_str = str(val)
+                # Highlight in bright green if the initial breakout blocks were fast
                 if "Slow" in val_str or val_str == "-":
                     speed_color = "#94a3b8"
-                elif "<5m" in val_str or "5m" in val_str:
+                elif val_str.startswith("<5m") or val_str.startswith("5m"):
                     speed_color = "#4ade80"  
                 else:
                     speed_color = "#38bdf8"  
@@ -649,7 +665,6 @@ def main():
                 long_candidates = long_candidates[long_candidates["Total_Blocks"] >= 20]
                 
                 if not long_candidates.empty:
-                    # Sort primarily by institutional volume block count descending
                     long_stocks = long_candidates.sort_values(
                         by=["Total_Blocks", "% Change"], ascending=[False, False], na_position="last"
                     )
@@ -668,7 +683,6 @@ def main():
                 short_candidates = short_candidates[short_candidates["Total_Blocks"] >= 20]
                 
                 if not short_candidates.empty:
-                    # Sort primarily by institutional volume block count descending
                     short_stocks = short_candidates.sort_values(
                         by=["Total_Blocks", "% Change"], ascending=[False, True], na_position="last"
                     )
