@@ -3,12 +3,13 @@
 FO_FNO_FYERS_CONFLUENCE_EMAIL_FIXED.py
 
 Strict FYERS confluence screener - Production Version with Exact Interpolated Volume Speed
+Sorted by Avg Volume Speed Ascending (Fastest Tapes First)
 
 Design rules:
 - Anchor_915 is ONLY the 09:15 candle open for stocks.
 - Hard filter: Automatically removes candidates with < 20 blocks.
-- Backward volume momentum: Calculates the EXACT time (down to the second) 
-  it took for each 10k block to pass, moving backward from LTP.
+- Backward volume momentum: Calculates the EXACT time it took for each 10k block to pass.
+- Sorting: Sorted by Average Volume Speed ascending (fastest average block time first).
 """
 
 import os
@@ -33,7 +34,7 @@ IST = "Asia/Kolkata"
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
-VERSION = "2026-07-11-prod-v11"
+VERSION = "2026-07-11-prod-v12"
 STATE_FILE = Path("fyers_state.json")
 
 NON_EQUITY_UNDERLYINGS = {
@@ -429,23 +430,22 @@ def scan_universe(fyers, symbol_list, session_date, is_index=False):
 
 def get_breach_metrics(fyers, symbol, session_date, level, direction="above"):
     """
-    Returns (breach_time, breach_type, vol_speed_10k, total_blocks)
+    Returns (breach_time, breach_type, vol_speed_10k, total_blocks, avg_rate)
     Calculates exact speed by mathematically dividing Time elapsed by Volume.
-    Moves backwards from LTP to give you the precise speed of the most recent blocks.
     """
     if pd.isna(level):
-        return pd.NaT, "None", "-", 0
+        return pd.NaT, "None", "-", 0, float('inf')
     try:
         session_start = int(pd.Timestamp(f"{session_date} {MARKET_OPEN}", tz=IST).timestamp())
         session_end = int(pd.Timestamp(f"{session_date} {MARKET_CLOSE}", tz=IST).timestamp())
         
         intraday = get_history(fyers, symbol, resolution="5", range_from=session_start, range_to=session_end, date_format="0")
         if intraday is None or intraday.empty:
-            return pd.NaT, "None", "-", 0
+            return pd.NaT, "None", "-", 0, float('inf')
             
         intraday = intraday[intraday["timestamp"].dt.date == session_date].sort_values("timestamp").reset_index(drop=True)
         if intraday.empty:
-            return pd.NaT, "None", "-", 0
+            return pd.NaT, "None", "-", 0, float('inf')
 
         prev_close = intraday["close"].shift(1)
         curr_close = intraday["close"]
@@ -472,12 +472,11 @@ def get_breach_metrics(fyers, symbol, session_date, level, direction="above"):
                     breach_time = first["timestamp"]
                     breach_type = "GapOpen"
 
-        # --- Calculate EXACT Interpolated Backward Speed ---
         vol_speed_10k = "-"
         total_blocks = 0
+        avg_rate = float('inf')
         
         if not pd.isna(breach_time):
-            # Sort Descending (Start at NEWEST candle, read backwards to the breach)
             post_breach_df = intraday[intraday["timestamp"] >= breach_time].sort_values("timestamp", ascending=False)
             
             speeds = []
@@ -494,20 +493,16 @@ def get_breach_metrics(fyers, symbol, session_date, level, direction="above"):
                 overall_vol += vol
                 overall_time += time_added
                 
-                # If the combined bucket volume crosses 10k, calculate the exact speed
                 if bucket_vol + vol >= 10000:
                     total_vol_in_bucket = bucket_vol + vol
                     total_time_in_bucket = bucket_time + time_added
                     
-                    # Rate = Minutes spent per 10k block
                     rate_mins = total_time_in_bucket / (total_vol_in_bucket / 10000.0)
                     
-                    # Log this speed for however many full blocks fit in this bucket
                     full_blocks = int(total_vol_in_bucket // 10000)
                     for _ in range(full_blocks):
                         speeds.append(rate_mins)
                     
-                    # Carry forward the remainder volume and proportional remainder time
                     bucket_vol = total_vol_in_bucket - (full_blocks * 10000)
                     bucket_time = rate_mins * (bucket_vol / 10000.0)
                 else:
@@ -516,7 +511,6 @@ def get_breach_metrics(fyers, symbol, session_date, level, direction="above"):
                     
             total_blocks = int(overall_vol // 10000)
             
-            # Format numbers to be highly readable (convert fast minutes into seconds)
             def fmt_rate(r):
                 if r < 1.0:
                     return f"{max(1, int(r * 60))}s"
@@ -528,19 +522,15 @@ def get_breach_metrics(fyers, symbol, session_date, level, direction="above"):
             if total_blocks == 0:
                 vol_speed_10k = "Slow (<10k total)"
             else:
-                # Display the 4 most recent speeds (Newest to Oldest)
                 recent_strs = [fmt_rate(s) for s in speeds[:4]]
-                
-                # Calculate True Average Speed for the entire post-breach session
                 avg_rate = overall_time / (overall_vol / 10000.0)
-                
                 vol_speed_10k = ", ".join(recent_strs) + f" | Avg: {fmt_rate(avg_rate)}"
                 
     except Exception as e:
         logger.warning(f"Error calculating precise metrics for {symbol}: {e}")
-        return pd.NaT, "None", "-", 0
+        return pd.NaT, "None", "-", 0, float('inf')
 
-    return breach_time, breach_type, vol_speed_10k, total_blocks
+    return breach_time, breach_type, vol_speed_10k, total_blocks, avg_rate
 
 
 def build_html_table(df, title, cols):
@@ -572,7 +562,6 @@ def build_html_table(df, title, cols):
                 html += f"<td style='{style} color:{tag_color}; font-weight:600;'>{val}</td>"
             elif c == "Vol_Speed_10k":
                 val_str = str(val)
-                # Highlight green if any of the recent speeds were under 1 minute (measured in seconds "s")
                 if "Slow" in val_str or val_str == "-":
                     speed_color = "#94a3b8"
                 elif "s" in val_str.split("|")[0]:
@@ -683,13 +672,14 @@ def main():
                 long_candidates["Breach_Type"] = breach_results.apply(lambda x: x[1])
                 long_candidates["Vol_Speed_10k"] = breach_results.apply(lambda x: x[2])
                 long_candidates["Total_Blocks"] = breach_results.apply(lambda x: x[3])
+                long_candidates["Avg_Rate"] = breach_results.apply(lambda x: x[4])
                 
-                # Hard Filter: Removes illiquid false breakouts
                 long_candidates = long_candidates[long_candidates["Total_Blocks"] >= 20]
                 
                 if not long_candidates.empty:
+                    # Sort by Avg_Rate Ascending (Fastest speed first, e.g. 12s before 45s, before 2m)
                     long_stocks = long_candidates.sort_values(
-                        by=["Total_Blocks", "% Change"], ascending=[False, False], na_position="last"
+                        by=["Avg_Rate", "% Change"], ascending=[True, False], na_position="last"
                     )
                     new_seen.update(long_stocks["Symbol"].tolist())
 
@@ -701,27 +691,18 @@ def main():
                 short_candidates["Breach_Type"] = breach_results.apply(lambda x: x[1])
                 short_candidates["Vol_Speed_10k"] = breach_results.apply(lambda x: x[2])
                 short_candidates["Total_Blocks"] = breach_results.apply(lambda x: x[3])
+                short_candidates["Avg_Rate"] = breach_results.apply(lambda x: x[4])
                 
-                # Hard Filter: Removes illiquid false breakdowns
                 short_candidates = short_candidates[short_candidates["Total_Blocks"] >= 20]
                 
                 if not short_candidates.empty:
+                    # Sort by Avg_Rate Ascending (Fastest speed first)
                     short_stocks = short_candidates.sort_values(
-                        by=["Total_Blocks", "% Change"], ascending=[False, True], na_position="last"
+                        by=["Avg_Rate", "% Change"], ascending=[True, True], na_position="last"
                     )
                     new_seen.update(short_stocks["Symbol"].tolist())
 
         if not fallback_df.empty:
             fallback_df = fallback_df.sort_values(by=["% Change"], ascending=[False])
 
-    if not index_df.empty:
-        index_df = index_df.sort_values(by=["% Change"], ascending=[False])
-
-    send_email(index_df, long_stocks, short_stocks, fallback_df, session_date)
-
-    seen_candidates.update(new_seen)
-    save_state(session_date, seen_candidates)
-
-
-if __name__ == "__main__":
-    main()
+    if
