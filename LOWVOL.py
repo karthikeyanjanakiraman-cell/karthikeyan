@@ -2,13 +2,13 @@
 """
 FO_FNO_FYERS_CONFLUENCE_EMAIL_FIXED.py
 
-Strict FYERS confluence screener - Production Version with Backward 10k Vol Speeds
+Strict FYERS confluence screener - Production Version with Institutional Volume Filtering
 
 Design rules:
 - Anchor_915 is ONLY the 09:15 candle open for stocks.
-- Only rows with Anchor_Source=OPEN_915 are eligible for ranked Long/Short tables.
-- Breach detection tracks genuine intraday crosses vs gap-open false positives.
-- Backward volume momentum: Tracks how fast each 10k block filled starting from LTP back to breach.
+- Hard filter: Automatically removes candidates with < 20 blocks or labeled Slow.
+- Sorting: Ranks candidates by total post-breach volume block count descending.
+- Backward volume momentum: Tracks block filling speed from newest to oldest.
 """
 
 import os
@@ -33,7 +33,7 @@ IST = "Asia/Kolkata"
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
-VERSION = "2026-07-11-prod-v6"
+VERSION = "2026-07-11-prod-v7"
 STATE_FILE = Path("fyers_state.json")
 
 NON_EQUITY_UNDERLYINGS = {
@@ -429,21 +429,20 @@ def scan_universe(fyers, symbol_list, session_date, is_index=False):
 
 def get_breach_metrics(fyers, symbol, session_date, level, direction="above"):
     """
-    Returns (breach_time, breach_type, vol_speed_10k)
-    Iterates backwards from the most recent 5-min candle down to the breach_time.
-    Calculates how many minutes it took to fill each 10,000-share block reading from newest to oldest.
+    Returns (breach_time, breach_type, vol_speed_10k, total_blocks)
+    Scans backward from LTP to breach_time. Calculates historical filling metrics.
     """
     if pd.isna(level):
-        return pd.NaT, "None", "-"
+        return pd.NaT, "None", "-", 0
     try:
         session_start = int(pd.Timestamp(f"{session_date} {MARKET_OPEN}", tz=IST).timestamp())
         session_end = int(pd.Timestamp(f"{session_date} {MARKET_CLOSE}", tz=IST).timestamp())
         intraday = get_history(fyers, symbol, resolution="5", range_from=session_start, range_to=session_end, date_format="0")
         if intraday is None or intraday.empty:
-            return pd.NaT, "None", "-"
+            return pd.NaT, "None", "-", 0
         intraday = intraday[intraday["timestamp"].dt.date == session_date].sort_values("timestamp").reset_index(drop=True)
         if intraday.empty:
-            return pd.NaT, "None", "-"
+            return pd.NaT, "None", "-", 0
 
         prev_close = intraday["close"].shift(1)
         curr_close = intraday["close"]
@@ -470,10 +469,9 @@ def get_breach_metrics(fyers, symbol, session_date, level, direction="above"):
                     breach_time = first["timestamp"]
                     breach_type = "GapOpen"
 
-        # Track rolling volume multipliers backwards from LTP to Breach
         vol_speed_10k = "-"
+        total_blocks = 0
         if not pd.isna(breach_time):
-            # Sort descending: row 0 is the most recent candle
             post_breach_df = intraday[intraday["timestamp"] >= breach_time].sort_values("timestamp", ascending=False)
             
             speeds = []
@@ -484,30 +482,27 @@ def get_breach_metrics(fyers, symbol, session_date, level, direction="above"):
                 candles_since_last_block += 1
                 current_bucket_vol += safe_float(row["volume"])
                 
-                # Each time we hit 10k cumulative volume, log the speed and reset
                 while current_bucket_vol >= 10000:
                     speeds.append(candles_since_last_block * 5)
                     current_bucket_vol -= 10000
-                    candles_since_last_block = 0  # Any remainder volume applies to the same candle timeframe (<5m)
+                    candles_since_last_block = 0
                     
+            total_blocks = len(speeds)
             if not speeds:
                 vol_speed_10k = "Slow (<10k total)"
             else:
                 formatted_speeds = []
-                # Render the first 5 speeds for the email column (Newest -> Oldest)
                 for s in speeds[:5]:
                     if s == 0:
                         formatted_speeds.append("<5m")
                     else:
                         formatted_speeds.append(f"{s}m")
                 
-                vol_speed_10k = ", ".join(formatted_speeds)
-                if len(speeds) > 5:
-                    vol_speed_10k += f" ...({len(speeds)} blks)"
+                vol_speed_10k = ", ".join(formatted_speeds) + f" ...({total_blocks} blks)"
 
-        return breach_time, breach_type, vol_speed_10k
+        return breach_time, breach_type, vol_speed_10k, total_blocks
     except Exception:
-        return pd.NaT, "None", "-"
+        return pd.NaT, "None", "-", 0
 
 
 def build_html_table(df, title, cols):
@@ -539,7 +534,6 @@ def build_html_table(df, title, cols):
                 html += f"<td style='{style} color:{tag_color}; font-weight:600;'>{val}</td>"
             elif c == "Vol_Speed_10k":
                 val_str = str(val)
-                # Apply bright green highlighting if recent volume is printing fast (<5m or 5m blocks)
                 if "Slow" in val_str or val_str == "-":
                     speed_color = "#94a3b8"
                 elif "<5m" in val_str or "5m" in val_str:
@@ -649,12 +643,17 @@ def main():
                 long_candidates["Breach_Time"] = breach_results.apply(lambda x: x[0])
                 long_candidates["Breach_Type"] = breach_results.apply(lambda x: x[1])
                 long_candidates["Vol_Speed_10k"] = breach_results.apply(lambda x: x[2])
+                long_candidates["Total_Blocks"] = breach_results.apply(lambda x: x[3])
                 
-                long_candidates["_type_rank"] = long_candidates["Breach_Type"].map({"Intraday": 0, "GapOpen": 1, "None": 2})
-                long_stocks = long_candidates.sort_values(
-                    by=["_type_rank", "% Change", "Breach_Time"], ascending=[True, False, False], na_position="last"
-                ).drop(columns=["_type_rank"])
-                new_seen.update(long_stocks["Symbol"].tolist())
+                # Institutional Quality Threshold Filter (>= 20 Blocks)
+                long_candidates = long_candidates[long_candidates["Total_Blocks"] >= 20]
+                
+                if not long_candidates.empty:
+                    # Sort primarily by institutional volume block count descending
+                    long_stocks = long_candidates.sort_values(
+                        by=["Total_Blocks", "% Change"], ascending=[False, False], na_position="last"
+                    )
+                    new_seen.update(long_stocks["Symbol"].tolist())
 
             if not short_candidates.empty:
                 breach_results = short_candidates.apply(
@@ -663,12 +662,17 @@ def main():
                 short_candidates["Breach_Time"] = breach_results.apply(lambda x: x[0])
                 short_candidates["Breach_Type"] = breach_results.apply(lambda x: x[1])
                 short_candidates["Vol_Speed_10k"] = breach_results.apply(lambda x: x[2])
+                short_candidates["Total_Blocks"] = breach_results.apply(lambda x: x[3])
                 
-                short_candidates["_type_rank"] = short_candidates["Breach_Type"].map({"Intraday": 0, "GapOpen": 1, "None": 2})
-                short_stocks = short_candidates.sort_values(
-                    by=["_type_rank", "% Change", "Breach_Time"], ascending=[True, True, False], na_position="last"
-                ).drop(columns=["_type_rank"])
-                new_seen.update(short_stocks["Symbol"].tolist())
+                # Institutional Quality Threshold Filter (>= 20 Blocks)
+                short_candidates = short_candidates[short_candidates["Total_Blocks"] >= 20]
+                
+                if not short_candidates.empty:
+                    # Sort primarily by institutional volume block count descending
+                    short_stocks = short_candidates.sort_values(
+                        by=["Total_Blocks", "% Change"], ascending=[False, True], na_position="last"
+                    )
+                    new_seen.update(short_stocks["Symbol"].tolist())
 
         if not fallback_df.empty:
             fallback_df = fallback_df.sort_values(by=["% Change"], ascending=[False])
