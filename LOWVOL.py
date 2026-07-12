@@ -399,8 +399,6 @@ def get_recent_expiry_options(fyers):
                 min_expiry = u_df['Expiry'].min()
                 nearest_df = u_df[u_df['Expiry'] == min_expiry]
                 
-                # --- Offline ATM Math Fix ---
-                # Finding the median strike reliably targets the center ATM price dynamically.
                 center_strike = nearest_df['Strike'].median()
                 if not pd.isna(center_strike) and center_strike > 0:
                     distance_pct = 0.025 
@@ -441,7 +439,6 @@ def process_single_scan(fyers, sym, q_data, session_date, is_index):
             anchor_915, anchor_source = np.nan, "QUOTE_INDEX"
             calc_anchor = open_quote if not pd.isna(open_quote) else prev_close
         else:
-            # Preserving EXACT strict design rule requirement: 09:15 open anchor via 5-min candle.
             anchor_915, is_exact = get_opening_anchor(fyers, sym, session_date)
             if pd.isna(anchor_915):
                 anchor_source = "QUOTE_FALLBACK"
@@ -473,7 +470,6 @@ def scan_universe(fyers, symbol_list, session_date, is_index=False):
         q_data = quotes_map.get(sym, {})
         ltp = q_data.get("ltp")
         
-        # --- Weekend / API Failure Failsafe ---
         if is_index or pd.isna(ltp) or ltp >= MINIMUM_PREMIUM:
             active_symbols.append(sym)
             
@@ -689,12 +685,13 @@ def main():
         fallback_df = option_df[~option_df["Anchor_Source"].isin(eligible_sources)].copy()
 
         if not valid_df.empty:
-            c_a1, c_a2 = valid_df["Conf_Above-1"], valid_df["Conf_Above-3"]
-            c_b1, c_b2 = valid_df["Conf_Below-1"], valid_df["Conf_Below-3"]
+            c_a1 = valid_df["Conf_Above-1"]
+            c_b1 = valid_df["Conf_Below-1"]
             ltp = valid_df["LTP"]
 
-            long_mask = (valid_df["Signal"] == "Long") & c_a1.notna() & c_a2.notna() & (ltp > c_a1) & (ltp < c_a2)
-            short_mask = (valid_df["Signal"] == "Short") & c_b1.notna() & c_b2.notna() & (ltp < c_b1) & (ltp > c_b2)
+            # --- Capping at Above-3 / Below-3 Removed ---
+            long_mask = (valid_df["Signal"] == "Long") & c_a1.notna() & (ltp > c_a1)
+            short_mask = (valid_df["Signal"] == "Short") & c_b1.notna() & (ltp < c_b1)
 
             long_candidates = valid_df[long_mask].copy()
             short_candidates = valid_df[short_mask].copy()
