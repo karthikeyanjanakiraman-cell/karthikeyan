@@ -5,12 +5,6 @@ FO_FNO_FYERS_CONFLUENCE_EMAIL_FIXED_OPTIONS.py
 Strict FYERS confluence screener - Production Version with Exact Interpolated Volume Speed
 Modified for Index Options (NIFTY, BANKNIFTY, SENSEX) - Nearest Expiry
 Sorted by Avg Volume Speed Ascending (Fastest Tapes First)
-
-Design rules:
-- Anchor_915 is ONLY the 09:15 candle open.
-- Hard filter: Automatically removes candidates with < 20 blocks.
-- Backward volume momentum: Calculates the EXACT time it took for each 10k block to pass.
-- Sorting: Sorted by Average Volume Speed ascending (fastest average block time first).
 """
 
 import os
@@ -20,6 +14,7 @@ import json
 import logging
 import warnings
 import smtplib
+import re
 from io import StringIO
 from pathlib import Path
 from email.mime.multipart import MIMEMultipart
@@ -38,7 +33,7 @@ FYERS_MASTER_URLS = [
 ]
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
-VERSION = "2026-07-11-prod-options-v1"
+VERSION = "2026-07-12-prod-options-v2"
 STATE_FILE = Path("fyers_state_options.json")
 
 class Config:
@@ -52,7 +47,7 @@ class Config:
         self.sender_password = os.environ.get("SENDER_PASSWORD", "password")
         self.recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
-        self.lookback_days = int(os.environ.get("LOOKBACK_DAYS", "365"))
+        self.lookback_days = int(os.environ.get("LOOKBACK_DAYS", "365")) # Kept for indices
         self.history_pause_sec = float(os.environ.get("HISTORY_PAUSE_SEC", "0.25"))
         self.quotes_pause_sec = float(os.environ.get("QUOTES_PAUSE_SEC", "0.20"))
         self.max_retries = int(os.environ.get("MAX_RETRIES", "3"))
@@ -69,7 +64,6 @@ class Config:
             "NSE:NIFTYBANK-INDEX",
             "BSE:SENSEX-INDEX",
         ]
-
 
 cfg = Config()
 
@@ -110,7 +104,6 @@ class RateLimiter:
             time.sleep(self.min_interval - elapsed)
         self._last = time.monotonic()
 
-
 rate_limiter = RateLimiter(cfg.max_requests_per_sec)
 
 
@@ -126,14 +119,12 @@ def load_state(session_date):
             logger.error(f"Error loading state: {e}")
     return set()
 
-
 def save_state(session_date, seen_set):
     try:
         with open(STATE_FILE, "w") as f:
             json.dump({"date": str(session_date), "seen": list(seen_set)}, f)
     except Exception as e:
         logger.error(f"Error saving state: {e}")
-
 
 def safe_float(val):
     try:
@@ -143,14 +134,12 @@ def safe_float(val):
     except Exception:
         return np.nan
 
-
 def format_value(val):
     if pd.isna(val) or val in [float("inf"), float("-inf")]:
         return "-"
     if isinstance(val, (int, float, np.integer, np.floating)):
         return f"{float(val):.2f}"
     return str(val)
-
 
 def format_change(val):
     try:
@@ -160,15 +149,12 @@ def format_change(val):
     except Exception:
         return "-"
 
-
 def chunked(seq, size):
     for i in range(0, len(seq), size):
         yield seq[i:i + size]
 
-
 def now_ist():
     return pd.Timestamp.now(tz=IST)
-
 
 def current_session_date():
     now = now_ist()
@@ -179,7 +165,6 @@ def current_session_date():
         d = d - timedelta(days=1)
     return d
 
-
 def init_fyers():
     try:
         if not cfg.client_id or not cfg.access_token:
@@ -189,7 +174,6 @@ def init_fyers():
     except Exception as e:
         logger.error(f"FYERS init failed: {e}")
         return None
-
 
 def call_with_retries(func, *args, **kwargs):
     last_err = None
@@ -240,7 +224,6 @@ def get_history(fyers, symbol, resolution, days=None, range_from=None, range_to=
         logger.warning(f"History fetch failed for {symbol}: {e}")
         return None
 
-
 def get_opening_anchor(fyers, symbol, session_date):
     try:
         session_start = int(pd.Timestamp(f"{session_date} {MARKET_OPEN}", tz=IST).timestamp())
@@ -267,7 +250,6 @@ def get_opening_anchor(fyers, symbol, session_date):
     except Exception:
         return np.nan, False
 
-
 def extract_quote_data(quote_item):
     if not isinstance(quote_item, dict):
         return {"ltp": np.nan, "open": np.nan}
@@ -276,7 +258,6 @@ def extract_quote_data(quote_item):
         "ltp": safe_float(nested.get("lp") or nested.get("last_price")),
         "open": safe_float(nested.get("open_price"))
     }
-
 
 def get_quotes_map(fyers, symbols):
     out = {}
@@ -293,7 +274,6 @@ def get_quotes_map(fyers, symbols):
             for sym in batch:
                 out.setdefault(sym, {"ltp": np.nan, "open": np.nan})
     return out
-
 
 def extract_volume_weighted_nodes(df, bins=120, peak_quantile=0.60):
     if df is None or df.empty:
@@ -323,7 +303,6 @@ def extract_volume_weighted_nodes(df, bins=120, peak_quantile=0.60):
         return extract_volume_weighted_nodes(df, bins, 0.30)
     return sorted(set(nodes))
 
-
 def nearest_levels(levels, ref_price, count=3):
     levels = sorted(set([x for x in levels if not pd.isna(x)]))
     below = [x for x in levels if x <= ref_price]
@@ -332,13 +311,11 @@ def nearest_levels(levels, ref_price, count=3):
     above_vals = above[:count] + [np.nan] * max(0, count - len(above[:count]))
     return below_vals, above_vals
 
-
 def nearest_support_resistance(levels, ref_price):
     levels = sorted(set([x for x in levels if not pd.isna(x)]))
     support = max([x for x in levels if x <= ref_price], default=np.nan)
     resistance = min([x for x in levels if x >= ref_price], default=np.nan)
     return support, resistance
-
 
 def build_row(symbol, anchor_915, anchor_source, calc_anchor, ltp_price, levels):
     below_vals, above_vals = nearest_levels(levels, calc_anchor, count=3)
@@ -368,30 +345,115 @@ def build_row(symbol, anchor_915, anchor_source, calc_anchor, ltp_price, levels)
     }
 
 
+def get_recent_expiry_options():
+    symbols = []
+    # Dynamic RegEx ensures we always grab the core indices regardless of column shifts
+    pattern = re.compile(r"^(NSE:NIFTY|NSE:BANKNIFTY|NSE:NIFTYBANK|BSE:SENSEX)\d+")
+    
+    for url in FYERS_MASTER_URLS:
+        try:
+            logger.info(f"Fetching option master data from {url}...")
+            text = requests.get(url, timeout=30).text
+            raw = pd.read_csv(StringIO(text), header=None, low_memory=False)
+            
+            # Auto-discover Ticker Column (Look for NSE: / BSE: string)
+            ticker_col = None
+            for col in raw.columns:
+                sample = raw[col].dropna().astype(str).head(100)
+                if sample.str.startswith("NSE:").any() or sample.str.startswith("BSE:").any():
+                    ticker_col = col
+                    break
+                    
+            # Auto-discover Expiry Column (Look for large Epoch Timestamps)
+            expiry_col = None
+            for col in raw.columns:
+                if pd.api.types.is_numeric_dtype(raw[col]):
+                    sample = raw[col].dropna()
+                    if not sample.empty and (sample > 1500000000).any() and (sample < 2200000000).any():
+                        expiry_col = col
+                        break
+                        
+            if ticker_col is None or expiry_col is None:
+                logger.warning(f"Failed to auto-detect correct columns in {url}")
+                continue
+                
+            tickers = raw[ticker_col].astype(str).str.strip().str.upper()
+            expiries = raw[expiry_col]
+            
+            # Mask to find Valid Options (CE/PE matching our index patterns)
+            mask = tickers.str.match(pattern) & tickers.str.endswith(('CE', 'PE'))
+            opt_df = raw[mask].copy()
+            
+            if opt_df.empty:
+                continue
+                
+            # Extract underlying prefix to group expiries (e.g., 'NSE:NIFTY')
+            opt_df['Underlying_Prefix'] = opt_df[ticker_col].str.extract(r"^(NSE:NIFTY|NSE:BANKNIFTY|NSE:NIFTYBANK|BSE:SENSEX)")
+            
+            for prefix in opt_df['Underlying_Prefix'].unique():
+                if pd.isna(prefix): continue
+                u_df = opt_df[opt_df['Underlying_Prefix'] == prefix]
+                min_expiry = u_df[expiry_col].min()
+                nearest_df = u_df[u_df[expiry_col] == min_expiry]
+                symbols.extend(nearest_df[ticker_col].tolist())
+                
+        except Exception as e:
+            logger.warning(f"Failed to fetch or parse master data from {url}: {e}")
+            
+    out = sorted(list(set(symbols)))
+    logger.info(f"Auto-discovered {len(out)} nearest expiry option symbols.")
+    return out[:cfg.symbol_limit] if cfg.symbol_limit > 0 else out
+
+
 def scan_universe(fyers, symbol_list, session_date, is_index=False):
     rows = []
     if not symbol_list:
         return pd.DataFrame(columns=RESULT_COLS)
+        
     quotes_map = get_quotes_map(fyers, symbol_list)
-
+    
+    # Speed Optimization: Filter out worthless deep OTM options
+    active_symbols = []
     for sym in symbol_list:
+        q_data = quotes_map.get(sym, {})
+        ltp = q_data.get("ltp")
+        # Keep indices OR Options with LTP > 5.0 (discards illiquid junk)
+        if is_index or (not pd.isna(ltp) and ltp > 5.0):
+            active_symbols.append(sym)
+            
+    if not is_index:
+        logger.info(f"Filtering out deep OTMs: Scanning {len(active_symbols)} active options out of {len(symbol_list)} total.")
+
+    for sym in active_symbols:
         try:
             q_data = quotes_map.get(sym, {})
             live_quote, open_quote = q_data.get("ltp"), q_data.get("open")
-            daily = get_history(fyers, sym, "D", days=cfg.lookback_days)
-            if daily is None or daily.empty:
+            
+            # OPTIONS TIMEFRAME FIX: Options are short-lived. Use 15-min candles over 7 days for accurate nodes.
+            # INDEX TIMEFRAME: Use Daily candles over Lookback Days.
+            if is_index:
+                history_tf = "D"
+                history_days = cfg.lookback_days
+            else:
+                history_tf = "15"
+                history_days = 7
+
+            df_hist = get_history(fyers, sym, history_tf, days=history_days)
+            
+            if df_hist is None or df_hist.empty:
                 continue
 
-            if daily.iloc[-1]["timestamp"].date() >= session_date:
-                hist_daily = daily.iloc[:-1].copy()
-            else:
-                hist_daily = daily.copy()
+            # Exclude today's data to find purely historical support/resistance nodes
+            hist_past = df_hist[df_hist["timestamp"].dt.date < session_date].copy()
+            if hist_past.empty:
+                # If option was introduced strictly today, fallback to full available data
+                hist_past = df_hist.copy()
 
-            levels = extract_volume_weighted_nodes(hist_daily)
+            levels = extract_volume_weighted_nodes(hist_past)
             if not levels:
                 continue
 
-            prev_close = safe_float(hist_daily["close"].iloc[-1]) if not hist_daily.empty else np.nan
+            prev_close = safe_float(hist_past["close"].iloc[-1]) if not hist_past.empty else np.nan
 
             if is_index:
                 anchor_915, anchor_source = np.nan, "QUOTE_INDEX"
@@ -411,6 +473,7 @@ def scan_universe(fyers, symbol_list, session_date, is_index=False):
                 continue
 
             rows.append(build_row(sym, anchor_915, anchor_source, calc_anchor, ltp, levels))
+            
         except Exception as e:
             logger.warning(f"Scan failed for {sym}: {e}")
 
@@ -422,10 +485,6 @@ def scan_universe(fyers, symbol_list, session_date, is_index=False):
 
 
 def get_breach_metrics(fyers, symbol, session_date, level, direction="above"):
-    """
-    Returns (breach_time, breach_type, vol_speed_10k, total_blocks, avg_rate)
-    Calculates exact speed by mathematically dividing Time elapsed by Volume.
-    """
     if pd.isna(level):
         return pd.NaT, "None", "-", 0, float('inf')
     try:
@@ -525,7 +584,6 @@ def get_breach_metrics(fyers, symbol, session_date, level, direction="above"):
 
     return breach_time, breach_type, vol_speed_10k, total_blocks, avg_rate
 
-
 def build_html_table(df, title, cols):
     if df is None or df.empty:
         return f"<h3 style='color:#fbbf24; font-family:sans-serif;'>{title}</h3><p style='color:#94a3b8;'>No candidates found.</p>"
@@ -604,38 +662,6 @@ def send_email(index_df, long_df, short_df, fallback_df, session_date):
         logger.error(f"Email failed: {e}")
 
 
-def get_recent_expiry_options():
-    symbols = []
-    target_indices = {'NIFTY', 'BANKNIFTY', 'SENSEX', 'NIFTY50', 'NIFTYBANK'}
-    
-    for url in FYERS_MASTER_URLS:
-        try:
-            logger.info(f"Fetching option master data from {url}...")
-            text = requests.get(url, timeout=30).text
-            raw = pd.read_csv(StringIO(text), header=None, low_memory=False)
-            
-            # FYERS CSV Mapping: Col 13 is Underlying, Col 15 is Option Type, Col 8 is Expiry, Col 9 is Symbol Ticker
-            raw[13] = raw[13].astype(str).str.strip().str.upper()
-            raw[15] = raw[15].astype(str).str.strip().str.upper()
-            
-            # Filter rows targeting our indices and identified as options (CE/PE)
-            opt_df = raw[(raw[13].isin(target_indices)) & (raw[15].isin(['CE', 'PE']))]
-            
-            for underlying in target_indices:
-                u_df = opt_df[opt_df[13] == underlying]
-                if not u_df.empty:
-                    # Find nearest upcoming expiry epoch date
-                    min_expiry = u_df[8].min()
-                    nearest_df = u_df[u_df[8] == min_expiry]
-                    symbols.extend(nearest_df[9].tolist())
-                    
-        except Exception as e:
-            logger.warning(f"Failed to fetch or parse master data from {url}: {e}")
-            
-    out = sorted(list(set(symbols)))
-    return out[:cfg.symbol_limit] if cfg.symbol_limit > 0 else out
-
-
 def main():
     fyers = init_fyers()
     if not fyers:
@@ -687,7 +713,6 @@ def main():
                 long_candidates = long_candidates[long_candidates["Total_Blocks"] >= 20]
                 
                 if not long_candidates.empty:
-                    # Sort by Avg_Rate Ascending (Fastest speed first, e.g. 12s before 45s, before 2m)
                     long_options = long_candidates.sort_values(
                         by=["Avg_Rate", "% Change"], ascending=[True, False], na_position="last"
                     )
@@ -706,7 +731,6 @@ def main():
                 short_candidates = short_candidates[short_candidates["Total_Blocks"] >= 20]
                 
                 if not short_candidates.empty:
-                    # Sort by Avg_Rate Ascending (Fastest speed first)
                     short_options = short_candidates.sort_values(
                         by=["Avg_Rate", "% Change"], ascending=[True, True], na_position="last"
                     )
@@ -722,7 +746,6 @@ def main():
 
     seen_candidates.update(new_seen)
     save_state(session_date, seen_candidates)
-
 
 if __name__ == "__main__":
     main()
