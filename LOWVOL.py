@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
-FO_FNO_FYERS_CONFLUENCE_EMAIL_FIXED.py
+FO_FNO_FYERS_CONFLUENCE_EMAIL_FIXED_OPTIONS.py
 
 Strict FYERS confluence screener - Production Version with Exact Interpolated Volume Speed
+Modified for Index Options (NIFTY, BANKNIFTY, SENSEX) - Nearest Expiry
 Sorted by Avg Volume Speed Ascending (Fastest Tapes First)
 
 Design rules:
-- Anchor_915 is ONLY the 09:15 candle open for stocks.
+- Anchor_915 is ONLY the 09:15 candle open.
 - Hard filter: Automatically removes candidates with < 20 blocks.
 - Backward volume momentum: Calculates the EXACT time it took for each 10k block to pass.
 - Sorting: Sorted by Average Volume Speed ascending (fastest average block time first).
@@ -31,18 +32,14 @@ import requests
 from fyers_apiv3 import fyersModel
 
 IST = "Asia/Kolkata"
-FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
+FYERS_MASTER_URLS = [
+    "https://public.fyers.in/sym_details/NSE_FO.csv",
+    "https://public.fyers.in/sym_details/BSE_FO.csv"
+]
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
-VERSION = "2026-07-11-prod-v12"
-STATE_FILE = Path("fyers_state.json")
-
-NON_EQUITY_UNDERLYINGS = {
-    "NIFTY", "NIFTY50", "NIFTYNXT50", "BANKNIFTY", "NIFTYBANK",
-    "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "SENSEX50",
-    "NIFTYMID", "NIFTYIT", "NIFTYPSE", "NIFTYINFRA",
-}
-
+VERSION = "2026-07-11-prod-options-v1"
+STATE_FILE = Path("fyers_state_options.json")
 
 class Config:
     def __init__(self):
@@ -59,7 +56,7 @@ class Config:
         self.history_pause_sec = float(os.environ.get("HISTORY_PAUSE_SEC", "0.25"))
         self.quotes_pause_sec = float(os.environ.get("QUOTES_PAUSE_SEC", "0.20"))
         self.max_retries = int(os.environ.get("MAX_RETRIES", "3"))
-        self.stock_limit = int(os.environ.get("STOCK_LIMIT", "0"))
+        self.symbol_limit = int(os.environ.get("STOCK_LIMIT", "0"))
 
         self.max_requests_per_sec = float(os.environ.get("MAX_REQ_PER_SEC", "6"))
         self.disable_index_scan = os.environ.get("DISABLE_INDEX_SCAN", "0") == "1"
@@ -71,10 +68,6 @@ class Config:
             "NSE:NIFTY50-INDEX",
             "NSE:NIFTYBANK-INDEX",
             "BSE:SENSEX-INDEX",
-        ]
-        self.fallback_stock_symbols = [
-            "NSE:RELIANCE-EQ", "NSE:HDFCBANK-EQ", "NSE:ICICIBANK-EQ",
-            "NSE:INFY-EQ", "NSE:TCS-EQ", "NSE:SBIN-EQ"
         ]
 
 
@@ -94,7 +87,7 @@ RESULT_COLS = [
     "Support", "Resistance", "Support_Gap_Pct", "Resistance_Gap_Pct", "Vol_Speed_10k"
 ]
 
-logger = logging.getLogger("fyers_confluence")
+logger = logging.getLogger("fyers_confluence_options")
 logger.setLevel(logging.INFO)
 logger.handlers.clear()
 stream = logging.StreamHandler(sys.stdout)
@@ -591,13 +584,13 @@ def send_email(index_df, long_df, short_df, fallback_df, session_date):
     msg["From"] = cfg.sender_email
     msg["To"] = ", ".join(recipients)
     total_candidates = len(long_df) + len(short_df)
-    subject_suffix = f"{total_candidates} New Candidates" if total_candidates > 0 else "Watchlist Update"
+    subject_suffix = f"{total_candidates} New Option Candidates" if total_candidates > 0 else "Options Watchlist Update"
     msg["Subject"] = f"FYERS Alert: {subject_suffix} - {datetime.now().strftime('%H:%M')}"
 
-    html = f"<html><body style='background-color:#030712; padding:20px; font-family:sans-serif;'><h2 style='color:#e2e8f0;'>FYERS Confluence</h2>"
+    html = f"<html><body style='background-color:#030712; padding:20px; font-family:sans-serif;'><h2 style='color:#e2e8f0;'>FYERS Options Confluence</h2>"
     html += f"{build_html_table(index_df, 'Market Index Snapshot', EMAIL_DISPLAY_COLS)}"
-    html += f"{build_html_table(long_df, 'New Long Candidates', EMAIL_DISPLAY_COLS)}"
-    html += f"{build_html_table(short_df, 'New Short Candidates', EMAIL_DISPLAY_COLS)}"
+    html += f"{build_html_table(long_df, 'New Long Option Candidates', EMAIL_DISPLAY_COLS)}"
+    html += f"{build_html_table(short_df, 'New Short Option Candidates', EMAIL_DISPLAY_COLS)}"
     html += f"{build_html_table(fallback_df, 'Watchlist (Missing/Late Open)', EMAIL_DISPLAY_COLS)}</body></html>"
 
     msg.attach(MIMEText(html, "html"))
@@ -611,19 +604,36 @@ def send_email(index_df, long_df, short_df, fallback_df, session_date):
         logger.error(f"Email failed: {e}")
 
 
-def get_live_fno_symbols():
-    try:
-        text = requests.get(FYERS_FO_MASTER_URL, timeout=30).text
-        raw = pd.read_csv(StringIO(text), header=None)
-        underlying = raw[13].astype(str).str.strip().str.upper().dropna().unique()
-        symbols = [
-            f"NSE:{sym}-EQ" for sym in underlying
-            if len(sym) >= 2 and sym not in {"", "SYMBOL"} and sym not in NON_EQUITY_UNDERLYINGS
-        ]
-        out = sorted(set(symbols))
-        return out[:cfg.stock_limit] if cfg.stock_limit > 0 else out
-    except Exception:
-        return cfg.fallback_stock_symbols
+def get_recent_expiry_options():
+    symbols = []
+    target_indices = {'NIFTY', 'BANKNIFTY', 'SENSEX', 'NIFTY50', 'NIFTYBANK'}
+    
+    for url in FYERS_MASTER_URLS:
+        try:
+            logger.info(f"Fetching option master data from {url}...")
+            text = requests.get(url, timeout=30).text
+            raw = pd.read_csv(StringIO(text), header=None, low_memory=False)
+            
+            # FYERS CSV Mapping: Col 13 is Underlying, Col 15 is Option Type, Col 8 is Expiry, Col 9 is Symbol Ticker
+            raw[13] = raw[13].astype(str).str.strip().str.upper()
+            raw[15] = raw[15].astype(str).str.strip().str.upper()
+            
+            # Filter rows targeting our indices and identified as options (CE/PE)
+            opt_df = raw[(raw[13].isin(target_indices)) & (raw[15].isin(['CE', 'PE']))]
+            
+            for underlying in target_indices:
+                u_df = opt_df[opt_df[13] == underlying]
+                if not u_df.empty:
+                    # Find nearest upcoming expiry epoch date
+                    min_expiry = u_df[8].min()
+                    nearest_df = u_df[u_df[8] == min_expiry]
+                    symbols.extend(nearest_df[9].tolist())
+                    
+        except Exception as e:
+            logger.warning(f"Failed to fetch or parse master data from {url}: {e}")
+            
+    out = sorted(list(set(symbols)))
+    return out[:cfg.symbol_limit] if cfg.symbol_limit > 0 else out
 
 
 def main():
@@ -635,20 +645,20 @@ def main():
     seen_candidates = load_state(session_date)
 
     index_df = pd.DataFrame(columns=RESULT_COLS) if cfg.disable_index_scan else scan_universe(fyers, cfg.index_symbols, session_date, is_index=True)
-    live_stock_symbols = get_live_fno_symbols()
-    stock_df = scan_universe(fyers, live_stock_symbols, session_date)
+    live_option_symbols = get_recent_expiry_options()
+    option_df = scan_universe(fyers, live_option_symbols, session_date)
 
-    long_stocks, short_stocks = pd.DataFrame(columns=RESULT_COLS), pd.DataFrame(columns=RESULT_COLS)
+    long_options, short_options = pd.DataFrame(columns=RESULT_COLS), pd.DataFrame(columns=RESULT_COLS)
     fallback_df = pd.DataFrame(columns=RESULT_COLS)
     new_seen = set()
 
-    if not stock_df.empty:
+    if not option_df.empty:
         eligible_sources = {"OPEN_915"}
         if cfg.include_late_anchor_in_ranked:
             eligible_sources.add("OPEN_915_LATE")
 
-        valid_df = stock_df[stock_df["Anchor_Source"].isin(eligible_sources)].copy()
-        fallback_df = stock_df[~stock_df["Anchor_Source"].isin(eligible_sources)].copy()
+        valid_df = option_df[option_df["Anchor_Source"].isin(eligible_sources)].copy()
+        fallback_df = option_df[~option_df["Anchor_Source"].isin(eligible_sources)].copy()
 
         if not valid_df.empty:
             c_a1, c_a2 = valid_df["Conf_Above-1"], valid_df["Conf_Above-3"]
@@ -678,10 +688,10 @@ def main():
                 
                 if not long_candidates.empty:
                     # Sort by Avg_Rate Ascending (Fastest speed first, e.g. 12s before 45s, before 2m)
-                    long_stocks = long_candidates.sort_values(
+                    long_options = long_candidates.sort_values(
                         by=["Avg_Rate", "% Change"], ascending=[True, False], na_position="last"
                     )
-                    new_seen.update(long_stocks["Symbol"].tolist())
+                    new_seen.update(long_options["Symbol"].tolist())
 
             if not short_candidates.empty:
                 breach_results = short_candidates.apply(
@@ -697,10 +707,10 @@ def main():
                 
                 if not short_candidates.empty:
                     # Sort by Avg_Rate Ascending (Fastest speed first)
-                    short_stocks = short_candidates.sort_values(
+                    short_options = short_candidates.sort_values(
                         by=["Avg_Rate", "% Change"], ascending=[True, True], na_position="last"
                     )
-                    new_seen.update(short_stocks["Symbol"].tolist())
+                    new_seen.update(short_options["Symbol"].tolist())
 
         if not fallback_df.empty:
             fallback_df = fallback_df.sort_values(by=["% Change"], ascending=[False])
@@ -708,7 +718,7 @@ def main():
     if not index_df.empty:
         index_df = index_df.sort_values(by=["% Change"], ascending=[False])
 
-    send_email(index_df, long_stocks, short_stocks, fallback_df, session_date)
+    send_email(index_df, long_options, short_options, fallback_df, session_date)
 
     seen_candidates.update(new_seen)
     save_state(session_date, seen_candidates)
