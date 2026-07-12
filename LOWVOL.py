@@ -1,11 +1,17 @@
 #!/usr/bin/env python3
 """
-FO_FNO_FYERS_CONFLUENCE_EMAIL_FIXED_OPTIONS_THREADED.py
+FO_FNO_FYERS_CONFLUENCE_EMAIL_FIXED_OPTIONS_FINAL.py
 
 Strict FYERS confluence screener - Production Version with Exact Interpolated Volume Speed
 Modified for Index Options (NIFTY, BANKNIFTY, SENSEX) - Nearest Expiry
 Sorted by Avg Volume Speed Ascending (Fastest Tapes First)
-** Fully Multithreaded for Maximum Execution Speed **
+** Fully Multithreaded & Weekend/API Failsafe Enabled **
+
+Design rules:
+- Anchor_915 is ONLY the 09:15 candle open.
+- Hard filter: Automatically removes candidates with < 20 blocks.
+- Backward volume momentum: Calculates the EXACT time it took for each 10k block to pass.
+- Sorting: Sorted by Average Volume Speed ascending (fastest average block time first).
 """
 
 import os
@@ -36,7 +42,7 @@ FYERS_MASTER_URLS = [
 ]
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
-VERSION = "2026-07-12-prod-options-v3-threaded"
+VERSION = "2026-07-12-prod-options-v4-final"
 STATE_FILE = Path("fyers_state_options.json")
 
 class Config:
@@ -225,6 +231,31 @@ def get_history(fyers, symbol, resolution, days=None, range_from=None, range_to=
     except Exception as e:
         return None
 
+def get_opening_anchor(fyers, symbol, session_date):
+    try:
+        session_start = int(pd.Timestamp(f"{session_date} {MARKET_OPEN}", tz=IST).timestamp())
+        session_end = int(pd.Timestamp(f"{session_date} {MARKET_CLOSE}", tz=IST).timestamp())
+        intraday = get_history(fyers, symbol, resolution="5", range_from=session_start, range_to=session_end, date_format="0")
+        if intraday is None or intraday.empty:
+            return np.nan, False
+
+        intraday = intraday[intraday["timestamp"].dt.date == session_date].copy()
+        if intraday.empty:
+            return np.nan, False
+
+        target = pd.Timestamp(f"{session_date} {MARKET_OPEN}")
+        row = intraday.loc[intraday["timestamp"] == target]
+        if not row.empty:
+            return safe_float(row.iloc[0]["open"]), True
+
+        market_rows = intraday.sort_values("timestamp")
+        if not market_rows.empty:
+            return safe_float(market_rows.iloc[0]["open"]), False
+
+        return np.nan, False
+    except Exception:
+        return np.nan, False
+
 def extract_quote_data(quote_item):
     if not isinstance(quote_item, dict):
         return {"ltp": np.nan, "open": np.nan}
@@ -319,28 +350,6 @@ def build_row(symbol, anchor_915, anchor_source, calc_anchor, ltp_price, levels)
     }
 
 def get_recent_expiry_options(fyers):
-    # Fetch live spots to restrict strike scan to ATM options (+/- 2.5%)
-    index_symbols = ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX", "BSE:SENSEX-INDEX"]
-    spot_prices = {}
-    
-    try:
-        quotes_res = call_with_retries(fyers.quotes, data={"symbols": ",".join(index_symbols)})
-        if isinstance(quotes_res, dict) and "d" in quotes_res:
-            for item in quotes_res["d"]:
-                sym = item.get("n") or item.get("symbol")
-                nested = item.get("v", item)
-                ltp = safe_float(nested.get("lp") or nested.get("last_price"))
-                if not pd.isna(ltp):
-                    if "NIFTY50" in sym: spot_prices["NIFTY"] = ltp
-                    elif "NIFTYBANK" in sym: spot_prices["BANKNIFTY"] = ltp
-                    elif "SENSEX" in sym: spot_prices["SENSEX"] = ltp
-    except:
-        pass
-
-    spot_prices.setdefault("NIFTY", 24000)
-    spot_prices.setdefault("BANKNIFTY", 52000)
-    spot_prices.setdefault("SENSEX", 79000)
-
     symbols = []
     pattern = re.compile(r"^(NSE:NIFTY|NSE:BANKNIFTY|BSE:SENSEX)\d+")
     
@@ -390,10 +399,12 @@ def get_recent_expiry_options(fyers):
                 min_expiry = u_df['Expiry'].min()
                 nearest_df = u_df[u_df['Expiry'] == min_expiry]
                 
-                spot = spot_prices.get(u_key, 0)
-                if spot > 0:
+                # --- Offline ATM Math Fix ---
+                # Finding the median strike reliably targets the center ATM price dynamically.
+                center_strike = nearest_df['Strike'].median()
+                if not pd.isna(center_strike) and center_strike > 0:
                     distance_pct = 0.025 
-                    lower_bound, upper_bound = spot * (1 - distance_pct), spot * (1 + distance_pct)
+                    lower_bound, upper_bound = center_strike * (1 - distance_pct), center_strike * (1 + distance_pct)
                     nearest_df = nearest_df[(nearest_df['Strike'] >= lower_bound) & (nearest_df['Strike'] <= upper_bound)]
                 
                 symbols.extend(nearest_df['Ticker'].tolist())
@@ -402,6 +413,7 @@ def get_recent_expiry_options(fyers):
             logger.warning(f"Failed to fetch master data: {e}")
             
     out = sorted(list(set(symbols)))
+    logger.info(f"Mathematical Filter: Found {len(out)} near-ATM strikes.")
     return out[:cfg.symbol_limit] if cfg.symbol_limit > 0 else out
 
 
@@ -416,19 +428,6 @@ def process_single_scan(fyers, sym, q_data, session_date, is_index):
         df_hist = get_history(fyers, sym, history_tf, days=history_days)
         if df_hist is None or df_hist.empty: return None
 
-        anchor_915 = np.nan
-        is_exact = False
-        
-        today_data = df_hist[df_hist["timestamp"].dt.date == session_date].sort_values("timestamp")
-        if not today_data.empty:
-            target_open = pd.Timestamp(f"{session_date} {MARKET_OPEN}")
-            morning_candle = today_data[today_data["timestamp"] == target_open]
-            if not morning_candle.empty:
-                anchor_915 = safe_float(morning_candle.iloc[0]["open"])
-                is_exact = True
-            else:
-                anchor_915 = safe_float(today_data.iloc[0]["open"])
-
         hist_past = df_hist[df_hist["timestamp"].dt.date < session_date].copy()
         if hist_past.empty:
             hist_past = df_hist.copy()
@@ -442,6 +441,8 @@ def process_single_scan(fyers, sym, q_data, session_date, is_index):
             anchor_915, anchor_source = np.nan, "QUOTE_INDEX"
             calc_anchor = open_quote if not pd.isna(open_quote) else prev_close
         else:
+            # Preserving EXACT strict design rule requirement: 09:15 open anchor via 5-min candle.
+            anchor_915, is_exact = get_opening_anchor(fyers, sym, session_date)
             if pd.isna(anchor_915):
                 anchor_source = "QUOTE_FALLBACK"
                 calc_anchor = open_quote if not pd.isna(open_quote) else prev_close
@@ -457,6 +458,7 @@ def process_single_scan(fyers, sym, q_data, session_date, is_index):
     except:
         return None
 
+
 # --- MULTITHREADED SCANNER ---
 def scan_universe(fyers, symbol_list, session_date, is_index=False):
     if not symbol_list:
@@ -465,19 +467,20 @@ def scan_universe(fyers, symbol_list, session_date, is_index=False):
     quotes_map = get_quotes_map(fyers, symbol_list)
     
     active_symbols = []
-    MINIMUM_PREMIUM = 5.0 # Low filter just to drop literal 0.05 junk
+    MINIMUM_PREMIUM = 5.0 
 
     for sym in symbol_list:
         q_data = quotes_map.get(sym, {})
         ltp = q_data.get("ltp")
-        if is_index or (not pd.isna(ltp) and ltp >= MINIMUM_PREMIUM):
+        
+        # --- Weekend / API Failure Failsafe ---
+        if is_index or pd.isna(ltp) or ltp >= MINIMUM_PREMIUM:
             active_symbols.append(sym)
             
     if not is_index:
-        logger.info(f"Initiating Multithreaded Scan for {len(active_symbols)} symbols...")
+        logger.info(f"Initiating Multithreaded Scan for {len(active_symbols)} active symbols...")
 
     rows = []
-    # Execute history downloads in parallel
     with ThreadPoolExecutor(max_workers=cfg.max_threads) as executor:
         futures = {executor.submit(process_single_scan, fyers, sym, quotes_map.get(sym, {}), session_date, is_index): sym for sym in active_symbols}
         for future in as_completed(futures):
@@ -643,7 +646,7 @@ def send_email(index_df, long_df, short_df, fallback_df, session_date):
     subject_suffix = f"{total_candidates} New Option Candidates" if total_candidates > 0 else "Options Watchlist Update"
     msg["Subject"] = f"FYERS Alert: {subject_suffix} - {datetime.now().strftime('%H:%M')}"
 
-    html = f"<html><body style='background-color:#030712; padding:20px; font-family:sans-serif;'><h2 style='color:#e2e8f0;'>FYERS Options Confluence (Speed v3)</h2>"
+    html = f"<html><body style='background-color:#030712; padding:20px; font-family:sans-serif;'><h2 style='color:#e2e8f0;'>FYERS Options Confluence</h2>"
     html += f"{build_html_table(index_df, 'Market Index Snapshot', EMAIL_DISPLAY_COLS)}"
     html += f"{build_html_table(long_df, 'New Long Option Candidates', EMAIL_DISPLAY_COLS)}"
     html += f"{build_html_table(short_df, 'New Short Option Candidates', EMAIL_DISPLAY_COLS)}"
