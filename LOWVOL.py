@@ -5,13 +5,7 @@ FO_FNO_FYERS_CONFLUENCE_EMAIL_FIXED_OPTIONS_FINAL.py
 Strict FYERS confluence screener - Production Version with Exact Interpolated Volume Speed
 Modified for Index Options (NIFTY, BANKNIFTY, SENSEX) - Nearest Expiry
 Sorted by Avg Volume Speed Ascending (Fastest Tapes First)
-** Fully Multithreaded & Weekend/API Failsafe Enabled **
-
-Design rules:
-- Anchor_915 is ONLY the 09:15 candle open.
-- Hard filter: Automatically removes candidates with < 20 blocks.
-- Backward volume momentum: Calculates the EXACT time it took for each 10k block to pass.
-- Sorting: Sorted by Average Volume Speed ascending (fastest average block time first).
+** Fully Multithreaded & Index-Synced Anchor System Enabled **
 """
 
 import os
@@ -42,7 +36,7 @@ FYERS_MASTER_URLS = [
 ]
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
-VERSION = "2026-07-12-prod-options-v4-final"
+VERSION = "2026-07-13-prod-options-v5-index-anchor"
 STATE_FILE = Path("fyers_state_options.json")
 
 class Config:
@@ -60,13 +54,11 @@ class Config:
         self.max_retries = int(os.environ.get("MAX_RETRIES", "3"))
         self.symbol_limit = int(os.environ.get("STOCK_LIMIT", "0"))
         
-        # FYERS limits apps to ~10 req/sec. Keep at 8-10 for threaded safety.
         self.max_requests_per_sec = float(os.environ.get("MAX_REQ_PER_SEC", "8"))
         self.max_threads = int(os.environ.get("MAX_THREADS", "10")) 
         
         self.disable_index_scan = os.environ.get("DISABLE_INDEX_SCAN", "0") == "1"
         self.always_send_watchlist = os.environ.get("ALWAYS_SEND_WATCHLIST", "1") == "1"
-        self.include_late_anchor_in_ranked = os.environ.get("INCLUDE_LATE_ANCHOR", "0") == "1"
 
         self.index_symbols = [
             "NSE:NIFTY50-INDEX",
@@ -117,7 +109,6 @@ class RateLimiter:
             self._last = time.monotonic()
 
 rate_limiter = RateLimiter(cfg.max_requests_per_sec)
-
 
 def load_state(session_date):
     date_str = str(session_date)
@@ -230,31 +221,6 @@ def get_history(fyers, symbol, resolution, days=None, range_from=None, range_to=
         return normalize_history_df(candles)
     except Exception as e:
         return None
-
-def get_opening_anchor(fyers, symbol, session_date):
-    try:
-        session_start = int(pd.Timestamp(f"{session_date} {MARKET_OPEN}", tz=IST).timestamp())
-        session_end = int(pd.Timestamp(f"{session_date} {MARKET_CLOSE}", tz=IST).timestamp())
-        intraday = get_history(fyers, symbol, resolution="5", range_from=session_start, range_to=session_end, date_format="0")
-        if intraday is None or intraday.empty:
-            return np.nan, False
-
-        intraday = intraday[intraday["timestamp"].dt.date == session_date].copy()
-        if intraday.empty:
-            return np.nan, False
-
-        target = pd.Timestamp(f"{session_date} {MARKET_OPEN}")
-        row = intraday.loc[intraday["timestamp"] == target]
-        if not row.empty:
-            return safe_float(row.iloc[0]["open"]), True
-
-        market_rows = intraday.sort_values("timestamp")
-        if not market_rows.empty:
-            return safe_float(market_rows.iloc[0]["open"]), False
-
-        return np.nan, False
-    except Exception:
-        return np.nan, False
 
 def extract_quote_data(quote_item):
     if not isinstance(quote_item, dict):
@@ -415,8 +381,8 @@ def get_recent_expiry_options(fyers):
     return out[:cfg.symbol_limit] if cfg.symbol_limit > 0 else out
 
 
-# --- SINGLE THREAD PROCESSOR FOR SCAN UNIVERSE ---
-def process_single_scan(fyers, sym, q_data, session_date, is_index):
+# --- INDEX-SYNCED PROCESSOR FOR SCAN UNIVERSE ---
+def process_single_scan(fyers, sym, q_data, session_date, is_index, index_anchors=None):
     try:
         live_quote, open_quote = q_data.get("ltp"), q_data.get("open")
         
@@ -436,17 +402,26 @@ def process_single_scan(fyers, sym, q_data, session_date, is_index):
         prev_close = safe_float(hist_past["close"].iloc[-1]) if not hist_past.empty else np.nan
 
         if is_index:
-            anchor_915, anchor_source = np.nan, "QUOTE_INDEX"
+            anchor_915 = np.nan
+            anchor_source = "QUOTE_INDEX"
             calc_anchor = open_quote if not pd.isna(open_quote) else prev_close
         else:
-            anchor_915, is_exact = get_opening_anchor(fyers, sym, session_date)
-            if pd.isna(anchor_915):
-                anchor_source = "QUOTE_FALLBACK"
-                calc_anchor = open_quote if not pd.isna(open_quote) else prev_close
-            elif is_exact:
-                anchor_source, calc_anchor = "OPEN_915", anchor_915
+            # Sync anchor logic to underlying index instead of option-level 09:15 timestamp
+            underlying = "UNKNOWN"
+            if "BANKNIFTY" in sym: underlying = "BANKNIFTY"
+            elif "NIFTY" in sym: underlying = "NIFTY"
+            elif "SENSEX" in sym: underlying = "SENSEX"
+            
+            idx_anchor = index_anchors.get(underlying, np.nan) if index_anchors else np.nan
+            
+            if not pd.isna(idx_anchor):
+                anchor_915 = idx_anchor  # This displays the Index's actual 09:15 open in the UI
+                anchor_source = "IDX_ANCHOR"
             else:
-                anchor_source, calc_anchor = "OPEN_915_LATE", anchor_915
+                anchor_915 = np.nan
+                anchor_source = "QUOTE_FALLBACK"
+                
+            calc_anchor = open_quote if not pd.isna(open_quote) else prev_close
 
         ltp = live_quote if not pd.isna(live_quote) else prev_close
         if pd.isna(ltp): return None
@@ -457,7 +432,7 @@ def process_single_scan(fyers, sym, q_data, session_date, is_index):
 
 
 # --- MULTITHREADED SCANNER ---
-def scan_universe(fyers, symbol_list, session_date, is_index=False):
+def scan_universe(fyers, symbol_list, session_date, is_index=False, index_anchors=None):
     if not symbol_list:
         return pd.DataFrame(columns=RESULT_COLS)
         
@@ -478,7 +453,7 @@ def scan_universe(fyers, symbol_list, session_date, is_index=False):
 
     rows = []
     with ThreadPoolExecutor(max_workers=cfg.max_threads) as executor:
-        futures = {executor.submit(process_single_scan, fyers, sym, quotes_map.get(sym, {}), session_date, is_index): sym for sym in active_symbols}
+        futures = {executor.submit(process_single_scan, fyers, sym, quotes_map.get(sym, {}), session_date, is_index, index_anchors): sym for sym in active_symbols}
         for future in as_completed(futures):
             res = future.result()
             if res:
@@ -646,7 +621,7 @@ def send_email(index_df, long_df, short_df, fallback_df, session_date):
     html += f"{build_html_table(index_df, 'Market Index Snapshot', EMAIL_DISPLAY_COLS)}"
     html += f"{build_html_table(long_df, 'New Long Option Candidates', EMAIL_DISPLAY_COLS)}"
     html += f"{build_html_table(short_df, 'New Short Option Candidates', EMAIL_DISPLAY_COLS)}"
-    html += f"{build_html_table(fallback_df, 'Watchlist (Missing/Late Open)', EMAIL_DISPLAY_COLS)}</body></html>"
+    html += f"{build_html_table(fallback_df, 'Watchlist (Data Missing)', EMAIL_DISPLAY_COLS)}</body></html>"
 
     msg.attach(MIMEText(html, "html"))
     try:
@@ -668,18 +643,30 @@ def main():
     session_date = current_session_date()
     seen_candidates = load_state(session_date)
 
+    # 1. Fetch Index Data First
     index_df = pd.DataFrame(columns=RESULT_COLS) if cfg.disable_index_scan else scan_universe(fyers, cfg.index_symbols, session_date, is_index=True)
+    
+    # 2. Extract Index Anchors for the Options Sync
+    index_anchors = {}
+    if not index_df.empty:
+        for _, row in index_df.iterrows():
+            sym = row["Symbol"]
+            if "NIFTY50" in sym: index_anchors["NIFTY"] = row["Calc_Anchor"]
+            elif "NIFTYBANK" in sym: index_anchors["BANKNIFTY"] = row["Calc_Anchor"]
+            elif "SENSEX" in sym: index_anchors["SENSEX"] = row["Calc_Anchor"]
+
     live_option_symbols = get_recent_expiry_options(fyers)
-    option_df = scan_universe(fyers, live_option_symbols, session_date)
+    
+    # 3. Scan Options using Index Anchors
+    option_df = scan_universe(fyers, live_option_symbols, session_date, index_anchors=index_anchors)
 
     long_options, short_options = pd.DataFrame(columns=RESULT_COLS), pd.DataFrame(columns=RESULT_COLS)
     fallback_df = pd.DataFrame(columns=RESULT_COLS)
     new_seen = set()
 
     if not option_df.empty:
-        eligible_sources = {"OPEN_915"}
-        if cfg.include_late_anchor_in_ranked:
-            eligible_sources.add("OPEN_915_LATE")
+        # We now accept the Index Anchor as valid proof that the market opened
+        eligible_sources = {"IDX_ANCHOR", "QUOTE_FALLBACK"}
 
         valid_df = option_df[option_df["Anchor_Source"].isin(eligible_sources)].copy()
         fallback_df = option_df[~option_df["Anchor_Source"].isin(eligible_sources)].copy()
@@ -689,7 +676,6 @@ def main():
             c_b1 = valid_df["Conf_Below-1"]
             ltp = valid_df["LTP"]
 
-            # --- Capping at Above-3 / Below-3 Removed ---
             long_mask = (valid_df["Signal"] == "Long") & c_a1.notna() & (ltp > c_a1)
             short_mask = (valid_df["Signal"] == "Short") & c_b1.notna() & (ltp < c_b1)
 
