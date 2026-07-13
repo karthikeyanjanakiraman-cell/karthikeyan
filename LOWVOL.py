@@ -36,7 +36,7 @@ FYERS_MASTER_URLS = [
 ]
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
-VERSION = "2026-07-13-prod-options-v5-index-anchor"
+VERSION = "2026-07-13-prod-options-v6-final"
 STATE_FILE = Path("fyers_state_options.json")
 
 class Config:
@@ -219,8 +219,33 @@ def get_history(fyers, symbol, resolution, days=None, range_from=None, range_to=
         if not candles:
             return None
         return normalize_history_df(candles)
-    except Exception as e:
+    except Exception:
         return None
+
+def get_opening_anchor(fyers, symbol, session_date):
+    try:
+        session_start = int(pd.Timestamp(f"{session_date} {MARKET_OPEN}", tz=IST).timestamp())
+        session_end = int(pd.Timestamp(f"{session_date} {MARKET_CLOSE}", tz=IST).timestamp())
+        intraday = get_history(fyers, symbol, resolution="5", range_from=session_start, range_to=session_end, date_format="0")
+        if intraday is None or intraday.empty:
+            return np.nan, False
+
+        intraday = intraday[intraday["timestamp"].dt.date == session_date].copy()
+        if intraday.empty:
+            return np.nan, False
+
+        target = pd.Timestamp(f"{session_date} {MARKET_OPEN}")
+        row = intraday.loc[intraday["timestamp"] == target]
+        if not row.empty:
+            return safe_float(row.iloc[0]["open"]), True
+
+        market_rows = intraday.sort_values("timestamp")
+        if not market_rows.empty:
+            return safe_float(market_rows.iloc[0]["open"]), False
+
+        return np.nan, False
+    except Exception:
+        return np.nan, False
 
 def extract_quote_data(quote_item):
     if not isinstance(quote_item, dict):
@@ -390,23 +415,35 @@ def process_single_scan(fyers, sym, q_data, session_date, is_index, index_anchor
         history_days = cfg.lookback_days if is_index else 7
 
         df_hist = get_history(fyers, sym, history_tf, days=history_days)
-        if df_hist is None or df_hist.empty: return None
+        if df_hist is None or df_hist.empty: 
+            return None
 
         hist_past = df_hist[df_hist["timestamp"].dt.date < session_date].copy()
         if hist_past.empty:
             hist_past = df_hist.copy()
 
         levels = extract_volume_weighted_nodes(hist_past)
-        if not levels: return None
+        
+        # Failsafe: Don't drop indices just because spot volume is empty
+        if not levels and not is_index: 
+            return None
+        if not levels:
+            levels = []
 
         prev_close = safe_float(hist_past["close"].iloc[-1]) if not hist_past.empty else np.nan
 
         if is_index:
-            anchor_915 = np.nan
-            anchor_source = "QUOTE_INDEX"
-            calc_anchor = open_quote if not pd.isna(open_quote) else prev_close
+            # Explicitly fetch the exact 09:15 candle for the index
+            anchor_915, is_exact = get_opening_anchor(fyers, sym, session_date)
+            if pd.isna(anchor_915):
+                anchor_915 = safe_float(open_quote) if not pd.isna(open_quote) else prev_close
+                anchor_source = "QUOTE_INDEX"
+            else:
+                anchor_source = "IDX_OPEN_915"
+                
+            calc_anchor = anchor_915 if not pd.isna(anchor_915) else prev_close
         else:
-            # Sync anchor logic to underlying index instead of option-level 09:15 timestamp
+            # Sync anchor logic to underlying index
             underlying = "UNKNOWN"
             if "BANKNIFTY" in sym: underlying = "BANKNIFTY"
             elif "NIFTY" in sym: underlying = "NIFTY"
@@ -415,7 +452,7 @@ def process_single_scan(fyers, sym, q_data, session_date, is_index, index_anchor
             idx_anchor = index_anchors.get(underlying, np.nan) if index_anchors else np.nan
             
             if not pd.isna(idx_anchor):
-                anchor_915 = idx_anchor  # This displays the Index's actual 09:15 open in the UI
+                anchor_915 = idx_anchor  
                 anchor_source = "IDX_ANCHOR"
             else:
                 anchor_915 = np.nan
@@ -427,7 +464,8 @@ def process_single_scan(fyers, sym, q_data, session_date, is_index, index_anchor
         if pd.isna(ltp): return None
 
         return build_row(sym, anchor_915, anchor_source, calc_anchor, ltp, levels)
-    except:
+    except Exception as e:
+        logger.error(f"Error processing {sym}: {e}")
         return None
 
 
@@ -646,14 +684,14 @@ def main():
     # 1. Fetch Index Data First
     index_df = pd.DataFrame(columns=RESULT_COLS) if cfg.disable_index_scan else scan_universe(fyers, cfg.index_symbols, session_date, is_index=True)
     
-    # 2. Extract Index Anchors for the Options Sync
+    # 2. Extract Exact 09:15 Index Anchors for the Options Sync
     index_anchors = {}
     if not index_df.empty:
         for _, row in index_df.iterrows():
             sym = row["Symbol"]
-            if "NIFTY50" in sym: index_anchors["NIFTY"] = row["Calc_Anchor"]
-            elif "NIFTYBANK" in sym: index_anchors["BANKNIFTY"] = row["Calc_Anchor"]
-            elif "SENSEX" in sym: index_anchors["SENSEX"] = row["Calc_Anchor"]
+            if "NIFTY50" in sym: index_anchors["NIFTY"] = row["Anchor_915"]
+            elif "NIFTYBANK" in sym: index_anchors["BANKNIFTY"] = row["Anchor_915"]
+            elif "SENSEX" in sym: index_anchors["SENSEX"] = row["Anchor_915"]
 
     live_option_symbols = get_recent_expiry_options(fyers)
     
@@ -665,7 +703,7 @@ def main():
     new_seen = set()
 
     if not option_df.empty:
-        # We now accept the Index Anchor as valid proof that the market opened
+        # We accept the Index Anchor as valid proof that the market opened
         eligible_sources = {"IDX_ANCHOR", "QUOTE_FALLBACK"}
 
         valid_df = option_df[option_df["Anchor_Source"].isin(eligible_sources)].copy()
