@@ -32,7 +32,7 @@ IST = "Asia/Kolkata"
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
-VERSION = "2026-07-15-prod-v14-optimized"
+VERSION = "2026-07-15-prod-v15-optimized"
 STATE_FILE = Path("fyers_state.json")
 
 NON_EQUITY_UNDERLYINGS = {
@@ -115,19 +115,14 @@ class RateLimiter:
         if self.min_interval <= 0:
             return
         
+        # Sleep INSIDE the lock. This forces threads into a single-file line 
+        # and guarantees requests never overlap closer than the min_interval.
         with self.lock:
             now = time.monotonic()
             elapsed = now - self._last
             if elapsed < self.min_interval:
-                sleep_time = self.min_interval - elapsed
-                self._last = now + sleep_time
-            else:
-                sleep_time = 0.0
-                self._last = now
-                
-        # Sleep OUTSIDE the lock so we don't bottleneck other threads
-        if sleep_time > 0:
-            time.sleep(sleep_time)
+                time.sleep(self.min_interval - elapsed)
+            self._last = time.monotonic()
 
 
 rate_limiter = RateLimiter(cfg.max_requests_per_sec)
@@ -238,25 +233,28 @@ def normalize_history_df(candles):
 
 def get_history(fyers, symbol, resolution, days=None, range_from=None, range_to=None, date_format="1"):
     try:
-        fmt = int(date_format)
-        if fmt == 1:
+        # FYERS v3 strictly requires "1D" for daily resolution. Auto-correct it here.
+        res_str = "1D" if str(resolution).upper() == "D" else str(resolution)
+        
+        if str(date_format) == "1":
             now = pd.Timestamp.now(tz=IST)
-            # Cap days at 360 to prevent strict >365 limit rejections
+            # Cap days at 360 to prevent strict 1-year window rejections
             safe_days = min(days or cfg.lookback_days, 360)
             start = (now - timedelta(days=safe_days)).strftime("%Y-%m-%d")
             end = now.strftime("%Y-%m-%d")
         else:
-            # date_format 0 strictly expects integers for epoch timestamps
-            start, end = int(range_from), int(range_to)
+            # Epoch timestamps must be integers converted back to strings for the payload
+            start = str(int(range_from))
+            end = str(int(range_to))
 
-        # FYERS V3 strictly requires date_format and cont_flag to be integers, NOT strings
+        # The Python SDK parses these internally, so they must be strings
         payload = {
             "symbol": symbol,
-            "resolution": str(resolution),
-            "date_format": fmt,
+            "resolution": res_str,
+            "date_format": str(date_format),
             "range_from": start,
             "range_to": end,
-            "cont_flag": 1 
+            "cont_flag": "1" 
         }
         res = call_with_retries(fyers.history, data=payload)
         candles = res.get("candles", []) if isinstance(res, dict) else []
@@ -404,7 +402,7 @@ def process_symbol(fyers, sym, session_date, quotes_map, is_index):
         q_data = quotes_map.get(sym, {})
         live_quote, open_quote = q_data.get("ltp"), q_data.get("open")
         
-        # FYERS V3 uses "D" for daily.
+        # FYERS V3 uses "1D" for daily. The get_history function now auto-corrects this if needed.
         daily = get_history(fyers, sym, "D", days=cfg.lookback_days)
         
         if daily is None or daily.empty:
@@ -763,3 +761,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
