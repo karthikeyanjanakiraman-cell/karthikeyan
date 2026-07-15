@@ -386,7 +386,7 @@ def process_symbol(fyers, sym, session_date, quotes_map, is_index):
     try:
         q_data = quotes_map.get(sym, {})
         live_quote, open_quote = q_data.get("ltp"), q_data.get("open")
-        daily = get_history(fyers, sym, "D", days=cfg.lookback_days)
+        daily = get_history(fyers, sym, "1D", days=cfg.lookback_days)
         if daily is None or daily.empty:
             return None
 
