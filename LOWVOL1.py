@@ -3,13 +3,9 @@
 FO_FNO_FYERS_CONFLUENCE_EMAIL_FIXED.py
 
 Strict FYERS confluence screener - Production Version with Exact Interpolated Volume Speed
-Sorted by Avg Volume Speed Ascending (Fastest Tapes First)
+* OPTIMIZED VERSION: Includes Multithreading, Thread-Safe Rate Limiting, and 5-min Caching *
 
-Design rules:
-- Anchor_915 is ONLY the 09:15 candle open for stocks.
-- Hard filter: Automatically removes candidates with < 20 blocks.
-- Backward volume momentum: Calculates the EXACT time it took for each 10k block to pass.
-- Sorting: Sorted by Average Volume Speed ascending (fastest average block time first).
+Sorted by Avg Volume Speed Ascending (Fastest Tapes First)
 """
 
 import os
@@ -19,11 +15,13 @@ import json
 import logging
 import warnings
 import smtplib
+import threading
 from io import StringIO
 from pathlib import Path
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import numpy as np
 import pandas as pd
@@ -34,7 +32,7 @@ IST = "Asia/Kolkata"
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
-VERSION = "2026-07-11-prod-v12"
+VERSION = "2026-07-11-prod-v13-optimized"
 STATE_FILE = Path("fyers_state.json")
 
 NON_EQUITY_UNDERLYINGS = {
@@ -42,6 +40,9 @@ NON_EQUITY_UNDERLYINGS = {
     "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "SENSEX50",
     "NIFTYMID", "NIFTYIT", "NIFTYPSE", "NIFTYINFRA",
 }
+
+# Global cache to prevent re-fetching 5-min data during breach calculations
+INTRADAY_CACHE = {}
 
 
 class Config:
@@ -56,12 +57,13 @@ class Config:
         self.recipient_email = os.environ.get("RECIPIENT_EMAIL", "you@example.com")
 
         self.lookback_days = int(os.environ.get("LOOKBACK_DAYS", "365"))
-        self.history_pause_sec = float(os.environ.get("HISTORY_PAUSE_SEC", "0.25"))
-        self.quotes_pause_sec = float(os.environ.get("QUOTES_PAUSE_SEC", "0.20"))
         self.max_retries = int(os.environ.get("MAX_RETRIES", "3"))
         self.stock_limit = int(os.environ.get("STOCK_LIMIT", "0"))
 
+        # Adjusted for threading, respect Fyers limit
         self.max_requests_per_sec = float(os.environ.get("MAX_REQ_PER_SEC", "6"))
+        self.max_threads = int(os.environ.get("MAX_THREADS", "5"))
+        
         self.disable_index_scan = os.environ.get("DISABLE_INDEX_SCAN", "0") == "1"
         self.force_run = os.environ.get("FORCE_RUN", "0") == "1"
         self.include_late_anchor_in_ranked = os.environ.get("INCLUDE_LATE_ANCHOR", "0") == "1"
@@ -107,15 +109,17 @@ class RateLimiter:
     def __init__(self, max_per_sec):
         self.min_interval = 1.0 / max_per_sec if max_per_sec > 0 else 0.0
         self._last = 0.0
+        self.lock = threading.Lock()  # Required for multithreading
 
     def wait(self):
         if self.min_interval <= 0:
             return
-        now = time.monotonic()
-        elapsed = now - self._last
-        if elapsed < self.min_interval:
-            time.sleep(self.min_interval - elapsed)
-        self._last = time.monotonic()
+        with self.lock:
+            now = time.monotonic()
+            elapsed = now - self._last
+            if elapsed < self.min_interval:
+                time.sleep(self.min_interval - elapsed)
+            self._last = time.monotonic()
 
 
 rate_limiter = RateLimiter(cfg.max_requests_per_sec)
@@ -238,7 +242,6 @@ def get_history(fyers, symbol, resolution, days=None, range_from=None, range_to=
             "range_from": start, "range_to": end, "cont_flag": "1"
         }
         res = call_with_retries(fyers.history, data=payload)
-        time.sleep(cfg.history_pause_sec)
         candles = res.get("candles", []) if isinstance(res, dict) else []
         if not candles:
             return None
@@ -252,9 +255,13 @@ def get_opening_anchor(fyers, symbol, session_date):
     try:
         session_start = int(pd.Timestamp(f"{session_date} {MARKET_OPEN}", tz=IST).timestamp())
         session_end = int(pd.Timestamp(f"{session_date} {MARKET_CLOSE}", tz=IST).timestamp())
+        
         intraday = get_history(fyers, symbol, resolution="5", range_from=session_start, range_to=session_end, date_format="0")
         if intraday is None or intraday.empty:
             return np.nan, False
+
+        # Cache the fetched 5-min history to save an API call later
+        INTRADAY_CACHE[symbol] = intraday.copy()
 
         intraday = intraday[intraday["timestamp"].dt.date == session_date].copy()
         if intraday.empty:
@@ -267,7 +274,7 @@ def get_opening_anchor(fyers, symbol, session_date):
 
         market_rows = intraday.sort_values("timestamp")
         if not market_rows.empty:
-            logger.info(f"09:15 exact candle missing for {symbol}; fallback first intraday candle used.")
+            logger.debug(f"09:15 exact candle missing for {symbol}; fallback first intraday candle used.")
             return safe_float(market_rows.iloc[0]["open"]), False
 
         return np.nan, False
@@ -290,7 +297,6 @@ def get_quotes_map(fyers, symbols):
     for batch in chunked(symbols, 50):
         try:
             res = call_with_retries(fyers.quotes, data={"symbols": ",".join(batch)})
-            time.sleep(cfg.quotes_pause_sec)
             items = res.get("d", []) if isinstance(res, dict) else []
             for item in items:
                 symbol = item.get("n") or item.get("symbol")
@@ -375,51 +381,67 @@ def build_row(symbol, anchor_915, anchor_source, calc_anchor, ltp_price, levels)
     }
 
 
+def process_symbol(fyers, sym, session_date, quotes_map, is_index):
+    """Thread target for individual symbol processing."""
+    try:
+        q_data = quotes_map.get(sym, {})
+        live_quote, open_quote = q_data.get("ltp"), q_data.get("open")
+        daily = get_history(fyers, sym, "D", days=cfg.lookback_days)
+        if daily is None or daily.empty:
+            return None
+
+        if daily.iloc[-1]["timestamp"].date() >= session_date:
+            hist_daily = daily.iloc[:-1].copy()
+        else:
+            hist_daily = daily.copy()
+
+        levels = extract_volume_weighted_nodes(hist_daily)
+        if not levels:
+            return None
+
+        prev_close = safe_float(hist_daily["close"].iloc[-1]) if not hist_daily.empty else np.nan
+
+        if is_index:
+            anchor_915, anchor_source = np.nan, "QUOTE_INDEX"
+            calc_anchor = open_quote if not pd.isna(open_quote) else prev_close
+        else:
+            anchor_915, is_exact = get_opening_anchor(fyers, sym, session_date)
+            if pd.isna(anchor_915):
+                anchor_source = "QUOTE_FALLBACK"
+                calc_anchor = open_quote if not pd.isna(open_quote) else prev_close
+            elif is_exact:
+                anchor_source, calc_anchor = "OPEN_915", anchor_915
+            else:
+                anchor_source, calc_anchor = "OPEN_915_LATE", anchor_915
+
+        ltp = live_quote if not pd.isna(live_quote) else prev_close
+        if pd.isna(ltp):
+            return None
+
+        return build_row(sym, anchor_915, anchor_source, calc_anchor, ltp, levels)
+    except Exception as e:
+        logger.warning(f"Scan failed for {sym}: {e}")
+        return None
+
+
 def scan_universe(fyers, symbol_list, session_date, is_index=False):
     rows = []
     if not symbol_list:
         return pd.DataFrame(columns=RESULT_COLS)
+    
     quotes_map = get_quotes_map(fyers, symbol_list)
 
-    for sym in symbol_list:
-        try:
-            q_data = quotes_map.get(sym, {})
-            live_quote, open_quote = q_data.get("ltp"), q_data.get("open")
-            daily = get_history(fyers, sym, "D", days=cfg.lookback_days)
-            if daily is None or daily.empty:
-                continue
-
-            if daily.iloc[-1]["timestamp"].date() >= session_date:
-                hist_daily = daily.iloc[:-1].copy()
-            else:
-                hist_daily = daily.copy()
-
-            levels = extract_volume_weighted_nodes(hist_daily)
-            if not levels:
-                continue
-
-            prev_close = safe_float(hist_daily["close"].iloc[-1]) if not hist_daily.empty else np.nan
-
-            if is_index:
-                anchor_915, anchor_source = np.nan, "QUOTE_INDEX"
-                calc_anchor = open_quote if not pd.isna(open_quote) else prev_close
-            else:
-                anchor_915, is_exact = get_opening_anchor(fyers, sym, session_date)
-                if pd.isna(anchor_915):
-                    anchor_source = "QUOTE_FALLBACK"
-                    calc_anchor = open_quote if not pd.isna(open_quote) else prev_close
-                elif is_exact:
-                    anchor_source, calc_anchor = "OPEN_915", anchor_915
-                else:
-                    anchor_source, calc_anchor = "OPEN_915_LATE", anchor_915
-
-            ltp = live_quote if not pd.isna(live_quote) else prev_close
-            if pd.isna(ltp):
-                continue
-
-            rows.append(build_row(sym, anchor_915, anchor_source, calc_anchor, ltp, levels))
-        except Exception as e:
-            logger.warning(f"Scan failed for {sym}: {e}")
+    # Use ThreadPoolExecutor for massive I/O speedup
+    with ThreadPoolExecutor(max_workers=cfg.max_threads) as executor:
+        futures = {
+            executor.submit(process_symbol, fyers, sym, session_date, quotes_map, is_index): sym 
+            for sym in symbol_list
+        }
+        
+        for future in as_completed(futures):
+            res = future.result()
+            if res:
+                rows.append(res)
 
     out = pd.DataFrame(rows) if rows else pd.DataFrame(columns=RESULT_COLS)
     for col in RESULT_COLS:
@@ -429,17 +451,18 @@ def scan_universe(fyers, symbol_list, session_date, is_index=False):
 
 
 def get_breach_metrics(fyers, symbol, session_date, level, direction="above"):
-    """
-    Returns (breach_time, breach_type, vol_speed_10k, total_blocks, avg_rate)
-    Calculates exact speed by mathematically dividing Time elapsed by Volume.
-    """
     if pd.isna(level):
         return pd.NaT, "None", "-", 0, float('inf')
     try:
-        session_start = int(pd.Timestamp(f"{session_date} {MARKET_OPEN}", tz=IST).timestamp())
-        session_end = int(pd.Timestamp(f"{session_date} {MARKET_CLOSE}", tz=IST).timestamp())
+        # Retrieve from cache first to save an API call
+        intraday = INTRADAY_CACHE.get(symbol)
         
-        intraday = get_history(fyers, symbol, resolution="5", range_from=session_start, range_to=session_end, date_format="0")
+        if intraday is None or intraday.empty:
+            logger.debug(f"Cache miss for {symbol}, fetching 5m data manually.")
+            session_start = int(pd.Timestamp(f"{session_date} {MARKET_OPEN}", tz=IST).timestamp())
+            session_end = int(pd.Timestamp(f"{session_date} {MARKET_CLOSE}", tz=IST).timestamp())
+            intraday = get_history(fyers, symbol, resolution="5", range_from=session_start, range_to=session_end, date_format="0")
+            
         if intraday is None or intraday.empty:
             return pd.NaT, "None", "-", 0, float('inf')
             
@@ -627,6 +650,8 @@ def get_live_fno_symbols():
 
 
 def main():
+    start_time = time.time()
+    
     fyers = init_fyers()
     if not fyers:
         return
@@ -636,6 +661,8 @@ def main():
 
     index_df = pd.DataFrame(columns=RESULT_COLS) if cfg.disable_index_scan else scan_universe(fyers, cfg.index_symbols, session_date, is_index=True)
     live_stock_symbols = get_live_fno_symbols()
+    
+    logger.info(f"Scanning {len(live_stock_symbols)} stocks using {cfg.max_threads} threads...")
     stock_df = scan_universe(fyers, live_stock_symbols, session_date)
 
     long_stocks, short_stocks = pd.DataFrame(columns=RESULT_COLS), pd.DataFrame(columns=RESULT_COLS)
@@ -677,7 +704,6 @@ def main():
                 long_candidates = long_candidates[long_candidates["Total_Blocks"] >= 20]
                 
                 if not long_candidates.empty:
-                    # Sort by Avg_Rate Ascending (Fastest speed first, e.g. 12s before 45s, before 2m)
                     long_stocks = long_candidates.sort_values(
                         by=["Avg_Rate", "% Change"], ascending=[True, False], na_position="last"
                     )
@@ -696,7 +722,6 @@ def main():
                 short_candidates = short_candidates[short_candidates["Total_Blocks"] >= 20]
                 
                 if not short_candidates.empty:
-                    # Sort by Avg_Rate Ascending (Fastest speed first)
                     short_stocks = short_candidates.sort_values(
                         by=["Avg_Rate", "% Change"], ascending=[True, True], na_position="last"
                     )
@@ -712,7 +737,10 @@ def main():
 
     seen_candidates.update(new_seen)
     save_state(session_date, seen_candidates)
+    
+    logger.info(f"Execution complete in {time.time() - start_time:.2f} seconds.")
 
 
 if __name__ == "__main__":
     main()
+
