@@ -3,7 +3,7 @@
 FO_FNO_FYERS_CONFLUENCE_EMAIL_FIXED.py
 
 Strict FYERS confluence screener - Production Version with Exact Interpolated Volume Speed
-* OPTIMIZED VERSION: Includes Multithreading, Thread-Safe Rate Limiting, and Strict API v3 Typing *
+* OPTIMIZED VERSION: Includes Multithreading, Dual-Window Rate Limiting, and Strict API v3 Typing *
 
 Sorted by Avg Volume Speed Ascending (Fastest Tapes First)
 """
@@ -32,7 +32,7 @@ IST = "Asia/Kolkata"
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
-VERSION = "2026-07-15-prod-v15-optimized"
+VERSION = "2026-07-15-prod-v16-optimized"
 STATE_FILE = Path("fyers_state.json")
 
 NON_EQUITY_UNDERLYINGS = {
@@ -60,8 +60,9 @@ class Config:
         self.max_retries = int(os.environ.get("MAX_RETRIES", "3"))
         self.stock_limit = int(os.environ.get("STOCK_LIMIT", "0"))
 
-        # Adjusted for threading, respect Fyers limit
-        self.max_requests_per_sec = float(os.environ.get("MAX_REQ_PER_SEC", "6"))
+        # Strict FYERS limits: 10 per sec, 200 per min. Kept slightly below for safety padding.
+        self.max_req_per_sec = float(os.environ.get("MAX_REQ_PER_SEC", "8"))
+        self.max_req_per_min = int(os.environ.get("MAX_REQ_PER_MIN", "190"))
         self.max_threads = int(os.environ.get("MAX_THREADS", "5"))
         
         self.disable_index_scan = os.environ.get("DISABLE_INDEX_SCAN", "0") == "1"
@@ -106,26 +107,42 @@ warnings.filterwarnings("ignore")
 
 
 class RateLimiter:
-    def __init__(self, max_per_sec):
+    def __init__(self, max_per_sec, max_per_min):
         self.min_interval = 1.0 / max_per_sec if max_per_sec > 0 else 0.0
-        self._last = 0.0
+        self.max_per_min = max_per_min
+        self.timestamps = []
         self.lock = threading.Lock()
 
     def wait(self):
-        if self.min_interval <= 0:
-            return
-        
-        # Sleep INSIDE the lock. This forces threads into a single-file line 
-        # and guarantees requests never overlap closer than the min_interval.
         with self.lock:
             now = time.monotonic()
-            elapsed = now - self._last
-            if elapsed < self.min_interval:
-                time.sleep(self.min_interval - elapsed)
-            self._last = time.monotonic()
+            
+            # Maintain a rolling window of the last 60 seconds
+            self.timestamps = [ts for ts in self.timestamps if now - ts < 60.0]
+            
+            sleep_time = 0.0
+            
+            # 1. Enforce per-second limit
+            if self.timestamps:
+                elapsed = now - self.timestamps[-1]
+                if elapsed < self.min_interval:
+                    sleep_time = self.min_interval - elapsed
+                    
+            # 2. Enforce per-minute limit
+            if len(self.timestamps) >= self.max_per_min:
+                time_since_oldest = now - self.timestamps[0]
+                wait_for_min = 60.0 - time_since_oldest
+                if wait_for_min > sleep_time:
+                    sleep_time = wait_for_min
+                    
+            if sleep_time > 0:
+                time.sleep(sleep_time)
+                now = time.monotonic()
+                
+            self.timestamps.append(now)
 
 
-rate_limiter = RateLimiter(cfg.max_requests_per_sec)
+rate_limiter = RateLimiter(cfg.max_req_per_sec, cfg.max_req_per_min)
 
 
 def load_state(session_date):
