@@ -3,7 +3,7 @@
 FO_FNO_FYERS_CONFLUENCE_EMAIL_FIXED.py
 
 Strict FYERS confluence screener - Production Version with Exact Interpolated Volume Speed
-* OPTIMIZED VERSION: Includes Multithreading, Thread-Safe Rate Limiting, and 5-min Caching *
+* OPTIMIZED VERSION: Includes Multithreading, Thread-Safe Rate Limiting, and Strict API v3 Typing *
 
 Sorted by Avg Volume Speed Ascending (Fastest Tapes First)
 """
@@ -32,7 +32,7 @@ IST = "Asia/Kolkata"
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 MARKET_OPEN = "09:15:00"
 MARKET_CLOSE = "15:30:00"
-VERSION = "2026-07-11-prod-v13-optimized"
+VERSION = "2026-07-15-prod-v14-optimized"
 STATE_FILE = Path("fyers_state.json")
 
 NON_EQUITY_UNDERLYINGS = {
@@ -109,17 +109,25 @@ class RateLimiter:
     def __init__(self, max_per_sec):
         self.min_interval = 1.0 / max_per_sec if max_per_sec > 0 else 0.0
         self._last = 0.0
-        self.lock = threading.Lock()  # Required for multithreading
+        self.lock = threading.Lock()
 
     def wait(self):
         if self.min_interval <= 0:
             return
+        
         with self.lock:
             now = time.monotonic()
             elapsed = now - self._last
             if elapsed < self.min_interval:
-                time.sleep(self.min_interval - elapsed)
-            self._last = time.monotonic()
+                sleep_time = self.min_interval - elapsed
+                self._last = now + sleep_time
+            else:
+                sleep_time = 0.0
+                self._last = now
+                
+        # Sleep OUTSIDE the lock so we don't bottleneck other threads
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
 
 rate_limiter = RateLimiter(cfg.max_requests_per_sec)
@@ -230,16 +238,25 @@ def normalize_history_df(candles):
 
 def get_history(fyers, symbol, resolution, days=None, range_from=None, range_to=None, date_format="1"):
     try:
-        if date_format == "1":
+        fmt = int(date_format)
+        if fmt == 1:
             now = pd.Timestamp.now(tz=IST)
-            start = (now - timedelta(days=days or cfg.lookback_days)).strftime("%Y-%m-%d")
+            # Cap days at 360 to prevent strict >365 limit rejections
+            safe_days = min(days or cfg.lookback_days, 360)
+            start = (now - timedelta(days=safe_days)).strftime("%Y-%m-%d")
             end = now.strftime("%Y-%m-%d")
         else:
-            start, end = str(range_from), str(range_to)
+            # date_format 0 strictly expects integers for epoch timestamps
+            start, end = int(range_from), int(range_to)
 
+        # FYERS V3 strictly requires date_format and cont_flag to be integers, NOT strings
         payload = {
-            "symbol": symbol, "resolution": str(resolution), "date_format": str(date_format),
-            "range_from": start, "range_to": end, "cont_flag": "1"
+            "symbol": symbol,
+            "resolution": str(resolution),
+            "date_format": fmt,
+            "range_from": start,
+            "range_to": end,
+            "cont_flag": 1 
         }
         res = call_with_retries(fyers.history, data=payload)
         candles = res.get("candles", []) if isinstance(res, dict) else []
@@ -386,7 +403,10 @@ def process_symbol(fyers, sym, session_date, quotes_map, is_index):
     try:
         q_data = quotes_map.get(sym, {})
         live_quote, open_quote = q_data.get("ltp"), q_data.get("open")
-        daily = get_history(fyers, sym, "1D", days=cfg.lookback_days)
+        
+        # FYERS V3 uses "D" for daily.
+        daily = get_history(fyers, sym, "D", days=cfg.lookback_days)
+        
         if daily is None or daily.empty:
             return None
 
@@ -743,4 +763,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
