@@ -1,15 +1,15 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-ASIT BARAN PATI STRATEGY - PRODUCTION v12.0 - SNIPER & STRETCH EDITION
+ASIT BARAN PATI STRATEGY - PRODUCTION v12.1 - SNIPER & STRETCH EDITION
 DUAL ENGINE + ATR VWAP STRETCH FILTER + ELITE EMAIL SELECTION
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 
-🎯 v12.0 MASTER ARCHITECTURE:
+🎯 MASTER ARCHITECTURE:
 ✅ VWAP STRETCH FILTER: Calculates 14-period ATR. If LTP is > 1.5x ATR away from VWAP, the setup is killed (🛑 Overextended).
-✅ 9:15 AM ANCHOR: Extracts the true daily open and scores the momentum drift against it.
+✅ 9:15 AM ANCHOR: Extracts the exact Typical Price and indicator state of the opening bell and scores the momentum drift against it.
 ✅ STRICT SIGNAL FILTERING: Automatically blocks Overextended, Traps, and Standard setups from your inbox.
-✅ DUAL ENGINE: Evaluates both macro TMV Rank and Intraday Drift Rank.
+✅ DUAL ENGINE: Evaluates both macro TMV Rank and pure Intraday Drift Rank.
 ✅ CYBER DARK-MODE EMAIL: Delivers the Top 15 pristine longs and shorts directly to your email.
 
 RUNNING: python asit_v12_master.py
@@ -217,7 +217,10 @@ def process_indicators(df, is_daily=False):
     df['adx_neg'] = ta.trend.adx_neg(df['high'], df['low'], df['close'])
 
     if not is_daily:
+        # For the anchor price, the opening print is structurally vital
         df['anchor_915_price'] = df.groupby(df['timestamp'].dt.date)['open'].transform('first')
+        
+        # Extract the exact 9:15 AM state of all core indicators
         for col in ['vwap', 'obv', 'roc', 'adx']:
             if col in df.columns:
                 df[f'{col}_915'] = df.groupby(df['timestamp'].dt.date)[col].transform('first')
@@ -463,7 +466,7 @@ def send_email_report(df):
     <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #121212; color: #e0e0e0; padding: 20px;">
       
       <div style="text-align: center; margin-bottom: 30px;">
-          <h2 style="color: #ffffff; margin-bottom: 5px;">Elite Visual Intelligence Matrix (v12.0)</h2>
+          <h2 style="color: #ffffff; margin-bottom: 5px;">Elite Visual Intelligence Matrix (v12.1)</h2>
           <p style="color: #aaaaaa; margin-top: 0;"><b>Session Baseline Reset:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
       </div>
       
@@ -516,7 +519,7 @@ def send_email_report(df):
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def main():
     print("=" * 80)
-    print("[LAUNCH] ASIT v12.0 - SNIPER & STRETCH EDITION")
+    print("[LAUNCH] ASIT v12.1 - SNIPER & STRETCH EDITION")
     print("=" * 80)
     symbols = get_live_fno_symbols()
     if not symbols: sys.exit()
