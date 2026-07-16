@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-ASIT BARAN PATI STRATEGY - PRODUCTION v9.0 - DUAL ENGINE (TMV + DRIFT)
-RUNS TRUE TMV AND 9:15 DRIFT LOGIC AS TWO COMPLETELY SEPARATE ALGORITHMS
+ASIT BARAN PATI STRATEGY - PRODUCTION v10.0 - VISUAL INTELLIGENCE EDITION
+DUAL ENGINE (TMV + DRIFT) WITH AI-DRIVEN COLOR-CODED SETUP BADGES
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 
-🎯 v9.0 DUAL ENGINE UPGRADES:
-✅ ENGINE 1 (TMV RANK): True Asit TMV (VWAP, OBV vs EMAs, Fractals, ROC, ADX).
-✅ ENGINE 2 (DRIFT RANK): Pure Intraday Drift (LTP vs 9:15 VWAP, OBV, ADX, ROC).
-✅ SIDE-BY-SIDE OUTPUT: The email and CSV now display `TMV_Rank` and `Drift_Rank` in separate columns.
-✅ TMV_DIFF: Still strictly tracks the active acceleration of Asit's TMV Rank.
+🎯 v10.0 UPGRADES:
+✅ VISUAL HTML ENGINE: Rips out plain tables, replaces with Dark Mode Cyber-UI.
+✅ SETUP CLASSIFIER: Automatically tags 🎯 Sweet Spot, ⚖️ Harmony, and ⚠️ The Trap.
+✅ EXTENDED WATCHLIST: Expanded from 10 to 15 rows for both Long and Short candidates.
+✅ CONDITIONAL COLORING: Positive/Negative momentum changes are color-coded in neon green/red.
 
-RUNNING: python asit_dual_engine.py
+RUNNING: python asit_visual_matrix.py
 OUTPUT: asit_dual_history_YYYYMMDD.csv
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
@@ -194,7 +194,6 @@ def process_indicators(df, is_daily=False):
     df['obv_ema10'] = ta.trend.ema_indicator(df['obv'], window=10)
     df['obv_ema20'] = ta.trend.ema_indicator(df['obv'], window=20)
     
-    # 5-Bar Fractals
     df['fractal_high'] = (df['high'] > df['high'].shift(1)) & (df['high'] > df['high'].shift(2)) & \
                          (df['high'] > df['high'].shift(-1)) & (df['high'] > df['high'].shift(-2))
     df['fractal_low'] = (df['low'] < df['low'].shift(1)) & (df['low'] < df['low'].shift(2)) & \
@@ -209,7 +208,6 @@ def process_indicators(df, is_daily=False):
     df['adx_pos'] = ta.trend.adx_pos(df['high'], df['low'], df['close'])
     df['adx_neg'] = ta.trend.adx_neg(df['high'], df['low'], df['close'])
 
-    # Extract 9:15 AM Anchors
     if not is_daily:
         for col in ['vwap', 'obv', 'roc', 'adx']:
             if col in df.columns:
@@ -222,7 +220,7 @@ def process_indicators(df, is_daily=False):
     return df
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# ENGINE 1: ASIT'S TMV RANK (Standard Logic)
+# ENGINE 1: ASIT'S TMV RANK
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def calc_tmv_bull(df, is_daily):
     score = 0
@@ -245,10 +243,10 @@ def calc_tmv_bear(df, is_daily):
     return min(score, 1.0)
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# ENGINE 2: 9:15 INDICATOR DRIFT RANK (Pure LTP vs 9:15)
+# ENGINE 2: 9:15 INDICATOR DRIFT RANK
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def calc_drift_bull(df, is_daily):
-    if is_daily: return calc_tmv_bull(df, is_daily) # Fallback for daily TF
+    if is_daily: return calc_tmv_bull(df, is_daily) 
     score = 0
     latest = df.iloc[-1]
     if latest['close'] > latest.get('vwap', 0): score += 0.20
@@ -259,7 +257,7 @@ def calc_drift_bull(df, is_daily):
     return min(score, 1.0)
 
 def calc_drift_bear(df, is_daily):
-    if is_daily: return calc_tmv_bear(df, is_daily) # Fallback for daily TF
+    if is_daily: return calc_tmv_bear(df, is_daily)
     score = 0
     latest = df.iloc[-1]
     if latest['close'] < latest.get('vwap', float('inf')): score += 0.20
@@ -306,13 +304,11 @@ def scan_symbol(symbol):
 
     rs_mult = get_rs_multiplier(symbol_pct)
     
-    # 1. Aggregate Engine 1 (TMV)
     tb_tmv = sum(r['tmv_bull'] * r['w'] for r in results.values())
     tbear_tmv = sum(r['tmv_bear'] * r['w'] for r in results.values())
     tmv_net = ((tb_tmv * 15) - (tbear_tmv * 15)) * rs_mult
     tmv_rank = max(-15.0, min(15.0, tmv_net))
     
-    # 2. Aggregate Engine 2 (DRIFT)
     tb_drift = sum(r['drift_bull'] * r['w'] for r in results.values())
     tbear_drift = sum(r['drift_bear'] * r['w'] for r in results.values())
     drift_net = ((tb_drift * 15) - (tbear_drift * 15)) * rs_mult
@@ -333,9 +329,6 @@ def scan_symbol(symbol):
         'HV (20D)': round(hv_20, 2) if not pd.isna(hv_20) else 0.0
     }
 
-# ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# DATA MANAGEMENT (TRACKS TMV ACCELERATION)
-# ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def manage_daily_history(current_results):
     df_curr = pd.DataFrame(current_results)
     if df_curr.empty: return df_curr
@@ -357,50 +350,133 @@ def manage_daily_history(current_results):
     df_curr.to_csv(HISTORY_CSV, mode='a', header=not os.path.exists(HISTORY_CSV), index=False)
     return df_curr
 
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════
+# VISUAL INTELLIGENCE HTML ENGINE (Dark Mode + Custom Setup Badges)
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════
+def determine_setup(row):
+    """Categorizes the stock based on TMV vs Drift divergence."""
+    tmv = row['TMV_Rank']
+    drift = row['Drift_Rank']
+    vol = row['Intraday_Vol']
+    trend = row['Trend']
+    
+    if trend == 'BULLISH':
+        if drift >= tmv and vol == "Acc.": return "🎯 Sweet Spot", "#d4af37", "#000"
+        elif abs(tmv - drift) <= 2.5 and vol == "Acc.": return "⚖️ Harmony", "#2196f3", "#fff"
+        elif drift < tmv - 3 and vol == "Dist.": return "⚠️ The Trap", "#ff9800", "#000"
+        else: return "🔄 Standard", "#555555", "#fff"
+    elif trend == 'BEARISH':
+        if drift <= tmv and vol == "Dist.": return "🎯 Sweet Spot", "#d4af37", "#000"
+        elif abs(tmv - drift) <= 2.5 and vol == "Dist.": return "⚖️ Harmony", "#2196f3", "#fff"
+        elif drift > tmv + 3 and vol == "Acc.": return "⚠️ The Trap", "#ff9800", "#000"
+        else: return "🔄 Standard", "#555555", "#fff"
+    return "N/A", "#555", "#fff"
+
+def generate_colorful_html_table(df, side):
+    if df.empty:
+        return f"<p style='color:#aaaaaa;'>No {side.lower()} candidates found.</p>"
+        
+    html = """
+    <table style="width:100%; border-collapse: collapse; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #1e1e1e; color: #ffffff; text-align: center; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 8px rgba(0,0,0,0.5);">
+        <thead>
+            <tr style="background-color: #2d2d30; border-bottom: 2px solid #3e3e42;">
+                <th style="padding: 12px 8px;">Symbol</th>
+                <th style="padding: 12px 8px;">Setup</th>
+                <th style="padding: 12px 8px;">LTP</th>
+                <th style="padding: 12px 8px;">% Chg</th>
+                <th style="padding: 12px 8px;">TMV Rank</th>
+                <th style="padding: 12px 8px;">Drift Rank</th>
+                <th style="padding: 12px 8px;">TMV Diff</th>
+                <th style="padding: 12px 8px;">Intra Vol</th>
+            </tr>
+        </thead>
+        <tbody>
+    """
+    
+    for idx, row in df.iterrows():
+        bg_color = "#1e1e1e" if idx % 2 == 0 else "#252526"
+        
+        # Colorize percentages and Diff
+        pct = row['% Change']
+        pct_color = "#4caf50" if pct > 0 else "#f44336" if pct < 0 else "#ffffff"
+        
+        diff = row['TMV_Diff']
+        diff_color = "#4caf50" if diff > 0 else "#f44336" if diff < 0 else "#ffffff"
+        
+        # Determine Setup Badge
+        badge_text, badge_bg, badge_fg = determine_setup(row)
+        badge_html = f"<span style='background-color:{badge_bg}; color:{badge_fg}; padding:4px 8px; border-radius:12px; font-size:12px; font-weight:bold; white-space:nowrap;'>{badge_text}</span>"
+        
+        html += f"""
+            <tr style="background-color: {bg_color}; border-bottom: 1px solid #333333;">
+                <td style="padding: 10px 8px; font-weight: bold; color: #64b5f6;">{row['Symbol'].replace('NSE:', '').replace('-EQ', '')}</td>
+                <td style="padding: 10px 8px;">{badge_html}</td>
+                <td style="padding: 10px 8px;">{row['LTP']:.2f}</td>
+                <td style="padding: 10px 8px; color: {pct_color}; font-weight:bold;">{pct:+.2f}%</td>
+                <td style="padding: 10px 8px;">{row['TMV_Rank']:.2f}</td>
+                <td style="padding: 10px 8px;">{row['Drift_Rank']:.2f}</td>
+                <td style="padding: 10px 8px; color: {diff_color}; font-weight:bold;">{diff:+.2f}</td>
+                <td style="padding: 10px 8px;">{row['Intraday_Vol']}</td>
+            </tr>
+        """
+        
+    html += "</tbody></table>"
+    return html
+
 def send_email_report(df):
     if not all([SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL]):
         return
 
-    bulls = df[(df['Trend'] == 'BULLISH') & (df['TMV_Rank'] > 0)].sort_values('TMV_Diff', ascending=False).head(10)
-    bears = df[(df['Trend'] == 'BEARISH') & (df['TMV_Rank'] < 0)].sort_values('TMV_Diff', ascending=True).head(10)
+    # Expand to Top 15 Rows
+    bulls = df[(df['Trend'] == 'BULLISH') & (df['TMV_Rank'] > 0)].sort_values('TMV_Diff', ascending=False).head(15)
+    bears = df[(df['Trend'] == 'BEARISH') & (df['TMV_Rank'] < 0)].sort_values('TMV_Diff', ascending=True).head(15)
 
-    def format_df(df_sub):
-        if df_sub.empty: return "<p><i>No acceleration setups flagged.</i></p>"
-        out = df_sub[['Symbol', 'LTP', '% Change', 'TMV_Rank', 'TMV_Diff', 'Drift_Rank', 'Intraday_Vol', 'HV (20D)']].copy()
-        out['TMV_Diff'] = out['TMV_Diff'].apply(lambda x: f"{x:+.2f}")
-        return out.to_html(index=False, border=1, justify="center")
+    bulls_table = generate_colorful_html_table(bulls, "BULLISH")
+    bears_table = generate_colorful_html_table(bears, "BEARISH")
 
     msg = MIMEMultipart("alternative")
     msg["From"], msg["To"] = SENDER_EMAIL, RECIPIENT_EMAIL
-    msg["Subject"] = f"Dual Engine (TMV + Drift) - {datetime.now().strftime('%H:%M')}"
+    msg["Subject"] = f"Visual Intelligence Matrix (TMV vs Drift) - {datetime.now().strftime('%H:%M')}"
 
     html = f"""
-    <html><body style="font-family: Arial, sans-serif;">
-      <h2>Dual Engine Watchlist: TMV Rank vs 9:15 Drift (v9.0)</h2>
-      <p><b>Run Trigger Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+    <html>
+    <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #121212; color: #e0e0e0; padding: 20px;">
       
-      <h3 style="color:green;">🚀 Long Targets (Sorted by TMV Acceleration)</h3>
-      {format_df(bulls)}
+      <div style="text-align: center; margin-bottom: 30px;">
+          <h2 style="color: #ffffff; margin-bottom: 5px;">Visual Intelligence Matrix (v10.0)</h2>
+          <p style="color: #aaaaaa; margin-top: 0;"><b>Run Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+      </div>
       
-      <h3 style="color:red;">🔻 Short Targets (Sorted by TMV Acceleration)</h3>
-      {format_df(bears)}
+      <h3 style="color: #4caf50; border-bottom: 2px solid #4caf50; padding-bottom: 5px; display: inline-block;">🚀 Top 15 Long Targets</h3>
+      {bulls_table}
       
-      <h4>v9.0 Dual Engine Breakdown:</h4>
-      <ul>
-        <li><b>TMV_Rank:</b> Asit's True TMV methodology (Breakouts, ADX, ROC, OBV vs EMAs).</li>
-        <li><b>Drift_Rank:</b> Custom Intraday measure (Current Indicators strictly compared against their 9:15 AM values).</li>
-      </ul>
-    </body></html>
+      <br><br>
+      
+      <h3 style="color: #f44336; border-bottom: 2px solid #f44336; padding-bottom: 5px; display: inline-block;">🔻 Top 15 Short Targets</h3>
+      {bears_table}
+      
+      <div style="margin-top: 40px; padding: 15px; background-color: #1e1e1e; border-radius: 8px; border-left: 4px solid #2196f3;">
+          <h4 style="color: #ffffff; margin-top: 0;">Badge Legend:</h4>
+          <ul style="color: #cccccc; line-height: 1.6;">
+            <li><span style='background-color:#d4af37; color:#000; padding:2px 6px; border-radius:4px; font-size:11px; font-weight:bold;'>🎯 Sweet Spot</span> : TMV macro trend is strong, AND the intraday Drift from 9:15 is accelerating even faster with Institutional volume.</li>
+            <li><span style='background-color:#2196f3; color:#fff; padding:2px 6px; border-radius:4px; font-size:11px; font-weight:bold;'>⚖️ Harmony</span> : TMV and Drift are perfectly aligned. High confidence, sustainable setup.</li>
+            <li><span style='background-color:#ff9800; color:#000; padding:2px 6px; border-radius:4px; font-size:11px; font-weight:bold;'>⚠️ The Trap</span> : Macro TMV looks great, but intraday Drift is collapsing with Distribution. Avoid.</li>
+          </ul>
+      </div>
+      
+    </body>
+    </html>
     """
     msg.attach(MIMEText(html, "html"))
 
     try:
-        with open(HISTORY_CSV, "rb") as f:
-            part = MIMEBase("application", "octet-stream")
-            part.set_payload(f.read())
-        encoders.encode_base64(part)
-        part.add_header("Content-Disposition", f'attachment; filename="{HISTORY_CSV}"')
-        msg.attach(part)
+        if os.path.exists(HISTORY_CSV):
+            with open(HISTORY_CSV, "rb") as f:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f'attachment; filename="{HISTORY_CSV}"')
+            msg.attach(part)
     except:
         pass
 
@@ -410,13 +486,13 @@ def send_email_report(df):
         server.login(SENDER_EMAIL, SENDER_PASSWORD)
         server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
         server.quit()
-        logger.info(f"[EMAIL] Dual Engine matrix dispatched.")
+        logger.info(f"[EMAIL] Visual Matrix successfully dispatched.")
     except Exception as e:
         logger.error(f"[EMAIL] SMTP Error: {e}")
 
 if __name__ == "__main__":
     print("=" * 80)
-    print("[LAUNCH] ASIT v9.0 - DUAL ENGINE (TMV + DRIFT)")
+    print("[LAUNCH] ASIT v10.0 - VISUAL INTELLIGENCE EDITION")
     print("=" * 80)
     symbols = get_live_fno_symbols()
     if not symbols: sys.exit()
@@ -428,12 +504,12 @@ if __name__ == "__main__":
         for idx, future in enumerate(as_completed(futures), 1):
             try:
                 if res := future.result(): results.append(res)
-                if idx % 20 == 0: logger.info(f"[SCAN] Dual Matrix progress: {idx}/{len(symbols)} complete...")
+                if idx % 20 == 0: logger.info(f"[SCAN] Visual Matrix progress: {idx}/{len(symbols)} complete...")
             except: pass
 
     if results:
         df_final = manage_daily_history(results)
         send_email_report(df_final)
         print("=" * 80)
-        print("[SUCCESS] Dual Engine (TMV + Drift) Complete.")
+        print("[SUCCESS] Visual Intelligence (TMV + Drift) Complete.")
         print("=" * 80)
