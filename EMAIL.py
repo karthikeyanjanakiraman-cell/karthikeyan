@@ -1,17 +1,18 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-ASIT BARAN PATI STRATEGY - PRODUCTION v11.0 - ELITE SELECTION EDITION
-FILTERED FOR SWEET SPOT & HARMONY CANDIDATES ONLY + 9:15 AM ANCHOR INTEGRATION
+ASIT BARAN PATI STRATEGY - PRODUCTION v12.0 - SNIPER & STRETCH EDITION
+DUAL ENGINE + ATR VWAP STRETCH FILTER + ELITE EMAIL SELECTION
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 
-🎯 v11.0 NOISE-REDUCTION UPGRADES:
-✅ STRICT SIGNAL FILTERING: Completely blocks "⚠️ The Trap" and "🔄 Standard" setups from the email.
-✅ ANCHOR 9:15 COLUMN: Added a distinct column showing the exact opening baseline for every candidate.
-✅ MAXIMIZED SLICING: Slices top 15 rows AFTER filtering, guaranteeing up to 15 pristine setups if they exist.
-✅ CYBER DARK-MODE: Retains neon visual hierarchy while adjusting legends for elite-only setups.
+🎯 v12.0 MASTER ARCHITECTURE:
+✅ VWAP STRETCH FILTER: Calculates 14-period ATR. If LTP is > 1.5x ATR away from VWAP, the setup is killed (🛑 Overextended).
+✅ 9:15 AM ANCHOR: Extracts the true daily open and scores the momentum drift against it.
+✅ STRICT SIGNAL FILTERING: Automatically blocks Overextended, Traps, and Standard setups from your inbox.
+✅ DUAL ENGINE: Evaluates both macro TMV Rank and Intraday Drift Rank.
+✅ CYBER DARK-MODE EMAIL: Delivers the Top 15 pristine longs and shorts directly to your email.
 
-RUNNING: python asit_elite_matrix.py
+RUNNING: python asit_v12_master.py
 OUTPUT: asit_dual_history_YYYYMMDD.csv
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
@@ -179,16 +180,23 @@ def get_history_ttl(symbol, resolution, days_back):
         return None
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# DATA PROCESSING (CALCULATES ALL INDICATORS + 9:15 SNAPSHOTS)
+# DATA PROCESSING (INDICATORS + ATR STRETCH + 9:15 SNAPSHOTS)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def process_indicators(df, is_daily=False):
     if df is None or len(df) < 25: return None
     df = df.copy()
     
+    # Calculate ATR for Volatility Stretch Measurement
+    df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=14)
+    
     if not is_daily:
         df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3.0
         df['vol_price'] = df['volume'] * df['typical_price']
         df['vwap'] = df.groupby(df['timestamp'].dt.date)['vol_price'].cumsum() / df.groupby(df['timestamp'].dt.date)['volume'].cumsum()
+        
+        # Calculate VWAP Stretch Multiplier
+        df['vwap_distance'] = abs(df['close'] - df['vwap'])
+        df['vwap_stretch_atr'] = df['vwap_distance'] / df['atr']
         
     df['obv'] = (np.sign(df['close'].diff()) * df['volume']).fillna(0).cumsum()
     df['obv_ema10'] = ta.trend.ema_indicator(df['obv'], window=10)
@@ -317,7 +325,9 @@ def scan_symbol(symbol):
     trend = 'BULLISH' if tmv_rank > 0 else ('BEARISH' if tmv_rank < 0 else 'NEUTRAL')
     latest_df = results.get('15min', list(results.values())[0])['df']
     obv_shift = "Acc." if latest_df['obv'].iloc[-1] > latest_df.get('obv_915', pd.Series([0])).iloc[-1] else "Dist."
+    
     anchor_price = latest_df['anchor_915_price'].iloc[-1] if 'anchor_915_price' in latest_df.columns else np.nan
+    vwap_stretch = latest_df['vwap_stretch_atr'].iloc[-1] if 'vwap_stretch_atr' in latest_df.columns else 0.0
 
     return {
         'Symbol': symbol,
@@ -328,6 +338,7 @@ def scan_symbol(symbol):
         'LTP': round(latest_df['close'].iloc[-1], 2),
         '% Change': round(symbol_pct, 2),
         'Intraday_Vol': obv_shift,
+        'VWAP_Stretch': round(vwap_stretch, 2),
         'HV (20D)': round(hv_20, 2) if not pd.isna(hv_20) else 0.0
     }
 
@@ -360,6 +371,11 @@ def determine_setup(row):
     drift = row['Drift_Rank']
     vol = row['Intraday_Vol']
     trend = row['Trend']
+    stretch = row.get('VWAP_Stretch', 0.0)
+    
+    # KILL SWITCH: If price is > 1.5x ATR from VWAP, it is structurally overextended
+    if stretch > 1.5:
+        return "🛑 Overextended", "#e91e63", "#fff"
     
     if trend == 'BULLISH':
         if drift >= tmv and vol == "Acc.": return "🎯 Sweet Spot", "#d4af37", "#000"
@@ -389,7 +405,7 @@ def generate_colorful_html_table(df, side):
                 <th style="padding: 12px 8px;">TMV Rank</th>
                 <th style="padding: 12px 8px;">Drift Rank</th>
                 <th style="padding: 12px 8px;">TMV Diff</th>
-                <th style="padding: 12px 8px;">Intra Vol</th>
+                <th style="padding: 12px 8px;">Stretch</th>
             </tr>
         </thead>
         <tbody>
@@ -416,7 +432,7 @@ def generate_colorful_html_table(df, side):
                 <td style="padding: 10px 8px;">{row['TMV_Rank']:.2f}</td>
                 <td style="padding: 10px 8px;">{row['Drift_Rank']:.2f}</td>
                 <td style="padding: 10px 8px; color: {diff_color}; font-weight:bold;">{diff:+.2f}</td>
-                <td style="padding: 10px 8px;">{row['Intraday_Vol']}</td>
+                <td style="padding: 10px 8px;">{row.get('VWAP_Stretch', 0.0):.1f}x</td>
             </tr>
         """
         
@@ -427,13 +443,11 @@ def send_email_report(df):
     if not all([SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL]):
         return
 
-    # Assign setup name tags across the dataframe to filter prior to taking the top 15 rows
     df['setup_name'] = df.apply(lambda r: determine_setup(r)[0], axis=1)
     
-    # STRICT FILTER: Whitelist ONLY Sweet Spot and Harmony candidates
+    # STRICT FILTER: Whitelist ONLY Sweet Spot and Harmony candidates. Kills Traps, Standard, and Overextended.
     df_elite = df[df['setup_name'].isin(["🎯 Sweet Spot", "⚖️ Harmony"])].copy()
 
-    # Slice the Top 15 rows cleanly from our filtered whitelisted datasets
     bulls = df_elite[(df_elite['Trend'] == 'BULLISH') & (df_elite['TMV_Rank'] > 0)].sort_values('TMV_Diff', ascending=False).head(15)
     bears = df_elite[(df_elite['Trend'] == 'BEARISH') & (df_elite['TMV_Rank'] < 0)].sort_values('TMV_Diff', ascending=True).head(15)
 
@@ -449,7 +463,7 @@ def send_email_report(df):
     <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #121212; color: #e0e0e0; padding: 20px;">
       
       <div style="text-align: center; margin-bottom: 30px;">
-          <h2 style="color: #ffffff; margin-bottom: 5px;">Elite Visual Intelligence Matrix (v11.0)</h2>
+          <h2 style="color: #ffffff; margin-bottom: 5px;">Elite Visual Intelligence Matrix (v12.0)</h2>
           <p style="color: #aaaaaa; margin-top: 0;"><b>Session Baseline Reset:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
       </div>
       
@@ -467,7 +481,8 @@ def send_email_report(df):
             <li><span style='background-color:#d4af37; color:#000; padding:2px 6px; border-radius:4px; font-size:11px; font-weight:bold;'>🎯 Sweet Spot</span> : TMV macro trend is strong, AND the intraday Drift from 9:15 is accelerating even faster with Institutional volume confirmation.</li>
             <li><span style='background-color:#2196f3; color:#fff; padding:2px 6px; border-radius:4px; font-size:11px; font-weight:bold;'>⚖️ Harmony</span> : TMV and Drift are perfectly aligned. High confidence, sustainable setup.</li>
           </ul>
-          <p style="color: #999; font-size: 12px; margin-bottom: 0;">* Note: Inefficient churn metrics (Standard/Trap conditions) have been strictly dropped from this grid view.</p>
+          <p style="color: #e91e63; font-size: 12px; margin-bottom: 0;">* VWAP Stretch Protection is ACTIVE. Any asset >1.5x ATR from VWAP is blocked as 🛑 Overextended.</p>
+          <p style="color: #999; font-size: 12px; margin-bottom: 0;">* Inefficient churn metrics (Standard/Trap conditions) have been strictly dropped from this grid view.</p>
       </div>
       
     </body>
@@ -499,42 +514,9 @@ def send_email_report(df):
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 # MAIN CONTROL GATE
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-def get_history_ttl(symbol, resolution, days_back):
-    cache_key = f"{symbol}_{resolution}_{days_back}"
-    now_ts = time.time()
-    ttl_seconds = 43200 if str(resolution).upper() in ["D", "1D"] else 180
-    
-    if cache_key in DATA_CACHE:
-        cached_df, fetch_time = DATA_CACHE[cache_key]
-        if now_ts - fetch_time < ttl_seconds:
-            return cached_df
-
-    try:
-        res_str = "1D" if str(resolution).upper() == "D" else str(resolution)
-        now_dt = pd.Timestamp.now(tz="Asia/Kolkata")
-        date_from = (now_dt - timedelta(days=days_back)).strftime("%Y-%m-%d")
-        
-        payload = {
-            "symbol": symbol, "resolution": res_str, "date_format": 1,
-            "range_from": date_from, "range_to": now_dt.strftime("%Y-%m-%d"), 
-            "cont_flag": 0 if "INDEX" in symbol else 1
-        }
-        res = call_with_retries(fyers.history, data=payload)
-        candles = res.get('candles', []) if isinstance(res, dict) else []
-        if not candles: return None
-
-        df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
-        df = df.sort_values('timestamp').reset_index(drop=True)
-        
-        DATA_CACHE[cache_key] = (df, now_ts)
-        return df
-    except:
-        return None
-
-if __name__ == "__main__":
+def main():
     print("=" * 80)
-    print("[LAUNCH] ASIT v11.0 - ELITE SELECTION ENGINE")
+    print("[LAUNCH] ASIT v12.0 - SNIPER & STRETCH EDITION")
     print("=" * 80)
     symbols = get_live_fno_symbols()
     if not symbols: sys.exit()
@@ -555,3 +537,6 @@ if __name__ == "__main__":
         print("=" * 80)
         print("[SUCCESS] Operational Phase Concluded.")
         print("=" * 80)
+
+if __name__ == "__main__":
+    main()
