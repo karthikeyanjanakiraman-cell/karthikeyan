@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-ASIT BARAN PATI STRATEGY - PRODUCTION v12.1 - SNIPER & STRETCH EDITION
+ASIT BARAN PATI STRATEGY - PRODUCTION v12.2 - UNWEIGHTED CONFLUENCE EDITION
 DUAL ENGINE + ATR VWAP STRETCH FILTER + ELITE EMAIL SELECTION
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 
 🎯 MASTER ARCHITECTURE:
-✅ VWAP STRETCH FILTER: Calculates 14-period ATR. If LTP is > 1.5x ATR away from VWAP, the setup is killed (🛑 Overextended).
-✅ 9:15 AM ANCHOR: Extracts the exact Typical Price and indicator state of the opening bell and scores the momentum drift against it.
-✅ STRICT SIGNAL FILTERING: Automatically blocks Overextended, Traps, and Standard setups from your inbox.
-✅ DUAL ENGINE: Evaluates both macro TMV Rank and pure Intraday Drift Rank.
+✅ UNWEIGHTED MTF: All timeframes (15m, 1H, 1D) now carry an equal 33.3% vote for pure confluence.
+✅ VWAP STRETCH FILTER: Calculates 14-period ATR. If LTP is > 1.5x ATR away from VWAP, setup is killed.
+✅ 9:15 AM ANCHOR: Extracts the exact Typical Price and indicator state of the opening bell.
+✅ STRICT SIGNAL FILTERING: Automatically blocks Overextended, Traps, and Standard setups.
 ✅ CYBER DARK-MODE EMAIL: Delivers the Top 15 pristine longs and shorts directly to your email.
 
-RUNNING: python asit_v12_master.py
+RUNNING: python asit_v12_unweighted.py
 OUTPUT: asit_dual_history_YYYYMMDD.csv
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
@@ -186,7 +186,6 @@ def process_indicators(df, is_daily=False):
     if df is None or len(df) < 25: return None
     df = df.copy()
     
-    # Calculate ATR for Volatility Stretch Measurement
     df['atr'] = ta.volatility.average_true_range(df['high'], df['low'], df['close'], window=14)
     
     if not is_daily:
@@ -194,7 +193,6 @@ def process_indicators(df, is_daily=False):
         df['vol_price'] = df['volume'] * df['typical_price']
         df['vwap'] = df.groupby(df['timestamp'].dt.date)['vol_price'].cumsum() / df.groupby(df['timestamp'].dt.date)['volume'].cumsum()
         
-        # Calculate VWAP Stretch Multiplier
         df['vwap_distance'] = abs(df['close'] - df['vwap'])
         df['vwap_stretch_atr'] = df['vwap_distance'] / df['atr']
         
@@ -217,10 +215,7 @@ def process_indicators(df, is_daily=False):
     df['adx_neg'] = ta.trend.adx_neg(df['high'], df['low'], df['close'])
 
     if not is_daily:
-        # For the anchor price, the opening print is structurally vital
         df['anchor_915_price'] = df.groupby(df['timestamp'].dt.date)['open'].transform('first')
-        
-        # Extract the exact 9:15 AM state of all core indicators
         for col in ['vwap', 'obv', 'roc', 'adx']:
             if col in df.columns:
                 df[f'{col}_915'] = df.groupby(df['timestamp'].dt.date)[col].transform('first')
@@ -279,12 +274,13 @@ def calc_drift_bear(df, is_daily):
     return min(score, 1.0)
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# SYSTEM RESOLUTION MACHINE
+# SYSTEM RESOLUTION MACHINE (UNWEIGHTED)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
+# Removed weight values entirely to treat every timeframe equally
 TIMEFRAMES = {
-    '15min': {'res': '15', 'days': 20, 'w': 0.30},
-    '1hour': {'res': '60', 'days': 40, 'w': 0.30},
-    '1day': {'res': '1D', 'days': 200, 'w': 0.40}
+    '15min': {'res': '15', 'days': 20},
+    '1hour': {'res': '60', 'days': 40},
+    '1day': {'res': '1D', 'days': 200}
 }
 
 def scan_symbol(symbol):
@@ -304,7 +300,7 @@ def scan_symbol(symbol):
             hv_20 = df_ind['hv'].iloc[-1]
 
         results[tf_name] = {
-            'df': df_ind, 'w': cfg['w'],
+            'df': df_ind,
             'tmv_bull': calc_tmv_bull(df_ind, is_daily),
             'tmv_bear': calc_tmv_bear(df_ind, is_daily),
             'drift_bull': calc_drift_bull(df_ind, is_daily),
@@ -314,14 +310,16 @@ def scan_symbol(symbol):
     if not results: return None
 
     rs_mult = get_rs_multiplier(symbol_pct)
+    num_tf = len(results)
     
-    tb_tmv = sum(r['tmv_bull'] * r['w'] for r in results.values())
-    tbear_tmv = sum(r['tmv_bear'] * r['w'] for r in results.values())
+    # UNWEIGHTED AVERAGE: Sum all timeframe scores and divide by the number of timeframes
+    tb_tmv = sum(r['tmv_bull'] for r in results.values()) / num_tf
+    tbear_tmv = sum(r['tmv_bear'] for r in results.values()) / num_tf
     tmv_net = ((tb_tmv * 15) - (tbear_tmv * 15)) * rs_mult
     tmv_rank = max(-15.0, min(15.0, tmv_net))
     
-    tb_drift = sum(r['drift_bull'] * r['w'] for r in results.values())
-    tbear_drift = sum(r['drift_bear'] * r['w'] for r in results.values())
+    tb_drift = sum(r['drift_bull'] for r in results.values()) / num_tf
+    tbear_drift = sum(r['drift_bear'] for r in results.values()) / num_tf
     drift_net = ((tb_drift * 15) - (tbear_drift * 15)) * rs_mult
     drift_rank = max(-15.0, min(15.0, drift_net))
 
@@ -376,7 +374,6 @@ def determine_setup(row):
     trend = row['Trend']
     stretch = row.get('VWAP_Stretch', 0.0)
     
-    # KILL SWITCH: If price is > 1.5x ATR from VWAP, it is structurally overextended
     if stretch > 1.5:
         return "🛑 Overextended", "#e91e63", "#fff"
     
@@ -447,8 +444,6 @@ def send_email_report(df):
         return
 
     df['setup_name'] = df.apply(lambda r: determine_setup(r)[0], axis=1)
-    
-    # STRICT FILTER: Whitelist ONLY Sweet Spot and Harmony candidates. Kills Traps, Standard, and Overextended.
     df_elite = df[df['setup_name'].isin(["🎯 Sweet Spot", "⚖️ Harmony"])].copy()
 
     bulls = df_elite[(df_elite['Trend'] == 'BULLISH') & (df_elite['TMV_Rank'] > 0)].sort_values('TMV_Diff', ascending=False).head(15)
@@ -459,14 +454,14 @@ def send_email_report(df):
 
     msg = MIMEMultipart("alternative")
     msg["From"], msg["To"] = SENDER_EMAIL, RECIPIENT_EMAIL
-    msg["Subject"] = f"Elite Dual Matrix (TMV vs Drift) - {datetime.now().strftime('%H:%M')}"
+    msg["Subject"] = f"Elite Dual Matrix (Unweighted Confluence) - {datetime.now().strftime('%H:%M')}"
 
     html = f"""
     <html>
     <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #121212; color: #e0e0e0; padding: 20px;">
       
       <div style="text-align: center; margin-bottom: 30px;">
-          <h2 style="color: #ffffff; margin-bottom: 5px;">Elite Visual Intelligence Matrix (v12.1)</h2>
+          <h2 style="color: #ffffff; margin-bottom: 5px;">Elite Visual Intelligence Matrix (v12.2)</h2>
           <p style="color: #aaaaaa; margin-top: 0;"><b>Session Baseline Reset:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
       </div>
       
@@ -486,6 +481,7 @@ def send_email_report(df):
           </ul>
           <p style="color: #e91e63; font-size: 12px; margin-bottom: 0;">* VWAP Stretch Protection is ACTIVE. Any asset >1.5x ATR from VWAP is blocked as 🛑 Overextended.</p>
           <p style="color: #999; font-size: 12px; margin-bottom: 0;">* Inefficient churn metrics (Standard/Trap conditions) have been strictly dropped from this grid view.</p>
+          <p style="color: #999; font-size: 12px; margin-bottom: 0;">* UNWEIGHTED ENGINE: All timeframes currently have equal scoring influence for pure confluence mapping.</p>
       </div>
       
     </body>
@@ -519,7 +515,7 @@ def send_email_report(df):
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def main():
     print("=" * 80)
-    print("[LAUNCH] ASIT v12.1 - SNIPER & STRETCH EDITION")
+    print("[LAUNCH] ASIT v12.2 - UNWEIGHTED CONFLUENCE EDITION")
     print("=" * 80)
     symbols = get_live_fno_symbols()
     if not symbols: sys.exit()
