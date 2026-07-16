@@ -1,17 +1,17 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-ASIT BARAN PATI STRATEGY - PRODUCTION v10.0 - VISUAL INTELLIGENCE EDITION
-DUAL ENGINE (TMV + DRIFT) WITH AI-DRIVEN COLOR-CODED SETUP BADGES
+ASIT BARAN PATI STRATEGY - PRODUCTION v11.0 - ELITE SELECTION EDITION
+FILTERED FOR SWEET SPOT & HARMONY CANDIDATES ONLY + 9:15 AM ANCHOR INTEGRATION
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 
-🎯 v10.0 UPGRADES:
-✅ VISUAL HTML ENGINE: Rips out plain tables, replaces with Dark Mode Cyber-UI.
-✅ SETUP CLASSIFIER: Automatically tags 🎯 Sweet Spot, ⚖️ Harmony, and ⚠️ The Trap.
-✅ EXTENDED WATCHLIST: Expanded from 10 to 15 rows for both Long and Short candidates.
-✅ CONDITIONAL COLORING: Positive/Negative momentum changes are color-coded in neon green/red.
+🎯 v11.0 NOISE-REDUCTION UPGRADES:
+✅ STRICT SIGNAL FILTERING: Completely blocks "⚠️ The Trap" and "🔄 Standard" setups from the email.
+✅ ANCHOR 9:15 COLUMN: Added a distinct column showing the exact opening baseline for every candidate.
+✅ MAXIMIZED SLICING: Slices top 15 rows AFTER filtering, guaranteeing up to 15 pristine setups if they exist.
+✅ CYBER DARK-MODE: Retains neon visual hierarchy while adjusting legends for elite-only setups.
 
-RUNNING: python asit_visual_matrix.py
+RUNNING: python asit_elite_matrix.py
 OUTPUT: asit_dual_history_YYYYMMDD.csv
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
@@ -209,9 +209,12 @@ def process_indicators(df, is_daily=False):
     df['adx_neg'] = ta.trend.adx_neg(df['high'], df['low'], df['close'])
 
     if not is_daily:
+        df['anchor_915_price'] = df.groupby(df['timestamp'].dt.date)['open'].transform('first')
         for col in ['vwap', 'obv', 'roc', 'adx']:
             if col in df.columns:
                 df[f'{col}_915'] = df.groupby(df['timestamp'].dt.date)[col].transform('first')
+    else:
+        df['anchor_915_price'] = df['open']
     
     if is_daily:
         df['returns'] = np.log(df['close'] / df['close'].shift(1))
@@ -220,7 +223,7 @@ def process_indicators(df, is_daily=False):
     return df
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# ENGINE 1: ASIT'S TMV RANK
+# ENGINE 1 & 2 SCORING ARCHITECTURE
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def calc_tmv_bull(df, is_daily):
     score = 0
@@ -242,9 +245,6 @@ def calc_tmv_bear(df, is_daily):
     if latest.get('obv', 0) < latest.get('obv_ema10', 0) < latest.get('obv_ema20', 0): score += 0.20
     return min(score, 1.0)
 
-# ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# ENGINE 2: 9:15 INDICATOR DRIFT RANK
-# ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def calc_drift_bull(df, is_daily):
     if is_daily: return calc_tmv_bull(df, is_daily) 
     score = 0
@@ -268,7 +268,7 @@ def calc_drift_bear(df, is_daily):
     return min(score, 1.0)
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# DUAL SCANNER EXECUTION
+# SYSTEM RESOLUTION MACHINE
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 TIMEFRAMES = {
     '15min': {'res': '15', 'days': 20, 'w': 0.30},
@@ -317,12 +317,14 @@ def scan_symbol(symbol):
     trend = 'BULLISH' if tmv_rank > 0 else ('BEARISH' if tmv_rank < 0 else 'NEUTRAL')
     latest_df = results.get('15min', list(results.values())[0])['df']
     obv_shift = "Acc." if latest_df['obv'].iloc[-1] > latest_df.get('obv_915', pd.Series([0])).iloc[-1] else "Dist."
+    anchor_price = latest_df['anchor_915_price'].iloc[-1] if 'anchor_915_price' in latest_df.columns else np.nan
 
     return {
         'Symbol': symbol,
         'TMV_Rank': round(tmv_rank, 2),
         'Drift_Rank': round(drift_rank, 2),
         'Trend': trend,
+        'Anchor_915': round(anchor_price, 2) if not pd.isna(anchor_price) else 0.0,
         'LTP': round(latest_df['close'].iloc[-1], 2),
         '% Change': round(symbol_pct, 2),
         'Intraday_Vol': obv_shift,
@@ -351,10 +353,9 @@ def manage_daily_history(current_results):
     return df_curr
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# VISUAL INTELLIGENCE HTML ENGINE (Dark Mode + Custom Setup Badges)
+# VISUAL HTML ENGINE WITH STRICT CLASSIFIER BLOCKERS
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def determine_setup(row):
-    """Categorizes the stock based on TMV vs Drift divergence."""
     tmv = row['TMV_Rank']
     drift = row['Drift_Rank']
     vol = row['Intraday_Vol']
@@ -374,7 +375,7 @@ def determine_setup(row):
 
 def generate_colorful_html_table(df, side):
     if df.empty:
-        return f"<p style='color:#aaaaaa;'>No {side.lower()} candidates found.</p>"
+        return f"<p style='color:#aaaaaa;'>No elite {side.lower()} setups identified.</p>"
         
     html = """
     <table style="width:100%; border-collapse: collapse; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #1e1e1e; color: #ffffff; text-align: center; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 8px rgba(0,0,0,0.5);">
@@ -382,6 +383,7 @@ def generate_colorful_html_table(df, side):
             <tr style="background-color: #2d2d30; border-bottom: 2px solid #3e3e42;">
                 <th style="padding: 12px 8px;">Symbol</th>
                 <th style="padding: 12px 8px;">Setup</th>
+                <th style="padding: 12px 8px;">Anchor 9:15</th>
                 <th style="padding: 12px 8px;">LTP</th>
                 <th style="padding: 12px 8px;">% Chg</th>
                 <th style="padding: 12px 8px;">TMV Rank</th>
@@ -395,15 +397,12 @@ def generate_colorful_html_table(df, side):
     
     for idx, row in df.iterrows():
         bg_color = "#1e1e1e" if idx % 2 == 0 else "#252526"
-        
-        # Colorize percentages and Diff
         pct = row['% Change']
         pct_color = "#4caf50" if pct > 0 else "#f44336" if pct < 0 else "#ffffff"
         
         diff = row['TMV_Diff']
         diff_color = "#4caf50" if diff > 0 else "#f44336" if diff < 0 else "#ffffff"
         
-        # Determine Setup Badge
         badge_text, badge_bg, badge_fg = determine_setup(row)
         badge_html = f"<span style='background-color:{badge_bg}; color:{badge_fg}; padding:4px 8px; border-radius:12px; font-size:12px; font-weight:bold; white-space:nowrap;'>{badge_text}</span>"
         
@@ -411,7 +410,8 @@ def generate_colorful_html_table(df, side):
             <tr style="background-color: {bg_color}; border-bottom: 1px solid #333333;">
                 <td style="padding: 10px 8px; font-weight: bold; color: #64b5f6;">{row['Symbol'].replace('NSE:', '').replace('-EQ', '')}</td>
                 <td style="padding: 10px 8px;">{badge_html}</td>
-                <td style="padding: 10px 8px;">{row['LTP']:.2f}</td>
+                <td style="padding: 10px 8px; font-weight: 500; color: #e0e0e0;">{row['Anchor_915']:.2f}</td>
+                <td style="padding: 10px 8px; font-weight: 600;">{row['LTP']:.2f}</td>
                 <td style="padding: 10px 8px; color: {pct_color}; font-weight:bold;">{pct:+.2f}%</td>
                 <td style="padding: 10px 8px;">{row['TMV_Rank']:.2f}</td>
                 <td style="padding: 10px 8px;">{row['Drift_Rank']:.2f}</td>
@@ -427,41 +427,47 @@ def send_email_report(df):
     if not all([SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL]):
         return
 
-    # Expand to Top 15 Rows
-    bulls = df[(df['Trend'] == 'BULLISH') & (df['TMV_Rank'] > 0)].sort_values('TMV_Diff', ascending=False).head(15)
-    bears = df[(df['Trend'] == 'BEARISH') & (df['TMV_Rank'] < 0)].sort_values('TMV_Diff', ascending=True).head(15)
+    # Assign setup name tags across the dataframe to filter prior to taking the top 15 rows
+    df['setup_name'] = df.apply(lambda r: determine_setup(r)[0], axis=1)
+    
+    # STRICT FILTER: Whitelist ONLY Sweet Spot and Harmony candidates
+    df_elite = df[df['setup_name'].isin(["🎯 Sweet Spot", "⚖️ Harmony"])].copy()
+
+    # Slice the Top 15 rows cleanly from our filtered whitelisted datasets
+    bulls = df_elite[(df_elite['Trend'] == 'BULLISH') & (df_elite['TMV_Rank'] > 0)].sort_values('TMV_Diff', ascending=False).head(15)
+    bears = df_elite[(df_elite['Trend'] == 'BEARISH') & (df_elite['TMV_Rank'] < 0)].sort_values('TMV_Diff', ascending=True).head(15)
 
     bulls_table = generate_colorful_html_table(bulls, "BULLISH")
     bears_table = generate_colorful_html_table(bears, "BEARISH")
 
     msg = MIMEMultipart("alternative")
     msg["From"], msg["To"] = SENDER_EMAIL, RECIPIENT_EMAIL
-    msg["Subject"] = f"Visual Intelligence Matrix (TMV vs Drift) - {datetime.now().strftime('%H:%M')}"
+    msg["Subject"] = f"Elite Dual Matrix (TMV vs Drift) - {datetime.now().strftime('%H:%M')}"
 
     html = f"""
     <html>
     <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #121212; color: #e0e0e0; padding: 20px;">
       
       <div style="text-align: center; margin-bottom: 30px;">
-          <h2 style="color: #ffffff; margin-bottom: 5px;">Visual Intelligence Matrix (v10.0)</h2>
-          <p style="color: #aaaaaa; margin-top: 0;"><b>Run Time:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
+          <h2 style="color: #ffffff; margin-bottom: 5px;">Elite Visual Intelligence Matrix (v11.0)</h2>
+          <p style="color: #aaaaaa; margin-top: 0;"><b>Session Baseline Reset:</b> {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}</p>
       </div>
       
-      <h3 style="color: #4caf50; border-bottom: 2px solid #4caf50; padding-bottom: 5px; display: inline-block;">🚀 Top 15 Long Targets</h3>
+      <h3 style="color: #4caf50; border-bottom: 2px solid #4caf50; padding-bottom: 5px; display: inline-block;">🚀 Top 15 Long Accelerators (Elite Only)</h3>
       {bulls_table}
       
       <br><br>
       
-      <h3 style="color: #f44336; border-bottom: 2px solid #f44336; padding-bottom: 5px; display: inline-block;">🔻 Top 15 Short Targets</h3>
+      <h3 style="color: #f44336; border-bottom: 2px solid #f44336; padding-bottom: 5px; display: inline-block;">🔻 Top 15 Short Accelerators (Elite Only)</h3>
       {bears_table}
       
-      <div style="margin-top: 40px; padding: 15px; background-color: #1e1e1e; border-radius: 8px; border-left: 4px solid #2196f3;">
-          <h4 style="color: #ffffff; margin-top: 0;">Badge Legend:</h4>
+      <div style="margin-top: 40px; padding: 15px; background-color: #1e1e1e; border-radius: 8px; border-left: 4px solid #d4af37;">
+          <h4 style="color: #ffffff; margin-top: 0;">Elite Selection Setup Parameters:</h4>
           <ul style="color: #cccccc; line-height: 1.6;">
-            <li><span style='background-color:#d4af37; color:#000; padding:2px 6px; border-radius:4px; font-size:11px; font-weight:bold;'>🎯 Sweet Spot</span> : TMV macro trend is strong, AND the intraday Drift from 9:15 is accelerating even faster with Institutional volume.</li>
+            <li><span style='background-color:#d4af37; color:#000; padding:2px 6px; border-radius:4px; font-size:11px; font-weight:bold;'>🎯 Sweet Spot</span> : TMV macro trend is strong, AND the intraday Drift from 9:15 is accelerating even faster with Institutional volume confirmation.</li>
             <li><span style='background-color:#2196f3; color:#fff; padding:2px 6px; border-radius:4px; font-size:11px; font-weight:bold;'>⚖️ Harmony</span> : TMV and Drift are perfectly aligned. High confidence, sustainable setup.</li>
-            <li><span style='background-color:#ff9800; color:#000; padding:2px 6px; border-radius:4px; font-size:11px; font-weight:bold;'>⚠️ The Trap</span> : Macro TMV looks great, but intraday Drift is collapsing with Distribution. Avoid.</li>
           </ul>
+          <p style="color: #999; font-size: 12px; margin-bottom: 0;">* Note: Inefficient churn metrics (Standard/Trap conditions) have been strictly dropped from this grid view.</p>
       </div>
       
     </body>
@@ -486,13 +492,49 @@ def send_email_report(df):
         server.login(SENDER_EMAIL, SENDER_PASSWORD)
         server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
         server.quit()
-        logger.info(f"[EMAIL] Visual Matrix successfully dispatched.")
+        logger.info(f"[EMAIL] Elite Selection reports successfully dispatched.")
     except Exception as e:
-        logger.error(f"[EMAIL] SMTP Error: {e}")
+        logger.error(f"[EMAIL] SMTP Transmission Error: {e}")
+
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════
+# MAIN CONTROL GATE
+# ═══════════════════════════════════════════════════════════════════════════════════════════════════
+def get_history_ttl(symbol, resolution, days_back):
+    cache_key = f"{symbol}_{resolution}_{days_back}"
+    now_ts = time.time()
+    ttl_seconds = 43200 if str(resolution).upper() in ["D", "1D"] else 180
+    
+    if cache_key in DATA_CACHE:
+        cached_df, fetch_time = DATA_CACHE[cache_key]
+        if now_ts - fetch_time < ttl_seconds:
+            return cached_df
+
+    try:
+        res_str = "1D" if str(resolution).upper() == "D" else str(resolution)
+        now_dt = pd.Timestamp.now(tz="Asia/Kolkata")
+        date_from = (now_dt - timedelta(days=days_back)).strftime("%Y-%m-%d")
+        
+        payload = {
+            "symbol": symbol, "resolution": res_str, "date_format": 1,
+            "range_from": date_from, "range_to": now_dt.strftime("%Y-%m-%d"), 
+            "cont_flag": 0 if "INDEX" in symbol else 1
+        }
+        res = call_with_retries(fyers.history, data=payload)
+        candles = res.get('candles', []) if isinstance(res, dict) else []
+        if not candles: return None
+
+        df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
+        df = df.sort_values('timestamp').reset_index(drop=True)
+        
+        DATA_CACHE[cache_key] = (df, now_ts)
+        return df
+    except:
+        return None
 
 if __name__ == "__main__":
     print("=" * 80)
-    print("[LAUNCH] ASIT v10.0 - VISUAL INTELLIGENCE EDITION")
+    print("[LAUNCH] ASIT v11.0 - ELITE SELECTION ENGINE")
     print("=" * 80)
     symbols = get_live_fno_symbols()
     if not symbols: sys.exit()
@@ -504,12 +546,12 @@ if __name__ == "__main__":
         for idx, future in enumerate(as_completed(futures), 1):
             try:
                 if res := future.result(): results.append(res)
-                if idx % 20 == 0: logger.info(f"[SCAN] Visual Matrix progress: {idx}/{len(symbols)} complete...")
+                if idx % 20 == 0: logger.info(f"[SCAN] Processing Elite Matrix: {idx}/{len(symbols)} complete...")
             except: pass
 
     if results:
         df_final = manage_daily_history(results)
         send_email_report(df_final)
         print("=" * 80)
-        print("[SUCCESS] Visual Intelligence (TMV + Drift) Complete.")
+        print("[SUCCESS] Operational Phase Concluded.")
         print("=" * 80)
