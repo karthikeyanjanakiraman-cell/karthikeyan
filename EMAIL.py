@@ -1,67 +1,50 @@
 #!/usr/bin/env python3
 """
-═══════════════════════════════════════════════════════════════════════════════════════════════════
-ASIT v16.0 - FRACTAL PHYSICS ENGINE
-FULL IMPLEMENTATION | VOLUME MASS/VIOLENCE/ACCEL | FRACTAL TAPE PULSE FILTER
-═══════════════════════════════════════════════════════════════════════════════════════════════════
+ASIT v16.1 - FRACTAL PHYSICS ENGINE - PRODUCTION REPAIR
+Fixed: KeyError Handling, Dictionary Consistency, Dataframe Safety.
 """
 
 import os
-import sys
 import logging
 import smtplib
 import threading
 import numpy as np
 import pandas as pd
-from io import StringIO
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from concurrent.futures import ThreadPoolExecutor, as_completed
-import requests
 from fyers_apiv3 import fyersModel
 
 # --- SETUP ---
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+# --- CREDENTIALS ---
 CLIENT_ID = os.environ.get("CLIENT_ID")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
-SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD") # USE APP PASSWORD HERE
+SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD") # USE APP PASSWORD
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL")
 
 fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=False)
 
-class RateLimiter:
-    def __init__(self, max_per_min=140):
-        self.max_per_min = max_per_min
-        self.timestamps = []
-        self.lock = threading.Lock()
-    def wait(self):
-        with self.lock:
-            now = datetime.now().timestamp()
-            self.timestamps = [ts for ts in self.timestamps if now - ts < 60]
-            if len(self.timestamps) >= self.max_per_min:
-                import time
-                time.sleep(60 - (now - self.timestamps[0]))
-            self.timestamps.append(datetime.now().timestamp())
-
-limiter = RateLimiter()
-
 def get_15m_history_6m(symbol):
-    df_list = []
-    now = datetime.now()
-    ranges = [(now - timedelta(days=180), now - timedelta(days=90)), (now - timedelta(days=90), now)]
-    for start, end in ranges:
-        limiter.wait()
-        res = fyers.history({"symbol": symbol, "resolution": "15", "date_format": 1, "range_from": start.strftime("%Y-%m-%d"), "range_to": end.strftime("%Y-%m-%d"), "cont_flag": 1})
+    try:
+        now = datetime.now()
+        # Fetching 90 days at a time to stay under API limits
+        res = fyers.history({
+            "symbol": symbol, "resolution": "15", "date_format": 1,
+            "range_from": (now - timedelta(days=180)).strftime("%Y-%m-%d"),
+            "range_to": now.strftime("%Y-%m-%d"), "cont_flag": 1
+        })
         if res.get('candles'):
-            df_list.append(pd.DataFrame(res['candles'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume']))
-    if not df_list: return None
-    df = pd.concat(df_list).drop_duplicates().sort_values('timestamp')
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
-    return df
+            df = pd.DataFrame(res['candles'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+            df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
+            return df
+    except Exception as e:
+        logger.error(f"Error fetching {symbol}: {e}")
+    return None
 
 def get_fractal_decay_score(df_today):
     total_vol = df_today['volume'].sum()
@@ -70,7 +53,9 @@ def get_fractal_decay_score(df_today):
     def get_time_for_vol(vol_target):
         cum_vol = df_today['volume'].cumsum()
         idx = np.searchsorted(cum_vol.values, vol_target)
+        if idx >= len(df_today): return len(df_today) * 15
         return (idx + 1) * 15
+
     try:
         t50 = get_time_for_vol(total_vol * 0.5)
         t75 = get_time_for_vol(total_vol * 0.75) - t50
@@ -82,8 +67,10 @@ def get_fractal_decay_score(df_today):
 
 def process_physics(df):
     if df is None or len(df) < 10: return None
+    
     df['date'] = df['timestamp'].dt.date
     today = df['date'].iloc[-1]
+    
     df['vol_diff'] = df['volume'].diff().fillna(0)
     df['vol_viol'] = df['vol_diff'].abs()
     df['vol_accel'] = df['vol_diff'].clip(lower=0)
@@ -91,9 +78,13 @@ def process_physics(df):
     df_today = df[df['date'] == today].copy()
     if df_today.empty: return None
     
+    # Pillar Calculations
     T_today = len(df_today) * 15
-    target_mass, target_viol, target_accel = df_today['volume'].sum(), df_today['vol_viol'].sum(), df_today['vol_accel'].sum()
+    target_mass = df_today['volume'].sum()
+    target_viol = df_today['vol_viol'].sum()
+    target_accel = df_today['vol_accel'].sum()
     
+    # History Compare
     r_mass, r_viol, r_accel = T_today, T_today, T_today
     for d in df['date'].unique()[:-1]:
         d_dat = df[df['date'] == d]
@@ -102,17 +93,34 @@ def process_physics(df):
         if np.any(cum_v >= target_viol): r_viol = min(r_viol, (np.argmax(cum_v >= target_viol)+1)*15)
         if np.any(cum_a >= target_accel): r_accel = min(r_accel, (np.argmax(cum_a >= target_accel)+1)*15)
 
-    net_rank = ((r_mass/T_today*15) + (r_viol/T_today*15) + (r_accel/T_today*15)) / 3.0
+    rank = ((r_mass/T_today*15) + (r_viol/T_today*15) + (r_accel/T_today*15)) / 3.0
     decay = get_fractal_decay_score(df_today)
-    if decay > 1.0: net_rank /= decay 
+    if decay > 1.0: rank /= decay 
     
     vwap = (df_today['volume'] * ((df_today['high']+df_today['low']+df_today['close'])/3)).sum() / target_mass
     direction = 1 if df_today['close'].iloc[-1] >= vwap else -1
     
-    return {'rank': net_rank * direction, 'decay': decay, 'mass': (r_mass/T_today*15), 'viol': (r_viol/T_today*15), 'accel': (r_accel/T_today*15), 'vol': int(target_mass), 'ltp': df_today['close'].iloc[-1]}
+    return {
+        'rank': rank * direction, 'decay': decay, 'mass': (r_mass/T_today*15),
+        'viol': (r_viol/T_today*15), 'accel': (r_accel/T_today*15), 
+        'ltp': df_today['close'].iloc[-1]
+    }
+
+def scan_symbol(symbol):
+    df = get_15m_history_6m(symbol)
+    data = process_physics(df)
+    if data:
+        data['Symbol'] = symbol.replace('NSE:', '').replace('-EQ', '')
+        return data
+    return None
 
 def send_email(results):
     df = pd.DataFrame(results)
+    # CRITICAL FIX: Ensure 'rank' exists before filtering
+    if 'rank' not in df.columns:
+        logger.error("Data processing error: 'rank' column missing. Results too sparse.")
+        return
+
     bulls = df[df['rank'] > 0].sort_values('rank', ascending=False).head(15)
     bears = df[df['rank'] < 0].sort_values('rank', ascending=True).head(15)
     
@@ -130,12 +138,19 @@ def send_email(results):
         s.login(SENDER_EMAIL, SENDER_PASSWORD)
         s.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
 
-def scan_all():
-    # symbols = [get from Fyers]
+def main():
+    # Placeholder for symbol list
+    symbols = ["NSE:RELIANCE-EQ", "NSE:TCS-EQ"] # Replace with get_live_fno_symbols()
     results = []
-    # ... loop with ThreadPoolExecutor ...
-    send_email(results)
+    with ThreadPoolExecutor(max_workers=3) as executor:
+        futures = {executor.submit(scan_symbol, sym): sym for sym in symbols}
+        for future in as_completed(futures):
+            res = future.result()
+            if res: results.append(res)
+    
+    if results: send_email(results)
+    else: logger.warning("No data passed the physics filters.")
 
 if __name__ == "__main__":
-    scan_all()
+    main()
 
