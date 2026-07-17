@@ -2,7 +2,7 @@
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 ASIT BARAN PATI STRATEGY - PRODUCTION v12.3 - PURE VOLUME CONFLUENCE EDITION
-DUAL ENGINE + VOLUME CLIMAX FILTER + INSTITUTIONAL NODE MAPPING
+DUAL ENGINE + VOLUME CLIMAX FILTER + INSTITUTIONAL NODE MAPPING + THROTTLE PROTECT
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -57,46 +57,61 @@ except Exception as e:
     sys.exit(1)
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# DUAL-WINDOW THREAD-SAFE RATE LIMITER
+# NON-BLOCKING RATE LIMITER & EXPONENTIAL BACKOFF
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 class RateLimiter:
-    def __init__(self, max_per_sec=8, max_per_min=190):
+    def __init__(self, max_per_sec=4, max_per_min=140):
         self.min_interval = 1.0 / max_per_sec
         self.max_per_min = max_per_min
         self.timestamps = []
         self.lock = threading.Lock()
 
     def wait(self):
+        sleep_time = 0.0
         with self.lock:
             now = time.monotonic()
+            # Clean up timestamps older than 60 seconds
             self.timestamps = [ts for ts in self.timestamps if now - ts < 60.0]
-            sleep_time = 0.0
+            
             if self.timestamps:
                 elapsed = now - self.timestamps[-1]
                 if elapsed < self.min_interval:
                     sleep_time = self.min_interval - elapsed
+                    
             if len(self.timestamps) >= self.max_per_min:
                 wait_for_min = 60.0 - (now - self.timestamps[0])
                 if wait_for_min > sleep_time:
                     sleep_time = wait_for_min
-            if sleep_time > 0:
-                time.sleep(sleep_time)
-                now = time.monotonic()
-            self.timestamps.append(now)
+            
+            # Record the projected execution time
+            self.timestamps.append(now + sleep_time)
+            
+        if sleep_time > 0:
+            time.sleep(sleep_time)
 
 rate_limiter = RateLimiter()
 
 def call_with_retries(func, *args, **kwargs):
-    for attempt in range(1, 4):
+    backoff = 3  # Start with a 3-second penalty wait
+    for attempt in range(1, 5):  # Try up to 4 times
         try:
             rate_limiter.wait()
             res = func(*args, **kwargs)
+            
             if isinstance(res, dict) and res.get('s') == 'error':
-                raise RuntimeError(res.get('message'))
+                err_msg = res.get('message', '').lower()
+                if 'limit' in err_msg:
+                    raise ValueError(f"Rate Limit Triggered: {err_msg}")
+                else:
+                    logger.warning(f"[API ERROR] {err_msg}")
+                    return None
+                    
             return res
         except Exception as e:
-            logger.warning(f"[RETRY] API failure on attempt {attempt}: {e}")
-            time.sleep(1)
+            logger.warning(f"[RETRY] Attempt {attempt} failed ({e}). Backing off for {backoff}s...")
+            time.sleep(backoff)
+            backoff *= 2  # Double the wait time on the next failure (3s -> 6s -> 12s)
+            
     return None
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -173,7 +188,7 @@ def process_volume_indicators(df, is_daily=False):
     if df is None or len(df) < 25: return None
     df = df.copy()
     
-    # 1. Base Cumulative Flow
+    # 1. Base Cumulative Flow (OBV)
     df['obv'] = (np.sign(df['close'].diff()) * df['volume']).fillna(0).cumsum()
     df['obv_ema10'] = ta.trend.ema_indicator(df['obv'], window=10)
     df['obv_ema20'] = ta.trend.ema_indicator(df['obv'], window=20)
@@ -312,6 +327,7 @@ def scan_symbol(symbol):
             'drift_bear': calc_drift_bear(df_ind, is_daily)
         }
 
+    # CRITICAL FLUSH: Reject the tracking run if any target timeframe dropouts occur
     if len(results) < len(TIMEFRAMES): return None
 
     rs_mult = get_rs_multiplier(symbol_pct)
@@ -504,6 +520,18 @@ def send_email_report(df):
     """
     msg.attach(MIMEText(html, "html"))
 
+    # Attach the history log if it exists
+    if os.path.exists(HISTORY_CSV):
+        try:
+            with open(HISTORY_CSV, "rb") as f:
+                part = MIMEBase("application", "octet-stream")
+                part.set_payload(f.read())
+            encoders.encode_base64(part)
+            part.add_header("Content-Disposition", f'attachment; filename="{HISTORY_CSV}"')
+            msg.attach(part)
+        except Exception as e:
+            logger.error(f"[EMAIL] Failed to attach log history payload: {e}")
+
     try:
         server = smtplib.SMTP("smtp.gmail.com", 587)
         server.starttls()
@@ -526,7 +554,8 @@ def main():
     pre_calculate_market_baseline()
     
     results = []
-    with ThreadPoolExecutor(max_workers=5) as executor:
+    # Throttled to 2 concurrent workers to prevent API bans
+    with ThreadPoolExecutor(max_workers=2) as executor:
         futures = {executor.submit(scan_symbol, sym): sym for sym in symbols}
         for idx, future in enumerate(as_completed(futures), 1):
             try:
@@ -542,6 +571,8 @@ def main():
         print("=" * 80)
         print("[SUCCESS] Operational Phase Concluded.")
         print("=" * 80)
+    else:
+        logger.error("[FATAL ERROR] System Matrix failed to generate output configurations.")
 
 if __name__ == "__main__":
     main()
