@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-ASIT v16.1 - FRACTAL PHYSICS ENGINE - PRODUCTION REPAIR
-Fixed: KeyError Handling, Dictionary Consistency, Dataframe Safety.
+ASIT v16.2 - FRACTAL PHYSICS ENGINE
+HARDENED FOR WEEKENDS/HOLIDAYS | AUTO-DETECTS LAST TRADING DAY
 """
 
 import os
 import logging
 import smtplib
-import threading
 import numpy as np
 import pandas as pd
 from datetime import datetime, timedelta
@@ -32,13 +31,13 @@ fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=
 def get_15m_history_6m(symbol):
     try:
         now = datetime.now()
-        # Fetching 90 days at a time to stay under API limits
+        # Fetching 180 days to ensure we have enough history
         res = fyers.history({
             "symbol": symbol, "resolution": "15", "date_format": 1,
             "range_from": (now - timedelta(days=180)).strftime("%Y-%m-%d"),
             "range_to": now.strftime("%Y-%m-%d"), "cont_flag": 1
         })
-        if res.get('candles'):
+        if res and res.get('candles'):
             df = pd.DataFrame(res['candles'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
             df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s')
             return df
@@ -69,23 +68,23 @@ def process_physics(df):
     if df is None or len(df) < 10: return None
     
     df['date'] = df['timestamp'].dt.date
-    today = df['date'].iloc[-1]
+    # FIX: Use the last available date, not today's actual calendar date
+    last_date = df['date'].unique()[-1]
     
     df['vol_diff'] = df['volume'].diff().fillna(0)
     df['vol_viol'] = df['vol_diff'].abs()
     df['vol_accel'] = df['vol_diff'].clip(lower=0)
     
-    df_today = df[df['date'] == today].copy()
-    if df_today.empty: return None
+    df_session = df[df['date'] == last_date].copy()
+    if df_session.empty: return None
     
-    # Pillar Calculations
-    T_today = len(df_today) * 15
-    target_mass = df_today['volume'].sum()
-    target_viol = df_today['vol_viol'].sum()
-    target_accel = df_today['vol_accel'].sum()
+    T_session = len(df_session) * 15
+    target_mass = df_session['volume'].sum()
+    target_viol = df_session['vol_viol'].sum()
+    target_accel = df_session['vol_accel'].sum()
     
     # History Compare
-    r_mass, r_viol, r_accel = T_today, T_today, T_today
+    r_mass, r_viol, r_accel = T_session, T_session, T_session
     for d in df['date'].unique()[:-1]:
         d_dat = df[df['date'] == d]
         cum_m, cum_v, cum_a = d_dat['volume'].cumsum().values, d_dat['vol_viol'].cumsum().values, d_dat['vol_accel'].cumsum().values
@@ -93,17 +92,17 @@ def process_physics(df):
         if np.any(cum_v >= target_viol): r_viol = min(r_viol, (np.argmax(cum_v >= target_viol)+1)*15)
         if np.any(cum_a >= target_accel): r_accel = min(r_accel, (np.argmax(cum_a >= target_accel)+1)*15)
 
-    rank = ((r_mass/T_today*15) + (r_viol/T_today*15) + (r_accel/T_today*15)) / 3.0
-    decay = get_fractal_decay_score(df_today)
+    rank = ((r_mass/T_session*15) + (r_viol/T_session*15) + (r_accel/T_session*15)) / 3.0
+    decay = get_fractal_decay_score(df_session)
     if decay > 1.0: rank /= decay 
     
-    vwap = (df_today['volume'] * ((df_today['high']+df_today['low']+df_today['close'])/3)).sum() / target_mass
-    direction = 1 if df_today['close'].iloc[-1] >= vwap else -1
+    vwap = (df_session['volume'] * ((df_session['high']+df_session['low']+df_session['close'])/3)).sum() / target_mass
+    direction = 1 if df_session['close'].iloc[-1] >= vwap else -1
     
     return {
-        'rank': rank * direction, 'decay': decay, 'mass': (r_mass/T_today*15),
-        'viol': (r_viol/T_today*15), 'accel': (r_accel/T_today*15), 
-        'ltp': df_today['close'].iloc[-1]
+        'rank': rank * direction, 'decay': decay, 'mass': (r_mass/T_session*15),
+        'viol': (r_viol/T_session*15), 'accel': (r_accel/T_session*15), 
+        'ltp': df_session['close'].iloc[-1]
     }
 
 def scan_symbol(symbol):
@@ -116,21 +115,19 @@ def scan_symbol(symbol):
 
 def send_email(results):
     df = pd.DataFrame(results)
-    # CRITICAL FIX: Ensure 'rank' exists before filtering
     if 'rank' not in df.columns:
-        logger.error("Data processing error: 'rank' column missing. Results too sparse.")
+        logger.error("No valid results to send (Physics criteria not met).")
         return
 
     bulls = df[df['rank'] > 0].sort_values('rank', ascending=False).head(15)
     bears = df[df['rank'] < 0].sort_values('rank', ascending=True).head(15)
     
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"Fractal Physics Matrix - {datetime.now().strftime('%H:%M')}"
+    msg["Subject"] = f"Fractal Physics Matrix - {datetime.now().strftime('%Y-%m-%d %H:%M')}"
     
-    html = f"""<html><body><h2>Fractal Physics Matrix</h2>
-    <h3>Bulls</h3><table border="1"><tr><th>Sym</th><th>Mass</th><th>Viol</th><th>Accel</th><th>Decay</th><th>Net Speed</th></tr>
-    {"".join([f"<tr><td>{r['Symbol']}</td><td>{r['mass']:.1f}</td><td>{r['viol']:.1f}</td><td>{r['accel']:.1f}</td><td style='color:{'red' if r['decay']>1.2 else 'green'}'>{r['decay']:.2f}</td><td>{r['rank']:.2f}</td></tr>" for _, r in bulls.iterrows()])}
-    </table></body></html>"""
+    html = f"<html><body><h2>Fractal Physics Matrix</h2><h3>Bulls</h3><table border='1'><tr><th>Sym</th><th>Mass</th><th>Viol</th><th>Accel</th><th>Decay</th><th>Net Speed</th></tr>"
+    html += "".join([f"<tr><td>{r['Symbol']}</td><td>{r['mass']:.1f}</td><td>{r['viol']:.1f}</td><td>{r['accel']:.1f}</td><td style='color:{'red' if r['decay']>1.2 else 'green'}'>{r['decay']:.2f}</td><td>{r['rank']:.2f}</td></tr>" for _, r in bulls.iterrows()])
+    html += "</table></body></html>"
     msg.attach(MIMEText(html, "html"))
     
     with smtplib.SMTP("smtp.gmail.com", 587) as s:
@@ -139,8 +136,9 @@ def send_email(results):
         s.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
 
 def main():
-    # Placeholder for symbol list
-    symbols = ["NSE:RELIANCE-EQ", "NSE:TCS-EQ"] # Replace with get_live_fno_symbols()
+    # Replace the list below with your actual F&O list fetcher
+    symbols = ["NSE:RELIANCE-EQ", "NSE:TCS-EQ", "NSE:INFY-EQ", "NSE:HDFCBANK-EQ"] 
+    logger.info(f"Scanning {len(symbols)} symbols...")
     results = []
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {executor.submit(scan_symbol, sym): sym for sym in symbols}
@@ -149,7 +147,7 @@ def main():
             if res: results.append(res)
     
     if results: send_email(results)
-    else: logger.warning("No data passed the physics filters.")
+    else: logger.warning("Scan complete, but no symbols passed the physics filters.")
 
 if __name__ == "__main__":
     main()
