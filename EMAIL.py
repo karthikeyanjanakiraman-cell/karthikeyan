@@ -4,17 +4,6 @@
 ASIT BARAN PATI STRATEGY - PRODUCTION v12.2 - UNWEIGHTED CONFLUENCE EDITION
 DUAL ENGINE + ATR VWAP STRETCH FILTER + ELITE EMAIL SELECTION
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-
-🎯 MASTER ARCHITECTURE:
-✅ UNWEIGHTED MTF: All timeframes (15m, 1H, 1D) now carry an equal 33.3% vote for pure confluence.
-✅ VWAP STRETCH FILTER: Calculates 14-period ATR. If LTP is > 1.5x ATR away from VWAP, setup is killed.
-✅ 9:15 AM ANCHOR: Extracts the exact Typical Price and indicator state of the opening bell.
-✅ STRICT SIGNAL FILTERING: Automatically blocks Overextended, Traps, and Standard setups.
-✅ CYBER DARK-MODE EMAIL: Delivers the Top 15 pristine longs and shorts directly to your email.
-
-RUNNING: python asit_v12_unweighted.py
-OUTPUT: asit_dual_history_YYYYMMDD.csv
-═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
 import os
@@ -40,11 +29,8 @@ from fyers_apiv3 import fyersModel
 
 # ===== LOGGING SETUP =====
 log_format = '%(asctime)s - %(levelname)s - %(message)s'
+logging.basicConfig(level=logging.INFO, format=log_format, handlers=[logging.StreamHandler(sys.stdout)])
 logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-console_handler = logging.StreamHandler(sys.stdout)
-console_handler.setFormatter(logging.Formatter(log_format))
-logger.addHandler(console_handler)
 
 # ===== ENVIRONMENTAL CREDENTIALS =====
 CLIENT_ID = os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID")
@@ -58,6 +44,7 @@ TODAY_STR = datetime.now().strftime('%Y%m%d')
 HISTORY_CSV = f"asit_dual_history_{TODAY_STR}.csv"
 
 DATA_CACHE = {} 
+CACHE_LOCK = threading.Lock()
 MARKET_BASELINE = 0.0  
 
 try:
@@ -112,6 +99,7 @@ def call_with_retries(func, *args, **kwargs):
                 raise RuntimeError(res.get('message'))
             return res
         except Exception as e:
+            logger.warning(f"[RETRY] API call execution failure on attempt {attempt}: {e}")
             time.sleep(1)
     return None
 
@@ -138,7 +126,9 @@ def pre_calculate_market_baseline():
         if len(hist) >= 2:
             prev, curr = hist['Close'].iloc[-2], hist['Close'].iloc[-1]
             MARKET_BASELINE = ((curr - prev) / prev) * 100
-    except:
+            logger.info(f"[BASELINE] Nifty Index 5D Baseline calibrated to: {MARKET_BASELINE:+.2f}%")
+    except Exception as e:
+        logger.warning(f"[BASELINE] Dynamic baseline calculation failed, defaulting to 0.0: {e}")
         MARKET_BASELINE = 0.0
 
 def get_rs_multiplier(symbol_pct):
@@ -151,10 +141,11 @@ def get_history_ttl(symbol, resolution, days_back):
     now_ts = time.time()
     ttl_seconds = 43200 if str(resolution).upper() in ["D", "1D"] else 180
     
-    if cache_key in DATA_CACHE:
-        cached_df, fetch_time = DATA_CACHE[cache_key]
-        if now_ts - fetch_time < ttl_seconds:
-            return cached_df
+    with CACHE_LOCK:
+        if cache_key in DATA_CACHE:
+            cached_df, fetch_time = DATA_CACHE[cache_key]
+            if now_ts - fetch_time < ttl_seconds:
+                return cached_df
 
     try:
         res_str = "1D" if str(resolution).upper() == "D" else str(resolution)
@@ -167,16 +158,22 @@ def get_history_ttl(symbol, resolution, days_back):
             "cont_flag": 0 if "INDEX" in symbol else 1
         }
         res = call_with_retries(fyers.history, data=payload)
-        candles = res.get('candles', []) if isinstance(res, dict) else []
-        if not candles: return None
+        if not res or not isinstance(res, dict):
+            return None
+            
+        candles = res.get('candles', [])
+        if not candles: 
+            return None
 
         df = pd.DataFrame(candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
         df = df.sort_values('timestamp').reset_index(drop=True)
         
-        DATA_CACHE[cache_key] = (df, now_ts)
+        with CACHE_LOCK:
+            DATA_CACHE[cache_key] = (df, now_ts)
         return df
-    except:
+    except Exception as e:
+        logger.error(f"[DATA ERROR] Failed fetching history for {symbol} ({resolution}): {e}")
         return None
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -191,10 +188,13 @@ def process_indicators(df, is_daily=False):
     if not is_daily:
         df['typical_price'] = (df['high'] + df['low'] + df['close']) / 3.0
         df['vol_price'] = df['volume'] * df['typical_price']
-        df['vwap'] = df.groupby(df['timestamp'].dt.date)['vol_price'].cumsum() / df.groupby(df['timestamp'].dt.date)['volume'].cumsum()
+        
+        cum_vol = df.groupby(df['timestamp'].dt.date)['volume'].cumsum()
+        cum_vol_price = df.groupby(df['timestamp'].dt.date)['vol_price'].cumsum()
+        df['vwap'] = cum_vol_price / np.where(cum_vol == 0, 1, cum_vol)
         
         df['vwap_distance'] = abs(df['close'] - df['vwap'])
-        df['vwap_stretch_atr'] = df['vwap_distance'] / df['atr']
+        df['vwap_stretch_atr'] = df['vwap_distance'] / np.where(df['atr'] == 0, 0.01, df['atr'])
         
     df['obv'] = (np.sign(df['close'].diff()) * df['volume']).fillna(0).cumsum()
     df['obv_ema10'] = ta.trend.ema_indicator(df['obv'], window=10)
@@ -204,6 +204,7 @@ def process_indicators(df, is_daily=False):
                          (df['high'] > df['high'].shift(-1)) & (df['high'] > df['high'].shift(-2))
     df['fractal_low'] = (df['low'] < df['low'].shift(1)) & (df['low'] < df['low'].shift(2)) & \
                         (df['low'] < df['low'].shift(-1)) & (df['low'] < df['low'].shift(-2))
+                        
     df['last_fractal_high_val'] = np.where(df['fractal_high'].shift(2), df['high'].shift(2), np.nan)
     df['last_fractal_high_val'] = df['last_fractal_high_val'].ffill()
     df['last_fractal_low_val'] = np.where(df['fractal_low'].shift(2), df['low'].shift(2), np.nan)
@@ -221,15 +222,15 @@ def process_indicators(df, is_daily=False):
                 df[f'{col}_915'] = df.groupby(df['timestamp'].dt.date)[col].transform('first')
     else:
         df['anchor_915_price'] = df['open']
-    
+        
     if is_daily:
-        df['returns'] = np.log(df['close'] / df['close'].shift(1))
+        df['returns'] = np.log(df['close'] / df['close'].shift(1).replace(0, np.nan))
         df['hv'] = df['returns'].rolling(window=20).std() * np.sqrt(252) * 100
         
     return df
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# ENGINE 1 & 2 SCORING ARCHITECTURE
+# ENGINE 1 & 2 SCORING ARCHITECTURE (SYMMETRIC QUANT METRICS)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def calc_tmv_bull(df, is_daily):
     score = 0
@@ -245,7 +246,7 @@ def calc_tmv_bear(df, is_daily):
     score = 0
     latest = df.iloc[-1]
     if not is_daily and latest['close'] < latest.get('vwap', float('inf')): score += 0.20
-    if latest['close'] < latest.get('last_fractal_low_val', -1): score += 0.20
+    if latest['close'] < latest.get('last_fractal_low_val', float('-inf')): score += 0.20
     if latest.get('roc', 0) < 0 and latest.get('roc', 0) < df['roc'].iloc[-2]: score += 0.20
     if latest.get('adx', 0) > 25 and latest.get('adx_neg', 0) > latest.get('adx_pos', 0): score += 0.20
     if latest.get('obv', 0) < latest.get('obv_ema10', 0) < latest.get('obv_ema20', 0): score += 0.20
@@ -267,16 +268,15 @@ def calc_drift_bear(df, is_daily):
     score = 0
     latest = df.iloc[-1]
     if latest['close'] < latest.get('vwap', float('inf')): score += 0.20
-    if latest.get('vwap', 0) < latest.get('vwap_915', -1): score += 0.20
-    if latest.get('roc', 0) < latest.get('roc_915', -1): score += 0.15
+    if latest.get('vwap', 0) < latest.get('vwap_915', float('-inf')): score += 0.20
+    if latest.get('roc', 0) < latest.get('roc_915', float('-inf')): score += 0.15
     if latest.get('adx', 0) > latest.get('adx_915', float('inf')): score += 0.15
-    if latest.get('obv', 0) < latest.get('obv_915', -1): score += 0.30
+    if latest.get('obv', 0) < latest.get('obv_915', float('-inf')): score += 0.30
     return min(score, 1.0)
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# SYSTEM RESOLUTION MACHINE (UNWEIGHTED)
+# SYSTEM RESOLUTION MACHINE (PURE UNWEIGHTED CONFLUENCE)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# Removed weight values entirely to treat every timeframe equally
 TIMEFRAMES = {
     '15min': {'res': '15', 'days': 20},
     '1hour': {'res': '60', 'days': 40},
@@ -296,7 +296,8 @@ def scan_symbol(symbol):
         
         if is_daily and len(df) >= 2:
             prev, curr = df['close'].iloc[-2], df['close'].iloc[-1]
-            symbol_pct = ((curr - prev) / prev) * 100
+            if prev != 0:
+                symbol_pct = ((curr - prev) / prev) * 100
             hv_20 = df_ind['hv'].iloc[-1]
 
         results[tf_name] = {
@@ -307,12 +308,13 @@ def scan_symbol(symbol):
             'drift_bear': calc_drift_bear(df_ind, is_daily)
         }
 
-    if not results: return None
+    # CRITICAL FLUSH: Reject the tracking run if any target timeframe dropouts occur
+    if len(results) < len(TIMEFRAMES): 
+        return None
 
     rs_mult = get_rs_multiplier(symbol_pct)
     num_tf = len(results)
     
-    # UNWEIGHTED AVERAGE: Sum all timeframe scores and divide by the number of timeframes
     tb_tmv = sum(r['tmv_bull'] for r in results.values()) / num_tf
     tbear_tmv = sum(r['tmv_bear'] for r in results.values()) / num_tf
     tmv_net = ((tb_tmv * 15) - (tbear_tmv * 15)) * rs_mult
@@ -324,7 +326,9 @@ def scan_symbol(symbol):
     drift_rank = max(-15.0, min(15.0, drift_net))
 
     trend = 'BULLISH' if tmv_rank > 0 else ('BEARISH' if tmv_rank < 0 else 'NEUTRAL')
-    latest_df = results.get('15min', list(results.values())[0])['df']
+    
+    # Intraday anchor variables are safely pulled from the validated 15min timeframe dataset
+    latest_df = results['15min']['df']
     obv_shift = "Acc." if latest_df['obv'].iloc[-1] > latest_df.get('obv_915', pd.Series([0])).iloc[-1] else "Dist."
     
     anchor_price = latest_df['anchor_915_price'].iloc[-1] if 'anchor_915_price' in latest_df.columns else np.nan
@@ -349,14 +353,17 @@ def manage_daily_history(current_results):
     df_curr['Runtime'] = datetime.now().strftime('%H:%M:%S')
 
     if os.path.exists(HISTORY_CSV):
-        df_hist = pd.read_csv(HISTORY_CSV)
-        def get_prev_rank(sym, trend):
-            sym_hist = df_hist[df_hist['Symbol'] == sym]
-            if sym_hist.empty: return 0.0
-            ranks = pd.to_numeric(sym_hist['TMV_Rank'], errors='coerce').dropna()
-            return ranks.max() if trend == 'BULLISH' else ranks.min() if not ranks.empty else 0.0
-            
-        df_curr['Prev_TMV'] = df_curr.apply(lambda r: get_prev_rank(r['Symbol'], r['Trend']), axis=1)
+        try:
+            df_hist = pd.read_csv(HISTORY_CSV)
+            def get_prev_rank(sym, trend):
+                sym_hist = df_hist[df_hist['Symbol'] == sym]
+                if sym_hist.empty: return 0.0
+                ranks = pd.to_numeric(sym_hist['TMV_Rank'], errors='coerce').dropna()
+                return ranks.max() if trend == 'BULLISH' else ranks.min() if not ranks.empty else 0.0
+            df_curr['Prev_TMV'] = df_curr.apply(lambda r: get_prev_rank(r['Symbol'], r['Trend']), axis=1)
+        except Exception as e:
+            logger.error(f"[HISTORY] Error processing historical ledger: {e}")
+            df_curr['Prev_TMV'] = 0.0
     else:
         df_curr['Prev_TMV'] = 0.0
 
@@ -391,7 +398,7 @@ def determine_setup(row):
 
 def generate_colorful_html_table(df, side):
     if df.empty:
-        return f"<p style='color:#aaaaaa;'>No elite {side.lower()} setups identified.</p>"
+        return f"<p style='color:#aaaaaa; font-size: 13px;'>No elite {side.lower()} setups identified matching metrics.</p>"
         
     html = """
     <table style="width:100%; border-collapse: collapse; font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #1e1e1e; color: #ffffff; text-align: center; border-radius: 8px; overflow: hidden; box-shadow: 0 4px 8px rgba(0,0,0,0.5);">
@@ -411,7 +418,7 @@ def generate_colorful_html_table(df, side):
         <tbody>
     """
     
-    for idx, row in df.iterrows():
+    for idx, row in df.reset_index(drop=True).iterrows():
         bg_color = "#1e1e1e" if idx % 2 == 0 else "#252526"
         pct = row['% Change']
         pct_color = "#4caf50" if pct > 0 else "#f44336" if pct < 0 else "#ffffff"
@@ -441,9 +448,13 @@ def generate_colorful_html_table(df, side):
 
 def send_email_report(df):
     if not all([SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL]):
+        logger.warning("[EMAIL] Missing SMTP configurations. Dispatch halted.")
         return
 
+    df = df.copy()
     df['setup_name'] = df.apply(lambda r: determine_setup(r)[0], axis=1)
+    
+    # Strictly isolate Sweet Spot and Harmony confirmations, dropping overextended or noisy channels
     df_elite = df[df['setup_name'].isin(["🎯 Sweet Spot", "⚖️ Harmony"])].copy()
 
     bulls = df_elite[(df_elite['Trend'] == 'BULLISH') & (df_elite['TMV_Rank'] > 0)].sort_values('TMV_Diff', ascending=False).head(15)
@@ -489,16 +500,16 @@ def send_email_report(df):
     """
     msg.attach(MIMEText(html, "html"))
 
-    try:
-        if os.path.exists(HISTORY_CSV):
+    if os.path.exists(HISTORY_CSV):
+        try:
             with open(HISTORY_CSV, "rb") as f:
                 part = MIMEBase("application", "octet-stream")
                 part.set_payload(f.read())
             encoders.encode_base64(part)
             part.add_header("Content-Disposition", f'attachment; filename="{HISTORY_CSV}"')
             msg.attach(part)
-    except:
-        pass
+        except Exception as e:
+            logger.error(f"[EMAIL] Failed to attach log history payload: {e}")
 
     try:
         server = smtplib.SMTP("smtp.gmail.com", 587)
@@ -518,7 +529,10 @@ def main():
     print("[LAUNCH] ASIT v12.2 - UNWEIGHTED CONFLUENCE EDITION")
     print("=" * 80)
     symbols = get_live_fno_symbols()
-    if not symbols: sys.exit()
+    if not symbols: 
+        logger.error("[TERMINATE] No underlying options targets found inside the session.")
+        sys.exit(1)
+        
     pre_calculate_market_baseline()
     
     results = []
@@ -526,9 +540,13 @@ def main():
         futures = {executor.submit(scan_symbol, sym): sym for sym in symbols}
         for idx, future in enumerate(as_completed(futures), 1):
             try:
-                if res := future.result(): results.append(res)
-                if idx % 20 == 0: logger.info(f"[SCAN] Processing Elite Matrix: {idx}/{len(symbols)} complete...")
-            except: pass
+                res = future.result()
+                if res: 
+                    results.append(res)
+                if idx % 20 == 0: 
+                    logger.info(f"[SCAN] Processing Elite Matrix: {idx}/{len(symbols)} complete...")
+            except Exception as e:
+                logger.debug(f"[THREAD ERROR] Error executing processing scan: {e}")
 
     if results:
         df_final = manage_daily_history(results)
@@ -536,6 +554,8 @@ def main():
         print("=" * 80)
         print("[SUCCESS] Operational Phase Concluded.")
         print("=" * 80)
+    else:
+        logger.error("[FATAL ERROR] System Matrix failed to generate output configurations.")
 
 if __name__ == "__main__":
     main()
