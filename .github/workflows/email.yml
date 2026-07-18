@@ -50,7 +50,7 @@ jobs:
           SMTP_PORT:       ${{ secrets.SMTP_PORT }}
           TZ:              Asia/Kolkata
         run: |
-          python EMAIL.py
+          python EMAIL.py  --date "2026-07-04 13:00"
 
       # NEW: persist updated DB for the next run
       - name: Upload intraday DB
