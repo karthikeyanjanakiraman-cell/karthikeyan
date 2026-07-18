@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-ASIT BARAN PATI STRATEGY - PRODUCTION v17.0 - CROSS-SECTIONAL VOLUME PHYSICS
-NEW: MTF RELATIVE PERCENTILE RANKING | OBV + 10 EMA TREND ANCHOR | CROSS-MARKET UNIVERSE SCORING
+ASIT BARAN PATI STRATEGY - PRODUCTION v17.1 - CROSS-SECTIONAL VOLUME PHYSICS
+FIXED: PANDAS TIE-BREAKER COLLISION | RELATIVE KINETIC MULTIPLIERS | 30-DAY AVG ANCHOR
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -169,27 +169,38 @@ def get_fractal_decay_score(df_session):
         return 1.0
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# PHASE 1: RAW DATA EXTRACTION (NO SCORING YET)
+# PHASE 1: RELATIVE KINETIC EXTRACTION
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def extract_raw_physics(symbol):
     df = get_15m_history_6m(symbol)
     if df is None or len(df) < 10: return None
     
-    # 1. ASIT'S TREND ANCHOR (OBV + 10 EMA)
+    # ASIT'S TREND ANCHOR (OBV + 10 EMA)
     df['price_dir'] = np.sign(df['close'].diff().fillna(0))
     df['obv'] = (df['price_dir'] * df['volume']).cumsum()
     df['obv_ema10'] = df['obv'].ewm(span=10, adjust=False).mean()
     
     df['date'] = df['timestamp'].dt.date
-    daily_vol = df.groupby('date')['volume'].sum()
-    valid_dates = daily_vol[daily_vol > 10000].index
-    if len(valid_dates) == 0: return None
     
-    last_date = valid_dates[-1] 
-    
+    # Core Physics Variables
     df['vol_diff'] = df['volume'].diff().fillna(0)
     df['vol_violence'] = df['vol_diff'].abs()               
     df['vol_accel'] = df['vol_diff'].clip(lower=0)          
+    
+    # Aggregate daily to find baselines
+    daily_stats = df.groupby('date').agg({
+        'volume': 'sum',
+        'vol_violence': 'sum',
+        'vol_accel': 'sum'
+    })
+    
+    valid_dates = daily_stats[daily_stats['volume'] > 10000].index
+    if len(valid_dates) < 5: return None # Need minimum history
+    
+    last_date = valid_dates[-1] 
+    historical_dates = valid_dates[:-1][-30:] # Lookback at the last 30 valid days
+    
+    if len(historical_dates) == 0: return None
     
     df_session = df[df['date'] == last_date].copy()
     if df_session.empty: return None
@@ -199,41 +210,31 @@ def extract_raw_physics(symbol):
     last_ema = df_session['obv_ema10'].iloc[-1]
     trend = 'BULLISH' if last_obv >= last_ema else 'BEARISH'
     
-    T_session = len(df_session) * 15 
-    if T_session == 0: T_session = 15
+    # Today's Kinetic Energy
+    today_mass = df_session['volume'].sum()
+    today_violence = df_session['vol_violence'].sum()
+    today_accel = df_session['vol_accel'].sum()
     
-    target_mass = df_session['volume'].sum()
-    target_violence = df_session['vol_violence'].sum()
-    target_accel = df_session['vol_accel'].sum()
+    # 30-Day Historical Baselines
+    hist_stats = daily_stats.loc[historical_dates]
+    avg_mass = hist_stats['volume'].mean()
+    avg_violence = hist_stats['vol_violence'].mean()
+    avg_accel = hist_stats['vol_accel'].mean()
     
-    record_mass, record_violence, record_accel = T_session, T_session, T_session
-    
-    for d in valid_dates[:-1]:
-        df_day = df[df['date'] == d]
-        if df_day.empty: continue
-        
-        cum_mass = df_day['volume'].cumsum().values
-        cum_violence = df_day['vol_violence'].cumsum().values
-        cum_accel = df_day['vol_accel'].cumsum().values
-        
-        idx_mass = np.argmax(cum_mass >= target_mass) if np.any(cum_mass >= target_mass) else -1
-        if idx_mass != -1: record_mass = min(record_mass, (idx_mass + 1) * 15)
-                
-        idx_violence = np.argmax(cum_violence >= target_violence) if np.any(cum_violence >= target_violence) else -1
-        if idx_violence != -1: record_violence = min(record_violence, (idx_violence + 1) * 15)
-                
-        idx_accel = np.argmax(cum_accel >= target_accel) if np.any(cum_accel >= target_accel) else -1
-        if idx_accel != -1: record_accel = min(record_accel, (idx_accel + 1) * 15)
+    # The Fix: Relative Kinetic Multipliers
+    mass_mult = today_mass / avg_mass if avg_mass > 0 else 1.0
+    violence_mult = today_violence / avg_violence if avg_violence > 0 else 1.0
+    accel_mult = today_accel / avg_accel if avg_accel > 0 else 1.0
 
     decay_score = get_fractal_decay_score(df_session)
     
     return {
         'Symbol': symbol.replace('NSE:', '').replace('-EQ', ''),
-        'record_mass': record_mass,
-        'record_violence': record_violence,
-        'record_accel': record_accel,
+        'mass_mult': mass_mult,
+        'violence_mult': violence_mult,
+        'accel_mult': accel_mult,
         'decay_score': decay_score,
-        'target_mass': target_mass,
+        'target_mass': today_mass,
         'Trend': trend,
         'LTP': df_session['close'].iloc[-1],
         'session_date': last_date
@@ -305,12 +306,12 @@ def send_email_report(df_universe):
     <html>
     <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #121212; color: #e0e0e0; padding: 20px;">
       <div style="text-align: center; margin-bottom: 30px;">
-          <h2 style="color: #00e676; margin-bottom: 5px;">ASIT CROSS-MARKET PHYSICS ENGINE (v17.0)</h2>
+          <h2 style="color: #00e676; margin-bottom: 5px;">ASIT CROSS-MARKET PHYSICS ENGINE (v17.1)</h2>
       </div>
       <h3 style="color: #4caf50;">🚀 Institutional Inflows (OBV > 10 EMA)</h3>
       {generate_html_table(bulls, "BULLISH")}
       <br><br>
-      <h3 style="color: #f44336;">🔻 Institutional Outflows (OBV < 10 EMA)</h3>
+      <h3 style="color: #f44336;">🔻 Institutional Outflows (OBV &lt; 10 EMA)</h3>
       {generate_html_table(bears, "BEARISH")}
     </body>
     </html>
@@ -332,7 +333,7 @@ def send_email_report(df_universe):
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def main():
     print("=" * 80)
-    print("[LAUNCH] ASIT v17.0 - CROSS-MARKET VOLUME PHYSICS")
+    print("[LAUNCH] ASIT v17.1 - CROSS-MARKET VOLUME PHYSICS")
     print("=" * 80)
     
     symbols = get_live_fno_symbols()
@@ -359,13 +360,13 @@ def main():
         logger.error("[WARNING] 0 valid symbols returned. Check API errors.")
         return
 
-    # THE MAGIC: Cross-Sectional Universe Ranking
+    # THE MAGIC: True Float-Based Cross-Sectional Ranking
     df_universe = pd.DataFrame(raw_results)
     
-    # We rank descending so the LOWEST time to achieve the target gets the HIGHEST percentile rank
-    df_universe['Mass_Rank'] = df_universe['record_mass'].rank(pct=True, ascending=False) * 100
-    df_universe['Violence_Rank'] = df_universe['record_violence'].rank(pct=True, ascending=False) * 100
-    df_universe['Accel_Rank'] = df_universe['record_accel'].rank(pct=True, ascending=False) * 100
+    # We rank ascending=True so the HIGHEST relative multiplier gets the HIGHEST percentile rank
+    df_universe['Mass_Rank'] = df_universe['mass_mult'].rank(pct=True, ascending=True) * 100
+    df_universe['Violence_Rank'] = df_universe['violence_mult'].rank(pct=True, ascending=True) * 100
+    df_universe['Accel_Rank'] = df_universe['accel_mult'].rank(pct=True, ascending=True) * 100
     
     df_universe['Base_Score'] = (df_universe['Mass_Rank'] + df_universe['Violence_Rank'] + df_universe['Accel_Rank']) / 3.0
     
