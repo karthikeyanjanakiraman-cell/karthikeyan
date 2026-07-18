@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-ASIT BARAN PATI TMV ENGINE - PRODUCTION v24.0 (5-MIN CANDLE + RANK VELOCITY BUILD)
+ASIT BARAN PATI TMV ENGINE - PRODUCTION v24.2 (5-MIN CANDLE + 5-MIN RANK VELOCITY)
 FEATURES: 
 - Dynamic F&O Universe (Column Hunting & Regex)
 - 5-Minute Candle High-Frequency Resolution Engine
@@ -11,8 +11,8 @@ FEATURES:
 - Anchored Volatility Range (Tied strictly to the Max Volume Day)
 - Intraday Volume Slicing (Vol Pace - Last 45 mins vs Baseline)
 - Kinetic Acceleration (Accelerating vs Supernova)
-- In-Memory Snapshot Momentum Tracker (T-30 Mins Lookback)
-- Primary Sorting Configured Strictly by Rank Velocity (Rank Delta)
+- In-Memory Snapshot Momentum Tracker (T-5 Mins Lookback = 1 Candle)
+- RESTORED: Primary Sorting Configured Strictly by Volat_Ratio & Vol_Pace
 - Clean Responsive HTML Email Matrix (7-Column Extended CSS Architecture)
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
@@ -192,12 +192,12 @@ def extract_raw_physics(symbol, target_dt=None):
         else:
             vol_pace = 1.0 
 
-        # IN-MEMORY HISTORICAL SNAPSHOT GENERATOR (T-30 Mins Lookback = 6 Candles Back)
+        # --- IN-MEMORY HISTORICAL SNAPSHOT GENERATOR (T-5 Mins Lookback = 1 Candle Back) ---
         past_volat_ratio = 0.0
         past_vol_pace = 1.0
         
-        if len(today_df) > 6:
-            past_today_df = today_df.iloc[:-6]
+        if len(today_df) > 1: # Require at least 2 candles to look back 1 candle
+            past_today_df = today_df.iloc[:-1] # Hides EXACTLY the last 5 minutes (1 candle)
             curr_range_past = (past_today_df['high'].max() - past_today_df['low'].min())
             past_volat_ratio = curr_range_past / max_range if max_range > 0 else 0
             
@@ -205,6 +205,7 @@ def extract_raw_physics(symbol, target_dt=None):
                 recent_vol_avg_past = past_today_df['volume'].tail(3).mean()
                 baseline_vol_avg_past = past_today_df['volume'].iloc[:-3].mean()
                 past_vol_pace = (recent_vol_avg_past / baseline_vol_avg_past) if baseline_vol_avg_past > 0 else 1.0
+        # ----------------------------------------------------------------------------------
 
         # TREND ANCHOR (OBV 10 EMA)
         df['price_dir'] = np.where(df['close'] > df['close'].shift(1), 1, 
@@ -230,7 +231,7 @@ def extract_raw_physics(symbol, target_dt=None):
         return None
 
 # ==========================================
-# 5. HTML REPORT GENERATOR & DISPATCH (7-COLUMN RESPLENDENT MATRIX)
+# 5. HTML REPORT GENERATOR & DISPATCH
 # ==========================================
 def send_html_email(bullish_df, bearish_df, sort_cols):
     criteria_str = ", ".join([c.replace('_', ' ') for c in sort_cols]).upper()
@@ -257,16 +258,16 @@ def send_html_email(bullish_df, bearish_df, sort_cols):
       <body>
         <h2 style="color: #1b5e20;">🚀 TOP BULLISH BREAKOUTS (SORTED BY {criteria_str})</h2>
         <table class="bullish">
-          <tr><th>Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>Vol Pace</th><th>Accel</th><th>Rank Vel</th></tr>
+          <tr><th>Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>Vol Pace</th><th>Accel</th><th>Rank Vel (5m)</th></tr>
           {"".join(f"<tr><td class='symbol'>{row['Symbol']}</td><td>₹{row['LTP']:.2f}</td><td>{row['Vol_Ratio']:.2f}x</td><td class='highlight'>{row['Volat_Ratio']:.2f}x</td><td class='pace'>{row['Vol_Pace']:.2f}x</td><td>{row['Accel']:.2f}x</td><td>{row['Rank_Vel_Str']}</td></tr>" for _, row in bullish_df.iterrows())}
         </table>
 
         <h2 style="color: #b71c1c;">🩸 TOP BEARISH BREAKDOWNS (SORTED BY {criteria_str})</h2>
         <table class="bearish">
-          <tr><th>Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>Vol Pace</th><th>Accel</th><th>Rank Vel</th></tr>
+          <tr><th>Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>Vol Pace</th><th>Accel</th><th>Rank Vel (5m)</th></tr>
           {"".join(f"<tr><td class='symbol'>{row['Symbol']}</td><td>₹{row['LTP']:.2f}</td><td>{row['Vol_Ratio']:.2f}x</td><td class='highlight'>{row['Volat_Ratio']:.2f}x</td><td class='pace'>{row['Vol_Pace']:.2f}x</td><td>{row['Accel']:.2f}x</td><td>{row['Rank_Vel_Str']}</td></tr>" for _, row in bearish_df.iterrows())}
         </table>
-        <p style="font-size: 12px; color: #777; text-align: center;">Asit Baran Pati TMV Engine v24.0 • Generated at {datetime.now().strftime('%I:%M %p')}</p>
+        <p style="font-size: 12px; color: #777; text-align: center;">Asit Baran Pati TMV Engine v24.2 • Generated at {datetime.now().strftime('%I:%M %p')}</p>
       </body>
     </html>
     """
@@ -296,7 +297,6 @@ def main():
     target_dt = None
     if args.date:
         try:
-            # Handle dots-to-colons normalization safety frame
             date_str = args.date.replace('.', ':')
             target_dt = pd.to_datetime(date_str, dayfirst=True).tz_localize("Asia/Kolkata")
             logger.info(f"--- BACKTEST MODE: Simulating {target_dt} ---")
@@ -327,20 +327,20 @@ def main():
         
     df_results = df_results.round(2)
     
-    # --- RANK VELOCITY ENGINE MATRIX MATH ---
+    # --- RANK VELOCITY METRIC CALCULATION (5-Minute Speedometer) ---
     def calculate_rank_velocity(trend_df):
         if trend_df.empty: return trend_df
         
-        # 1. Backtrack baseline: Rank positions as of T-30 minutes ago
+        # 1. Backtrack baseline: Rank positions based on original Volat_Ratio & Vol_Pace as of T-5 mins ago (1 candle)
         trend_df['Past_Rank'] = trend_df[['Past_Volat_Ratio', 'Past_Vol_Pace']].apply(tuple, axis=1).rank(method='min', ascending=False)
         
-        # 2. Modern baseline: Rank positions right now
+        # 2. Modern baseline: Rank positions right now using the identical logic
         trend_df['Curr_Rank'] = trend_df[['Volat_Ratio', 'Vol_Pace']].apply(tuple, axis=1).rank(method='min', ascending=False)
         
-        # 3. Compute Rank Velocity Delta (Positive delta equals an upward charge)
+        # 3. Compute Rank Velocity Delta (Past - Current)
         trend_df['Rank_Delta'] = trend_df['Past_Rank'] - trend_df['Curr_Rank']
         
-        # 4. Generate beautifully styled status markup for the dedicated column
+        # 4. Generate visual indicators for the Rank Vel column
         def format_velocity(row):
             if row['Past_Volat_Ratio'] == 0: 
                 return "<span style='color:gray;'>➖ N/A</span>"
@@ -353,14 +353,15 @@ def main():
                 
         trend_df['Rank_Vel_Str'] = trend_df.apply(format_velocity, axis=1)
         
-        # 5. EXECUTE SCAN SORTING BY RANK VELOCITY PRIMARY MATRIX (Volat_Ratio handles tie breaks)
-        return trend_df.sort_values(['Rank_Delta', 'Volat_Ratio'], ascending=[False, False]).head(15)
+        # 5. RESTORED ORIGINAL SCAN SORTING CRITERIA: Sorted primarily by Volat_Ratio, then Vol_Pace
+        SORT_CRITERIA = ['Volat_Ratio', 'Vol_Pace']
+        return trend_df.sort_values(SORT_CRITERIA, ascending=[False, False]).head(15)
 
     bullish_df = calculate_rank_velocity(df_results[df_results['Trend'] == 'BULLISH'].copy())
     bearish_df = calculate_rank_velocity(df_results[df_results['Trend'] == 'BEARISH'].copy())
     
-    # Dispatch Email Report Matrix Configuration
-    send_html_email(bullish_df, bearish_df, ['Rank_Velocity', 'Volat_Ratio'])
+    # Pass original matrix naming to email headers
+    send_html_email(bullish_df, bearish_df, ['Volat_Ratio', 'Vol_Pace'])
     logger.info("System execution completed successfully.")
  
 if __name__ == "__main__":
