@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-ASIT BARAN PATI TMV ENGINE - PRODUCTION v19.0 (BULLETPROOF EDITION)
-FIXES APPLIED: Pre-market exclusion, Exact Historical Max split, Safe Kinetic Tiers, API Limits
+ASIT BARAN PATI TMV ENGINE - PRODUCTION v19.1 (FINAL BULLETPROOF EDITION)
+FEATURES: Dynamic F&O Universe, Time-Sliced Ceilings, Kinetic Accel, Cross-Sectional Ranking
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -24,7 +24,7 @@ import requests
 from fyers_apiv3 import fyersModel
 
 # ===== LOGGING SETUP =====
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # ===== CREDENTIALS =====
@@ -38,25 +38,41 @@ FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=False, log_path="")
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# 1. DYNAMIC F&O UNIVERSE BUILDER
+# 1. DYNAMIC F&O UNIVERSE BUILDER (Fixed Column Hunt & Regex)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def fetch_fo_universe():
     logger.info("Fetching Master F&O Universe...")
     try:
-        response = requests.get(FYERS_FO_MASTER_URL)
+        response = requests.get(FYERS_FO_MASTER_URL, timeout=15)
         df = pd.read_csv(StringIO(response.text), header=None)
-        raw_symbols = df[1].astype(str).tolist()
+        
+        # Dynamically hunt for the column containing the Fyers 'NSE:' tags
+        symbol_col = None
+        for col in df.columns:
+            if df[col].astype(str).str.startswith('NSE:').any():
+                symbol_col = col
+                break
+                
+        if symbol_col is None:
+            logger.error("CRITICAL: Could not locate the Symbol column in Fyers CSV.")
+            return []
+            
+        raw_symbols = df[symbol_col].astype(str).tolist()
         
         base_symbols = set()
         for s in raw_symbols:
-            if s.startswith('NSE:'):
-                match = re.search(r'NSE:([A-Z&]+)\d+', s)
-                if match: base_symbols.add(match.group(1))
+            # Regex handles standard text, ampersands (M&M), and hyphens (BAJAJ-AUTO)
+            match = re.search(r'NSE:([A-Z&\-]+)\d+', s)
+            if match: 
+                base_symbols.add(match.group(1))
         
         ignore_list = {'NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'}
         base_symbols = base_symbols - ignore_list
         
-        return [f"NSE:{sym}-EQ" for sym in base_symbols]
+        universe = [f"NSE:{sym}-EQ" for sym in base_symbols]
+        logger.info(f"Successfully extracted {len(universe)} F&O equities.")
+        return universe
+        
     except Exception as e:
         logger.error(f"Failed to fetch Universe: {e}")
         return []
@@ -81,7 +97,6 @@ def calculate_kinetic_acceleration(df_today, target_vol):
     t3 = get_time_to_reach(0.875) # Time to 87.5%
     t4 = get_time_to_reach(1.0)   # Time to 100%
     
-    # Measure deltas (time spent inside each tier)
     if t1 and t2 and t3:
         delta_1 = t2 - t1
         delta_2 = t3 - t2
@@ -95,14 +110,14 @@ def calculate_kinetic_acceleration(df_today, target_vol):
     return 1.0
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# 3. CORE PHYSICS ENGINE (Fixed time boundaries & historical splitting)
+# 3. CORE PHYSICS ENGINE (Time-Sliced & Historical Splitting)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def extract_raw_physics(symbol):
     try:
         time.sleep(0.1) # Prevent API Rate Limit (429 Error)
         now_dt = pd.Timestamp.now(tz="Asia/Kolkata")
         
-        # Max 90 days for 15m resolution to avoid Fyers API rejection
+        # Max 90 days for 15m resolution to avoid Fyers API limits
         payload = {
             "symbol": symbol, "resolution": "15", "date_format": 1,
             "range_from": (now_dt - timedelta(days=90)).strftime("%Y-%m-%d"),
@@ -115,25 +130,25 @@ def extract_raw_physics(symbol):
         df = pd.DataFrame(res['candles'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True).dt.tz_convert("Asia/Kolkata")
         
-        # FIX: Strict Time Boundaries (9:15 AM to Current Time)
+        # Strict Time Boundaries (9:15 AM to Current Time)
         market_open = dt_time(9, 15)
         current_time = now_dt.time()
         
         df['date'] = df['timestamp'].dt.date
         df['time'] = df['timestamp'].dt.time
         
-        # Only keep candles during market hours, up to the current time of day
+        # Keep only active market hours up to the current run-time
         df = df[(df['time'] >= market_open) & (df['time'] <= current_time)]
         if df.empty: return None
         
-        # FIX: Separate History from Today
+        # Separate History from Today (Prevents self-inflation bug)
         today_date = now_dt.date()
         history_df = df[df['date'] < today_date]
         today_df = df[df['date'] == today_date]
         
         if history_df.empty or today_df.empty: return None
         
-        # Calculate Historical Ceilings
+        # Historical Ceilings (The Benchmark)
         daily_groups = history_df.groupby('date').agg({'volume': 'sum', 'high': 'max', 'low': 'min'})
         daily_groups['range'] = daily_groups['high'] - daily_groups['low']
         
@@ -141,14 +156,14 @@ def extract_raw_physics(symbol):
         max_range = daily_groups['range'].max()
         if max_vol == 0 or max_range == 0: return None
         
-        # Today's Action
+        # Today's Real-time Performance
         curr_vol = today_df['volume'].sum()
         curr_range = (today_df['high'].max() - today_df['low'].min())
         
         vol_ratio = curr_vol / max_vol
         volatility_ratio = curr_range / max_range
         
-        # Trend Anchor (OBV EMA)
+        # Trend Anchor (OBV vs 10 EMA)
         df['price_dir'] = np.where(df['close'] > df['close'].shift(1), 1, 
                           np.where(df['close'] < df['close'].shift(1), -1, 0))
         df['obv'] = (df['price_dir'] * df['volume']).cumsum()
@@ -169,7 +184,7 @@ def extract_raw_physics(symbol):
         return None
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# 4. EXECUTION & EMAIL
+# 4. EXECUTION & DISPATCH
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def send_html_email(bullish_df, bearish_df):
     logger.info("Formatting and dispatching HTML Email...")
@@ -179,17 +194,17 @@ def send_html_email(bullish_df, bearish_df):
         <h2 style="color: #2e7d32;">🔥 TOP BULLISH BREAKOUTS</h2>
         <table style="width: 100%; border-collapse: collapse; text-align: left;">
           <tr style="background-color: #2e7d32; color: white;">
-            <th>Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>TMV Score</th>
+            <th style="padding: 10px;">Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>TMV Score</th>
           </tr>
-          {"".join(f"<tr><td style='border-bottom: 1px solid #ddd; padding: 8px;'>{row['Symbol']}</td><td style='border-bottom: 1px solid #ddd;'>{row['LTP']}</td><td style='border-bottom: 1px solid #ddd;'>{row['Vol_Ratio']}x</td><td style='border-bottom: 1px solid #ddd;'>{row['Volat_Ratio']}x</td><td style='border-bottom: 1px solid #ddd;'>{row['TMV_Score']}</td></tr>" for _, row in bullish_df.iterrows())}
+          {"".join(f"<tr><td style='border-bottom: 1px solid #ddd; padding: 10px;'><b>{row['Symbol']}</b></td><td style='border-bottom: 1px solid #ddd;'>{row['LTP']}</td><td style='border-bottom: 1px solid #ddd;'>{row['Vol_Ratio']}x</td><td style='border-bottom: 1px solid #ddd;'>{row['Volat_Ratio']}x</td><td style='border-bottom: 1px solid #ddd;'><b>{row['TMV_Score']}</b></td></tr>" for _, row in bullish_df.iterrows())}
         </table>
 
         <h2 style="color: #c62828; margin-top: 40px;">🩸 TOP BEARISH BREAKDOWNS</h2>
         <table style="width: 100%; border-collapse: collapse; text-align: left;">
           <tr style="background-color: #c62828; color: white;">
-            <th>Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>TMV Score</th>
+            <th style="padding: 10px;">Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>TMV Score</th>
           </tr>
-          {"".join(f"<tr><td style='border-bottom: 1px solid #ddd; padding: 8px;'>{row['Symbol']}</td><td style='border-bottom: 1px solid #ddd;'>{row['LTP']}</td><td style='border-bottom: 1px solid #ddd;'>{row['Vol_Ratio']}x</td><td style='border-bottom: 1px solid #ddd;'>{row['Volat_Ratio']}x</td><td style='border-bottom: 1px solid #ddd;'>{row['TMV_Score']}</td></tr>" for _, row in bearish_df.iterrows())}
+          {"".join(f"<tr><td style='border-bottom: 1px solid #ddd; padding: 10px;'><b>{row['Symbol']}</b></td><td style='border-bottom: 1px solid #ddd;'>{row['LTP']}</td><td style='border-bottom: 1px solid #ddd;'>{row['Vol_Ratio']}x</td><td style='border-bottom: 1px solid #ddd;'>{row['Volat_Ratio']}x</td><td style='border-bottom: 1px solid #ddd;'><b>{row['TMV_Score']}</b></td></tr>" for _, row in bearish_df.iterrows())}
         </table>
       </body>
     </html>
@@ -210,11 +225,17 @@ def send_html_email(bullish_df, bearish_df):
         logger.error(f"Failed to send email: {e}")
 
 def main():
+    logger.info("Initializing TMV Engine v19.1...")
     symbols = fetch_fo_universe()
-    if not symbols: return
+    
+    if not symbols: 
+        logger.error("Universe is completely empty. Shutting down engine.")
+        return
         
     results = []
-    # FIX: max_workers lowered to 4 to prevent API blocking
+    logger.info(f"Scanning {len(symbols)} symbols. This will take ~60 seconds to respect API limits...")
+    
+    # Using 4 workers to prevent API rate limiting
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(extract_raw_physics, sym): sym for sym in symbols}
         for future in as_completed(futures):
@@ -223,26 +244,31 @@ def main():
             
     df_results = pd.DataFrame(results)
     if df_results.empty: 
-        logger.error("No valid data processed. Exiting.")
+        logger.error("No valid data processed. Market might be closed or API down. Exiting.")
         return
         
+    # Cross-Sectional Percentile Ranking
     df_results['Vol_Rank'] = df_results['Vol_Ratio'].rank(pct=True)
     df_results['Volat_Rank'] = df_results['Volat_Ratio'].rank(pct=True)
     df_results['Accel_Rank'] = df_results['Accel'].rank(pct=True)
     
+    # Master Score (100-point scale)
     df_results['TMV_Score'] = (
         (df_results['Vol_Rank'] * 0.5) + 
         (df_results['Volat_Rank'] * 0.3) + 
         (df_results['Accel_Rank'] * 0.2)
     ) * 100
     
+    # Format for readability
     df_results = df_results.round(2)
     
+    # Slicing the Top 15
     bullish_df = df_results[df_results['Trend'] == 'BULLISH'].sort_values('TMV_Score', ascending=False).head(15)
     bearish_df = df_results[df_results['Trend'] == 'BEARISH'].sort_values('TMV_Score', ascending=False).head(15)
     
-    print("\n[+] Calculation Complete. Dispatching results to Email...")
+    print("\n[+] Math complete. Generating HTML...")
     send_html_email(bullish_df, bearish_df)
+    logger.info("Run completed successfully.")
     
 if __name__ == "__main__":
     main()
