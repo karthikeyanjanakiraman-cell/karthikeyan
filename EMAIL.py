@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 CLIENT_ID = os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN") or os.environ.get("ACCESSTOKEN")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
-SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD") # MUST BE APP PASSWORD
+SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD") # MUST BE GOOGLE APP PASSWORD
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL")
 
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
@@ -239,13 +239,14 @@ def scan_symbol(symbol):
     
     if not res or res['target_mass'] == 0: return None
     
-    # Require at least 20% of maximum historical speed
+    # --- WEEKEND FIX: Threshold lowered from 0.20 to 0.02 ---
+    # This prevents Friday's End-of-Day decayed stocks from being completely filtered out
     avg_ratio = abs(res['net_rank']) / 15.0
     if avg_ratio < 0.02: return None
     
     if avg_ratio >= 0.80: status = "🔥 Apex Breakout"
     elif avg_ratio >= 0.60: status = "🎯 Extreme Force"
-    elif avg_ratio >= 0.40: status = "⚖️ Institutional Flow"
+    elif avg_ratio >= 0.30: status = "⚖️ Institutional Flow"
     else: status = "🔄 Standard Flow"
 
     return {
@@ -327,15 +328,18 @@ def send_email_report(results_list):
 
     msg = MIMEMultipart("alternative")
     msg["From"], msg["To"] = SENDER_EMAIL, RECIPIENT_EMAIL
-    msg["Subject"] = f"Fractal Physics Matrix - {datetime.now().strftime('%d %b %H:%M')}"
+    
+    # --- ASIT BRANDING IN SUBJECT LINE ---
+    msg["Subject"] = f"ASIT Physics Matrix - {datetime.now().strftime('%d %b %H:%M')}"
 
     html = f"""
     <html>
     <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #121212; color: #e0e0e0; padding: 20px;">
       
       <div style="text-align: center; margin-bottom: 30px;">
-          <h2 style="color: #ffffff; margin-bottom: 5px;">Pure Volume Physics Engine (v16.3)</h2>
-          <p style="color: #aaaaaa; margin-top: 0;"><b>Fractal Tape Pulse Active</b></p>
+          <!-- ASIT BRANDING IN HEADER -->
+          <h2 style="color: #00e676; margin-bottom: 5px;">ASIT FRACTAL PHYSICS ENGINE (v16.3)</h2>
+          <p style="color: #aaaaaa; margin-top: 0;"><b>Proprietary Order Flow & Tape Pulse Matrix</b></p>
       </div>
       
       <h3 style="color: #4caf50; border-bottom: 2px solid #4caf50; padding-bottom: 5px; display: inline-block;">🚀 Institutional Inflows (Above VWAP)</h3>
@@ -347,12 +351,13 @@ def send_email_report(results_list):
       {generate_html_table(bears, "BEARISH")}
       
       <div style="margin-top: 40px; padding: 15px; background-color: #1e1e1e; border-radius: 8px; border-left: 4px solid #00e676;">
-          <h4 style="color: #ffffff; margin-top: 0;">The 4 Pillars of Fractal Physics:</h4>
+          <!-- ASIT STRATEGY BREAKDOWN -->
+          <h4 style="color: #ffffff; margin-top: 0;">The ASIT Strategy - 4 Pillars of Fractal Physics:</h4>
           <ul style="color: #cccccc; line-height: 1.6;">
             <li><b style="color:#64b5f6;">Mass:</b> How fast total volume aggregated vs 6-month peak.</li>
             <li><b style="color:#ff9800;">Violence:</b> Speed of block-to-block fluctuations (The Warfare).</li>
             <li><b style="color:#4caf50;">Accel:</b> Rate of volume speeding up.</li>
-            <li><b style="color:#ff5252;">Tape Pulse (The Trap Filter):</b> Measures time-to-clear. If > 1.2, volume is dying. Net speed is mathematically crushed to protect you from fakeouts.</li>
+            <li><b style="color:#ff5252;">Tape Pulse (The Trap Filter):</b> Recursive halving of volume blocks. If > 1.2, volume is dying. Net speed is mathematically crushed to protect from fakeouts.</li>
           </ul>
       </div>
     </body>
@@ -366,7 +371,7 @@ def send_email_report(results_list):
         server.login(SENDER_EMAIL, SENDER_PASSWORD)
         server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
         server.quit()
-        logger.info(f"[EMAIL] Matrix successfully dispatched.")
+        logger.info(f"[EMAIL] ASIT Matrix successfully dispatched.")
     except Exception as e:
         logger.error(f"[EMAIL] SMTP Transmission Error: {e}")
 
@@ -386,6 +391,7 @@ def main():
     logger.info(f"Loaded {len(symbols)} F&O Symbols. Beginning Physics Analysis...")
     
     results = []
+    # Multithreading set to 3 workers to respect API limits across 210 symbols
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {executor.submit(scan_symbol, sym): sym for sym in symbols}
         for idx, future in enumerate(as_completed(futures), 1):
