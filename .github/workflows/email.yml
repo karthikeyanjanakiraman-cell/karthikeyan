@@ -4,7 +4,12 @@ on:
   schedule:
     # Every 5 minutes, 03:00–10:59 UTC (≈ 08:30–16:29 IST), Monday–Friday
     - cron: "*/5 3-10 * * 1-5"
-  workflow_dispatch: {}
+  workflow_dispatch:
+    inputs:
+      backtest_date:
+        description: 'Backtest Date (YYYY-MM-DD HH:MM). Leave empty for Live Mode.'
+        required: false
+        default: ''
 
 permissions:
   contents: write
@@ -29,7 +34,6 @@ jobs:
           python -m pip install --upgrade pip
           pip install fyers_apiv3 pandas numpy scipy ta yfinance
 
-      # NEW: bring back last run's DB (if any) into the workspace
       - name: Download previous intraday DB (if exists)
         uses: actions/download-artifact@v4
         with:
@@ -50,9 +54,14 @@ jobs:
           SMTP_PORT:       ${{ secrets.SMTP_PORT }}
           TZ:              Asia/Kolkata
         run: |
-          python EMAIL.py  --date "2026-07-04 13:00"
+          if [ -n "${{ github.event.inputs.backtest_date }}" ]; then
+            echo "Running in BACKTEST mode for: ${{ github.event.inputs.backtest_date }}"
+            python EMAIL.py --date "${{ github.event.inputs.backtest_date }}"
+          else
+            echo "Running in LIVE mode."
+            python EMAIL.py
+          fi
 
-      # NEW: persist updated DB for the next run
       - name: Upload intraday DB
         if: always()
         uses: actions/upload-artifact@v4
@@ -67,14 +76,11 @@ jobs:
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-
           git fetch origin main
           git pull --rebase origin main || true
-
           if [ -f "intraday_signals.db" ]; then
             git add intraday_signals.db
           fi
-          
           if git diff --cached --quiet; then
             echo "No DB/CSV changes to commit."
           else
