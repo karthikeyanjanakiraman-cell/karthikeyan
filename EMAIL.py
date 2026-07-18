@@ -241,7 +241,7 @@ def scan_symbol(symbol):
     
     # Require at least 20% of maximum historical speed
     avg_ratio = abs(res['net_rank']) / 15.0
-    if avg_ratio < 0.20: return None
+    if avg_ratio < 0.02: return None
     
     if avg_ratio >= 0.80: status = "🔥 Apex Breakout"
     elif avg_ratio >= 0.60: status = "🎯 Extreme Force"
