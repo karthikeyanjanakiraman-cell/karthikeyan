@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-ASIT BARAN PATI TMV ENGINE - PRODUCTION v20.0 (HOLISTIC MASTER BUILD)
+ASIT BARAN PATI TMV ENGINE - PRODUCTION v21.0 (ISOLATED MATRIX BUILD)
 FEATURES: 
 - Dynamic F&O Universe (Column Hunting & Regex)
 - Smart Time Routing (24/7 Execution Safety: Handles Weekends & Pre-Market)
 - Time-Sliced Historical Ceilings (True Apples-to-Apples)
-- Kinetic Acceleration (Velocity of Institutional Buying)
-- Cross-Sectional Percentile Ranking Matrix
-- Responsive HTML Email Dispatch
+- Anchored Volatility Range (Tied strictly to the Max Volume Day)
+- Kinetic Acceleration Column Integration (Unmerged)
+- Volatility Expansion Primary Sorting 
+- Clean Responsive HTML Email Matrix (No TMV Score)
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -161,14 +162,12 @@ def extract_raw_physics(symbol):
         daily_groups = history_df.groupby('date').agg({'volume': 'sum', 'high': 'max', 'low': 'min'})
         daily_groups['range'] = daily_groups['high'] - daily_groups['low']
 
-
-        # Find the specific day with the highest volume
+        # FIXED ANCHOR: Specific day with the highest volume
         max_vol_date = daily_groups['volume'].idxmax()
         
         # Extract the volume AND the price range from that exact same day
         max_vol = daily_groups.loc[max_vol_date, 'volume']
         max_range = daily_groups.loc[max_vol_date, 'range'] 
-        
         
         if max_vol == 0 or max_range == 0: return None
         
@@ -197,7 +196,6 @@ def extract_raw_physics(symbol):
             'LTP': df['close'].iloc[-1]
         }
     except Exception as e:
-        # Fails silently for a single stock to protect the overall thread pool
         return None
 
 # ==========================================
@@ -220,28 +218,28 @@ def send_html_email(bullish_df, bearish_df):
           .bearish th {{ background-color: #b71c1c; color: white; }}
           tr:hover {{ background-color: #f5f5f5; }}
           .symbol {{ font-weight: bold; color: #1a73e8; }}
-          .score {{ font-weight: bold; font-size: 15px; }}
+          .highlight {{ font-weight: bold; color: #333; font-size: 14px; }}
         </style>
       </head>
       <body>
-        <h2 style="color: #1b5e20;">🚀 TOP BULLISH BREAKOUTS</h2>
+        <h2 style="color: #1b5e20;">🚀 TOP BULLISH BREAKOUTS (SORTED BY VOLAT EXP)</h2>
         <table class="bullish">
-          <tr><th>Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>TMV Score</th></tr>
-          {"".join(f"<tr><td class='symbol'>{row['Symbol']}</td><td>₹{row['LTP']:.2f}</td><td>{row['Vol_Ratio']:.2f}x</td><td>{row['Volat_Ratio']:.2f}x</td><td class='score'>{row['TMV_Score']:.1f}</td></tr>" for _, row in bullish_df.iterrows())}
+          <tr><th>Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>Accel</th></tr>
+          {"".join(f"<tr><td class='symbol'>{row['Symbol']}</td><td>₹{row['LTP']:.2f}</td><td>{row['Vol_Ratio']:.2f}x</td><td class='highlight'>{row['Volat_Ratio']:.2f}x</td><td>{row['Accel']:.2f}x</td></tr>" for _, row in bullish_df.iterrows())}
         </table>
 
-        <h2 style="color: #b71c1c;">🩸 TOP BEARISH BREAKDOWNS</h2>
+        <h2 style="color: #b71c1c;">🩸 TOP BEARISH BREAKDOWNS (SORTED BY VOLAT EXP)</h2>
         <table class="bearish">
-          <tr><th>Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>TMV Score</th></tr>
-          {"".join(f"<tr><td class='symbol'>{row['Symbol']}</td><td>₹{row['LTP']:.2f}</td><td>{row['Vol_Ratio']:.2f}x</td><td>{row['Volat_Ratio']:.2f}x</td><td class='score'>{row['TMV_Score']:.1f}</td></tr>" for _, row in bearish_df.iterrows())}
+          <tr><th>Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>Accel</th></tr>
+          {"".join(f"<tr><td class='symbol'>{row['Symbol']}</td><td>₹{row['LTP']:.2f}</td><td>{row['Vol_Ratio']:.2f}x</td><td class='highlight'>{row['Volat_Ratio']:.2f}x</td><td>{row['Accel']:.2f}x</td></tr>" for _, row in bearish_df.iterrows())}
         </table>
-        <p style="font-size: 12px; color: #777; text-align: center;">Asit Baran Pati TMV Engine v20.0 • Generated at {datetime.now().strftime('%I:%M %p')}</p>
+        <p style="font-size: 12px; color: #777; text-align: center;">Asit Baran Pati TMV Engine v21.0 • Generated at {datetime.now().strftime('%I:%M %p')}</p>
       </body>
     </html>
     """
     
     msg = MIMEMultipart("alternative")
-    msg['Subject'] = f"TMV Algorithmic Alert: {datetime.now().strftime('%d %b - %I:%M %p')}"
+    msg['Subject'] = f"TMV Volatility Scan: {datetime.now().strftime('%d %b - %I:%M %p')}"
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECIPIENT_EMAIL
     msg.attach(MIMEText(html, "html"))
@@ -252,13 +250,13 @@ def send_html_email(bullish_df, bearish_df):
             server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
         logger.info("Email dispatched successfully to secure channel.")
     except Exception as e:
-        logger.error(f"Failed to send email. Check credentials/App Password: {e}")
+        logger.error(f"Failed to send email. Check credentials: {e}")
 
 # ==========================================
 # 6. MASTER EXECUTION THREAD
 # ==========================================
 def main():
-    logger.info("Initializing TMV Engine v20.0...")
+    logger.info("Initializing TMV Engine v21.0...")
     symbols = fetch_fo_universe()
     
     if not symbols: 
@@ -268,7 +266,6 @@ def main():
     results = []
     logger.info(f"Commencing Time-Sliced Scan on {len(symbols)} symbols. This will take ~90 seconds...")
     
-    # 4 Workers max to stay under Fyers API constraints
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(extract_raw_physics, sym): sym for sym in symbols}
         for future in as_completed(futures):
@@ -280,17 +277,10 @@ def main():
         logger.error("No valid data processed. Market data missing or API disconnected. Exiting.")
         return
         
-    # CROSS-SECTIONAL MATRIX MATH
-    df_results['Vol_Rank'] = df_results['Vol_Ratio'].rank(pct=True)
-    df_results['Volat_Rank'] = df_results['Volat_Ratio'].rank(pct=True)
-    df_results['Accel_Rank'] = df_results['Accel'].rank(pct=True)
+    df_results = df_results.round(2)
     
-    df_results['TMV_Score'] = (
-        (df_results['Vol_Rank'] * 0.5) + 
-        (df_results['Volat_Rank'] * 0.3) + 
-        (df_results['Accel_Rank'] * 0.2)
-    ) * 100
-    
+    # ISOLATED CROSS-SECTION REFERENCE: Primary Sort strictly via Volat_Ratio (Volatility Expansion)
+    # Metrics are kept totally independent; no merged score is generated.
     bullish_df = df_results[df_results['Trend'] == 'BULLISH'].sort_values('Volat_Ratio', ascending=False).head(15)
     bearish_df = df_results[df_results['Trend'] == 'BEARISH'].sort_values('Volat_Ratio', ascending=False).head(15)
     
