@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-ASIT BARAN PATI STRATEGY - PRODUCTION v16.3 - FRACTAL VOLUME PHYSICS
-ZERO LAG | REAL-TIME TRAP DETECTION (TAPE PULSE) | WEEKEND/HOLIDAY SAFE
+ASIT BARAN PATI STRATEGY - PRODUCTION v16.4 - FRACTAL VOLUME PHYSICS
+FIXED: GHOST WEEKEND CANDLE FILTER | AUTO-DETECTS TRUE TRADING DAY
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -31,7 +31,7 @@ logger = logging.getLogger(__name__)
 CLIENT_ID = os.environ.get("CLIENT_ID") or os.environ.get("CLIENTID")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN") or os.environ.get("ACCESSTOKEN")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL")
-SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD") # MUST BE GOOGLE APP PASSWORD
+SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD")
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL")
 
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
@@ -165,8 +165,15 @@ def process_volume_physics(df):
     if df is None or len(df) < 10: return None
     
     df['date'] = df['timestamp'].dt.date
-    dates = df['date'].unique()
-    last_date = dates[-1] # Safe for weekends/holidays
+    
+    # --- THE GHOST CANDLE FIX ---
+    # We group by date and only consider dates that have more than 10,000 shares traded.
+    # This automatically bypasses any dummy weekend API ticks with 0 volume.
+    daily_vol = df.groupby('date')['volume'].sum()
+    valid_dates = daily_vol[daily_vol > 10000].index
+    if len(valid_dates) == 0: return None
+    
+    last_date = valid_dates[-1] 
     
     df['vol_diff'] = df['volume'].diff().fillna(0)
     df['vol_violence'] = df['vol_diff'].abs()               
@@ -185,7 +192,7 @@ def process_volume_physics(df):
     record_mass, record_violence, record_accel = T_session, T_session, T_session
     
     # 6-Month Tape Reader
-    for d in dates[:-1]:
+    for d in valid_dates[:-1]:
         df_day = df[df['date'] == d]
         if df_day.empty: continue
         
@@ -239,8 +246,7 @@ def scan_symbol(symbol):
     
     if not res or res['target_mass'] == 0: return None
     
-    # --- WEEKEND FIX: Threshold lowered from 0.20 to 0.02 ---
-    # This prevents Friday's End-of-Day decayed stocks from being completely filtered out
+    # Set to 0.02 for weekend testing to allow Friday EOD flow through
     avg_ratio = abs(res['net_rank']) / 15.0
     if avg_ratio < 0.02: return None
     
@@ -296,7 +302,6 @@ def generate_html_table(df, side):
         bg, fg = get_status_colors(row['Status'])
         badge_html = f"<span style='background-color:{bg}; color:{fg}; padding:4px 8px; border-radius:12px; font-size:12px; font-weight:bold; white-space:nowrap;'>{row['Status']}</span>"
         
-        # Color the Tape Pulse. Red = Trap. Green = Good.
         pulse_color = "#ff5252" if row['Decay'] > 1.2 else "#69f0ae" if row['Decay'] < 1.0 else "#e0e0e0"
         
         html += f"""
@@ -329,7 +334,6 @@ def send_email_report(results_list):
     msg = MIMEMultipart("alternative")
     msg["From"], msg["To"] = SENDER_EMAIL, RECIPIENT_EMAIL
     
-    # --- ASIT BRANDING IN SUBJECT LINE ---
     msg["Subject"] = f"ASIT Physics Matrix - {datetime.now().strftime('%d %b %H:%M')}"
 
     html = f"""
@@ -337,8 +341,7 @@ def send_email_report(results_list):
     <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #121212; color: #e0e0e0; padding: 20px;">
       
       <div style="text-align: center; margin-bottom: 30px;">
-          <!-- ASIT BRANDING IN HEADER -->
-          <h2 style="color: #00e676; margin-bottom: 5px;">ASIT FRACTAL PHYSICS ENGINE (v16.3)</h2>
+          <h2 style="color: #00e676; margin-bottom: 5px;">ASIT FRACTAL PHYSICS ENGINE (v16.4)</h2>
           <p style="color: #aaaaaa; margin-top: 0;"><b>Proprietary Order Flow & Tape Pulse Matrix</b></p>
       </div>
       
@@ -351,7 +354,6 @@ def send_email_report(results_list):
       {generate_html_table(bears, "BEARISH")}
       
       <div style="margin-top: 40px; padding: 15px; background-color: #1e1e1e; border-radius: 8px; border-left: 4px solid #00e676;">
-          <!-- ASIT STRATEGY BREAKDOWN -->
           <h4 style="color: #ffffff; margin-top: 0;">The ASIT Strategy - 4 Pillars of Fractal Physics:</h4>
           <ul style="color: #cccccc; line-height: 1.6;">
             <li><b style="color:#64b5f6;">Mass:</b> How fast total volume aggregated vs 6-month peak.</li>
@@ -380,7 +382,7 @@ def send_email_report(results_list):
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def main():
     print("=" * 80)
-    print("[LAUNCH] ASIT v16.3 - FRACTAL VOLUME PHYSICS")
+    print("[LAUNCH] ASIT v16.4 - FRACTAL VOLUME PHYSICS")
     print("=" * 80)
     
     symbols = get_live_fno_symbols()
@@ -391,7 +393,6 @@ def main():
     logger.info(f"Loaded {len(symbols)} F&O Symbols. Beginning Physics Analysis...")
     
     results = []
-    # Multithreading set to 3 workers to respect API limits across 210 symbols
     with ThreadPoolExecutor(max_workers=3) as executor:
         futures = {executor.submit(scan_symbol, sym): sym for sym in symbols}
         for idx, future in enumerate(as_completed(futures), 1):
