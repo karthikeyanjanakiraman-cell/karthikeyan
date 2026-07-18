@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-ASIT BARAN PATI TMV ENGINE - PRODUCTION v22.0 (VOLUME SLICING BUILD)
+ASIT BARAN PATI TMV ENGINE - PRODUCTION v23.5 (EXTENDED + TIME MACHINE BUILD)
 FEATURES: 
 - Dynamic F&O Universe (Column Hunting & Regex)
 - Smart Time Routing (24/7 Execution Safety: Handles Weekends & Pre-Market)
+- Time Machine Backtester (Forces historical anchor for math & slicing)
 - Time-Sliced Historical Ceilings (True Apples-to-Apples)
 - Anchored Volatility Range (Tied strictly to the Max Volume Day)
-- NEW: Intraday Volume Slicing (Vol Pace - Last 45 mins vs Baseline)
-- Kinetic Acceleration Column Integration (Unmerged)
-- Volatility Expansion Primary Sorting 
-- Clean Responsive HTML Email Matrix
+- Intraday Volume Slicing (Vol Pace - Last 45 mins vs Baseline)
+- Kinetic Acceleration (Accelerating vs Supernova)
+- Priority Multi-Column Sorting (Dynamic HTML Headers)
+- Clean Responsive HTML Email Matrix (Extended CSS)
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -90,9 +91,6 @@ def fetch_fo_universe():
 # ==========================================
 # 3. KINETIC ACCELERATION MATH
 # ==========================================
-# ==========================================
-# 3. UPDATED KINETIC ACCELERATION (Intraday Sensitive)
-# ==========================================
 def calculate_kinetic_acceleration(df_today):
     """Calculates if buying speed is accelerating relative to today's own volume accumulation."""
     if len(df_today) < 4: return 1.0 # Need at least 4 candles (1 hour) to measure speed
@@ -102,26 +100,21 @@ def calculate_kinetic_acceleration(df_today):
     
     if total_vol_today == 0: return 1.0
     
-    # Calculate time taken to reach 25%, 50%, and 75% of TODAY'S cumulative volume
     def get_time_to_reach(pct):
         target = total_vol_today * pct
         idx = np.searchsorted(cum_vol, target)
-        return idx # Index is proportional to time in 15m intervals
+        return idx 
 
     t1 = get_time_to_reach(0.25)
     t2 = get_time_to_reach(0.50)
     t3 = get_time_to_reach(0.75)
     
-    # Delta 1: Time to move from 25% to 50%
-    # Delta 2: Time to move from 50% to 75%
     delta_1 = t2 - t1
     delta_2 = t3 - t2
     
-    # If the time taken to move the next 25% of volume is shorter than the last, 
-    # it means speed is INCREASING.
     if delta_2 > 0 and delta_1 > delta_2:
         return 1.5 # Accelerating
-    elif delta_2 > 0 and delta_1 > delta_2 + 1: # Significant gap
+    elif delta_2 > 0 and delta_1 > delta_2 + 1:
         return 2.0 # Supernova
             
     return 1.0
@@ -132,7 +125,9 @@ def calculate_kinetic_acceleration(df_today):
 def extract_raw_physics(symbol, target_dt=None):
     try:
         time.sleep(0.12) # Strict API rate limit protection
-        now_dt = pd.Timestamp.now(tz="Asia/Kolkata")
+        
+        # TIME MACHINE ANCHOR: Use target_dt if provided, else use current time
+        now_dt = target_dt if target_dt else pd.Timestamp.now(tz="Asia/Kolkata")
         
         payload = {
             "symbol": symbol, "resolution": "15", "date_format": 1,
@@ -145,6 +140,9 @@ def extract_raw_physics(symbol, target_dt=None):
         
         df = pd.DataFrame(res['candles'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True).dt.tz_convert("Asia/Kolkata")
+        
+        # TIME MACHINE FILTER: Only keep data up to the requested simulation time
+        df = df[df['timestamp'] <= now_dt]
         
         market_open = dt_time(9, 15)
         current_time = now_dt.time()
@@ -159,7 +157,7 @@ def extract_raw_physics(symbol, target_dt=None):
         df = df[(df['time'] >= market_open) & (df['time'] <= current_time)]
         if df.empty: return None
         
-        # WEEKEND PATCH: Identify the last active trading session dynamically
+        # DYNAMIC ANCHOR FIX: Identify the last active trading session dynamically based on the filtered df
         today_date = df['date'].max()
         
         history_df = df[df['date'] < today_date]
@@ -171,10 +169,8 @@ def extract_raw_physics(symbol, target_dt=None):
         daily_groups = history_df.groupby('date').agg({'volume': 'sum', 'high': 'max', 'low': 'min'})
         daily_groups['range'] = daily_groups['high'] - daily_groups['low']
 
-        # FIXED ANCHOR: Specific day with the highest volume
         max_vol_date = daily_groups['volume'].idxmax()
         
-        # Extract the volume AND the price range from that exact same day
         max_vol = daily_groups.loc[max_vol_date, 'volume']
         max_range = daily_groups.loc[max_vol_date, 'range'] 
         
@@ -187,15 +183,13 @@ def extract_raw_physics(symbol, target_dt=None):
         vol_ratio = curr_vol / max_vol
         volatility_ratio = curr_range / max_range
         
-        # --- NEW: INTRADAY VOLUME SLICING (Vol Pace) ---
-        # Compares the average volume of the last 45 mins (3 candles) to the rest of the day
+        # INTRADAY VOLUME SLICING (Vol Pace)
         if len(today_df) >= 5:
             recent_vol_avg = today_df['volume'].tail(3).mean()
             baseline_vol_avg = today_df['volume'].iloc[:-3].mean()
             vol_pace = (recent_vol_avg / baseline_vol_avg) if baseline_vol_avg > 0 else 1.0
         else:
-            vol_pace = 1.0 # Not enough time has passed in the trading day to slice
-        # -----------------------------------------------
+            vol_pace = 1.0 
 
         # TREND ANCHOR (OBV 10 EMA)
         df['price_dir'] = np.where(df['close'] > df['close'].shift(1), 1, 
@@ -221,13 +215,9 @@ def extract_raw_physics(symbol, target_dt=None):
 # ==========================================
 # 5. HTML REPORT GENERATOR & DISPATCH
 # ==========================================
-# Change this line:
 def send_html_email(bullish_df, bearish_df, sort_cols):
-    # This now accepts the 3rd argument (the list of sort criteria)
     criteria_str = ", ".join([c.replace('_', ' ') for c in sort_cols]).upper()
-    
-    # Make sure your email subject/header uses criteria_str instead of hardcoded text
-    logger.info("Formatting HTML matrix and dispatching...")
+    logger.info(f"Formatting HTML matrix (Sorted by {criteria_str}) and dispatching...")
     
     html = f"""
     <html lang="en">
@@ -248,18 +238,18 @@ def send_html_email(bullish_df, bearish_df, sort_cols):
         </style>
       </head>
       <body>
-        <h2 style="color: #1b5e20;">🚀 TOP BULLISH BREAKOUTS (SORTED BY VOLAT EXP)</h2>
+        <h2 style="color: #1b5e20;">🚀 TOP BULLISH BREAKOUTS (SORTED BY {criteria_str})</h2>
         <table class="bullish">
           <tr><th>Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>Vol Pace</th><th>Accel</th></tr>
           {"".join(f"<tr><td class='symbol'>{row['Symbol']}</td><td>₹{row['LTP']:.2f}</td><td>{row['Vol_Ratio']:.2f}x</td><td class='highlight'>{row['Volat_Ratio']:.2f}x</td><td class='pace'>{row['Vol_Pace']:.2f}x</td><td>{row['Accel']:.2f}x</td></tr>" for _, row in bullish_df.iterrows())}
         </table>
 
-        <h2 style="color: #b71c1c;">🩸 TOP BEARISH BREAKDOWNS (SORTED BY VOLAT EXP)</h2>
+        <h2 style="color: #b71c1c;">🩸 TOP BEARISH BREAKDOWNS (SORTED BY {criteria_str})</h2>
         <table class="bearish">
           <tr><th>Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>Vol Pace</th><th>Accel</th></tr>
           {"".join(f"<tr><td class='symbol'>{row['Symbol']}</td><td>₹{row['LTP']:.2f}</td><td>{row['Vol_Ratio']:.2f}x</td><td class='highlight'>{row['Volat_Ratio']:.2f}x</td><td class='pace'>{row['Vol_Pace']:.2f}x</td><td>{row['Accel']:.2f}x</td></tr>" for _, row in bearish_df.iterrows())}
         </table>
-        <p style="font-size: 12px; color: #777; text-align: center;">Asit Baran Pati TMV Engine v22.0 • Generated at {datetime.now().strftime('%I:%M %p')}</p>
+        <p style="font-size: 12px; color: #777; text-align: center;">Asit Baran Pati TMV Engine v23.5 • Generated at {datetime.now().strftime('%I:%M %p')}</p>
       </body>
     </html>
     """
@@ -281,13 +271,8 @@ def send_html_email(bullish_df, bearish_df, sort_cols):
 # ==========================================
 # 6. MASTER EXECUTION THREAD
 # ==========================================
-# ==========================================
-# 6. MASTER EXECUTION THREAD
-# ==========================================
 def main():
     # Setup Argument Parser for "Time Machine" backtesting
-
-    
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", help="Input format: YYYY-MM-DD HH:MM")
     args = parser.parse_args()
@@ -295,12 +280,9 @@ def main():
     target_dt = None
     if args.date:
         try:
-            # We enforce 24-hour parsing to avoid AM/PM confusion
-            # If you type 13:00, it becomes 1 PM. If you type 09:00, it is 9 AM.
-            target_dt = pd.to_datetime(args.date, dayfirst=True).tz_localize("Asia/Kolkata")
-            
-            # Safety Check: If the parsed time is effectively "today" but you meant a past date,
-            # it means the format was misunderstood.
+            # Normalize dots to colons and enforce 24-hour parsing
+            date_str = args.date.replace('.', ':')
+            target_dt = pd.to_datetime(date_str, dayfirst=True).tz_localize("Asia/Kolkata")
             logger.info(f"--- BACKTEST MODE: Simulating {target_dt} ---")
         except Exception as e:
             logger.error(f"Invalid Date/Time Format. Use YYYY-MM-DD HH:MM (24-hour). Error: {e}")
