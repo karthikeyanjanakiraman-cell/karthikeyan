@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-ASIT BARAN PATI TMV ENGINE - PRODUCTION v23.5 (EXTENDED + TIME MACHINE BUILD)
+ASIT BARAN PATI TMV ENGINE - PRODUCTION v24.0 (5-MIN CANDLE + RANK VELOCITY BUILD)
 FEATURES: 
 - Dynamic F&O Universe (Column Hunting & Regex)
+- 5-Minute Candle High-Frequency Resolution Engine
 - Smart Time Routing (24/7 Execution Safety: Handles Weekends & Pre-Market)
 - Time Machine Backtester (Forces historical anchor for math & slicing)
 - Time-Sliced Historical Ceilings (True Apples-to-Apples)
 - Anchored Volatility Range (Tied strictly to the Max Volume Day)
 - Intraday Volume Slicing (Vol Pace - Last 45 mins vs Baseline)
 - Kinetic Acceleration (Accelerating vs Supernova)
-- Priority Multi-Column Sorting (Dynamic HTML Headers)
-- Clean Responsive HTML Email Matrix (Extended CSS)
+- In-Memory Snapshot Momentum Tracker (T-30 Mins Lookback)
+- Primary Sorting Configured Strictly by Rank Velocity (Rank Delta)
+- Clean Responsive HTML Email Matrix (7-Column Extended CSS Architecture)
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -93,7 +95,7 @@ def fetch_fo_universe():
 # ==========================================
 def calculate_kinetic_acceleration(df_today):
     """Calculates if buying speed is accelerating relative to today's own volume accumulation."""
-    if len(df_today) < 4: return 1.0 # Need at least 4 candles (1 hour) to measure speed
+    if len(df_today) < 4: return 1.0 
     
     cum_vol = df_today['volume'].cumsum().values
     total_vol_today = cum_vol[-1]
@@ -120,7 +122,7 @@ def calculate_kinetic_acceleration(df_today):
     return 1.0
 
 # ==========================================
-# 4. CORE PHYSICS ENGINE
+# 4. CORE PHYSICS ENGINE (5-MIN HIGH FREQUENCY CONFIG)
 # ==========================================
 def extract_raw_physics(symbol, target_dt=None):
     try:
@@ -141,13 +143,13 @@ def extract_raw_physics(symbol, target_dt=None):
         df = pd.DataFrame(res['candles'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True).dt.tz_convert("Asia/Kolkata")
         
-        # TIME MACHINE FILTER: Only keep data up to the requested simulation time
+        # TIME MACHINE FILTER: Squelch future candles during simulation
         df = df[df['timestamp'] <= now_dt]
         
         market_open = dt_time(9, 15)
         current_time = now_dt.time()
         
-        # SMART TIME ROUTING: If run before market opens, analyze previous EOD profile
+        # SMART TIME ROUTING
         if current_time < market_open:
             current_time = dt_time(15, 30)
             
@@ -157,7 +159,6 @@ def extract_raw_physics(symbol, target_dt=None):
         df = df[(df['time'] >= market_open) & (df['time'] <= current_time)]
         if df.empty: return None
         
-        # DYNAMIC ANCHOR FIX: Identify the last active trading session dynamically based on the filtered df
         today_date = df['date'].max()
         
         history_df = df[df['date'] < today_date]
@@ -183,13 +184,27 @@ def extract_raw_physics(symbol, target_dt=None):
         vol_ratio = curr_vol / max_vol
         volatility_ratio = curr_range / max_range
         
-        # INTRADAY VOLUME SLICING (Vol Pace)
+        # INTRADAY VOLUME SLICING (Vol Pace Configured for 5-Min Candles)
         if len(today_df) >= 5:
             recent_vol_avg = today_df['volume'].tail(3).mean()
             baseline_vol_avg = today_df['volume'].iloc[:-3].mean()
             vol_pace = (recent_vol_avg / baseline_vol_avg) if baseline_vol_avg > 0 else 1.0
         else:
             vol_pace = 1.0 
+
+        # IN-MEMORY HISTORICAL SNAPSHOT GENERATOR (T-30 Mins Lookback = 6 Candles Back)
+        past_volat_ratio = 0.0
+        past_vol_pace = 1.0
+        
+        if len(today_df) > 6:
+            past_today_df = today_df.iloc[:-6]
+            curr_range_past = (past_today_df['high'].max() - past_today_df['low'].min())
+            past_volat_ratio = curr_range_past / max_range if max_range > 0 else 0
+            
+            if len(past_today_df) >= 5:
+                recent_vol_avg_past = past_today_df['volume'].tail(3).mean()
+                baseline_vol_avg_past = past_today_df['volume'].iloc[:-3].mean()
+                past_vol_pace = (recent_vol_avg_past / baseline_vol_avg_past) if baseline_vol_avg_past > 0 else 1.0
 
         # TREND ANCHOR (OBV 10 EMA)
         df['price_dir'] = np.where(df['close'] > df['close'].shift(1), 1, 
@@ -205,6 +220,8 @@ def extract_raw_physics(symbol, target_dt=None):
             'Vol_Ratio': vol_ratio,
             'Volat_Ratio': volatility_ratio,
             'Vol_Pace': vol_pace,
+            'Past_Volat_Ratio': past_volat_ratio,
+            'Past_Vol_Pace': past_vol_pace,
             'Accel': accel,
             'Trend': trend,
             'LTP': df['close'].iloc[-1]
@@ -213,7 +230,7 @@ def extract_raw_physics(symbol, target_dt=None):
         return None
 
 # ==========================================
-# 5. HTML REPORT GENERATOR & DISPATCH
+# 5. HTML REPORT GENERATOR & DISPATCH (7-COLUMN RESPLENDENT MATRIX)
 # ==========================================
 def send_html_email(bullish_df, bearish_df, sort_cols):
     criteria_str = ", ".join([c.replace('_', ' ') for c in sort_cols]).upper()
@@ -240,16 +257,16 @@ def send_html_email(bullish_df, bearish_df, sort_cols):
       <body>
         <h2 style="color: #1b5e20;">🚀 TOP BULLISH BREAKOUTS (SORTED BY {criteria_str})</h2>
         <table class="bullish">
-          <tr><th>Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>Vol Pace</th><th>Accel</th></tr>
-          {"".join(f"<tr><td class='symbol'>{row['Symbol']}</td><td>₹{row['LTP']:.2f}</td><td>{row['Vol_Ratio']:.2f}x</td><td class='highlight'>{row['Volat_Ratio']:.2f}x</td><td class='pace'>{row['Vol_Pace']:.2f}x</td><td>{row['Accel']:.2f}x</td></tr>" for _, row in bullish_df.iterrows())}
+          <tr><th>Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>Vol Pace</th><th>Accel</th><th>Rank Vel</th></tr>
+          {"".join(f"<tr><td class='symbol'>{row['Symbol']}</td><td>₹{row['LTP']:.2f}</td><td>{row['Vol_Ratio']:.2f}x</td><td class='highlight'>{row['Volat_Ratio']:.2f}x</td><td class='pace'>{row['Vol_Pace']:.2f}x</td><td>{row['Accel']:.2f}x</td><td>{row['Rank_Vel_Str']}</td></tr>" for _, row in bullish_df.iterrows())}
         </table>
 
         <h2 style="color: #b71c1c;">🩸 TOP BEARISH BREAKDOWNS (SORTED BY {criteria_str})</h2>
         <table class="bearish">
-          <tr><th>Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>Vol Pace</th><th>Accel</th></tr>
-          {"".join(f"<tr><td class='symbol'>{row['Symbol']}</td><td>₹{row['LTP']:.2f}</td><td>{row['Vol_Ratio']:.2f}x</td><td class='highlight'>{row['Volat_Ratio']:.2f}x</td><td class='pace'>{row['Vol_Pace']:.2f}x</td><td>{row['Accel']:.2f}x</td></tr>" for _, row in bearish_df.iterrows())}
+          <tr><th>Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>Vol Pace</th><th>Accel</th><th>Rank Vel</th></tr>
+          {"".join(f"<tr><td class='symbol'>{row['Symbol']}</td><td>₹{row['LTP']:.2f}</td><td>{row['Vol_Ratio']:.2f}x</td><td class='highlight'>{row['Volat_Ratio']:.2f}x</td><td class='pace'>{row['Vol_Pace']:.2f}x</td><td>{row['Accel']:.2f}x</td><td>{row['Rank_Vel_Str']}</td></tr>" for _, row in bearish_df.iterrows())}
         </table>
-        <p style="font-size: 12px; color: #777; text-align: center;">Asit Baran Pati TMV Engine v23.5 • Generated at {datetime.now().strftime('%I:%M %p')}</p>
+        <p style="font-size: 12px; color: #777; text-align: center;">Asit Baran Pati TMV Engine v24.0 • Generated at {datetime.now().strftime('%I:%M %p')}</p>
       </body>
     </html>
     """
@@ -269,10 +286,9 @@ def send_html_email(bullish_df, bearish_df, sort_cols):
         logger.error(f"Failed to send email. Check credentials: {e}")
 
 # ==========================================
-# 6. MASTER EXECUTION THREAD
+# 6. MASTER EXECUTION THREAD & SORTER
 # ==========================================
 def main():
-    # Setup Argument Parser for "Time Machine" backtesting
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", help="Input format: YYYY-MM-DD HH:MM")
     args = parser.parse_args()
@@ -280,7 +296,7 @@ def main():
     target_dt = None
     if args.date:
         try:
-            # Normalize dots to colons and enforce 24-hour parsing
+            # Handle dots-to-colons normalization safety frame
             date_str = args.date.replace('.', ':')
             target_dt = pd.to_datetime(date_str, dayfirst=True).tz_localize("Asia/Kolkata")
             logger.info(f"--- BACKTEST MODE: Simulating {target_dt} ---")
@@ -290,18 +306,15 @@ def main():
     else:
         logger.info("--- LIVE MODE: Running real-time analysis ---")
 
-    # Fetch Universe
     symbols = fetch_fo_universe()
     if not symbols: 
         logger.error("Universe is empty. Shutting down.")
         return
         
-    # Execute Scan
     results = []
-    logger.info(f"Commencing Scan on {len(symbols)} symbols...")
+    logger.info(f"Commencing High-Frequency Scan on {len(symbols)} symbols...")
     
     with ThreadPoolExecutor(max_workers=4) as executor:
-        # Passes the target_dt to extract_raw_physics
         futures = {executor.submit(extract_raw_physics, sym, target_dt): sym for sym in symbols}
         for future in as_completed(futures):
             res = future.result()
@@ -314,15 +327,40 @@ def main():
         
     df_results = df_results.round(2)
     
-    # --- MULTI-COLUMN PRIORITY SORTING ---
-    # Sorts by Volat_Ratio first, then by Vol_Pace (tie-breaker)
-    SORT_CRITERIA = ['Volat_Ratio', 'Vol_Pace']
+    # --- RANK VELOCITY ENGINE MATRIX MATH ---
+    def calculate_rank_velocity(trend_df):
+        if trend_df.empty: return trend_df
+        
+        # 1. Backtrack baseline: Rank positions as of T-30 minutes ago
+        trend_df['Past_Rank'] = trend_df[['Past_Volat_Ratio', 'Past_Vol_Pace']].apply(tuple, axis=1).rank(method='min', ascending=False)
+        
+        # 2. Modern baseline: Rank positions right now
+        trend_df['Curr_Rank'] = trend_df[['Volat_Ratio', 'Vol_Pace']].apply(tuple, axis=1).rank(method='min', ascending=False)
+        
+        # 3. Compute Rank Velocity Delta (Positive delta equals an upward charge)
+        trend_df['Rank_Delta'] = trend_df['Past_Rank'] - trend_df['Curr_Rank']
+        
+        # 4. Generate beautifully styled status markup for the dedicated column
+        def format_velocity(row):
+            if row['Past_Volat_Ratio'] == 0: 
+                return "<span style='color:gray;'>➖ N/A</span>"
+            if row['Rank_Delta'] > 0:
+                return f"<span style='color:#1b5e20; font-weight:bold;'>🚀 +{int(row['Rank_Delta'])}</span>"
+            elif row['Rank_Delta'] < 0:
+                return f"<span style='color:#b71c1c; font-weight:bold;'>🔻 {int(row['Rank_Delta'])}</span>"
+            else:
+                return "<span style='color:gray;'>➖ 0</span>"
+                
+        trend_df['Rank_Vel_Str'] = trend_df.apply(format_velocity, axis=1)
+        
+        # 5. EXECUTE SCAN SORTING BY RANK VELOCITY PRIMARY MATRIX (Volat_Ratio handles tie breaks)
+        return trend_df.sort_values(['Rank_Delta', 'Volat_Ratio'], ascending=[False, False]).head(15)
+
+    bullish_df = calculate_rank_velocity(df_results[df_results['Trend'] == 'BULLISH'].copy())
+    bearish_df = calculate_rank_velocity(df_results[df_results['Trend'] == 'BEARISH'].copy())
     
-    bullish_df = df_results[df_results['Trend'] == 'BULLISH'].sort_values(SORT_CRITERIA, ascending=[False, False]).head(15)
-    bearish_df = df_results[df_results['Trend'] == 'BEARISH'].sort_values(SORT_CRITERIA, ascending=[False, False]).head(15)
-    
-    # Dispatch Email
-    send_html_email(bullish_df, bearish_df, SORT_CRITERIA)
+    # Dispatch Email Report Matrix Configuration
+    send_html_email(bullish_df, bearish_df, ['Rank_Velocity', 'Volat_Ratio'])
     logger.info("System execution completed successfully.")
  
 if __name__ == "__main__":
