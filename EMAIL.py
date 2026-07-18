@@ -275,36 +275,61 @@ def send_html_email(bullish_df, bearish_df):
 # ==========================================
 # 6. MASTER EXECUTION THREAD
 # ==========================================
+# ==========================================
+# 6. MASTER EXECUTION THREAD
+# ==========================================
 def main():
-    logger.info("Initializing TMV Engine v22.0...")
-    symbols = fetch_fo_universe()
+    # Setup Argument Parser for "Time Machine" backtesting
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--date", help="Input format: YYYY-MM-DD HH:MM")
+    args = parser.parse_args()
     
+    target_dt = None
+    if args.date:
+        try:
+            # Parses the string from the terminal into a pandas timestamp
+            target_dt = pd.to_datetime(args.date).tz_localize("Asia/Kolkata")
+            logger.info(f"--- BACKTEST MODE: Simulating {target_dt} ---")
+        except Exception as e:
+            logger.error(f"Invalid Date Format. Please use YYYY-MM-DD HH:MM. Error: {e}")
+            return
+    else:
+        logger.info("--- LIVE MODE: Running real-time analysis ---")
+
+    # Fetch Universe
+    symbols = fetch_fo_universe()
     if not symbols: 
-        logger.error("Universe is completely empty. Shutting down engine.")
+        logger.error("Universe is empty. Shutting down.")
         return
         
+    # Execute Scan
     results = []
-    logger.info(f"Commencing Time-Sliced Scan on {len(symbols)} symbols. This will take ~90 seconds...")
+    logger.info(f"Commencing Scan on {len(symbols)} symbols...")
     
     with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(extract_raw_physics, sym): sym for sym in symbols}
+        # Passes the target_dt to extract_raw_physics
+        futures = {executor.submit(extract_raw_physics, sym, target_dt): sym for sym in symbols}
         for future in as_completed(futures):
             res = future.result()
             if res: results.append(res)
             
     df_results = pd.DataFrame(results)
     if df_results.empty: 
-        logger.error("No valid data processed. Market data missing or API disconnected. Exiting.")
+        logger.error("No valid data processed. Exiting.")
         return
         
     df_results = df_results.round(2)
     
-    # ISOLATED CROSS-SECTION REFERENCE: Primary Sort strictly via Volat_Ratio (Volatility Expansion)
-    bullish_df = df_results[df_results['Trend'] == 'BULLISH'].sort_values('Volat_Ratio', ascending=False).head(15)
-    bearish_df = df_results[df_results['Trend'] == 'BEARISH'].sort_values('Volat_Ratio', ascending=False).head(15)
+    # --- MULTI-COLUMN PRIORITY SORTING ---
+    # Sorts by Volat_Ratio first, then by Vol_Pace (tie-breaker)
+    SORT_CRITERIA = ['Volat_Ratio', 'Vol_Pace']
     
-    send_html_email(bullish_df, bearish_df)
-    logger.info("System execution completed successfully. Standing by.")
+    bullish_df = df_results[df_results['Trend'] == 'BULLISH'].sort_values(SORT_CRITERIA, ascending=[False, False]).head(15)
+    bearish_df = df_results[df_results['Trend'] == 'BEARISH'].sort_values(SORT_CRITERIA, ascending=[False, False]).head(15)
     
+    # Dispatch Email
+    send_html_email(bullish_df, bearish_df, SORT_CRITERIA)
+    logger.info("System execution completed successfully.")
+ 
 if __name__ == "__main__":
     main()
