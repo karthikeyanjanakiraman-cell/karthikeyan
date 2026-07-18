@@ -286,6 +286,8 @@ def send_html_email(bullish_df, bearish_df, sort_cols):
 # ==========================================
 def main():
     # Setup Argument Parser for "Time Machine" backtesting
+
+    
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", help="Input format: YYYY-MM-DD HH:MM")
     args = parser.parse_args()
@@ -294,7 +296,9 @@ def main():
     if args.date:
         try:
             # Parses the string from the terminal into a pandas timestamp
-            target_dt = pd.to_datetime(args.date).tz_localize("Asia/Kolkata")
+            # Replaces dots with colons before parsing
+            date_str = args.date.replace('.', ':')
+            target_dt = pd.to_datetime(date_str).tz_localize("Asia/Kolkata")
             logger.info(f"--- BACKTEST MODE: Simulating {target_dt} ---")
         except Exception as e:
             logger.error(f"Invalid Date Format. Please use YYYY-MM-DD HH:MM. Error: {e}")
