@@ -160,9 +160,16 @@ def extract_raw_physics(symbol):
         # HISTORICAL BENCHMARKS
         daily_groups = history_df.groupby('date').agg({'volume': 'sum', 'high': 'max', 'low': 'min'})
         daily_groups['range'] = daily_groups['high'] - daily_groups['low']
+
+
+        # Find the specific day with the highest volume
+        max_vol_date = daily_groups['volume'].idxmax()
         
-        max_vol = daily_groups['volume'].max()
-        max_range = daily_groups['range'].max()
+        # Extract the volume AND the price range from that exact same day
+        max_vol = daily_groups.loc[max_vol_date, 'volume']
+        max_range = daily_groups.loc[max_vol_date, 'range'] 
+        
+        
         if max_vol == 0 or max_range == 0: return None
         
         # TODAY'S LIVE ACTION
