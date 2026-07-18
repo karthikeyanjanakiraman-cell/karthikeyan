@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-ASIT BARAN PATI STRATEGY - PRODUCTION v16.4 - FRACTAL VOLUME PHYSICS
-FIXED: GHOST WEEKEND CANDLE FILTER | AUTO-DETECTS TRUE TRADING DAY
+ASIT BARAN PATI STRATEGY - PRODUCTION v16.5 - FRACTAL VOLUME PHYSICS
+FLOODGATES OPEN | NO FILTERS | GUARANTEED OUTPUT
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -166,9 +166,6 @@ def process_volume_physics(df):
     
     df['date'] = df['timestamp'].dt.date
     
-    # --- THE GHOST CANDLE FIX ---
-    # We group by date and only consider dates that have more than 10,000 shares traded.
-    # This automatically bypasses any dummy weekend API ticks with 0 volume.
     daily_vol = df.groupby('date')['volume'].sum()
     valid_dates = daily_vol[daily_vol > 10000].index
     if len(valid_dates) == 0: return None
@@ -209,21 +206,18 @@ def process_volume_physics(df):
         idx_accel = np.argmax(cum_accel >= target_accel) if np.any(cum_accel >= target_accel) else -1
         if idx_accel != -1: record_accel = min(record_accel, (idx_accel + 1) * 15)
 
-    # Base Physics Ranks (Out of 15)
     rank_mass = (record_mass / T_session) * 15.0
     rank_violence = (record_violence / T_session) * 15.0
     rank_accel = (record_accel / T_session) * 15.0
     
     net_rank_base = (rank_mass + rank_violence + rank_accel) / 3.0
     
-    # Fractal Decay (The Trap Filter)
     decay_score = get_fractal_decay_score(df_session)
     if decay_score > 1.2: 
         net_rank_final = net_rank_base / decay_score
     else:
         net_rank_final = net_rank_base
 
-    # VWAP Direction
     df_session['typical_price'] = (df_session['high'] + df_session['low'] + df_session['close']) / 3.0
     vwap = (df_session['volume'] * df_session['typical_price']).sum() / target_mass if target_mass > 0 else df_session['close'].iloc[-1]
     direction = 1 if df_session['close'].iloc[-1] >= vwap else -1
@@ -246,14 +240,16 @@ def scan_symbol(symbol):
     
     if not res or res['target_mass'] == 0: return None
     
-    # Set to 0.02 for weekend testing to allow Friday EOD flow through
     avg_ratio = abs(res['net_rank']) / 15.0
-    if avg_ratio < 0.02: return None
+    
+    # --- FILTERS REMOVED COMPLETELY ---
+    # We will now classify and send EVERYTHING so you can see the raw math.
     
     if avg_ratio >= 0.80: status = "🔥 Apex Breakout"
     elif avg_ratio >= 0.60: status = "🎯 Extreme Force"
     elif avg_ratio >= 0.30: status = "⚖️ Institutional Flow"
-    else: status = "🔄 Standard Flow"
+    elif avg_ratio >= 0.10: status = "🔄 Standard Flow"
+    else: status = "💤 Flat / Decayed" # This captures the Friday dead volume
 
     return {
         'Symbol': symbol.replace('NSE:', '').replace('-EQ', ''),
@@ -275,7 +271,8 @@ def get_status_colors(status):
     if "Apex Breakout" in status: return "#e91e63", "#fff"
     if "Extreme Force" in status: return "#9c27b0", "#fff"
     if "Institutional Flow" in status: return "#2196f3", "#fff"
-    return "#555555", "#fff"
+    if "Standard Flow" in status: return "#009688", "#fff"
+    return "#555555", "#fff" # Flat / Decayed color
 
 def generate_html_table(df, side):
     if df.empty:
@@ -333,7 +330,6 @@ def send_email_report(results_list):
 
     msg = MIMEMultipart("alternative")
     msg["From"], msg["To"] = SENDER_EMAIL, RECIPIENT_EMAIL
-    
     msg["Subject"] = f"ASIT Physics Matrix - {datetime.now().strftime('%d %b %H:%M')}"
 
     html = f"""
@@ -341,7 +337,7 @@ def send_email_report(results_list):
     <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #121212; color: #e0e0e0; padding: 20px;">
       
       <div style="text-align: center; margin-bottom: 30px;">
-          <h2 style="color: #00e676; margin-bottom: 5px;">ASIT FRACTAL PHYSICS ENGINE (v16.4)</h2>
+          <h2 style="color: #00e676; margin-bottom: 5px;">ASIT FRACTAL PHYSICS ENGINE (v16.5)</h2>
           <p style="color: #aaaaaa; margin-top: 0;"><b>Proprietary Order Flow & Tape Pulse Matrix</b></p>
       </div>
       
@@ -382,7 +378,7 @@ def send_email_report(results_list):
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def main():
     print("=" * 80)
-    print("[LAUNCH] ASIT v16.4 - FRACTAL VOLUME PHYSICS")
+    print("[LAUNCH] ASIT v16.5 - FRACTAL VOLUME PHYSICS")
     print("=" * 80)
     
     symbols = get_live_fno_symbols()
@@ -406,10 +402,10 @@ def main():
     if results:
         send_email_report(results)
         print("=" * 80)
-        print("[SUCCESS] Scan Concluded. Results dispatched.")
+        print(f"[SUCCESS] Scan Concluded. Ranked {len(results)} symbols. Results dispatched.")
         print("=" * 80)
     else:
-        logger.error("[WARNING] Scan completed, but zero symbols met the physics threshold.")
+        logger.error("[WARNING] API Failed to retrieve valid history for the symbols.")
 
 if __name__ == "__main__":
     main()
