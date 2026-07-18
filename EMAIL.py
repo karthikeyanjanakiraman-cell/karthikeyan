@@ -1,15 +1,16 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-ASIT BARAN PATI TMV ENGINE - PRODUCTION v21.0 (ISOLATED MATRIX BUILD)
+ASIT BARAN PATI TMV ENGINE - PRODUCTION v22.0 (VOLUME SLICING BUILD)
 FEATURES: 
 - Dynamic F&O Universe (Column Hunting & Regex)
 - Smart Time Routing (24/7 Execution Safety: Handles Weekends & Pre-Market)
 - Time-Sliced Historical Ceilings (True Apples-to-Apples)
 - Anchored Volatility Range (Tied strictly to the Max Volume Day)
+- NEW: Intraday Volume Slicing (Vol Pace - Last 45 mins vs Baseline)
 - Kinetic Acceleration Column Integration (Unmerged)
 - Volatility Expansion Primary Sorting 
-- Clean Responsive HTML Email Matrix (No TMV Score)
+- Clean Responsive HTML Email Matrix
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -178,6 +179,16 @@ def extract_raw_physics(symbol):
         vol_ratio = curr_vol / max_vol
         volatility_ratio = curr_range / max_range
         
+        # --- NEW: INTRADAY VOLUME SLICING (Vol Pace) ---
+        # Compares the average volume of the last 45 mins (3 candles) to the rest of the day
+        if len(today_df) >= 5:
+            recent_vol_avg = today_df['volume'].tail(3).mean()
+            baseline_vol_avg = today_df['volume'].iloc[:-3].mean()
+            vol_pace = (recent_vol_avg / baseline_vol_avg) if baseline_vol_avg > 0 else 1.0
+        else:
+            vol_pace = 1.0 # Not enough time has passed in the trading day to slice
+        # -----------------------------------------------
+
         # TREND ANCHOR (OBV 10 EMA)
         df['price_dir'] = np.where(df['close'] > df['close'].shift(1), 1, 
                           np.where(df['close'] < df['close'].shift(1), -1, 0))
@@ -191,6 +202,7 @@ def extract_raw_physics(symbol):
             'Symbol': symbol.replace('NSE:', '').replace('-EQ', ''),
             'Vol_Ratio': vol_ratio,
             'Volat_Ratio': volatility_ratio,
+            'Vol_Pace': vol_pace,
             'Accel': accel,
             'Trend': trend,
             'LTP': df['close'].iloc[-1]
@@ -219,27 +231,28 @@ def send_html_email(bullish_df, bearish_df):
           tr:hover {{ background-color: #f5f5f5; }}
           .symbol {{ font-weight: bold; color: #1a73e8; }}
           .highlight {{ font-weight: bold; color: #333; font-size: 14px; }}
+          .pace {{ font-weight: bold; color: #d84315; }}
         </style>
       </head>
       <body>
         <h2 style="color: #1b5e20;">🚀 TOP BULLISH BREAKOUTS (SORTED BY VOLAT EXP)</h2>
         <table class="bullish">
-          <tr><th>Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>Accel</th></tr>
-          {"".join(f"<tr><td class='symbol'>{row['Symbol']}</td><td>₹{row['LTP']:.2f}</td><td>{row['Vol_Ratio']:.2f}x</td><td class='highlight'>{row['Volat_Ratio']:.2f}x</td><td>{row['Accel']:.2f}x</td></tr>" for _, row in bullish_df.iterrows())}
+          <tr><th>Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>Vol Pace</th><th>Accel</th></tr>
+          {"".join(f"<tr><td class='symbol'>{row['Symbol']}</td><td>₹{row['LTP']:.2f}</td><td>{row['Vol_Ratio']:.2f}x</td><td class='highlight'>{row['Volat_Ratio']:.2f}x</td><td class='pace'>{row['Vol_Pace']:.2f}x</td><td>{row['Accel']:.2f}x</td></tr>" for _, row in bullish_df.iterrows())}
         </table>
 
         <h2 style="color: #b71c1c;">🩸 TOP BEARISH BREAKDOWNS (SORTED BY VOLAT EXP)</h2>
         <table class="bearish">
-          <tr><th>Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>Accel</th></tr>
-          {"".join(f"<tr><td class='symbol'>{row['Symbol']}</td><td>₹{row['LTP']:.2f}</td><td>{row['Vol_Ratio']:.2f}x</td><td class='highlight'>{row['Volat_Ratio']:.2f}x</td><td>{row['Accel']:.2f}x</td></tr>" for _, row in bearish_df.iterrows())}
+          <tr><th>Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>Vol Pace</th><th>Accel</th></tr>
+          {"".join(f"<tr><td class='symbol'>{row['Symbol']}</td><td>₹{row['LTP']:.2f}</td><td>{row['Vol_Ratio']:.2f}x</td><td class='highlight'>{row['Volat_Ratio']:.2f}x</td><td class='pace'>{row['Vol_Pace']:.2f}x</td><td>{row['Accel']:.2f}x</td></tr>" for _, row in bearish_df.iterrows())}
         </table>
-        <p style="font-size: 12px; color: #777; text-align: center;">Asit Baran Pati TMV Engine v21.0 • Generated at {datetime.now().strftime('%I:%M %p')}</p>
+        <p style="font-size: 12px; color: #777; text-align: center;">Asit Baran Pati TMV Engine v22.0 • Generated at {datetime.now().strftime('%I:%M %p')}</p>
       </body>
     </html>
     """
     
     msg = MIMEMultipart("alternative")
-    msg['Subject'] = f"TMV Volatility Scan: {datetime.now().strftime('%d %b - %I:%M %p')}"
+    msg['Subject'] = f"TMV Flow Scan: {datetime.now().strftime('%d %b - %I:%M %p')}"
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECIPIENT_EMAIL
     msg.attach(MIMEText(html, "html"))
@@ -256,7 +269,7 @@ def send_html_email(bullish_df, bearish_df):
 # 6. MASTER EXECUTION THREAD
 # ==========================================
 def main():
-    logger.info("Initializing TMV Engine v21.0...")
+    logger.info("Initializing TMV Engine v22.0...")
     symbols = fetch_fo_universe()
     
     if not symbols: 
@@ -280,7 +293,6 @@ def main():
     df_results = df_results.round(2)
     
     # ISOLATED CROSS-SECTION REFERENCE: Primary Sort strictly via Volat_Ratio (Volatility Expansion)
-    # Metrics are kept totally independent; no merged score is generated.
     bullish_df = df_results[df_results['Trend'] == 'BULLISH'].sort_values('Volat_Ratio', ascending=False).head(15)
     bearish_df = df_results[df_results['Trend'] == 'BEARISH'].sort_values('Volat_Ratio', ascending=False).head(15)
     
