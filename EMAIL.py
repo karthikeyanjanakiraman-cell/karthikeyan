@@ -129,7 +129,7 @@ def calculate_kinetic_acceleration(df_today):
 # ==========================================
 # 4. CORE PHYSICS ENGINE
 # ==========================================
-def extract_raw_physics(symbol):
+def extract_raw_physics(symbol, target_dt=None):
     try:
         time.sleep(0.12) # Strict API rate limit protection
         now_dt = pd.Timestamp.now(tz="Asia/Kolkata")
