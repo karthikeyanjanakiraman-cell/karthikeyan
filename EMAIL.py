@@ -89,32 +89,39 @@ def fetch_fo_universe():
 # ==========================================
 # 3. KINETIC ACCELERATION MATH
 # ==========================================
-def calculate_kinetic_acceleration(df_today, target_vol):
-    """Calculates time intervals to detect compression in buying speed."""
-    if target_vol <= 0 or df_today.empty: return 1.0
+# ==========================================
+# 3. UPDATED KINETIC ACCELERATION (Intraday Sensitive)
+# ==========================================
+def calculate_kinetic_acceleration(df_today):
+    """Calculates if buying speed is accelerating relative to today's own volume accumulation."""
+    if len(df_today) < 4: return 1.0 # Need at least 4 candles (1 hour) to measure speed
     
     cum_vol = df_today['volume'].cumsum().values
+    total_vol_today = cum_vol[-1]
     
+    if total_vol_today == 0: return 1.0
+    
+    # Calculate time taken to reach 25%, 50%, and 75% of TODAY'S cumulative volume
     def get_time_to_reach(pct):
-        target = target_vol * pct
+        target = total_vol_today * pct
         idx = np.searchsorted(cum_vol, target)
-        if idx < len(cum_vol): return (idx + 1) * 15 
-        return None 
+        return idx # Index is proportional to time in 15m intervals
 
-    t1 = get_time_to_reach(0.5)   
-    t2 = get_time_to_reach(0.75)  
-    t3 = get_time_to_reach(0.875) 
-    t4 = get_time_to_reach(1.0)   
+    t1 = get_time_to_reach(0.25)
+    t2 = get_time_to_reach(0.50)
+    t3 = get_time_to_reach(0.75)
     
-    if t1 and t2 and t3:
-        delta_1 = t2 - t1
-        delta_2 = t3 - t2
-        
-        if t4:
-            delta_3 = t4 - t3
-            if delta_3 < delta_2 < delta_1: return 2.0 # Maximum Acceleration (Supernova)
-        elif delta_2 < delta_1:
-            return 1.5 # Accelerating up to 87.5%
+    # Delta 1: Time to move from 25% to 50%
+    # Delta 2: Time to move from 50% to 75%
+    delta_1 = t2 - t1
+    delta_2 = t3 - t2
+    
+    # If the time taken to move the next 25% of volume is shorter than the last, 
+    # it means speed is INCREASING.
+    if delta_2 > 0 and delta_1 > delta_2:
+        return 1.5 # Accelerating
+    elif delta_2 > 0 and delta_1 > delta_2 + 1: # Significant gap
+        return 2.0 # Supernova
             
     return 1.0
 
@@ -196,7 +203,7 @@ def extract_raw_physics(symbol):
         df['obv_ema'] = df['obv'].ewm(span=10, min_periods=1).mean()
         
         trend = 'BULLISH' if df['obv'].iloc[-1] > df['obv_ema'].iloc[-1] else 'BEARISH'
-        accel = calculate_kinetic_acceleration(today_df, max_vol)
+        accel = calculate_kinetic_acceleration(today_df)
         
         return {
             'Symbol': symbol.replace('NSE:', '').replace('-EQ', ''),
