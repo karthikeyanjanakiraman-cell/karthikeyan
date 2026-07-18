@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-ASIT BARAN PATI STRATEGY - PRODUCTION v16.5 - FRACTAL VOLUME PHYSICS
-FLOODGATES OPEN | NO FILTERS | GUARANTEED OUTPUT
+ASIT BARAN PATI STRATEGY - PRODUCTION v16.6 - FRACTAL VOLUME PHYSICS
+FIXED: DATA TYPE CASTING | SILENT THREAD ERRORS EXPOSED | FLOODGATES OPEN
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -11,6 +11,7 @@ import sys
 import time
 import logging
 import smtplib
+import traceback
 import threading
 from io import StringIO
 from datetime import datetime, timedelta
@@ -82,10 +83,15 @@ def call_with_retries(func, *args, **kwargs):
             res = func(*args, **kwargs)
             if isinstance(res, dict) and res.get('s') == 'error':
                 err_msg = res.get('message', '').lower()
-                if 'limit' in err_msg: raise ValueError(f"Rate Limit: {err_msg}")
-                else: return None
+                if 'limit' in err_msg:
+                    time.sleep(backoff)
+                    backoff *= 2
+                    continue
+                else:
+                    logger.error(f"[API ERROR] Fyers returned: {res}")
+                    return None
             return res
-        except Exception:
+        except Exception as e:
             time.sleep(backoff)
             backoff *= 2  
     return None
@@ -121,7 +127,8 @@ def get_15m_history_6m(symbol):
             "range_to": r_end.strftime("%Y-%m-%d"), 
             "cont_flag": 1
         }
-        res = call_with_retries(fyers.history, data=payload)
+        # Passing payload directly as a positional argument (fixes strict API signature issues)
+        res = call_with_retries(fyers.history, payload)
         
         if res and isinstance(res, dict) and 'candles' in res and res['candles']:
             chunk_df = pd.DataFrame(res['candles'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -130,12 +137,17 @@ def get_15m_history_6m(symbol):
     if not df_list: return None
     
     df = pd.concat(df_list, ignore_index=True)
+    
+    # BULLETPROOF DATA CASTING: Force all columns to numeric to prevent silent Pandas String-Math crashes
+    for col in ['open', 'high', 'low', 'close', 'volume']:
+        df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
+        
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None)
     df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
     return df
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# FRACTAL TAPE PULSE (THE TRAP DETECTOR)
+# FRACTAL TAPE PULSE
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def get_fractal_decay_score(df_session):
     total_vol = df_session['volume'].sum()
@@ -159,7 +171,7 @@ def get_fractal_decay_score(df_session):
         return 1.0
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# PURE VOLUME PHYSICS ENGINE
+# PHYSICS ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def process_volume_physics(df):
     if df is None or len(df) < 10: return None
@@ -188,7 +200,6 @@ def process_volume_physics(df):
     
     record_mass, record_violence, record_accel = T_session, T_session, T_session
     
-    # 6-Month Tape Reader
     for d in valid_dates[:-1]:
         df_day = df[df['date'] == d]
         if df_day.empty: continue
@@ -242,14 +253,11 @@ def scan_symbol(symbol):
     
     avg_ratio = abs(res['net_rank']) / 15.0
     
-    # --- FILTERS REMOVED COMPLETELY ---
-    # We will now classify and send EVERYTHING so you can see the raw math.
-    
     if avg_ratio >= 0.80: status = "🔥 Apex Breakout"
     elif avg_ratio >= 0.60: status = "🎯 Extreme Force"
     elif avg_ratio >= 0.30: status = "⚖️ Institutional Flow"
     elif avg_ratio >= 0.10: status = "🔄 Standard Flow"
-    else: status = "💤 Flat / Decayed" # This captures the Friday dead volume
+    else: status = "💤 Flat / Decayed"
 
     return {
         'Symbol': symbol.replace('NSE:', '').replace('-EQ', ''),
@@ -265,14 +273,14 @@ def scan_symbol(symbol):
     }
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# HTML & EMAIL DASHBOARD
+# EMAIL ENGINE
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def get_status_colors(status):
     if "Apex Breakout" in status: return "#e91e63", "#fff"
     if "Extreme Force" in status: return "#9c27b0", "#fff"
     if "Institutional Flow" in status: return "#2196f3", "#fff"
     if "Standard Flow" in status: return "#009688", "#fff"
-    return "#555555", "#fff" # Flat / Decayed color
+    return "#555555", "#fff"
 
 def generate_html_table(df, side):
     if df.empty:
@@ -298,7 +306,6 @@ def generate_html_table(df, side):
         bg_color = "#1e1e1e" if idx % 2 == 0 else "#252526"
         bg, fg = get_status_colors(row['Status'])
         badge_html = f"<span style='background-color:{bg}; color:{fg}; padding:4px 8px; border-radius:12px; font-size:12px; font-weight:bold; white-space:nowrap;'>{row['Status']}</span>"
-        
         pulse_color = "#ff5252" if row['Decay'] > 1.2 else "#69f0ae" if row['Decay'] < 1.0 else "#e0e0e0"
         
         html += f"""
@@ -317,14 +324,10 @@ def generate_html_table(df, side):
 
 def send_email_report(results_list):
     if not all([SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL]):
-        logger.warning("[EMAIL] Missing SMTP configurations. Dispatch halted.")
+        logger.warning("[EMAIL] Missing SMTP configurations.")
         return
 
     df = pd.DataFrame(results_list)
-    if df.empty or 'Net_Rank' not in df.columns: 
-        logger.warning("Dataframe empty or missing Net_Rank. Cannot send email.")
-        return
-    
     bulls = df[df['Trend'] == 'BULLISH'].sort_values(by=['Net_Rank'], ascending=False).head(15)
     bears = df[df['Trend'] == 'BEARISH'].sort_values(by=['Net_Rank'], ascending=True).head(15)
 
@@ -335,29 +338,14 @@ def send_email_report(results_list):
     html = f"""
     <html>
     <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #121212; color: #e0e0e0; padding: 20px;">
-      
       <div style="text-align: center; margin-bottom: 30px;">
-          <h2 style="color: #00e676; margin-bottom: 5px;">ASIT FRACTAL PHYSICS ENGINE (v16.5)</h2>
-          <p style="color: #aaaaaa; margin-top: 0;"><b>Proprietary Order Flow & Tape Pulse Matrix</b></p>
+          <h2 style="color: #00e676; margin-bottom: 5px;">ASIT FRACTAL PHYSICS ENGINE (v16.6)</h2>
       </div>
-      
-      <h3 style="color: #4caf50; border-bottom: 2px solid #4caf50; padding-bottom: 5px; display: inline-block;">🚀 Institutional Inflows (Above VWAP)</h3>
+      <h3 style="color: #4caf50;">🚀 Institutional Inflows (Above VWAP)</h3>
       {generate_html_table(bulls, "BULLISH")}
-      
       <br><br>
-      
-      <h3 style="color: #f44336; border-bottom: 2px solid #f44336; padding-bottom: 5px; display: inline-block;">🔻 Institutional Outflows (Below VWAP)</h3>
+      <h3 style="color: #f44336;">🔻 Institutional Outflows (Below VWAP)</h3>
       {generate_html_table(bears, "BEARISH")}
-      
-      <div style="margin-top: 40px; padding: 15px; background-color: #1e1e1e; border-radius: 8px; border-left: 4px solid #00e676;">
-          <h4 style="color: #ffffff; margin-top: 0;">The ASIT Strategy - 4 Pillars of Fractal Physics:</h4>
-          <ul style="color: #cccccc; line-height: 1.6;">
-            <li><b style="color:#64b5f6;">Mass:</b> How fast total volume aggregated vs 6-month peak.</li>
-            <li><b style="color:#ff9800;">Violence:</b> Speed of block-to-block fluctuations (The Warfare).</li>
-            <li><b style="color:#4caf50;">Accel:</b> Rate of volume speeding up.</li>
-            <li><b style="color:#ff5252;">Tape Pulse (The Trap Filter):</b> Recursive halving of volume blocks. If > 1.2, volume is dying. Net speed is mathematically crushed to protect from fakeouts.</li>
-          </ul>
-      </div>
     </body>
     </html>
     """
@@ -374,16 +362,16 @@ def send_email_report(results_list):
         logger.error(f"[EMAIL] SMTP Transmission Error: {e}")
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# SYSTEM START
+# EXECUTION CORE
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def main():
     print("=" * 80)
-    print("[LAUNCH] ASIT v16.5 - FRACTAL VOLUME PHYSICS")
+    print("[LAUNCH] ASIT v16.6 - FRACTAL VOLUME PHYSICS")
     print("=" * 80)
     
     symbols = get_live_fno_symbols()
     if not symbols: 
-        logger.error("[TERMINATE] No underlying options targets found.")
+        logger.error("[TERMINATE] No targets found.")
         sys.exit(1)
         
     logger.info(f"Loaded {len(symbols)} F&O Symbols. Beginning Physics Analysis...")
@@ -395,17 +383,19 @@ def main():
             try:
                 res = future.result()
                 if res: results.append(res)
-                if idx % 25 == 0: logger.info(f"[SCAN] Computing Volume Physics: {idx}/{len(symbols)} complete...")
+                if idx % 25 == 0: logger.info(f"[SCAN] Physics processed: {idx}/{len(symbols)}")
             except Exception as e:
-                pass
+                # NO MORE SILENT FAILURES! This will print exactly why a stock crashed.
+                logger.error(f"[FATAL] Exception inside thread for {futures[future]}: {e}")
+                traceback.print_exc() 
 
     if results:
         send_email_report(results)
         print("=" * 80)
-        print(f"[SUCCESS] Scan Concluded. Ranked {len(results)} symbols. Results dispatched.")
+        print(f"[SUCCESS] Ranked {len(results)} symbols. Dispatched.")
         print("=" * 80)
     else:
-        logger.error("[WARNING] API Failed to retrieve valid history for the symbols.")
+        logger.error("[WARNING] 0 symbols returned. Check API errors above.")
 
 if __name__ == "__main__":
     main()
