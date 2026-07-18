@@ -130,7 +130,7 @@ def extract_raw_physics(symbol, target_dt=None):
         now_dt = target_dt if target_dt else pd.Timestamp.now(tz="Asia/Kolkata")
         
         payload = {
-            "symbol": symbol, "resolution": "15", "date_format": 1,
+            "symbol": symbol, "resolution": "5", "date_format": 1,
             "range_from": (now_dt - timedelta(days=90)).strftime("%Y-%m-%d"),
             "range_to": now_dt.strftime("%Y-%m-%d"), "cont_flag": 1
         }
