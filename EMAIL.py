@@ -295,13 +295,15 @@ def main():
     target_dt = None
     if args.date:
         try:
-            # Parses the string from the terminal into a pandas timestamp
-            # Replaces dots with colons before parsing
-            date_str = args.date.replace('.', ':')
-            target_dt = pd.to_datetime(date_str).tz_localize("Asia/Kolkata")
+            # We enforce 24-hour parsing to avoid AM/PM confusion
+            # If you type 13:00, it becomes 1 PM. If you type 09:00, it is 9 AM.
+            target_dt = pd.to_datetime(args.date, dayfirst=True).tz_localize("Asia/Kolkata")
+            
+            # Safety Check: If the parsed time is effectively "today" but you meant a past date,
+            # it means the format was misunderstood.
             logger.info(f"--- BACKTEST MODE: Simulating {target_dt} ---")
         except Exception as e:
-            logger.error(f"Invalid Date Format. Please use YYYY-MM-DD HH:MM. Error: {e}")
+            logger.error(f"Invalid Date/Time Format. Use YYYY-MM-DD HH:MM (24-hour). Error: {e}")
             return
     else:
         logger.info("--- LIVE MODE: Running real-time analysis ---")
