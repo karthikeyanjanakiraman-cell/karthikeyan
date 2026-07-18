@@ -1,14 +1,15 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-ASIT BARAN PATI TMV ENGINE - PRODUCTION v23.5 (EXTENDED + TIME MACHINE BUILD)
+ASIT BARAN PATI TMV ENGINE - PRODUCTION v23.6 (DYNAMIC RESOLUTION SHIFTER)
 FEATURES: 
 - Dynamic F&O Universe (Column Hunting & Regex)
+- Automatic Gear Shifter: Uses 5-Min candles from 9:15-10:15, then 15-Min to avoid chop.
 - Smart Time Routing (24/7 Execution Safety: Handles Weekends & Pre-Market)
 - Time Machine Backtester (Forces historical anchor for math & slicing)
 - Time-Sliced Historical Ceilings (True Apples-to-Apples)
 - Anchored Volatility Range (Tied strictly to the Max Volume Day)
-- Intraday Volume Slicing (Vol Pace - Last 45 mins vs Baseline)
+- Intraday Volume Slicing (Vol Pace - Last 3 Candles vs Baseline)
 - Kinetic Acceleration (Accelerating vs Supernova)
 - Priority Multi-Column Sorting (Dynamic HTML Headers)
 - Clean Responsive HTML Email Matrix (Extended CSS)
@@ -93,7 +94,7 @@ def fetch_fo_universe():
 # ==========================================
 def calculate_kinetic_acceleration(df_today):
     """Calculates if buying speed is accelerating relative to today's own volume accumulation."""
-    if len(df_today) < 4: return 1.0 # Need at least 4 candles (1 hour) to measure speed
+    if len(df_today) < 4: return 1.0 # Need at least 4 candles to measure speed
     
     cum_vol = df_today['volume'].cumsum().values
     total_vol_today = cum_vol[-1]
@@ -120,7 +121,7 @@ def calculate_kinetic_acceleration(df_today):
     return 1.0
 
 # ==========================================
-# 4. CORE PHYSICS ENGINE
+# 4. CORE PHYSICS ENGINE (DYNAMIC RESOLUTION)
 # ==========================================
 def extract_raw_physics(symbol, target_dt=None):
     try:
@@ -128,9 +129,18 @@ def extract_raw_physics(symbol, target_dt=None):
         
         # TIME MACHINE ANCHOR: Use target_dt if provided, else use current time
         now_dt = target_dt if target_dt else pd.Timestamp.now(tz="Asia/Kolkata")
+        current_time = now_dt.time()
         
+        # --- DYNAMIC GEAR SHIFTING ---
+        # 9:15 to 10:15 -> Use 5 min candles (Catches early fast moves)
+        # 10:16 onwards -> Use 15 min candles (Filters out midday chop)
+        if dt_time(9, 15) <= current_time <= dt_time(10, 15):
+            candle_res = "5"
+        else:
+            candle_res = "15"
+            
         payload = {
-            "symbol": symbol, "resolution": "5", "date_format": 1,
+            "symbol": symbol, "resolution": candle_res, "date_format": 1,
             "range_from": (now_dt - timedelta(days=90)).strftime("%Y-%m-%d"),
             "range_to": now_dt.strftime("%Y-%m-%d"), "cont_flag": 1
         }
@@ -145,7 +155,6 @@ def extract_raw_physics(symbol, target_dt=None):
         df = df[df['timestamp'] <= now_dt]
         
         market_open = dt_time(9, 15)
-        current_time = now_dt.time()
         
         # SMART TIME ROUTING: If run before market opens, analyze previous EOD profile
         if current_time < market_open:
@@ -207,7 +216,8 @@ def extract_raw_physics(symbol, target_dt=None):
             'Vol_Pace': vol_pace,
             'Accel': accel,
             'Trend': trend,
-            'LTP': df['close'].iloc[-1]
+            'LTP': df['close'].iloc[-1],
+            'Res_Used': candle_res # Track which gear we are in for the email
         }
     except Exception as e:
         return None
@@ -219,6 +229,13 @@ def send_html_email(bullish_df, bearish_df, sort_cols):
     criteria_str = ", ".join([c.replace('_', ' ') for c in sort_cols]).upper()
     logger.info(f"Formatting HTML matrix (Sorted by {criteria_str}) and dispatching...")
     
+    # Grab the resolution used from the first row (if exists) to put in the email title
+    res_indicator = "15m"
+    if not bullish_df.empty:
+        res_indicator = f"{bullish_df['Res_Used'].iloc[0]}m"
+    elif not bearish_df.empty:
+        res_indicator = f"{bearish_df['Res_Used'].iloc[0]}m"
+        
     html = f"""
     <html lang="en">
       <head>
@@ -249,13 +266,13 @@ def send_html_email(bullish_df, bearish_df, sort_cols):
           <tr><th>Symbol</th><th>LTP</th><th>Vol Ratio</th><th>Volat Exp</th><th>Vol Pace</th><th>Accel</th></tr>
           {"".join(f"<tr><td class='symbol'>{row['Symbol']}</td><td>₹{row['LTP']:.2f}</td><td>{row['Vol_Ratio']:.2f}x</td><td class='highlight'>{row['Volat_Ratio']:.2f}x</td><td class='pace'>{row['Vol_Pace']:.2f}x</td><td>{row['Accel']:.2f}x</td></tr>" for _, row in bearish_df.iterrows())}
         </table>
-        <p style="font-size: 12px; color: #777; text-align: center;">Asit Baran Pati TMV Engine v23.5 • Generated at {datetime.now().strftime('%I:%M %p')}</p>
+        <p style="font-size: 12px; color: #777; text-align: center;">Asit Baran Pati TMV Engine v23.6 (Res: {res_indicator}) • Generated at {datetime.now().strftime('%I:%M %p')}</p>
       </body>
     </html>
     """
     
     msg = MIMEMultipart("alternative")
-    msg['Subject'] = f"TMV Flow Scan: {datetime.now().strftime('%d %b - %I:%M %p')}"
+    msg['Subject'] = f"TMV Flow Scan ({res_indicator}): {datetime.now().strftime('%d %b - %I:%M %p')}"
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECIPIENT_EMAIL
     msg.attach(MIMEText(html, "html"))
