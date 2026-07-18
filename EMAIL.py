@@ -221,7 +221,12 @@ def extract_raw_physics(symbol, target_dt=None):
 # ==========================================
 # 5. HTML REPORT GENERATOR & DISPATCH
 # ==========================================
-def send_html_email(bullish_df, bearish_df):
+# Change this line:
+def send_html_email(bullish_df, bearish_df, sort_cols):
+    # This now accepts the 3rd argument (the list of sort criteria)
+    criteria_str = ", ".join([c.replace('_', ' ') for c in sort_cols]).upper()
+    
+    # Make sure your email subject/header uses criteria_str instead of hardcoded text
     logger.info("Formatting HTML matrix and dispatching...")
     
     html = f"""
