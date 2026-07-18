@@ -284,8 +284,8 @@ def main():
         (df_results['Accel_Rank'] * 0.2)
     ) * 100
     
-    bullish_df = df_results[df_results['Trend'] == 'BULLISH'].sort_values('TMV_Score', ascending=False).head(15)
-    bearish_df = df_results[df_results['Trend'] == 'BEARISH'].sort_values('TMV_Score', ascending=False).head(15)
+    bullish_df = df_results[df_results['Trend'] == 'BULLISH'].sort_values('Volat_Ratio', ascending=False).head(15)
+    bearish_df = df_results[df_results['Trend'] == 'BEARISH'].sort_values('Volat_Ratio', ascending=False).head(15)
     
     send_html_email(bullish_df, bearish_df)
     logger.info("System execution completed successfully. Standing by.")
