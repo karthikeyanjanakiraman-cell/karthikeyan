@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-ASIT BARAN PATI STRATEGY - PRODUCTION v16.6 - FRACTAL VOLUME PHYSICS
-FIXED: DATA TYPE CASTING | SILENT THREAD ERRORS EXPOSED | FLOODGATES OPEN
+ASIT BARAN PATI STRATEGY - PRODUCTION v17.0 - CROSS-SECTIONAL VOLUME PHYSICS
+NEW: MTF RELATIVE PERCENTILE RANKING | OBV + 10 EMA TREND ANCHOR | CROSS-MARKET UNIVERSE SCORING
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -127,7 +127,6 @@ def get_15m_history_6m(symbol):
             "range_to": r_end.strftime("%Y-%m-%d"), 
             "cont_flag": 1
         }
-        # Passing payload directly as a positional argument (fixes strict API signature issues)
         res = call_with_retries(fyers.history, payload)
         
         if res and isinstance(res, dict) and 'candles' in res and res['candles']:
@@ -138,7 +137,6 @@ def get_15m_history_6m(symbol):
     
     df = pd.concat(df_list, ignore_index=True)
     
-    # BULLETPROOF DATA CASTING: Force all columns to numeric to prevent silent Pandas String-Math crashes
     for col in ['open', 'high', 'low', 'close', 'volume']:
         df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
         
@@ -171,13 +169,18 @@ def get_fractal_decay_score(df_session):
         return 1.0
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# PHYSICS ENGINE
+# PHASE 1: RAW DATA EXTRACTION (NO SCORING YET)
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-def process_volume_physics(df):
+def extract_raw_physics(symbol):
+    df = get_15m_history_6m(symbol)
     if df is None or len(df) < 10: return None
     
-    df['date'] = df['timestamp'].dt.date
+    # 1. ASIT'S TREND ANCHOR (OBV + 10 EMA)
+    df['price_dir'] = np.sign(df['close'].diff().fillna(0))
+    df['obv'] = (df['price_dir'] * df['volume']).cumsum()
+    df['obv_ema10'] = df['obv'].ewm(span=10, adjust=False).mean()
     
+    df['date'] = df['timestamp'].dt.date
     daily_vol = df.groupby('date')['volume'].sum()
     valid_dates = daily_vol[daily_vol > 10000].index
     if len(valid_dates) == 0: return None
@@ -190,6 +193,11 @@ def process_volume_physics(df):
     
     df_session = df[df['date'] == last_date].copy()
     if df_session.empty: return None
+    
+    # Determine the Trend via OBV vs EMA
+    last_obv = df_session['obv'].iloc[-1]
+    last_ema = df_session['obv_ema10'].iloc[-1]
+    trend = 'BULLISH' if last_obv >= last_ema else 'BEARISH'
     
     T_session = len(df_session) * 15 
     if T_session == 0: T_session = 15
@@ -217,59 +225,18 @@ def process_volume_physics(df):
         idx_accel = np.argmax(cum_accel >= target_accel) if np.any(cum_accel >= target_accel) else -1
         if idx_accel != -1: record_accel = min(record_accel, (idx_accel + 1) * 15)
 
-    rank_mass = (record_mass / T_session) * 15.0
-    rank_violence = (record_violence / T_session) * 15.0
-    rank_accel = (record_accel / T_session) * 15.0
-    
-    net_rank_base = (rank_mass + rank_violence + rank_accel) / 3.0
-    
     decay_score = get_fractal_decay_score(df_session)
-    if decay_score > 1.2: 
-        net_rank_final = net_rank_base / decay_score
-    else:
-        net_rank_final = net_rank_base
-
-    df_session['typical_price'] = (df_session['high'] + df_session['low'] + df_session['close']) / 3.0
-    vwap = (df_session['volume'] * df_session['typical_price']).sum() / target_mass if target_mass > 0 else df_session['close'].iloc[-1]
-    direction = 1 if df_session['close'].iloc[-1] >= vwap else -1
     
-    return {
-        'rank_mass': rank_mass,
-        'rank_violence': rank_violence,
-        'rank_accel': rank_accel,
-        'decay_score': decay_score,
-        'net_rank': net_rank_final * direction,
-        'target_mass': target_mass,
-        'direction': 'BULLISH' if direction == 1 else 'BEARISH',
-        'ltp': df_session['close'].iloc[-1],
-        'session_date': last_date
-    }
-
-def scan_symbol(symbol):
-    df = get_15m_history_6m(symbol)
-    res = process_volume_physics(df)
-    
-    if not res or res['target_mass'] == 0: return None
-    
-    avg_ratio = abs(res['net_rank']) / 15.0
-    
-    if avg_ratio >= 0.80: status = "🔥 Apex Breakout"
-    elif avg_ratio >= 0.60: status = "🎯 Extreme Force"
-    elif avg_ratio >= 0.30: status = "⚖️ Institutional Flow"
-    elif avg_ratio >= 0.10: status = "🔄 Standard Flow"
-    else: status = "💤 Flat / Decayed"
-
     return {
         'Symbol': symbol.replace('NSE:', '').replace('-EQ', ''),
-        'Net_Rank': res['net_rank'],
-        'Decay': res['decay_score'],
-        'Trend': res['direction'],
-        'Status': status,
-        'Mass_Rank': res['rank_mass'],
-        'Violence_Rank': res['rank_violence'],
-        'Accel_Rank': res['rank_accel'],
-        'Cur_Vol': f"{int(res['target_mass']):,}",
-        'LTP': res['ltp']
+        'record_mass': record_mass,
+        'record_violence': record_violence,
+        'record_accel': record_accel,
+        'decay_score': decay_score,
+        'target_mass': target_mass,
+        'Trend': trend,
+        'LTP': df_session['close'].iloc[-1],
+        'session_date': last_date
     }
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -292,11 +259,11 @@ def generate_html_table(df, side):
             <tr style="background-color: #2d2d30; border-bottom: 2px solid #3e3e42;">
                 <th style="padding: 12px 8px;">Symbol</th>
                 <th style="padding: 12px 8px;">Kinetic State</th>
-                <th style="padding: 12px 8px;">Mass Rk</th>
-                <th style="padding: 12px 8px;">Viol Rk</th>
-                <th style="padding: 12px 8px;">Accel Rk</th>
-                <th style="padding: 12px 8px;">Tape Pulse (Decay)</th>
-                <th style="padding: 12px 8px; font-size: 14px; color: #00e676;">Net Speed</th>
+                <th style="padding: 12px 8px;">Mass Rank</th>
+                <th style="padding: 12px 8px;">Viol Rank</th>
+                <th style="padding: 12px 8px;">Accel Rank</th>
+                <th style="padding: 12px 8px;">Decay</th>
+                <th style="padding: 12px 8px; font-size: 14px; color: #00e676;">Total TMV Score</th>
             </tr>
         </thead>
         <tbody>
@@ -306,30 +273,29 @@ def generate_html_table(df, side):
         bg_color = "#1e1e1e" if idx % 2 == 0 else "#252526"
         bg, fg = get_status_colors(row['Status'])
         badge_html = f"<span style='background-color:{bg}; color:{fg}; padding:4px 8px; border-radius:12px; font-size:12px; font-weight:bold; white-space:nowrap;'>{row['Status']}</span>"
-        pulse_color = "#ff5252" if row['Decay'] > 1.2 else "#69f0ae" if row['Decay'] < 1.0 else "#e0e0e0"
+        pulse_color = "#ff5252" if row['decay_score'] > 1.2 else "#69f0ae" if row['decay_score'] < 1.0 else "#e0e0e0"
         
         html += f"""
             <tr style="background-color: {bg_color}; border-bottom: 1px solid #333333;">
                 <td style="padding: 10px 8px; font-weight: bold; color: #ffffff;">{row['Symbol']}</td>
                 <td style="padding: 10px 8px;">{badge_html}</td>
-                <td style="padding: 10px 8px; color: #64b5f6;">{row['Mass_Rank']:.1f}</td>
-                <td style="padding: 10px 8px; color: #ff9800;">{row['Violence_Rank']:.1f}</td>
-                <td style="padding: 10px 8px; color: #4caf50;">{row['Accel_Rank']:.1f}</td>
-                <td style="padding: 10px 8px; font-weight: bold; color: {pulse_color};">{row['Decay']:.2f}</td>
-                <td style="padding: 10px 8px; font-weight:bold; font-size: 16px; color: #00e676;">{abs(row['Net_Rank']):.2f}</td>
+                <td style="padding: 10px 8px; color: #64b5f6;">{row['Mass_Rank']:.1f} / 100</td>
+                <td style="padding: 10px 8px; color: #ff9800;">{row['Violence_Rank']:.1f} / 100</td>
+                <td style="padding: 10px 8px; color: #4caf50;">{row['Accel_Rank']:.1f} / 100</td>
+                <td style="padding: 10px 8px; font-weight: bold; color: {pulse_color};">{row['decay_score']:.2f}</td>
+                <td style="padding: 10px 8px; font-weight:bold; font-size: 16px; color: #00e676;">{row['Final_Score']:.1f}</td>
             </tr>
         """
     html += "</tbody></table>"
     return html
 
-def send_email_report(results_list):
+def send_email_report(df_universe):
     if not all([SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL]):
         logger.warning("[EMAIL] Missing SMTP configurations.")
         return
 
-    df = pd.DataFrame(results_list)
-    bulls = df[df['Trend'] == 'BULLISH'].sort_values(by=['Net_Rank'], ascending=False).head(15)
-    bears = df[df['Trend'] == 'BEARISH'].sort_values(by=['Net_Rank'], ascending=True).head(15)
+    bulls = df_universe[df_universe['Trend'] == 'BULLISH'].sort_values(by=['Final_Score'], ascending=False).head(15)
+    bears = df_universe[df_universe['Trend'] == 'BEARISH'].sort_values(by=['Final_Score'], ascending=False).head(15)
 
     msg = MIMEMultipart("alternative")
     msg["From"], msg["To"] = SENDER_EMAIL, RECIPIENT_EMAIL
@@ -339,12 +305,12 @@ def send_email_report(results_list):
     <html>
     <body style="font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif; background-color: #121212; color: #e0e0e0; padding: 20px;">
       <div style="text-align: center; margin-bottom: 30px;">
-          <h2 style="color: #00e676; margin-bottom: 5px;">ASIT FRACTAL PHYSICS ENGINE (v16.6)</h2>
+          <h2 style="color: #00e676; margin-bottom: 5px;">ASIT CROSS-MARKET PHYSICS ENGINE (v17.0)</h2>
       </div>
-      <h3 style="color: #4caf50;">🚀 Institutional Inflows (Above VWAP)</h3>
+      <h3 style="color: #4caf50;">🚀 Institutional Inflows (OBV > 10 EMA)</h3>
       {generate_html_table(bulls, "BULLISH")}
       <br><br>
-      <h3 style="color: #f44336;">🔻 Institutional Outflows (Below VWAP)</h3>
+      <h3 style="color: #f44336;">🔻 Institutional Outflows (OBV < 10 EMA)</h3>
       {generate_html_table(bears, "BEARISH")}
     </body>
     </html>
@@ -362,11 +328,11 @@ def send_email_report(results_list):
         logger.error(f"[EMAIL] SMTP Transmission Error: {e}")
 
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
-# EXECUTION CORE
+# PHASE 2: EXECUTION & CROSS-SECTIONAL RANKING CORE
 # ═══════════════════════════════════════════════════════════════════════════════════════════════════
 def main():
     print("=" * 80)
-    print("[LAUNCH] ASIT v16.6 - FRACTAL VOLUME PHYSICS")
+    print("[LAUNCH] ASIT v17.0 - CROSS-MARKET VOLUME PHYSICS")
     print("=" * 80)
     
     symbols = get_live_fno_symbols()
@@ -376,26 +342,51 @@ def main():
         
     logger.info(f"Loaded {len(symbols)} F&O Symbols. Beginning Physics Analysis...")
     
-    results = []
+    raw_results = []
     with ThreadPoolExecutor(max_workers=3) as executor:
-        futures = {executor.submit(scan_symbol, sym): sym for sym in symbols}
+        futures = {executor.submit(extract_raw_physics, sym): sym for sym in symbols}
         for idx, future in enumerate(as_completed(futures), 1):
             try:
                 res = future.result()
-                if res: results.append(res)
-                if idx % 25 == 0: logger.info(f"[SCAN] Physics processed: {idx}/{len(symbols)}")
+                if res and res['target_mass'] > 0: 
+                    raw_results.append(res)
+                if idx % 25 == 0: logger.info(f"[SCAN] Physics extracted: {idx}/{len(symbols)}")
             except Exception as e:
-                # NO MORE SILENT FAILURES! This will print exactly why a stock crashed.
                 logger.error(f"[FATAL] Exception inside thread for {futures[future]}: {e}")
                 traceback.print_exc() 
 
-    if results:
-        send_email_report(results)
-        print("=" * 80)
-        print(f"[SUCCESS] Ranked {len(results)} symbols. Dispatched.")
-        print("=" * 80)
-    else:
-        logger.error("[WARNING] 0 symbols returned. Check API errors above.")
+    if not raw_results:
+        logger.error("[WARNING] 0 valid symbols returned. Check API errors.")
+        return
+
+    # THE MAGIC: Cross-Sectional Universe Ranking
+    df_universe = pd.DataFrame(raw_results)
+    
+    # We rank descending so the LOWEST time to achieve the target gets the HIGHEST percentile rank
+    df_universe['Mass_Rank'] = df_universe['record_mass'].rank(pct=True, ascending=False) * 100
+    df_universe['Violence_Rank'] = df_universe['record_violence'].rank(pct=True, ascending=False) * 100
+    df_universe['Accel_Rank'] = df_universe['record_accel'].rank(pct=True, ascending=False) * 100
+    
+    df_universe['Base_Score'] = (df_universe['Mass_Rank'] + df_universe['Violence_Rank'] + df_universe['Accel_Rank']) / 3.0
+    
+    # Apply Fractal Decay Penalty
+    df_universe['Final_Score'] = np.where(df_universe['decay_score'] > 1.2,
+                                          df_universe['Base_Score'] / df_universe['decay_score'],
+                                          df_universe['Base_Score'])
+
+    def assign_status(score):
+        if score >= 90: return "🔥 Apex Breakout"
+        if score >= 75: return "🎯 Extreme Force"
+        if score >= 50: return "⚖️ Institutional Flow"
+        if score >= 25: return "🔄 Standard Flow"
+        return "💤 Flat / Decayed"
+        
+    df_universe['Status'] = df_universe['Final_Score'].apply(assign_status)
+
+    send_email_report(df_universe)
+    print("=" * 80)
+    print(f"[SUCCESS] Cross-Market Ranked {len(df_universe)} symbols out of 100. Dispatched.")
+    print("=" * 80)
 
 if __name__ == "__main__":
     main()
