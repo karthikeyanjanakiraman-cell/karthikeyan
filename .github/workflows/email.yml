@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       backtest_date:
-        description: 'Backtest Date (YYYY-MM-DD). For a single target execution, use YYYY-MM-DD HH:MM. Leave empty for Live Mode.'
+        description: 'Backtest Date (YYYY-MM-DD). For Single Run use YYYY-MM-DD HH:MM. Leave empty for Live Mode.'
         required: false
         default: ''
       from_time:
