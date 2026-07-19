@@ -204,7 +204,7 @@ def extract_pre_market_score(symbol, target_dt):
 # ==========================================
 # 5. PHASE 2: INTRADAY PROCESSING MODULE
 # ==========================================
-def process_intraday_matrix(symbol, df, target_dt):
+def process_intraday_matrix(symbol, pre_market_ratio, df, target_dt):
     """Processes live fractional tracks exclusively for the anchored universe."""
     try:
         current_time = target_dt.time()
@@ -248,7 +248,7 @@ def process_intraday_matrix(symbol, df, target_dt):
         
         return {
             'Symbol': symbol.replace('NSE:', '').replace('-EQ', ''),
-            'Pre_Market_Ratio': df.get('Pre_Market_Ratio', 0), # Maintain the anchor score in the output
+            'Pre_Market_Ratio': pre_market_ratio,
             'Vol_Ratio': vol_ratio,
             'Volat_Ratio': volatility_ratio,
             'Kin_Vol_Str': f"PASS ({v_mult:.1f}x)" if v_pass else f"FAIL ({v_mult:.1f}x)",
@@ -258,7 +258,8 @@ def process_intraday_matrix(symbol, df, target_dt):
             'V_Pass': v_pass,
             'P_Pass': p_pass
         }
-    except Exception:
+    except Exception as e:
+        logger.error(f"Error processing {symbol}: {e}")
         return None
 
 # ==========================================
@@ -387,7 +388,7 @@ def main():
     
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {
-            executor.submit(process_intraday_matrix, row['Symbol'], row['Full_DF'], target_dt): row['Symbol'] 
+            executor.submit(process_intraday_matrix, row['Symbol'], row['Pre_Market_Ratio'], row['Full_DF'], target_dt): row['Symbol'] 
             for _, row in anchored_watchlist.iterrows()
         }
         for future in as_completed(futures):
@@ -398,9 +399,6 @@ def main():
     if df_matrix.empty:
         logger.error("Watchlist matrix processing returned empty set.")
         return
-        
-    # Inject Pre-Market Ratio back into final matrix for the email output
-    df_matrix = df_matrix.merge(anchored_watchlist[['Symbol', 'Pre_Market_Ratio']], on='Symbol', how='left')
 
     # Sort Matrix by clean institutional parameters
     PRIORITY_SORT = ['V_Pass', 'P_Pass', 'Volat_Ratio']
@@ -412,4 +410,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
