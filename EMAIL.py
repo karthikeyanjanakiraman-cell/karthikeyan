@@ -51,7 +51,7 @@ fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=
 # MASTER CONFIG: THE STRICTNESS DIAL
 # 0.30 means the engine compares the Last 30% of iterations against the First 70%.
 # ------------------------------------------
-RECENT_ITERATION_PCT = 0.7  
+RECENT_ITERATION_PCT = 0.5  
 
 # ==========================================
 # 2. DYNAMIC UNIVERSE BUILDER
