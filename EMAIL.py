@@ -47,7 +47,7 @@ fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=
 # ------------------------------------------
 # MASTER PARAMETERS (THE CONTROL BOARD)
 # ------------------------------------------
-WATCHLIST_SIZE = 30            # Size of the anchored pre-market watchlist 
+WATCHLIST_SIZE = 10            # Size of the anchored pre-market watchlist 
 RECENT_ITERATION_PCT = 1.0     # Slices the last 30% of iterations as the momentum window
 SPEED_THRESHOLD_RATIO = 0.20   # Hurdle rate dial (e.g., recent speed must exceed 30% of base peak speed)
 
