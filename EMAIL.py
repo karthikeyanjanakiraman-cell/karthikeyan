@@ -51,8 +51,8 @@ fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=
 WATCHLIST_SIZE = 30            # Size of the anchored pre-market watchlist 
 RECENT_ITERATION_PCT = 1.0     # Slices the last 30% of iterations as the momentum window
 SPEED_THRESHOLD_RATIO = 0.20   # Hurdle rate dial (e.g., recent speed must exceed 30% of base peak speed)
-VOLATILITY_EXP_THRESHOLD = 1.0 # DYNAMIC DIAL: Minimum Volat Exp required to be displayed in the matrix
-VOL_RATIO_THRESHOLD = 1.0      # DYNAMIC DIAL: Minimum Vol Ratio required to be displayed in the matrix
+VOLATILITY_EXP_THRESHOLD = 0.7 # DYNAMIC DIAL: Minimum Volat Exp required to be displayed in the matrix
+VOL_RATIO_THRESHOLD = 0.7      # DYNAMIC DIAL: Minimum Vol Ratio required to be displayed in the matrix
 
 # ==========================================
 # 2. DYNAMIC UNIVERSE BUILDER
