@@ -1,4 +1,4 @@
-Name: Email
+name: Email
 
 on:
   schedule:
