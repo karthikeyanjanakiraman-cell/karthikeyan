@@ -1,4 +1,4 @@
-name: Email
+Name: Email
 
 on:
   schedule:
@@ -7,9 +7,21 @@ on:
   workflow_dispatch:
     inputs:
       backtest_date:
-        description: 'Backtest Date (YYYY-MM-DD HH:MM). Leave empty for Live Mode.'
+        description: 'Backtest Date (YYYY-MM-DD). For a single target execution, use YYYY-MM-DD HH:MM. Leave empty for Live Mode.'
         required: false
         default: ''
+      from_time:
+        description: 'Batch Start Time (HH:MM). Leave empty for Single Run or Live Mode.'
+        required: false
+        default: ''
+      to_time:
+        description: 'Batch End Time (HH:MM). Leave empty for Single Run or Live Mode.'
+        required: false
+        default: ''
+      interval:
+        description: 'Batch Step Interval in minutes (Only used if from_time and to_time are filled).'
+        required: false
+        default: '60'
 
 permissions:
   contents: write
@@ -54,9 +66,17 @@ jobs:
           SMTP_PORT:       ${{ secrets.SMTP_PORT }}
           TZ:              Asia/Kolkata
         run: |
-          if [ -n "${{ github.event.inputs.backtest_date }}" ]; then
-            echo "Running in BACKTEST mode for: ${{ github.event.inputs.backtest_date }}"
-            python EMAIL.py --date "${{ github.event.inputs.backtest_date }}"
+          B_DATE="${{ github.event.inputs.backtest_date }}"
+          B_FROM="${{ github.event.inputs.from_time }}"
+          B_TO="${{ github.event.inputs.to_time }}"
+          B_INT="${{ github.event.inputs.interval }}"
+          
+          if [ -n "$B_DATE" ] && [ -n "$B_FROM" ] && [ -n "$B_TO" ]; then
+            echo "Running in BATCH BACKTEST mode: $B_DATE from $B_FROM to $B_TO every $B_INT mins."
+            python EMAIL.py --date "$B_DATE" --from_time "$B_FROM" --to_time "$B_TO" --interval "$B_INT"
+          elif [ -n "$B_DATE" ]; then
+            echo "Running in SINGLE BACKTEST mode for target: $B_DATE"
+            python EMAIL.py --date "$B_DATE"
           else
             echo "Running in LIVE mode."
             python EMAIL.py
