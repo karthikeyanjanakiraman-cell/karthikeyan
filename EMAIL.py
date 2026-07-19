@@ -50,6 +50,7 @@ fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=
 WATCHLIST_SIZE = 30            # Size of the anchored pre-market watchlist 
 RECENT_ITERATION_PCT = 1.0     # Slices the last 30% of iterations as the momentum window
 SPEED_THRESHOLD_RATIO = 0.20   # Hurdle rate dial (e.g., recent speed must exceed 30% of base peak speed)
+VOLATILITY_EXP_THRESHOLD = 1.0 # DYNAMIC DIAL: Minimum Volat Exp required to be displayed in the matrix
 
 # ==========================================
 # 2. DYNAMIC UNIVERSE BUILDER
@@ -305,14 +306,13 @@ def send_html_email(df_matrix, target_dt):
           {build_rows(df_matrix)}
         </table>
         <p style="font-size: 12px; color: #777; text-align: center;">
-            TMV Engine v25.0 • Anchored Matrix Size: {WATCHLIST_SIZE} • Speed Hurdle Dial: {int(SPEED_THRESHOLD_RATIO*100)}%
+            TMV Engine v25.0 • Anchored Matrix Size: {WATCHLIST_SIZE} • Speed Hurdle Dial: {int(SPEED_THRESHOLD_RATIO*100)}% • Volat Exp Hurdle: >{VOLATILITY_EXP_THRESHOLD}x
         </p>
       </body>
     </html>
     """
     
     msg = MIMEMultipart("alternative")
-    # Updated subject to accurately match the target data time
     msg['Subject'] = f"TMV Anchored Matrix Tracker: {fetch_time_str}"
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECIPIENT_EMAIL
@@ -393,7 +393,13 @@ def main():
     PRIORITY_SORT = ['Volat_Ratio', 'Vol_Ratio', 'Pre_Market_Ratio']
     sorted_matrix = df_matrix.sort_values(PRIORITY_SORT, ascending=[False, False, False])
     
-    send_html_email(sorted_matrix, target_dt)
+    # Strictly display only the stocks exceeding the configurable Volatility Expansion Threshold
+    filtered_matrix = sorted_matrix[sorted_matrix['Volat_Ratio'] > VOLATILITY_EXP_THRESHOLD]
+    
+    if filtered_matrix.empty:
+        logger.warning(f"No structures cleared the active Volatility Expansion threshold: >{VOLATILITY_EXP_THRESHOLD}x")
+    
+    send_html_email(filtered_matrix, target_dt)
     logger.info("System process workflow completed successfully.")
 
 if __name__ == "__main__":
