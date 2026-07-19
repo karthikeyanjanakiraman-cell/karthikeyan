@@ -6,6 +6,7 @@ FEATURES:
 - Dynamic F&O Universe (Column Hunting & Regex Extraction)
 - Phase 1: Pre-Market Sieve (Anchors Top 25 Stocks via 90-Day 9:15 AM Max Vol ceiling)
 - Phase 2: Live Intraday Tracking Matrix restricted strictly to the Anchored Watchlist
+- Interval Batch Processing (Steps through specified times using memory caching)
 - Downshifted Speed Hurdle (The Threshold-Based Kinetic Chain Rule)
 - Clean Responsive HTML Matrix Dispatch System (Single Master Table with Timestamp)
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -213,6 +214,7 @@ def process_intraday_matrix(symbol, pre_market_ratio, df, target_dt):
         df['date'] = df['timestamp'].dt.date
         df['time'] = df['timestamp'].dt.time
         
+        # Dynamically filters the 'Full_DF' up to the current interval loop time
         df_filtered = df[(df['time'] >= market_open) & (df['time'] <= current_time)]
         today_date = df_filtered['date'].max()
         
@@ -258,7 +260,7 @@ def process_intraday_matrix(symbol, pre_market_ratio, df, target_dt):
 # 6. HTML REPORT GENERATOR & DISPATCH
 # ==========================================
 def send_html_email(df_matrix, target_dt):
-    logger.info("Generating secure HTML performance matrix...")
+    logger.info(f"Generating HTML performance matrix for {target_dt.strftime('%I:%M %p')}...")
     
     # Format the time the data was anchored/fetched
     fetch_time_str = target_dt.strftime('%d %b %Y, %I:%M %p')
@@ -322,7 +324,7 @@ def send_html_email(df_matrix, target_dt):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
             server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
-        logger.info("HTML report successfully dispatched.")
+        logger.info(f"HTML report successfully dispatched for {fetch_time_str}.")
     except Exception as e:
         logger.error(f"Failed to transmit email package: {e}")
 
@@ -331,18 +333,39 @@ def send_html_email(df_matrix, target_dt):
 # ==========================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--date", help="Input format: YYYY-MM-DD HH:MM")
+    parser.add_argument("--date", help="Input format: YYYY-MM-DD (Batch) or YYYY-MM-DD HH:MM (Single Run)")
+    parser.add_argument("--from_time", help="Input format: HH:MM (e.g., 10:00)")
+    parser.add_argument("--to_time", help="Input format: HH:MM (e.g., 14:00)")
+    parser.add_argument("--interval", type=int, default=60, help="Interval in minutes (e.g., 60)")
     args = parser.parse_args()
     
+    # Establish default parameters for live running
     target_dt = pd.Timestamp.now(tz="Asia/Kolkata")
-    if args.date:
+    start_dt = target_dt
+    end_dt = target_dt
+    interval_mins = args.interval
+    
+    # Override logic based on provided arguments
+    if args.date and args.from_time and args.to_time:
+        try:
+            date_str = args.date.replace('.', '-')
+            start_dt = pd.to_datetime(f"{date_str} {args.from_time}").tz_localize("Asia/Kolkata")
+            end_dt = pd.to_datetime(f"{date_str} {args.to_time}").tz_localize("Asia/Kolkata")
+            logger.info(f"--- BATCH BACKTEST MODE: {start_dt.strftime('%H:%M')} to {end_dt.strftime('%H:%M')} every {interval_mins} mins ---")
+        except Exception as e:
+            logger.error(f"Invalid Batch Date/Time format. Error: {e}")
+            return
+    elif args.date:
         try:
             date_str = args.date.replace('.', ':')
-            target_dt = pd.to_datetime(date_str, dayfirst=True).tz_localize("Asia/Kolkata")
-            logger.info(f"--- BACKTEST MODE: Simulating Timestamp {target_dt} ---")
+            start_dt = pd.to_datetime(date_str, dayfirst=True).tz_localize("Asia/Kolkata")
+            end_dt = start_dt
+            logger.info(f"--- SINGLE BACKTEST MODE: Simulating Timestamp {start_dt} ---")
         except Exception as e:
-            logger.error(f"Invalid Date format. Use YYYY-MM-DD HH:MM. Error: {e}")
+            logger.error(f"Invalid Single Date format. Use YYYY-MM-DD HH:MM. Error: {e}")
             return
+    else:
+        logger.info(f"--- LIVE EXECUTION MODE: Simulating Timestamp {start_dt} ---")
             
     raw_symbols = fetch_fo_universe()
     if not raw_symbols:
@@ -355,8 +378,9 @@ def main():
     logger.info(f"Phase 1: Running Pre-Market Opening Sieve across {len(raw_symbols)} symbols...")
     pre_market_results = []
     
+    # We pass 'end_dt' here so the engine securely caches all the day's data up to the final interval ONCE.
     with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {executor.submit(extract_pre_market_score, sym, target_dt): sym for sym in raw_symbols}
+        futures = {executor.submit(extract_pre_market_score, sym, end_dt): sym for sym in raw_symbols}
         for future in as_completed(futures):
             res = future.result()
             if res: pre_market_results.append(res)
@@ -370,36 +394,46 @@ def main():
     logger.info(f"Watchlist successfully anchored. Tracking top {len(anchored_watchlist)} institutional structures.")
     
     # -----------------------------------------------------------------
-    # PHASE 2: RUN CONTINUOUS INTRADAY FRACTIONAL PROCESSING VIA WATCHLIST
+    # PHASE 2: CONTINUOUS INTERVAL LOOP PROCESSING VIA WATCHLIST
     # -----------------------------------------------------------------
-    logger.info("Phase 2: Executing Intraday Matrix Calculations on anchored targets...")
-    intraday_results = []
+    current_dt = start_dt
     
-    with ThreadPoolExecutor(max_workers=4) as executor:
-        futures = {
-            executor.submit(process_intraday_matrix, row['Symbol'], row['Pre_Market_Ratio'], row['Full_DF'], target_dt): row['Symbol'] 
-            for _, row in anchored_watchlist.iterrows()
-        }
-        for future in as_completed(futures):
-            res = future.result()
-            if res: intraday_results.append(res)
+    while current_dt <= end_dt:
+        logger.info(f"Phase 2: Executing Intraday Matrix Calculations for {current_dt.strftime('%I:%M %p')}...")
+        intraday_results = []
+        
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = {
+                # We pass 'current_dt' through the loop to safely slice the Full_DF memory cache
+                executor.submit(process_intraday_matrix, row['Symbol'], row['Pre_Market_Ratio'], row['Full_DF'], current_dt): row['Symbol'] 
+                for _, row in anchored_watchlist.iterrows()
+            }
+            for future in as_completed(futures):
+                res = future.result()
+                if res: intraday_results.append(res)
+                
+        df_matrix = pd.DataFrame(intraday_results)
+        
+        if not df_matrix.empty:
+            # Sort Matrix by clean institutional parameters in a single list
+            PRIORITY_SORT = ['Volat_Ratio', 'Vol_Ratio', 'Pre_Market_Ratio']
+            sorted_matrix = df_matrix.sort_values(PRIORITY_SORT, ascending=[False, False, False])
             
-    df_matrix = pd.DataFrame(intraday_results)
-    if df_matrix.empty:
-        logger.error("Watchlist matrix processing returned empty set.")
-        return
+            # Strictly display only the stocks exceeding the configurable Volatility Expansion Threshold
+            filtered_matrix = sorted_matrix[sorted_matrix['Volat_Ratio'] > VOLATILITY_EXP_THRESHOLD]
+            
+            if not filtered_matrix.empty:
+                send_html_email(filtered_matrix, current_dt)
+            else:
+                logger.warning(f"No structures cleared the active Volatility Expansion threshold (> {VOLATILITY_EXP_THRESHOLD}x) at {current_dt.strftime('%I:%M %p')}.")
+        else:
+            logger.error(f"Watchlist matrix processing returned empty set for {current_dt.strftime('%I:%M %p')}.")
 
-    # Sort Matrix by clean institutional parameters in a single list
-    PRIORITY_SORT = ['Volat_Ratio', 'Vol_Ratio', 'Pre_Market_Ratio']
-    sorted_matrix = df_matrix.sort_values(PRIORITY_SORT, ascending=[False, False, False])
-    
-    # Strictly display only the stocks exceeding the configurable Volatility Expansion Threshold
-    filtered_matrix = sorted_matrix[sorted_matrix['Volat_Ratio'] > VOLATILITY_EXP_THRESHOLD]
-    
-    if filtered_matrix.empty:
-        logger.warning(f"No structures cleared the active Volatility Expansion threshold: >{VOLATILITY_EXP_THRESHOLD}x")
-    
-    send_html_email(filtered_matrix, target_dt)
+        # Step time forward by the defined interval and briefly pause to prevent SMTP limits
+        current_dt += timedelta(minutes=interval_mins)
+        if current_dt <= end_dt:
+            time.sleep(2)
+            
     logger.info("System process workflow completed successfully.")
 
 if __name__ == "__main__":
