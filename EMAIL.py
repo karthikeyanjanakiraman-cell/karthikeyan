@@ -52,6 +52,7 @@ WATCHLIST_SIZE = 30            # Size of the anchored pre-market watchlist
 RECENT_ITERATION_PCT = 1.0     # Slices the last 30% of iterations as the momentum window
 SPEED_THRESHOLD_RATIO = 0.20   # Hurdle rate dial (e.g., recent speed must exceed 30% of base peak speed)
 VOLATILITY_EXP_THRESHOLD = 1.0 # DYNAMIC DIAL: Minimum Volat Exp required to be displayed in the matrix
+VOL_RATIO_THRESHOLD = 1.0      # DYNAMIC DIAL: Minimum Vol Ratio required to be displayed in the matrix
 
 # ==========================================
 # 2. DYNAMIC UNIVERSE BUILDER
@@ -308,7 +309,7 @@ def send_html_email(df_matrix, target_dt):
           {build_rows(df_matrix)}
         </table>
         <p style="font-size: 12px; color: #777; text-align: center;">
-            TMV Engine v25.0 • Anchored Matrix Size: {WATCHLIST_SIZE} • Speed Hurdle Dial: {int(SPEED_THRESHOLD_RATIO*100)}% • Volat Exp Hurdle: >{VOLATILITY_EXP_THRESHOLD}x
+            TMV Engine v25.0 • Anchored Matrix Size: {WATCHLIST_SIZE} • Speed Hurdle: {int(SPEED_THRESHOLD_RATIO*100)}% • Volat Exp: >{VOLATILITY_EXP_THRESHOLD}x • Vol Ratio: >{VOL_RATIO_THRESHOLD}x
         </p>
       </body>
     </html>
@@ -349,8 +350,12 @@ def main():
     if args.date and args.from_time and args.to_time:
         try:
             date_str = args.date.replace('.', '-')
-            start_dt = pd.to_datetime(f"{date_str} {args.from_time}").tz_localize("Asia/Kolkata")
-            end_dt = pd.to_datetime(f"{date_str} {args.to_time}").tz_localize("Asia/Kolkata")
+            # Automatically convert any dots in the time to colons to prevent parsing errors
+            clean_from_time = args.from_time.replace('.', ':')
+            clean_to_time = args.to_time.replace('.', ':')
+            
+            start_dt = pd.to_datetime(f"{date_str} {clean_from_time}").tz_localize("Asia/Kolkata")
+            end_dt = pd.to_datetime(f"{date_str} {clean_to_time}").tz_localize("Asia/Kolkata")
             logger.info(f"--- BATCH BACKTEST MODE: {start_dt.strftime('%H:%M')} to {end_dt.strftime('%H:%M')} every {interval_mins} mins ---")
         except Exception as e:
             logger.error(f"Invalid Batch Date/Time format. Error: {e}")
@@ -419,13 +424,16 @@ def main():
             PRIORITY_SORT = ['Volat_Ratio', 'Vol_Ratio', 'Pre_Market_Ratio']
             sorted_matrix = df_matrix.sort_values(PRIORITY_SORT, ascending=[False, False, False])
             
-            # Strictly display only the stocks exceeding the configurable Volatility Expansion Threshold
-            filtered_matrix = sorted_matrix[sorted_matrix['Volat_Ratio'] > VOLATILITY_EXP_THRESHOLD]
+            # Strictly display only the stocks exceeding BOTH the Volatility Expansion AND Vol Ratio thresholds
+            filtered_matrix = sorted_matrix[
+                (sorted_matrix['Volat_Ratio'] > VOLATILITY_EXP_THRESHOLD) & 
+                (sorted_matrix['Vol_Ratio'] > VOL_RATIO_THRESHOLD)
+            ]
             
             if not filtered_matrix.empty:
                 send_html_email(filtered_matrix, current_dt)
             else:
-                logger.warning(f"No structures cleared the active Volatility Expansion threshold (> {VOLATILITY_EXP_THRESHOLD}x) at {current_dt.strftime('%I:%M %p')}.")
+                logger.warning(f"No structures cleared BOTH Volat Exp (>{VOLATILITY_EXP_THRESHOLD}x) AND Vol Ratio (>{VOL_RATIO_THRESHOLD}x) hurdles at {current_dt.strftime('%I:%M %p')}.")
         else:
             logger.error(f"Watchlist matrix processing returned empty set for {current_dt.strftime('%I:%M %p')}.")
 
