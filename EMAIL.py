@@ -401,7 +401,7 @@ def main():
         return
 
     # Sort Matrix by clean institutional parameters
-    PRIORITY_SORT = ['Volat_Ratio','Kin_Price_Str','Vol_Ratio']
+    PRIORITY_SORT = ['Kin_Price_Mult', 'Kin_Vol_Mult', 'Volat_Ratio']
     bullish_df = df_matrix[df_matrix['Trend'] == 'BULLISH'].sort_values(PRIORITY_SORT, ascending=[False, False, False])
     bearish_df = df_matrix[df_matrix['Trend'] == 'BEARISH'].sort_values(PRIORITY_SORT, ascending=[False, False, False])
     
