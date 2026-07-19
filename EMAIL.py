@@ -253,6 +253,8 @@ def process_intraday_matrix(symbol, pre_market_ratio, df, target_dt):
             'Volat_Ratio': volatility_ratio,
             'Kin_Vol_Str': f"PASS ({v_mult:.1f}x)" if v_pass else f"FAIL ({v_mult:.1f}x)",
             'Kin_Price_Str': f"PASS ({p_mult:.1f}x)" if p_pass else f"FAIL ({p_mult:.1f}x)",
+            'Kin_Vol_Mult': v_mult,
+            'Kin_Price_Mult': p_mult,
             'Trend': trend,
             'LTP': today_df['close'].iloc[-1],
             'V_Pass': v_pass,
