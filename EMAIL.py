@@ -7,8 +7,7 @@ FEATURES:
 - Phase 1: Pre-Market Sieve (Anchors Top 25 Stocks via 90-Day 9:15 AM Max Vol ceiling)
 - Phase 2: Live Intraday Tracking Matrix restricted strictly to the Anchored Watchlist
 - Downshifted Speed Hurdle (The Threshold-Based Kinetic Chain Rule)
-- Iceberg Trap Identifier & Dual-Engine Multi-Column Priority Sorting
-- Clean Responsive HTML Matrix Dispatch System
+- Clean Responsive HTML Matrix Dispatch System (Single Master Table)
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -237,15 +236,6 @@ def process_intraday_matrix(symbol, pre_market_ratio, df, target_dt):
         # Calculate Kinetic Splits with downshifted hurdles
         v_pass, p_pass, v_mult, p_mult = calculate_threshold_kinetic_chain(today_df, resolution=5)
         
-        # OBV Directional Anchor
-        df_filtered = df_filtered.copy()
-        df_filtered['price_dir'] = np.where(df_filtered['close'] > df_filtered['close'].shift(1), 1, 
-                                   np.where(df_filtered['close'] < df_filtered['close'].shift(1), -1, 0))
-        df_filtered['obv'] = (df_filtered['price_dir'] * df_filtered['volume']).cumsum()
-        df_filtered['obv_ema'] = df_filtered['obv'].ewm(span=10, min_periods=1).mean()
-        
-        trend = 'BULLISH' if df_filtered['obv'].iloc[-1] > df_filtered['obv_ema'].iloc[-1] else 'BEARISH'
-        
         return {
             'Symbol': symbol.replace('NSE:', '').replace('-EQ', ''),
             'Pre_Market_Ratio': pre_market_ratio,
@@ -255,7 +245,6 @@ def process_intraday_matrix(symbol, pre_market_ratio, df, target_dt):
             'Kin_Price_Str': f"PASS ({p_mult:.1f}x)" if p_pass else f"FAIL ({p_mult:.1f}x)",
             'Kin_Vol_Mult': v_mult,
             'Kin_Price_Mult': p_mult,
-            'Trend': trend,
             'LTP': today_df['close'].iloc[-1],
             'V_Pass': v_pass,
             'P_Pass': p_pass
@@ -267,7 +256,7 @@ def process_intraday_matrix(symbol, pre_market_ratio, df, target_dt):
 # ==========================================
 # 6. HTML REPORT GENERATOR & DISPATCH
 # ==========================================
-def send_html_email(bullish_df, bearish_df):
+def send_html_email(df_matrix):
     logger.info("Generating secure HTML performance matrix...")
     
     def build_rows(df):
@@ -293,12 +282,10 @@ def send_html_email(bullish_df, bearish_df):
         <meta charset="UTF-8">
         <style>
           body {{ font-family: 'Segoe UI', Arial, sans-serif; background-color: #f7f9fc; padding: 20px; color: #333; }}
-          h2 {{ margin-bottom: 10px; font-weight: 600; }}
+          h2 {{ margin-bottom: 10px; font-weight: 600; color: #1a237e; }}
           table {{ width: 100%; border-collapse: collapse; margin-bottom: 40px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); background-color: #fff; }}
           th, td {{ padding: 12px 15px; text-align: left; border-bottom: 1px solid #e0e0e0; }}
-          th {{ font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; }}
-          .bullish th {{ background-color: #1b5e20; color: white; }}
-          .bearish th {{ background-color: #b71c1c; color: white; }}
+          th {{ font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; background-color: #3949ab; color: white; }}
           tr:hover {{ background-color: #f5f5f5; }}
           .symbol {{ font-weight: bold; color: #1a73e8; }}
           .highlight {{ font-weight: bold; color: #333; font-size: 14px; }}
@@ -307,16 +294,10 @@ def send_html_email(bullish_df, bearish_df):
         </style>
       </head>
       <body>
-        <h2 style="color: #1b5e20;">🏆 TOP BULLISH ANCHORED BREAKOUTS</h2>
-        <table class="bullish">
+        <h2>🏆 TMV ANCHORED MASTER MATRIX</h2>
+        <table>
           <tr><th>Symbol</th><th>LTP</th><th>9:15 Print Ratio</th><th>Vol Ratio</th><th>Volat Exp</th><th>Kinetic Vol</th><th>Kinetic Price</th></tr>
-          {build_rows(bullish_df)}
-        </table>
-
-        <h2 style="color: #b71c1c;">🩸 TOP BEARISH ANCHORED BREAKDOWNS</h2>
-        <table class="bearish">
-          <tr><th>Symbol</th><th>LTP</th><th>9:15 Print Ratio</th><th>Vol Ratio</th><th>Volat Exp</th><th>Kinetic Vol</th><th>Kinetic Price</th></tr>
-          {build_rows(bearish_df)}
+          {build_rows(df_matrix)}
         </table>
         <p style="font-size: 12px; color: #777; text-align: center;">
             TMV Engine v25.0 • Anchored Matrix Size: {WATCHLIST_SIZE} • Speed Hurdle Dial: {int(SPEED_THRESHOLD_RATIO*100)}%
@@ -402,12 +383,11 @@ def main():
         logger.error("Watchlist matrix processing returned empty set.")
         return
 
-    # Sort Matrix by clean institutional parameters
-    PRIORITY_SORT = ['Volat_Ratio','Vol_Ratio','Pre_Market_Ratio']
-    bullish_df = df_matrix[df_matrix['Trend'] == 'BULLISH'].sort_values(PRIORITY_SORT, ascending=[False, False, False])
-    bearish_df = df_matrix[df_matrix['Trend'] == 'BEARISH'].sort_values(PRIORITY_SORT, ascending=[False, False, False])
+    # Sort Matrix by clean institutional parameters in a single list
+    PRIORITY_SORT = ['Volat_Ratio', 'Vol_Ratio', 'Pre_Market_Ratio']
+    sorted_matrix = df_matrix.sort_values(PRIORITY_SORT, ascending=[False, False, False])
     
-    send_html_email(bullish_df, bearish_df)
+    send_html_email(sorted_matrix)
     logger.info("System process workflow completed successfully.")
 
 if __name__ == "__main__":
