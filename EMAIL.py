@@ -7,7 +7,7 @@ FEATURES:
 - Phase 1: Pre-Market Sieve (Anchors Top 25 Stocks via 90-Day 9:15 AM Max Vol ceiling)
 - Phase 2: Live Intraday Tracking Matrix restricted strictly to the Anchored Watchlist
 - Downshifted Speed Hurdle (The Threshold-Based Kinetic Chain Rule)
-- Clean Responsive HTML Matrix Dispatch System (Single Master Table)
+- Clean Responsive HTML Matrix Dispatch System (Single Master Table with Timestamp)
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -47,7 +47,7 @@ fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=
 # ------------------------------------------
 # MASTER PARAMETERS (THE CONTROL BOARD)
 # ------------------------------------------
-WATCHLIST_SIZE = 10            # Size of the anchored pre-market watchlist 
+WATCHLIST_SIZE = 30            # Size of the anchored pre-market watchlist 
 RECENT_ITERATION_PCT = 1.0     # Slices the last 30% of iterations as the momentum window
 SPEED_THRESHOLD_RATIO = 0.20   # Hurdle rate dial (e.g., recent speed must exceed 30% of base peak speed)
 
@@ -256,8 +256,11 @@ def process_intraday_matrix(symbol, pre_market_ratio, df, target_dt):
 # ==========================================
 # 6. HTML REPORT GENERATOR & DISPATCH
 # ==========================================
-def send_html_email(df_matrix):
+def send_html_email(df_matrix, target_dt):
     logger.info("Generating secure HTML performance matrix...")
+    
+    # Format the time the data was anchored/fetched
+    fetch_time_str = target_dt.strftime('%d %b %Y, %I:%M %p')
     
     def build_rows(df):
         html_rows = ""
@@ -282,7 +285,8 @@ def send_html_email(df_matrix):
         <meta charset="UTF-8">
         <style>
           body {{ font-family: 'Segoe UI', Arial, sans-serif; background-color: #f7f9fc; padding: 20px; color: #333; }}
-          h2 {{ margin-bottom: 10px; font-weight: 600; color: #1a237e; }}
+          h2 {{ margin-bottom: 5px; font-weight: 600; color: #1a237e; text-align: center; }}
+          .time-stamp {{ text-align: center; font-size: 13px; color: #555; margin-bottom: 25px; }}
           table {{ width: 100%; border-collapse: collapse; margin-bottom: 40px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); background-color: #fff; }}
           th, td {{ padding: 12px 15px; text-align: left; border-bottom: 1px solid #e0e0e0; }}
           th {{ font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; background-color: #3949ab; color: white; }}
@@ -295,6 +299,7 @@ def send_html_email(df_matrix):
       </head>
       <body>
         <h2>🏆 TMV ANCHORED MASTER MATRIX</h2>
+        <p class="time-stamp">🕒 Data Fetched At: <b>{fetch_time_str}</b></p>
         <table>
           <tr><th>Symbol</th><th>LTP</th><th>9:15 Print Ratio</th><th>Vol Ratio</th><th>Volat Exp</th><th>Kinetic Vol</th><th>Kinetic Price</th></tr>
           {build_rows(df_matrix)}
@@ -307,7 +312,8 @@ def send_html_email(df_matrix):
     """
     
     msg = MIMEMultipart("alternative")
-    msg['Subject'] = f"TMV Anchored Matrix Tracker: {datetime.now().strftime('%d %b - %I:%M %p')}"
+    # Updated subject to accurately match the target data time
+    msg['Subject'] = f"TMV Anchored Matrix Tracker: {fetch_time_str}"
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECIPIENT_EMAIL
     msg.attach(MIMEText(html, "html"))
@@ -387,7 +393,7 @@ def main():
     PRIORITY_SORT = ['Volat_Ratio', 'Vol_Ratio', 'Pre_Market_Ratio']
     sorted_matrix = df_matrix.sort_values(PRIORITY_SORT, ascending=[False, False, False])
     
-    send_html_email(sorted_matrix)
+    send_html_email(sorted_matrix, target_dt)
     logger.info("System process workflow completed successfully.")
 
 if __name__ == "__main__":
