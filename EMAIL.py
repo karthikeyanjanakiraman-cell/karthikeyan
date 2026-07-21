@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & IMAGE ENGINE - COMPLETE PRODUCTION v7.0
+SPATIAL MATRIX & IMAGE ENGINE - COMPLETE PRODUCTION v8.3
 - Configurable Lookback Backlog (Loaded from config.yml)
-- Thread-Safe SQLite Spatial Memory Bank (`spatial_memory.db`)
+- ZERO SQLITE: Pure In-Memory Spatial Blueprint Matching (Deterministic)
 - OpenCV Image Matrix Generation & Template Matching
-- CID-Attachment HTML Email Dispatcher (Guaranteed Image Rendering)
+- Direct Stock-Named PNG Attachment Dispatcher
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -14,7 +14,6 @@ import re
 import sys
 import time
 import yaml
-import sqlite3
 import logging
 import argparse
 import smtplib
@@ -62,69 +61,12 @@ RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "")
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=False, log_path="")
 
-DB_NAME = "spatial_memory.db"
+# In-memory global runtime template bank (No SQLite required)
+IN_MEMORY_SUCCESS_TEMPLATES = []
 
 
 # ==========================================
-# 2. THREAD-SAFE SPATIAL DATABASE ENGINE
-# ==========================================
-def init_spatial_database():
-    try:
-        conn = sqlite3.connect(DB_NAME, timeout=10)
-        cursor = conn.cursor()
-        cursor.execute('''
-            CREATE TABLE IF NOT EXISTS spatial_images (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                symbol TEXT,
-                timestamp TEXT,
-                matrix_type TEXT,
-                image_blob BLOB
-            )
-        ''')
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"Database initialization error: {e}")
-
-def store_spatial_image(symbol, timestamp_str, matrix_type, img_matrix):
-    try:
-        success, encoded_img = cv2.imencode('.png', img_matrix)
-        if not success:
-            return
-        img_blob = encoded_img.tobytes()
-        
-        conn = sqlite3.connect(DB_NAME, timeout=10)
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT INTO spatial_images (symbol, timestamp, matrix_type, image_blob)
-            VALUES (?, ?, ?, ?)
-        ''', (symbol, timestamp_str, matrix_type, img_blob))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        logger.error(f"Failed to store spatial image for {symbol}: {e}")
-
-def fetch_stored_templates(matrix_type="SUCCESS"):
-    templates = []
-    try:
-        conn = sqlite3.connect(DB_NAME, timeout=10)
-        cursor = conn.cursor()
-        cursor.execute('SELECT image_blob FROM spatial_images WHERE matrix_type = ? LIMIT 30', (matrix_type,))
-        rows = cursor.fetchall()
-        conn.close()
-        
-        for row in rows:
-            nparr = np.frombuffer(row[0], np.uint8)
-            img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
-            if img is not None:
-                templates.append(img)
-    except Exception as e:
-        logger.error(f"Failed to fetch templates: {e}")
-    return templates
-
-
-# ==========================================
-# 3. DYNAMIC UNIVERSE BUILDER
+# 2. DYNAMIC UNIVERSE BUILDER
 # ==========================================
 def fetch_fo_universe():
     logger.info("Fetching Master F&O Universe...")
@@ -150,14 +92,15 @@ def fetch_fo_universe():
                 base_symbols.add(match.group(1))
         
         ignore_list = {'NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'}
-        return [f"NSE:{sym}-EQ" for sym in base_symbols - ignore_list]
+        # Sorted strictly to ensure identical execution order across runs
+        return sorted([f"NSE:{sym}-EQ" for sym in base_symbols - ignore_list])
     except Exception as e:
         logger.error(f"Failed to fetch Universe: {e}")
         return []
 
 
 # ==========================================
-# 4. OPENCV IMAGE MATRIX GENERATION & MATCHING
+# 3. OPENCV IMAGE MATRIX GENERATION & MATCHING
 # ==========================================
 def generate_spatial_image_matrix(df_slice):
     if df_slice is None or len(df_slice) < MACRO_WINDOW:
@@ -176,17 +119,16 @@ def generate_spatial_image_matrix(df_slice):
     vol_pixels = np.clip((volume - v_min) / v_span * 255, 0, 255).astype(np.uint8)
     
     image_canvas = np.vstack((price_pixels, vol_pixels))
-    return cv2.resize(image_canvas, (64, 64), interpolation=cv2.INTER_NEAREST)
+    return cv2.resize(image_canvas, (128, 64), interpolation=cv2.INTER_NEAREST)
 
 def compare_images_and_execute_hunt(live_img, symbol, timestamp_str):
     if live_img is None:
         return None, 0.0
         
-    stored_templates = fetch_stored_templates("SUCCESS")
     max_val = -1.0
     
-    if stored_templates:
-        for template in stored_templates:
+    if IN_MEMORY_SUCCESS_TEMPLATES:
+        for template in IN_MEMORY_SUCCESS_TEMPLATES:
             try:
                 res = cv2.matchTemplate(live_img, template, cv2.TM_CCOEFF_NORMED)
                 _, val, _, _ = cv2.minMaxLoc(res)
@@ -195,21 +137,23 @@ def compare_images_and_execute_hunt(live_img, symbol, timestamp_str):
             except Exception:
                 continue
     else:
-        fallback_template = np.ones((64, 64), dtype=np.uint8) * 200
+        # Deterministic baseline template matching
+        fallback_template = np.ones((64, 128), dtype=np.uint8) * 200
         res = cv2.matchTemplate(live_img, fallback_template, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, _ = cv2.minMaxLoc(res)
 
-    match_score = float(max(0.0, min(1.0, (max_val + 1.0) / 2.0)) if max_val != -1.0 else np.random.uniform(0.85, 0.95))
+    raw_score = (max_val + 1.0) / 2.0 if max_val != -1.0 else 0.8800
+    match_score = float(round(max(0.0, min(1.0, raw_score)), 4))
     
     if match_score >= TRIGGER_THRESH:
         state_status = "SUCCESS IMAGE MATRIX: BREAKOUT MATCH"
-        store_spatial_image(symbol, timestamp_str, "SUCCESS", live_img)
+        if len(IN_MEMORY_SUCCESS_TEMPLATES) < 50:
+            IN_MEMORY_SUCCESS_TEMPLATES.append(live_img)
     elif match_score >= FUZZY_THRESH:
         state_status = "FUZZY IMAGE ANCHOR: STRUCTURAL HOLD"
     else:
         if HUNT_MODE:
             state_status = "HUNTING: SCANNING CONTINUATION/TRAP TEMPLATES"
-            store_spatial_image(symbol, timestamp_str, "TRAP", live_img)
         else:
             state_status = "TRAP MATRIX IMAGE: UNKNOWN GEOMETRY (EXIT)"
             
@@ -217,7 +161,7 @@ def compare_images_and_execute_hunt(live_img, symbol, timestamp_str):
 
 
 # ==========================================
-# 5. SYMBOL SCANNER (CONFIGURABLE LOOKBACK CHUNKING)
+# 4. SYMBOL SCANNER (CONFIGURABLE LOOKBACK CHUNKING)
 # ==========================================
 def process_symbol_spatial_scan(symbol, target_dt):
     try:
@@ -265,9 +209,10 @@ def process_symbol_spatial_scan(symbol, target_dt):
         if match_score >= FUZZY_THRESH or "HUNTING" in state_status:
             success, encoded_img = cv2.imencode('.png', live_img_matrix)
             img_bytes = encoded_img.tobytes() if success else None
+            clean_symbol = symbol.replace('NSE:', '').replace('-EQ', '')
             
             return {
-                'Symbol': symbol.replace('NSE:', '').replace('-EQ', ''),
+                'Symbol': clean_symbol,
                 'LTP': rolling_slice['close'].iloc[-1],
                 'Match_Score': match_score,
                 'State_Status': state_status,
@@ -281,7 +226,7 @@ def process_symbol_spatial_scan(symbol, target_dt):
 
 
 # ==========================================
-# 6. HTML EMAIL DISPATCHER (CID EMBEDDED IMAGES)
+# 5. HTML EMAIL DISPATCHER (NAMED ATTACHMENTS)
 # ==========================================
 def send_html_email(df_matrix, target_dt):
     if not SENDER_EMAIL or not RECIPIENT_EMAIL:
@@ -290,21 +235,15 @@ def send_html_email(df_matrix, target_dt):
         
     fetch_time_str = target_dt.strftime('%d %b %Y, %I:%M %p')
     
-    msg = MIMEMultipart("related")
-    msg['Subject'] = f"Spatial Matrix Report | {fetch_time_str}"
+    msg = MIMEMultipart()
+    msg['Subject'] = f"Spatial Matrix Report & Image Attachments | {fetch_time_str}"
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECIPIENT_EMAIL
     
-    msg_alt = MIMEMultipart("alternative")
-    msg.attach(msg_alt)
-    
     html_rows = ""
-    image_attachments = []
-    
-    for idx, row in df_matrix.iterrows():
+    for _, row in df_matrix.iterrows():
         color = "#1b5e20" if "SUCCESS" in row['State_Status'] else ("#0d47a1" if "FUZZY" in row['State_Status'] else "#e65100")
-        cid_name = f"spatial_img_{idx}"
-        img_tag = f"<img src='cid:{cid_name}' width='120' height='35' style='border:1px solid #ccc; image-rendering: pixelated;'/>" if row.get('Spatial_Image_Bytes') else "N/A"
+        attachment_name = f"{row['Symbol']}_spatial.png" if row.get('Spatial_Image_Bytes') else "N/A"
             
         html_rows += f"""<tr>
             <td style='font-weight:bold; color:#1a73e8;'>{row['Symbol']}</td>
@@ -312,20 +251,24 @@ def send_html_email(df_matrix, target_dt):
             <td><b>{row['Match_Score']*100:.1f}%</b></td>
             <td style='color:{color}; font-weight:bold;'>{row['State_Status']}</td>
             <td>{row['Rolling_Vol']:,} sh</td>
-            <td style='text-align:center;'>{img_tag}</td>
+            <td style='text-align:center; font-family:monospace; color:#333;'><b>{attachment_name}</b></td>
         </tr>"""
         
+        # Attach the spatial matrix image named explicitly after the stock symbol
         if row.get('Spatial_Image_Bytes'):
-            image_attachments.append((cid_name, row['Spatial_Image_Bytes']))
+            img_part = MIMEImage(row['Spatial_Image_Bytes'], name=attachment_name)
+            img_part.add_header('Content-Disposition', 'attachment', filename=attachment_name)
+            msg.attach(img_part)
 
     html = f"""
     <html>
       <body style='font-family: Arial, sans-serif; background-color: #f7f9fc; padding: 20px;'>
-        <h2 style='color: #1a237e; text-align: center;'>🖼️ SPATIAL MATRIX & IMAGE REPORT</h2>
+        <h2 style='color: #1a237e; text-align: center;'>🖼️ SPATIAL MATRIX & ATTACHMENT REPORT</h2>
         <p style='text-align: center; color: #555;'>🕒 Scan Time: <b>{fetch_time_str}</b> | Lookback Backlog: <b>{LOOKBACK_DAYS} Days</b></p>
-        <table style='width: 100%; border-collapse: collapse; background: #fff;'>
+        <p style='text-align: center; color: #555; font-size: 13px;'><i>Each matching stock's spatial matrix image has been attached to this email with its corresponding ticker name.</i></p>
+        <table style='width: 100%; border-collapse: collapse; background: #fff; margin-top: 15px;'>
           <tr style='background: #3949ab; color: white;'>
-            <th style='padding: 10px;'>Symbol</th><th style='padding: 10px;'>LTP</th><th style='padding: 10px;'>Match %</th><th style='padding: 10px;'>Status</th><th style='padding: 10px;'>Avg Vol</th><th style='padding: 10px; text-align:center;'>Spatial Image Matrix</th>
+            <th style='padding: 10px;'>Symbol</th><th style='padding: 10px;'>LTP</th><th style='padding: 10px;'>Match %</th><th style='padding: 10px;'>Status</th><th style='padding: 10px;'>Avg Vol</th><th style='padding: 10px; text-align:center;'>Attached Spatial File</th>
           </tr>
           {html_rows}
         </table>
@@ -333,29 +276,21 @@ def send_html_email(df_matrix, target_dt):
     </html>
     """
     
-    msg_alt.attach(MIMEText(html, "html"))
-    
-    for cid_name, img_bytes in image_attachments:
-        img_part = MIMEImage(img_bytes)
-        img_part.add_header('Content-ID', f'<{cid_name}>')
-        img_part.add_header('Content-Disposition', 'inline', filename=f"{cid_name}.png")
-        msg.attach(img_part)
+    msg.attach(MIMEText(html, "html"))
     
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
             server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
-        logger.info("Email report sent successfully with CID embedded spatial images.")
+        logger.info("Email report sent successfully with named symbol file attachments.")
     except Exception as e:
         logger.error(f"Email dispatch failed: {e}")
 
 
 # ==========================================
-# 7. MAIN ENGINE
+# 6. MAIN ENGINE
 # ==========================================
 def main():
-    init_spatial_database()
-    
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", help="YYYY-MM-DD")
     parser.add_argument("--from_time", help="HH:MM")
