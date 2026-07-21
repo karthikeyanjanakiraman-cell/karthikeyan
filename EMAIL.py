@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL IMAGE MATRIX RESULTS & MEMORY BANK - PRODUCTION v6.1
-- Stores and retrieves true spatial image matrices in SQLite (`spatial_memory.db`)
-- OpenCV Image Template Matching
-- Injects raw spatial image matrices & data directly into HTML email reports
+SPATIAL MATRIX ENGINE - STABLE PRODUCTION v6.2
+- Thread-safe SQLite Spatial Memory Bank (`spatial_memory.db`)
+- OpenCV Image Matrix Generation & Template Matching
+- Inline Base64 Spatial Image Data Injected into HTML Email
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -19,7 +19,7 @@ import logging
 import argparse
 import smtplib
 from io import StringIO
-from datetime import datetime, timedelta, time as dt_time
+from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -41,12 +41,10 @@ try:
         _raw_cfg = yaml.safe_load(f)
         cfg = _raw_cfg.get("trading_engine", {})
         
-    BASE_RES = cfg.get("base_resolution_min", 1)
     MACRO_WINDOW = cfg.get("macro_window_min", 30)
     TRIGGER_THRESH = cfg.get("correlation", {}).get("initial_trigger_threshold", 0.95)
     FUZZY_THRESH = cfg.get("correlation", {}).get("fuzzy_hold_threshold", 0.90)
     HUNT_MODE = cfg.get("hunt_mode_enabled", True)
-    
     logger.info("✅ config.yml loaded successfully.")
 except Exception as e:
     logger.error(f"❌ Configuration error: {e}")
@@ -65,22 +63,25 @@ DB_NAME = "spatial_memory.db"
 
 
 # ==========================================
-# 2. SPATIAL MEMORY DATABASE SETUP
+# 2. THREAD-SAFE SPATIAL DATABASE ENGINE
 # ==========================================
 def init_spatial_database():
-    conn = sqlite3.connect(DB_NAME)
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS spatial_images (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT,
-            timestamp TEXT,
-            matrix_type TEXT,
-            image_blob BLOB
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_NAME, timeout=10)
+        cursor = conn.cursor()
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS spatial_images (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                timestamp TEXT,
+                matrix_type TEXT,
+                image_blob BLOB
+            )
+        ''')
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Database initialization error: {e}")
 
 def store_spatial_image(symbol, timestamp_str, matrix_type, img_matrix):
     try:
@@ -89,7 +90,7 @@ def store_spatial_image(symbol, timestamp_str, matrix_type, img_matrix):
             return
         img_blob = encoded_img.tobytes()
         
-        conn = sqlite3.connect(DB_NAME)
+        conn = sqlite3.connect(DB_NAME, timeout=10)
         cursor = conn.cursor()
         cursor.execute('''
             INSERT INTO spatial_images (symbol, timestamp, matrix_type, image_blob)
@@ -103,20 +104,19 @@ def store_spatial_image(symbol, timestamp_str, matrix_type, img_matrix):
 def fetch_stored_templates(matrix_type="SUCCESS"):
     templates = []
     try:
-        conn = sqlite3.connect(DB_NAME)
+        conn = sqlite3.connect(DB_NAME, timeout=10)
         cursor = conn.cursor()
-        cursor.execute('SELECT image_blob FROM spatial_images WHERE matrix_type = ? LIMIT 50', (matrix_type,))
+        cursor.execute('SELECT image_blob FROM spatial_images WHERE matrix_type = ? LIMIT 30', (matrix_type,))
         rows = cursor.fetchall()
         conn.close()
         
         for row in rows:
-            blob_data = row[0]
-            nparr = np.frombuffer(blob_data, np.uint8)
+            nparr = np.frombuffer(row[0], np.uint8)
             img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
             if img is not None:
                 templates.append(img)
     except Exception as e:
-        logger.error(f"Failed to fetch stored templates: {e}")
+        logger.error(f"Failed to fetch templates: {e}")
     return templates
 
 
@@ -173,8 +173,7 @@ def generate_spatial_image_matrix(df_slice):
     vol_pixels = np.clip((volume - v_min) / v_span * 255, 0, 255).astype(np.uint8)
     
     image_canvas = np.vstack((price_pixels, vol_pixels))
-    resized_img_matrix = cv2.resize(image_canvas, (64, 64), interpolation=cv2.INTER_NEAREST)
-    return resized_img_matrix
+    return cv2.resize(image_canvas, (64, 64), interpolation=cv2.INTER_NEAREST)
 
 def compare_images_and_execute_hunt(live_img, symbol, timestamp_str):
     if live_img is None:
@@ -215,19 +214,16 @@ def compare_images_and_execute_hunt(live_img, symbol, timestamp_str):
 
 
 # ==========================================
-# 5. SYMBOL SCANNER
+# 5. SYMBOL SCANNER (SAFE CHUNKING)
 # ==========================================
 def process_symbol_spatial_scan(symbol, target_dt):
     try:
-        TOTAL_BACKLOG_DAYS = 1800
-        CHUNK_SIZE_DAYS = 30
-        
         all_candles = []
         current_end_date = target_dt
         days_fetched = 0
         
-        while days_fetched < TOTAL_BACKLOG_DAYS:
-            chunk_start_date = current_end_date - timedelta(days=CHUNK_SIZE_DAYS)
+        while days_fetched < 90:  # Single safe loop block
+            chunk_start_date = current_end_date - timedelta(days=30)
             payload = {
                 "symbol": symbol, "resolution": "1", "date_format": 1,
                 "range_from": chunk_start_date.strftime("%Y-%m-%d"),
@@ -243,7 +239,7 @@ def process_symbol_spatial_scan(symbol, target_dt):
                 break
                 
             current_end_date = chunk_start_date
-            days_fetched += CHUNK_SIZE_DAYS
+            days_fetched += 30
 
         if not all_candles: 
             return None
@@ -263,7 +259,6 @@ def process_symbol_spatial_scan(symbol, target_dt):
         state_status, match_score = compare_images_and_execute_hunt(live_img_matrix, symbol, timestamp_str)
         
         if match_score >= FUZZY_THRESH or "HUNTING" in state_status:
-            # Encode spatial image matrix to Base64 to embed directly inside the HTML report
             success, encoded_img = cv2.imencode('.png', live_img_matrix)
             img_base64 = base64.b64encode(encoded_img.tobytes()).decode('utf-8') if success else ""
             
@@ -282,7 +277,7 @@ def process_symbol_spatial_scan(symbol, target_dt):
 
 
 # ==========================================
-# 6. HTML EMAIL DISPATCHER (WITH EMBEDDED SPATIAL IMAGE DATA)
+# 6. HTML EMAIL DISPATCHER
 # ==========================================
 def send_html_email(df_matrix, target_dt):
     if not SENDER_EMAIL or not RECIPIENT_EMAIL:
@@ -293,14 +288,8 @@ def send_html_email(df_matrix, target_dt):
     
     html_rows = ""
     for _, row in df_matrix.iterrows():
-        if "SUCCESS" in row['State_Status']:
-            color = "#1b5e20"
-        elif "FUZZY" in row['State_Status']:
-            color = "#0d47a1"
-        else:
-            color = "#e65100"
-            
-        img_tag = f"<img src='data:image/png;base64,{row['Spatial_Image_B64']}' width='120' height='40' style='border:1px solid #ccc; image-rendering: pixelated;'/>" if row['Spatial_Image_B64'] else "N/A"
+        color = "#1b5e20" if "SUCCESS" in row['State_Status'] else ("#0d47a1" if "FUZZY" in row['State_Status'] else "#e65100")
+        img_tag = f"<img src='data:image/png;base64,{row['Spatial_Image_B64']}' width='100' height='30' style='border:1px solid #ccc; image-rendering: pixelated;'/>" if row['Spatial_Image_B64'] else "N/A"
             
         html_rows += f"""<tr>
             <td style='font-weight:bold; color:#1a73e8;'>{row['Symbol']}</td>
@@ -315,10 +304,10 @@ def send_html_email(df_matrix, target_dt):
     <html>
       <body style='font-family: Arial, sans-serif; background-color: #f7f9fc; padding: 20px;'>
         <h2 style='color: #1a237e; text-align: center;'>🖼️ SPATIAL DATA MATRIX & IMAGE REPORT</h2>
-        <p style='text-align: center; color: #555;'>🕒 Scan Time: <b>{fetch_time_str}</b> | Raw Spatial Matrix Visualization Included</p>
+        <p style='text-align: center; color: #555;'>🕒 Scan Time: <b>{fetch_time_str}</b></p>
         <table style='width: 100%; border-collapse: collapse; background: #fff;'>
           <tr style='background: #3949ab; color: white;'>
-            <th style='padding: 10px;'>Symbol</th><th style='padding: 10px;'>LTP</th><th style='padding: 10px;'>Match %</th><th style='padding: 10px;'>State Status</th><th style='padding: 10px;'>Avg Vol</th><th style='padding: 10px; text-align:center;'>Spatial Image Matrix (64x2)</th>
+            <th style='padding: 10px;'>Symbol</th><th style='padding: 10px;'>LTP</th><th style='padding: 10px;'>Match %</th><th style='padding: 10px;'>Status</th><th style='padding: 10px;'>Avg Vol</th><th style='padding: 10px; text-align:center;'>Spatial Image Matrix</th>
           </tr>
           {html_rows}
         </table>
@@ -327,7 +316,7 @@ def send_html_email(df_matrix, target_dt):
     """
     
     msg = MIMEMultipart("alternative")
-    msg['Subject'] = f"Spatial Data & Image Matrix Report | {fetch_time_str}"
+    msg['Subject'] = f"Spatial Matrix Report | {fetch_time_str}"
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECIPIENT_EMAIL
     msg.attach(MIMEText(html, "html"))
@@ -371,7 +360,7 @@ def main():
         
     current_dt = start_dt
     while current_dt <= end_dt:
-        logger.info(f"Executing Spatial Data Matrix scan for {current_dt.strftime('%I:%M %p')}...")
+        logger.info(f"Executing Spatial Matrix scan for {current_dt.strftime('%I:%M %p')}...")
         results = []
         
         with ThreadPoolExecutor(max_workers=4) as executor:
@@ -385,7 +374,7 @@ def main():
             df_matrix = df_matrix.sort_values('Match_Score', ascending=False)
             send_html_email(df_matrix, current_dt)
         else:
-            logger.warning("No spatial image matches met the threshold for this scan interval.")
+            logger.warning("No matches met the threshold for this scan interval.")
             
         current_dt += timedelta(minutes=args.interval)
         if current_dt <= end_dt:
