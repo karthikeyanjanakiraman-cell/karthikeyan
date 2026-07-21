@@ -1,6 +1,6 @@
 trading_engine:
   base_resolution_min: 1
-  macro_window_min: 1D
+  macro_window_min: 360
   micro_xray_mins:
     - 1
     - 5
