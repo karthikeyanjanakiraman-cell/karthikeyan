@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v9.3
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v9.4
 - Configurable Lookback Backlog (Loaded from config.yml)
 - ZERO SQLITE: Pure In-Memory Spatial Blueprint Matching (Deterministic)
 - True Multi-Channel F&O 1024x1024 Grid (Price, Volume, Open Interest / Volatility Channels)
 - Maximum 64-Dimensional NumPy/Tensor Hyper-Pipeline
 - Dynamic Target Calculator (Target 1, Target 2, Target 3 Breakout Projections)
-- Conditional PNG Attachments & Success Matrix Image References (Attached ONLY for BREAKOUT MATCH)
+- Dual Attachment Dispatcher: Both Live Spatial Matrix AND Matched Success Blueprint Attached for Breakouts
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -63,7 +63,7 @@ RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "")
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=False, log_path="")
 
-# In-memory global runtime template bank (No SQLite required)
+# In-memory global runtime template bank storing both image bytes and identifiers
 IN_MEMORY_SUCCESS_TEMPLATES = []
 
 
@@ -176,14 +176,17 @@ def generate_multichannel_spatial_matrix(df_slice):
 
 def compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str):
     if multi_channel_img is None:
-        return None, 0.0, "N/A"
+        return None, 0.0, "N/A", None
         
     live_img_gray = cv2.cvtColor(multi_channel_img, cv2.COLOR_RGB2GRAY)
     build_maximum_64d_hyper_tensor(multi_channel_img)
 
     max_val = -1.0
     matched_template_id = "N/A (Pending Blueprint Match)"
+    matched_template_bytes = None
     
+    clean_sym = symbol.replace('NSE:', '').replace('-EQ', '')
+
     if IN_MEMORY_SUCCESS_TEMPLATES:
         for idx, template_item in enumerate(IN_MEMORY_SUCCESS_TEMPLATES):
             try:
@@ -200,17 +203,19 @@ def compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str):
                 _, val, _, _ = cv2.minMaxLoc(res)
                 if val > max_val:
                     max_val = val
-                    matched_template_id = f"SUCCESS_BLUEPRINT_{idx}_{t_id}_spatial_1024.png"
+                    matched_template_id = f"SUCCESS_BLUEPRINT_{t_id}_spatial_1024.png"
+                    success_enc, enc_bytes = cv2.imencode('.png', template)
+                    matched_template_bytes = enc_bytes.tobytes() if success_enc else None
             except Exception:
                 continue
     else:
         fallback_template = np.ones((1024, 1024), dtype=np.uint8) * 220
         res = cv2.matchTemplate(live_img_gray, fallback_template, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, _ = cv2.minMaxLoc(res)
+        matched_template_id = "DEFAULT_ANALYTIC_MATRIX"
 
     raw_score = (max_val + 1.0) / 2.0 if max_val != -1.0 else 0.8800
     match_score = float(round(max(0.0, min(1.0, raw_score)), 4))
-    clean_sym = symbol.replace('NSE:', '').replace('-EQ', '')
     
     if match_score >= TRIGGER_THRESH:
         state_status = "SUCCESS IMAGE MATRIX: BREAKOUT MATCH"
@@ -219,16 +224,13 @@ def compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str):
             IN_MEMORY_SUCCESS_TEMPLATES.append({'img': multi_channel_img, 'id': clean_sym})
     elif match_score >= FUZZY_THRESH:
         state_status = "FUZZY IMAGE ANCHOR: STRUCTURAL HOLD"
-        matched_template_id = "N/A (Fuzzy Hold Zone)"
     else:
         if HUNT_MODE:
             state_status = "HUNTING: SCANNING CONTINUATION/TRAP TEMPLATES"
-            matched_template_id = "N/A (Active Scan Hunt)"
         else:
             state_status = "TRAP MATRIX IMAGE: UNKNOWN GEOMETRY (EXIT)"
-            matched_template_id = "N/A (Trap Exit)"
             
-    return state_status, match_score, matched_template_id
+    return state_status, match_score, matched_template_id, matched_template_bytes
 
 
 # ==========================================
@@ -275,7 +277,7 @@ def process_symbol_spatial_scan(symbol, target_dt):
         
         t1, t2, t3 = calculate_breakout_targets(rolling_slice, ltp)
         multi_channel_img = generate_multichannel_spatial_matrix(rolling_slice)
-        state_status, match_score, success_matrix_ref = compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str)
+        state_status, match_score, success_matrix_ref, template_bytes = compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str)
         
         if match_score >= FUZZY_THRESH or "HUNTING" in state_status:
             success, encoded_img = cv2.imencode('.png', multi_channel_img)
@@ -291,7 +293,8 @@ def process_symbol_spatial_scan(symbol, target_dt):
                 'Match_Score': match_score,
                 'State_Status': state_status,
                 'Success_Matrix_Ref': success_matrix_ref,
-                'Spatial_Image_Bytes': img_bytes
+                'Spatial_Image_Bytes': img_bytes,
+                'Matched_Template_Bytes': template_bytes
             }
         return None
     except Exception as e:
@@ -300,7 +303,7 @@ def process_symbol_spatial_scan(symbol, target_dt):
 
 
 # ==========================================
-# 6. HTML EMAIL DISPATCHER (CONDITIONAL ATTACHMENTS)
+# 6. HTML EMAIL DISPATCHER (DUAL ATTACHMENTS FOR BREAKOUTS)
 # ==========================================
 def send_html_email(df_matrix, target_dt):
     if not SENDER_EMAIL or not RECIPIENT_EMAIL:
@@ -310,7 +313,7 @@ def send_html_email(df_matrix, target_dt):
     fetch_time_str = target_dt.strftime('%d %b %Y, %I:%M %p')
     
     msg = MIMEMultipart()
-    msg['Subject'] = f"F&O 1024x1024 Spatial Matrix & Conditional Breakout Report | {fetch_time_str}"
+    msg['Subject'] = f"F&O 1024x1024 Spatial Matrix & Matching Blueprint Report | {fetch_time_str}"
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECIPIENT_EMAIL
     
@@ -319,15 +322,25 @@ def send_html_email(df_matrix, target_dt):
         is_breakout = "SUCCESS" in row['State_Status']
         color = "#1b5e20" if is_breakout else ("#0d47a1" if "FUZZY" in row['State_Status'] else "#e65100")
         
-        # Attach image ONLY for SUCCESS BREAKOUT MATCH
+        attachments_display = []
+        
+        # 1. Attach Live Spatial Matrix Image ONLY for Breakout Matches
         if is_breakout and row.get('Spatial_Image_Bytes'):
-            attachment_name = f"{row['Symbol']}_spatial_1024.png"
-            img_part = MIMEImage(row['Spatial_Image_Bytes'], name=attachment_name)
-            img_part.add_header('Content-Disposition', 'attachment', filename=attachment_name)
-            msg.attach(img_part)
-            file_display = f"<b style='color:#1b5e20;'>{attachment_name} (Attached)</b>"
-        else:
-            file_display = "<span style='color:#888;'>None (Filtered Out)</span>"
+            live_att_name = f"{row['Symbol']}_spatial_1024.png"
+            img_part1 = MIMEImage(row['Spatial_Image_Bytes'], name=live_att_name)
+            img_part1.add_header('Content-Disposition', 'attachment', filename=live_att_name)
+            msg.attach(img_part1)
+            attachments_display.append(live_att_name)
+            
+        # 2. Attach Matching Success Blueprint Image Referenced in the Success Matrix Ref column
+        if is_breakout and row.get('Matched_Template_Bytes'):
+            ref_att_name = row['Success_Matrix_Ref']
+            img_part2 = MIMEImage(row['Matched_Template_Bytes'], name=ref_att_name)
+            img_part2.add_header('Content-Disposition', 'attachment', filename=ref_att_name)
+            msg.attach(img_part2)
+            attachments_display.append(ref_att_name)
+            
+        file_display = f"<b style='color:#1b5e20;'>{', '.join(attachments_display)} (Attached)</b>" if attachments_display else "<span style='color:#888;'>None (Filtered Out)</span>"
             
         html_rows += f"""<tr>
             <td style='font-weight:bold; color:#1a73e8;'>{row['Symbol']}</td>
@@ -344,9 +357,9 @@ def send_html_email(df_matrix, target_dt):
     html = f"""
     <html>
       <body style='font-family: Arial, sans-serif; background-color: #f7f9fc; padding: 20px;'>
-        <h2 style='color: #1a237e; text-align: center;'>🎯 F&O 1024x1024 CONDITIONAL BREAKOUT REPORT</h2>
+        <h2 style='color: #1a237e; text-align: center;'>🎯 F&O 1024x1024 DUAL ATTACHMENT BREAKOUT REPORT</h2>
         <p style='text-align: center; color: #555;'>🕒 Scan Time: <b>{fetch_time_str}</b> | Lookback Backlog: <b>{LOOKBACK_DAYS} Days</b></p>
-        <p style='text-align: center; color: #555; font-size: 13px;'><i>Spatial matrix images and file attachments are dispatched <b>ONLY</b> for SUCCESS IMAGE MATRIX: BREAKOUT MATCH triggers.</i></p>
+        <p style='text-align: center; color: #555; font-size: 13px;'><i>Both the live spatial matrix and the referenced matching success blueprint are attached <b>ONLY</b> for SUCCESS BREAKOUT MATCHES.</i></p>
         <table style='width: 100%; border-collapse: collapse; background: #fff; margin-top: 15px;'>
           <tr style='background: #3949ab; color: white;'>
             <th style='padding: 10px;'>Symbol</th>
@@ -357,7 +370,7 @@ def send_html_email(df_matrix, target_dt):
             <th style='padding: 10px;'>Match %</th>
             <th style='padding: 10px;'>Status</th>
             <th style='padding: 10px;'>Success Matrix Image Ref</th>
-            <th style='padding: 10px; text-align:center;'>Attachment Status</th>
+            <th style='padding: 10px; text-align:center;'>Attachments</th>
           </tr>
           {html_rows}
         </table>
@@ -371,7 +384,7 @@ def send_html_email(df_matrix, target_dt):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
             server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
-        logger.info("Email report sent successfully with conditional breakout attachments.")
+        logger.info("Email report sent successfully with dual attachments (Live Matrix + Matching Blueprint).")
     except Exception as e:
         logger.error(f"Email dispatch failed: {e}")
 
@@ -404,7 +417,7 @@ def main():
         
     current_dt = start_dt
     while current_dt <= end_dt:
-        logger.info(f"Executing 1024x1024 Conditional Scan for {current_dt.strftime('%I:%M %p')}...")
+        logger.info(f"Executing 1024x1024 Dual Attachment Scan for {current_dt.strftime('%I:%M %p')}...")
         results = []
         
         with ThreadPoolExecutor(max_workers=4) as executor:
