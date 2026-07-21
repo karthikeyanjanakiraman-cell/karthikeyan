@@ -176,24 +176,53 @@ def evaluate_fractal_spatial_geometry(df_1min, current_dt):
         logger.error(f"Error in spatial evaluation: {e}")
         return None
 
-
 # ==========================================
-# 4. FETCH SYMBOL DATA
+# 4. FETCH SYMBOL DATA (WITH AUTO-CHUNKING LOOP)
 # ==========================================
 def process_symbol_spatial_scan(symbol, target_dt):
     try:
-        time.sleep(0.1) # Rate-limit protection for FYERS API
-        payload = {
-            "symbol": symbol, "resolution": "1", "date_format": 1,
-            "range_from": (target_dt - timedelta(days=89)).strftime("%Y-%m-%d"),
-            "range_to": target_dt.strftime("%Y-%m-%d"), "cont_flag": 1
-        }
-        res = fyers.history(payload)
-        if not res or 'candles' not in res or len(res['candles']) == 0: 
+        # Define how many total days of history you want to look back (e.g., 365 days)
+        TOTAL_BACKLOG_DAYS = 900
+        CHUNK_SIZE_DAYS = 90  # Safely under the FYERS 100-day API limit
+        
+        all_candles = []
+        current_end_date = target_dt
+        days_fetched = 0
+        
+        # Loop backwards in 90-day chunks to bypass FYERS limits
+        while days_fetched < TOTAL_BACKLOG_DAYS:
+            chunk_start_date = current_end_date - timedelta(days=CHUNK_SIZE_DAYS)
+            
+            payload = {
+                "symbol": symbol, 
+                "resolution": "1", 
+                "date_format": 1,
+                "range_from": chunk_start_date.strftime("%Y-%m-%d"),
+                "range_to": current_end_date.strftime("%Y-%m-%d"), 
+                "cont_flag": 1
+            }
+            
+            time.sleep(0.12) # Rate-limit protection for FYERS API
+            res = fyers.history(payload)
+            
+            if res and 'candles' in res and len(res['candles']) > 0:
+                all_candles.extend(res['candles'])
+                
+            # Move the window further back in time for the next loop
+            current_end_date = chunk_start_date
+            days_fetched += CHUNK_SIZE_DAYS
+            
+            # Prevent infinite loops if API stops returning older data
+            if not res or 'candles' not in res or len(res['candles']) == 0:
+                break
+
+        if not all_candles: 
             return None
             
-        df = pd.DataFrame(res['candles'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+        # Convert raw candles to DataFrame and remove duplicate timestamps from chunk overlaps
+        df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True).dt.tz_convert("Asia/Kolkata")
+        df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
         
         # Filter up to current target timestamp for rolling simulation
         df_filtered = df[df['timestamp'] <= target_dt]
@@ -209,8 +238,9 @@ def process_symbol_spatial_scan(symbol, target_dt):
             }
         return None
     except Exception as e:
-        logger.error(f"Failed processing {symbol}: {e}")
+        logger.error(f"Failed processing {symbol} with chunking loop: {e}")
         return None
+
 
 
 # ==========================================
