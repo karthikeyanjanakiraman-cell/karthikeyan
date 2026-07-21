@@ -6,6 +6,7 @@ FEATURES:
 - Dynamic F&O Universe (Column Hunting & Regex Extraction)
 - Phase 1: Pre-Market Sieve (Anchors Top 25 Stocks via 90-Day 9:15 AM Max Vol ceiling)
 - Phase 2: Live Intraday Tracking Matrix restricted strictly to the Anchored Watchlist
+- Time-of-Day (ToD) Velocity: Compares current minute's speed to 90-day median for that EXACT minute.
 - Interval Batch Processing (Steps through specified times using memory caching)
 - Downshifted Speed Hurdle (The Threshold-Based Kinetic Chain Rule)
 - Clean Responsive HTML Matrix Dispatch System (Single Master Table with Timestamp)
@@ -94,7 +95,7 @@ def fetch_fo_universe():
 # ==========================================
 # 3. KINETIC HALVING ENGINE (WITH THRESHOLD HURDLE)
 # ==========================================
-def calculate_threshold_kinetic_chain(today_df, resolution=5):
+def calculate_threshold_kinetic_chain(today_df, resolution=1):
     """
     Slices total live volume into fractional blocks.
     Applies the downshifted speed hurdle (cruising momentum validator).
@@ -223,6 +224,23 @@ def process_intraday_matrix(symbol, pre_market_ratio, df, target_dt):
         today_df = df_filtered[df_filtered['date'] == today_date]
         
         if history_df.empty or today_df.empty: return None
+
+        # ════════════════════════════════════════════════════════════════════════
+        # NEW: TIME-OF-DAY VELOCITY BASELINE (Shares per minute ratio)
+        # ════════════════════════════════════════════════════════════════════════
+        current_candle = today_df.iloc[-1]
+        current_time_slot = current_candle['time']
+        current_live_vol = current_candle['volume']
+        
+        historical_time_slot_df = history_df[history_df['time'] == current_time_slot]
+        
+        if not historical_time_slot_df.empty and current_live_vol > 0:
+            historical_median_vol = historical_time_slot_df['volume'].median()
+            if historical_median_vol <= 0: historical_median_vol = 1 # Prevent zero div
+            tod_velocity_ratio = current_live_vol / historical_median_vol
+        else:
+            tod_velocity_ratio = 1.0
+        # ════════════════════════════════════════════════════════════════════════
         
         # Core Benchmarks
         daily_groups = history_df.groupby('date').agg({'volume': 'sum', 'high': 'max', 'low': 'min'})
@@ -238,11 +256,12 @@ def process_intraday_matrix(symbol, pre_market_ratio, df, target_dt):
         volatility_ratio = (today_df['high'].max() - today_df['low'].min()) / max_range
         
         # Calculate Kinetic Splits with downshifted hurdles
-        v_pass, p_pass, v_mult, p_mult = calculate_threshold_kinetic_chain(today_df, resolution=5)
+        v_pass, p_pass, v_mult, p_mult = calculate_threshold_kinetic_chain(today_df, resolution=1)
         
         return {
             'Symbol': symbol.replace('NSE:', '').replace('-EQ', ''),
             'Pre_Market_Ratio': pre_market_ratio,
+            'ToD_Velocity': tod_velocity_ratio,
             'Vol_Ratio': vol_ratio,
             'Volat_Ratio': volatility_ratio,
             'Kin_Vol_Str': f"PASS ({v_mult:.1f}x)" if v_pass else f"FAIL ({v_mult:.1f}x)",
@@ -263,7 +282,6 @@ def process_intraday_matrix(symbol, pre_market_ratio, df, target_dt):
 def send_html_email(df_matrix, target_dt):
     logger.info(f"Generating HTML performance matrix for {target_dt.strftime('%I:%M %p')}...")
     
-    # Format the time the data was anchored/fetched
     fetch_time_str = target_dt.strftime('%d %b %Y, %I:%M %p')
     
     def build_rows(df):
@@ -272,10 +290,14 @@ def send_html_email(df_matrix, target_dt):
             v_class = "pass" if row['V_Pass'] else "fail"
             p_class = "pass" if row['P_Pass'] else "fail"
             
+            # Color code the new Velocity metric
+            vel_color = "#1b5e20" if row['ToD_Velocity'] > 2.0 else "#ff9800" if row['ToD_Velocity'] > 1.0 else "#757575"
+            
             html_rows += f"""<tr>
                 <td class='symbol'>{row['Symbol']}</td>
                 <td>₹{row['LTP']:.2f}</td>
                 <td>{row['Pre_Market_Ratio']:.2f}x</td>
+                <td style='color:{vel_color}; font-weight:bold;'>{row['ToD_Velocity']:.1f}x</td>
                 <td>{row['Vol_Ratio']:.2f}x</td>
                 <td class='highlight'>{row['Volat_Ratio']:.2f}x</td>
                 <td class='{v_class}'>{row['Kin_Vol_Str']}</td>
@@ -305,18 +327,18 @@ def send_html_email(df_matrix, target_dt):
         <h2>🏆 TMV ANCHORED MASTER MATRIX</h2>
         <p class="time-stamp">🕒 Data Fetched At: <b>{fetch_time_str}</b></p>
         <table>
-          <tr><th>Symbol</th><th>LTP</th><th>9:15 Print Ratio</th><th>Vol Ratio</th><th>Volat Exp</th><th>Kinetic Vol</th><th>Kinetic Price</th></tr>
+          <tr><th>Symbol</th><th>LTP</th><th>9:15 Ratio</th><th>ToD Velocity</th><th>Vol Ratio</th><th>Volat Exp</th><th>Kinetic Vol</th><th>Kinetic Price</th></tr>
           {build_rows(df_matrix)}
         </table>
         <p style="font-size: 12px; color: #777; text-align: center;">
-            TMV Engine v25.0 • Anchored Matrix Size: {WATCHLIST_SIZE} • Speed Hurdle: {int(SPEED_THRESHOLD_RATIO*100)}% • Volat Exp: >{VOLATILITY_EXP_THRESHOLD}x • Vol Ratio: >{VOL_RATIO_THRESHOLD}x
+            TMV Engine v25.0 • Watchlist Size: {WATCHLIST_SIZE} • Volat Exp: >{VOLATILITY_EXP_THRESHOLD}x • Vol Ratio: >{VOL_RATIO_THRESHOLD}x
         </p>
       </body>
     </html>
     """
     
     msg = MIMEMultipart("alternative")
-    msg['Subject'] = f"TMV Anchored Matrix Tracker: {fetch_time_str}"
+    msg['Subject'] = f"TMV Matrix | Velocity Updated: {fetch_time_str}"
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECIPIENT_EMAIL
     msg.attach(MIMEText(html, "html"))
@@ -350,7 +372,6 @@ def main():
     if args.date and args.from_time and args.to_time:
         try:
             date_str = args.date.replace('.', '-')
-            # Automatically convert any dots in the time to colons to prevent parsing errors
             clean_from_time = args.from_time.replace('.', ':')
             clean_to_time = args.to_time.replace('.', ':')
             
@@ -383,7 +404,6 @@ def main():
     logger.info(f"Phase 1: Running Pre-Market Opening Sieve across {len(raw_symbols)} symbols...")
     pre_market_results = []
     
-    # We pass 'end_dt' here so the engine securely caches all the day's data up to the final interval ONCE.
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = {executor.submit(extract_pre_market_score, sym, end_dt): sym for sym in raw_symbols}
         for future in as_completed(futures):
@@ -409,7 +429,6 @@ def main():
         
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = {
-                # We pass 'current_dt' through the loop to safely slice the Full_DF memory cache
                 executor.submit(process_intraday_matrix, row['Symbol'], row['Pre_Market_Ratio'], row['Full_DF'], current_dt): row['Symbol'] 
                 for _, row in anchored_watchlist.iterrows()
             }
