@@ -1,15 +1,13 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-ASIT BARAN PATI TMV ENGINE - PRODUCTION v25.0 (PRE-MARKET ANCHOR & LIVE MATRIX)
+ASIT BARAN PATI TMV ENGINE - PRODUCTION v26.0 (CONSTANT VOLUME BAR UPGRADE)
 FEATURES: 
-- Dynamic F&O Universe (Column Hunting & Regex Extraction)
-- Phase 1: Pre-Market Sieve (Anchors Top 25 Stocks via 90-Day 9:15 AM Max Vol ceiling)
-- Phase 2: Live Intraday Tracking Matrix restricted strictly to the Anchored Watchlist
-- Time-of-Day (ToD) Velocity: Compares current minute's speed to 90-day median for that EXACT minute.
-- Interval Batch Processing (Steps through specified times using memory caching)
-- Downshifted Speed Hurdle (The Threshold-Based Kinetic Chain Rule)
-- Clean Responsive HTML Matrix Dispatch System (Single Master Table with Timestamp)
+- Time-based candles are DESTROYED. Replaced by Constant Volume Bars (CVB).
+- VOLUME_BAR_SIZE: Dynamically chunks 1-min raw data into perfect 10,000-share blocks.
+- Kinetic Chain is now calculated purely on the TIME it takes to clear each 10k block.
+- Phase 1: Anchors top stocks based on opening gap volume logic.
+- Phase 2: Intraday tracking strictly comparing the Velocity (Shares/Min) of recent 10k blocks.
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -49,17 +47,17 @@ fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=
 # ------------------------------------------
 # MASTER PARAMETERS (THE CONTROL BOARD)
 # ------------------------------------------
+VOLUME_BAR_SIZE = 10000        # NEW: The fixed size of our Volume Bucket
 WATCHLIST_SIZE = 30            # Size of the anchored pre-market watchlist 
-RECENT_ITERATION_PCT = 1.0     # Slices the last 30% of iterations as the momentum window
-SPEED_THRESHOLD_RATIO = 0.20   # Hurdle rate dial (e.g., recent speed must exceed 30% of base peak speed)
-VOLATILITY_EXP_THRESHOLD = 0.7 # DYNAMIC DIAL: Minimum Volat Exp required to be displayed in the matrix
-VOL_RATIO_THRESHOLD = 0.7      # DYNAMIC DIAL: Minimum Vol Ratio required to be displayed in the matrix
+RECENT_ITERATION_PCT = 0.30    # Top 30% of 10k bars used as the live momentum window
+SPEED_THRESHOLD_RATIO = 0.20   # Hurdle rate dial
+VOLATILITY_EXP_THRESHOLD = 0.5 # DYNAMIC DIAL (Lowered slightly due to 10k chunking)
+VOL_RATIO_THRESHOLD = 0.5      # DYNAMIC DIAL 
 
 # ==========================================
 # 2. DYNAMIC UNIVERSE BUILDER
 # ==========================================
 def fetch_fo_universe():
-    """Scrapes active F&O Equities dynamically from Fyers Master data."""
     logger.info("Fetching Master F&O Universe...")
     try:
         response = requests.get(FYERS_FO_MASTER_URL, timeout=15)
@@ -71,106 +69,112 @@ def fetch_fo_universe():
                 symbol_col = col
                 break
                 
-        if symbol_col is None:
-            logger.error("CRITICAL: Could not locate Symbol column in Fyers Master.")
-            return []
+        if symbol_col is None: return []
             
         raw_symbols = df[symbol_col].astype(str).tolist()
         base_symbols = set()
         
         for s in raw_symbols:
             match = re.search(r'NSE:([A-Z&\-]+)\d+', s)
-            if match: 
-                base_symbols.add(match.group(1))
+            if match: base_symbols.add(match.group(1))
         
         ignore_list = {'NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'}
-        base_symbols = base_symbols - ignore_list
-        
-        return [f"NSE:{sym}-EQ" for sym in base_symbols]
-        
+        return [f"NSE:{sym}-EQ" for sym in base_symbols - ignore_list]
     except Exception as e:
         logger.error(f"Failed to fetch Universe: {e}")
         return []
 
 # ==========================================
-# 3. KINETIC HALVING ENGINE (WITH THRESHOLD HURDLE)
+# 3. CONSTANT VOLUME BAR SYNTHESIZER
 # ==========================================
-def calculate_threshold_kinetic_chain(today_df, resolution=1):
+def build_volume_bars(df_1min, target_vol=VOLUME_BAR_SIZE):
     """
-    Slices total live volume into fractional blocks.
-    Applies the downshifted speed hurdle (cruising momentum validator).
+    Takes 1-min raw data and compresses it into Constant Volume Bars.
+    Records the exact time taken to clear every 10,000 share block.
     """
-    cum_vol = today_df['volume'].cumsum()
-    total_vol = cum_vol.iloc[-1]
+    if df_1min.empty: return pd.DataFrame()
     
-    if total_vol == 0 or len(today_df) < 4: 
-        return False, False, 1.0, 1.0
+    bars = []
+    current_vol = 0
+    start_time = None
+    open_price = None
+    high_price = -np.inf
+    low_price = np.inf
+    
+    for idx, row in df_1min.iterrows():
+        if current_vol == 0:
+            start_time = row['timestamp']
+            open_price = row['open']
+            
+        current_vol += row['volume']
+        high_price = max(high_price, row['high'])
+        low_price = min(low_price, row['low'])
         
-    iterations = []
-    current_start_idx = 0
-    remaining_vol = total_vol
-    current_base_vol = 0
-    
-    for _ in range(8):
-        target_vol = current_base_vol + (remaining_vol / 2.0)
-        idx = int(np.searchsorted(cum_vol.values, target_vol))
-        if idx >= len(today_df): idx = len(today_df) - 1
-        
-        slice_df = today_df.iloc[current_start_idx : idx + 1]
-        if slice_df.empty: break
-        
-        time_taken = len(slice_df) * resolution
-        vol_filled = slice_df['volume'].sum()
-        price_dist = abs(slice_df['close'].iloc[-1] - slice_df['open'].iloc[0])
-        
-        iterations.append({
-            'vol_vel': vol_filled / time_taken if time_taken > 0 else 0,
-            'price_vel': price_dist / time_taken if time_taken > 0 else 0
-        })
-        
-        current_start_idx = idx + 1
-        current_base_vol = cum_vol.iloc[idx] 
-        remaining_vol = total_vol - current_base_vol
-        
-        if current_start_idx >= len(today_df) or remaining_vol <= 0: break
-        
-    if len(iterations) < 2:
-        return False, False, 1.0, 1.0
-        
-    split_idx = int(len(iterations) * (1 - RECENT_ITERATION_PCT))
-    if split_idx == len(iterations): split_idx -= 1
-    if split_idx == 0: split_idx = 1
-    
-    base_chain = iterations[:split_idx]
-    recent_chain = iterations[split_idx:]
-    
-    max_base_v = max([x['vol_vel'] for x in base_chain])
-    max_base_p = max([x['price_vel'] for x in base_chain])
-    
-    min_recent_v = min([x['vol_vel'] for x in recent_chain])
-    min_recent_p = min([x['price_vel'] for x in recent_chain])
-    
-    # DOWNSHIFTED THRESHOLD HURDLES
-    hurdle_v = max_base_v * SPEED_THRESHOLD_RATIO
-    hurdle_p = max_base_p * SPEED_THRESHOLD_RATIO
-    
-    vol_pass = (min_recent_v > hurdle_v) and (max_base_v > 0)
-    price_pass = (min_recent_p > hurdle_p) and (max_base_p > 0)
-    
-    v_mult = (min_recent_v / max_base_v) if max_base_v > 0 else 1.0
-    p_mult = (min_recent_p / max_base_p) if max_base_p > 0 else 1.0
-    
-    return vol_pass, price_pass, v_mult, p_mult
+        # When bucket fills up:
+        if current_vol >= target_vol:
+            end_time = row['timestamp']
+            
+            # Calculate time taken in minutes (minimum 1 minute to prevent divide by zero)
+            time_diff = (end_time - start_time).total_seconds() / 60.0
+            time_taken = max(1.0, time_diff) 
+            
+            bars.append({
+                'time_taken': time_taken,
+                'open': open_price,
+                'high': high_price,
+                'low': low_price,
+                'close': row['close'],
+                'volume': current_vol,
+                'velocity': current_vol / time_taken # Speed: Shares per Minute
+            })
+            
+            # Reset bucket for the next 10,000 block
+            current_vol = 0
+            high_price = -np.inf
+            low_price = np.inf
+            
+    return pd.DataFrame(bars)
 
 # ==========================================
-# 4. PHASE 1: PRE-MARKET MATRIX GENERATOR
+# 4. NEW KINETIC CHAIN (BASED ON VOLUME BARS)
+# ==========================================
+def calculate_cvb_kinetic_chain(vol_bars_df):
+    """
+    Analyzes the speed of the 10,000-volume bars. 
+    If recent 10k bars are filling faster than morning 10k bars, we have a breakout.
+    """
+    if vol_bars_df.empty or len(vol_bars_df) < 4: 
+        return False, 1.0, 0.0
+        
+    # Split the bars into Base (Past) and Recent (Live)
+    split_idx = int(len(vol_bars_df) * (1 - RECENT_ITERATION_PCT))
+    if split_idx == len(vol_bars_df): split_idx -= 1
+    if split_idx <= 0: split_idx = 1
+    
+    base_chain = vol_bars_df.iloc[:split_idx]
+    recent_chain = vol_bars_df.iloc[split_idx:]
+    
+    max_base_velocity = base_chain['velocity'].max()
+    min_recent_velocity = recent_chain['velocity'].min()
+    current_live_velocity = recent_chain['velocity'].iloc[-1]
+    
+    # Downshifted Speed Hurdle
+    hurdle_v = max_base_velocity * SPEED_THRESHOLD_RATIO
+    
+    vol_pass = (min_recent_velocity > hurdle_v) and (max_base_velocity > 0)
+    v_mult = (min_recent_velocity / max_base_velocity) if max_base_velocity > 0 else 1.0
+    
+    return vol_pass, v_mult, current_live_velocity
+
+# ==========================================
+# 5. PHASE 1: PRE-MARKET MATRIX GENERATOR
 # ==========================================
 def extract_pre_market_score(symbol, target_dt):
-    """Scans 90 days of 9:15 AM data to isolate institutional volume anomalies."""
+    """Anchors the top 30 stocks based on overall gap/open volume to ensure liquidity."""
     try:
-        time.sleep(0.12) # Rate limit guard rails
+        time.sleep(0.12)
         payload = {
-            "symbol": symbol, "resolution": "5", "date_format": 1,
+            "symbol": symbol, "resolution": "1", "date_format": 1,
             "range_from": (target_dt - timedelta(days=90)).strftime("%Y-%m-%d"),
             "range_to": target_dt.strftime("%Y-%m-%d"), "cont_flag": 1
         }
@@ -180,43 +184,30 @@ def extract_pre_market_score(symbol, target_dt):
         df = pd.DataFrame(res['candles'], columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
         df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True).dt.tz_convert("Asia/Kolkata")
         df = df[df['timestamp'] <= target_dt]
-        
         df['date'] = df['timestamp'].dt.date
         df['time'] = df['timestamp'].dt.time
         
-        open_prints = df[df['time'] == dt_time(9, 15)]
+        open_prints = df[(df['time'] >= dt_time(9, 15)) & (df['time'] <= dt_time(9, 20))]
         if open_prints.empty: return None
         
         today_date = df['date'].max()
-        historical_opens = open_prints[open_prints['date'] < today_date]
         today_open = open_prints[open_prints['date'] == today_date]
+        if today_open.empty: return None
         
-        if historical_opens.empty or today_open.empty: return None
-        
-        max_historical_open_vol = historical_opens['volume'].max()
-        today_open_vol = today_open['volume'].iloc[0]
-        
-        if max_historical_open_vol == 0: return None
-        
-        pre_market_ratio = today_open_vol / max_historical_open_vol
-        
-        return {'Symbol': symbol, 'Pre_Market_Ratio': pre_market_ratio, 'Full_DF': df}
+        today_open_vol = today_open['volume'].sum()
+        return {'Symbol': symbol, 'Pre_Market_Vol': today_open_vol, 'Full_DF': df}
     except Exception:
         return None
 
 # ==========================================
-# 5. PHASE 2: INTRADAY PROCESSING MODULE
+# 6. PHASE 2: INTRADAY CVB PROCESSING MODULE
 # ==========================================
-def process_intraday_matrix(symbol, pre_market_ratio, df, target_dt):
-    """Processes live fractional tracks exclusively for the anchored universe."""
+def process_intraday_matrix(symbol, pre_market_vol, df, target_dt):
+    """Processes Live Constant Volume Bars to detect Institutional Speed."""
     try:
         current_time = target_dt.time()
         market_open = dt_time(9, 15)
         
-        df['date'] = df['timestamp'].dt.date
-        df['time'] = df['timestamp'].dt.time
-        
-        # Dynamically filters the 'Full_DF' up to the current interval loop time
         df_filtered = df[(df['time'] >= market_open) & (df['time'] <= current_time)]
         today_date = df_filtered['date'].max()
         
@@ -225,24 +216,12 @@ def process_intraday_matrix(symbol, pre_market_ratio, df, target_dt):
         
         if history_df.empty or today_df.empty: return None
 
-        # ════════════════════════════════════════════════════════════════════════
-        # NEW: TIME-OF-DAY VELOCITY BASELINE (Shares per minute ratio)
-        # ════════════════════════════════════════════════════════════════════════
-        current_candle = today_df.iloc[-1]
-        current_time_slot = current_candle['time']
-        current_live_vol = current_candle['volume']
+        # --- THE QUANT UPGRADE: CONVERT TO 10K VOLUME BARS ---
+        today_vol_bars = build_volume_bars(today_df, VOLUME_BAR_SIZE)
         
-        historical_time_slot_df = history_df[history_df['time'] == current_time_slot]
-        
-        if not historical_time_slot_df.empty and current_live_vol > 0:
-            historical_median_vol = historical_time_slot_df['volume'].median()
-            if historical_median_vol <= 0: historical_median_vol = 1 # Prevent zero div
-            tod_velocity_ratio = current_live_vol / historical_median_vol
-        else:
-            tod_velocity_ratio = 1.0
-        # ════════════════════════════════════════════════════════════════════════
-        
-        # Core Benchmarks
+        if today_vol_bars.empty: return None
+
+        # Process standard benchmarks
         daily_groups = history_df.groupby('date').agg({'volume': 'sum', 'high': 'max', 'low': 'min'})
         daily_groups['range'] = daily_groups['high'] - daily_groups['low']
         
@@ -255,53 +234,46 @@ def process_intraday_matrix(symbol, pre_market_ratio, df, target_dt):
         vol_ratio = today_df['volume'].sum() / max_vol
         volatility_ratio = (today_df['high'].max() - today_df['low'].min()) / max_range
         
-        # Calculate Kinetic Splits with downshifted hurdles
-        v_pass, p_pass, v_mult, p_mult = calculate_threshold_kinetic_chain(today_df, resolution=5)
+        # --- THE NEW SPEED TEST ---
+        v_pass, v_mult, live_velocity = calculate_cvb_kinetic_chain(today_vol_bars)
         
         return {
             'Symbol': symbol.replace('NSE:', '').replace('-EQ', ''),
-            'Pre_Market_Ratio': pre_market_ratio,
-            'ToD_Velocity': tod_velocity_ratio,
+            'Total_10k_Bars': len(today_vol_bars),
+            'Live_10k_Speed': live_velocity,  # Shares per min of the current 10k block
             'Vol_Ratio': vol_ratio,
             'Volat_Ratio': volatility_ratio,
             'Kin_Vol_Str': f"PASS ({v_mult:.1f}x)" if v_pass else f"FAIL ({v_mult:.1f}x)",
-            'Kin_Price_Str': f"PASS ({p_mult:.1f}x)" if p_pass else f"FAIL ({p_mult:.1f}x)",
-            'Kin_Vol_Mult': v_mult,
-            'Kin_Price_Mult': p_mult,
             'LTP': today_df['close'].iloc[-1],
-            'V_Pass': v_pass,
-            'P_Pass': p_pass
+            'V_Pass': v_pass
         }
     except Exception as e:
         logger.error(f"Error processing {symbol}: {e}")
         return None
 
 # ==========================================
-# 6. HTML REPORT GENERATOR & DISPATCH
+# 7. HTML REPORT GENERATOR
 # ==========================================
 def send_html_email(df_matrix, target_dt):
     logger.info(f"Generating HTML performance matrix for {target_dt.strftime('%I:%M %p')}...")
-    
     fetch_time_str = target_dt.strftime('%d %b %Y, %I:%M %p')
     
     def build_rows(df):
         html_rows = ""
         for _, row in df.iterrows():
             v_class = "pass" if row['V_Pass'] else "fail"
-            p_class = "pass" if row['P_Pass'] else "fail"
             
-            # Color code the new Velocity metric
-            vel_color = "#1b5e20" if row['ToD_Velocity'] > 2.0 else "#ff9800" if row['ToD_Velocity'] > 1.0 else "#757575"
+            # Color code Velocity (Green if 10k bucket filled at > 10,000 shares/min)
+            vel_color = "#1b5e20" if row['Live_10k_Speed'] >= 10000 else "#ff9800" if row['Live_10k_Speed'] >= 5000 else "#757575"
             
             html_rows += f"""<tr>
                 <td class='symbol'>{row['Symbol']}</td>
                 <td>₹{row['LTP']:.2f}</td>
-                <td>{row['Pre_Market_Ratio']:.2f}x</td>
-                <td style='color:{vel_color}; font-weight:bold;'>{row['ToD_Velocity']:.1f}x</td>
+                <td>{int(row['Total_10k_Bars'])} Bars</td>
+                <td style='color:{vel_color}; font-weight:bold;'>{int(row['Live_10k_Speed']):,} sh/min</td>
                 <td>{row['Vol_Ratio']:.2f}x</td>
                 <td class='highlight'>{row['Volat_Ratio']:.2f}x</td>
                 <td class='{v_class}'>{row['Kin_Vol_Str']}</td>
-                <td class='{p_class}'>{row['Kin_Price_Str']}</td>
             </tr>"""
         return html_rows
 
@@ -315,30 +287,30 @@ def send_html_email(df_matrix, target_dt):
           .time-stamp {{ text-align: center; font-size: 13px; color: #555; margin-bottom: 25px; }}
           table {{ width: 100%; border-collapse: collapse; margin-bottom: 40px; box-shadow: 0 4px 6px rgba(0,0,0,0.1); background-color: #fff; }}
           th, td {{ padding: 12px 15px; text-align: left; border-bottom: 1px solid #e0e0e0; }}
-          th {{ font-size: 14px; text-transform: uppercase; letter-spacing: 0.5px; background-color: #3949ab; color: white; }}
+          th {{ font-size: 14px; text-transform: uppercase; background-color: #3949ab; color: white; }}
           tr:hover {{ background-color: #f5f5f5; }}
           .symbol {{ font-weight: bold; color: #1a73e8; }}
-          .highlight {{ font-weight: bold; color: #333; font-size: 14px; }}
+          .highlight {{ font-weight: bold; color: #333; }}
           .pass {{ font-weight: bold; color: #1b5e20; }}
           .fail {{ color: #757575; }}
         </style>
       </head>
       <body>
-        <h2>🏆 TMV ANCHORED MASTER MATRIX</h2>
+        <h2>🏆 TMV 10K-VOLUME BAR ENGINE</h2>
         <p class="time-stamp">🕒 Data Fetched At: <b>{fetch_time_str}</b></p>
         <table>
-          <tr><th>Symbol</th><th>LTP</th><th>9:15 Ratio</th><th>ToD Velocity</th><th>Vol Ratio</th><th>Volat Exp</th><th>Kinetic Vol</th><th>Kinetic Price</th></tr>
+          <tr><th>Symbol</th><th>LTP</th><th>10k Bars Formed</th><th>Live 10k Bucket Speed</th><th>Vol Ratio</th><th>Volat Exp</th><th>Kinetic Speed Chain</th></tr>
           {build_rows(df_matrix)}
         </table>
         <p style="font-size: 12px; color: #777; text-align: center;">
-            TMV Engine v25.0 • Watchlist Size: {WATCHLIST_SIZE} • Volat Exp: >{VOLATILITY_EXP_THRESHOLD}x • Vol Ratio: >{VOL_RATIO_THRESHOLD}x
+            TMV Engine v26.0 • Resolution: {VOLUME_BAR_SIZE} Shares • Measuring time-to-fill per block.
         </p>
       </body>
     </html>
     """
     
     msg = MIMEMultipart("alternative")
-    msg['Subject'] = f"TMV Matrix | Velocity Updated: {fetch_time_str}"
+    msg['Subject'] = f"CVB Matrix | 10k Block Speed: {fetch_time_str}"
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECIPIENT_EMAIL
     msg.attach(MIMEText(html, "html"))
@@ -352,7 +324,7 @@ def send_html_email(df_matrix, target_dt):
         logger.error(f"Failed to transmit email package: {e}")
 
 # ==========================================
-# 7. MAIN COORDINATION ENGINE
+# 8. MAIN COORDINATION ENGINE
 # ==========================================
 def main():
     parser = argparse.ArgumentParser()
@@ -362,46 +334,32 @@ def main():
     parser.add_argument("--interval", type=int, default=60, help="Interval in minutes (e.g., 60)")
     args = parser.parse_args()
     
-    # Establish default parameters for live running
     target_dt = pd.Timestamp.now(tz="Asia/Kolkata")
-    start_dt = target_dt
-    end_dt = target_dt
+    start_dt, end_dt = target_dt, target_dt
     interval_mins = args.interval
     
-    # Override logic based on provided arguments
     if args.date and args.from_time and args.to_time:
         try:
             date_str = args.date.replace('.', '-')
             clean_from_time = args.from_time.replace('.', ':')
             clean_to_time = args.to_time.replace('.', ':')
-            
             start_dt = pd.to_datetime(f"{date_str} {clean_from_time}").tz_localize("Asia/Kolkata")
             end_dt = pd.to_datetime(f"{date_str} {clean_to_time}").tz_localize("Asia/Kolkata")
-            logger.info(f"--- BATCH BACKTEST MODE: {start_dt.strftime('%H:%M')} to {end_dt.strftime('%H:%M')} every {interval_mins} mins ---")
+            logger.info(f"--- BATCH BACKTEST MODE: {start_dt.strftime('%H:%M')} to {end_dt.strftime('%H:%M')} ---")
         except Exception as e:
-            logger.error(f"Invalid Batch Date/Time format. Error: {e}")
+            logger.error(f"Invalid Batch format. Error: {e}")
             return
     elif args.date:
         try:
             date_str = args.date.replace('.', ':')
             start_dt = pd.to_datetime(date_str, dayfirst=True).tz_localize("Asia/Kolkata")
             end_dt = start_dt
-            logger.info(f"--- SINGLE BACKTEST MODE: Simulating Timestamp {start_dt} ---")
-        except Exception as e:
-            logger.error(f"Invalid Single Date format. Use YYYY-MM-DD HH:MM. Error: {e}")
-            return
-    else:
-        logger.info(f"--- LIVE EXECUTION MODE: Simulating Timestamp {start_dt} ---")
+        except Exception as e: return
             
     raw_symbols = fetch_fo_universe()
-    if not raw_symbols:
-        logger.error("Universe extraction returned null. Terminating execution.")
-        return
+    if not raw_symbols: return
         
-    # -----------------------------------------------------------------
-    # PHASE 1: COMPUTE PRE-MARKET MATRIX & SIEVE THE TOP CONTENDERS
-    # -----------------------------------------------------------------
-    logger.info(f"Phase 1: Running Pre-Market Opening Sieve across {len(raw_symbols)} symbols...")
+    logger.info(f"Phase 1: Running Pre-Market Sieve across {len(raw_symbols)} symbols...")
     pre_market_results = []
     
     with ThreadPoolExecutor(max_workers=4) as executor:
@@ -410,26 +368,20 @@ def main():
             res = future.result()
             if res: pre_market_results.append(res)
             
-    if not pre_market_results:
-        logger.error("No valid pre-market profiles calculated. Exiting.")
-        return
+    if not pre_market_results: return
         
     pre_market_df = pd.DataFrame(pre_market_results)
-    anchored_watchlist = pre_market_df.sort_values('Pre_Market_Ratio', ascending=False).head(WATCHLIST_SIZE)
-    logger.info(f"Watchlist successfully anchored. Tracking top {len(anchored_watchlist)} institutional structures.")
+    anchored_watchlist = pre_market_df.sort_values('Pre_Market_Vol', ascending=False).head(WATCHLIST_SIZE)
+    logger.info(f"Anchored top {len(anchored_watchlist)} structures.")
     
-    # -----------------------------------------------------------------
-    # PHASE 2: CONTINUOUS INTERVAL LOOP PROCESSING VIA WATCHLIST
-    # -----------------------------------------------------------------
     current_dt = start_dt
-    
     while current_dt <= end_dt:
-        logger.info(f"Phase 2: Executing Intraday Matrix Calculations for {current_dt.strftime('%I:%M %p')}...")
+        logger.info(f"Phase 2: Executing CVB Matrix Calculations for {current_dt.strftime('%I:%M %p')}...")
         intraday_results = []
         
         with ThreadPoolExecutor(max_workers=4) as executor:
             futures = {
-                executor.submit(process_intraday_matrix, row['Symbol'], row['Pre_Market_Ratio'], row['Full_DF'], current_dt): row['Symbol'] 
+                executor.submit(process_intraday_matrix, row['Symbol'], row['Pre_Market_Vol'], row['Full_DF'], current_dt): row['Symbol'] 
                 for _, row in anchored_watchlist.iterrows()
             }
             for future in as_completed(futures):
@@ -439,27 +391,19 @@ def main():
         df_matrix = pd.DataFrame(intraday_results)
         
         if not df_matrix.empty:
-            # Sort Matrix by clean institutional parameters in a single list
-            PRIORITY_SORT = ['Volat_Ratio', 'Vol_Ratio', 'Pre_Market_Ratio']
+            PRIORITY_SORT = ['Volat_Ratio', 'Vol_Ratio', 'Live_10k_Speed']
             sorted_matrix = df_matrix.sort_values(PRIORITY_SORT, ascending=[False, False, False])
             
-            # Strictly display only the stocks exceeding BOTH the Volatility Expansion AND Vol Ratio thresholds
             filtered_matrix = sorted_matrix[
                 (sorted_matrix['Volat_Ratio'] > VOLATILITY_EXP_THRESHOLD) & 
                 (sorted_matrix['Vol_Ratio'] > VOL_RATIO_THRESHOLD)
             ]
             
-            if not filtered_matrix.empty:
-                send_html_email(filtered_matrix, current_dt)
-            else:
-                logger.warning(f"No structures cleared BOTH Volat Exp (>{VOLATILITY_EXP_THRESHOLD}x) AND Vol Ratio (>{VOL_RATIO_THRESHOLD}x) hurdles at {current_dt.strftime('%I:%M %p')}.")
-        else:
-            logger.error(f"Watchlist matrix processing returned empty set for {current_dt.strftime('%I:%M %p')}.")
-
-        # Step time forward by the defined interval and briefly pause to prevent SMTP limits
+            if not filtered_matrix.empty: send_html_email(filtered_matrix, current_dt)
+            else: logger.warning(f"No structures cleared hurdles at {current_dt.strftime('%I:%M %p')}.")
+        
         current_dt += timedelta(minutes=interval_mins)
-        if current_dt <= end_dt:
-            time.sleep(2)
+        if current_dt <= end_dt: time.sleep(2)
             
     logger.info("System process workflow completed successfully.")
 
