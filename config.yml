@@ -1,10 +1,16 @@
 trading_engine:
   base_resolution_min: 1
-  macro_window_min: 30
+  macro_window_min: 1D
   micro_xray_mins:
     - 1
     - 5
     - 15
+    - 30
+    - 45
+    - 60
+    - 75
+    - 90
+    - 180
   correlation:
     initial_trigger_threshold: 0.95
     fuzzy_hold_threshold: 0.90
