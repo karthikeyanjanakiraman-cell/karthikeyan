@@ -185,7 +185,7 @@ def process_symbol_spatial_scan(symbol, target_dt):
         time.sleep(0.1) # Rate-limit protection for FYERS API
         payload = {
             "symbol": symbol, "resolution": "1", "date_format": 1,
-            "range_from": (target_dt - timedelta(days=5)).strftime("%Y-%m-%d"),
+            "range_from": (target_dt - timedelta(days=89)).strftime("%Y-%m-%d"),
             "range_to": target_dt.strftime("%Y-%m-%d"), "cont_flag": 1
         }
         res = fyers.history(payload)
