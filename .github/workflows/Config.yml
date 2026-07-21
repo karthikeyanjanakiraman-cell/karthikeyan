@@ -1,0 +1,12 @@
+trading_engine:
+  base_resolution_min: 1
+  macro_window_min: 30
+  micro_xray_mins:
+    - 1
+    - 5
+    - 15
+  correlation:
+    initial_trigger_threshold: 0.95
+    fuzzy_hold_threshold: 0.90
+  hunt_mode_enabled: true
+
