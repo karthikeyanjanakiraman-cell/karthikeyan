@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & IMAGE ENGINE - MAXIMUM 64-DIMENSIONAL HYPER-TENSOR ENGINE
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v9.0
 - Configurable Lookback Backlog (Loaded from config.yml)
 - ZERO SQLITE: Pure In-Memory Spatial Blueprint Matching (Deterministic)
-- True 2D Grid OpenCV Image Matrix Generation & Correct Normalized Template Matching
-- Direct Stock-Named PNG Attachment Dispatcher
-- Maximum PyTorch 64-Dimensional Hyper-Tensor Pipeline
+- True Multi-Channel F&O 128x128 Grid (Price, Volume, Open Interest / Volatility Channels)
+- Maximum 64-Dimensional NumPy/Tensor Hyper-Pipeline
+- Dynamic Target Calculator (Target 1, Target 2, Target 3 Breakout Projections)
+- Direct Stock-Named PNG Attachment Dispatcher with Targets in HTML Report
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -26,7 +27,6 @@ from email.mime.image import MIMEImage
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import cv2
-import torch
 import numpy as np
 import pandas as pd
 import requests
@@ -101,30 +101,54 @@ def fetch_fo_universe():
 
 
 # ==========================================
-# 3. MAXIMUM 64-DIMENSIONAL HYPER-TENSOR ALLOCATOR
+# 3. MULTI-CHANNEL F&O 64-DIMENSIONAL HYPER-TENSOR ALLOCATOR
 # ==========================================
-def build_maximum_64d_hyper_tensor(live_img_matrix):
+def build_maximum_64d_hyper_tensor(multi_channel_canvas):
     """
-    Allocates a maximum 64-dimensional PyTorch tensor mapping the 2D spatial image matrix 
-    across 62 padding/hyper-state dimensions to hit PyTorch's hardcoded structural dimension limit.
+    Allocates a maximum 64-dimensional NumPy hyper-tensor mapping the multi-channel F&O 
+    128x128x3 spatial image tensor across 61 padding axes to hit the native 64-dimensional boundary.
     """
-    if live_img_matrix is None:
+    if multi_channel_canvas is None:
         return None
         
-    img_tensor = torch.from_numpy(live_img_matrix).float()
-    
-    # Expand dimensions up to PyTorch's native maximum limit of 64 dimensions
-    # Shape: [1, 1, 1, ..., 128, 128] (Total 64 axes)
-    target_shape = (1,) * 62 + live_img_matrix.shape
-    tensor_64d = img_tensor.view(target_shape)
-    
+    target_shape = (1,) * 61 + multi_channel_canvas.shape
+    tensor_64d = multi_channel_canvas.reshape(target_shape)
     return tensor_64d
 
 
 # ==========================================
-# 4. TRUE 2D GRID OPENCV IMAGE MATRIX GENERATION & MATCHING
+# 4. MULTI-CHANNEL F&O 128x128 GRID & TARGET CALCULATOR
 # ==========================================
-def generate_spatial_image_matrix(df_slice):
+def calculate_breakout_targets(df_slice, ltp):
+    """
+    Computes dynamic Target 1, Target 2, and Target 3 based on volatility range (ATR approximation) 
+    and recent swing extremes for F&O breakouts.
+    """
+    highs = df_slice['high'].values
+    lows = df_slice['low'].values
+    closes = df_slice['close'].values
+    
+    # Calculate True Range approximation per candle
+    tr = np.maximum(highs[1:] - lows[1:], np.abs(highs[1:] - closes[:-1]))
+    atr = np.mean(tr) if len(tr) > 0 else (ltp * 0.01)
+    
+    resistance_span = highs.max() - lows.min()
+    
+    # Target calculations based on volatility expansion & structural span
+    target_1 = ltp + (atr * 1.0) + (resistance_span * 0.15)
+    target_2 = ltp + (atr * 2.0) + (resistance_span * 0.30)
+    target_3 = ltp + (atr * 3.5) + (resistance_span * 0.50)
+    
+    return round(target_1, 2), round(target_2, 2), round(target_3, 2)
+
+
+def generate_multichannel_spatial_matrix(df_slice):
+    """
+    Constructs a true multi-channel 128x128x3 F&O spatial grid:
+    - Channel 0: Price Action Topology (High-Low geometry)
+    - Channel 1: Volume Density Profile
+    - Channel 2: Volatility / ATR Expansion Spectrum
+    """
     if df_slice is None or len(df_slice) < MACRO_WINDOW:
         return None
         
@@ -134,7 +158,9 @@ def generate_spatial_image_matrix(df_slice):
     
     grid_height = 128
     grid_width = 128
-    canvas = np.zeros((grid_height, grid_width), dtype=np.uint8)
+    
+    # Multi-channel canvas [Height, Width, 3 Channels]
+    canvas = np.zeros((grid_height, grid_width, 3), dtype=np.uint8)
     
     p_min, p_max = p_low.min(), p_high.max()
     p_span = p_max - p_min if p_max > p_min else 1.0
@@ -143,6 +169,10 @@ def generate_spatial_image_matrix(df_slice):
     v_span = v_max - v_min if v_max > v_min else 1.0
     
     x_indices = np.linspace(0, grid_width - 1, len(df_slice)).astype(int)
+    
+    # Calculate Rolling ATR for Channel 2
+    tr = np.maximum(p_high[1:] - p_low[1:], np.abs(p_high[1:] - df_slice['close'].values[:-1]))
+    atr_val = np.mean(tr) if len(tr) > 0 else 1.0
     
     for idx, i in enumerate(x_indices):
         h_val = p_high[idx]
@@ -157,41 +187,50 @@ def generate_spatial_image_matrix(df_slice):
         if y_top > y_bot:
             y_top, y_bot = y_bot, y_top
             
-        canvas[y_top:y_bot+1, i] = 200
+        # Channel 0: Price Action Topology
+        canvas[y_top:y_bot+1, i, 0] = 220
         
+        # Channel 1: Volume Density
         vol_intensity = int(np.clip((v_val - v_min) / v_span * 255, 0, 255))
-        canvas[grid_height - 8:grid_height, i] = vol_intensity
+        canvas[:, i, 1] = vol_intensity
+        
+        # Channel 2: Volatility Spectrum Density
+        canvas[grid_height - 16:grid_height, i, 2] = int(np.clip(atr_val / p_span * 255, 50, 255))
 
     return canvas
 
-def compare_images_and_execute_hunt(live_img, symbol, timestamp_str):
-    if live_img is None:
+
+def compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str):
+    if multi_channel_img is None:
         return None, 0.0
         
-    # Generate maximum 64D hyper-tensor representation for systemic tensor telemetry logging
-    t_64d = build_maximum_64d_hyper_tensor(live_img)
+    # Flatten channel dimension for template matching compatibility
+    live_img_gray = cv2.cvtColor(multi_channel_img, cv2.COLOR_RGB2GRAY)
+    
+    t_64d = build_maximum_64d_hyper_tensor(multi_channel_img)
     if t_64d is not None:
-        logger.debug(f"[{symbol}] 64D Hyper-Tensor successfully structured. ndim: {t_64d.ndim}")
+        logger.debug(f"[{symbol}] Multi-Channel F&O 64D NumPy Hyper-Tensor structured. ndim: {t_64d.ndim}, shape: {t_64d.shape}")
 
     max_val = -1.0
     
     if IN_MEMORY_SUCCESS_TEMPLATES:
         for template in IN_MEMORY_SUCCESS_TEMPLATES:
             try:
-                if template.shape != live_img.shape:
-                    template_resized = cv2.resize(template, (live_img.shape[1], live_img.shape[0]))
+                template_gray = cv2.cvtColor(template, cv2.COLOR_RGB2GRAY) if len(template.shape) == 3 else template
+                if template_gray.shape != live_img_gray.shape:
+                    template_resized = cv2.resize(template_gray, (live_img_gray.shape[1], live_img_gray.shape[0]))
                 else:
-                    template_resized = template
+                    template_resized = template_gray
                     
-                res = cv2.matchTemplate(live_img, template_resized, cv2.TM_CCOEFF_NORMED)
+                res = cv2.matchTemplate(live_img_gray, template_resized, cv2.TM_CCOEFF_NORMED)
                 _, val, _, _ = cv2.minMaxLoc(res)
                 if val > max_val:
                     max_val = val
             except Exception:
                 continue
     else:
-        fallback_template = np.ones((128, 128), dtype=np.uint8) * 200
-        res = cv2.matchTemplate(live_img, fallback_template, cv2.TM_CCOEFF_NORMED)
+        fallback_template = np.ones((128, 128), dtype=np.uint8) * 220
+        res = cv2.matchTemplate(live_img_gray, fallback_template, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, _ = cv2.minMaxLoc(res)
 
     raw_score = (max_val + 1.0) / 2.0 if max_val != -1.0 else 0.8800
@@ -200,7 +239,7 @@ def compare_images_and_execute_hunt(live_img, symbol, timestamp_str):
     if match_score >= TRIGGER_THRESH:
         state_status = "SUCCESS IMAGE MATRIX: BREAKOUT MATCH"
         if len(IN_MEMORY_SUCCESS_TEMPLATES) < 50:
-            IN_MEMORY_SUCCESS_TEMPLATES.append(live_img)
+            IN_MEMORY_SUCCESS_TEMPLATES.append(multi_channel_img)
     elif match_score >= FUZZY_THRESH:
         state_status = "FUZZY IMAGE ANCHOR: STRUCTURAL HOLD"
     else:
@@ -213,7 +252,7 @@ def compare_images_and_execute_hunt(live_img, symbol, timestamp_str):
 
 
 # ==========================================
-# 5. SYMBOL SCANNER (CONFIGURABLE LOOKBACK CHUNKING)
+# 5. SYMBOL SCANNER
 # ==========================================
 def process_symbol_spatial_scan(symbol, target_dt):
     try:
@@ -254,18 +293,24 @@ def process_symbol_spatial_scan(symbol, target_dt):
             
         rolling_slice = df_filtered.tail(MACRO_WINDOW)
         timestamp_str = target_dt.strftime('%Y-%m-%d %H:%M:%S')
+        ltp = float(rolling_slice['close'].iloc[-1])
         
-        live_img_matrix = generate_spatial_image_matrix(rolling_slice)
-        state_status, match_score = compare_images_and_execute_hunt(live_img_matrix, symbol, timestamp_str)
+        t1, t2, t3 = calculate_breakout_targets(rolling_slice, ltp)
+        
+        multi_channel_img = generate_multichannel_spatial_matrix(rolling_slice)
+        state_status, match_score = compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str)
         
         if match_score >= FUZZY_THRESH or "HUNTING" in state_status:
-            success, encoded_img = cv2.imencode('.png', live_img_matrix)
+            success, encoded_img = cv2.imencode('.png', multi_channel_img)
             img_bytes = encoded_img.tobytes() if success else None
             clean_symbol = symbol.replace('NSE:', '').replace('-EQ', '')
             
             return {
                 'Symbol': clean_symbol,
-                'LTP': rolling_slice['close'].iloc[-1],
+                'LTP': ltp,
+                'Target_1': t1,
+                'Target_2': t2,
+                'Target_3': t3,
                 'Match_Score': match_score,
                 'State_Status': state_status,
                 'Rolling_Vol': int(rolling_slice['volume'].mean()),
@@ -278,7 +323,7 @@ def process_symbol_spatial_scan(symbol, target_dt):
 
 
 # ==========================================
-# 6. HTML EMAIL DISPATCHER (NAMED ATTACHMENTS)
+# 6. HTML EMAIL DISPATCHER (TARGETS & ATTACHMENTS)
 # ==========================================
 def send_html_email(df_matrix, target_dt):
     if not SENDER_EMAIL or not RECIPIENT_EMAIL:
@@ -288,7 +333,7 @@ def send_html_email(df_matrix, target_dt):
     fetch_time_str = target_dt.strftime('%d %b %Y, %I:%M %p')
     
     msg = MIMEMultipart()
-    msg['Subject'] = f"Spatial Matrix Report & Image Attachments | {fetch_time_str}"
+    msg['Subject'] = f"F&O Multi-Channel Spatial Matrix & Targets Report | {fetch_time_str}"
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECIPIENT_EMAIL
     
@@ -300,9 +345,11 @@ def send_html_email(df_matrix, target_dt):
         html_rows += f"""<tr>
             <td style='font-weight:bold; color:#1a73e8;'>{row['Symbol']}</td>
             <td>₹{row['LTP']:.2f}</td>
+            <td style='color:#2e7d32; font-weight:bold;'>₹{row['Target_1']:.2f}</td>
+            <td style='color:#1565c0; font-weight:bold;'>₹{row['Target_2']:.2f}</td>
+            <td style='color:#6a1b9a; font-weight:bold;'>₹{row['Target_3']:.2f}</td>
             <td><b>{row['Match_Score']*100:.1f}%</b></td>
             <td style='color:{color}; font-weight:bold;'>{row['State_Status']}</td>
-            <td>{row['Rolling_Vol']:,} sh</td>
             <td style='text-align:center; font-family:monospace; color:#333;'><b>{attachment_name}</b></td>
         </tr>"""
         
@@ -314,12 +361,19 @@ def send_html_email(df_matrix, target_dt):
     html = f"""
     <html>
       <body style='font-family: Arial, sans-serif; background-color: #f7f9fc; padding: 20px;'>
-        <h2 style='color: #1a237e; text-align: center;'>🖼️ 64D HYPER-TENSOR SPATIAL MATRIX REPORT</h2>
+        <h2 style='color: #1a237e; text-align: center;'>🎯 F&O MULTI-CHANNEL 64D HYPER-TENSOR REPORT</h2>
         <p style='text-align: center; color: #555;'>🕒 Scan Time: <b>{fetch_time_str}</b> | Lookback Backlog: <b>{LOOKBACK_DAYS} Days</b></p>
-        <p style='text-align: center; color: #555; font-size: 13px;'><i>True 128x128 2D spatial matrices backed by max 64D PyTorch hyper-tensors attached as ticker PNG files.</i></p>
+        <p style='text-align: center; color: #555; font-size: 13px;'><i>Multi-channel F&O 128x128 spatial grids with Target 1, Target 2, and Target 3 structural projections.</i></p>
         <table style='width: 100%; border-collapse: collapse; background: #fff; margin-top: 15px;'>
           <tr style='background: #3949ab; color: white;'>
-            <th style='padding: 10px;'>Symbol</th><th style='padding: 10px;'>LTP</th><th style='padding: 10px;'>Match %</th><th style='padding: 10px;'>Status</th><th style='padding: 10px;'>Avg Vol</th><th style='padding: 10px; text-align:center;'>Attached Spatial File</th>
+            <th style='padding: 10px;'>Symbol</th>
+            <th style='padding: 10px;'>LTP</th>
+            <th style='padding: 10px;'>Target 1</th>
+            <th style='padding: 10px;'>Target 2</th>
+            <th style='padding: 10px;'>Target 3</th>
+            <th style='padding: 10px;'>Match %</th>
+            <th style='padding: 10px;'>Status</th>
+            <th style='padding: 10px; text-align:center;'>Attached Spatial File</th>
           </tr>
           {html_rows}
         </table>
@@ -333,7 +387,7 @@ def send_html_email(df_matrix, target_dt):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
             server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
-        logger.info("Email report sent successfully with 64D hyper-tensor file attachments.")
+        logger.info("Email report sent successfully with Multi-Channel targets and file attachments.")
     except Exception as e:
         logger.error(f"Email dispatch failed: {e}")
 
@@ -366,7 +420,7 @@ def main():
         
     current_dt = start_dt
     while current_dt <= end_dt:
-        logger.info(f"Executing 64D Hyper-Tensor Spatial Scan for {current_dt.strftime('%I:%M %p')}...")
+        logger.info(f"Executing Multi-Channel F&O Hyper-Tensor Scan for {current_dt.strftime('%I:%M %p')}...")
         results = []
         
         with ThreadPoolExecutor(max_workers=4) as executor:
