@@ -170,7 +170,7 @@ def extract_pre_market_score(symbol, target_dt):
     try:
         time.sleep(0.12) # Rate limit guard rails
         payload = {
-            "symbol": symbol, "resolution": "1", "date_format": 1,
+            "symbol": symbol, "resolution": "5", "date_format": 1,
             "range_from": (target_dt - timedelta(days=90)).strftime("%Y-%m-%d"),
             "range_to": target_dt.strftime("%Y-%m-%d"), "cont_flag": 1
         }
@@ -256,7 +256,7 @@ def process_intraday_matrix(symbol, pre_market_ratio, df, target_dt):
         volatility_ratio = (today_df['high'].max() - today_df['low'].min()) / max_range
         
         # Calculate Kinetic Splits with downshifted hurdles
-        v_pass, p_pass, v_mult, p_mult = calculate_threshold_kinetic_chain(today_df, resolution=1)
+        v_pass, p_pass, v_mult, p_mult = calculate_threshold_kinetic_chain(today_df, resolution=5)
         
         return {
             'Symbol': symbol.replace('NSE:', '').replace('-EQ', ''),
