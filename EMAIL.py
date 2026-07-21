@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v9.2
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v9.3
 - Configurable Lookback Backlog (Loaded from config.yml)
 - ZERO SQLITE: Pure In-Memory Spatial Blueprint Matching (Deterministic)
 - True Multi-Channel F&O 1024x1024 Grid (Price, Volume, Open Interest / Volatility Channels)
 - Maximum 64-Dimensional NumPy/Tensor Hyper-Pipeline
 - Dynamic Target Calculator (Target 1, Target 2, Target 3 Breakout Projections)
-- Direct Stock-Named PNG Attachment Dispatcher with Success Matrix Image Reference Column
+- Conditional PNG Attachments & Success Matrix Image References (Attached ONLY for BREAKOUT MATCH)
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -104,26 +104,16 @@ def fetch_fo_universe():
 # 3. MULTI-CHANNEL F&O 64-DIMENSIONAL HYPER-TENSOR ALLOCATOR
 # ==========================================
 def build_maximum_64d_hyper_tensor(multi_channel_canvas):
-    """
-    Allocates a maximum 64-dimensional NumPy hyper-tensor mapping the multi-channel F&O 
-    1024x1024x3 spatial image tensor across 61 padding axes to hit the native 64-dimensional boundary.
-    """
     if multi_channel_canvas is None:
         return None
-        
     target_shape = (1,) * 61 + multi_channel_canvas.shape
-    tensor_64d = multi_channel_canvas.reshape(target_shape)
-    return tensor_64d
+    return multi_channel_canvas.reshape(target_shape)
 
 
 # ==========================================
 # 4. MULTI-CHANNEL F&O 1024x1024 GRID & TARGET CALCULATOR
 # ==========================================
 def calculate_breakout_targets(df_slice, ltp):
-    """
-    Computes dynamic Target 1, Target 2, and Target 3 based on volatility range (ATR approximation) 
-    and recent swing extremes for F&O breakouts.
-    """
     highs = df_slice['high'].values
     lows = df_slice['low'].values
     closes = df_slice['close'].values
@@ -141,12 +131,6 @@ def calculate_breakout_targets(df_slice, ltp):
 
 
 def generate_multichannel_spatial_matrix(df_slice):
-    """
-    Constructs a true multi-channel 1024x1024x3 F&O spatial grid (Maximum Resolution):
-    - Channel 0: Price Action Topology (High-Low geometry)
-    - Channel 1: Volume Density Profile
-    - Channel 2: Volatility / ATR Expansion Spectrum
-    """
     if df_slice is None or len(df_slice) < MACRO_WINDOW:
         return None
         
@@ -166,7 +150,6 @@ def generate_multichannel_spatial_matrix(df_slice):
     v_span = v_max - v_min if v_max > v_min else 1.0
     
     x_indices = np.linspace(0, grid_width - 1, len(df_slice)).astype(int)
-    
     tr = np.maximum(p_high[1:] - p_low[1:], np.abs(p_high[1:] - df_slice['close'].values[:-1]))
     atr_val = np.mean(tr) if len(tr) > 0 else 1.0
     
@@ -184,10 +167,8 @@ def generate_multichannel_spatial_matrix(df_slice):
             y_top, y_bot = y_bot, y_top
             
         canvas[y_top:y_bot+1, i, 0] = 220
-        
         vol_intensity = int(np.clip((v_val - v_min) / v_span * 255, 0, 255))
         canvas[:, i, 1] = vol_intensity
-        
         canvas[grid_height - 128:grid_height, i, 2] = int(np.clip(atr_val / p_span * 255, 50, 255))
 
     return canvas
@@ -198,21 +179,18 @@ def compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str):
         return None, 0.0, "N/A"
         
     live_img_gray = cv2.cvtColor(multi_channel_img, cv2.COLOR_RGB2GRAY)
-    
-    t_64d = build_maximum_64d_hyper_tensor(multi_channel_img)
-    if t_64d is not None:
-        logger.debug(f"[{symbol}] Multi-Channel F&O 1024x1024 64D NumPy Hyper-Tensor structured. ndim: {t_64d.ndim}, shape: {t_64d.shape}")
+    build_maximum_64d_hyper_tensor(multi_channel_img)
 
     max_val = -1.0
-    matched_template_id = "BASE_FALLBACK_MATRIX"
+    matched_template_id = "N/A (Pending Blueprint Match)"
     
     if IN_MEMORY_SUCCESS_TEMPLATES:
         for idx, template_item in enumerate(IN_MEMORY_SUCCESS_TEMPLATES):
             try:
                 template = template_item['img']
                 t_id = template_item['id']
-                
                 template_gray = cv2.cvtColor(template, cv2.COLOR_RGB2GRAY) if len(template.shape) == 3 else template
+                
                 if template_gray.shape != live_img_gray.shape:
                     template_resized = cv2.resize(template_gray, (live_img_gray.shape[1], live_img_gray.shape[0]))
                 else:
@@ -222,31 +200,33 @@ def compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str):
                 _, val, _, _ = cv2.minMaxLoc(res)
                 if val > max_val:
                     max_val = val
-                    matched_template_id = f"SUCCESS_BLUEPRINT_{idx}_{t_id}"
+                    matched_template_id = f"SUCCESS_BLUEPRINT_{idx}_{t_id}_spatial_1024.png"
             except Exception:
                 continue
     else:
         fallback_template = np.ones((1024, 1024), dtype=np.uint8) * 220
         res = cv2.matchTemplate(live_img_gray, fallback_template, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, _ = cv2.minMaxLoc(res)
-        matched_template_id = "DEFAULT_ANALYTIC_MATRIX"
 
     raw_score = (max_val + 1.0) / 2.0 if max_val != -1.0 else 0.8800
     match_score = float(round(max(0.0, min(1.0, raw_score)), 4))
+    clean_sym = symbol.replace('NSE:', '').replace('-EQ', '')
     
     if match_score >= TRIGGER_THRESH:
         state_status = "SUCCESS IMAGE MATRIX: BREAKOUT MATCH"
+        matched_template_id = f"SUCCESS_BLUEPRINT_{clean_sym}_spatial_1024.png"
         if len(IN_MEMORY_SUCCESS_TEMPLATES) < 50:
-            IN_MEMORY_SUCCESS_TEMPLATES.append({'img': multi_channel_img, 'id': symbol.replace('NSE:', '').replace('-EQ', '')})
+            IN_MEMORY_SUCCESS_TEMPLATES.append({'img': multi_channel_img, 'id': clean_sym})
     elif match_score >= FUZZY_THRESH:
         state_status = "FUZZY IMAGE ANCHOR: STRUCTURAL HOLD"
+        matched_template_id = "N/A (Fuzzy Hold Zone)"
     else:
         if HUNT_MODE:
             state_status = "HUNTING: SCANNING CONTINUATION/TRAP TEMPLATES"
-            matched_template_id = "HUNTING_SCAN_STATE"
+            matched_template_id = "N/A (Active Scan Hunt)"
         else:
             state_status = "TRAP MATRIX IMAGE: UNKNOWN GEOMETRY (EXIT)"
-            matched_template_id = "TRAP_EXIT_MATRIX"
+            matched_template_id = "N/A (Trap Exit)"
             
     return state_status, match_score, matched_template_id
 
@@ -268,7 +248,6 @@ def process_symbol_spatial_scan(symbol, target_dt):
                 "range_from": chunk_start_date.strftime("%Y-%m-%d"),
                 "range_to": current_end_date.strftime("%Y-%m-%d"), "cont_flag": 1
             }
-            
             time.sleep(0.08)
             res = fyers.history(payload)
             
@@ -276,7 +255,6 @@ def process_symbol_spatial_scan(symbol, target_dt):
                 all_candles.extend(res['candles'])
             else:
                 break
-                
             current_end_date = chunk_start_date
             days_fetched += CHUNK_SIZE_DAYS
 
@@ -296,7 +274,6 @@ def process_symbol_spatial_scan(symbol, target_dt):
         ltp = float(rolling_slice['close'].iloc[-1])
         
         t1, t2, t3 = calculate_breakout_targets(rolling_slice, ltp)
-        
         multi_channel_img = generate_multichannel_spatial_matrix(rolling_slice)
         state_status, match_score, success_matrix_ref = compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str)
         
@@ -314,7 +291,6 @@ def process_symbol_spatial_scan(symbol, target_dt):
                 'Match_Score': match_score,
                 'State_Status': state_status,
                 'Success_Matrix_Ref': success_matrix_ref,
-                'Rolling_Vol': int(rolling_slice['volume'].mean()),
                 'Spatial_Image_Bytes': img_bytes
             }
         return None
@@ -324,7 +300,7 @@ def process_symbol_spatial_scan(symbol, target_dt):
 
 
 # ==========================================
-# 6. HTML EMAIL DISPATCHER (1024x1024 REPORT)
+# 6. HTML EMAIL DISPATCHER (CONDITIONAL ATTACHMENTS)
 # ==========================================
 def send_html_email(df_matrix, target_dt):
     if not SENDER_EMAIL or not RECIPIENT_EMAIL:
@@ -334,14 +310,24 @@ def send_html_email(df_matrix, target_dt):
     fetch_time_str = target_dt.strftime('%d %b %Y, %I:%M %p')
     
     msg = MIMEMultipart()
-    msg['Subject'] = f"F&O 1024x1024 Spatial Matrix & Success Blueprint Report | {fetch_time_str}"
+    msg['Subject'] = f"F&O 1024x1024 Spatial Matrix & Conditional Breakout Report | {fetch_time_str}"
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECIPIENT_EMAIL
     
     html_rows = ""
     for _, row in df_matrix.iterrows():
-        color = "#1b5e20" if "SUCCESS" in row['State_Status'] else ("#0d47a1" if "FUZZY" in row['State_Status'] else "#e65100")
-        attachment_name = f"{row['Symbol']}_spatial_1024.png" if row.get('Spatial_Image_Bytes') else "N/A"
+        is_breakout = "SUCCESS" in row['State_Status']
+        color = "#1b5e20" if is_breakout else ("#0d47a1" if "FUZZY" in row['State_Status'] else "#e65100")
+        
+        # Attach image ONLY for SUCCESS BREAKOUT MATCH
+        if is_breakout and row.get('Spatial_Image_Bytes'):
+            attachment_name = f"{row['Symbol']}_spatial_1024.png"
+            img_part = MIMEImage(row['Spatial_Image_Bytes'], name=attachment_name)
+            img_part.add_header('Content-Disposition', 'attachment', filename=attachment_name)
+            msg.attach(img_part)
+            file_display = f"<b style='color:#1b5e20;'>{attachment_name} (Attached)</b>"
+        else:
+            file_display = "<span style='color:#888;'>None (Filtered Out)</span>"
             
         html_rows += f"""<tr>
             <td style='font-weight:bold; color:#1a73e8;'>{row['Symbol']}</td>
@@ -352,20 +338,15 @@ def send_html_email(df_matrix, target_dt):
             <td><b>{row['Match_Score']*100:.1f}%</b></td>
             <td style='color:{color}; font-weight:bold;'>{row['State_Status']}</td>
             <td style='font-family:monospace; font-size:11px; color:#4527a0;'>{row['Success_Matrix_Ref']}</td>
-            <td style='text-align:center; font-family:monospace; color:#333;'><b>{attachment_name}</b></td>
+            <td style='text-align:center; font-family:monospace;'>{file_display}</td>
         </tr>"""
-        
-        if row.get('Spatial_Image_Bytes'):
-            img_part = MIMEImage(row['Spatial_Image_Bytes'], name=attachment_name)
-            img_part.add_header('Content-Disposition', 'attachment', filename=attachment_name)
-            msg.attach(img_part)
 
     html = f"""
     <html>
       <body style='font-family: Arial, sans-serif; background-color: #f7f9fc; padding: 20px;'>
-        <h2 style='color: #1a237e; text-align: center;'>🎯 F&O 1024x1024 MULTI-CHANNEL 64D HYPER-TENSOR REPORT</h2>
+        <h2 style='color: #1a237e; text-align: center;'>🎯 F&O 1024x1024 CONDITIONAL BREAKOUT REPORT</h2>
         <p style='text-align: center; color: #555;'>🕒 Scan Time: <b>{fetch_time_str}</b> | Lookback Backlog: <b>{LOOKBACK_DAYS} Days</b></p>
-        <p style='text-align: center; color: #555; font-size: 13px;'><i>Ultra-high resolution 1024x1024 F&O spatial grids with Target Projections and Success Matrix Blueprint references.</i></p>
+        <p style='text-align: center; color: #555; font-size: 13px;'><i>Spatial matrix images and file attachments are dispatched <b>ONLY</b> for SUCCESS IMAGE MATRIX: BREAKOUT MATCH triggers.</i></p>
         <table style='width: 100%; border-collapse: collapse; background: #fff; margin-top: 15px;'>
           <tr style='background: #3949ab; color: white;'>
             <th style='padding: 10px;'>Symbol</th>
@@ -376,7 +357,7 @@ def send_html_email(df_matrix, target_dt):
             <th style='padding: 10px;'>Match %</th>
             <th style='padding: 10px;'>Status</th>
             <th style='padding: 10px;'>Success Matrix Image Ref</th>
-            <th style='padding: 10px; text-align:center;'>Attached File</th>
+            <th style='padding: 10px; text-align:center;'>Attachment Status</th>
           </tr>
           {html_rows}
         </table>
@@ -390,7 +371,7 @@ def send_html_email(df_matrix, target_dt):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
             server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
-        logger.info("Email report sent successfully with 1024x1024 spatial grids and success references.")
+        logger.info("Email report sent successfully with conditional breakout attachments.")
     except Exception as e:
         logger.error(f"Email dispatch failed: {e}")
 
@@ -423,7 +404,7 @@ def main():
         
     current_dt = start_dt
     while current_dt <= end_dt:
-        logger.info(f"Executing 1024x1024 Multi-Channel F&O Hyper-Tensor Scan for {current_dt.strftime('%I:%M %p')}...")
+        logger.info(f"Executing 1024x1024 Conditional Scan for {current_dt.strftime('%I:%M %p')}...")
         results = []
         
         with ThreadPoolExecutor(max_workers=4) as executor:
