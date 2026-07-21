@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-ASIT BARAN PATI TMV ENGINE - PRODUCTION v26.0 (CONSTANT VOLUME HISTORICAL BREAKOUT MATCHER)
+ASIT BARAN PATI TMV ENGINE - PRODUCTION v26.1 (95th PERCENTILE CEILING & CVB ENGINE)
 FEATURES: 
-- Completely removes time-framed candle limits; aggregates raw 1-min data into 10k volume blocks.
-- Time-to-Fill Metrics: Measures the explicit speed (shares per minute) to clear each 10k block.
-- Ultimate Speed Filter: Restricts matrix output strictly to assets whose live 10k bucket velocity 
-  violates the absolute fastest 10k bar velocity recorded on their historical 90-day Max Volume Day.
-- Median Kinetic Chain: Deploys robust median calculations to assess cruising momentum.
-- Full Dispatch System: Transmits beautifully responsive HTML tables directly to your terminal or mail.
+- Constant Volume Bars (CVB): Condenses raw 1-min data into fixed 10k volume blocks.
+- Smart Time-To-Fill: Automatically scales across missing minutes using physical timestamps.
+- 95th Percentile Speed Ceiling: Deletes one-off historical anomalies (like block deals) 
+  and compares live speed against the true sustainable cruising speed of the Max Volume Day.
+- Median Kinetic Chain: Deploys robust median calculations for smooth momentum tracking.
+- Full Dispatch System: Transmits responsive HTML matrices directly to your inbox.
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -93,7 +93,7 @@ def fetch_fo_universe():
 def build_volume_bars(df_1min, target_vol=VOLUME_BAR_SIZE):
     """
     Takes 1-min raw candle components and condenses them into unified Constant Volume Bars.
-    Tracks explicit time to complete every 10,000 share transactional block.
+    Tracks explicit time (scaling dynamically over missing minutes) to complete every 10k block.
     """
     if df_1min.empty: 
         return pd.DataFrame()
@@ -200,7 +200,7 @@ def extract_pre_market_score(symbol, target_dt):
 # 6. PHASE 2: INTRADAY PROCESSING MODULE
 # ==========================================
 def process_intraday_matrix(symbol, pre_market_vol, df, target_dt):
-    """Processes Live Constant Volume Bars to check against Historical High Speed Days."""
+    """Processes Live CVBs against the 95th Percentile Speed Ceiling of the Max Volume Day."""
     try:
         current_time = target_dt.time()
         market_open = dt_time(9, 15)
@@ -221,13 +221,14 @@ def process_intraday_matrix(symbol, pre_market_vol, df, target_dt):
         max_vol_date = daily_groups['volume'].idxmax()
         
         # ════════════════════════════════════════════════════════════════════════
-        # ISOLATE HISTORICAL RECORD PEAK VELOCITY
+        # 95th PERCENTILE CEILING (FILTERING OUT FREAK HISTORICAL ANOMALIES)
         # ════════════════════════════════════════════════════════════════════════
         max_vol_day_df = history_df[history_df['date'] == max_vol_date]
         historical_max_bars = build_volume_bars(max_vol_day_df, VOLUME_BAR_SIZE)
         if historical_max_bars.empty: return None
         
-        historical_max_speed = historical_max_bars['velocity'].max()
+        # Using 95th percentile instead of absolute .max() to eliminate outlier block spikes
+        historical_max_speed = historical_max_bars['velocity'].quantile(0.95)
         # ════════════════════════════════════════════════════════════════════════
         
         max_vol = daily_groups.loc[max_vol_date, 'volume']
@@ -296,21 +297,21 @@ def send_html_email(df_matrix, target_dt):
         </style>
       </head>
       <body>
-        <h2>🏆 TMV 10K SPEED LIMIT BREAKER</h2>
+        <h2>🏆 TMV 95th PERCENTILE SPEED BREAKER</h2>
         <p class="time-stamp">🕒 Data Fetched At: <b>{fetch_time_str}</b></p>
         <table>
-          <tr><th>Symbol</th><th>LTP</th><th>Live 10k Speed</th><th>Max Day's Speed</th><th>10k Bars Formed</th><th>Vol Ratio</th><th>Volat Exp</th><th>Kinetic Chain</th></tr>
+          <tr><th>Symbol</th><th>LTP</th><th>Live 10k Speed</th><th>95th Pct Max Speed</th><th>10k Bars Formed</th><th>Vol Ratio</th><th>Volat Exp</th><th>Kinetic Chain</th></tr>
           {build_rows(df_matrix)}
         </table>
         <p style="font-size: 12px; color: #777; text-align: center;">
-            TMV Engine v26.0 • Unprecedented Momentum Mode • Alerting strictly when live velocity breaks historical max day ceiling.
+            TMV Engine v26.1 • 95th Percentile Momentum Mode • Alerting when live velocity beats historical sustainable ceiling.
         </p>
       </body>
     </html>
     """
     
     msg = MIMEMultipart("alternative")
-    msg['Subject'] = f"CVB Breakout Matrix | Velocity Violations: {fetch_time_str}"
+    msg['Subject'] = f"CVB Breakout Matrix | 95th Pct Violations: {fetch_time_str}"
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECIPIENT_EMAIL
     msg.attach(MIMEText(html, "html"))
@@ -401,7 +402,7 @@ def main():
             sorted_matrix = df_matrix.sort_values(PRIORITY_SORT, ascending=[False, False])
             
             # ════════════════════════════════════════════════════════════════════════
-            # THE CRITICAL QUANT CEILING FILTER:
+            # 95th PERCENTILE CEILING FILTER
             # ════════════════════════════════════════════════════════════════════════
             filtered_matrix = sorted_matrix[
                 (sorted_matrix['Live_10k_Speed'] > sorted_matrix['Historical_Max_Speed']) &
@@ -411,7 +412,7 @@ def main():
             if not filtered_matrix.empty: 
                 send_html_email(filtered_matrix, current_dt)
             else: 
-                logger.warning(f"No assets exceeded their Historical Record Speeds at {current_dt.strftime('%I:%M %p')}.")
+                logger.warning(f"No assets exceeded their 95th Pct Historical Speeds at {current_dt.strftime('%I:%M %p')}.")
         
         current_dt += timedelta(minutes=interval_mins)
         if current_dt <= end_dt: 
