@@ -426,7 +426,7 @@ def main():
             
             # Strictly display only the stocks exceeding BOTH the Volatility Expansion AND Vol Ratio thresholds
             filtered_matrix = sorted_matrix[
-                (sorted_matrix['Pre_Market_Ratio'] > VOLATILITY_EXP_THRESHOLD) & 
+                (sorted_matrix['Volat_Ratio'] > VOLATILITY_EXP_THRESHOLD) & 
                 (sorted_matrix['Vol_Ratio'] > VOL_RATIO_THRESHOLD)
             ]
             
