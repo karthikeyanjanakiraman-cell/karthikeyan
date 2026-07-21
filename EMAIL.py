@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX ENGINE - STABLE PRODUCTION v6.2
-- Thread-safe SQLite Spatial Memory Bank (`spatial_memory.db`)
+SPATIAL MATRIX & IMAGE ENGINE - COMPLETE PRODUCTION v7.0
+- Configurable Lookback Backlog (Loaded from config.yml)
+- Thread-Safe SQLite Spatial Memory Bank (`spatial_memory.db`)
 - OpenCV Image Matrix Generation & Template Matching
-- Inline Base64 Spatial Image Data Injected into HTML Email
+- CID-Attachment HTML Email Dispatcher (Guaranteed Image Rendering)
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -14,7 +15,6 @@ import sys
 import time
 import yaml
 import sqlite3
-import base64
 import logging
 import argparse
 import smtplib
@@ -22,6 +22,7 @@ from io import StringIO
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import cv2
@@ -42,10 +43,12 @@ try:
         cfg = _raw_cfg.get("trading_engine", {})
         
     MACRO_WINDOW = cfg.get("macro_window_min", 30)
+    LOOKBACK_DAYS = cfg.get("lookback_backlog_days", 365)
     TRIGGER_THRESH = cfg.get("correlation", {}).get("initial_trigger_threshold", 0.95)
     FUZZY_THRESH = cfg.get("correlation", {}).get("fuzzy_hold_threshold", 0.90)
     HUNT_MODE = cfg.get("hunt_mode_enabled", True)
-    logger.info("✅ config.yml loaded successfully.")
+    
+    logger.info(f"✅ config.yml loaded successfully. Lookback Backlog: {LOOKBACK_DAYS} days.")
 except Exception as e:
     logger.error(f"❌ Configuration error: {e}")
     sys.exit(1)
@@ -214,16 +217,17 @@ def compare_images_and_execute_hunt(live_img, symbol, timestamp_str):
 
 
 # ==========================================
-# 5. SYMBOL SCANNER (SAFE CHUNKING)
+# 5. SYMBOL SCANNER (CONFIGURABLE LOOKBACK CHUNKING)
 # ==========================================
 def process_symbol_spatial_scan(symbol, target_dt):
     try:
+        CHUNK_SIZE_DAYS = 30
         all_candles = []
         current_end_date = target_dt
         days_fetched = 0
         
-        while days_fetched < 90:  # Single safe loop block
-            chunk_start_date = current_end_date - timedelta(days=30)
+        while days_fetched < LOOKBACK_DAYS:
+            chunk_start_date = current_end_date - timedelta(days=CHUNK_SIZE_DAYS)
             payload = {
                 "symbol": symbol, "resolution": "1", "date_format": 1,
                 "range_from": chunk_start_date.strftime("%Y-%m-%d"),
@@ -239,7 +243,7 @@ def process_symbol_spatial_scan(symbol, target_dt):
                 break
                 
             current_end_date = chunk_start_date
-            days_fetched += 30
+            days_fetched += CHUNK_SIZE_DAYS
 
         if not all_candles: 
             return None
@@ -260,7 +264,7 @@ def process_symbol_spatial_scan(symbol, target_dt):
         
         if match_score >= FUZZY_THRESH or "HUNTING" in state_status:
             success, encoded_img = cv2.imencode('.png', live_img_matrix)
-            img_base64 = base64.b64encode(encoded_img.tobytes()).decode('utf-8') if success else ""
+            img_bytes = encoded_img.tobytes() if success else None
             
             return {
                 'Symbol': symbol.replace('NSE:', '').replace('-EQ', ''),
@@ -268,7 +272,7 @@ def process_symbol_spatial_scan(symbol, target_dt):
                 'Match_Score': match_score,
                 'State_Status': state_status,
                 'Rolling_Vol': int(rolling_slice['volume'].mean()),
-                'Spatial_Image_B64': img_base64
+                'Spatial_Image_Bytes': img_bytes
             }
         return None
     except Exception as e:
@@ -277,7 +281,7 @@ def process_symbol_spatial_scan(symbol, target_dt):
 
 
 # ==========================================
-# 6. HTML EMAIL DISPATCHER
+# 6. HTML EMAIL DISPATCHER (CID EMBEDDED IMAGES)
 # ==========================================
 def send_html_email(df_matrix, target_dt):
     if not SENDER_EMAIL or not RECIPIENT_EMAIL:
@@ -286,10 +290,21 @@ def send_html_email(df_matrix, target_dt):
         
     fetch_time_str = target_dt.strftime('%d %b %Y, %I:%M %p')
     
+    msg = MIMEMultipart("related")
+    msg['Subject'] = f"Spatial Matrix Report | {fetch_time_str}"
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = RECIPIENT_EMAIL
+    
+    msg_alt = MIMEMultipart("alternative")
+    msg.attach(msg_alt)
+    
     html_rows = ""
-    for _, row in df_matrix.iterrows():
+    image_attachments = []
+    
+    for idx, row in df_matrix.iterrows():
         color = "#1b5e20" if "SUCCESS" in row['State_Status'] else ("#0d47a1" if "FUZZY" in row['State_Status'] else "#e65100")
-        img_tag = f"<img src='data:image/png;base64,{row['Spatial_Image_B64']}' width='100' height='30' style='border:1px solid #ccc; image-rendering: pixelated;'/>" if row['Spatial_Image_B64'] else "N/A"
+        cid_name = f"spatial_img_{idx}"
+        img_tag = f"<img src='cid:{cid_name}' width='120' height='35' style='border:1px solid #ccc; image-rendering: pixelated;'/>" if row.get('Spatial_Image_Bytes') else "N/A"
             
         html_rows += f"""<tr>
             <td style='font-weight:bold; color:#1a73e8;'>{row['Symbol']}</td>
@@ -299,12 +314,15 @@ def send_html_email(df_matrix, target_dt):
             <td>{row['Rolling_Vol']:,} sh</td>
             <td style='text-align:center;'>{img_tag}</td>
         </tr>"""
+        
+        if row.get('Spatial_Image_Bytes'):
+            image_attachments.append((cid_name, row['Spatial_Image_Bytes']))
 
     html = f"""
     <html>
       <body style='font-family: Arial, sans-serif; background-color: #f7f9fc; padding: 20px;'>
-        <h2 style='color: #1a237e; text-align: center;'>🖼️ SPATIAL DATA MATRIX & IMAGE REPORT</h2>
-        <p style='text-align: center; color: #555;'>🕒 Scan Time: <b>{fetch_time_str}</b></p>
+        <h2 style='color: #1a237e; text-align: center;'>🖼️ SPATIAL MATRIX & IMAGE REPORT</h2>
+        <p style='text-align: center; color: #555;'>🕒 Scan Time: <b>{fetch_time_str}</b> | Lookback Backlog: <b>{LOOKBACK_DAYS} Days</b></p>
         <table style='width: 100%; border-collapse: collapse; background: #fff;'>
           <tr style='background: #3949ab; color: white;'>
             <th style='padding: 10px;'>Symbol</th><th style='padding: 10px;'>LTP</th><th style='padding: 10px;'>Match %</th><th style='padding: 10px;'>Status</th><th style='padding: 10px;'>Avg Vol</th><th style='padding: 10px; text-align:center;'>Spatial Image Matrix</th>
@@ -315,17 +333,19 @@ def send_html_email(df_matrix, target_dt):
     </html>
     """
     
-    msg = MIMEMultipart("alternative")
-    msg['Subject'] = f"Spatial Matrix Report | {fetch_time_str}"
-    msg['From'] = SENDER_EMAIL
-    msg['To'] = RECIPIENT_EMAIL
-    msg.attach(MIMEText(html, "html"))
+    msg_alt.attach(MIMEText(html, "html"))
+    
+    for cid_name, img_bytes in image_attachments:
+        img_part = MIMEImage(img_bytes)
+        img_part.add_header('Content-ID', f'<{cid_name}>')
+        img_part.add_header('Content-Disposition', 'inline', filename=f"{cid_name}.png")
+        msg.attach(img_part)
     
     try:
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
             server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
-        logger.info("Email report sent successfully.")
+        logger.info("Email report sent successfully with CID embedded spatial images.")
     except Exception as e:
         logger.error(f"Email dispatch failed: {e}")
 
