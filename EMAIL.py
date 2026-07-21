@@ -169,7 +169,7 @@ def extract_pre_market_score(symbol, target_dt):
     try:
         time.sleep(0.12) # Rate limit guard rails
         payload = {
-            "symbol": symbol, "resolution": "5", "date_format": 1,
+            "symbol": symbol, "resolution": "1", "date_format": 1,
             "range_from": (target_dt - timedelta(days=90)).strftime("%Y-%m-%d"),
             "range_to": target_dt.strftime("%Y-%m-%d"), "cont_flag": 1
         }
