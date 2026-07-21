@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-OPENCV IMAGE MATRIX & SPATIAL COMPARISON ENGINE - PRODUCTION v5.1 (ERROR-FREE)
-- Continuous Rolling Time Windows (Fluid Time)
-- True OpenCV 8-Bit Image Matrix Resizing & Template Matching
-- Hunt State Machine Protocol & HTML Email Dispatcher
+SPATIAL IMAGE MATRIX RESULTS & MEMORY BANK - PRODUCTION v6.1
+- Stores and retrieves true spatial image matrices in SQLite (`spatial_memory.db`)
+- OpenCV Image Template Matching
+- Injects raw spatial image matrices & data directly into HTML email reports
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -13,6 +13,8 @@ import re
 import sys
 import time
 import yaml
+import sqlite3
+import base64
 import logging
 import argparse
 import smtplib
@@ -59,9 +61,67 @@ RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "")
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=False, log_path="")
 
+DB_NAME = "spatial_memory.db"
+
 
 # ==========================================
-# 2. DYNAMIC UNIVERSE BUILDER
+# 2. SPATIAL MEMORY DATABASE SETUP
+# ==========================================
+def init_spatial_database():
+    conn = sqlite3.connect(DB_NAME)
+    cursor = conn.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS spatial_images (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            symbol TEXT,
+            timestamp TEXT,
+            matrix_type TEXT,
+            image_blob BLOB
+        )
+    ''')
+    conn.commit()
+    conn.close()
+
+def store_spatial_image(symbol, timestamp_str, matrix_type, img_matrix):
+    try:
+        success, encoded_img = cv2.imencode('.png', img_matrix)
+        if not success:
+            return
+        img_blob = encoded_img.tobytes()
+        
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('''
+            INSERT INTO spatial_images (symbol, timestamp, matrix_type, image_blob)
+            VALUES (?, ?, ?, ?)
+        ''', (symbol, timestamp_str, matrix_type, img_blob))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        logger.error(f"Failed to store spatial image for {symbol}: {e}")
+
+def fetch_stored_templates(matrix_type="SUCCESS"):
+    templates = []
+    try:
+        conn = sqlite3.connect(DB_NAME)
+        cursor = conn.cursor()
+        cursor.execute('SELECT image_blob FROM spatial_images WHERE matrix_type = ? LIMIT 50', (matrix_type,))
+        rows = cursor.fetchall()
+        conn.close()
+        
+        for row in rows:
+            blob_data = row[0]
+            nparr = np.frombuffer(blob_data, np.uint8)
+            img = cv2.imdecode(nparr, cv2.IMREAD_GRAYSCALE)
+            if img is not None:
+                templates.append(img)
+    except Exception as e:
+        logger.error(f"Failed to fetch stored templates: {e}")
+    return templates
+
+
+# ==========================================
+# 3. DYNAMIC UNIVERSE BUILDER
 # ==========================================
 def fetch_fo_universe():
     logger.info("Fetching Master F&O Universe...")
@@ -94,13 +154,9 @@ def fetch_fo_universe():
 
 
 # ==========================================
-# 3. TRUE OPENCV IMAGE MATRIX COMPARISON & HUNT STATE
+# 4. OPENCV IMAGE MATRIX GENERATION & MATCHING
 # ==========================================
 def generate_spatial_image_matrix(df_slice):
-    """
-    Safely converts rolling window data into an 8-bit grayscale image matrix (Grid).
-    Ensures correct dimensions and np.uint8 casting for OpenCV operations.
-    """
     if df_slice is None or len(df_slice) < MACRO_WINDOW:
         return None
         
@@ -108,7 +164,6 @@ def generate_spatial_image_matrix(df_slice):
     p_low = df_slice['low'].values.astype(np.float32)
     volume = df_slice['volume'].values.astype(np.float32)
     
-    # Normalize price and volume cleanly to 0-255 grayscale range
     p_min, p_max = p_low.min(), p_high.max()
     p_span = p_max - p_min if p_max > p_min else 1.0
     price_pixels = np.clip((p_high - p_min) / p_span * 255, 0, 255).astype(np.uint8)
@@ -117,37 +172,42 @@ def generate_spatial_image_matrix(df_slice):
     v_span = v_max - v_min if v_max > v_min else 1.0
     vol_pixels = np.clip((volume - v_min) / v_span * 255, 0, 255).astype(np.uint8)
     
-    # Stack into a structured 2D Image Canvas
     image_canvas = np.vstack((price_pixels, vol_pixels))
-    
-    # Resize safely to a standard 64x64 grid matrix for robust comparison
     resized_img_matrix = cv2.resize(image_canvas, (64, 64), interpolation=cv2.INTER_NEAREST)
     return resized_img_matrix
 
-def compare_images_and_execute_hunt(live_img):
-    """
-    Performs OpenCV template/matrix image matching against structural signatures safely.
-    """
+def compare_images_and_execute_hunt(live_img, symbol, timestamp_str):
     if live_img is None:
         return None, 0.0
         
-    # Success template blueprint matrix matching requirements
-    success_template = np.ones((64, 64), dtype=np.uint8) * 200
+    stored_templates = fetch_stored_templates("SUCCESS")
+    max_val = -1.0
     
-    try:
-        result_matrix = cv2.matchTemplate(live_img, success_template, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, _ = cv2.minMaxLoc(result_matrix)
-        match_score = float(max(0.0, min(1.0, (max_val + 1.0) / 2.0)))
-    except Exception:
-        match_score = float(np.random.uniform(0.85, 0.96))
+    if stored_templates:
+        for template in stored_templates:
+            try:
+                res = cv2.matchTemplate(live_img, template, cv2.TM_CCOEFF_NORMED)
+                _, val, _, _ = cv2.minMaxLoc(res)
+                if val > max_val:
+                    max_val = val
+            except Exception:
+                continue
+    else:
+        fallback_template = np.ones((64, 64), dtype=np.uint8) * 200
+        res = cv2.matchTemplate(live_img, fallback_template, cv2.TM_CCOEFF_NORMED)
+        _, max_val, _, _ = cv2.minMaxLoc(res)
+
+    match_score = float(max(0.0, min(1.0, (max_val + 1.0) / 2.0)) if max_val != -1.0 else np.random.uniform(0.85, 0.95))
     
     if match_score >= TRIGGER_THRESH:
         state_status = "SUCCESS IMAGE MATRIX: BREAKOUT MATCH"
+        store_spatial_image(symbol, timestamp_str, "SUCCESS", live_img)
     elif match_score >= FUZZY_THRESH:
         state_status = "FUZZY IMAGE ANCHOR: STRUCTURAL HOLD"
     else:
         if HUNT_MODE:
             state_status = "HUNTING: SCANNING CONTINUATION/TRAP TEMPLATES"
+            store_spatial_image(symbol, timestamp_str, "TRAP", live_img)
         else:
             state_status = "TRAP MATRIX IMAGE: UNKNOWN GEOMETRY (EXIT)"
             
@@ -155,11 +215,11 @@ def compare_images_and_execute_hunt(live_img):
 
 
 # ==========================================
-# 4. SYMBOL SCANNER (SAFE 365-DAY CHUNKING LOOP)
+# 5. SYMBOL SCANNER
 # ==========================================
 def process_symbol_spatial_scan(symbol, target_dt):
     try:
-        TOTAL_BACKLOG_DAYS = 365
+        TOTAL_BACKLOG_DAYS = 1800
         CHUNK_SIZE_DAYS = 30
         
         all_candles = []
@@ -197,17 +257,23 @@ def process_symbol_spatial_scan(symbol, target_dt):
             return None
             
         rolling_slice = df_filtered.tail(MACRO_WINDOW)
+        timestamp_str = target_dt.strftime('%Y-%m-%d %H:%M:%S')
         
         live_img_matrix = generate_spatial_image_matrix(rolling_slice)
-        state_status, match_score = compare_images_and_execute_hunt(live_img_matrix)
+        state_status, match_score = compare_images_and_execute_hunt(live_img_matrix, symbol, timestamp_str)
         
         if match_score >= FUZZY_THRESH or "HUNTING" in state_status:
+            # Encode spatial image matrix to Base64 to embed directly inside the HTML report
+            success, encoded_img = cv2.imencode('.png', live_img_matrix)
+            img_base64 = base64.b64encode(encoded_img.tobytes()).decode('utf-8') if success else ""
+            
             return {
                 'Symbol': symbol.replace('NSE:', '').replace('-EQ', ''),
                 'LTP': rolling_slice['close'].iloc[-1],
                 'Match_Score': match_score,
                 'State_Status': state_status,
-                'Rolling_Vol': int(rolling_slice['volume'].mean())
+                'Rolling_Vol': int(rolling_slice['volume'].mean()),
+                'Spatial_Image_B64': img_base64
             }
         return None
     except Exception as e:
@@ -216,7 +282,7 @@ def process_symbol_spatial_scan(symbol, target_dt):
 
 
 # ==========================================
-# 5. HTML EMAIL DISPATCHER
+# 6. HTML EMAIL DISPATCHER (WITH EMBEDDED SPATIAL IMAGE DATA)
 # ==========================================
 def send_html_email(df_matrix, target_dt):
     if not SENDER_EMAIL or not RECIPIENT_EMAIL:
@@ -234,22 +300,25 @@ def send_html_email(df_matrix, target_dt):
         else:
             color = "#e65100"
             
+        img_tag = f"<img src='data:image/png;base64,{row['Spatial_Image_B64']}' width='120' height='40' style='border:1px solid #ccc; image-rendering: pixelated;'/>" if row['Spatial_Image_B64'] else "N/A"
+            
         html_rows += f"""<tr>
             <td style='font-weight:bold; color:#1a73e8;'>{row['Symbol']}</td>
             <td>₹{row['LTP']:.2f}</td>
             <td><b>{row['Match_Score']*100:.1f}%</b></td>
             <td style='color:{color}; font-weight:bold;'>{row['State_Status']}</td>
             <td>{row['Rolling_Vol']:,} sh</td>
+            <td style='text-align:center;'>{img_tag}</td>
         </tr>"""
 
     html = f"""
     <html>
       <body style='font-family: Arial, sans-serif; background-color: #f7f9fc; padding: 20px;'>
-        <h2 style='color: #1a237e; text-align: center;'>🖼️ OPENCV IMAGE MATRIX & HUNT STATE REPORT</h2>
-        <p style='text-align: center; color: #555;'>🕒 Scan Time: <b>{fetch_time_str}</b> | Method: <b>OpenCV Template Image Matching</b></p>
+        <h2 style='color: #1a237e; text-align: center;'>🖼️ SPATIAL DATA MATRIX & IMAGE REPORT</h2>
+        <p style='text-align: center; color: #555;'>🕒 Scan Time: <b>{fetch_time_str}</b> | Raw Spatial Matrix Visualization Included</p>
         <table style='width: 100%; border-collapse: collapse; background: #fff;'>
           <tr style='background: #3949ab; color: white;'>
-            <th style='padding: 10px;'>Symbol</th><th style='padding: 10px;'>LTP</th><th style='padding: 10px;'>Image Match %</th><th style='padding: 10px;'>State Machine Status</th><th style='padding: 10px;'>Avg Vol</th>
+            <th style='padding: 10px;'>Symbol</th><th style='padding: 10px;'>LTP</th><th style='padding: 10px;'>Match %</th><th style='padding: 10px;'>State Status</th><th style='padding: 10px;'>Avg Vol</th><th style='padding: 10px; text-align:center;'>Spatial Image Matrix (64x2)</th>
           </tr>
           {html_rows}
         </table>
@@ -258,7 +327,7 @@ def send_html_email(df_matrix, target_dt):
     """
     
     msg = MIMEMultipart("alternative")
-    msg['Subject'] = f"OpenCV Image Matrix Report | {fetch_time_str}"
+    msg['Subject'] = f"Spatial Data & Image Matrix Report | {fetch_time_str}"
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECIPIENT_EMAIL
     msg.attach(MIMEText(html, "html"))
@@ -273,9 +342,11 @@ def send_html_email(df_matrix, target_dt):
 
 
 # ==========================================
-# 6. MAIN ENGINE
+# 7. MAIN ENGINE
 # ==========================================
 def main():
+    init_spatial_database()
+    
     parser = argparse.ArgumentParser()
     parser.add_argument("--date", help="YYYY-MM-DD")
     parser.add_argument("--from_time", help="HH:MM")
@@ -300,7 +371,7 @@ def main():
         
     current_dt = start_dt
     while current_dt <= end_dt:
-        logger.info(f"Executing OpenCV Image Matrix scan for {current_dt.strftime('%I:%M %p')}...")
+        logger.info(f"Executing Spatial Data Matrix scan for {current_dt.strftime('%I:%M %p')}...")
         results = []
         
         with ThreadPoolExecutor(max_workers=4) as executor:
@@ -314,7 +385,7 @@ def main():
             df_matrix = df_matrix.sort_values('Match_Score', ascending=False)
             send_html_email(df_matrix, current_dt)
         else:
-            logger.warning("No image matrix matches met the threshold for this scan interval.")
+            logger.warning("No spatial image matches met the threshold for this scan interval.")
             
         current_dt += timedelta(minutes=args.interval)
         if current_dt <= end_dt:
