@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-ASIT BARAN PATI TMV ENGINE - PRODUCTION v26.0 (CONSTANT VOLUME BAR UPGRADE)
+ASIT BARAN PATI TMV ENGINE - PRODUCTION v26.0 (CONSTANT VOLUME HISTORICAL BREAKOUT MATCHER)
 FEATURES: 
-- Time-based candles are DESTROYED. Replaced by Constant Volume Bars (CVB).
-- VOLUME_BAR_SIZE: Dynamically chunks 1-min raw data into perfect 10,000-share blocks.
-- Kinetic Chain is now calculated purely on the TIME it takes to clear each 10k block.
-- Phase 1: Anchors top stocks based on opening gap volume logic.
-- Phase 2: Intraday tracking strictly comparing the Velocity (Shares/Min) of recent 10k blocks.
+- Completely removes time-framed candle limits; aggregates raw 1-min data into 10k volume blocks.
+- Time-to-Fill Metrics: Measures the explicit speed (shares per minute) to clear each 10k block.
+- Ultimate Speed Filter: Restricts matrix output strictly to assets whose live 10k bucket velocity 
+  violates the absolute fastest 10k bar velocity recorded on their historical 90-day Max Volume Day.
+- Median Kinetic Chain: Deploys robust median calculations to assess cruising momentum.
+- Full Dispatch System: Transmits beautifully responsive HTML tables directly to your terminal or mail.
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -47,12 +48,11 @@ fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=
 # ------------------------------------------
 # MASTER PARAMETERS (THE CONTROL BOARD)
 # ------------------------------------------
-VOLUME_BAR_SIZE = 10000        # NEW: The fixed size of our Volume Bucket
+VOLUME_BAR_SIZE = 10000        # The fixed size of our Volume Bucket
 WATCHLIST_SIZE = 30            # Size of the anchored pre-market watchlist 
-RECENT_ITERATION_PCT = 0.30    # Top 30% of 10k bars used as the live momentum window
+RECENT_ITERATION_PCT = 0.30    # Top 30% of 10k bars used as the live momentum cruising window
 SPEED_THRESHOLD_RATIO = 0.20   # Hurdle rate dial
-VOLATILITY_EXP_THRESHOLD = 0.5 # DYNAMIC DIAL (Lowered slightly due to 10k chunking)
-VOL_RATIO_THRESHOLD = 0.5      # DYNAMIC DIAL 
+VOLATILITY_EXP_THRESHOLD = 0.5 # Minimum Volat Exp required to pass primary sieve
 
 # ==========================================
 # 2. DYNAMIC UNIVERSE BUILDER
@@ -69,14 +69,17 @@ def fetch_fo_universe():
                 symbol_col = col
                 break
                 
-        if symbol_col is None: return []
+        if symbol_col is None: 
+            logger.error("CRITICAL: Could not locate Symbol column in Fyers Master.")
+            return []
             
         raw_symbols = df[symbol_col].astype(str).tolist()
         base_symbols = set()
         
         for s in raw_symbols:
             match = re.search(r'NSE:([A-Z&\-]+)\d+', s)
-            if match: base_symbols.add(match.group(1))
+            if match: 
+                base_symbols.add(match.group(1))
         
         ignore_list = {'NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'}
         return [f"NSE:{sym}-EQ" for sym in base_symbols - ignore_list]
@@ -89,10 +92,11 @@ def fetch_fo_universe():
 # ==========================================
 def build_volume_bars(df_1min, target_vol=VOLUME_BAR_SIZE):
     """
-    Takes 1-min raw data and compresses it into Constant Volume Bars.
-    Records the exact time taken to clear every 10,000 share block.
+    Takes 1-min raw candle components and condenses them into unified Constant Volume Bars.
+    Tracks explicit time to complete every 10,000 share transactional block.
     """
-    if df_1min.empty: return pd.DataFrame()
+    if df_1min.empty: 
+        return pd.DataFrame()
     
     bars = []
     current_vol = 0
@@ -110,11 +114,8 @@ def build_volume_bars(df_1min, target_vol=VOLUME_BAR_SIZE):
         high_price = max(high_price, row['high'])
         low_price = min(low_price, row['low'])
         
-        # When bucket fills up:
         if current_vol >= target_vol:
             end_time = row['timestamp']
-            
-            # Calculate time taken in minutes (minimum 1 minute to prevent divide by zero)
             time_diff = (end_time - start_time).total_seconds() / 60.0
             time_taken = max(1.0, time_diff) 
             
@@ -125,10 +126,9 @@ def build_volume_bars(df_1min, target_vol=VOLUME_BAR_SIZE):
                 'low': low_price,
                 'close': row['close'],
                 'volume': current_vol,
-                'velocity': current_vol / time_taken # Speed: Shares per Minute
+                'velocity': current_vol / time_taken
             })
             
-            # Reset bucket for the next 10,000 block
             current_vol = 0
             high_price = -np.inf
             low_price = np.inf
@@ -136,17 +136,15 @@ def build_volume_bars(df_1min, target_vol=VOLUME_BAR_SIZE):
     return pd.DataFrame(bars)
 
 # ==========================================
-# 4. NEW KINETIC CHAIN (BASED ON VOLUME BARS)
+# 4. KINETIC CHAIN ENGINE (MEDIAN BASED CRUISE CONTROL)
 # ==========================================
 def calculate_cvb_kinetic_chain(vol_bars_df):
     """
-    Analyzes the speed of the 10,000-volume bars. 
-    If recent 10k bars are filling faster than morning 10k bars, we have a breakout.
+    Evaluates historical base velocities against recent windows via robust medians.
     """
     if vol_bars_df.empty or len(vol_bars_df) < 4: 
         return False, 1.0, 0.0
         
-    # Split the bars into Base (Past) and Recent (Live)
     split_idx = int(len(vol_bars_df) * (1 - RECENT_ITERATION_PCT))
     if split_idx == len(vol_bars_df): split_idx -= 1
     if split_idx <= 0: split_idx = 1
@@ -155,22 +153,21 @@ def calculate_cvb_kinetic_chain(vol_bars_df):
     recent_chain = vol_bars_df.iloc[split_idx:]
     
     max_base_velocity = base_chain['velocity'].max()
-    min_recent_velocity = recent_chain['velocity'].min()
+    median_recent_velocity = recent_chain['velocity'].median()
     current_live_velocity = recent_chain['velocity'].iloc[-1]
     
-    # Downshifted Speed Hurdle
     hurdle_v = max_base_velocity * SPEED_THRESHOLD_RATIO
     
-    vol_pass = (min_recent_velocity > hurdle_v) and (max_base_velocity > 0)
-    v_mult = (min_recent_velocity / max_base_velocity) if max_base_velocity > 0 else 1.0
+    vol_pass = (median_recent_velocity > hurdle_v) and (max_base_velocity > 0)
+    v_mult = (median_recent_velocity / max_base_velocity) if max_base_velocity > 0 else 1.0
     
     return vol_pass, v_mult, current_live_velocity
 
 # ==========================================
-# 5. PHASE 1: PRE-MARKET MATRIX GENERATOR
+# 5. PHASE 1: PRE-MARKET MATRIX ANCHOR
 # ==========================================
 def extract_pre_market_score(symbol, target_dt):
-    """Anchors the top 30 stocks based on overall gap/open volume to ensure liquidity."""
+    """Sifts opening configurations across the network to secure immediate liquidity."""
     try:
         time.sleep(0.12)
         payload = {
@@ -200,10 +197,10 @@ def extract_pre_market_score(symbol, target_dt):
         return None
 
 # ==========================================
-# 6. PHASE 2: INTRADAY CVB PROCESSING MODULE
+# 6. PHASE 2: INTRADAY PROCESSING MODULE
 # ==========================================
 def process_intraday_matrix(symbol, pre_market_vol, df, target_dt):
-    """Processes Live Constant Volume Bars to detect Institutional Speed."""
+    """Processes Live Constant Volume Bars to check against Historical High Speed Days."""
     try:
         current_time = target_dt.time()
         market_open = dt_time(9, 15)
@@ -216,31 +213,36 @@ def process_intraday_matrix(symbol, pre_market_vol, df, target_dt):
         
         if history_df.empty or today_df.empty: return None
 
-        # --- THE QUANT UPGRADE: CONVERT TO 10K VOLUME BARS ---
         today_vol_bars = build_volume_bars(today_df, VOLUME_BAR_SIZE)
-        
         if today_vol_bars.empty: return None
 
-        # Process standard benchmarks
+        # Determine the absolute highest total volume day in history
         daily_groups = history_df.groupby('date').agg({'volume': 'sum', 'high': 'max', 'low': 'min'})
-        daily_groups['range'] = daily_groups['high'] - daily_groups['low']
-        
         max_vol_date = daily_groups['volume'].idxmax()
+        
+        # ════════════════════════════════════════════════════════════════════════
+        # ISOLATE HISTORICAL RECORD PEAK VELOCITY
+        # ════════════════════════════════════════════════════════════════════════
+        max_vol_day_df = history_df[history_df['date'] == max_vol_date]
+        historical_max_bars = build_volume_bars(max_vol_day_df, VOLUME_BAR_SIZE)
+        if historical_max_bars.empty: return None
+        
+        historical_max_speed = historical_max_bars['velocity'].max()
+        # ════════════════════════════════════════════════════════════════════════
+        
         max_vol = daily_groups.loc[max_vol_date, 'volume']
-        max_range = daily_groups.loc[max_vol_date, 'range']
+        max_range = daily_groups['high'].max() - daily_groups['low'].min()
         
-        if max_vol == 0 or max_range == 0: return None
+        vol_ratio = today_df['volume'].sum() / max_vol if max_vol > 0 else 0
+        volatility_ratio = (today_df['high'].max() - today_df['low'].min()) / max_range if max_range > 0 else 0
         
-        vol_ratio = today_df['volume'].sum() / max_vol
-        volatility_ratio = (today_df['high'].max() - today_df['low'].min()) / max_range
-        
-        # --- THE NEW SPEED TEST ---
         v_pass, v_mult, live_velocity = calculate_cvb_kinetic_chain(today_vol_bars)
         
         return {
             'Symbol': symbol.replace('NSE:', '').replace('-EQ', ''),
+            'Live_10k_Speed': live_velocity,
+            'Historical_Max_Speed': historical_max_speed,
             'Total_10k_Bars': len(today_vol_bars),
-            'Live_10k_Speed': live_velocity,  # Shares per min of the current 10k block
             'Vol_Ratio': vol_ratio,
             'Volat_Ratio': volatility_ratio,
             'Kin_Vol_Str': f"PASS ({v_mult:.1f}x)" if v_pass else f"FAIL ({v_mult:.1f}x)",
@@ -252,7 +254,7 @@ def process_intraday_matrix(symbol, pre_market_vol, df, target_dt):
         return None
 
 # ==========================================
-# 7. HTML REPORT GENERATOR
+# 7. HTML REPORT GENERATOR & DISPATCH
 # ==========================================
 def send_html_email(df_matrix, target_dt):
     logger.info(f"Generating HTML performance matrix for {target_dt.strftime('%I:%M %p')}...")
@@ -263,14 +265,12 @@ def send_html_email(df_matrix, target_dt):
         for _, row in df.iterrows():
             v_class = "pass" if row['V_Pass'] else "fail"
             
-            # Color code Velocity (Green if 10k bucket filled at > 10,000 shares/min)
-            vel_color = "#1b5e20" if row['Live_10k_Speed'] >= 10000 else "#ff9800" if row['Live_10k_Speed'] >= 5000 else "#757575"
-            
             html_rows += f"""<tr>
                 <td class='symbol'>{row['Symbol']}</td>
                 <td>₹{row['LTP']:.2f}</td>
+                <td style='color:#1b5e20; font-weight:bold;'>{int(row['Live_10k_Speed']):,} sh/min</td>
+                <td style='color:#757575;'>{int(row['Historical_Max_Speed']):,} sh/min</td>
                 <td>{int(row['Total_10k_Bars'])} Bars</td>
-                <td style='color:{vel_color}; font-weight:bold;'>{int(row['Live_10k_Speed']):,} sh/min</td>
                 <td>{row['Vol_Ratio']:.2f}x</td>
                 <td class='highlight'>{row['Volat_Ratio']:.2f}x</td>
                 <td class='{v_class}'>{row['Kin_Vol_Str']}</td>
@@ -296,21 +296,21 @@ def send_html_email(df_matrix, target_dt):
         </style>
       </head>
       <body>
-        <h2>🏆 TMV 10K-VOLUME BAR ENGINE</h2>
+        <h2>🏆 TMV 10K SPEED LIMIT BREAKER</h2>
         <p class="time-stamp">🕒 Data Fetched At: <b>{fetch_time_str}</b></p>
         <table>
-          <tr><th>Symbol</th><th>LTP</th><th>10k Bars Formed</th><th>Live 10k Bucket Speed</th><th>Vol Ratio</th><th>Volat Exp</th><th>Kinetic Speed Chain</th></tr>
+          <tr><th>Symbol</th><th>LTP</th><th>Live 10k Speed</th><th>Max Day's Speed</th><th>10k Bars Formed</th><th>Vol Ratio</th><th>Volat Exp</th><th>Kinetic Chain</th></tr>
           {build_rows(df_matrix)}
         </table>
         <p style="font-size: 12px; color: #777; text-align: center;">
-            TMV Engine v26.0 • Resolution: {VOLUME_BAR_SIZE} Shares • Measuring time-to-fill per block.
+            TMV Engine v26.0 • Unprecedented Momentum Mode • Alerting strictly when live velocity breaks historical max day ceiling.
         </p>
       </body>
     </html>
     """
     
     msg = MIMEMultipart("alternative")
-    msg['Subject'] = f"CVB Matrix | 10k Block Speed: {fetch_time_str}"
+    msg['Subject'] = f"CVB Breakout Matrix | Velocity Violations: {fetch_time_str}"
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECIPIENT_EMAIL
     msg.attach(MIMEText(html, "html"))
@@ -354,10 +354,14 @@ def main():
             date_str = args.date.replace('.', ':')
             start_dt = pd.to_datetime(date_str, dayfirst=True).tz_localize("Asia/Kolkata")
             end_dt = start_dt
-        except Exception as e: return
+        except Exception as e: 
+            logger.error(f"Invalid Single Run format. Error: {e}")
+            return
             
     raw_symbols = fetch_fo_universe()
-    if not raw_symbols: return
+    if not raw_symbols: 
+        logger.error("Universe empty. Terminating.")
+        return
         
     logger.info(f"Phase 1: Running Pre-Market Sieve across {len(raw_symbols)} symbols...")
     pre_market_results = []
@@ -368,11 +372,13 @@ def main():
             res = future.result()
             if res: pre_market_results.append(res)
             
-    if not pre_market_results: return
+    if not pre_market_results: 
+        logger.error("Pre-market collection failed.")
+        return
         
     pre_market_df = pd.DataFrame(pre_market_results)
     anchored_watchlist = pre_market_df.sort_values('Pre_Market_Vol', ascending=False).head(WATCHLIST_SIZE)
-    logger.info(f"Anchored top {len(anchored_watchlist)} structures.")
+    logger.info(f"Watchlist securely anchored. Monitored structures: {len(anchored_watchlist)}")
     
     current_dt = start_dt
     while current_dt <= end_dt:
@@ -391,19 +397,25 @@ def main():
         df_matrix = pd.DataFrame(intraday_results)
         
         if not df_matrix.empty:
-            PRIORITY_SORT = ['Volat_Ratio', 'Vol_Ratio', 'Live_10k_Speed']
-            sorted_matrix = df_matrix.sort_values(PRIORITY_SORT, ascending=[False, False, False])
+            PRIORITY_SORT = ['Live_10k_Speed', 'Vol_Ratio']
+            sorted_matrix = df_matrix.sort_values(PRIORITY_SORT, ascending=[False, False])
             
+            # ════════════════════════════════════════════════════════════════════════
+            # THE CRITICAL QUANT CEILING FILTER:
+            # ════════════════════════════════════════════════════════════════════════
             filtered_matrix = sorted_matrix[
-                (sorted_matrix['Volat_Ratio'] > VOLATILITY_EXP_THRESHOLD) & 
-                (sorted_matrix['Vol_Ratio'] > VOL_RATIO_THRESHOLD)
+                (sorted_matrix['Live_10k_Speed'] > sorted_matrix['Historical_Max_Speed']) &
+                (sorted_matrix['Volat_Ratio'] > VOLATILITY_EXP_THRESHOLD)
             ]
             
-            if not filtered_matrix.empty: send_html_email(filtered_matrix, current_dt)
-            else: logger.warning(f"No structures cleared hurdles at {current_dt.strftime('%I:%M %p')}.")
+            if not filtered_matrix.empty: 
+                send_html_email(filtered_matrix, current_dt)
+            else: 
+                logger.warning(f"No assets exceeded their Historical Record Speeds at {current_dt.strftime('%I:%M %p')}.")
         
         current_dt += timedelta(minutes=interval_mins)
-        if current_dt <= end_dt: time.sleep(2)
+        if current_dt <= end_dt: 
+            time.sleep(2)
             
     logger.info("System process workflow completed successfully.")
 
