@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v9.0
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v9.2
 - Configurable Lookback Backlog (Loaded from config.yml)
 - ZERO SQLITE: Pure In-Memory Spatial Blueprint Matching (Deterministic)
-- True Multi-Channel F&O 128x128 Grid (Price, Volume, Open Interest / Volatility Channels)
+- True Multi-Channel F&O 1024x1024 Grid (Price, Volume, Open Interest / Volatility Channels)
 - Maximum 64-Dimensional NumPy/Tensor Hyper-Pipeline
 - Dynamic Target Calculator (Target 1, Target 2, Target 3 Breakout Projections)
-- Direct Stock-Named PNG Attachment Dispatcher with Targets in HTML Report
+- Direct Stock-Named PNG Attachment Dispatcher with Success Matrix Image Reference Column
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -106,7 +106,7 @@ def fetch_fo_universe():
 def build_maximum_64d_hyper_tensor(multi_channel_canvas):
     """
     Allocates a maximum 64-dimensional NumPy hyper-tensor mapping the multi-channel F&O 
-    128x128x3 spatial image tensor across 61 padding axes to hit the native 64-dimensional boundary.
+    1024x1024x3 spatial image tensor across 61 padding axes to hit the native 64-dimensional boundary.
     """
     if multi_channel_canvas is None:
         return None
@@ -117,7 +117,7 @@ def build_maximum_64d_hyper_tensor(multi_channel_canvas):
 
 
 # ==========================================
-# 4. MULTI-CHANNEL F&O 128x128 GRID & TARGET CALCULATOR
+# 4. MULTI-CHANNEL F&O 1024x1024 GRID & TARGET CALCULATOR
 # ==========================================
 def calculate_breakout_targets(df_slice, ltp):
     """
@@ -128,13 +128,11 @@ def calculate_breakout_targets(df_slice, ltp):
     lows = df_slice['low'].values
     closes = df_slice['close'].values
     
-    # Calculate True Range approximation per candle
     tr = np.maximum(highs[1:] - lows[1:], np.abs(highs[1:] - closes[:-1]))
     atr = np.mean(tr) if len(tr) > 0 else (ltp * 0.01)
     
     resistance_span = highs.max() - lows.min()
     
-    # Target calculations based on volatility expansion & structural span
     target_1 = ltp + (atr * 1.0) + (resistance_span * 0.15)
     target_2 = ltp + (atr * 2.0) + (resistance_span * 0.30)
     target_3 = ltp + (atr * 3.5) + (resistance_span * 0.50)
@@ -144,7 +142,7 @@ def calculate_breakout_targets(df_slice, ltp):
 
 def generate_multichannel_spatial_matrix(df_slice):
     """
-    Constructs a true multi-channel 128x128x3 F&O spatial grid:
+    Constructs a true multi-channel 1024x1024x3 F&O spatial grid (Maximum Resolution):
     - Channel 0: Price Action Topology (High-Low geometry)
     - Channel 1: Volume Density Profile
     - Channel 2: Volatility / ATR Expansion Spectrum
@@ -156,10 +154,9 @@ def generate_multichannel_spatial_matrix(df_slice):
     p_low = df_slice['low'].values.astype(np.float32)
     volume = df_slice['volume'].values.astype(np.float32)
     
-    grid_height = 128
-    grid_width = 128
+    grid_height = 1024
+    grid_width = 1024
     
-    # Multi-channel canvas [Height, Width, 3 Channels]
     canvas = np.zeros((grid_height, grid_width, 3), dtype=np.uint8)
     
     p_min, p_max = p_low.min(), p_high.max()
@@ -170,7 +167,6 @@ def generate_multichannel_spatial_matrix(df_slice):
     
     x_indices = np.linspace(0, grid_width - 1, len(df_slice)).astype(int)
     
-    # Calculate Rolling ATR for Channel 2
     tr = np.maximum(p_high[1:] - p_low[1:], np.abs(p_high[1:] - df_slice['close'].values[:-1]))
     atr_val = np.mean(tr) if len(tr) > 0 else 1.0
     
@@ -187,35 +183,35 @@ def generate_multichannel_spatial_matrix(df_slice):
         if y_top > y_bot:
             y_top, y_bot = y_bot, y_top
             
-        # Channel 0: Price Action Topology
         canvas[y_top:y_bot+1, i, 0] = 220
         
-        # Channel 1: Volume Density
         vol_intensity = int(np.clip((v_val - v_min) / v_span * 255, 0, 255))
         canvas[:, i, 1] = vol_intensity
         
-        # Channel 2: Volatility Spectrum Density
-        canvas[grid_height - 16:grid_height, i, 2] = int(np.clip(atr_val / p_span * 255, 50, 255))
+        canvas[grid_height - 128:grid_height, i, 2] = int(np.clip(atr_val / p_span * 255, 50, 255))
 
     return canvas
 
 
 def compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str):
     if multi_channel_img is None:
-        return None, 0.0
+        return None, 0.0, "N/A"
         
-    # Flatten channel dimension for template matching compatibility
     live_img_gray = cv2.cvtColor(multi_channel_img, cv2.COLOR_RGB2GRAY)
     
     t_64d = build_maximum_64d_hyper_tensor(multi_channel_img)
     if t_64d is not None:
-        logger.debug(f"[{symbol}] Multi-Channel F&O 64D NumPy Hyper-Tensor structured. ndim: {t_64d.ndim}, shape: {t_64d.shape}")
+        logger.debug(f"[{symbol}] Multi-Channel F&O 1024x1024 64D NumPy Hyper-Tensor structured. ndim: {t_64d.ndim}, shape: {t_64d.shape}")
 
     max_val = -1.0
+    matched_template_id = "BASE_FALLBACK_MATRIX"
     
     if IN_MEMORY_SUCCESS_TEMPLATES:
-        for template in IN_MEMORY_SUCCESS_TEMPLATES:
+        for idx, template_item in enumerate(IN_MEMORY_SUCCESS_TEMPLATES):
             try:
+                template = template_item['img']
+                t_id = template_item['id']
+                
                 template_gray = cv2.cvtColor(template, cv2.COLOR_RGB2GRAY) if len(template.shape) == 3 else template
                 if template_gray.shape != live_img_gray.shape:
                     template_resized = cv2.resize(template_gray, (live_img_gray.shape[1], live_img_gray.shape[0]))
@@ -226,12 +222,14 @@ def compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str):
                 _, val, _, _ = cv2.minMaxLoc(res)
                 if val > max_val:
                     max_val = val
+                    matched_template_id = f"SUCCESS_BLUEPRINT_{idx}_{t_id}"
             except Exception:
                 continue
     else:
-        fallback_template = np.ones((128, 128), dtype=np.uint8) * 220
+        fallback_template = np.ones((1024, 1024), dtype=np.uint8) * 220
         res = cv2.matchTemplate(live_img_gray, fallback_template, cv2.TM_CCOEFF_NORMED)
         _, max_val, _, _ = cv2.minMaxLoc(res)
+        matched_template_id = "DEFAULT_ANALYTIC_MATRIX"
 
     raw_score = (max_val + 1.0) / 2.0 if max_val != -1.0 else 0.8800
     match_score = float(round(max(0.0, min(1.0, raw_score)), 4))
@@ -239,16 +237,18 @@ def compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str):
     if match_score >= TRIGGER_THRESH:
         state_status = "SUCCESS IMAGE MATRIX: BREAKOUT MATCH"
         if len(IN_MEMORY_SUCCESS_TEMPLATES) < 50:
-            IN_MEMORY_SUCCESS_TEMPLATES.append(multi_channel_img)
+            IN_MEMORY_SUCCESS_TEMPLATES.append({'img': multi_channel_img, 'id': symbol.replace('NSE:', '').replace('-EQ', '')})
     elif match_score >= FUZZY_THRESH:
         state_status = "FUZZY IMAGE ANCHOR: STRUCTURAL HOLD"
     else:
         if HUNT_MODE:
             state_status = "HUNTING: SCANNING CONTINUATION/TRAP TEMPLATES"
+            matched_template_id = "HUNTING_SCAN_STATE"
         else:
             state_status = "TRAP MATRIX IMAGE: UNKNOWN GEOMETRY (EXIT)"
+            matched_template_id = "TRAP_EXIT_MATRIX"
             
-    return state_status, match_score
+    return state_status, match_score, matched_template_id
 
 
 # ==========================================
@@ -298,7 +298,7 @@ def process_symbol_spatial_scan(symbol, target_dt):
         t1, t2, t3 = calculate_breakout_targets(rolling_slice, ltp)
         
         multi_channel_img = generate_multichannel_spatial_matrix(rolling_slice)
-        state_status, match_score = compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str)
+        state_status, match_score, success_matrix_ref = compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str)
         
         if match_score >= FUZZY_THRESH or "HUNTING" in state_status:
             success, encoded_img = cv2.imencode('.png', multi_channel_img)
@@ -313,6 +313,7 @@ def process_symbol_spatial_scan(symbol, target_dt):
                 'Target_3': t3,
                 'Match_Score': match_score,
                 'State_Status': state_status,
+                'Success_Matrix_Ref': success_matrix_ref,
                 'Rolling_Vol': int(rolling_slice['volume'].mean()),
                 'Spatial_Image_Bytes': img_bytes
             }
@@ -323,7 +324,7 @@ def process_symbol_spatial_scan(symbol, target_dt):
 
 
 # ==========================================
-# 6. HTML EMAIL DISPATCHER (TARGETS & ATTACHMENTS)
+# 6. HTML EMAIL DISPATCHER (1024x1024 REPORT)
 # ==========================================
 def send_html_email(df_matrix, target_dt):
     if not SENDER_EMAIL or not RECIPIENT_EMAIL:
@@ -333,14 +334,14 @@ def send_html_email(df_matrix, target_dt):
     fetch_time_str = target_dt.strftime('%d %b %Y, %I:%M %p')
     
     msg = MIMEMultipart()
-    msg['Subject'] = f"F&O Multi-Channel Spatial Matrix & Targets Report | {fetch_time_str}"
+    msg['Subject'] = f"F&O 1024x1024 Spatial Matrix & Success Blueprint Report | {fetch_time_str}"
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECIPIENT_EMAIL
     
     html_rows = ""
     for _, row in df_matrix.iterrows():
         color = "#1b5e20" if "SUCCESS" in row['State_Status'] else ("#0d47a1" if "FUZZY" in row['State_Status'] else "#e65100")
-        attachment_name = f"{row['Symbol']}_spatial.png" if row.get('Spatial_Image_Bytes') else "N/A"
+        attachment_name = f"{row['Symbol']}_spatial_1024.png" if row.get('Spatial_Image_Bytes') else "N/A"
             
         html_rows += f"""<tr>
             <td style='font-weight:bold; color:#1a73e8;'>{row['Symbol']}</td>
@@ -350,6 +351,7 @@ def send_html_email(df_matrix, target_dt):
             <td style='color:#6a1b9a; font-weight:bold;'>₹{row['Target_3']:.2f}</td>
             <td><b>{row['Match_Score']*100:.1f}%</b></td>
             <td style='color:{color}; font-weight:bold;'>{row['State_Status']}</td>
+            <td style='font-family:monospace; font-size:11px; color:#4527a0;'>{row['Success_Matrix_Ref']}</td>
             <td style='text-align:center; font-family:monospace; color:#333;'><b>{attachment_name}</b></td>
         </tr>"""
         
@@ -361,9 +363,9 @@ def send_html_email(df_matrix, target_dt):
     html = f"""
     <html>
       <body style='font-family: Arial, sans-serif; background-color: #f7f9fc; padding: 20px;'>
-        <h2 style='color: #1a237e; text-align: center;'>🎯 F&O MULTI-CHANNEL 64D HYPER-TENSOR REPORT</h2>
+        <h2 style='color: #1a237e; text-align: center;'>🎯 F&O 1024x1024 MULTI-CHANNEL 64D HYPER-TENSOR REPORT</h2>
         <p style='text-align: center; color: #555;'>🕒 Scan Time: <b>{fetch_time_str}</b> | Lookback Backlog: <b>{LOOKBACK_DAYS} Days</b></p>
-        <p style='text-align: center; color: #555; font-size: 13px;'><i>Multi-channel F&O 128x128 spatial grids with Target 1, Target 2, and Target 3 structural projections.</i></p>
+        <p style='text-align: center; color: #555; font-size: 13px;'><i>Ultra-high resolution 1024x1024 F&O spatial grids with Target Projections and Success Matrix Blueprint references.</i></p>
         <table style='width: 100%; border-collapse: collapse; background: #fff; margin-top: 15px;'>
           <tr style='background: #3949ab; color: white;'>
             <th style='padding: 10px;'>Symbol</th>
@@ -373,7 +375,8 @@ def send_html_email(df_matrix, target_dt):
             <th style='padding: 10px;'>Target 3</th>
             <th style='padding: 10px;'>Match %</th>
             <th style='padding: 10px;'>Status</th>
-            <th style='padding: 10px; text-align:center;'>Attached Spatial File</th>
+            <th style='padding: 10px;'>Success Matrix Image Ref</th>
+            <th style='padding: 10px; text-align:center;'>Attached File</th>
           </tr>
           {html_rows}
         </table>
@@ -387,7 +390,7 @@ def send_html_email(df_matrix, target_dt):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
             server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
-        logger.info("Email report sent successfully with Multi-Channel targets and file attachments.")
+        logger.info("Email report sent successfully with 1024x1024 spatial grids and success references.")
     except Exception as e:
         logger.error(f"Email dispatch failed: {e}")
 
@@ -420,7 +423,7 @@ def main():
         
     current_dt = start_dt
     while current_dt <= end_dt:
-        logger.info(f"Executing Multi-Channel F&O Hyper-Tensor Scan for {current_dt.strftime('%I:%M %p')}...")
+        logger.info(f"Executing 1024x1024 Multi-Channel F&O Hyper-Tensor Scan for {current_dt.strftime('%I:%M %p')}...")
         results = []
         
         with ThreadPoolExecutor(max_workers=4) as executor:
