@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v12.4 (Anti-Rate Limit Edition)
-- ZERO Silent Failures: Every skipped stock or API error is now loudly logged.
-- API Throttling: Exponential backoff for HTTP 429 (Too Many Requests).
-- Thread Control: Tuned to stay under Fyers API security limits.
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v12.5 (Production Release)
+- Database Lifecycle: ALWAYS Rebuilds on boot to ensure freshest data
+- Resolution Scaling: 256x256 Matrix Compression
+- Anti-Rate Limit: Exponential backoff for HTTP 429 & throttled worker threads
+- Risk Mitigation: Live Trap Filter active; forces rejection if Trap Match >= Success Match
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -51,8 +52,8 @@ except FileNotFoundError:
 MACRO_WINDOW = cfg.get("macro_window_min", 15)
 HIST_TRAVERSAL_LOOKBACK = cfg.get("historical_traversal_lookback", "1 month")
 LIVE_LOOKBACK_DAYS = cfg.get("live_lookback_days", 30)
-TRIGGER_THRESH = cfg.get("correlation", {}).get("initial_trigger_threshold", 0.70)
-COMPRESSION_MAX = 0.06  
+TRIGGER_THRESH = cfg.get("correlation", {}).get("initial_trigger_threshold", 0.75)
+COMPRESSION_MAX = 0.06  # Strict 6% volatility boundary for institutional accumulation channels
 
 CLIENT_ID = os.environ.get("CLIENT_ID", "")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "")
@@ -157,29 +158,26 @@ def fetch_historical_raw_data(symbol, resolution, total_days_back, target_end_dt
         }
         
         success = False
-        # ANTI-RATE LIMIT LOOP (Allows up to 3 retries if Fyers throws 429)
         for attempt in range(4):
             try:
-                time.sleep(0.3) # Slower base pacing for API health
+                time.sleep(0.3)  # Paced intervals to decouple API concurrent density
                 res = fyers.history(payload)
                 
-                # Check for 429 Rate Limit
                 if isinstance(res, dict) and res.get('s') == 'error':
                     if res.get('code') in [429, 403, 400]:
                         if context == "LIVE":
                             logger.warning(f"[{symbol}-{resolution}] FYERS RATE LIMIT. Cooling down {2.5*(attempt+1)}s (Attempt {attempt+1})")
                         time.sleep(2.5 * (attempt + 1))
-                        continue # Retry
+                        continue
                         
-                # Validate Success
                 if res and isinstance(res, dict) and 'candles' in res and len(res['candles']) > 0:
                     all_candles.extend(res['candles'])
                     success = True
                     break
                 else:
-                    break # Genuinely empty, exit loop
+                    break
                     
-            except Exception as e:
+            except Exception:
                 time.sleep(1)
                 
         if not success and context == "LIVE":
@@ -225,6 +223,7 @@ def process_historical_profiling_permutations(symbol):
             max_forward_high = forward_horizon['high'].max()
             min_forward_low = forward_horizon['low'].min()
             
+            # Reverted to Production Strict Breakout verification rules
             direction = "UP" if trigger_price > p_high_hist.max() else ("DOWN" if trigger_price < p_low_hist.min() else None)
             if not direction:
                 stats["fail_brkout"] += 1
@@ -242,6 +241,7 @@ def process_historical_profiling_permutations(symbol):
                     if f_row['close'] <= base_ltp: linear_periods += 1
                     else: break
                     
+            # Reverted to Production Target mapping limits
             matrix_type = "SUCCESS" if max_move_pct >= 4.0 else "TRAP"
             if matrix_type == "SUCCESS": stats["saved_success"] += 1
             else: stats["saved_trap"] += 1
@@ -314,8 +314,7 @@ def evaluate_live_market_matrix(symbol, live_canvas, current_dt, res):
                     best_trap_score = normalized_score
         except Exception: continue
 
-    logger.info(f"[{symbol}-{res}] Live Scan -> Best Success: {best_success_score:.3f} | Best Trap: {best_trap_score:.3f} | Target: {TRIGGER_THRESH}")
-
+    # Re-enforced complete production filters (Threshold validation + Trap deflection checks)
     if best_success_score < TRIGGER_THRESH:
         return None
         
@@ -425,7 +424,7 @@ def dispatch_predictive_analysis_report(df_matrix, target_dt):
       <body style='font-family: Arial, sans-serif; background-color: #f4f6f9; padding: 20px; color: #333;'>
         <div style='max-width: 1000px; margin: 0 auto; background: #fff; padding: 25px; border-radius: 8px;'>
             <h2 style='color: #1a237e; text-align: center;'>🎯 64D HYPER-TENSOR TARGET DETECTOR</h2>
-            <p style='text-align: center; color: #666;'>Verification timestamp: <b>{scan_time_str}</b> | Confidence Limit: <b>$>= {TRIGGER_THRESH*100}\%$</b></p>
+            <p style='text-align: center; color: #666;'>Verification timestamp: <b>{scan_time_str}</b> | Confidence Limit: <b>&gt;= {TRIGGER_THRESH*100}%</b></p>
             <p style='color: #c62828; font-size: 12px; text-align: center;'><i>Traps Filtered. Showing validated historical blueprints only.</i></p>
             <table style='width: 100%; border-collapse: collapse; margin-top: 20px;'>
               <thead>
@@ -478,7 +477,6 @@ def execute_engine_pass(target_dt, symbols):
     logger.info(f"⚡ Booting 64D Hyper-Tensor analysis sweep for target window: {target_dt.strftime('%Y-%m-%d %H:%M:%S')}")
     live_signals = []
     
-    # DROPPED WORKER COUNT TO 3 TO AVOID FYERS DDOS ALARMS
     with ThreadPoolExecutor(max_workers=3) as scan_executor:
         futures = {scan_executor.submit(process_live_scanning_sequence, sym, target_dt): sym for sym in symbols}
         for future in as_completed(futures):
@@ -512,7 +510,6 @@ def main():
     if not symbols: return
         
     logger.info(f"⚙️ Initiating full historical profiling for the past {HIST_TRAVERSAL_LOOKBACK}...")
-    # DROPPED WORKER COUNT TO 3 TO AVOID FYERS DDOS ALARMS
     with ThreadPoolExecutor(max_workers=3) as profiler_executor:
         profiler_executor.map(process_historical_profiling_permutations, symbols)
     logger.info("✅ Database generation finalized. Proceeding directly to scan logic...")
@@ -537,4 +534,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
