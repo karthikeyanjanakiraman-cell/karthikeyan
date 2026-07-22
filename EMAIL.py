@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v11.0 (Production Master)
-- Database Lifecycle: Zero-Update Master Atlas (Builds if 0 records, STRICT Read-Only if populated)
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v12.0 (Dynamic Rebuild Master)
+- Database Lifecycle: ALWAYS Rebuilds (Wipes old DB on boot to ensure freshest data)
+- Resolution Scaling: 256x256 Matrix Compression to prevent Cache/Repo bloat (400MB Max)
 - Dual-Matrix Verification: Cross-references live setups against Success and False Breakout Atlases
 - Predictive Metric Calculator: Projects achieved vs. pending move percentages in real-time
-- Multi-Channel Spatial Mapping (1024x1024x3): Channel 0 (Price), Channel 1 (Volume), Channel 2 (ATR)
-- Strict Success Filtering: Dispatches HTML analysis reports with dual inline images only on success
-- Backtest Engine: Fully supports interval-based batch looping for historical simulations
+- Multi-Channel Spatial Mapping: Channel 0 (Price), Channel 1 (Volume), Channel 2 (ATR)
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -43,7 +42,7 @@ logger = logging.getLogger(__name__)
 DB_PATH = "spatial_matrix_atlas.db"
 DB_LOCK = threading.Lock()
 
-# Load Engine Configurations (with safe fallbacks for GitHub CI environments)
+# Load Engine Configurations (with safe fallbacks)
 try:
     with open("config.yml", "r") as f:
         _raw_cfg = yaml.safe_load(f)
@@ -53,10 +52,10 @@ except FileNotFoundError:
     cfg = {}
 
 MACRO_WINDOW = cfg.get("macro_window_min", 30)
-HIST_TRAVERSAL_LOOKBACK = cfg.get("historical_traversal_lookback", "1 year")
+HIST_TRAVERSAL_LOOKBACK = cfg.get("historical_traversal_lookback", "1 month")
 LIVE_LOOKBACK_DAYS = cfg.get("live_lookback_days", 30)
-TRIGGER_THRESH = cfg.get("correlation", {}).get("initial_trigger_threshold", 0.85) # Tuned from 0.92
-COMPRESSION_MAX = 0.06 # Maximum allowed volatility (6%) during the accumulation phase
+TRIGGER_THRESH = cfg.get("correlation", {}).get("initial_trigger_threshold", 0.70)
+COMPRESSION_MAX = 0.06 # Max volatility allowed during accumulation (Change to 0.20 to loosen for tests)
 
 # Extraction of Infrastructure Credentials
 CLIENT_ID = os.environ.get("CLIENT_ID", "")
@@ -70,11 +69,10 @@ FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 if not CLIENT_ID or not ACCESS_TOKEN:
     logger.warning("Fyers Credentials missing from environment. API calls will fail.")
 
-# Initialize Fyers API Model
 fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=False, log_path="")
 
 # =================================================================================================
-# 2. LOCAL DATA STORAGE MANAGEMENT (ZERO-UPDATE ATLAS)
+# 2. LOCAL DATA STORAGE MANAGEMENT
 # =================================================================================================
 def initialize_spatial_database():
     """Initializes schema maps inside the local SQLite binary store."""
@@ -96,23 +94,6 @@ def initialize_spatial_database():
         """)
         conn.commit()
 
-def check_database_state():
-    """Returns True ONLY if database exists AND contains populated spatial blueprints."""
-    if not os.path.exists(DB_PATH):
-        return False
-    try:
-        with DB_LOCK, sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.cursor()
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='spatial_blueprints'")
-            if not cursor.fetchone():
-                return False
-            cursor.execute("SELECT COUNT(*) FROM spatial_blueprints")
-            count = cursor.fetchone()[0]
-            return count > 0 
-    except sqlite3.Error as e:
-        logger.error(f"Database verification fault: {e}. Assuming empty state.")
-        return False
-
 # =================================================================================================
 # 3. CORE MULTI-CHANNEL VISUAL SPATIAL MATRIX ENGINE
 # =================================================================================================
@@ -124,12 +105,7 @@ def build_maximum_64d_hyper_tensor(spatial_matrix):
     return spatial_matrix.reshape(target_shape)
 
 def generate_multichannel_spatial_matrix(df_slice):
-    """
-    Transforms regular price, volume, and volatility vectors into a normalized 1024x1024x3 multi-channel image.
-    Channel 0: Price structural boundaries
-    Channel 1: Normalized volume footprints
-    Channel 2: Latent volatility tracking via Average True Range (ATR)
-    """
+    """Transforms regular price, volume, and volatility vectors into a normalized 1024x1024x3 image."""
     if df_slice is None or len(df_slice) < MACRO_WINDOW:
         return None
         
@@ -167,7 +143,7 @@ def generate_multichannel_spatial_matrix(df_slice):
     return canvas
 
 # =================================================================================================
-# 4. HISTORICAL PROFILER (RUNS ONLY IF ZERO RECORDS EXIST)
+# 4. HISTORICAL PROFILER
 # =================================================================================================
 def parse_traversal_window(window_str):
     """Converts configuration strings into discrete numeric day metrics."""
@@ -180,7 +156,6 @@ def parse_traversal_window(window_str):
     return 365
 
 def fetch_historical_raw_data(symbol, resolution, total_days_back, target_end_dt=None):
-    """Extracts continuous series from Fyers API, utilizing chunked aggregation methods."""
     all_candles = []
     end_date = target_end_dt if target_end_dt else pd.Timestamp.now(tz="Asia/Kolkata")
     days_fetched = 0
@@ -213,10 +188,6 @@ def fetch_historical_raw_data(symbol, resolution, total_days_back, target_end_dt
     return df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
 
 def process_historical_profiling_permutations(symbol):
-    """
-    100% Full Scan mode. Parses historical market arrays to extract friction decay setups.
-    Identifies successes vs traps, generates visual blueprints, and stores them in SQLite.
-    """
     resolutions = ['15', '60', 'D']
     total_days = parse_traversal_window(HIST_TRAVERSAL_LOOKBACK)
     
@@ -237,12 +208,14 @@ def process_historical_profiling_permutations(symbol):
             base_ltp = p_close_hist[-1]
             if base_ltp == 0: continue
             
-            # Friction decay detection (Compression Filter)
+            # Friction decay detection
             if (channel_range / base_ltp) < COMPRESSION_MAX:
                 trigger_price = forward_horizon['close'].iloc[0]
                 max_forward_high = forward_horizon['high'].max()
                 min_forward_low = forward_horizon['low'].min()
                 
+                # ---> EMAIL TEST TOGGLE 1: Strict Breakout Rules
+                # To force successes, change to: direction = "UP" if trigger_price >= base_ltp else "DOWN"
                 direction = "UP" if trigger_price > p_high_hist.max() else ("DOWN" if trigger_price < p_low_hist.min() else None)
                 if not direction: continue
                 
@@ -262,6 +235,9 @@ def process_historical_profiling_permutations(symbol):
                 
                 spatial_mat = generate_multichannel_spatial_matrix(window_slice)
                 if spatial_mat is None: continue
+                
+                # --- MEMORY FIX: SHRINK IMAGE TO 256x256 BEFORE SAVING TO DB ---
+                spatial_mat = cv2.resize(spatial_mat, (256, 256))
                 
                 success_enc, encoded_bytes = cv2.imencode('.png', spatial_mat)
                 if not success_enc: continue
@@ -285,13 +261,13 @@ def process_historical_profiling_permutations(symbol):
 # 5. LIVE HIERARCHICAL MATCHING ENGINE (64D HYPER-TENSOR)
 # =================================================================================================
 def evaluate_live_market_matrix(symbol, live_canvas, current_dt):
-    """
-    Executes cross-correlation structural validation on grids using spatial matrix assets.
-    """
     if live_canvas is None: return None
         
+    # --- MEMORY FIX: SHRINK LIVE IMAGE TO 256x256 TO MATCH DB ---
+    live_canvas = cv2.resize(live_canvas, (256, 256))
+    
     live_gray = cv2.cvtColor(live_canvas, cv2.COLOR_RGB2GRAY)
-    _ = build_maximum_64d_hyper_tensor(live_canvas) # Array structured for logical tensor abstraction
+    _ = build_maximum_64d_hyper_tensor(live_canvas)
     
     best_success_score = 0.0
     best_trap_score = 0.0
@@ -325,8 +301,9 @@ def evaluate_live_market_matrix(symbol, live_canvas, current_dt):
                     best_trap_score = normalized_score
         except Exception: continue
 
-    # Reject setups that look more like traps than successes
-    if best_success_score >= TRIGGER_THRESH:
+    # ---> EMAIL TEST TOGGLE 2: Trap Filter
+    # To force emails through, delete: 'and best_success_score > best_trap_score'
+    if best_success_score >= TRIGGER_THRESH and best_success_score > best_trap_score:
         success_img_bytes = np.frombuffer(matched_blueprint_row['image_blob'], dtype=np.uint8).tobytes()
         live_img_bytes = cv2.imencode('.png', live_canvas)[1].tobytes()
         
@@ -343,7 +320,6 @@ def evaluate_live_market_matrix(symbol, live_canvas, current_dt):
     return None
 
 def process_live_scanning_sequence(symbol, target_dt):
-    """Executes dynamic multi-permutation scans pulling from the exact target timestamp backward."""
     resolutions = ['15', '60', 'D']
     
     for res in resolutions:
@@ -360,8 +336,7 @@ def process_live_scanning_sequence(symbol, target_dt):
             match_result['LTP'] = ltp
             hist_max = match_result['Hist_Max_Move_Pct']
             
-            # Predict Achieved vs Pending (Using a stabilized anchor 5 periods back)
-            p_initial = float(rolling_slice['close'].iloc[-5])
+            p_initial = float(rolling_slice['close'].iloc[-5]) if MACRO_WINDOW >= 5 else ltp
             if p_initial > 0:
                 if match_result['Direction'] == 'UP': achieved = max(0.0, ((ltp - p_initial) / p_initial) * 100.0)
                 else: achieved = max(0.0, ((p_initial - ltp) / p_initial) * 100.0)
@@ -377,7 +352,6 @@ def process_live_scanning_sequence(symbol, target_dt):
 # 6. EMAIL TRANSMISSION SUBSYSTEM
 # =================================================================================================
 def dispatch_predictive_analysis_report(df_matrix, target_dt):
-    """Embeds high-fidelity image components exclusively for validated breakout patterns."""
     if not SENDER_EMAIL or not RECIPIENT_EMAIL:
         logger.warning("Email transmission skipped: Missing user credentials.")
         return
@@ -413,11 +387,11 @@ def dispatch_predictive_analysis_report(df_matrix, target_dt):
             <td colspan='7' style='padding: 15px; background-color: #fafafa; text-align: center;'>
                 <div style='display: inline-block; margin: 10px;'>
                     <p style='margin: 2px; font-size: 11px; color: #555;'><b>Live Market Spatial Vector</b></p>
-                    <img src="cid:{live_cid}" width="420" height="420" style='border: 1px solid #ccc;' />
+                    <img src="cid:{live_cid}" width="256" height="256" style='border: 1px solid #ccc;' />
                 </div>
                 <div style='display: inline-block; margin: 10px;'>
                     <p style='margin: 2px; font-size: 11px; color: #555;'><b>Matched Success Blueprint Target</b></p>
-                    <img src="cid:{bp_cid}" width="420" height="420" style='border: 1px solid #ccc;' />
+                    <img src="cid:{bp_cid}" width="256" height="256" style='border: 1px solid #ccc;' />
                 </div>
             </td>
         </tr>
@@ -464,7 +438,6 @@ def dispatch_predictive_analysis_report(df_matrix, target_dt):
 # 7. REVOLVING MASTER EXECUTION PIPELINE
 # =================================================================================================
 def fetch_fo_universe():
-    """Extracts base listing definitions from F&O market feeds."""
     logger.info("Accessing live exchange F&O listing tables...")
     try:
         response = requests.get(FYERS_FO_MASTER_URL, timeout=15)
@@ -490,7 +463,6 @@ def fetch_fo_universe():
         return []
 
 def execute_engine_pass(target_dt, symbols):
-    """Executes a single sweep of the market at the given target datetime."""
     logger.info(f"⚡ Booting 64D Hyper-Tensor analysis sweep for target window: {target_dt.strftime('%Y-%m-%d %H:%M:%S')}")
     live_signals = []
     
@@ -515,6 +487,16 @@ def main():
     parser.add_argument("--interval", default="60", help="Batch Step Interval in minutes")
     args = parser.parse_args()
     
+    # ---------------------------------------------------------
+    # 1. ALWAYS REBUILD LOGIC (Deletes old DB on boot)
+    # ---------------------------------------------------------
+    if os.path.exists(DB_PATH):
+        try:
+            os.remove(DB_PATH)
+            logger.info("🗑️ Wiped old spatial atlas. Forcing a completely fresh build...")
+        except Exception as e:
+            logger.warning(f"Could not remove old DB: {e}")
+            
     initialize_spatial_database()
     
     symbols = fetch_fo_universe()
@@ -522,18 +504,18 @@ def main():
         logger.error("Empty market tracking schema. Shuttling down workspace.")
         return
         
-    # Database Verification / Builder Step
-    if not check_database_state():
-        logger.info("⚠️ Spatial database is missing or empty (0 records). Initiating full historical profiling...")
-        with ThreadPoolExecutor(max_workers=8) as profiler_executor:
-            profiler_executor.map(process_historical_profiling_permutations, symbols)
-        logger.info("✅ Database generation finalized. Atlas is now locked for read-only access.")
-    else:
-        logger.info("🔒 Database already contains records. Bypassing all updates and inserts. Proceeding directly to scan logic...")
+    # ---------------------------------------------------------
+    # 2. PROCEED DIRECTLY TO PROFILING (No 'if' checks)
+    # ---------------------------------------------------------
+    logger.info(f"⚙️ Initiating full historical profiling for the past {HIST_TRAVERSAL_LOOKBACK}...")
+    with ThreadPoolExecutor(max_workers=8) as profiler_executor:
+        profiler_executor.map(process_historical_profiling_permutations, symbols)
+    logger.info("✅ Database generation finalized. Proceeding directly to scan logic...")
         
-    # Execution Routing (Live vs. Single Backtest vs. Batch Backtest)
+    # ---------------------------------------------------------
+    # 3. RUN LIVE SCANS
+    # ---------------------------------------------------------
     if args.date and args.from_time and args.to_time:
-        # BATCH BACKTEST MODE
         start_dt = pd.to_datetime(f"{args.date} {args.from_time}").tz_localize("Asia/Kolkata")
         end_dt = pd.to_datetime(f"{args.date} {args.to_time}").tz_localize("Asia/Kolkata")
         interval_mins = int(args.interval)
@@ -544,12 +526,10 @@ def main():
             current_dt += timedelta(minutes=interval_mins)
             
     elif args.date:
-        # SINGLE BACKTEST MODE
         target_dt = pd.to_datetime(args.date).tz_localize("Asia/Kolkata")
         execute_engine_pass(target_dt, symbols)
         
     else:
-        # LIVE MODE
         target_dt = pd.Timestamp.now(tz="Asia/Kolkata")
         execute_engine_pass(target_dt, symbols)
 
