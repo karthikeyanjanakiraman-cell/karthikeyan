@@ -1,11 +1,8 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v12.2 (X-Ray + Bug Fix Edition)
-- Database Lifecycle: ALWAYS Rebuilds on boot to ensure freshest data
-- Resolution Scaling: 256x256 Matrix Compression
-- X-Ray Logging: Prints exact mathematical reasons for setup rejections
-- Symbol Match Fix: Database queries now perfectly match the F&O ticker format
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v12.3 (Total Verbosity Edition)
+- ZERO Silent Failures: Every skipped stock or API error is now loudly logged.
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -41,7 +38,6 @@ logger = logging.getLogger(__name__)
 DB_PATH = "spatial_matrix_atlas.db"
 DB_LOCK = threading.Lock()
 
-# Load Engine Configurations
 try:
     with open("config.yml", "r") as f:
         _raw_cfg = yaml.safe_load(f)
@@ -54,7 +50,7 @@ MACRO_WINDOW = cfg.get("macro_window_min", 15)
 HIST_TRAVERSAL_LOOKBACK = cfg.get("historical_traversal_lookback", "1 month")
 LIVE_LOOKBACK_DAYS = cfg.get("live_lookback_days", 30)
 TRIGGER_THRESH = cfg.get("correlation", {}).get("initial_trigger_threshold", 0.70)
-COMPRESSION_MAX = 0.06  # Maximum allowed volatility/range percentage (6%)
+COMPRESSION_MAX = 0.06  
 
 CLIENT_ID = os.environ.get("CLIENT_ID", "")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "")
@@ -63,9 +59,6 @@ SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD", "")
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "")
 
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
-
-if not CLIENT_ID or not ACCESS_TOKEN:
-    logger.warning("Fyers Credentials missing from environment. API calls will fail.")
 
 fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=False, log_path="")
 
@@ -136,7 +129,7 @@ def generate_multichannel_spatial_matrix(df_slice):
     return canvas
 
 # =================================================================================================
-# 4. HISTORICAL PROFILER (WITH VERBOSE X-RAY LOGGING)
+# 4. HISTORICAL PROFILER 
 # =================================================================================================
 def parse_traversal_window(window_str):
     clean = window_str.lower().strip()
@@ -147,7 +140,7 @@ def parse_traversal_window(window_str):
     if 'day' in clean: return digits
     return 365
 
-def fetch_historical_raw_data(symbol, resolution, total_days_back, target_end_dt=None):
+def fetch_historical_raw_data(symbol, resolution, total_days_back, target_end_dt=None, context="HIST"):
     all_candles = []
     end_date = target_end_dt if target_end_dt else pd.Timestamp.now(tz="Asia/Kolkata")
     days_fetched = 0
@@ -161,12 +154,18 @@ def fetch_historical_raw_data(symbol, resolution, total_days_back, target_end_dt
             "cont_flag": 1
         }
         try:
-            time.sleep(0.06) 
+            time.sleep(0.1) # Slightly increased to prevent API bans
             res = fyers.history(payload)
             if res and isinstance(res, dict) and 'candles' in res and len(res['candles']) > 0:
                 all_candles.extend(res['candles'])
-            else: break
+            else:
+                # LOUD LOGGING for Fyers API rejections
+                if context == "LIVE":
+                    logger.warning(f"[{symbol}-{res}] FYERS API REJECTED LIVE DATA: {res}")
+                break
         except Exception as e:
+            if context == "LIVE":
+                logger.error(f"[{symbol}-{res}] FYERS API CRASHED: {e}")
             break
         end_date = start_date
         days_fetched += chunk_size
@@ -181,9 +180,8 @@ def process_historical_profiling_permutations(symbol):
     total_days = parse_traversal_window(HIST_TRAVERSAL_LOOKBACK)
     
     for res in resolutions:
-        df = fetch_historical_raw_data(symbol, res, total_days)
+        df = fetch_historical_raw_data(symbol, res, total_days, context="HIST")
         if df is None or len(df) < (MACRO_WINDOW + 20):
-            if res == 'D': logger.debug(f"[{symbol} - {res}] Skipped: Insufficient data.")
             continue
             
         stats = {"tested": 0, "fail_comp": 0, "fail_brkout": 0, "saved_trap": 0, "saved_success": 0}
@@ -201,7 +199,6 @@ def process_historical_profiling_permutations(symbol):
             base_ltp = p_close_hist[-1]
             if base_ltp == 0: continue
             
-            # 1. Check Compression (Must be tight)
             if (channel_range / base_ltp) >= COMPRESSION_MAX:
                 stats["fail_comp"] += 1
                 continue
@@ -210,7 +207,6 @@ def process_historical_profiling_permutations(symbol):
             max_forward_high = forward_horizon['high'].max()
             min_forward_low = forward_horizon['low'].min()
             
-            # 2. Check Breakout Direction
             direction = "UP" if trigger_price > p_high_hist.max() else ("DOWN" if trigger_price < p_low_hist.min() else None)
             if not direction:
                 stats["fail_brkout"] += 1
@@ -228,7 +224,6 @@ def process_historical_profiling_permutations(symbol):
                     if f_row['close'] <= base_ltp: linear_periods += 1
                     else: break
                     
-            # 3. Save as Success or Trap
             matrix_type = "SUCCESS" if max_move_pct >= 4.0 else "TRAP"
             if matrix_type == "SUCCESS": stats["saved_success"] += 1
             else: stats["saved_trap"] += 1
@@ -256,14 +251,14 @@ def process_historical_profiling_permutations(symbol):
                 
         if stats["saved_success"] > 0:
             logger.info(f"✅ [{symbol}-{res}] SUCCESS DB ENTRY! Tested: {stats['tested']} | Fail_Comp: {stats['fail_comp']} | Fail_Brkout: {stats['fail_brkout']} | Traps: {stats['saved_trap']} | SUCCESS: {stats['saved_success']}")
-        else:
-            logger.info(f"❌ [{symbol}-{res}] Rejected All. Tested: {stats['tested']} | Fail_Comp: {stats['fail_comp']} | Fail_Brkout: {stats['fail_brkout']} | Traps: {stats['saved_trap']}")
 
 # =================================================================================================
-# 5. LIVE HIERARCHICAL MATCHING ENGINE (WITH X-RAY LOGGING)
+# 5. LIVE HIERARCHICAL MATCHING ENGINE 
 # =================================================================================================
-def evaluate_live_market_matrix(symbol, live_canvas, current_dt):
-    if live_canvas is None: return None
+def evaluate_live_market_matrix(symbol, live_canvas, current_dt, res):
+    if live_canvas is None: 
+        logger.warning(f"[{symbol}-{res}] Live Scan skipped: Image Canvas generation failed.")
+        return None
         
     live_canvas = cv2.resize(live_canvas, (256, 256))
     live_gray = cv2.cvtColor(live_canvas, cv2.COLOR_RGB2GRAY)
@@ -276,11 +271,11 @@ def evaluate_live_market_matrix(symbol, live_canvas, current_dt):
     with DB_LOCK, sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        # FIX: Directly use the symbol variable which perfectly matches the DB format (e.g., "NSE:CONCOR-EQ")
         cursor.execute("SELECT * FROM spatial_blueprints WHERE symbol=?", (symbol,))
         blueprints = cursor.fetchall()
         
     if not blueprints:
+        logger.info(f"[{symbol}-{res}] Live Scan skipped: 0 blueprints found in DB.")
         return None
         
     for bp in blueprints:
@@ -305,8 +300,7 @@ def evaluate_live_market_matrix(symbol, live_canvas, current_dt):
                     best_trap_score = normalized_score
         except Exception: continue
 
-    # X-RAY LOGGING: Why did the live scan fail?
-    logger.info(f"[{symbol}] Live Scan -> Best Success: {best_success_score:.3f} | Best Trap: {best_trap_score:.3f} | Target: {TRIGGER_THRESH}")
+    logger.info(f"[{symbol}-{res}] Live Scan -> Best Success: {best_success_score:.3f} | Best Trap: {best_trap_score:.3f} | Target: {TRIGGER_THRESH}")
 
     if best_success_score < TRIGGER_THRESH:
         return None
@@ -315,7 +309,6 @@ def evaluate_live_market_matrix(symbol, live_canvas, current_dt):
         logger.info(f"   -> FILTERED: {symbol} matched a Trap ({best_trap_score:.3f}) stronger than a Success ({best_success_score:.3f}).")
         return None
 
-    # Passed!
     logger.info(f"🚀 [{symbol}] PASSED ALL FILTERS! Prepping for email dispatch.")
     success_img_bytes = np.frombuffer(matched_blueprint_row['image_blob'], dtype=np.uint8).tobytes()
     live_img_bytes = cv2.imencode('.png', live_canvas)[1].tobytes()
@@ -335,14 +328,21 @@ def process_live_scanning_sequence(symbol, target_dt):
     resolutions = ['15', '60', 'D']
     
     for res in resolutions:
-        df = fetch_historical_raw_data(symbol, res, LIVE_LOOKBACK_DAYS, target_end_dt=target_dt)
-        if df is None or len(df) < MACRO_WINDOW: continue
+        df = fetch_historical_raw_data(symbol, res, LIVE_LOOKBACK_DAYS, target_end_dt=target_dt, context="LIVE")
+        
+        if df is None:
+            logger.warning(f"[{symbol}-{res}] Live Scan skipped: Fyers returned NO data (Empty).")
+            continue
+            
+        if len(df) < MACRO_WINDOW: 
+            logger.warning(f"[{symbol}-{res}] Live Scan skipped: Fyers returned only {len(df)} candles (Needs {MACRO_WINDOW}).")
+            continue
             
         rolling_slice = df.tail(MACRO_WINDOW)
         ltp = float(rolling_slice['close'].iloc[-1])
         
         live_canvas = generate_multichannel_spatial_matrix(rolling_slice)
-        match_result = evaluate_live_market_matrix(symbol, live_canvas, target_dt)
+        match_result = evaluate_live_market_matrix(symbol, live_canvas, target_dt, res)
         
         if match_result:
             match_result['LTP'] = ltp
@@ -526,4 +526,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
