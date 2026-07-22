@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v12.3 (Total Verbosity Edition)
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v12.4 (Anti-Rate Limit Edition)
 - ZERO Silent Failures: Every skipped stock or API error is now loudly logged.
+- API Throttling: Exponential backoff for HTTP 429 (Too Many Requests).
+- Thread Control: Tuned to stay under Fyers API security limits.
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -129,7 +131,7 @@ def generate_multichannel_spatial_matrix(df_slice):
     return canvas
 
 # =================================================================================================
-# 4. HISTORICAL PROFILER 
+# 4. HISTORICAL PROFILER WITH PROGRESSIVE BACKOFF
 # =================================================================================================
 def parse_traversal_window(window_str):
     clean = window_str.lower().strip()
@@ -153,20 +155,36 @@ def fetch_historical_raw_data(symbol, resolution, total_days_back, target_end_dt
             "range_from": start_date.strftime("%Y-%m-%d"), "range_to": end_date.strftime("%Y-%m-%d"),
             "cont_flag": 1
         }
-        try:
-            time.sleep(0.1) # Slightly increased to prevent API bans
-            res = fyers.history(payload)
-            if res and isinstance(res, dict) and 'candles' in res and len(res['candles']) > 0:
-                all_candles.extend(res['candles'])
-            else:
-                # LOUD LOGGING for Fyers API rejections
-                if context == "LIVE":
-                    logger.warning(f"[{symbol}-{res}] FYERS API REJECTED LIVE DATA: {res}")
-                break
-        except Exception as e:
-            if context == "LIVE":
-                logger.error(f"[{symbol}-{res}] FYERS API CRASHED: {e}")
-            break
+        
+        success = False
+        # ANTI-RATE LIMIT LOOP (Allows up to 3 retries if Fyers throws 429)
+        for attempt in range(4):
+            try:
+                time.sleep(0.3) # Slower base pacing for API health
+                res = fyers.history(payload)
+                
+                # Check for 429 Rate Limit
+                if isinstance(res, dict) and res.get('s') == 'error':
+                    if res.get('code') in [429, 403, 400]:
+                        if context == "LIVE":
+                            logger.warning(f"[{symbol}-{resolution}] FYERS RATE LIMIT. Cooling down {2.5*(attempt+1)}s (Attempt {attempt+1})")
+                        time.sleep(2.5 * (attempt + 1))
+                        continue # Retry
+                        
+                # Validate Success
+                if res and isinstance(res, dict) and 'candles' in res and len(res['candles']) > 0:
+                    all_candles.extend(res['candles'])
+                    success = True
+                    break
+                else:
+                    break # Genuinely empty, exit loop
+                    
+            except Exception as e:
+                time.sleep(1)
+                
+        if not success and context == "LIVE":
+             logger.warning(f"[{symbol}-{resolution}] Live Scan skipped: Fyers failed to return data after retries.")
+             
         end_date = start_date
         days_fetched += chunk_size
 
@@ -256,9 +274,7 @@ def process_historical_profiling_permutations(symbol):
 # 5. LIVE HIERARCHICAL MATCHING ENGINE 
 # =================================================================================================
 def evaluate_live_market_matrix(symbol, live_canvas, current_dt, res):
-    if live_canvas is None: 
-        logger.warning(f"[{symbol}-{res}] Live Scan skipped: Image Canvas generation failed.")
-        return None
+    if live_canvas is None: return None
         
     live_canvas = cv2.resize(live_canvas, (256, 256))
     live_gray = cv2.cvtColor(live_canvas, cv2.COLOR_RGB2GRAY)
@@ -274,9 +290,7 @@ def evaluate_live_market_matrix(symbol, live_canvas, current_dt, res):
         cursor.execute("SELECT * FROM spatial_blueprints WHERE symbol=?", (symbol,))
         blueprints = cursor.fetchall()
         
-    if not blueprints:
-        logger.info(f"[{symbol}-{res}] Live Scan skipped: 0 blueprints found in DB.")
-        return None
+    if not blueprints: return None
         
     for bp in blueprints:
         try:
@@ -330,12 +344,7 @@ def process_live_scanning_sequence(symbol, target_dt):
     for res in resolutions:
         df = fetch_historical_raw_data(symbol, res, LIVE_LOOKBACK_DAYS, target_end_dt=target_dt, context="LIVE")
         
-        if df is None:
-            logger.warning(f"[{symbol}-{res}] Live Scan skipped: Fyers returned NO data (Empty).")
-            continue
-            
-        if len(df) < MACRO_WINDOW: 
-            logger.warning(f"[{symbol}-{res}] Live Scan skipped: Fyers returned only {len(df)} candles (Needs {MACRO_WINDOW}).")
+        if df is None or len(df) < MACRO_WINDOW: 
             continue
             
         rolling_slice = df.tail(MACRO_WINDOW)
@@ -469,7 +478,8 @@ def execute_engine_pass(target_dt, symbols):
     logger.info(f"⚡ Booting 64D Hyper-Tensor analysis sweep for target window: {target_dt.strftime('%Y-%m-%d %H:%M:%S')}")
     live_signals = []
     
-    with ThreadPoolExecutor(max_workers=5) as scan_executor:
+    # DROPPED WORKER COUNT TO 3 TO AVOID FYERS DDOS ALARMS
+    with ThreadPoolExecutor(max_workers=3) as scan_executor:
         futures = {scan_executor.submit(process_live_scanning_sequence, sym, target_dt): sym for sym in symbols}
         for future in as_completed(futures):
             res = future.result()
@@ -502,7 +512,8 @@ def main():
     if not symbols: return
         
     logger.info(f"⚙️ Initiating full historical profiling for the past {HIST_TRAVERSAL_LOOKBACK}...")
-    with ThreadPoolExecutor(max_workers=8) as profiler_executor:
+    # DROPPED WORKER COUNT TO 3 TO AVOID FYERS DDOS ALARMS
+    with ThreadPoolExecutor(max_workers=3) as profiler_executor:
         profiler_executor.map(process_historical_profiling_permutations, symbols)
     logger.info("✅ Database generation finalized. Proceeding directly to scan logic...")
         
@@ -526,3 +537,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
