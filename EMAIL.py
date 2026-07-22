@@ -1,12 +1,10 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v12.0 (Dynamic Rebuild Master)
-- Database Lifecycle: ALWAYS Rebuilds (Wipes old DB on boot to ensure freshest data)
-- Resolution Scaling: 256x256 Matrix Compression to prevent Cache/Repo bloat (400MB Max)
-- Dual-Matrix Verification: Cross-references live setups against Success and False Breakout Atlases
-- Predictive Metric Calculator: Projects achieved vs. pending move percentages in real-time
-- Multi-Channel Spatial Mapping: Channel 0 (Price), Channel 1 (Volume), Channel 2 (ATR)
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v12.1 (X-Ray Diagnostic Edition)
+- Database Lifecycle: ALWAYS Rebuilds on boot to ensure freshest data
+- Resolution Scaling: 256x256 Matrix Compression
+- X-Ray Logging: Prints exact mathematical reasons for setup rejections
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -42,7 +40,7 @@ logger = logging.getLogger(__name__)
 DB_PATH = "spatial_matrix_atlas.db"
 DB_LOCK = threading.Lock()
 
-# Load Engine Configurations (with safe fallbacks)
+# Load Engine Configurations
 try:
     with open("config.yml", "r") as f:
         _raw_cfg = yaml.safe_load(f)
@@ -51,13 +49,12 @@ except FileNotFoundError:
     logger.warning("config.yml not found. Using optimal production defaults.")
     cfg = {}
 
-MACRO_WINDOW = cfg.get("macro_window_min", 30)
+MACRO_WINDOW = cfg.get("macro_window_min", 15)
 HIST_TRAVERSAL_LOOKBACK = cfg.get("historical_traversal_lookback", "1 month")
 LIVE_LOOKBACK_DAYS = cfg.get("live_lookback_days", 30)
 TRIGGER_THRESH = cfg.get("correlation", {}).get("initial_trigger_threshold", 0.70)
-COMPRESSION_MAX = 0.06 # Max volatility allowed during accumulation (Change to 0.20 to loosen for tests)
+COMPRESSION_MAX = 0.06  # Maximum allowed volatility/range percentage (6%)
 
-# Extraction of Infrastructure Credentials
 CLIENT_ID = os.environ.get("CLIENT_ID", "")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "")
@@ -75,7 +72,6 @@ fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=
 # 2. LOCAL DATA STORAGE MANAGEMENT
 # =================================================================================================
 def initialize_spatial_database():
-    """Initializes schema maps inside the local SQLite binary store."""
     with DB_LOCK, sqlite3.connect(DB_PATH) as conn:
         cursor = conn.cursor()
         cursor.execute("""
@@ -98,16 +94,12 @@ def initialize_spatial_database():
 # 3. CORE MULTI-CHANNEL VISUAL SPATIAL MATRIX ENGINE
 # =================================================================================================
 def build_maximum_64d_hyper_tensor(spatial_matrix):
-    """Reshapes the 3-channel matrix into a 64-dimensional hyper-tensor space for structural evaluation."""
-    if spatial_matrix is None:
-        return None
+    if spatial_matrix is None: return None
     target_shape = (1,) * 61 + spatial_matrix.shape
     return spatial_matrix.reshape(target_shape)
 
 def generate_multichannel_spatial_matrix(df_slice):
-    """Transforms regular price, volume, and volatility vectors into a normalized 1024x1024x3 image."""
-    if df_slice is None or len(df_slice) < MACRO_WINDOW:
-        return None
+    if df_slice is None or len(df_slice) < MACRO_WINDOW: return None
         
     p_high = df_slice['high'].values.astype(np.float32)
     p_low = df_slice['low'].values.astype(np.float32)
@@ -143,10 +135,9 @@ def generate_multichannel_spatial_matrix(df_slice):
     return canvas
 
 # =================================================================================================
-# 4. HISTORICAL PROFILER
+# 4. HISTORICAL PROFILER (WITH VERBOSE X-RAY LOGGING)
 # =================================================================================================
 def parse_traversal_window(window_str):
-    """Converts configuration strings into discrete numeric day metrics."""
     clean = window_str.lower().strip()
     digits = int(re.search(r'\d+', clean).group()) if re.search(r'\d+', clean) else 365
     if 'year' in clean: return digits * 365
@@ -173,16 +164,13 @@ def fetch_historical_raw_data(symbol, resolution, total_days_back, target_end_dt
             res = fyers.history(payload)
             if res and isinstance(res, dict) and 'candles' in res and len(res['candles']) > 0:
                 all_candles.extend(res['candles'])
-            else:
-                break
+            else: break
         except Exception as e:
-            logger.debug(f"History slice issue for {symbol}: {e}")
             break
         end_date = start_date
         days_fetched += chunk_size
 
     if not all_candles: return None
-        
     df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
     df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True).dt.tz_convert("Asia/Kolkata")
     return df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
@@ -194,9 +182,14 @@ def process_historical_profiling_permutations(symbol):
     for res in resolutions:
         df = fetch_historical_raw_data(symbol, res, total_days)
         if df is None or len(df) < (MACRO_WINDOW + 20):
+            # Only log daily resolution skips to avoid console spam
+            if res == 'D': logger.debug(f"[{symbol} - {res}] Skipped: Insufficient data.")
             continue
             
+        stats = {"tested": 0, "fail_comp": 0, "fail_brkout": 0, "saved_trap": 0, "saved_success": 0}
+            
         for i in range(MACRO_WINDOW, len(df) - 20):
+            stats["tested"] += 1
             window_slice = df.iloc[i-MACRO_WINDOW:i]
             forward_horizon = df.iloc[i:i+20]
             
@@ -208,64 +201,71 @@ def process_historical_profiling_permutations(symbol):
             base_ltp = p_close_hist[-1]
             if base_ltp == 0: continue
             
-            # Friction decay detection
-            if (channel_range / base_ltp) < COMPRESSION_MAX:
-                trigger_price = forward_horizon['close'].iloc[0]
-                max_forward_high = forward_horizon['high'].max()
-                min_forward_low = forward_horizon['low'].min()
+            # 1. Check Compression (Must be tight)
+            if (channel_range / base_ltp) >= COMPRESSION_MAX:
+                stats["fail_comp"] += 1
+                continue
                 
-                # ---> EMAIL TEST TOGGLE 1: Strict Breakout Rules
-                # To force successes, change to: direction = "UP" if trigger_price >= base_ltp else "DOWN"
-                direction = "UP" if trigger_price > p_high_hist.max() else ("DOWN" if trigger_price < p_low_hist.min() else None)
-                if not direction: continue
+            trigger_price = forward_horizon['close'].iloc[0]
+            max_forward_high = forward_horizon['high'].max()
+            min_forward_low = forward_horizon['low'].min()
+            
+            # 2. Check Breakout Direction (Next candle must clear the whole range)
+            direction = "UP" if trigger_price > p_high_hist.max() else ("DOWN" if trigger_price < p_low_hist.min() else None)
+            if not direction:
+                stats["fail_brkout"] += 1
+                continue
                 
-                linear_periods = 0
-                if direction == "UP":
-                    max_move_pct = ((max_forward_high - base_ltp) / base_ltp) * 100.0
-                    for _, f_row in forward_horizon.iterrows():
-                        if f_row['close'] >= base_ltp: linear_periods += 1
-                        else: break
-                else:
-                    max_move_pct = ((base_ltp - min_forward_low) / base_ltp) * 100.0
-                    for _, f_row in forward_horizon.iterrows():
-                        if f_row['close'] <= base_ltp: linear_periods += 1
-                        else: break
-                        
-                matrix_type = "SUCCESS" if max_move_pct >= 4.0 else "TRAP"
+            linear_periods = 0
+            if direction == "UP":
+                max_move_pct = ((max_forward_high - base_ltp) / base_ltp) * 100.0
+                for _, f_row in forward_horizon.iterrows():
+                    if f_row['close'] >= base_ltp: linear_periods += 1
+                    else: break
+            else:
+                max_move_pct = ((base_ltp - min_forward_low) / base_ltp) * 100.0
+                for _, f_row in forward_horizon.iterrows():
+                    if f_row['close'] <= base_ltp: linear_periods += 1
+                    else: break
+                    
+            # 3. Save as Success (>= 4% move) or Trap
+            matrix_type = "SUCCESS" if max_move_pct >= 4.0 else "TRAP"
+            if matrix_type == "SUCCESS": stats["saved_success"] += 1
+            else: stats["saved_trap"] += 1
+            
+            spatial_mat = generate_multichannel_spatial_matrix(window_slice)
+            if spatial_mat is None: continue
+            
+            spatial_mat = cv2.resize(spatial_mat, (256, 256))
+            success_enc, encoded_bytes = cv2.imencode('.png', spatial_mat)
+            if not success_enc: continue
+            
+            blob_data = encoded_bytes.tobytes()
+            timestamp_str = window_slice['timestamp'].iloc[-1].strftime('%Y-%m-%d %H:%M:%S')
+            
+            try:
+                with DB_LOCK, sqlite3.connect(DB_PATH) as conn:
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        INSERT OR IGNORE INTO spatial_blueprints 
+                        (symbol, timeframe, direction, matrix_type, image_blob, hist_max_move_pct, hist_linear_periods, detected_timestamp)
+                        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    """, (symbol, res, direction, matrix_type, blob_data, float(max_move_pct), int(linear_periods), timestamp_str))
+                    conn.commit()
+            except sqlite3.Error: pass
                 
-                spatial_mat = generate_multichannel_spatial_matrix(window_slice)
-                if spatial_mat is None: continue
-                
-                # --- MEMORY FIX: SHRINK IMAGE TO 256x256 BEFORE SAVING TO DB ---
-                spatial_mat = cv2.resize(spatial_mat, (256, 256))
-                
-                success_enc, encoded_bytes = cv2.imencode('.png', spatial_mat)
-                if not success_enc: continue
-                
-                blob_data = encoded_bytes.tobytes()
-                timestamp_str = window_slice['timestamp'].iloc[-1].strftime('%Y-%m-%d %H:%M:%S')
-                
-                try:
-                    with DB_LOCK, sqlite3.connect(DB_PATH) as conn:
-                        cursor = conn.cursor()
-                        cursor.execute("""
-                            INSERT OR IGNORE INTO spatial_blueprints 
-                            (symbol, timeframe, direction, matrix_type, image_blob, hist_max_move_pct, hist_linear_periods, detected_timestamp)
-                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-                        """, (symbol, res, direction, matrix_type, blob_data, float(max_move_pct), int(linear_periods), timestamp_str))
-                        conn.commit()
-                except sqlite3.Error as db_err:
-                    logger.debug(f"DB insert skipped: {db_err}")
+        if stats["saved_success"] > 0:
+            logger.info(f"✅ [{symbol}-{res}] SUCCESS DB ENTRY! Tested: {stats['tested']} | Fail_Comp: {stats['fail_comp']} | Fail_Brkout: {stats['fail_brkout']} | Traps: {stats['saved_trap']} | SUCCESS: {stats['saved_success']}")
+        else:
+            logger.info(f"❌ [{symbol}-{res}] Rejected All. Tested: {stats['tested']} | Fail_Comp: {stats['fail_comp']} | Fail_Brkout: {stats['fail_brkout']} | Traps: {stats['saved_trap']}")
 
 # =================================================================================================
-# 5. LIVE HIERARCHICAL MATCHING ENGINE (64D HYPER-TENSOR)
+# 5. LIVE HIERARCHICAL MATCHING ENGINE (WITH X-RAY LOGGING)
 # =================================================================================================
 def evaluate_live_market_matrix(symbol, live_canvas, current_dt):
     if live_canvas is None: return None
         
-    # --- MEMORY FIX: SHRINK LIVE IMAGE TO 256x256 TO MATCH DB ---
     live_canvas = cv2.resize(live_canvas, (256, 256))
-    
     live_gray = cv2.cvtColor(live_canvas, cv2.COLOR_RGB2GRAY)
     _ = build_maximum_64d_hyper_tensor(live_canvas)
     
@@ -278,6 +278,10 @@ def evaluate_live_market_matrix(symbol, live_canvas, current_dt):
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM spatial_blueprints WHERE symbol=?", (symbol.replace('NSE:', '').replace('-EQ', ''),))
         blueprints = cursor.fetchall()
+        
+    if not blueprints:
+        # Silencing this specific log to avoid spamming 200 "No blueprint" lines per scan
+        return None
         
     for bp in blueprints:
         try:
@@ -301,23 +305,31 @@ def evaluate_live_market_matrix(symbol, live_canvas, current_dt):
                     best_trap_score = normalized_score
         except Exception: continue
 
-    # ---> EMAIL TEST TOGGLE 2: Trap Filter
-    # To force emails through, delete: 'and best_success_score > best_trap_score'
-    if best_success_score >= TRIGGER_THRESH and best_success_score > best_trap_score:
-        success_img_bytes = np.frombuffer(matched_blueprint_row['image_blob'], dtype=np.uint8).tobytes()
-        live_img_bytes = cv2.imencode('.png', live_canvas)[1].tobytes()
+    # X-RAY LOGGING: Why did the live scan fail?
+    logger.info(f"[{symbol}] Live Scan -> Best Success: {best_success_score:.3f} | Best Trap: {best_trap_score:.3f} | Target: {TRIGGER_THRESH}")
+
+    if best_success_score < TRIGGER_THRESH:
+        return None
         
-        return {
-            'Symbol': symbol.replace('NSE:', '').replace('-EQ', ''),
-            'Direction': matched_blueprint_row['direction'],
-            'Match_Score': best_success_score,
-            'Hist_Max_Move_Pct': matched_blueprint_row['hist_max_move_pct'],
-            'Hist_Linear_Periods': matched_blueprint_row['hist_linear_periods'],
-            'Timeframe': matched_blueprint_row['timeframe'],
-            'Live_Image_Bytes': live_img_bytes,
-            'Blueprint_Image_Bytes': success_img_bytes
-        }
-    return None
+    if best_success_score <= best_trap_score:
+        logger.info(f"   -> FILTERED: {symbol} matched a Trap ({best_trap_score:.3f}) stronger than a Success ({best_success_score:.3f}).")
+        return None
+
+    # Passed!
+    logger.info(f"🚀 [{symbol}] PASSED ALL FILTERS! Prepping for email dispatch.")
+    success_img_bytes = np.frombuffer(matched_blueprint_row['image_blob'], dtype=np.uint8).tobytes()
+    live_img_bytes = cv2.imencode('.png', live_canvas)[1].tobytes()
+    
+    return {
+        'Symbol': symbol.replace('NSE:', '').replace('-EQ', ''),
+        'Direction': matched_blueprint_row['direction'],
+        'Match_Score': best_success_score,
+        'Hist_Max_Move_Pct': matched_blueprint_row['hist_max_move_pct'],
+        'Hist_Linear_Periods': matched_blueprint_row['hist_linear_periods'],
+        'Timeframe': matched_blueprint_row['timeframe'],
+        'Live_Image_Bytes': live_img_bytes,
+        'Blueprint_Image_Bytes': success_img_bytes
+    }
 
 def process_live_scanning_sequence(symbol, target_dt):
     resolutions = ['15', '60', 'D']
@@ -442,21 +454,12 @@ def fetch_fo_universe():
     try:
         response = requests.get(FYERS_FO_MASTER_URL, timeout=15)
         df = pd.read_csv(StringIO(response.text), header=None)
-        
-        symbol_col = None
-        for col in df.columns:
-            if df[col].astype(str).str.startswith('NSE:').any():
-                symbol_col = col
-                break
+        symbol_col = next((col for col in df.columns if df[col].astype(str).str.startswith('NSE:').any()), None)
                 
         if symbol_col is None: return []
             
         raw_symbols = df[symbol_col].astype(str).tolist()
-        base_symbols = set()
-        for s in raw_symbols:
-            match = re.search(r'NSE:([A-Z&\-]+)\d+', s)
-            if match: base_symbols.add(match.group(1))
-            
+        base_symbols = {re.search(r'NSE:([A-Z&\-]+)\d+', s).group(1) for s in raw_symbols if re.search(r'NSE:([A-Z&\-]+)\d+', s)}
         return sorted([f"NSE:{sym}-EQ" for sym in base_symbols - {'NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'}])
     except Exception as e:
         logger.error(f"Failed to fetch F&O universe: {e}")
@@ -487,34 +490,22 @@ def main():
     parser.add_argument("--interval", default="60", help="Batch Step Interval in minutes")
     args = parser.parse_args()
     
-    # ---------------------------------------------------------
-    # 1. ALWAYS REBUILD LOGIC (Deletes old DB on boot)
-    # ---------------------------------------------------------
     if os.path.exists(DB_PATH):
         try:
             os.remove(DB_PATH)
             logger.info("🗑️ Wiped old spatial atlas. Forcing a completely fresh build...")
-        except Exception as e:
-            logger.warning(f"Could not remove old DB: {e}")
+        except Exception: pass
             
     initialize_spatial_database()
     
     symbols = fetch_fo_universe()
-    if not symbols:
-        logger.error("Empty market tracking schema. Shuttling down workspace.")
-        return
+    if not symbols: return
         
-    # ---------------------------------------------------------
-    # 2. PROCEED DIRECTLY TO PROFILING (No 'if' checks)
-    # ---------------------------------------------------------
     logger.info(f"⚙️ Initiating full historical profiling for the past {HIST_TRAVERSAL_LOOKBACK}...")
     with ThreadPoolExecutor(max_workers=8) as profiler_executor:
         profiler_executor.map(process_historical_profiling_permutations, symbols)
     logger.info("✅ Database generation finalized. Proceeding directly to scan logic...")
         
-    # ---------------------------------------------------------
-    # 3. RUN LIVE SCANS
-    # ---------------------------------------------------------
     if args.date and args.from_time and args.to_time:
         start_dt = pd.to_datetime(f"{args.date} {args.from_time}").tz_localize("Asia/Kolkata")
         end_dt = pd.to_datetime(f"{args.date} {args.to_time}").tz_localize("Asia/Kolkata")
@@ -535,3 +526,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
