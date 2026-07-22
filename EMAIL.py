@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v9.5
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v9.6 (GitHub Actions Edition)
 - Configurable Lookback Backlog (Loaded from config.yml)
-- ZERO SQLITE: Pure In-Memory Spatial Blueprint Matching (Deterministic)
+- ZERO FILES NEEDED: Pure Mathematical Synthetic Blueprint Auto-Generation in RAM
 - True Multi-Channel F&O 1024x1024 Grid (Price, Volume, Open Interest / Volatility Channels)
 - Maximum 64-Dimensional NumPy/Tensor Hyper-Pipeline
 - Dynamic Target Calculator (Target 1, Target 2, Target 3 Breakout Projections)
 - Dual Attachment Dispatcher: Both Live Spatial Matrix AND Matched Success Blueprint Attached
-- PATCHED: Thread-Safety, Blueprint Bootstrapping, and Math/Division-by-Zero Fixes
+- PATCHED: Thread-Safety, Math/Division-by-Zero Fixes, Ephemeral Server Ready
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -71,28 +71,53 @@ TEMPLATE_LOCK = threading.Lock()
 
 
 # ==========================================
-# 1.5 BLUEPRINT BOOTSTRAPPER
+# 1.5 SYNTHETIC BLUEPRINT AUTOGEN (ZERO FILES NEEDED)
 # ==========================================
-def load_historical_blueprints(directory_path="./blueprints"):
-    """Loads actual historical success matrices into memory before scanning begins."""
+def load_historical_blueprints():
+    """
+    Mathematically auto-generates the perfect 1024x1024 spatial matrix of a 
+    breakout (compression -> friction collapse -> expansion) directly in RAM.
+    Eliminates the need for saved .png files in GitHub.
+    """
     global IN_MEMORY_SUCCESS_TEMPLATES
-    
-    if not os.path.exists(directory_path):
-        os.makedirs(directory_path)
-        logger.warning(f"Created '{directory_path}' directory. Add your historical success PNGs here.")
-        return
-        
-    loaded_count = 0
-    for file in os.listdir(directory_path):
-        if file.endswith(".png"):
-            filepath = os.path.join(directory_path, file)
-            img = cv2.imread(filepath)
-            if img is not None:
-                blueprint_id = file.split('.')[0]
-                IN_MEMORY_SUCCESS_TEMPLATES.append({'img': img, 'id': blueprint_id})
-                loaded_count += 1
-                
-    logger.info(f"✅ Loaded {loaded_count} historical blueprints into the spatial matrix.")
+    grid_height, grid_width = 1024, 1024
+    canvas = np.zeros((grid_height, grid_width, 3), dtype=np.uint8)
+
+    logger.info("Auto-generating Synthetic Master Breakout Blueprint...")
+
+    # Iterate through the grid to draw the perfect structural breakout pattern
+    for i in range(grid_width):
+        # 1. PRICE CHANNEL (Channel 0)
+        if i < 800:
+            # Phase 1: Coiling / Accumulation (Tight sideways price action)
+            y_top = 500 + int(np.sin(i * 0.05) * 20)
+            y_bot = 520 + int(np.cos(i * 0.05) * 20)
+        else:
+            # Phase 2: Friction Collapse / Breakout (Price rockets upward)
+            progress = (i - 800) / 224.0
+            y_top = int(500 - (450 * (progress ** 2)))
+            y_bot = y_top + 40
+
+        y_top, y_bot = np.clip(y_top, 0, 1023), np.clip(y_bot, 0, 1023)
+        canvas[y_top:y_bot+1, i, 0] = 220
+
+        # 2. VOLUME CHANNEL (Channel 1)
+        if i < 800:
+            vol_intensity = 50 + int(np.random.rand() * 30) # Low volume during compression
+        else:
+            vol_intensity = 150 + int(np.random.rand() * 105) # Heavy volume burst on breakout
+        canvas[:, i, 1] = vol_intensity
+
+        # 3. ATR / VOLATILITY CHANNEL (Channel 2)
+        if i < 800:
+            atr_val = 50
+        else:
+            atr_val = int(50 + (205 * progress)) # Volatility expands as price breaks
+        canvas[grid_height - 128:grid_height, i, 2] = atr_val
+
+    # Save the synthetic master blueprint directly into the engine's memory
+    IN_MEMORY_SUCCESS_TEMPLATES.append({'img': canvas, 'id': 'SYNTHETIC_MASTER_BREAKOUT'})
+    logger.info("✅ Synthetic Master Blueprint loaded into memory successfully. Zero files required.")
 
 
 # ==========================================
@@ -259,7 +284,7 @@ def compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str):
         # Safely write to the global template list using the Thread Lock
         with TEMPLATE_LOCK:
             if len(IN_MEMORY_SUCCESS_TEMPLATES) < 50:
-                # Optional: Ensure we don't store duplicates of the same symbol
+                # Store the newly discovered live success pattern to hunt for future identical structures
                 existing_ids = [t['id'] for t in IN_MEMORY_SUCCESS_TEMPLATES]
                 if clean_sym not in existing_ids:
                     IN_MEMORY_SUCCESS_TEMPLATES.append({'img': multi_channel_img, 'id': clean_sym})
@@ -442,7 +467,7 @@ def main():
     parser.add_argument("--interval", type=int, default=60)
     args = parser.parse_args()
     
-    # Bootstrap: Load historical blueprints before multithreading starts
+    # Bootstrap: Mathematically generate the breakout blueprint in RAM (Zero files)
     load_historical_blueprints()
     
     target_dt = pd.Timestamp.now(tz="Asia/Kolkata")
