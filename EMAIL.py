@@ -326,7 +326,7 @@ def evaluate_live_market_matrix(symbol, live_canvas, current_dt):
         except Exception: continue
 
     # Reject setups that look more like traps than successes
-    if best_success_score >= TRIGGER_THRESH and best_success_score > best_trap_score:
+    if best_success_score >= TRIGGER_THRESH
         success_img_bytes = np.frombuffer(matched_blueprint_row['image_blob'], dtype=np.uint8).tobytes()
         live_img_bytes = cv2.imencode('.png', live_canvas)[1].tobytes()
         
