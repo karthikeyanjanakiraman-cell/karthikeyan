@@ -1,6 +1,5 @@
 trading_engine:
   macro_window_min: 15
-  # Select dynamic historical lookback bounds: "1 year", "9 months", "6 months", "13 weeks"
   historical_traversal_lookback: "1 month"
   live_lookback_days: 30
   correlation:
