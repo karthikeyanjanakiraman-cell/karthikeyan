@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v9.4
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v9.5
 - Configurable Lookback Backlog (Loaded from config.yml)
 - ZERO SQLITE: Pure In-Memory Spatial Blueprint Matching (Deterministic)
 - True Multi-Channel F&O 1024x1024 Grid (Price, Volume, Open Interest / Volatility Channels)
 - Maximum 64-Dimensional NumPy/Tensor Hyper-Pipeline
 - Dynamic Target Calculator (Target 1, Target 2, Target 3 Breakout Projections)
-- Dual Attachment Dispatcher: Both Live Spatial Matrix AND Matched Success Blueprint Attached for Breakouts
+- Dual Attachment Dispatcher: Both Live Spatial Matrix AND Matched Success Blueprint Attached
+- PATCHED: Thread-Safety, Blueprint Bootstrapping, and Math/Division-by-Zero Fixes
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -19,6 +20,7 @@ import yaml
 import logging
 import argparse
 import smtplib
+import threading
 from io import StringIO
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
@@ -51,7 +53,7 @@ try:
     
     logger.info(f"✅ config.yml loaded successfully. Lookback Backlog: {LOOKBACK_DAYS} days.")
 except Exception as e:
-    logger.error(f"❌ Configuration error: {e}")
+    logger.error(f"❌ Configuration error (Please ensure config.yml exists): {e}")
     sys.exit(1)
 
 CLIENT_ID = os.environ.get("CLIENT_ID", "")
@@ -63,8 +65,34 @@ RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "")
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=False, log_path="")
 
-# In-memory global runtime template bank storing both image bytes and identifiers
+# In-memory global runtime template bank and Threading Lock for safe concurrent access
 IN_MEMORY_SUCCESS_TEMPLATES = []
+TEMPLATE_LOCK = threading.Lock()
+
+
+# ==========================================
+# 1.5 BLUEPRINT BOOTSTRAPPER
+# ==========================================
+def load_historical_blueprints(directory_path="./blueprints"):
+    """Loads actual historical success matrices into memory before scanning begins."""
+    global IN_MEMORY_SUCCESS_TEMPLATES
+    
+    if not os.path.exists(directory_path):
+        os.makedirs(directory_path)
+        logger.warning(f"Created '{directory_path}' directory. Add your historical success PNGs here.")
+        return
+        
+    loaded_count = 0
+    for file in os.listdir(directory_path):
+        if file.endswith(".png"):
+            filepath = os.path.join(directory_path, file)
+            img = cv2.imread(filepath)
+            if img is not None:
+                blueprint_id = file.split('.')[0]
+                IN_MEMORY_SUCCESS_TEMPLATES.append({'img': img, 'id': blueprint_id})
+                loaded_count += 1
+                
+    logger.info(f"✅ Loaded {loaded_count} historical blueprints into the spatial matrix.")
 
 
 # ==========================================
@@ -179,7 +207,9 @@ def compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str):
         return None, 0.0, "N/A", None
         
     live_img_gray = cv2.cvtColor(multi_channel_img, cv2.COLOR_RGB2GRAY)
-    build_maximum_64d_hyper_tensor(multi_channel_img)
+    
+    # Store the Tensor instead of letting it vanish (Ready for ML prediction layer)
+    hyper_tensor = build_maximum_64d_hyper_tensor(multi_channel_img)
 
     max_val = -1.0
     matched_template_id = "N/A (Pending Blueprint Match)"
@@ -187,8 +217,12 @@ def compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str):
     
     clean_sym = symbol.replace('NSE:', '').replace('-EQ', '')
 
-    if IN_MEMORY_SUCCESS_TEMPLATES:
-        for idx, template_item in enumerate(IN_MEMORY_SUCCESS_TEMPLATES):
+    # Safely create a local copy of templates for iteration to avoid thread collision
+    with TEMPLATE_LOCK:
+        current_templates = list(IN_MEMORY_SUCCESS_TEMPLATES)
+
+    if current_templates:
+        for template_item in current_templates:
             try:
                 template = template_item['img']
                 t_id = template_item['id']
@@ -201,27 +235,35 @@ def compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str):
                     
                 res = cv2.matchTemplate(live_img_gray, template_resized, cv2.TM_CCOEFF_NORMED)
                 _, val, _, _ = cv2.minMaxLoc(res)
+                
                 if val > max_val:
                     max_val = val
                     matched_template_id = f"SUCCESS_BLUEPRINT_{t_id}_spatial_1024.png"
                     success_enc, enc_bytes = cv2.imencode('.png', template)
                     matched_template_bytes = enc_bytes.tobytes() if success_enc else None
-            except Exception:
+            except Exception as e:
+                logger.debug(f"Template match error on {clean_sym}: {e}")
                 continue
     else:
-        fallback_template = np.ones((1024, 1024), dtype=np.uint8) * 220
-        res = cv2.matchTemplate(live_img_gray, fallback_template, cv2.TM_CCOEFF_NORMED)
-        _, max_val, _, _ = cv2.minMaxLoc(res)
-        matched_template_id = "DEFAULT_ANALYTIC_MATRIX"
+        # Prevent division-by-zero math bug by returning early if no templates exist
+        logger.debug(f"No historical templates loaded. Skipping pattern match for {clean_sym}.")
+        return "AWAITING BLUEPRINTS", 0.0, "N/A", None
 
-    raw_score = (max_val + 1.0) / 2.0 if max_val != -1.0 else 0.8800
+    raw_score = (max_val + 1.0) / 2.0 if max_val != -1.0 else 0.0
     match_score = float(round(max(0.0, min(1.0, raw_score)), 4))
     
     if match_score >= TRIGGER_THRESH:
         state_status = "SUCCESS IMAGE MATRIX: BREAKOUT MATCH"
         matched_template_id = f"SUCCESS_BLUEPRINT_{clean_sym}_spatial_1024.png"
-        if len(IN_MEMORY_SUCCESS_TEMPLATES) < 50:
-            IN_MEMORY_SUCCESS_TEMPLATES.append({'img': multi_channel_img, 'id': clean_sym})
+        
+        # Safely write to the global template list using the Thread Lock
+        with TEMPLATE_LOCK:
+            if len(IN_MEMORY_SUCCESS_TEMPLATES) < 50:
+                # Optional: Ensure we don't store duplicates of the same symbol
+                existing_ids = [t['id'] for t in IN_MEMORY_SUCCESS_TEMPLATES]
+                if clean_sym not in existing_ids:
+                    IN_MEMORY_SUCCESS_TEMPLATES.append({'img': multi_channel_img, 'id': clean_sym})
+                    
     elif match_score >= FUZZY_THRESH:
         state_status = "FUZZY IMAGE ANCHOR: STRUCTURAL HOLD"
     else:
@@ -250,7 +292,7 @@ def process_symbol_spatial_scan(symbol, target_dt):
                 "range_from": chunk_start_date.strftime("%Y-%m-%d"),
                 "range_to": current_end_date.strftime("%Y-%m-%d"), "cont_flag": 1
             }
-            time.sleep(0.08)
+            time.sleep(0.08)  # API Rate limit respect
             res = fyers.history(payload)
             
             if res and isinstance(res, dict) and 'candles' in res and len(res['candles']) > 0:
@@ -277,8 +319,10 @@ def process_symbol_spatial_scan(symbol, target_dt):
         
         t1, t2, t3 = calculate_breakout_targets(rolling_slice, ltp)
         multi_channel_img = generate_multichannel_spatial_matrix(rolling_slice)
+        
         state_status, match_score, success_matrix_ref, template_bytes = compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str)
         
+        # Only return meaningful data to keep reports clean
         if match_score >= FUZZY_THRESH or "HUNTING" in state_status:
             success, encoded_img = cv2.imencode('.png', multi_channel_img)
             img_bytes = encoded_img.tobytes() if success else None
@@ -303,7 +347,7 @@ def process_symbol_spatial_scan(symbol, target_dt):
 
 
 # ==========================================
-# 6. HTML EMAIL DISPATCHER (DUAL ATTACHMENTS FOR BREAKOUTS)
+# 6. HTML EMAIL DISPATCHER
 # ==========================================
 def send_html_email(df_matrix, target_dt):
     if not SENDER_EMAIL or not RECIPIENT_EMAIL:
@@ -313,7 +357,7 @@ def send_html_email(df_matrix, target_dt):
     fetch_time_str = target_dt.strftime('%d %b %Y, %I:%M %p')
     
     msg = MIMEMultipart()
-    msg['Subject'] = f"F&O 1024x1024 Spatial Matrix & Matching Blueprint Report | {fetch_time_str}"
+    msg['Subject'] = f"F&O 1024x1024 Spatial Matrix Report | {fetch_time_str}"
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECIPIENT_EMAIL
     
@@ -324,7 +368,6 @@ def send_html_email(df_matrix, target_dt):
         
         attachments_display = []
         
-        # 1. Attach Live Spatial Matrix Image ONLY for Breakout Matches
         if is_breakout and row.get('Spatial_Image_Bytes'):
             live_att_name = f"{row['Symbol']}_spatial_1024.png"
             img_part1 = MIMEImage(row['Spatial_Image_Bytes'], name=live_att_name)
@@ -332,7 +375,6 @@ def send_html_email(df_matrix, target_dt):
             msg.attach(img_part1)
             attachments_display.append(live_att_name)
             
-        # 2. Attach Matching Success Blueprint Image Referenced in the Success Matrix Ref column
         if is_breakout and row.get('Matched_Template_Bytes'):
             ref_att_name = row['Success_Matrix_Ref']
             img_part2 = MIMEImage(row['Matched_Template_Bytes'], name=ref_att_name)
@@ -359,7 +401,7 @@ def send_html_email(df_matrix, target_dt):
       <body style='font-family: Arial, sans-serif; background-color: #f7f9fc; padding: 20px;'>
         <h2 style='color: #1a237e; text-align: center;'>🎯 F&O 1024x1024 DUAL ATTACHMENT BREAKOUT REPORT</h2>
         <p style='text-align: center; color: #555;'>🕒 Scan Time: <b>{fetch_time_str}</b> | Lookback Backlog: <b>{LOOKBACK_DAYS} Days</b></p>
-        <p style='text-align: center; color: #555; font-size: 13px;'><i>Both the live spatial matrix and the referenced matching success blueprint are attached <b>ONLY</b> for SUCCESS BREAKOUT MATCHES.</i></p>
+        <p style='text-align: center; color: #555; font-size: 13px;'><i>Attachments included <b>ONLY</b> for SUCCESS BREAKOUT MATCHES.</i></p>
         <table style='width: 100%; border-collapse: collapse; background: #fff; margin-top: 15px;'>
           <tr style='background: #3949ab; color: white;'>
             <th style='padding: 10px;'>Symbol</th>
@@ -384,7 +426,7 @@ def send_html_email(df_matrix, target_dt):
         with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
             server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
-        logger.info("Email report sent successfully with dual attachments (Live Matrix + Matching Blueprint).")
+        logger.info("Email report sent successfully.")
     except Exception as e:
         logger.error(f"Email dispatch failed: {e}")
 
@@ -399,6 +441,9 @@ def main():
     parser.add_argument("--to_time", help="HH:MM")
     parser.add_argument("--interval", type=int, default=60)
     args = parser.parse_args()
+    
+    # Bootstrap: Load historical blueprints before multithreading starts
+    load_historical_blueprints()
     
     target_dt = pd.Timestamp.now(tz="Asia/Kolkata")
     start_dt, end_dt = target_dt, target_dt
