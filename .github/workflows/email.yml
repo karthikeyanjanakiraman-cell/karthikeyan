@@ -19,7 +19,7 @@ on:
         required: false
         default: ''
       interval:
-        description: 'Batch Step Interval in minutes (Only used if from_time and to_time are filled).'
+        description: 'Batch Step Interval in minutes.'
         required: false
         default: '60'
 
@@ -47,18 +47,7 @@ jobs:
           pip install fyers_apiv3 pandas numpy scipy ta yfinance PyYAML opencv-python-headless torch
 
       # ---------------------------------------------------------
-      # 1. RESTORE HEAVY SQLITE DB FROM GITHUB CLOUD CACHE
-      # ---------------------------------------------------------
-      - name: Restore Spatial Database Cache
-        uses: actions/cache/restore@v4
-        with:
-          path: spatial_matrix_atlas.db
-          key: spatial-db-${{ github.run_id }}
-          restore-keys: |
-            spatial-db-
-
-      # ---------------------------------------------------------
-      # 2. RUN THE ENGINE (Will operate in read-only DB mode if cache exists)
+      # RUN THE ENGINE (Reads DB from repo, builds if missing)
       # ---------------------------------------------------------
       - name: Run Spatial Engine Script
         env:
@@ -79,10 +68,10 @@ jobs:
           B_INT="${{ github.event.inputs.interval }}"
           
           if [ -n "$B_DATE" ] && [ -n "$B_FROM" ] && [ -n "$B_TO" ]; then
-            echo "Running in BATCH BACKTEST mode: $B_DATE from $B_FROM to $B_TO every $B_INT mins."
+            echo "Running in BATCH BACKTEST mode."
             python EMAIL.py --date "$B_DATE" --from_time "$B_FROM" --to_time "$B_TO" --interval "$B_INT"
           elif [ -n "$B_DATE" ]; then
-            echo "Running in SINGLE BACKTEST mode for target: $B_DATE"
+            echo "Running in SINGLE BACKTEST mode."
             python EMAIL.py --date "$B_DATE"
           else
             echo "Running in LIVE mode."
@@ -90,35 +79,30 @@ jobs:
           fi
 
       # ---------------------------------------------------------
-      # 3. SAVE DB TO CACHE (Saves the initial build, rolls over otherwise)
+      # PUSH DATABASE & LOGS DIRECTLY TO REPOSITORY
       # ---------------------------------------------------------
-      - name: Save Updated Spatial Database Cache
-        uses: actions/cache/save@v4
-        if: always()
-        with:
-          path: spatial_matrix_atlas.db
-          key: spatial-db-${{ github.run_id }}
-
-      # ---------------------------------------------------------
-      # 4. COMMIT LIGHTWEIGHT LOGS/CSVS ONLY (Zero Repo Bloat)
-      # ---------------------------------------------------------
-      - name: Commit updated text logs/CSVs
+      - name: Commit Database and Logs to Repository
         if: always()
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           git config user.name "github-actions"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          
+          # Pull latest changes to avoid merge conflicts
           git fetch origin main
           git pull --rebase origin main || true
           
-          # Only add CSVs if your script generates them.
-          # Explicitly ignore tracking the binary .db file in git.
+          # Explicitly add the database and any generated CSVs
+          if [ -f "spatial_matrix_atlas.db" ]; then
+            git add spatial_matrix_atlas.db
+          fi
           git add *.csv || true
           
+          # Commit and Push
           if git diff --cached --quiet; then
-            echo "No CSV changes to commit."
+            echo "No database or log changes to commit."
           else
-            git commit -m "Auto-update CSV logs [skip ci]" || true
-            git push origin HEAD:main || echo "Push failed; skipping."
+            git commit -m "Auto-update Spatial Atlas and Logs [skip ci]" || true
+            git push origin HEAD:main || echo "Push failed; database might exceed GitHub limits."
           fi
