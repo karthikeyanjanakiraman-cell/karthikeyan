@@ -1,14 +1,13 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v9.6 (GitHub Actions Edition)
-- Configurable Lookback Backlog (Loaded from config.yml)
-- ZERO FILES NEEDED: Pure Mathematical Synthetic Blueprint Auto-Generation in RAM
-- True Multi-Channel F&O 1024x1024 Grid (Price, Volume, Open Interest / Volatility Channels)
-- Maximum 64-Dimensional NumPy/Tensor Hyper-Pipeline
-- Dynamic Target Calculator (Target 1, Target 2, Target 3 Breakout Projections)
-- Dual Attachment Dispatcher: Both Live Spatial Matrix AND Matched Success Blueprint Attached
-- PATCHED: Thread-Safety, Math/Division-by-Zero Fixes, Ephemeral Server Ready
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v10.0 (Production Master)
+- Dual Mode: Full Historical Permutation Profiler & Live Hyper-Tensor Scanner
+- Ephemeral Database Lifecycle: Auto-generates/updates sqlite3 database for GitHub Actions compatibility
+- Dual-Matrix Verification: Cross-references live setups against Success and False Breakout Atlases
+- Predictive Metric Calculator: Projects achieved vs. pending move percentages in real-time
+- Multi-Channel Spatial Mapping (1024x1024x3): Channel 0 (Price), Channel 1 (Volume), Channel 2 (ATR)
+- Strict Success Filtering: Dispatches HTML analysis reports with dual inline images only on success
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -17,6 +16,7 @@ import re
 import sys
 import time
 import yaml
+import sqlite3
 import logging
 import argparse
 import smtplib
@@ -34,28 +34,32 @@ import pandas as pd
 import requests
 from fyers_apiv3 import fyersModel
 
-# ==========================================
-# 1. SYSTEM SETUP & CONFIGURATION
-# ==========================================
+# =================================================================================================
+# 1. ENVIRONMENT & STACK INITIALIZATION
+# =================================================================================================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+DB_PATH = "spatial_matrix_atlas.db"
+DB_LOCK = threading.Lock()
+
+# Load Engine Configurations
 try:
     with open("config.yml", "r") as f:
         _raw_cfg = yaml.safe_load(f)
         cfg = _raw_cfg.get("trading_engine", {})
         
     MACRO_WINDOW = cfg.get("macro_window_min", 30)
-    LOOKBACK_DAYS = cfg.get("lookback_backlog_days", 365)
-    TRIGGER_THRESH = cfg.get("correlation", {}).get("initial_trigger_threshold", 0.95)
-    FUZZY_THRESH = cfg.get("correlation", {}).get("fuzzy_hold_threshold", 0.90)
-    HUNT_MODE = cfg.get("hunt_mode_enabled", True)
+    HIST_TRAVERSAL_LOOKBACK = cfg.get("historical_traversal_lookback", "1 year")
+    LIVE_LOOKBACK_DAYS = cfg.get("live_lookback_days", 30)
+    TRIGGER_THRESH = cfg.get("correlation", {}).get("initial_trigger_threshold", 0.92)
     
-    logger.info(f"✅ config.yml loaded successfully. Lookback Backlog: {LOOKBACK_DAYS} days.")
+    logger.info(f"✅ Configuration parsed. Traversal Window: {HIST_TRAVERSAL_LOOKBACK} | Live Window: {LIVE_LOOKBACK_DAYS} days.")
 except Exception as e:
-    logger.error(f"❌ Configuration error (Please ensure config.yml exists): {e}")
+    logger.error(f"❌ Initialization failed (Verify config.yml): {e}")
     sys.exit(1)
 
+# Extraction of Infrastructure Credentials
 CLIENT_ID = os.environ.get("CLIENT_ID", "")
 ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "")
@@ -65,66 +69,487 @@ RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "")
 FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=False, log_path="")
 
-# In-memory global runtime template bank and Threading Lock for safe concurrent access
-IN_MEMORY_SUCCESS_TEMPLATES = []
-TEMPLATE_LOCK = threading.Lock()
+# =================================================================================================
+# 2. LOCAL DATA STORAGE MANAGEMENT (SQLITE ATLAS INTERFACE)
+# =================================================================================================
+def initialize_spatial_database():
+    """Initializes schema maps inside the local SQLite binary store."""
+    with DB_LOCK, sqlite3.connect(DB_PATH) as conn:
+        cursor = conn.cursor()
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS spatial_blueprints (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT,
+                timeframe TEXT,
+                direction TEXT,
+                matrix_type TEXT,
+                image_blob BLOB,
+                hist_max_move_pct REAL,
+                hist_linear_periods INTEGER,
+                detected_timestamp TEXT,
+                UNIQUE(symbol, timeframe, detected_timestamp, matrix_type)
+            )
+        """)
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS engine_sync_logs (
+                symbol TEXT,
+                timeframe TEXT,
+                last_sync_timestamp TEXT,
+                PRIMARY KEY (symbol, timeframe)
+            )
+        """)
+        conn.commit()
+    logger.info("💾 SQLite Matrix Atlas schemas validated successfully.")
 
+def check_database_state():
+    """Returns True if database contains spatial assets, triggering incremental delta update mode."""
+    if not os.path.exists(DB_PATH):
+        return False
+    try:
+        with DB_LOCK, sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT COUNT(*) FROM spatial_blueprints")
+            count = cursor.fetchone()[0]
+            return count > 0
+    except sqlite3.Error:
+        return False
 
-# ==========================================
-# 1.5 SYNTHETIC BLUEPRINT AUTOGEN (ZERO FILES NEEDED)
-# ==========================================
-def load_historical_blueprints():
+# =================================================================================================
+# 3. CORE MULTI-CHANNEL VISUAL SPATIAL MATRIX ENGINE
+# =================================================================================================
+def build_maximum_64d_hyper_tensor(spatial_matrix):
+    """Reshapes the 3-channel matrix into a 64-dimensional hyper-tensor space for structural evaluation."""
+    if spatial_matrix is None:
+        return None
+    target_shape = (1,) * 61 + spatial_matrix.shape
+    return spatial_matrix.reshape(target_shape)
+
+def generate_multichannel_spatial_matrix(df_slice):
     """
-    Mathematically auto-generates the perfect 1024x1024 spatial matrix of a 
-    breakout (compression -> friction collapse -> expansion) directly in RAM.
-    Eliminates the need for saved .png files in GitHub.
+    Transforms regular price, volume, and volatility vectors into a normalized 1024x1024x3 multi-channel image.
+    Channel 0: Price structural boundaries
+    Channel 1: Normalized volume footprints
+    Channel 2: Latent volatility tracking via Average True Range (ATR)
     """
-    global IN_MEMORY_SUCCESS_TEMPLATES
-    grid_height, grid_width = 1024, 1024
-    canvas = np.zeros((grid_height, grid_width, 3), dtype=np.uint8)
+    if df_slice is None or len(df_slice) < MACRO_WINDOW:
+        return None
+        
+    p_high = df_slice['high'].values.astype(np.float32)
+    p_low = df_slice['low'].values.astype(np.float32)
+    p_close = df_slice['close'].values.astype(np.float32)
+    volume = df_slice['volume'].values.astype(np.float32)
+    
+    grid_h, grid_w = 1024, 1024
+    canvas = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)
+    
+    p_min, p_max = p_low.min(), p_high.max()
+    p_span = p_max - p_min if p_max > p_min else 1.0
+    
+    v_min, v_max = volume.min(), volume.max()
+    v_span = v_max - v_min if v_max > v_min else 1.0
+    
+    # Track spatial boundaries across the time axis
+    x_coords = np.linspace(0, grid_w - 1, len(df_slice)).astype(int)
+    
+    # Multi-period calculation for ATR trace mapped onto Channel 2
+    tr = np.maximum(p_high[1:] - p_low[1:], np.abs(p_high[1:] - p_close[:-1]))
+    atr_val = np.mean(tr) if len(tr) > 0 else 1.0
+    
+    for idx, x_idx in enumerate(x_coords):
+        h_val = p_high[idx]
+        l_val = p_low[idx]
+        v_val = volume[idx]
+        
+        # Calculate coordinate transformations
+        y_top = int(grid_h * (1.0 - (h_val - p_min) / p_span))
+        y_bot = int(grid_h * (1.0 - (l_val - p_min) / p_span))
+        
+        y_top = np.clip(y_top, 0, grid_h - 1)
+        y_bot = np.clip(y_bot, 0, grid_h - 1)
+        if y_top > y_bot:
+            y_top, y_bot = y_bot, y_top
+            
+        # Write to spatial grid layer channels
+        canvas[y_top:y_bot+1, x_idx, 0] = 220
+        vol_intensity = int(np.clip((v_val - v_min) / v_span * 255, 0, 255)) if v_span > 0 else 100
+        canvas[:, x_idx, 1] = vol_intensity
+        canvas[grid_h - 128:grid_h, x_idx, 2] = int(np.clip(atr_val / p_span * 255, 50, 255))
 
-    logger.info("Auto-generating Synthetic Master Breakout Blueprint...")
+    return canvas
 
-    # Iterate through the grid to draw the perfect structural breakout pattern
-    for i in range(grid_width):
-        # 1. PRICE CHANNEL (Channel 0)
-        if i < 800:
-            # Phase 1: Coiling / Accumulation (Tight sideways price action)
-            y_top = 500 + int(np.sin(i * 0.05) * 20)
-            y_bot = 520 + int(np.cos(i * 0.05) * 20)
+# =================================================================================================
+# 4. HISTORICAL PROFILER & PERMUTATION ENGINE (DATA LOADER)
+# =================================================================================================
+def parse_traversal_window(window_str):
+    """Converts configuration strings into discrete numeric day metrics."""
+    clean = window_str.lower().strip()
+    digits = int(re.search(r'\d+', clean).group()) if re.search(r'\d+', clean) else 365
+    if 'year' in clean: return digits * 365
+    if 'month' in clean: return digits * 30
+    if 'week' in clean: return digits * 7
+    if 'day' in clean: return digits
+    return 365
+
+def fetch_historical_raw_data(symbol, resolution, total_days_back, target_end_dt=None):
+    """Extracts continuous series from Fyers API, utilizing chunked aggregation methods."""
+    all_candles = []
+    end_date = target_end_dt if target_end_dt else pd.Timestamp.now(tz="Asia/Kolkata")
+    days_fetched = 0
+    chunk_size = 30 if resolution != 'D' else 365
+    
+    while days_fetched < total_days_back:
+        start_date = end_date - timedelta(days=chunk_size)
+        payload = {
+            "symbol": symbol, "resolution": resolution, "date_format": 1,
+            "range_from": start_date.strftime("%Y-%m-%d"), "range_to": end_date.strftime("%Y-%m-%d"),
+            "cont_flag": 1
+        }
+        try:
+            time.sleep(0.06)  # Maintain stable API requests
+            res = fyers.history(payload)
+            if res and isinstance(res, dict) and 'candles' in res and len(res['candles']) > 0:
+                all_candles.extend(res['candles'])
+            else:
+                break
+        except Exception as e:
+            logger.error(f"Error fetching historical slice for {symbol}: {e}")
+            break
+        end_date = start_date
+        days_fetched += chunk_size
+
+    if not all_candles:
+        return None
+        
+    df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True).dt.tz_convert("Asia/Kolkata")
+    df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
+    return df
+
+def process_historical_profiling_permutations(symbol):
+    """
+    Parses historical market arrays to extract friction decay setups across multi-resolution combinations.
+    Classifies signals into structural matrix categories and saves them to the database.
+    """
+    resolutions = ['15', '60', 'D']
+    total_days = parse_traversal_window(HIST_TRAVERSAL_LOOKBACK)
+    
+    # Identify database state to support seamless incremental delta logging
+    is_incremental = check_database_state()
+    
+    for res in resolutions:
+        with DB_LOCK, sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT last_sync_timestamp FROM engine_sync_logs WHERE symbol=? AND timeframe=?", (symbol, res))
+            row = cursor.fetchone()
+            last_sync = pd.to_datetime(row[0]).tz_convert("Asia/Kolkata") if row else None
+            
+        if is_incremental and last_sync:
+            # Run fast delta update from the last recorded synchronization marker
+            fetch_days = (pd.Timestamp.now(tz="Asia/Kolkata") - last_sync).days + 2
+            df = fetch_historical_raw_data(symbol, res, fetch_days)
+            if df is not None:
+                df = df[df['timestamp'] > last_sync].reset_index(drop=True)
         else:
-            # Phase 2: Friction Collapse / Breakout (Price rockets upward)
-            progress = (i - 800) / 224.0
-            y_top = int(500 - (450 * (progress ** 2)))
-            y_bot = y_top + 40
+            # Complete fresh scan across the full historical lookback window
+            df = fetch_historical_raw_data(symbol, res, total_days)
+            
+        if df is None or len(df) < (MACRO_WINDOW + 20):
+            continue
+            
+        # Search for structural breakout mechanics
+        for i in range(MACRO_WINDOW, len(df) - 20):
+            window_slice = df.iloc[i-MACRO_WINDOW:i]
+            forward_horizon = df.iloc[i:i+20]
+            
+            p_close_hist = window_slice['close'].values
+            p_high_hist = window_slice['high'].values
+            p_low_hist = window_slice['low'].values
+            
+            # Metric evaluation of coiling state prior to trigger execution
+            channel_range = p_high_hist.max() - p_low_hist.min()
+            base_ltp = p_close_hist[-1]
+            if base_ltp == 0: continue
+            
+            compression_ratio = channel_range / base_ltp
+            
+            # Confirm structural tightness (friction decay coiling criteria)
+            if compression_ratio < 0.04:
+                trigger_price = forward_horizon['close'].iloc[0]
+                max_forward_high = forward_horizon['high'].max()
+                min_forward_low = forward_horizon['low'].min()
+                
+                direction = "UP" if trigger_price > p_high_hist.max() else ("DOWN" if trigger_price < p_low_hist.min() else None)
+                if not direction: continue
+                
+                # Analyze linear directional moves vs expansion validation windows
+                if direction == "UP":
+                    max_move_pct = ((max_forward_high - base_ltp) / base_ltp) * 100.0
+                    # Identify where momentum fades or exhibits structural mean reversion
+                    linear_periods = 0
+                    for _, f_row in forward_horizon.iterrows():
+                        if f_row['close'] >= base_ltp: linear_periods += 1
+                        else: break
+                    matrix_type = "SUCCESS" if max_move_pct >= 4.0 else "TRAP"
+                else:
+                    max_move_pct = ((base_ltp - min_forward_low) / base_ltp) * 100.0
+                    linear_periods = 0
+                    for _, f_row in forward_horizon.iterrows():
+                        if f_row['close'] <= base_ltp: linear_periods += 1
+                        else: break
+                    matrix_type = "SUCCESS" if max_move_pct >= 4.0 else "TRAP"
+                    
+                spatial_mat = generate_multichannel_spatial_matrix(window_slice)
+                if spatial_mat is None: continue
+                
+                success_enc, encoded_bytes = cv2.imencode('.png', spatial_mat)
+                if not success_enc: continue
+                
+                blob_data = encoded_bytes.tobytes()
+                timestamp_str = window_slice['timestamp'].iloc[-1].strftime('%Y-%m-%d %H:%M:%S')
+                
+                # Update persistent state database records
+                try:
+                    with DB_LOCK, sqlite3.connect(DB_PATH) as conn:
+                        cursor = conn.cursor()
+                        cursor.execute("""
+                            INSERT OR IGNORE INTO spatial_blueprints 
+                            (symbol, timeframe, direction, matrix_type, image_blob, hist_max_move_pct, hist_linear_periods, detected_timestamp)
+                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                        """, (symbol, res, direction, matrix_type, blob_data, float(max_move_pct), int(linear_periods), timestamp_str))
+                        conn.commit()
+                except sqlite3.Error as db_err:
+                    logger.debug(f"Database insertion skipped: {db_err}")
 
-        y_top, y_bot = np.clip(y_top, 0, 1023), np.clip(y_bot, 0, 1023)
-        canvas[y_top:y_bot+1, i, 0] = 220
+        # Update sync tracking log parameters
+        latest_timestamp = df['timestamp'].iloc[-1].strftime('%Y-%m-%d %H:%M:%S')
+        with DB_LOCK, sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT OR REPLACE INTO engine_sync_logs (symbol, timeframe, last_sync_timestamp)
+                VALUES (?, ?, ?)
+            """, (symbol, res, latest_timestamp))
+            conn.commit()
 
-        # 2. VOLUME CHANNEL (Channel 1)
-        if i < 800:
-            vol_intensity = 50 + int(np.random.rand() * 30) # Low volume during compression
-        else:
-            vol_intensity = 150 + int(np.random.rand() * 105) # Heavy volume burst on breakout
-        canvas[:, i, 1] = vol_intensity
+# =================================================================================================
+# 5. LIVE HIERARCHICAL MATCHING ENGINE (64D HYPER-TENSOR CALCULATOR)
+# =================================================================================================
+def evaluate_live_market_matrix(symbol, live_canvas, current_dt):
+    """
+    Executes cross-correlation structural validation on 1024x1024 grids using spatial matrix assets.
+    Verifies setups against historical data patterns to isolate breakouts and suppress false targets.
+    """
+    if live_canvas is None:
+        return None
+        
+    live_gray = cv2.cvtColor(live_canvas, cv2.COLOR_RGB2GRAY)
+    hyper_tensor = build_maximum_64d_hyper_tensor(live_canvas) # Array locked for tensor calculation layer
+    
+    best_success_score = 0.0
+    best_trap_score = 0.0
+    matched_blueprint_row = None
+    
+    with DB_LOCK, sqlite3.connect(DB_PATH) as conn:
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM spatial_blueprints WHERE symbol=?", (symbol.replace('NSE:', '').replace('-EQ', ''),))
+        blueprints = cursor.fetchall()
+        
+    for bp in blueprints:
+        try:
+            bp_bytes = np.frombuffer(bp['image_blob'], dtype=np.uint8)
+            bp_img = cv2.imdecode(bp_bytes, cv2.IMREAD_COLOR)
+            bp_gray = cv2.cvtColor(bp_img, cv2.COLOR_RGB2GRAY)
+            
+            if bp_gray.shape != live_gray.shape:
+                bp_gray = cv2.resize(bp_gray, (live_gray.shape[1], live_gray.shape[0]))
+                
+            match_res = cv2.matchTemplate(live_gray, bp_gray, cv2.TM_CCOEFF_NORMED)
+            _, val, _, _ = cv2.minMaxLoc(match_res)
+            normalized_score = float(max(0.0, min(1.0, (val + 1.0) / 2.0)))
+            
+            if bp['matrix_type'] == 'SUCCESS':
+                if normalized_score > best_success_score:
+                    best_success_score = normalized_score
+                    matched_blueprint_row = bp
+            else:
+                if normalized_score > best_trap_score:
+                    best_trap_score = normalized_score
+        except Exception as e:
+            logger.debug(f"Error matching blueprint ID {bp['id']}: {e}")
+            continue
 
-        # 3. ATR / VOLATILITY CHANNEL (Channel 2)
-        if i < 800:
-            atr_val = 50
-        else:
-            atr_val = int(50 + (205 * progress)) # Volatility expands as price breaks
-        canvas[grid_height - 128:grid_height, i, 2] = atr_val
+    # Confirm matching configuration targets
+    if best_success_score >= TRIGGER_THRESH and best_success_score > best_trap_score:
+        direction = matched_blueprint_row['direction']
+        
+        # Pull reference variables from the configuration profile
+        hist_max_move = matched_blueprint_row['hist_max_move_pct']
+        hist_periods = matched_blueprint_row['hist_linear_periods']
+        
+        success_img_bytes = np.frombuffer(matched_blueprint_row['image_blob'], dtype=np.uint8).tobytes()
+        live_img_bytes = cv2.imencode('.png', live_canvas)[1].tobytes()
+        
+        return {
+            'Symbol': symbol.replace('NSE:', '').replace('-EQ', ''),
+            'Direction': direction,
+            'Match_Score': best_success_score,
+            'Hist_Max_Move_Pct': hist_max_move,
+            'Hist_Linear_Periods': hist_periods,
+            'Timeframe': matched_blueprint_row['timeframe'],
+            'Live_Image_Bytes': live_img_bytes,
+            'Blueprint_Image_Bytes': success_img_bytes
+        }
+    
+    return None
 
-    # Save the synthetic master blueprint directly into the engine's memory
-    IN_MEMORY_SUCCESS_TEMPLATES.append({'img': canvas, 'id': 'SYNTHETIC_MASTER_BREAKOUT'})
-    logger.info("✅ Synthetic Master Blueprint loaded into memory successfully. Zero files required.")
+def process_live_scanning_sequence(symbol, target_dt):
+    """Executes dynamic multi-permutation scans using rolling backward tracking arrays."""
+    resolutions = ['15', '60', 'D']
+    
+    for res in resolutions:
+        # Pull down localized structural telemetry
+        df = fetch_historical_raw_data(symbol, res, LIVE_LOOKBACK_DAYS, target_end_dt=target_dt)
+        if df is None or len(df) < MACRO_WINDOW:
+            continue
+            
+        rolling_slice = df.tail(MACRO_WINDOW)
+        ltp = float(rolling_slice['close'].iloc[-1])
+        
+        # Generate multi-channel coordinate matrices
+        live_canvas = generate_multichannel_spatial_matrix(rolling_slice)
+        match_result = evaluate_live_market_matrix(symbol, live_canvas, target_dt)
+        
+        if match_result:
+            # Inject dynamic performance calculations
+            match_result['LTP'] = ltp
+            
+            # Estimate current progress trends
+            hist_max = match_result['Hist_Max_Move_Pct']
+            # Compute current movement delta
+            p_initial = float(rolling_slice['close'].iloc[-5]) # Baseline historical comparison anchor
+            if p_initial > 0:
+                if match_result['Direction'] == 'UP':
+                    achieved = max(0.0, ((ltp - p_initial) / p_initial) * 100.0)
+                else:
+                    achieved = max(0.0, ((p_initial - ltp) / p_initial) * 100.0)
+            else:
+                achieved = 0.0
+                
+            pending = max(0.0, hist_max - achieved)
+            
+            match_result['Achieved_Pct'] = round(achieved, 2)
+            match_result['Pending_Pct'] = round(pending, 2)
+            return match_result
+            
+    return None
 
+# =================================================================================================
+# 6. EMAIL TRANSMISSION SUBSYSTEM
+# =================================================================================================
+def dispatch_predictive_analysis_report(df_matrix, target_dt):
+    """
+    Sends detailed HTML structural performance summaries via email.
+    Embeds high-fidelity image components exclusively for validated breakout patterns.
+    """
+    if not SENDER_EMAIL or not RECIPIENT_EMAIL:
+        logger.warning("Email transmission skipped: Missing user email configuration credentials.")
+        return
+        
+    scan_time_str = target_dt.strftime('%d %b %Y, %I:%M %p')
+    msg = MIMEMultipart('related')
+    msg['Subject'] = f"🎯 SUCCESS MATRIX ALERT: F&O Spatial Breakout Detected | {scan_time_str}"
+    msg['From'] = SENDER_EMAIL
+    msg['To'] = RECIPIENT_EMAIL
+    
+    html_rows = ""
+    image_attachments = []
+    
+    for idx, row in df_matrix.iterrows():
+        sym = row['Symbol']
+        dir_label = "📈 UPWARD BREAKOUT" if row['Direction'] == 'UP' else "📉 DOWNWARD BREAKDOWN"
+        dir_color = "#1b5e20" if row['Direction'] == 'UP' else "#b71c1c"
+        
+        live_cid = f"live_{sym}_{idx}"
+        bp_cid = f"blueprint_{sym}_{idx}"
+        
+        html_rows += f"""
+        <tr style='border-bottom: 1px solid #ddd;'>
+            <td style='padding: 12px; font-weight: bold; color: #1a73e8;'>{sym}</td>
+            <td style='padding: 12px; font-weight: bold; color: {dir_color};'>{dir_label}</td>
+            <td style='padding: 12px;'>TF: {row['Timeframe']} | <b>{row['Match_Score']*100:.1f}% Match</b></td>
+            <td style='padding: 12px;'>₹{row['LTP']:.2f}</td>
+            <td style='padding: 12px; color: #2e7d32;'><b>{row['Hist_Max_Move_Pct']:.2f}%</b> ({row['Hist_Linear_Periods']} periods)</td>
+            <td style='padding: 12px; color: #e65100;'><b>{row['Achieved_Pct']:.2f}%</b></td>
+            <td style='padding: 12px; color: #1565c0; font-weight: bold;'>{row['Pending_Pct']:.2f}%</td>
+        </tr>
+        <tr>
+            <td colspan='7' style='padding: 15px; background-color: #fafafa; text-align: center;'>
+                <div style='display: inline-block; margin: 10px;'>
+                    <p style='margin: 2px; font-size: 11px; color: #555;'><b>Live Market Spatial Layer Vector</b></p>
+                    <img src="cid:{live_cid}" width="420" height="420" style='border: 1px solid #ccc;' />
+                </div>
+                <div style='display: inline-block; margin: 10px;'>
+                    <p style='margin: 2px; font-size: 11px; color: #555;'><b>Matched Success Blueprint Target</b></p>
+                    <img src="cid:{bp_cid}" width="420" height="420" style='border: 1px solid #ccc;' />
+                </div>
+            </td>
+        </tr>
+        """
+        image_attachments.append((live_cid, row['Live_Image_Bytes']))
+        image_attachments.append((bp_cid, row['Blueprint_Image_Bytes']))
 
-# ==========================================
-# 2. DYNAMIC UNIVERSE BUILDER
-# ==========================================
+    html_body = f"""
+    <html>
+      <body style='font-family: Arial, sans-serif; background-color: #f4f6f9; padding: 20px; color: #333;'>
+        <div style='max-width: 1000px; margin: 0 auto; background: #fff; padding: 25px; border-radius: 8px; border: 1px solid #dcdcdc;'>
+            <h2 style='color: #1a237e; text-align: center; margin-top: 0;'>🎯 F&O SPATIAL HYPER-TENSOR TARGET DETECTOR</h2>
+            <p style='text-align: center; color: #666;'>Verification timestamp: <b>{scan_time_str}</b> | Match Criteria Limit: <b>$>= {TRIGGER_THRESH*100}\%$</b></p>
+            <p style='color: #c62828; font-size: 12px; text-align: center;'><i>Notice: False Breakout Traps have been filtered out. Only verified historical winners are reported.</i></p>
+            
+            <table style='width: 100%; border-collapse: collapse; margin-top: 20px;'>
+              <thead>
+                <tr style='background-color: #283593; color: #ffffff; text-align: left;'>
+                  <th style='padding: 12px;'>Asset</th>
+                  <th style='padding: 12px;'>Vector Type</th>
+                  <th style='padding: 12px;'>Confidence Space</th>
+                  <th style='padding: 12px;'>LTP</th>
+                  <th style='padding: 12px;'>Hist Benchmark</th>
+                  <th style='padding: 12px;'>Move Achieved</th>
+                  <th style='padding: 12px;'>Move Pending</th>
+                </tr>
+              </thead>
+              <tbody>
+                {html_rows}
+              </tbody>
+            </table>
+        </div>
+      </body>
+    </html>
+    """
+    
+    msg.attach(MIMEText(html_body, "html"))
+    
+    # Attach embedded raw image resources securely using unique Content-IDs
+    for cid, img_b in image_attachments:
+        img_part = MIMEImage(img_b, name=f"{cid}.png")
+        img_part.add_header('Content-ID', f"<{cid}>")
+        img_part.add_header('Content-Disposition', 'inline', filename=f"{cid}.png")
+        msg.attach(img_part)
+        
+    try:
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+            server.login(SENDER_EMAIL, SENDER_PASSWORD)
+            server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
+        logger.info(f"📬 Dispatched predictive breakout alert notification for {len(df_matrix)} assets.")
+    except Exception as e:
+        logger.error(f"Failed to transmit email analysis report: {e}")
+
+# =================================================================================================
+# 7. REVOLVING MASTER EXECUTION PIPELINE
+# =================================================================================================
 def fetch_fo_universe():
-    logger.info("Fetching Master F&O Universe...")
+    """Extracts base listing definitions from F&O market feeds."""
+    logger.info("Accessing live exchange F&O listing tables...")
     try:
         response = requests.get(FYERS_FO_MASTER_URL, timeout=15)
         df = pd.read_csv(StringIO(response.text), header=None)
@@ -140,374 +565,61 @@ def fetch_fo_universe():
             
         raw_symbols = df[symbol_col].astype(str).tolist()
         base_symbols = set()
-        
         for s in raw_symbols:
             match = re.search(r'NSE:([A-Z&\-]+)\d+', s)
-            if match: 
-                base_symbols.add(match.group(1))
-        
+            if match: base_symbols.add(match.group(1))
+            
         ignore_list = {'NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'}
         return sorted([f"NSE:{sym}-EQ" for sym in base_symbols - ignore_list])
     except Exception as e:
-        logger.error(f"Failed to fetch Universe: {e}")
+        logger.error(f"Failed to fetch F&O universe definition rows: {e}")
         return []
 
-
-# ==========================================
-# 3. MULTI-CHANNEL F&O 64-DIMENSIONAL HYPER-TENSOR ALLOCATOR
-# ==========================================
-def build_maximum_64d_hyper_tensor(multi_channel_canvas):
-    if multi_channel_canvas is None:
-        return None
-    target_shape = (1,) * 61 + multi_channel_canvas.shape
-    return multi_channel_canvas.reshape(target_shape)
-
-
-# ==========================================
-# 4. MULTI-CHANNEL F&O 1024x1024 GRID & TARGET CALCULATOR
-# ==========================================
-def calculate_breakout_targets(df_slice, ltp):
-    highs = df_slice['high'].values
-    lows = df_slice['low'].values
-    closes = df_slice['close'].values
-    
-    tr = np.maximum(highs[1:] - lows[1:], np.abs(highs[1:] - closes[:-1]))
-    atr = np.mean(tr) if len(tr) > 0 else (ltp * 0.01)
-    
-    resistance_span = highs.max() - lows.min()
-    
-    target_1 = ltp + (atr * 1.0) + (resistance_span * 0.15)
-    target_2 = ltp + (atr * 2.0) + (resistance_span * 0.30)
-    target_3 = ltp + (atr * 3.5) + (resistance_span * 0.50)
-    
-    return round(target_1, 2), round(target_2, 2), round(target_3, 2)
-
-
-def generate_multichannel_spatial_matrix(df_slice):
-    if df_slice is None or len(df_slice) < MACRO_WINDOW:
-        return None
-        
-    p_high = df_slice['high'].values.astype(np.float32)
-    p_low = df_slice['low'].values.astype(np.float32)
-    volume = df_slice['volume'].values.astype(np.float32)
-    
-    grid_height = 1024
-    grid_width = 1024
-    
-    canvas = np.zeros((grid_height, grid_width, 3), dtype=np.uint8)
-    
-    p_min, p_max = p_low.min(), p_high.max()
-    p_span = p_max - p_min if p_max > p_min else 1.0
-    
-    v_min, v_max = volume.min(), volume.max()
-    v_span = v_max - v_min if v_max > v_min else 1.0
-    
-    x_indices = np.linspace(0, grid_width - 1, len(df_slice)).astype(int)
-    tr = np.maximum(p_high[1:] - p_low[1:], np.abs(p_high[1:] - df_slice['close'].values[:-1]))
-    atr_val = np.mean(tr) if len(tr) > 0 else 1.0
-    
-    for idx, i in enumerate(x_indices):
-        h_val = p_high[idx]
-        l_val = p_low[idx]
-        v_val = volume[idx]
-        
-        y_top = int(grid_height * (1.0 - (h_val - p_min) / p_span))
-        y_bot = int(grid_height * (1.0 - (l_val - p_min) / p_span))
-        
-        y_top = np.clip(y_top, 0, grid_height - 1)
-        y_bot = np.clip(y_bot, 0, grid_height - 1)
-        if y_top > y_bot:
-            y_top, y_bot = y_bot, y_top
-            
-        canvas[y_top:y_bot+1, i, 0] = 220
-        vol_intensity = int(np.clip((v_val - v_min) / v_span * 255, 0, 255))
-        canvas[:, i, 1] = vol_intensity
-        canvas[grid_height - 128:grid_height, i, 2] = int(np.clip(atr_val / p_span * 255, 50, 255))
-
-    return canvas
-
-
-def compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str):
-    if multi_channel_img is None:
-        return None, 0.0, "N/A", None
-        
-    live_img_gray = cv2.cvtColor(multi_channel_img, cv2.COLOR_RGB2GRAY)
-    
-    # Store the Tensor instead of letting it vanish (Ready for ML prediction layer)
-    hyper_tensor = build_maximum_64d_hyper_tensor(multi_channel_img)
-
-    max_val = -1.0
-    matched_template_id = "N/A (Pending Blueprint Match)"
-    matched_template_bytes = None
-    
-    clean_sym = symbol.replace('NSE:', '').replace('-EQ', '')
-
-    # Safely create a local copy of templates for iteration to avoid thread collision
-    with TEMPLATE_LOCK:
-        current_templates = list(IN_MEMORY_SUCCESS_TEMPLATES)
-
-    if current_templates:
-        for template_item in current_templates:
-            try:
-                template = template_item['img']
-                t_id = template_item['id']
-                template_gray = cv2.cvtColor(template, cv2.COLOR_RGB2GRAY) if len(template.shape) == 3 else template
-                
-                if template_gray.shape != live_img_gray.shape:
-                    template_resized = cv2.resize(template_gray, (live_img_gray.shape[1], live_img_gray.shape[0]))
-                else:
-                    template_resized = template_gray
-                    
-                res = cv2.matchTemplate(live_img_gray, template_resized, cv2.TM_CCOEFF_NORMED)
-                _, val, _, _ = cv2.minMaxLoc(res)
-                
-                if val > max_val:
-                    max_val = val
-                    matched_template_id = f"SUCCESS_BLUEPRINT_{t_id}_spatial_1024.png"
-                    success_enc, enc_bytes = cv2.imencode('.png', template)
-                    matched_template_bytes = enc_bytes.tobytes() if success_enc else None
-            except Exception as e:
-                logger.debug(f"Template match error on {clean_sym}: {e}")
-                continue
-    else:
-        # Prevent division-by-zero math bug by returning early if no templates exist
-        logger.debug(f"No historical templates loaded. Skipping pattern match for {clean_sym}.")
-        return "AWAITING BLUEPRINTS", 0.0, "N/A", None
-
-    raw_score = (max_val + 1.0) / 2.0 if max_val != -1.0 else 0.0
-    match_score = float(round(max(0.0, min(1.0, raw_score)), 4))
-    
-    if match_score >= TRIGGER_THRESH:
-        state_status = "SUCCESS IMAGE MATRIX: BREAKOUT MATCH"
-        matched_template_id = f"SUCCESS_BLUEPRINT_{clean_sym}_spatial_1024.png"
-        
-        # Safely write to the global template list using the Thread Lock
-        with TEMPLATE_LOCK:
-            if len(IN_MEMORY_SUCCESS_TEMPLATES) < 50:
-                # Store the newly discovered live success pattern to hunt for future identical structures
-                existing_ids = [t['id'] for t in IN_MEMORY_SUCCESS_TEMPLATES]
-                if clean_sym not in existing_ids:
-                    IN_MEMORY_SUCCESS_TEMPLATES.append({'img': multi_channel_img, 'id': clean_sym})
-                    
-    elif match_score >= FUZZY_THRESH:
-        state_status = "FUZZY IMAGE ANCHOR: STRUCTURAL HOLD"
-    else:
-        if HUNT_MODE:
-            state_status = "HUNTING: SCANNING CONTINUATION/TRAP TEMPLATES"
-        else:
-            state_status = "TRAP MATRIX IMAGE: UNKNOWN GEOMETRY (EXIT)"
-            
-    return state_status, match_score, matched_template_id, matched_template_bytes
-
-
-# ==========================================
-# 5. SYMBOL SCANNER
-# ==========================================
-def process_symbol_spatial_scan(symbol, target_dt):
-    try:
-        CHUNK_SIZE_DAYS = 30
-        all_candles = []
-        current_end_date = target_dt
-        days_fetched = 0
-        
-        while days_fetched < LOOKBACK_DAYS:
-            chunk_start_date = current_end_date - timedelta(days=CHUNK_SIZE_DAYS)
-            payload = {
-                "symbol": symbol, "resolution": "1", "date_format": 1,
-                "range_from": chunk_start_date.strftime("%Y-%m-%d"),
-                "range_to": current_end_date.strftime("%Y-%m-%d"), "cont_flag": 1
-            }
-            time.sleep(0.08)  # API Rate limit respect
-            res = fyers.history(payload)
-            
-            if res and isinstance(res, dict) and 'candles' in res and len(res['candles']) > 0:
-                all_candles.extend(res['candles'])
-            else:
-                break
-            current_end_date = chunk_start_date
-            days_fetched += CHUNK_SIZE_DAYS
-
-        if not all_candles: 
-            return None
-            
-        df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-        df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True).dt.tz_convert("Asia/Kolkata")
-        df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
-        
-        df_filtered = df[df['timestamp'] <= target_dt]
-        if len(df_filtered) < MACRO_WINDOW:
-            return None
-            
-        rolling_slice = df_filtered.tail(MACRO_WINDOW)
-        timestamp_str = target_dt.strftime('%Y-%m-%d %H:%M:%S')
-        ltp = float(rolling_slice['close'].iloc[-1])
-        
-        t1, t2, t3 = calculate_breakout_targets(rolling_slice, ltp)
-        multi_channel_img = generate_multichannel_spatial_matrix(rolling_slice)
-        
-        state_status, match_score, success_matrix_ref, template_bytes = compare_images_and_execute_hunt(multi_channel_img, symbol, timestamp_str)
-        
-        # Only return meaningful data to keep reports clean
-        if match_score >= FUZZY_THRESH or "HUNTING" in state_status:
-            success, encoded_img = cv2.imencode('.png', multi_channel_img)
-            img_bytes = encoded_img.tobytes() if success else None
-            clean_symbol = symbol.replace('NSE:', '').replace('-EQ', '')
-            
-            return {
-                'Symbol': clean_symbol,
-                'LTP': ltp,
-                'Target_1': t1,
-                'Target_2': t2,
-                'Target_3': t3,
-                'Match_Score': match_score,
-                'State_Status': state_status,
-                'Success_Matrix_Ref': success_matrix_ref,
-                'Spatial_Image_Bytes': img_bytes,
-                'Matched_Template_Bytes': template_bytes
-            }
-        return None
-    except Exception as e:
-        logger.error(f"Error processing {symbol}: {e}")
-        return None
-
-
-# ==========================================
-# 6. HTML EMAIL DISPATCHER
-# ==========================================
-def send_html_email(df_matrix, target_dt):
-    if not SENDER_EMAIL or not RECIPIENT_EMAIL:
-        logger.warning("Email credentials missing. Skipping transmission.")
-        return
-        
-    fetch_time_str = target_dt.strftime('%d %b %Y, %I:%M %p')
-    
-    msg = MIMEMultipart()
-    msg['Subject'] = f"F&O 1024x1024 Spatial Matrix Report | {fetch_time_str}"
-    msg['From'] = SENDER_EMAIL
-    msg['To'] = RECIPIENT_EMAIL
-    
-    html_rows = ""
-    for _, row in df_matrix.iterrows():
-        is_breakout = "SUCCESS" in row['State_Status']
-        color = "#1b5e20" if is_breakout else ("#0d47a1" if "FUZZY" in row['State_Status'] else "#e65100")
-        
-        attachments_display = []
-        
-        if is_breakout and row.get('Spatial_Image_Bytes'):
-            live_att_name = f"{row['Symbol']}_spatial_1024.png"
-            img_part1 = MIMEImage(row['Spatial_Image_Bytes'], name=live_att_name)
-            img_part1.add_header('Content-Disposition', 'attachment', filename=live_att_name)
-            msg.attach(img_part1)
-            attachments_display.append(live_att_name)
-            
-        if is_breakout and row.get('Matched_Template_Bytes'):
-            ref_att_name = row['Success_Matrix_Ref']
-            img_part2 = MIMEImage(row['Matched_Template_Bytes'], name=ref_att_name)
-            img_part2.add_header('Content-Disposition', 'attachment', filename=ref_att_name)
-            msg.attach(img_part2)
-            attachments_display.append(ref_att_name)
-            
-        file_display = f"<b style='color:#1b5e20;'>{', '.join(attachments_display)} (Attached)</b>" if attachments_display else "<span style='color:#888;'>None (Filtered Out)</span>"
-            
-        html_rows += f"""<tr>
-            <td style='font-weight:bold; color:#1a73e8;'>{row['Symbol']}</td>
-            <td>₹{row['LTP']:.2f}</td>
-            <td style='color:#2e7d32; font-weight:bold;'>₹{row['Target_1']:.2f}</td>
-            <td style='color:#1565c0; font-weight:bold;'>₹{row['Target_2']:.2f}</td>
-            <td style='color:#6a1b9a; font-weight:bold;'>₹{row['Target_3']:.2f}</td>
-            <td><b>{row['Match_Score']*100:.1f}%</b></td>
-            <td style='color:{color}; font-weight:bold;'>{row['State_Status']}</td>
-            <td style='font-family:monospace; font-size:11px; color:#4527a0;'>{row['Success_Matrix_Ref']}</td>
-            <td style='text-align:center; font-family:monospace;'>{file_display}</td>
-        </tr>"""
-
-    html = f"""
-    <html>
-      <body style='font-family: Arial, sans-serif; background-color: #f7f9fc; padding: 20px;'>
-        <h2 style='color: #1a237e; text-align: center;'>🎯 F&O 1024x1024 DUAL ATTACHMENT BREAKOUT REPORT</h2>
-        <p style='text-align: center; color: #555;'>🕒 Scan Time: <b>{fetch_time_str}</b> | Lookback Backlog: <b>{LOOKBACK_DAYS} Days</b></p>
-        <p style='text-align: center; color: #555; font-size: 13px;'><i>Attachments included <b>ONLY</b> for SUCCESS BREAKOUT MATCHES.</i></p>
-        <table style='width: 100%; border-collapse: collapse; background: #fff; margin-top: 15px;'>
-          <tr style='background: #3949ab; color: white;'>
-            <th style='padding: 10px;'>Symbol</th>
-            <th style='padding: 10px;'>LTP</th>
-            <th style='padding: 10px;'>Target 1</th>
-            <th style='padding: 10px;'>Target 2</th>
-            <th style='padding: 10px;'>Target 3</th>
-            <th style='padding: 10px;'>Match %</th>
-            <th style='padding: 10px;'>Status</th>
-            <th style='padding: 10px;'>Success Matrix Image Ref</th>
-            <th style='padding: 10px; text-align:center;'>Attachments</th>
-          </tr>
-          {html_rows}
-        </table>
-      </body>
-    </html>
-    """
-    
-    msg.attach(MIMEText(html, "html"))
-    
-    try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(SENDER_EMAIL, SENDER_PASSWORD)
-            server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
-        logger.info("Email report sent successfully.")
-    except Exception as e:
-        logger.error(f"Email dispatch failed: {e}")
-
-
-# ==========================================
-# 7. MAIN ENGINE
-# ==========================================
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--date", help="YYYY-MM-DD")
-    parser.add_argument("--from_time", help="HH:MM")
-    parser.add_argument("--to_time", help="HH:MM")
-    parser.add_argument("--interval", type=int, default=60)
+    parser.add_argument("--date", help="Target processing date pattern formatted as YYYY-MM-DD")
     args = parser.parse_args()
     
-    # Bootstrap: Mathematically generate the breakout blueprint in RAM (Zero files)
-    load_historical_blueprints()
+    # Step 1: Initialize Database Structural Environment
+    initialize_spatial_database()
     
-    target_dt = pd.Timestamp.now(tz="Asia/Kolkata")
-    start_dt, end_dt = target_dt, target_dt
-    
-    if args.date and args.from_time and args.to_time:
-        start_dt = pd.to_datetime(f"{args.date} {args.from_time}").tz_localize("Asia/Kolkata")
-        end_dt = pd.to_datetime(f"{args.date} {args.to_time}").tz_localize("Asia/Kolkata")
-    elif args.date:
-        start_dt = pd.to_datetime(args.date).tz_localize("Asia/Kolkata")
-        end_dt = start_dt
-        
-    raw_symbols = fetch_fo_universe()
-    if not raw_symbols:
-        logger.error("No symbols found. Exiting.")
+    # Step 2: Resolve Listing Parameters
+    symbols = fetch_fo_universe()
+    if not symbols:
+        logger.error("Empty market tracking schema map. Shuttling down workspace.")
         return
         
-    current_dt = start_dt
-    while current_dt <= end_dt:
-        logger.info(f"Executing 1024x1024 Dual Attachment Scan for {current_dt.strftime('%I:%M %p')}...")
-        results = []
+    # Step 3: Run Database Asset Analysis Lifecycle Engine
+    if not check_database_state():
+        logger.info("⚠️ Spatial database not detected or contains no assets. Initiating full multi-timeframe historical profiling...")
+    else:
+        logger.info("🔄 Existing database identified. Initializing fast incremental delta synchronization sequence...")
         
-        with ThreadPoolExecutor(max_workers=4) as executor:
-            futures = {executor.submit(process_symbol_spatial_scan, sym, current_dt): sym for sym in raw_symbols}
-            for future in as_completed(futures):
-                res = future.result()
-                if res: results.append(res)
+    with ThreadPoolExecutor(max_workers=8) as profiler_executor:
+        profiler_executor.map(process_historical_profiling_permutations, symbols)
+    logger.info("✅ Database synchronization tracking window finalized.")
+    
+    # Step 4: Run Real-Time Matrix Engine Scanners
+    target_dt = pd.Timestamp.now(tz="Asia/Kolkata")
+    if args.date:
+        target_dt = pd.to_datetime(args.date).tz_localize("Asia/Kolkata")
+        
+    logger.info(f"⚡ Booting 64D Hyper-Tensor analysis sweep for target window: {target_dt.strftime('%Y-%m-%d %H:%M:%S')}...")
+    
+    live_signals = []
+    with ThreadPoolExecutor(max_workers=5) as scan_executor:
+        futures = {scan_executor.submit(process_live_scanning_sequence, sym, target_dt): sym for sym in symbols}
+        for future in as_completed(futures):
+            res = future.result()
+            if res:
+                live_signals.append(res)
                 
-        df_matrix = pd.DataFrame(results)
-        if not df_matrix.empty:
-            df_matrix = df_matrix.sort_values('Match_Score', ascending=False)
-            send_html_email(df_matrix, current_dt)
-        else:
-            logger.warning("No matches met the threshold for this scan interval.")
-            
-        current_dt += timedelta(minutes=args.interval)
-        if current_dt <= end_dt:
-            time.sleep(2)
-            
-    logger.info("Execution complete.")
+    # Step 5: Process Email Alert Filtering Rules
+    if live_signals:
+        df_matrix = pd.DataFrame(live_signals).sort_values('Match_Score', ascending=False)
+        dispatch_predictive_analysis_report(df_matrix, target_dt)
+    else:
+        logger.info("🔍 Scan complete: Zero setups met strict Success Matrix criteria for this tracking period.")
 
 if __name__ == "__main__":
     main()
