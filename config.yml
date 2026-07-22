@@ -1,6 +1,6 @@
 trading_engine:
   macro_window_min: 15
-  historical_traversal_lookback: "1 month"
-  live_lookback_days: 30
+  historical_traversal_lookback: "365"
+  live_lookback_days: 1
   correlation:
     initial_trigger_threshold: 0.95  # Strict 75% structural visual correlation required
