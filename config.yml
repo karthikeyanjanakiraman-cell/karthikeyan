@@ -1,17 +1,7 @@
 trading_engine:
-  base_resolution_min: 1
-  macro_window_min: 360
-  micro_xray_mins:
-    - 1
-    - 5
-    - 15
-    - 30
-    - 45
-    - 60
-    - 75
-    - 90
-    - 180
+  macro_window_min: 1
+  # Select dynamic historical lookback bounds: "1 year", "9 months", "6 months", "13 weeks"
+  historical_traversal_lookback: "1 year"
+  live_lookback_days: 30
   correlation:
-    initial_trigger_threshold: 0.95
-    fuzzy_hold_threshold: 0.90
-  hunt_mode_enabled: true
+    initial_trigger_threshold: 0.92
