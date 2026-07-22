@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v12.1 (X-Ray Diagnostic Edition)
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v12.2 (X-Ray + Bug Fix Edition)
 - Database Lifecycle: ALWAYS Rebuilds on boot to ensure freshest data
 - Resolution Scaling: 256x256 Matrix Compression
 - X-Ray Logging: Prints exact mathematical reasons for setup rejections
+- Symbol Match Fix: Database queries now perfectly match the F&O ticker format
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -182,7 +183,6 @@ def process_historical_profiling_permutations(symbol):
     for res in resolutions:
         df = fetch_historical_raw_data(symbol, res, total_days)
         if df is None or len(df) < (MACRO_WINDOW + 20):
-            # Only log daily resolution skips to avoid console spam
             if res == 'D': logger.debug(f"[{symbol} - {res}] Skipped: Insufficient data.")
             continue
             
@@ -210,7 +210,7 @@ def process_historical_profiling_permutations(symbol):
             max_forward_high = forward_horizon['high'].max()
             min_forward_low = forward_horizon['low'].min()
             
-            # 2. Check Breakout Direction (Next candle must clear the whole range)
+            # 2. Check Breakout Direction
             direction = "UP" if trigger_price > p_high_hist.max() else ("DOWN" if trigger_price < p_low_hist.min() else None)
             if not direction:
                 stats["fail_brkout"] += 1
@@ -228,7 +228,7 @@ def process_historical_profiling_permutations(symbol):
                     if f_row['close'] <= base_ltp: linear_periods += 1
                     else: break
                     
-            # 3. Save as Success (>= 4% move) or Trap
+            # 3. Save as Success or Trap
             matrix_type = "SUCCESS" if max_move_pct >= 4.0 else "TRAP"
             if matrix_type == "SUCCESS": stats["saved_success"] += 1
             else: stats["saved_trap"] += 1
@@ -276,11 +276,11 @@ def evaluate_live_market_matrix(symbol, live_canvas, current_dt):
     with DB_LOCK, sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         cursor = conn.cursor()
-        cursor.execute("SELECT * FROM spatial_blueprints WHERE symbol=?", (symbol.replace('NSE:', '').replace('-EQ', ''),))
+        # FIX: Directly use the symbol variable which perfectly matches the DB format (e.g., "NSE:CONCOR-EQ")
+        cursor.execute("SELECT * FROM spatial_blueprints WHERE symbol=?", (symbol,))
         blueprints = cursor.fetchall()
         
     if not blueprints:
-        # Silencing this specific log to avoid spamming 200 "No blueprint" lines per scan
         return None
         
     for bp in blueprints:
