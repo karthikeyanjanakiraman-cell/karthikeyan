@@ -1,4 +1,4 @@
-name: Email
+name: F&O Spatial Engine
 
 on:
   schedule:
@@ -46,14 +46,21 @@ jobs:
           python -m pip install --upgrade pip
           pip install fyers_apiv3 pandas numpy scipy ta yfinance PyYAML opencv-python-headless torch
 
-      - name: Download previous intraday DB (if exists)
-        uses: actions/download-artifact@v4
+      # ---------------------------------------------------------
+      # 1. RESTORE HEAVY SQLITE DB FROM GITHUB CLOUD CACHE
+      # ---------------------------------------------------------
+      - name: Restore Spatial Database Cache
+        uses: actions/cache/restore@v4
         with:
-          name: intraday-signals-db
-          path: .
-        continue-on-error: true
+          path: spatial_matrix_atlas.db
+          key: spatial-db-${{ github.run_id }}
+          restore-keys: |
+            spatial-db-
 
-      - name: Run Fyers v3 email script
+      # ---------------------------------------------------------
+      # 2. RUN THE ENGINE (Will operate in read-only DB mode if cache exists)
+      # ---------------------------------------------------------
+      - name: Run Spatial Engine Script
         env:
           CLIENT_ID:       ${{ secrets.CLIENT_ID }}
           SECRET_KEY:      ${{ secrets.SECRET_KEY }}
@@ -82,14 +89,20 @@ jobs:
             python EMAIL.py
           fi
 
-      - name: Upload intraday DB
+      # ---------------------------------------------------------
+      # 3. SAVE DB TO CACHE (Saves the initial build, rolls over otherwise)
+      # ---------------------------------------------------------
+      - name: Save Updated Spatial Database Cache
+        uses: actions/cache/save@v4
         if: always()
-        uses: actions/upload-artifact@v4
         with:
-          name: intraday-signals-db
-          path: intraday_signals.db
+          path: spatial_matrix_atlas.db
+          key: spatial-db-${{ github.run_id }}
 
-      - name: Commit updated DB and CSV
+      # ---------------------------------------------------------
+      # 4. COMMIT LIGHTWEIGHT LOGS/CSVS ONLY (Zero Repo Bloat)
+      # ---------------------------------------------------------
+      - name: Commit updated text logs/CSVs
         if: always()
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -98,12 +111,14 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git fetch origin main
           git pull --rebase origin main || true
-          if [ -f "intraday_signals.db" ]; then
-            git add intraday_signals.db
-          fi
+          
+          # Only add CSVs if your script generates them.
+          # Explicitly ignore tracking the binary .db file in git.
+          git add *.csv || true
+          
           if git diff --cached --quiet; then
-            echo "No DB/CSV changes to commit."
+            echo "No CSV changes to commit."
           else
-            git commit -m "Auto-update intraday SQLite DB and CSV [skip ci]" || true
+            git commit -m "Auto-update CSV logs [skip ci]" || true
             git push origin HEAD:main || echo "Push failed; skipping."
           fi
