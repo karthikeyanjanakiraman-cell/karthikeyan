@@ -1,6 +1,6 @@
 trading_engine:
   macro_window_min: 15
-  historical_traversal_lookback: "365 Days"
+  historical_traversal_lookback: "35 Days"
   live_lookback_days: 30
   correlation:
-    initial_trigger_threshold: 0.1
+    initial_trigger_threshold: 0.5
