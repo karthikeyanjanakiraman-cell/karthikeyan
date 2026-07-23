@@ -450,13 +450,24 @@ def dispatch_predictive_analysis_report(df_matrix, target_dt):
         img_part.add_header('Content-ID', f"<{cid}>")
         msg.attach(img_part)
         
+    # THE FIX: Dual-Protocol Self-Healing SMTP
     try:
-        context = smtplib.ssl.create_default_context() if hasattr(smtplib, 'ssl') else None
-        with smtplib.SMTP_SSL("smtp.gmail.com", SMTP_PORT) as server:
+        # First attempt: standard STARTTLS (Port 587)
+        with smtplib.SMTP("smtp.gmail.com", 587) as server:
+            server.starttls()
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
             server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
-        logger.info(f"📬 Alert dispatched for {len(df_matrix)} assets.")
-    except Exception as e: logger.error(f"Email failed: {e}")
+        logger.info(f"📬 Alert dispatched (via 587 TLS) for {len(df_matrix)} assets.")
+    except Exception as e: 
+        logger.warning(f"TLS Email failed ({e}). Attempting SSL fallback...")
+        try:
+            # Fallback attempt: Implicit SSL (Port 465)
+            with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+                server.login(SENDER_EMAIL, SENDER_PASSWORD)
+                server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
+            logger.info(f"📬 Alert dispatched (via 465 SSL) for {len(df_matrix)} assets.")
+        except Exception as ssl_e:
+            logger.error(f"❌ EMAIL CRASH: Both TLS and SSL protocols failed. {ssl_e}")
 
 def fetch_fo_universe():
     global UPSTOX_KEYS
