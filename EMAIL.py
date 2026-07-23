@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v15.0 (Ultimate Edition)
-- Hyper-Structure Generator: Injects VWAP gravity, 9-EMA momentum, and structural liquidity anchors.
-- Exhaustion Heatmaps: Detects liquidity sweeps and colors rejection wicks Yellow to filter traps.
-- 3D Tensor Matching: OpenCV directly compares 3-channel RGB arrays (bypassing grayscale data loss).
-- Upstox Native: Uses 1-Year Long-Lived Token, maps ISINs, and auto-reverses backward data streams.
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v15.1 (Institutional Edition)
+- Volatility Lock: Enforces a minimum 4% Y-Axis span so sideways markets aren't stretched.
+- Strict Pixel Penalty: OpenCV calculates absolute deviation, ignoring empty black backgrounds.
+- Self-Healing Network: Auto-routes between TLS (587) and SSL (465) to prevent email crashes.
+- Upstox Native: Uses 1-Year Token, maps ISINs, and intercepts raw HTTP block headers.
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -20,6 +20,7 @@ import argparse
 import smtplib
 import asyncio
 import aiohttp
+import urllib.parse
 from io import StringIO
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
@@ -61,7 +62,6 @@ UPSTOX_ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN", "")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "")
 SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD", "")
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "")
-SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 
 MAX_CONCURRENT_API_CALLS = 6
 API_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_API_CALLS)
@@ -99,7 +99,7 @@ def get_last_timestamp_from_db(symbol, timeframe):
     return None
 
 # =================================================================================================
-# 3. CORE MULTI-CHANNEL VISUAL SPATIAL MATRIX ENGINE
+# 3. CORE MULTI-CHANNEL VISUAL SPATIAL MATRIX ENGINE (Volatility Anchored)
 # =================================================================================================
 def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume):
     if len(p_high) < MACRO_WINDOW: return None
@@ -107,8 +107,23 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
     grid_h, grid_w = 256, 256 
     canvas = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)
     
-    p_min, p_max = p_low.min(), p_high.max()
-    p_span = p_max - p_min if p_max > p_min else 1.0
+    # 1. BASE CALCULATIONS
+    actual_min, actual_max = p_low.min(), p_high.max()
+    actual_span = actual_max - actual_min if actual_max > actual_min else 1.0
+    
+    # 2. THE VOLATILITY LOCK (Y-Axis Anchoring)
+    base_price = p_open[0] if p_open[0] > 0 else 1.0
+    min_required_span = base_price * 0.04 # Canvas must represent at least a 4% move
+    
+    if actual_span < min_required_span:
+        p_span = min_required_span
+        center_price = (actual_max + actual_min) / 2.0
+        p_max = center_price + (min_required_span / 2.0)
+        p_min = center_price - (min_required_span / 2.0)
+    else:
+        p_span = actual_span
+        p_max = actual_max
+        p_min = actual_min
     
     v_min, v_max = volume.min(), volume.max()
     v_avg = np.mean(volume) if np.mean(volume) > 0 else 1.0
@@ -120,7 +135,7 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
     num_candles = len(p_high)
     base_w = grid_w / num_candles
     
-    # 1. LIQUIDITY ANCHORS
+    # 3. LIQUIDITY ANCHORS
     anchor_idx = max(1, int(num_candles * 0.8))
     ch_high = p_high[:anchor_idx].max()
     ch_low = p_low[:anchor_idx].min()
@@ -128,34 +143,32 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
     ch_y = int(grid_h * (1.0 - (ch_high - p_min) / p_span))
     cl_y = int(grid_h * (1.0 - (ch_low - p_min) / p_span))
     
-    cv2.line(canvas, (0, ch_y), (grid_w, ch_y), (40, 40, 40), 1)
-    cv2.line(canvas, (0, cl_y), (grid_w, cl_y), (40, 40, 40), 1)
+    if 0 <= ch_y < grid_h: cv2.line(canvas, (0, ch_y), (grid_w, ch_y), (40, 40, 40), 1)
+    if 0 <= cl_y < grid_h: cv2.line(canvas, (0, cl_y), (grid_w, cl_y), (40, 40, 40), 1)
     
     prev_x = prev_vwap_y = prev_ema_y = None
     
     for idx in range(num_candles):
         x_center = int((idx + 0.5) * base_w)
         
-        o_y = int(grid_h * (1.0 - (p_open[idx] - p_min) / p_span))
-        h_y = int(grid_h * (1.0 - (p_high[idx] - p_min) / p_span))
-        l_y = int(grid_h * (1.0 - (p_low[idx] - p_min) / p_span))
-        c_y = int(grid_h * (1.0 - (p_close[idx] - p_min) / p_span))
-        vwap_y = int(grid_h * (1.0 - (vwap[idx] - p_min) / p_span))
-        ema_y = int(grid_h * (1.0 - (ema[idx] - p_min) / p_span))
+        # Clip Y-coordinates so wicks outside the min span don't crash OpenCV drawing logic
+        o_y = int(np.clip(grid_h * (1.0 - (p_open[idx] - p_min) / p_span), 0, grid_h - 1))
+        h_y = int(np.clip(grid_h * (1.0 - (p_high[idx] - p_min) / p_span), 0, grid_h - 1))
+        l_y = int(np.clip(grid_h * (1.0 - (p_low[idx] - p_min) / p_span), 0, grid_h - 1))
+        c_y = int(np.clip(grid_h * (1.0 - (p_close[idx] - p_min) / p_span), 0, grid_h - 1))
+        vwap_y = int(np.clip(grid_h * (1.0 - (vwap[idx] - p_min) / p_span), 0, grid_h - 1))
+        ema_y = int(np.clip(grid_h * (1.0 - (ema[idx] - p_min) / p_span), 0, grid_h - 1))
         
-        # Volume-Weighted Geometry 
         v_ratio = volume[idx] / v_avg
         dynamic_w = int(base_w * 0.45 * v_ratio)
         body_w = max(1, min(dynamic_w, int(base_w * 0.9))) 
         wick_w = max(1, int(base_w * 0.08))
             
-        # VWAP (Blue) and 9-EMA (Green)
         if prev_x is not None:
             cv2.line(canvas, (prev_x, prev_vwap_y), (x_center, vwap_y), (200, 0, 0), 2)  
             cv2.line(canvas, (prev_x, prev_ema_y), (x_center, ema_y), (0, 150, 0), 2)    
         prev_x, prev_vwap_y, prev_ema_y = x_center, vwap_y, ema_y
 
-        # Exhaustion Heatmap Wicks
         body_len = max(1, abs(p_close[idx] - p_open[idx]))
         top_price, bot_price = max(p_close[idx], p_open[idx]), min(p_close[idx], p_open[idx])
         
@@ -169,12 +182,10 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
         cv2.line(canvas, (x_center, h_y), (x_center, top_y), up_wick_color, wick_w)
         cv2.line(canvas, (x_center, bot_y), (x_center, l_y), dn_wick_color, wick_w)
         
-        # Candle Body
         if top_y == bot_y: bot_y += 1 
         body_intensity = 255 if p_close[idx] >= p_open[idx] else 60 
         cv2.rectangle(canvas, (x_center - body_w, top_y), (x_center + body_w, bot_y), (0, 0, body_intensity), -1)
 
-        # Volume Profile
         v_h = int(np.clip((volume[idx] - v_min) / (v_max - v_min) * 50, 1, 50)) if v_max > v_min else 1
         cv2.rectangle(canvas, (x_center - body_w, grid_h - v_h), (x_center + body_w, grid_h), (0, 100, 0), -1)
 
@@ -199,8 +210,10 @@ async def fetch_historical_raw_data_async(symbol, resolution, total_days_back, t
     
     instrument_key = UPSTOX_KEYS.get(symbol)
     if not instrument_key:
-        logger.error(f"[{symbol}] No Upstox Instrument Key found in mapping.")
         return None
+
+    # Encode ISIN pipe characters safely for URL insertion
+    encoded_key = urllib.parse.quote(instrument_key)
 
     all_candles = []
     days_fetched = 0
@@ -208,6 +221,7 @@ async def fetch_historical_raw_data_async(symbol, resolution, total_days_back, t
     
     headers = {
         'Accept': 'application/json',
+        'Api-Version': '2.0',
         'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}'
     }
     
@@ -217,25 +231,28 @@ async def fetch_historical_raw_data_async(symbol, resolution, total_days_back, t
             str_to = end_date.strftime("%Y-%m-%d")
             str_from = start_date.strftime("%Y-%m-%d")
             
-            url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{resolution}/{str_to}/{str_from}"
+            url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/{resolution}/{str_to}/{str_from}"
             
             success = False
             for attempt in range(4):
                 async with API_SEMAPHORE: 
                     try:
                         async with session.get(url, headers=headers) as response:
-                            res = await response.json()
+                            res_text = await response.text()
+                            
+                            try:
+                                res = await response.json()
+                            except Exception:
+                                res = {} 
                             
                             if response.status != 200 or res.get('status') == 'error':
-                                if attempt == 3:
-                                    err_msg = res.get('errors', [{}])[0].get('message', 'Unknown Error')
-                                    logger.error(f"❌ UPSTOX REJECTION [{symbol}]: {err_msg}")
-                                
-                                if response.status in [429, 403, 400]:
+                                if response.status in [429, 403]:
                                     await asyncio.sleep(2.5 * (attempt + 1))
                                     continue
-                                else:
-                                    break
+                                
+                                err_msg = res.get('errors', [{}])[0].get('message', 'No detailed message')
+                                logger.error(f"❌ UPSTOX BLOCK [{symbol}]: HTTP {response.status} | {err_msg} | Raw: {res_text[:60]}")
+                                break 
                                     
                             if 'data' in res and 'candles' in res['data'] and res['data']['candles']:
                                 all_candles.extend(res['data']['candles'])
@@ -245,23 +262,24 @@ async def fetch_historical_raw_data_async(symbol, resolution, total_days_back, t
                                 break 
                                 
                     except Exception as e:
-                        logger.error(f"💥 NETWORK/THREAD ERROR [{symbol}]: {e}")
+                        logger.error(f"💥 NETWORK ERROR [{symbol}]: {e}")
                         await asyncio.sleep(1)
                     
             if not success: 
-                if context == "LIVE":
-                    logger.warning(f"[{symbol}-{resolution}] Scan skipped: Data unavailable.")
                 break
                 
             end_date = start_date - timedelta(days=1)
             days_fetched += chunk_size
 
-    if not all_candles: return None
+    if not all_candles: 
+        if context == "LIVE":
+            logger.warning(f"[{symbol}-{resolution}] Scan skipped: Zero historical candles found on Upstox.")
+        return None
     
     df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     
-    # Chrono-correction: Reverse the native backward data stream from Upstox
+    # Chrono-correction
     df = df.sort_values('timestamp').reset_index(drop=True)
     df = df.drop_duplicates(subset=['timestamp'])
     
@@ -312,10 +330,9 @@ def _cpu_process_historical_data(symbol, res, df):
     return db_records
 
 # =================================================================================================
-# 5. LIVE HIERARCHICAL MATCHING ENGINE
+# 5. LIVE HIERARCHICAL MATCHING ENGINE (Strict Pixel Penalty)
 # =================================================================================================
 def _cpu_evaluate_live_market(symbol, live_canvas, res):
-    # TRUE 3D TENSOR MATCHING (No Grayscale Conversion)
     best_success_score, best_trap_score = 0.0, 0.0
     matched_blueprint_row = None
     
@@ -329,25 +346,38 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
         try:
             bp_img = cv2.imdecode(np.frombuffer(bp['image_blob'], dtype=np.uint8), cv2.IMREAD_COLOR)
             
-            # Match directly on the 3-Channel RGB matrix
+            # 1. Base Structural Correlation
             match_res = cv2.matchTemplate(live_canvas, bp_img, cv2.TM_CCOEFF_NORMED)
-            normalized_score = float(max(0.0, min(1.0, (cv2.minMaxLoc(match_res)[1] + 1.0) / 2.0)))
+            base_score = float(max(0.0, min(1.0, (cv2.minMaxLoc(match_res)[1] + 1.0) / 2.0)))
+            
+            # 2. STRICT PIXEL PENALTY
+            # Calculate absolute deviation directly on the color pixels, ignoring the black background
+            diff = cv2.absdiff(live_canvas, bp_img)
+            _, active_mask = cv2.threshold(cv2.cvtColor(bp_img, cv2.COLOR_RGB2GRAY), 1, 255, cv2.THRESH_BINARY)
+            active_pixel_count = cv2.countNonZero(active_mask)
+            
+            if active_pixel_count > 0:
+                error = np.sum(diff) / (active_pixel_count * 255.0 * 3.0) 
+                strict_score = max(0.0, base_score - (error * 1.5))
+            else:
+                strict_score = base_score
             
             if bp['matrix_type'] == 'SUCCESS':
-                if normalized_score > best_success_score:
-                    best_success_score = normalized_score
+                if strict_score > best_success_score:
+                    best_success_score = strict_score
                     matched_blueprint_row = bp
             else:
-                if normalized_score > best_trap_score:
-                    best_trap_score = normalized_score
+                if strict_score > best_trap_score:
+                    best_trap_score = strict_score
         except Exception: continue
 
     if best_success_score < TRIGGER_THRESH: return None
+    
     if best_success_score <= (best_trap_score + MATCH_MARGIN):
         logger.info(f"   -> FILTERED: {symbol} Trap ({best_trap_score:.3f}) neutralized Success ({best_success_score:.3f}).")
         return None
 
-    logger.info(f"🚀 [{symbol}-{res}] PASSED ALL FILTERS! Target locked.")
+    logger.info(f"🚀 [{symbol}-{res}] PASSED STRICT FILTERS! Target locked. (Score: {best_success_score:.3f})")
     return {
         'Symbol': symbol,
         'Direction': matched_blueprint_row['direction'],
@@ -360,7 +390,7 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
     }
 
 async def process_live_scanning_sequence_async(symbol, target_dt):
-    resolutions = ['day']
+    resolutions = ['30minute', 'day']
     loop = asyncio.get_running_loop()
     
     for res in resolutions:
@@ -450,9 +480,8 @@ def dispatch_predictive_analysis_report(df_matrix, target_dt):
         img_part.add_header('Content-ID', f"<{cid}>")
         msg.attach(img_part)
         
-    # THE FIX: Dual-Protocol Self-Healing SMTP
     try:
-        # First attempt: standard STARTTLS (Port 587)
+        # Fallback Dual-Protocol SMTP Routing
         with smtplib.SMTP("smtp.gmail.com", 587) as server:
             server.starttls()
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
@@ -461,7 +490,6 @@ def dispatch_predictive_analysis_report(df_matrix, target_dt):
     except Exception as e: 
         logger.warning(f"TLS Email failed ({e}). Attempting SSL fallback...")
         try:
-            # Fallback attempt: Implicit SSL (Port 465)
             with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
                 server.login(SENDER_EMAIL, SENDER_PASSWORD)
                 server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
@@ -486,8 +514,6 @@ def fetch_fo_universe():
         logger.info(f"Extracted {len(fo_names)} target F&O symbols. Downloading Upstox Master...")
 
         df_upstox = pd.read_csv("https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz")
-        
-        # Maps using the immutable Instrument Key prefix to prevent Upstox backend changes from breaking the script
         eq_df = df_upstox[df_upstox['instrument_key'].astype(str).str.startswith('NSE_EQ|')]
         
         for _, row in eq_df.iterrows():
