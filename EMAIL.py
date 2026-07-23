@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v15.1 (Institutional Edition)
-- Volatility Lock: Enforces a minimum 4% Y-Axis span so sideways markets aren't stretched.
-- Strict Pixel Penalty: OpenCV calculates absolute deviation, ignoring empty black backgrounds.
-- Self-Healing Network: Auto-routes between TLS (587) and SSL (465) to prevent email crashes.
-- Upstox Native: Uses 1-Year Token, maps ISINs, and intercepts raw HTTP block headers.
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE (ULTRA-HD EDITION)
+- 1024x1024 Tensor Canvas: Maximum possible spatial definition for pattern geometry.
+- Elastic Spatial Core: Slides a 896x896 core pattern to perfectly align market variance.
+- HD Anti-Aliasing & Gaussian Smoothing: Eliminates brittle pixel-to-pixel mismatches.
+- 30-Candle Horizon: Deepened market context to ensure higher reliability breakouts.
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -51,7 +51,8 @@ except FileNotFoundError:
     logger.warning("config.yml not found. Using optimal production defaults.")
     cfg = {}
 
-MACRO_WINDOW = cfg.get("macro_window_min", 15)
+# UPGRADED: 30-Candle default horizon for deeper HD context
+MACRO_WINDOW = cfg.get("macro_window_min", 30)
 HIST_TRAVERSAL_LOOKBACK = cfg.get("historical_traversal_lookback", "1 month")
 LIVE_LOOKBACK_DAYS = cfg.get("live_lookback_days", 30)
 TRIGGER_THRESH = cfg.get("correlation", {}).get("initial_trigger_threshold", 0.75)
@@ -99,21 +100,20 @@ def get_last_timestamp_from_db(symbol, timeframe):
     return None
 
 # =================================================================================================
-# 3. CORE MULTI-CHANNEL VISUAL SPATIAL MATRIX ENGINE (Volatility Anchored)
+# 3. CORE MULTI-CHANNEL VISUAL SPATIAL MATRIX ENGINE (1024x1024 ULTRA-HD)
 # =================================================================================================
 def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume):
     if len(p_high) < MACRO_WINDOW: return None
         
-    grid_h, grid_w = 256, 256 
+    # ULTRA-HD RESOLUTION
+    grid_h, grid_w = 1024, 1024 
     canvas = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)
     
-    # 1. BASE CALCULATIONS
     actual_min, actual_max = p_low.min(), p_high.max()
     actual_span = actual_max - actual_min if actual_max > actual_min else 1.0
     
-    # 2. THE VOLATILITY LOCK (Y-Axis Anchoring)
     base_price = p_open[0] if p_open[0] > 0 else 1.0
-    min_required_span = base_price * 0.04 # Canvas must represent at least a 4% move
+    min_required_span = base_price * 0.04 
     
     if actual_span < min_required_span:
         p_span = min_required_span
@@ -135,7 +135,6 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
     num_candles = len(p_high)
     base_w = grid_w / num_candles
     
-    # 3. LIQUIDITY ANCHORS
     anchor_idx = max(1, int(num_candles * 0.8))
     ch_high = p_high[:anchor_idx].max()
     ch_low = p_low[:anchor_idx].min()
@@ -143,15 +142,15 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
     ch_y = int(grid_h * (1.0 - (ch_high - p_min) / p_span))
     cl_y = int(grid_h * (1.0 - (ch_low - p_min) / p_span))
     
-    if 0 <= ch_y < grid_h: cv2.line(canvas, (0, ch_y), (grid_w, ch_y), (40, 40, 40), 1)
-    if 0 <= cl_y < grid_h: cv2.line(canvas, (0, cl_y), (grid_w, cl_y), (40, 40, 40), 1)
+    # ULTRA-HD: Thicken anchor lines to 3px
+    if 0 <= ch_y < grid_h: cv2.line(canvas, (0, ch_y), (grid_w, ch_y), (40, 40, 40), 3, cv2.LINE_AA)
+    if 0 <= cl_y < grid_h: cv2.line(canvas, (0, cl_y), (grid_w, cl_y), (40, 40, 40), 3, cv2.LINE_AA)
     
     prev_x = prev_vwap_y = prev_ema_y = None
     
     for idx in range(num_candles):
         x_center = int((idx + 0.5) * base_w)
         
-        # Clip Y-coordinates so wicks outside the min span don't crash OpenCV drawing logic
         o_y = int(np.clip(grid_h * (1.0 - (p_open[idx] - p_min) / p_span), 0, grid_h - 1))
         h_y = int(np.clip(grid_h * (1.0 - (p_high[idx] - p_min) / p_span), 0, grid_h - 1))
         l_y = int(np.clip(grid_h * (1.0 - (p_low[idx] - p_min) / p_span), 0, grid_h - 1))
@@ -162,11 +161,13 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
         v_ratio = volume[idx] / v_avg
         dynamic_w = int(base_w * 0.45 * v_ratio)
         body_w = max(1, min(dynamic_w, int(base_w * 0.9))) 
-        wick_w = max(1, int(base_w * 0.08))
+        # ULTRA-HD: Thicken wicks to minimum 3px
+        wick_w = max(3, int(base_w * 0.08)) 
             
         if prev_x is not None:
-            cv2.line(canvas, (prev_x, prev_vwap_y), (x_center, vwap_y), (200, 0, 0), 2)  
-            cv2.line(canvas, (prev_x, prev_ema_y), (x_center, ema_y), (0, 150, 0), 2)    
+            # ULTRA-HD: Thicken VWAP and EMA to 5px
+            cv2.line(canvas, (prev_x, prev_vwap_y), (x_center, vwap_y), (200, 0, 0), 5, cv2.LINE_AA)  
+            cv2.line(canvas, (prev_x, prev_ema_y), (x_center, ema_y), (0, 150, 0), 5, cv2.LINE_AA)    
         prev_x, prev_vwap_y, prev_ema_y = x_center, vwap_y, ema_y
 
         body_len = max(1, abs(p_close[idx] - p_open[idx]))
@@ -179,14 +180,16 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
         dn_wick_color = (0, 255, 255) if (lower_wick_len > body_len * 2) else (0, 0, 150)
         
         top_y, bot_y = min(o_y, c_y), max(o_y, c_y)
-        cv2.line(canvas, (x_center, h_y), (x_center, top_y), up_wick_color, wick_w)
-        cv2.line(canvas, (x_center, bot_y), (x_center, l_y), dn_wick_color, wick_w)
+        
+        cv2.line(canvas, (x_center, h_y), (x_center, top_y), up_wick_color, wick_w, cv2.LINE_AA)
+        cv2.line(canvas, (x_center, bot_y), (x_center, l_y), dn_wick_color, wick_w, cv2.LINE_AA)
         
         if top_y == bot_y: bot_y += 1 
         body_intensity = 255 if p_close[idx] >= p_open[idx] else 60 
         cv2.rectangle(canvas, (x_center - body_w, top_y), (x_center + body_w, bot_y), (0, 0, body_intensity), -1)
 
-        v_h = int(np.clip((volume[idx] - v_min) / (v_max - v_min) * 50, 1, 50)) if v_max > v_min else 1
+        # ULTRA-HD: Scaled volume profile height to 200px max
+        v_h = int(np.clip((volume[idx] - v_min) / (v_max - v_min) * 200, 1, 200)) if v_max > v_min else 1
         cv2.rectangle(canvas, (x_center - body_w, grid_h - v_h), (x_center + body_w, grid_h), (0, 100, 0), -1)
 
     return canvas
@@ -212,7 +215,6 @@ async def fetch_historical_raw_data_async(symbol, resolution, total_days_back, t
     if not instrument_key:
         return None
 
-    # Encode ISIN pipe characters safely for URL insertion
     encoded_key = urllib.parse.quote(instrument_key)
 
     all_candles = []
@@ -279,7 +281,6 @@ async def fetch_historical_raw_data_async(symbol, resolution, total_days_back, t
     df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
     df['timestamp'] = pd.to_datetime(df['timestamp'])
     
-    # Chrono-correction
     df = df.sort_values('timestamp').reset_index(drop=True)
     df = df.drop_duplicates(subset=['timestamp'])
     
@@ -330,7 +331,7 @@ def _cpu_process_historical_data(symbol, res, df):
     return db_records
 
 # =================================================================================================
-# 5. LIVE HIERARCHICAL MATCHING ENGINE (Strict Pixel Penalty)
+# 5. LIVE HIERARCHICAL MATCHING ENGINE (Spatial Sliding Core)
 # =================================================================================================
 def _cpu_evaluate_live_market(symbol, live_canvas, res):
     best_success_score, best_trap_score = 0.0, 0.0
@@ -342,33 +343,29 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
         
     if not blueprints: return None
         
+    # ULTRA-HD: Massive 9x9 Gaussian Blur to force geometric relationship matching
+    live_blur = cv2.GaussianBlur(live_canvas, (9, 9), 0)
+        
     for bp in blueprints:
         try:
             bp_img = cv2.imdecode(np.frombuffer(bp['image_blob'], dtype=np.uint8), cv2.IMREAD_COLOR)
+            bp_blur = cv2.GaussianBlur(bp_img, (9, 9), 0)
             
-            # 1. Base Structural Correlation
-            match_res = cv2.matchTemplate(live_canvas, bp_img, cv2.TM_CCOEFF_NORMED)
-            base_score = float(max(0.0, min(1.0, (cv2.minMaxLoc(match_res)[1] + 1.0) / 2.0)))
+            # ULTRA-HD: 64-pixel slide margin allows massive convolution across variance
+            crop_margin = 64
+            bp_core = bp_blur[crop_margin:-crop_margin, crop_margin:-crop_margin]
             
-            # 2. STRICT PIXEL PENALTY
-            # Calculate absolute deviation directly on the color pixels, ignoring the black background
-            diff = cv2.absdiff(live_canvas, bp_img)
-            _, active_mask = cv2.threshold(cv2.cvtColor(bp_img, cv2.COLOR_RGB2GRAY), 1, 255, cv2.THRESH_BINARY)
-            active_pixel_count = cv2.countNonZero(active_mask)
-            
-            if active_pixel_count > 0:
-                error = np.sum(diff) / (active_pixel_count * 255.0 * 3.0) 
-                strict_score = max(0.0, base_score - (error * 1.5))
-            else:
-                strict_score = base_score
+            match_res = cv2.matchTemplate(live_blur, bp_core, cv2.TM_CCOEFF_NORMED)
+            _, max_val, _, _ = cv2.minMaxLoc(match_res)
+            score = float(max(0.0, min(1.0, max_val)))
             
             if bp['matrix_type'] == 'SUCCESS':
-                if strict_score > best_success_score:
-                    best_success_score = strict_score
+                if score > best_success_score:
+                    best_success_score = score
                     matched_blueprint_row = bp
             else:
-                if strict_score > best_trap_score:
-                    best_trap_score = strict_score
+                if score > best_trap_score:
+                    best_trap_score = score
         except Exception: continue
 
     if best_success_score < TRIGGER_THRESH: return None
@@ -377,7 +374,7 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
         logger.info(f"   -> FILTERED: {symbol} Trap ({best_trap_score:.3f}) neutralized Success ({best_success_score:.3f}).")
         return None
 
-    logger.info(f"🚀 [{symbol}-{res}] PASSED STRICT FILTERS! Target locked. (Score: {best_success_score:.3f})")
+    logger.info(f"🚀 [{symbol}-{res}] PASSED ELASTIC SLIDING FILTER! Target locked. (Score: {best_success_score:.3f})")
     return {
         'Symbol': symbol,
         'Direction': matched_blueprint_row['direction'],
@@ -466,8 +463,9 @@ def dispatch_predictive_analysis_report(df_matrix, target_dt):
         </tr>
         <tr>
             <td colspan='7' style='padding: 15px; text-align: center;'>
-                <img src="cid:{live_cid}" width="256" height="256" style='border: 1px solid #ccc; margin-right: 10px;' />
-                <img src="cid:{bp_cid}" width="256" height="256" style='border: 1px solid #ccc;' />
+                <!-- HTML bounds kept at 400x400 to prevent mobile layout breaking, while serving 1024x1024 high-res source -->
+                <img src="cid:{live_cid}" width="400" height="400" style='border: 1px solid #ccc; margin-right: 10px;' />
+                <img src="cid:{bp_cid}" width="400" height="400" style='border: 1px solid #ccc;' />
             </td>
         </tr>
         """
@@ -481,7 +479,6 @@ def dispatch_predictive_analysis_report(df_matrix, target_dt):
         msg.attach(img_part)
         
     try:
-        # Fallback Dual-Protocol SMTP Routing
         with smtplib.SMTP("smtp.gmail.com", 587) as server:
             server.starttls()
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
