@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v13.0 (Async + Delta Updates)
-- Asyncio Network Pipeline: Bypasses API blocking; Semaphore limits concurrent requests.
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v13.5
+- Native AIOHTTP Pipeline: Bypasses SDK thread collisions for flawless asynchronous fetching.
 - Delta-Update DB Engine: Never rebuilds from scratch. Only processes new candles (99% faster).
 - Native Resolution Canvas: Renders directly at 256x256, eliminating massive CPU resize loads.
 - SQLite WAL Mode: Unlocks thread contention, allowing instant concurrent database writes.
@@ -19,6 +19,7 @@ import logging
 import argparse
 import smtplib
 import asyncio
+import aiohttp
 from io import StringIO
 from datetime import datetime, timedelta
 from email.mime.multipart import MIMEMultipart
@@ -30,7 +31,6 @@ import cv2
 import numpy as np
 import pandas as pd
 import requests
-from fyers_apiv3 import fyersModel
 
 # =================================================================================================
 # 1. ENVIRONMENT & STACK INITIALIZATION
@@ -70,18 +70,15 @@ API_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_API_CALLS)
 DATA_CACHE = {} 
 CPU_EXECUTOR = ThreadPoolExecutor(max_workers=os.cpu_count() or 4)
 
-fyers = fyersModel.FyersModel(client_id=CLIENT_ID, token=ACCESS_TOKEN, is_async=False, log_path="")
-
 # =================================================================================================
 # 2. ASYNC LOCAL DATA STORAGE MANAGEMENT
 # =================================================================================================
 async def initialize_spatial_database():
     def _init():
         with sqlite3.connect(DB_PATH) as conn:
-            # FIX: Enable WAL mode for high-speed concurrent thread writing
             conn.execute("PRAGMA journal_mode = WAL;")
             conn.execute("PRAGMA synchronous = NORMAL;")
-            conn.execute("PRAGMA cache_size = -10000;") # 10MB memory cache
+            conn.execute("PRAGMA cache_size = -10000;") 
             
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS spatial_blueprints (
@@ -110,7 +107,6 @@ def get_last_timestamp_from_db(symbol, timeframe):
 def generate_multichannel_spatial_matrix(p_high, p_low, p_close, volume):
     if len(p_high) < MACRO_WINDOW: return None
         
-    # FIX: Render directly at target resolution (40x faster than 1024x1024)
     grid_h, grid_w = 256, 256 
     canvas = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)
     
@@ -140,7 +136,7 @@ def generate_multichannel_spatial_matrix(p_high, p_low, p_close, volume):
     return canvas
 
 # =================================================================================================
-# 4. ASYNC HISTORICAL PROFILER & DATA INGESTION
+# 4. ASYNC HISTORICAL PROFILER & NATIVE AIOHTTP DATA INGESTION
 # =================================================================================================
 def parse_traversal_window(window_str):
     clean = window_str.lower().strip()
@@ -153,46 +149,60 @@ def parse_traversal_window(window_str):
 
 async def fetch_historical_raw_data_async(symbol, resolution, total_days_back, target_end_dt=None, context="HIST"):
     end_date = target_end_dt if target_end_dt else pd.Timestamp.now(tz="Asia/Kolkata")
-    
     cache_key = f"{symbol}_{resolution}_{total_days_back}_{end_date.strftime('%Y-%m-%d_%H')}"
-    if cache_key in DATA_CACHE:
-        return DATA_CACHE[cache_key]
+    if cache_key in DATA_CACHE: return DATA_CACHE[cache_key]
 
     all_candles = []
     days_fetched = 0
     chunk_size = 30 if resolution != 'D' else 365
-    loop = asyncio.get_running_loop()
     
-    while days_fetched < total_days_back:
-        start_date = end_date - timedelta(days=chunk_size)
-        payload = {
-            "symbol": symbol, "resolution": resolution, "date_format": 1,
-            "range_from": start_date.strftime("%Y-%m-%d"), "range_to": end_date.strftime("%Y-%m-%d"),
-            "cont_flag": 1
-        }
-        
-        success = False
-        for attempt in range(4):
-            async with API_SEMAPHORE: 
-                try:
-                    res = await loop.run_in_executor(CPU_EXECUTOR, fyers.history, payload)
-                    if isinstance(res, dict) and res.get('s') == 'error':
-                        if res.get('code') in [429, 403, 400]:
-                            await asyncio.sleep(2.5 * (attempt + 1))
-                            continue
-                    if res and isinstance(res, dict) and 'candles' in res and len(res['candles']) > 0:
-                        all_candles.extend(res['candles'])
-                        success = True
-                        break
-                    else: break
-                except Exception:
-                    await asyncio.sleep(1)
+    url = "https://api-t1.fyers.in/data/history"
+    headers = {"Authorization": f"{CLIENT_ID}:{ACCESS_TOKEN}"}
+    
+    async with aiohttp.ClientSession() as session:
+        while days_fetched < total_days_back:
+            start_date = end_date - timedelta(days=chunk_size)
+            payload = {
+                "symbol": symbol, "resolution": resolution, "date_format": "1",
+                "range_from": start_date.strftime("%Y-%m-%d"), "range_to": end_date.strftime("%Y-%m-%d"),
+                "cont_flag": "1"
+            }
+            
+            success = False
+            for attempt in range(4):
+                async with API_SEMAPHORE: 
+                    try:
+                        async with session.get(url, params=payload, headers=headers) as response:
+                            res = await response.json()
+                            
+                            if res.get('s') == 'error':
+                                if attempt == 3:
+                                    logger.error(f"❌ FYERS SERVER REJECTION [{symbol}]: {res.get('message', 'Unknown Error')}")
+                                
+                                if res.get('code') in [429, 403, 400, -300]:
+                                    await asyncio.sleep(2.5 * (attempt + 1))
+                                    continue
+                                else:
+                                    break
+                                    
+                            if 'candles' in res and res['candles']:
+                                all_candles.extend(res['candles'])
+                                success = True
+                                break
+                            else:
+                                break 
+                                
+                    except Exception as e:
+                        logger.error(f"💥 NETWORK/THREAD ERROR [{symbol}]: {e}")
+                        await asyncio.sleep(1)
+                    
+            if not success: 
+                if context == "LIVE":
+                    logger.warning(f"[{symbol}-{resolution}] Scan skipped: Data unavailable.")
+                break
                 
-        if not success and context == "LIVE":
-             logger.warning(f"[{symbol}-{resolution}] Scan skipped: FYERS API failure.")
-             
-        end_date = start_date
-        days_fetched += chunk_size
+            end_date = start_date
+            days_fetched += chunk_size
 
     if not all_candles: return None
     df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
@@ -203,7 +213,6 @@ async def fetch_historical_raw_data_async(symbol, resolution, total_days_back, t
     return df
 
 def _cpu_process_historical_data(symbol, res, df):
-    """CPU Bound: Extracts numpy arrays once, avoiding pandas loops."""
     if len(df) < (MACRO_WINDOW + 20): return []
     
     closes, highs, lows, volumes = df['close'].values, df['high'].values, df['low'].values, df['volume'].values
@@ -278,7 +287,6 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
         except Exception: continue
 
     if best_success_score < TRIGGER_THRESH: return None
-    # FIX: Trap Margin to prevent 1.000 score collisions
     if best_success_score <= (best_trap_score + MATCH_MARGIN):
         logger.info(f"   -> FILTERED: {symbol} Trap ({best_trap_score:.3f}) neutralized Success ({best_success_score:.3f}).")
         return None
@@ -300,11 +308,9 @@ async def process_live_scanning_sequence_async(symbol, target_dt):
     loop = asyncio.get_running_loop()
     
     for res in resolutions:
-        # 1. Fetch 30 days of data once
         df = await fetch_historical_raw_data_async(symbol, res, LIVE_LOOKBACK_DAYS, target_end_dt=target_dt, context="LIVE")
         if df is None or len(df) < MACRO_WINDOW + 20: continue
             
-        # 2. DELTA-UPDATE (Continuous Learning): Find the last DB entry and only process NEW candles
         last_known_time = get_last_timestamp_from_db(symbol, res)
         historical_df = df if last_known_time is None else df[df['timestamp'] > last_known_time]
         
@@ -321,7 +327,6 @@ async def process_live_scanning_sequence_async(symbol, target_dt):
                             """, records)
                     await loop.run_in_executor(CPU_EXECUTOR, _batch_insert)
         
-        # 3. LIVE SCAN: Evaluate the single most recent macro window
         r_slice = df.tail(MACRO_WINDOW)
         ltp = float(r_slice['close'].iloc[-1])
         
@@ -410,7 +415,6 @@ def fetch_fo_universe():
 async def execute_engine_pass_async(target_dt, symbols):
     logger.info(f"⚡ Booting sweep for target window: {target_dt.strftime('%H:%M:%S')}")
     
-    # Run async scan for all symbols concurrently, bounded by the Semaphore
     tasks = [process_live_scanning_sequence_async(sym, target_dt) for sym in symbols]
     results = await asyncio.gather(*tasks)
     
@@ -431,7 +435,6 @@ async def async_main():
     parser.add_argument("--seed_history", action="store_true", help="Force rebuild 1-year history")
     args = parser.parse_args()
     
-    # 1. Delta Update logic: We NO LONGER wipe the database. It persists.
     if args.seed_history and os.path.exists(DB_PATH):
         os.remove(DB_PATH)
         logger.info("🗑️ --seed_history passed. Wiped DB for fresh build.")
@@ -440,7 +443,6 @@ async def async_main():
     symbols = fetch_fo_universe()
     if not symbols: return
     
-    # 2. Only run the deep historical profiler if explicitly asked
     if args.seed_history:
         logger.info("⚙️ Initiating 1-year deep historical profiling...")
         loop = asyncio.get_running_loop()
@@ -458,7 +460,6 @@ async def async_main():
                 conn.executemany("INSERT OR IGNORE INTO spatial_blueprints (symbol, timeframe, direction, matrix_type, image_blob, hist_max_move_pct, hist_linear_periods, detected_timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", flat_records)
         logger.info("✅ Deep database generation finalized.")
         
-    # 3. Standard Live Scan Loop
     if args.date and args.from_time and args.to_time:
         start_dt = pd.to_datetime(f"{args.date} {args.from_time}").tz_localize("Asia/Kolkata")
         end_dt = pd.to_datetime(f"{args.date} {args.to_time}").tz_localize("Asia/Kolkata")
