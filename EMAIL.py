@@ -360,7 +360,7 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
     }
 
 async def process_live_scanning_sequence_async(symbol, target_dt):
-    resolutions = ['30minute', 'day']
+    resolutions = ['day']
     loop = asyncio.get_running_loop()
     
     for res in resolutions:
