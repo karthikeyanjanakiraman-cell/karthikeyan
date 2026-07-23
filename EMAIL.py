@@ -410,25 +410,31 @@ def dispatch_predictive_analysis_report(df_matrix, target_dt):
         logger.info(f"📬 Alert dispatched for {len(df_matrix)} assets.")
     except Exception as e: logger.error(f"Email failed: {e}")
 
-
 def fetch_fo_universe():
     global UPSTOX_KEYS
     logger.info("Fetching F&O Base List & Mapping to Upstox ISINs...")
     try:
+        # 1. Grab raw F&O list to know which ones we actually care about
         res_fyers = requests.get("https://public.fyers.in/sym_details/NSE_FO.csv", timeout=15)
         df_fyers = pd.read_csv(StringIO(res_fyers.text), header=None)
         sym_col = next((col for col in df_fyers.columns if df_fyers[col].astype(str).str.startswith('NSE:').any()), None)
-        if sym_col is None: return []
+        if sym_col is None: 
+            logger.error("Could not find symbol column in Fyers CSV")
+            return []
         
         base_symbols = {re.search(r'NSE:([A-Z&\-]+)\d+', s).group(1) for s in df_fyers[sym_col].astype(str) if re.search(r'NSE:([A-Z&\-]+)\d+', s)}
         fo_names = base_symbols - {'NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'}
+        
+        logger.info(f"Extracted {len(fo_names)} target F&O symbols. Downloading Upstox Master...")
 
-        logger.info("Downloading Upstox Master Contract File (mapping names)...")
+        # 2. Download Upstox Master CSV mapping
         df_upstox = pd.read_csv("https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz")
         
-        eq_df = df_upstox[df_upstox['instrument_type'] == 'EQ']
+        # 3. CRITICAL FIX: Filter by the immutable instrument_key prefix instead of instrument_type
+        eq_df = df_upstox[df_upstox['instrument_key'].astype(str).str.startswith('NSE_EQ|')]
+        
         for _, row in eq_df.iterrows():
-            ts = str(row['tradingsymbol'])
+            ts = str(row['tradingsymbol']).strip()
             if ts in fo_names:
                 UPSTOX_KEYS[ts] = row['instrument_key']
 
@@ -439,6 +445,7 @@ def fetch_fo_universe():
     except Exception as e:
         logger.error(f"Failed to map Upstox F&O universe: {e}")
         return []
+
 
 async def execute_engine_pass_async(target_dt, symbols):
     logger.info(f"⚡ Booting sweep for target window: {target_dt.strftime('%H:%M:%S')}")
