@@ -22,6 +22,11 @@ on:
         description: 'Batch Step Interval in mins.'
         required: false
         default: '60'
+      seed_history:
+        description: 'Check to WIPE DB and force 1-year historical rebuild.'
+        type: boolean
+        required: false
+        default: false
 
 jobs:
   run-strategy:
@@ -39,9 +44,10 @@ jobs:
           python-version: "3.11"
 
       - name: Install dependencies
+        # Removed heavy Fyers/Torch dependencies to speed up boot time by ~40s
         run: |
           python -m pip install --upgrade pip
-          pip install fyers_apiv3 pandas numpy scipy ta yfinance PyYAML opencv-python-headless torch aiohttp
+          pip install pandas numpy opencv-python-headless aiohttp requests PyYAML
 
       # ---------------------------------------------------------
       # 1. DOWNLOAD DATABASE FROM CLOUD CACHE
@@ -59,31 +65,37 @@ jobs:
       # ---------------------------------------------------------
       - name: Run Spatial Engine Script
         env:
-          CLIENT_ID:       ${{ secrets.CLIENT_ID }}
-          SECRET_KEY:      ${{ secrets.SECRET_KEY }}
-          REDIRECT_URI:    ${{ secrets.REDIRECT_URI }}
-          AUTH_CODE:       ${{ secrets.AUTH_CODE }}
-          ACCESS_TOKEN:    ${{ secrets.ACCESS_TOKEN }}
-          SENDER_EMAIL:    ${{ secrets.SENDER_EMAIL }}
-          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
-          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
-          SMTP_PORT:       ${{ secrets.SMTP_PORT }}
-          TZ:              Asia/Kolkata
+          # Upstox 1-Year Long-Lived Token
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+          SENDER_EMAIL:        ${{ secrets.SENDER_EMAIL }}
+          SENDER_PASSWORD:     ${{ secrets.SENDER_PASSWORD }}
+          RECIPIENT_EMAIL:     ${{ secrets.RECIPIENT_EMAIL }}
+          SMTP_PORT:           ${{ secrets.SMTP_PORT }}
+          TZ:                  Asia/Kolkata
         run: |
           B_DATE="${{ github.event.inputs.backtest_date }}"
           B_FROM="${{ github.event.inputs.from_time }}"
           B_TO="${{ github.event.inputs.to_time }}"
           B_INT="${{ github.event.inputs.interval }}"
+          SEED="${{ github.event.inputs.seed_history }}"
           
+          # Pass the seed history flag if checked in UI
+          ARGS=""
+          if [ "$SEED" == "true" ]; then
+            echo "⚠️ SEED FLAG ACTIVE: Wiping and rebuilding 1-year history..."
+            ARGS="--seed_history"
+          fi
+          
+          # Notice we assume your Python file is named EMAIL.py based on your previous config
           if [ -n "$B_DATE" ] && [ -n "$B_FROM" ] && [ -n "$B_TO" ]; then
             echo "Running in BATCH BACKTEST mode."
-            python EMAIL.py --date "$B_DATE" --from_time "$B_FROM" --to_time "$B_TO" --interval "$B_INT"
+            python EMAIL.py --date "$B_DATE" --from_time "$B_FROM" --to_time "$B_TO" --interval "$B_INT" $ARGS
           elif [ -n "$B_DATE" ]; then
             echo "Running in SINGLE BACKTEST mode."
-            python EMAIL.py --date "$B_DATE"
+            python EMAIL.py --date "$B_DATE" $ARGS
           else
             echo "Running in LIVE mode."
-            python EMAIL.py
+            python EMAIL.py $ARGS
           fi
 
       # ---------------------------------------------------------
