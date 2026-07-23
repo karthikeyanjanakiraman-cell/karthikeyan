@@ -3,4 +3,4 @@ trading_engine:
   historical_traversal_lookback: "365"
   live_lookback_days: 30
   correlation:
-    initial_trigger_threshold: 0.9  # Strict 75% structural visual correlation required
+    initial_trigger_threshold: 0.6  # Strict 75% structural visual correlation required
