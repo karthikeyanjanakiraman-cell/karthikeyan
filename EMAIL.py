@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v14.1 (Upstox Analytics Edition)
-- Upstox Auth: Uses 1-Year Long-Lived UPSTOX_ACCESS_TOKEN (Zero daily login maintenance).
-- Instrument Key Mapping: Auto-downloads Upstox Master DB and translates F&O symbols to ISINs.
-- Chrono-Correction: Reverses Upstox's backwards data streams before matrix injection.
-- Delta-Update DB Engine: Only processes new candles (99% faster).
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v15.0 (Ultimate Edition)
+- Hyper-Structure Generator: Injects VWAP gravity, 9-EMA momentum, and structural liquidity anchors.
+- Exhaustion Heatmaps: Detects liquidity sweeps and colors rejection wicks Yellow to filter traps.
+- 3D Tensor Matching: OpenCV directly compares 3-channel RGB arrays (bypassing grayscale data loss).
+- Upstox Native: Uses 1-Year Long-Lived Token, maps ISINs, and auto-reverses backward data streams.
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = "spatial_matrix_atlas.db"
 DB_LOCK = asyncio.Lock()
-UPSTOX_KEYS = {} # Global mapping for Human Symbol -> Upstox ISIN Key
+UPSTOX_KEYS = {} 
 
 try:
     with open("config.yml", "r") as f:
@@ -57,13 +57,12 @@ TRIGGER_THRESH = cfg.get("correlation", {}).get("initial_trigger_threshold", 0.7
 COMPRESSION_MAX = 0.06  
 MATCH_MARGIN = 0.02 
 
-# Upstox Specific Authentication Environment Variables
-UPSTOX_ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN", "") # Your 1-Year Upstox Analytics Token
+UPSTOX_ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN", "")
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "")
 SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD", "")
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "587"))
 
-# Concurrency & Caching Controls
 MAX_CONCURRENT_API_CALLS = 6
 API_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_API_CALLS)
 DATA_CACHE = {} 
@@ -102,7 +101,7 @@ def get_last_timestamp_from_db(symbol, timeframe):
 # =================================================================================================
 # 3. CORE MULTI-CHANNEL VISUAL SPATIAL MATRIX ENGINE
 # =================================================================================================
-def generate_multichannel_spatial_matrix(p_high, p_low, p_close, volume):
+def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume):
     if len(p_high) < MACRO_WINDOW: return None
         
     grid_h, grid_w = 256, 256 
@@ -112,24 +111,72 @@ def generate_multichannel_spatial_matrix(p_high, p_low, p_close, volume):
     p_span = p_max - p_min if p_max > p_min else 1.0
     
     v_min, v_max = volume.min(), volume.max()
-    v_span = v_max - v_min if v_max > v_min else 1.0
+    v_avg = np.mean(volume) if np.mean(volume) > 0 else 1.0
     
-    x_coords = np.linspace(0, grid_w - 1, len(p_high)).astype(int)
+    typical_price = (p_high + p_low + p_close) / 3.0
+    vwap = np.cumsum(typical_price * volume) / np.cumsum(volume)
+    ema = pd.Series(p_close).ewm(span=min(9, len(p_close)), adjust=False).mean().values
     
-    tr = np.maximum(p_high[1:] - p_low[1:], np.abs(p_high[1:] - p_close[:-1]))
-    atr_val = np.mean(tr) if len(tr) > 0 else 1.0
+    num_candles = len(p_high)
+    base_w = grid_w / num_candles
     
-    for idx, x_idx in enumerate(x_coords):
-        h_val, l_val, v_val = p_high[idx], p_low[idx], volume[idx]
+    # 1. LIQUIDITY ANCHORS
+    anchor_idx = max(1, int(num_candles * 0.8))
+    ch_high = p_high[:anchor_idx].max()
+    ch_low = p_low[:anchor_idx].min()
+    
+    ch_y = int(grid_h * (1.0 - (ch_high - p_min) / p_span))
+    cl_y = int(grid_h * (1.0 - (ch_low - p_min) / p_span))
+    
+    cv2.line(canvas, (0, ch_y), (grid_w, ch_y), (40, 40, 40), 1)
+    cv2.line(canvas, (0, cl_y), (grid_w, cl_y), (40, 40, 40), 1)
+    
+    prev_x = prev_vwap_y = prev_ema_y = None
+    
+    for idx in range(num_candles):
+        x_center = int((idx + 0.5) * base_w)
         
-        y_top = int(grid_h * (1.0 - (h_val - p_min) / p_span))
-        y_bot = int(grid_h * (1.0 - (l_val - p_min) / p_span))
-        y_top, y_bot = np.clip(y_top, 0, grid_h - 1), np.clip(y_bot, 0, grid_h - 1)
-        if y_top > y_bot: y_top, y_bot = y_bot, y_top
+        o_y = int(grid_h * (1.0 - (p_open[idx] - p_min) / p_span))
+        h_y = int(grid_h * (1.0 - (p_high[idx] - p_min) / p_span))
+        l_y = int(grid_h * (1.0 - (p_low[idx] - p_min) / p_span))
+        c_y = int(grid_h * (1.0 - (p_close[idx] - p_min) / p_span))
+        vwap_y = int(grid_h * (1.0 - (vwap[idx] - p_min) / p_span))
+        ema_y = int(grid_h * (1.0 - (ema[idx] - p_min) / p_span))
+        
+        # Volume-Weighted Geometry 
+        v_ratio = volume[idx] / v_avg
+        dynamic_w = int(base_w * 0.45 * v_ratio)
+        body_w = max(1, min(dynamic_w, int(base_w * 0.9))) 
+        wick_w = max(1, int(base_w * 0.08))
             
-        canvas[y_top:y_bot+1, x_idx, 0] = 220
-        canvas[:, x_idx, 1] = int(np.clip((v_val - v_min) / v_span * 255, 0, 255)) if v_span > 0 else 100
-        canvas[grid_h - 128:grid_h, x_idx, 2] = int(np.clip(atr_val / p_span * 255, 50, 255))
+        # VWAP (Blue) and 9-EMA (Green)
+        if prev_x is not None:
+            cv2.line(canvas, (prev_x, prev_vwap_y), (x_center, vwap_y), (200, 0, 0), 2)  
+            cv2.line(canvas, (prev_x, prev_ema_y), (x_center, ema_y), (0, 150, 0), 2)    
+        prev_x, prev_vwap_y, prev_ema_y = x_center, vwap_y, ema_y
+
+        # Exhaustion Heatmap Wicks
+        body_len = max(1, abs(p_close[idx] - p_open[idx]))
+        top_price, bot_price = max(p_close[idx], p_open[idx]), min(p_close[idx], p_open[idx])
+        
+        upper_wick_len = p_high[idx] - top_price
+        lower_wick_len = bot_price - p_low[idx]
+        
+        up_wick_color = (0, 255, 255) if (upper_wick_len > body_len * 2) else (0, 0, 150)
+        dn_wick_color = (0, 255, 255) if (lower_wick_len > body_len * 2) else (0, 0, 150)
+        
+        top_y, bot_y = min(o_y, c_y), max(o_y, c_y)
+        cv2.line(canvas, (x_center, h_y), (x_center, top_y), up_wick_color, wick_w)
+        cv2.line(canvas, (x_center, bot_y), (x_center, l_y), dn_wick_color, wick_w)
+        
+        # Candle Body
+        if top_y == bot_y: bot_y += 1 
+        body_intensity = 255 if p_close[idx] >= p_open[idx] else 60 
+        cv2.rectangle(canvas, (x_center - body_w, top_y), (x_center + body_w, bot_y), (0, 0, body_intensity), -1)
+
+        # Volume Profile
+        v_h = int(np.clip((volume[idx] - v_min) / (v_max - v_min) * 50, 1, 50)) if v_max > v_min else 1
+        cv2.rectangle(canvas, (x_center - body_w, grid_h - v_h), (x_center + body_w, grid_h), (0, 100, 0), -1)
 
     return canvas
 
@@ -224,12 +271,12 @@ async def fetch_historical_raw_data_async(symbol, resolution, total_days_back, t
 def _cpu_process_historical_data(symbol, res, df):
     if len(df) < (MACRO_WINDOW + 20): return []
     
-    closes, highs, lows, volumes = df['close'].values, df['high'].values, df['low'].values, df['volume'].values
+    opens, closes, highs, lows, volumes = df['open'].values, df['close'].values, df['high'].values, df['low'].values, df['volume'].values
     timestamps = df['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S').values
     db_records = []
     
     for i in range(MACRO_WINDOW, len(df) - 20):
-        c_slice, h_slice, l_slice, v_slice = closes[i-MACRO_WINDOW:i], highs[i-MACRO_WINDOW:i], lows[i-MACRO_WINDOW:i], volumes[i-MACRO_WINDOW:i]
+        o_slice, c_slice, h_slice, l_slice, v_slice = opens[i-MACRO_WINDOW:i], closes[i-MACRO_WINDOW:i], highs[i-MACRO_WINDOW:i], lows[i-MACRO_WINDOW:i], volumes[i-MACRO_WINDOW:i]
         
         base_ltp = c_slice[-1]
         if base_ltp == 0 or ((h_slice.max() - l_slice.min()) / base_ltp) >= COMPRESSION_MAX: 
@@ -254,7 +301,7 @@ def _cpu_process_historical_data(symbol, res, df):
                 else: break
                 
         matrix_type = "SUCCESS" if max_move_pct >= 4.0 else "TRAP"
-        spatial_mat = generate_multichannel_spatial_matrix(h_slice, l_slice, c_slice, v_slice)
+        spatial_mat = generate_multichannel_spatial_matrix(o_slice, h_slice, l_slice, c_slice, v_slice)
         if spatial_mat is None: continue
         
         success_enc, encoded_bytes = cv2.imencode('.png', spatial_mat)
@@ -268,7 +315,7 @@ def _cpu_process_historical_data(symbol, res, df):
 # 5. LIVE HIERARCHICAL MATCHING ENGINE
 # =================================================================================================
 def _cpu_evaluate_live_market(symbol, live_canvas, res):
-    live_gray = cv2.cvtColor(live_canvas, cv2.COLOR_RGB2GRAY)
+    # TRUE 3D TENSOR MATCHING (No Grayscale Conversion)
     best_success_score, best_trap_score = 0.0, 0.0
     matched_blueprint_row = None
     
@@ -281,9 +328,9 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
     for bp in blueprints:
         try:
             bp_img = cv2.imdecode(np.frombuffer(bp['image_blob'], dtype=np.uint8), cv2.IMREAD_COLOR)
-            bp_gray = cv2.cvtColor(bp_img, cv2.COLOR_RGB2GRAY)
             
-            match_res = cv2.matchTemplate(live_gray, bp_gray, cv2.TM_CCOEFF_NORMED)
+            # Match directly on the 3-Channel RGB matrix
+            match_res = cv2.matchTemplate(live_canvas, bp_img, cv2.TM_CCOEFF_NORMED)
             normalized_score = float(max(0.0, min(1.0, (cv2.minMaxLoc(match_res)[1] + 1.0) / 2.0)))
             
             if bp['matrix_type'] == 'SUCCESS':
@@ -340,7 +387,7 @@ async def process_live_scanning_sequence_async(symbol, target_dt):
         ltp = float(r_slice['close'].iloc[-1])
         
         live_canvas = await loop.run_in_executor(CPU_EXECUTOR, generate_multichannel_spatial_matrix, 
-            r_slice['high'].values, r_slice['low'].values, r_slice['close'].values, r_slice['volume'].values)
+            r_slice['open'].values, r_slice['high'].values, r_slice['low'].values, r_slice['close'].values, r_slice['volume'].values)
             
         if live_canvas is None: continue
             
@@ -404,7 +451,8 @@ def dispatch_predictive_analysis_report(df_matrix, target_dt):
         msg.attach(img_part)
         
     try:
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
+        context = smtplib.ssl.create_default_context() if hasattr(smtplib, 'ssl') else None
+        with smtplib.SMTP_SSL("smtp.gmail.com", SMTP_PORT) as server:
             server.login(SENDER_EMAIL, SENDER_PASSWORD)
             server.sendmail(SENDER_EMAIL, RECIPIENT_EMAIL, msg.as_string())
         logger.info(f"📬 Alert dispatched for {len(df_matrix)} assets.")
@@ -414,23 +462,21 @@ def fetch_fo_universe():
     global UPSTOX_KEYS
     logger.info("Fetching F&O Base List & Mapping to Upstox ISINs...")
     try:
-        # 1. Grab raw F&O list to know which ones we actually care about
         res_fyers = requests.get("https://public.fyers.in/sym_details/NSE_FO.csv", timeout=15)
         df_fyers = pd.read_csv(StringIO(res_fyers.text), header=None)
         sym_col = next((col for col in df_fyers.columns if df_fyers[col].astype(str).str.startswith('NSE:').any()), None)
+        
         if sym_col is None: 
             logger.error("Could not find symbol column in Fyers CSV")
             return []
         
         base_symbols = {re.search(r'NSE:([A-Z&\-]+)\d+', s).group(1) for s in df_fyers[sym_col].astype(str) if re.search(r'NSE:([A-Z&\-]+)\d+', s)}
         fo_names = base_symbols - {'NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'}
-        
         logger.info(f"Extracted {len(fo_names)} target F&O symbols. Downloading Upstox Master...")
 
-        # 2. Download Upstox Master CSV mapping
         df_upstox = pd.read_csv("https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz")
         
-        # 3. CRITICAL FIX: Filter by the immutable instrument_key prefix instead of instrument_type
+        # Maps using the immutable Instrument Key prefix to prevent Upstox backend changes from breaking the script
         eq_df = df_upstox[df_upstox['instrument_key'].astype(str).str.startswith('NSE_EQ|')]
         
         for _, row in eq_df.iterrows():
@@ -445,7 +491,6 @@ def fetch_fo_universe():
     except Exception as e:
         logger.error(f"Failed to map Upstox F&O universe: {e}")
         return []
-
 
 async def execute_engine_pass_async(target_dt, symbols):
     logger.info(f"⚡ Booting sweep for target window: {target_dt.strftime('%H:%M:%S')}")
