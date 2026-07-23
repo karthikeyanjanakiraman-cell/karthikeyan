@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v13.5
-- Native AIOHTTP Pipeline: Bypasses SDK thread collisions for flawless asynchronous fetching.
-- Delta-Update DB Engine: Never rebuilds from scratch. Only processes new candles (99% faster).
-- Native Resolution Canvas: Renders directly at 256x256, eliminating massive CPU resize loads.
-- SQLite WAL Mode: Unlocks thread contention, allowing instant concurrent database writes.
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE v14.1 (Upstox Analytics Edition)
+- Upstox Auth: Uses 1-Year Long-Lived UPSTOX_ACCESS_TOKEN (Zero daily login maintenance).
+- Instrument Key Mapping: Auto-downloads Upstox Master DB and translates F&O symbols to ISINs.
+- Chrono-Correction: Reverses Upstox's backwards data streams before matrix injection.
+- Delta-Update DB Engine: Only processes new candles (99% faster).
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -40,6 +40,7 @@ logger = logging.getLogger(__name__)
 
 DB_PATH = "spatial_matrix_atlas.db"
 DB_LOCK = asyncio.Lock()
+UPSTOX_KEYS = {} # Global mapping for Human Symbol -> Upstox ISIN Key
 
 try:
     with open("config.yml", "r") as f:
@@ -54,15 +55,13 @@ HIST_TRAVERSAL_LOOKBACK = cfg.get("historical_traversal_lookback", "1 month")
 LIVE_LOOKBACK_DAYS = cfg.get("live_lookback_days", 30)
 TRIGGER_THRESH = cfg.get("correlation", {}).get("initial_trigger_threshold", 0.75)
 COMPRESSION_MAX = 0.06  
-MATCH_MARGIN = 0.02 # Solves the 1.000 Trap vs Success collision
+MATCH_MARGIN = 0.02 
 
-CLIENT_ID = os.environ.get("CLIENT_ID", "")
-ACCESS_TOKEN = os.environ.get("ACCESS_TOKEN", "")
+# Upstox Specific Authentication Environment Variables
+UPSTOX_ACCESS_TOKEN = os.environ.get("UPSTOX_ACCESS_TOKEN", "") # Your 1-Year Upstox Analytics Token
 SENDER_EMAIL = os.environ.get("SENDER_EMAIL", "")
 SENDER_PASSWORD = os.environ.get("SENDER_PASSWORD", "")
 RECIPIENT_EMAIL = os.environ.get("RECIPIENT_EMAIL", "")
-
-FYERS_FO_MASTER_URL = "https://public.fyers.in/sym_details/NSE_FO.csv"
 
 # Concurrency & Caching Controls
 MAX_CONCURRENT_API_CALLS = 6
@@ -92,7 +91,6 @@ async def initialize_spatial_database():
     await asyncio.get_running_loop().run_in_executor(CPU_EXECUTOR, _init)
 
 def get_last_timestamp_from_db(symbol, timeframe):
-    """Fetches the latest recorded pattern time so we don't re-process old history."""
     with sqlite3.connect(DB_PATH) as conn:
         cur = conn.cursor()
         cur.execute("SELECT MAX(detected_timestamp) FROM spatial_blueprints WHERE symbol=? AND timeframe=?", (symbol, timeframe))
@@ -136,7 +134,7 @@ def generate_multichannel_spatial_matrix(p_high, p_low, p_close, volume):
     return canvas
 
 # =================================================================================================
-# 4. ASYNC HISTORICAL PROFILER & NATIVE AIOHTTP DATA INGESTION
+# 4. ASYNC HISTORICAL PROFILER & UPSTOX NATIVE INGESTION
 # =================================================================================================
 def parse_traversal_window(window_str):
     clean = window_str.lower().strip()
@@ -151,42 +149,49 @@ async def fetch_historical_raw_data_async(symbol, resolution, total_days_back, t
     end_date = target_end_dt if target_end_dt else pd.Timestamp.now(tz="Asia/Kolkata")
     cache_key = f"{symbol}_{resolution}_{total_days_back}_{end_date.strftime('%Y-%m-%d_%H')}"
     if cache_key in DATA_CACHE: return DATA_CACHE[cache_key]
+    
+    instrument_key = UPSTOX_KEYS.get(symbol)
+    if not instrument_key:
+        logger.error(f"[{symbol}] No Upstox Instrument Key found in mapping.")
+        return None
 
     all_candles = []
     days_fetched = 0
-    chunk_size = 30 if resolution != 'D' else 365
+    chunk_size = 30 if resolution != 'day' else 365
     
-    url = "https://api-t1.fyers.in/data/history"
-    headers = {"Authorization": f"{CLIENT_ID}:{ACCESS_TOKEN}"}
+    headers = {
+        'Accept': 'application/json',
+        'Authorization': f'Bearer {UPSTOX_ACCESS_TOKEN}'
+    }
     
     async with aiohttp.ClientSession() as session:
         while days_fetched < total_days_back:
             start_date = end_date - timedelta(days=chunk_size)
-            payload = {
-                "symbol": symbol, "resolution": resolution, "date_format": "1",
-                "range_from": start_date.strftime("%Y-%m-%d"), "range_to": end_date.strftime("%Y-%m-%d"),
-                "cont_flag": "1"
-            }
+            str_to = end_date.strftime("%Y-%m-%d")
+            str_from = start_date.strftime("%Y-%m-%d")
+            
+            url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{resolution}/{str_to}/{str_from}"
             
             success = False
             for attempt in range(4):
                 async with API_SEMAPHORE: 
                     try:
-                        async with session.get(url, params=payload, headers=headers) as response:
+                        async with session.get(url, headers=headers) as response:
                             res = await response.json()
                             
-                            if res.get('s') == 'error':
+                            if response.status != 200 or res.get('status') == 'error':
                                 if attempt == 3:
-                                    logger.error(f"❌ FYERS SERVER REJECTION [{symbol}]: {res.get('message', 'Unknown Error')}")
+                                    err_msg = res.get('errors', [{}])[0].get('message', 'Unknown Error')
+                                    logger.error(f"❌ UPSTOX REJECTION [{symbol}]: {err_msg}")
                                 
-                                if res.get('code') in [429, 403, 400, -300]:
+                                if response.status in [429, 403, 400]:
                                     await asyncio.sleep(2.5 * (attempt + 1))
                                     continue
                                 else:
                                     break
                                     
-                            if 'candles' in res and res['candles']:
-                                all_candles.extend(res['candles'])
+                            if 'data' in res and 'candles' in res['data'] and res['data']['candles']:
+                                all_candles.extend(res['data']['candles'])
                                 success = True
                                 break
                             else:
@@ -201,13 +206,17 @@ async def fetch_historical_raw_data_async(symbol, resolution, total_days_back, t
                     logger.warning(f"[{symbol}-{resolution}] Scan skipped: Data unavailable.")
                 break
                 
-            end_date = start_date
+            end_date = start_date - timedelta(days=1)
             days_fetched += chunk_size
 
     if not all_candles: return None
-    df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
-    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='s', utc=True).dt.tz_convert("Asia/Kolkata")
-    df = df.drop_duplicates(subset=['timestamp']).sort_values('timestamp').reset_index(drop=True)
+    
+    df = pd.DataFrame(all_candles, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume', 'oi'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'])
+    
+    # Chrono-correction: Reverse the native backward data stream from Upstox
+    df = df.sort_values('timestamp').reset_index(drop=True)
+    df = df.drop_duplicates(subset=['timestamp'])
     
     DATA_CACHE[cache_key] = df 
     return df
@@ -293,7 +302,7 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
 
     logger.info(f"🚀 [{symbol}-{res}] PASSED ALL FILTERS! Target locked.")
     return {
-        'Symbol': symbol.replace('NSE:', '').replace('-EQ', ''),
+        'Symbol': symbol,
         'Direction': matched_blueprint_row['direction'],
         'Match_Score': best_success_score,
         'Hist_Max_Move_Pct': matched_blueprint_row['hist_max_move_pct'],
@@ -304,7 +313,7 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
     }
 
 async def process_live_scanning_sequence_async(symbol, target_dt):
-    resolutions = ['15', '60', 'D']
+    resolutions = ['30minute', 'day']
     loop = asyncio.get_running_loop()
     
     for res in resolutions:
@@ -401,16 +410,35 @@ def dispatch_predictive_analysis_report(df_matrix, target_dt):
         logger.info(f"📬 Alert dispatched for {len(df_matrix)} assets.")
     except Exception as e: logger.error(f"Email failed: {e}")
 
+
 def fetch_fo_universe():
-    logger.info("Accessing live exchange F&O listing tables...")
+    global UPSTOX_KEYS
+    logger.info("Fetching F&O Base List & Mapping to Upstox ISINs...")
     try:
-        response = requests.get(FYERS_FO_MASTER_URL, timeout=15)
-        df = pd.read_csv(StringIO(response.text), header=None)
-        sym_col = next((col for col in df.columns if df[col].astype(str).str.startswith('NSE:').any()), None)
+        res_fyers = requests.get("https://public.fyers.in/sym_details/NSE_FO.csv", timeout=15)
+        df_fyers = pd.read_csv(StringIO(res_fyers.text), header=None)
+        sym_col = next((col for col in df_fyers.columns if df_fyers[col].astype(str).str.startswith('NSE:').any()), None)
         if sym_col is None: return []
-        base_symbols = {re.search(r'NSE:([A-Z&\-]+)\d+', s).group(1) for s in df[sym_col].astype(str) if re.search(r'NSE:([A-Z&\-]+)\d+', s)}
-        return sorted([f"NSE:{sym}-EQ" for sym in base_symbols - {'NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'}])
-    except Exception: return []
+        
+        base_symbols = {re.search(r'NSE:([A-Z&\-]+)\d+', s).group(1) for s in df_fyers[sym_col].astype(str) if re.search(r'NSE:([A-Z&\-]+)\d+', s)}
+        fo_names = base_symbols - {'NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY'}
+
+        logger.info("Downloading Upstox Master Contract File (mapping names)...")
+        df_upstox = pd.read_csv("https://assets.upstox.com/market-quote/instruments/exchange/NSE.csv.gz")
+        
+        eq_df = df_upstox[df_upstox['instrument_type'] == 'EQ']
+        for _, row in eq_df.iterrows():
+            ts = str(row['tradingsymbol'])
+            if ts in fo_names:
+                UPSTOX_KEYS[ts] = row['instrument_key']
+
+        valid_symbols = sorted(list(UPSTOX_KEYS.keys()))
+        logger.info(f"✅ Successfully mapped {len(valid_symbols)} F&O symbols to Upstox Instrument Keys.")
+        return valid_symbols
+        
+    except Exception as e:
+        logger.error(f"Failed to map Upstox F&O universe: {e}")
+        return []
 
 async def execute_engine_pass_async(target_dt, symbols):
     logger.info(f"⚡ Booting sweep for target window: {target_dt.strftime('%H:%M:%S')}")
@@ -435,6 +463,10 @@ async def async_main():
     parser.add_argument("--seed_history", action="store_true", help="Force rebuild 1-year history")
     args = parser.parse_args()
     
+    if not UPSTOX_ACCESS_TOKEN:
+        logger.error("UPSTOX_ACCESS_TOKEN environment variable not set. Exiting script.")
+        return
+
     if args.seed_history and os.path.exists(DB_PATH):
         os.remove(DB_PATH)
         logger.info("🗑️ --seed_history passed. Wiped DB for fresh build.")
@@ -448,7 +480,7 @@ async def async_main():
         loop = asyncio.get_running_loop()
         tasks = []
         for sym in symbols:
-            for res in ['15', '60', 'D']:
+            for res in ['30minute', 'day']: 
                 df = await fetch_historical_raw_data_async(sym, res, parse_traversal_window(HIST_TRAVERSAL_LOOKBACK), context="HIST")
                 if df is not None:
                     tasks.append(loop.run_in_executor(CPU_EXECUTOR, _cpu_process_historical_data, sym, res, df))
