@@ -52,7 +52,7 @@ except FileNotFoundError:
     cfg = {}
 
 MACRO_WINDOW = cfg.get("macro_window_min", 30)
-HIST_TRAVERSAL_LOOKBACK = cfg.get("historical_traversal_lookback", "1 month")
+HIST_TRAVERSAL_LOOKBACK = cfg.get("historical_traversal_lookback", "365 Days")
 LIVE_LOOKBACK_DAYS = cfg.get("live_lookback_days", 30)
 TRIGGER_THRESH = cfg.get("correlation", {}).get("initial_trigger_threshold", 0.75)
 COMPRESSION_MAX = 0.06  
