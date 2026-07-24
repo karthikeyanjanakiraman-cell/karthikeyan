@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE (ULTRA-HD EDITION)
-- 1024x1024 Tensor Canvas: Maximum possible spatial definition for pattern geometry.
-- Elastic Spatial Core: Slides a 896x896 core pattern to perfectly align market variance.
-- HD Anti-Aliasing & Gaussian Smoothing: Eliminates brittle pixel-to-pixel mismatches.
-- 30-Candle Horizon: Deepened market context to ensure higher reliability breakouts.
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE (DAILY LINEAR EDITION)
+- Daily Candles Only: Intraday noise removed. Operates purely on high-conviction D1 charts.
+- Strict Linear Momentum: Rejects any setup with mean reversion or stagnation post-breakout.
+- 2-Day Minimum Hold: Demands at least two consecutive days of one-sided, flawless movement.
+- Temporal Sorting: Prioritizes setups that achieve their targets in the fewest number of days.
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -51,7 +51,6 @@ except FileNotFoundError:
     logger.warning("config.yml not found. Using optimal production defaults.")
     cfg = {}
 
-# UPGRADED: 30-Candle default horizon for deeper HD context
 MACRO_WINDOW = cfg.get("macro_window_min", 30)
 HIST_TRAVERSAL_LOOKBACK = cfg.get("historical_traversal_lookback", "1 month")
 LIVE_LOOKBACK_DAYS = cfg.get("live_lookback_days", 30)
@@ -105,7 +104,6 @@ def get_last_timestamp_from_db(symbol, timeframe):
 def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume):
     if len(p_high) < MACRO_WINDOW: return None
         
-    # ULTRA-HD RESOLUTION
     grid_h, grid_w = 1024, 1024 
     canvas = np.zeros((grid_h, grid_w, 3), dtype=np.uint8)
     
@@ -142,7 +140,6 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
     ch_y = int(grid_h * (1.0 - (ch_high - p_min) / p_span))
     cl_y = int(grid_h * (1.0 - (ch_low - p_min) / p_span))
     
-    # ULTRA-HD: Thicken anchor lines to 3px
     if 0 <= ch_y < grid_h: cv2.line(canvas, (0, ch_y), (grid_w, ch_y), (40, 40, 40), 3, cv2.LINE_AA)
     if 0 <= cl_y < grid_h: cv2.line(canvas, (0, cl_y), (grid_w, cl_y), (40, 40, 40), 3, cv2.LINE_AA)
     
@@ -161,11 +158,9 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
         v_ratio = volume[idx] / v_avg
         dynamic_w = int(base_w * 0.45 * v_ratio)
         body_w = max(1, min(dynamic_w, int(base_w * 0.9))) 
-        # ULTRA-HD: Thicken wicks to minimum 3px
         wick_w = max(3, int(base_w * 0.08)) 
             
         if prev_x is not None:
-            # ULTRA-HD: Thicken VWAP and EMA to 5px
             cv2.line(canvas, (prev_x, prev_vwap_y), (x_center, vwap_y), (200, 0, 0), 5, cv2.LINE_AA)  
             cv2.line(canvas, (prev_x, prev_ema_y), (x_center, ema_y), (0, 150, 0), 5, cv2.LINE_AA)    
         prev_x, prev_vwap_y, prev_ema_y = x_center, vwap_y, ema_y
@@ -188,7 +183,6 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
         body_intensity = 255 if p_close[idx] >= p_open[idx] else 60 
         cv2.rectangle(canvas, (x_center - body_w, top_y), (x_center + body_w, bot_y), (0, 0, body_intensity), -1)
 
-        # ULTRA-HD: Scaled volume profile height to 200px max
         v_h = int(np.clip((volume[idx] - v_min) / (v_max - v_min) * 200, 1, 200)) if v_max > v_min else 1
         cv2.rectangle(canvas, (x_center - body_w, grid_h - v_h), (x_center + body_w, grid_h), (0, 100, 0), -1)
 
@@ -219,7 +213,8 @@ async def fetch_historical_raw_data_async(symbol, resolution, total_days_back, t
 
     all_candles = []
     days_fetched = 0
-    chunk_size = 30 if resolution != 'day' else 365
+    # Strict daily fetching structure
+    chunk_size = 365
     
     headers = {
         'Accept': 'application/json',
@@ -294,30 +289,45 @@ def _cpu_process_historical_data(symbol, res, df):
     timestamps = df['timestamp'].dt.strftime('%Y-%m-%d %H:%M:%S').values
     db_records = []
     
-    for i in range(MACRO_WINDOW, len(df) - 20):
+    for i in range(MACRO_WINDOW, len(df) - 10):
         o_slice, c_slice, h_slice, l_slice, v_slice = opens[i-MACRO_WINDOW:i], closes[i-MACRO_WINDOW:i], highs[i-MACRO_WINDOW:i], lows[i-MACRO_WINDOW:i], volumes[i-MACRO_WINDOW:i]
         
         base_ltp = c_slice[-1]
         if base_ltp == 0 or ((h_slice.max() - l_slice.min()) / base_ltp) >= COMPRESSION_MAX: 
             continue
             
-        f_close, f_high, f_low = closes[i:i+20], highs[i:i+20], lows[i:i+20]
+        f_close, f_high, f_low = closes[i:i+10], highs[i:i+10], lows[i:i+10]
+        if len(f_close) < 2: continue
+            
         trigger_price = f_close[0]
-        
         direction = "UP" if trigger_price > h_slice.max() else ("DOWN" if trigger_price < l_slice.min() else None)
         if not direction: continue
             
+        # STRICT LINEAR MOMENTUM FILTER
         linear_periods = 0
         if direction == "UP":
-            max_move_pct = ((f_high.max() - base_ltp) / base_ltp) * 100.0
-            for val in f_close:
-                if val >= base_ltp: linear_periods += 1
-                else: break
-        else:
-            max_move_pct = ((base_ltp - f_low.min()) / base_ltp) * 100.0
-            for val in f_close:
-                if val <= base_ltp: linear_periods += 1
-                else: break
+            for j in range(len(f_close)):
+                prev_c = base_ltp if j == 0 else f_close[j-1]
+                # Rule: Must close higher than previous close, and low cannot severely violate previous close (no mean reversion)
+                if f_close[j] > prev_c and f_low[j] >= (prev_c * 0.995):
+                    linear_periods += 1
+                else:
+                    break 
+                    
+            if linear_periods < 2: continue
+            max_move_pct = ((f_high[:linear_periods].max() - base_ltp) / base_ltp) * 100.0
+            
+        else: # DOWNWARD
+            for j in range(len(f_close)):
+                prev_c = base_ltp if j == 0 else f_close[j-1]
+                # Rule: Must close lower than previous close, and high cannot severely violate previous close
+                if f_close[j] < prev_c and f_high[j] <= (prev_c * 1.005):
+                    linear_periods += 1
+                else:
+                    break
+                    
+            if linear_periods < 2: continue
+            max_move_pct = ((base_ltp - f_low[:linear_periods].min()) / base_ltp) * 100.0
                 
         matrix_type = "SUCCESS" if max_move_pct >= 4.0 else "TRAP"
         spatial_mat = generate_multichannel_spatial_matrix(o_slice, h_slice, l_slice, c_slice, v_slice)
@@ -331,7 +341,7 @@ def _cpu_process_historical_data(symbol, res, df):
     return db_records
 
 # =================================================================================================
-# 5. LIVE HIERARCHICAL MATCHING ENGINE (Spatial Sliding Core)
+# 5. LIVE HIERARCHICAL MATCHING ENGINE (Cutting-Edge Masked X-Ray Tensor)
 # =================================================================================================
 def _cpu_evaluate_live_market(symbol, live_canvas, res):
     best_success_score, best_trap_score = 0.0, 0.0
@@ -343,29 +353,48 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
         
     if not blueprints: return None
         
-    # ULTRA-HD: Massive 9x9 Gaussian Blur to force geometric relationship matching
-    live_blur = cv2.GaussianBlur(live_canvas, (9, 9), 0)
+    live_gray = cv2.cvtColor(live_canvas, cv2.COLOR_BGR2GRAY)
+    live_grad_x = cv2.Sobel(live_gray, cv2.CV_32F, 1, 0, ksize=3)
+    live_grad_y = cv2.Sobel(live_gray, cv2.CV_32F, 0, 1, ksize=3)
+    live_edges = cv2.magnitude(live_grad_x, live_grad_y)
+    live_edges = cv2.normalize(live_edges, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
         
     for bp in blueprints:
         try:
             bp_img = cv2.imdecode(np.frombuffer(bp['image_blob'], dtype=np.uint8), cv2.IMREAD_COLOR)
-            bp_blur = cv2.GaussianBlur(bp_img, (9, 9), 0)
             
-            # ULTRA-HD: 64-pixel slide margin allows massive convolution across variance
+            bp_gray = cv2.cvtColor(bp_img, cv2.COLOR_BGR2GRAY)
+            bp_grad_x = cv2.Sobel(bp_gray, cv2.CV_32F, 1, 0, ksize=3)
+            bp_grad_y = cv2.Sobel(bp_gray, cv2.CV_32F, 0, 1, ksize=3)
+            bp_edges = cv2.magnitude(bp_grad_x, bp_grad_y)
+            bp_edges = cv2.normalize(bp_edges, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+            
+            _, bp_mask = cv2.threshold(bp_gray, 1, 255, cv2.THRESH_BINARY)
+            
             crop_margin = 64
-            bp_core = bp_blur[crop_margin:-crop_margin, crop_margin:-crop_margin]
+            bp_core_edges = bp_edges[crop_margin:-crop_margin, crop_margin:-crop_margin]
+            bp_core_mask = bp_mask[crop_margin:-crop_margin, crop_margin:-crop_margin]
             
-            match_res = cv2.matchTemplate(live_blur, bp_core, cv2.TM_CCOEFF_NORMED)
-            _, max_val, _, _ = cv2.minMaxLoc(match_res)
-            score = float(max(0.0, min(1.0, max_val)))
+            match_res = cv2.matchTemplate(live_edges, bp_core_edges, cv2.TM_CCORR_NORMED, mask=bp_core_mask)
+            _, shape_score, _, max_loc = cv2.minMaxLoc(match_res)
+            shape_score = float(max(0.0, min(1.0, shape_score)))
+            
+            h, w = bp_core_edges.shape
+            live_color_crop = live_canvas[max_loc[1]:max_loc[1]+h, max_loc[0]:max_loc[0]+w]
+            bp_color_core = bp_img[crop_margin:-crop_margin, crop_margin:-crop_margin]
+            
+            color_res = cv2.matchTemplate(live_color_crop, bp_color_core, cv2.TM_CCOEFF_NORMED)
+            color_score = float(max(0.0, min(1.0, (cv2.minMaxLoc(color_res)[1] + 1.0) / 2.0)))
+            
+            final_score = (shape_score * 0.75) + (color_score * 0.25)
             
             if bp['matrix_type'] == 'SUCCESS':
-                if score > best_success_score:
-                    best_success_score = score
+                if final_score > best_success_score:
+                    best_success_score = final_score
                     matched_blueprint_row = bp
             else:
-                if score > best_trap_score:
-                    best_trap_score = score
+                if final_score > best_trap_score:
+                    best_trap_score = final_score
         except Exception: continue
 
     if best_success_score < TRIGGER_THRESH: return None
@@ -374,7 +403,7 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
         logger.info(f"   -> FILTERED: {symbol} Trap ({best_trap_score:.3f}) neutralized Success ({best_success_score:.3f}).")
         return None
 
-    logger.info(f"🚀 [{symbol}-{res}] PASSED ELASTIC SLIDING FILTER! Target locked. (Score: {best_success_score:.3f})")
+    logger.info(f"🚀 [{symbol}-{res}] PASSED CUTTING-EDGE FILTER! Target locked. (Score: {best_success_score:.3f})")
     return {
         'Symbol': symbol,
         'Direction': matched_blueprint_row['direction'],
@@ -387,7 +416,8 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
     }
 
 async def process_live_scanning_sequence_async(symbol, target_dt):
-    resolutions = ['30minute', 'day']
+    # RESTRICTED: Daily timeframe only
+    resolutions = ['day']
     loop = asyncio.get_running_loop()
     
     for res in resolutions:
@@ -463,7 +493,6 @@ def dispatch_predictive_analysis_report(df_matrix, target_dt):
         </tr>
         <tr>
             <td colspan='7' style='padding: 15px; text-align: center;'>
-                <!-- HTML bounds kept at 400x400 to prevent mobile layout breaking, while serving 1024x1024 high-res source -->
                 <img src="cid:{live_cid}" width="400" height="400" style='border: 1px solid #ccc; margin-right: 10px;' />
                 <img src="cid:{bp_cid}" width="400" height="400" style='border: 1px solid #ccc;' />
             </td>
@@ -535,7 +564,11 @@ async def execute_engine_pass_async(target_dt, symbols):
     live_signals = [res for res in results if res]
     
     if live_signals:
-        df_matrix = pd.DataFrame(live_signals).sort_values('Match_Score', ascending=False)
+        # TEMPORAL SORTING: Least amount of days (Ascending), then Highest Confidence (Descending)
+        df_matrix = pd.DataFrame(live_signals).sort_values(
+            by=['Hist_Linear_Periods', 'Match_Score'], 
+            ascending=[True, False]
+        )
         dispatch_predictive_analysis_report(df_matrix, target_dt)
     else:
         logger.info(f"🔍 Scan complete: Zero setups met strict Success criteria.")
@@ -566,7 +599,8 @@ async def async_main():
         loop = asyncio.get_running_loop()
         tasks = []
         for sym in symbols:
-            for res in ['30minute', 'day']: 
+            # RESTRICTED: Daily timeframe only
+            for res in ['day']: 
                 df = await fetch_historical_raw_data_async(sym, res, parse_traversal_window(HIST_TRAVERSAL_LOOKBACK), context="HIST")
                 if df is not None:
                     tasks.append(loop.run_in_executor(CPU_EXECUTOR, _cpu_process_historical_data, sym, res, df))
