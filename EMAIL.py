@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE (v16.1 INSTITUTIONAL)
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE (v16.2 FINAL)
 - True Color Mapping: BGR corrected. Bullish = Green, Bearish = Red, EMA = Magenta.
-- Masked Gradient Convolution (X-Ray): 75% Shape / 25% Color strict matching.
-- Realistic Linear Momentum: 20-Day Body Breakout with 1.2% wick retest tolerance.
+- Wick Resistance Breakouts: Demands the price breaks the highest wick of the last 20 days.
+- Realistic Linear Momentum: Permits a 1.2% wick retest pullback post-breakout.
 - Dynamic ATR Anchoring: Canvas span scales to 2.5x of a 14-period True Range.
 - WEBP Tensor Compression & Global TCP Pooling: Protects DB storage and network limits.
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
@@ -100,7 +100,7 @@ def get_last_timestamp_from_db(symbol, timeframe):
     return None
 
 # =================================================================================================
-# 3. CORE MULTI-CHANNEL VISUAL SPATIAL MATRIX ENGINE (COLOR CORRECTED)
+# 3. CORE MULTI-CHANNEL VISUAL SPATIAL MATRIX ENGINE (TRUE COLORS)
 # =================================================================================================
 def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume):
     if len(p_high) < MACRO_WINDOW: return None
@@ -168,7 +168,7 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
         if prev_x is not None:
             # Blue VWAP Line (255, 0, 0 in BGR)
             cv2.line(canvas, (prev_x, prev_vwap_y), (x_center, vwap_y), (255, 0, 0), 5, cv2.LINE_AA)  
-            # Magenta EMA Line (255, 0, 255 in BGR) so it stands out against green candles
+            # Magenta EMA Line (255, 0, 255 in BGR)
             cv2.line(canvas, (prev_x, prev_ema_y), (x_center, ema_y), (255, 0, 255), 5, cv2.LINE_AA)    
         prev_x, prev_vwap_y, prev_ema_y = x_center, vwap_y, ema_y
 
@@ -178,11 +178,11 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
         upper_wick_len = p_high[idx] - top_price
         lower_wick_len = bot_price - p_low[idx]
         
-        # COLOR CORRECTION: OpenCV uses BGR (Blue, Green, Red)
+        # BGR True Colors: Green for UP, Red for DOWN
         is_bullish = p_close[idx] >= p_open[idx]
-        candle_color = (0, 200, 0) if is_bullish else (0, 0, 200) # Green for UP, Red for DOWN
+        candle_color = (0, 200, 0) if is_bullish else (0, 0, 200) 
         
-        # Yellow (0, 255, 255) for violent exhaustion wicks
+        # Yellow wicks for violent exhaustion
         up_wick_color = (0, 255, 255) if (upper_wick_len > body_len * 2) else candle_color
         dn_wick_color = (0, 255, 255) if (lower_wick_len > body_len * 2) else candle_color
         
@@ -201,7 +201,7 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
     return canvas
 
 # =================================================================================================
-# 4. ASYNC HISTORICAL PROFILER
+# 4. ASYNC HISTORICAL PROFILER (WICK RESISTANCE LOGIC)
 # =================================================================================================
 def parse_traversal_window(window_str):
     clean = window_str.lower().strip()
@@ -298,16 +298,19 @@ def _cpu_process_historical_data(symbol, res, df):
         if len(f_close) < 2: continue
             
         trigger_price = f_close[0]
-        local_max_close = c_slice[-20:].max()
-        local_min_close = c_slice[-20:].min()
         
-        direction = "UP" if trigger_price > local_max_close else ("DOWN" if trigger_price < local_min_close else None)
+        # WICK RESISTANCE FIX: Demands the price breaks the absolute highest wick.
+        local_max_high = h_slice[-20:].max()
+        local_min_low = l_slice[-20:].min()
+        
+        direction = "UP" if trigger_price > local_max_high else ("DOWN" if trigger_price < local_min_low else None)
         if not direction: continue
             
         linear_periods = 0
         if direction == "UP":
             for j in range(len(f_close)):
                 prev_c = base_ltp if j == 0 else f_close[j-1]
+                # 1.2% RETEST PULLBACK TOLERANCE
                 if f_close[j] > prev_c and f_low[j] >= (prev_c * 0.988):
                     linear_periods += 1
                 else: break 
@@ -317,6 +320,7 @@ def _cpu_process_historical_data(symbol, res, df):
         else: 
             for j in range(len(f_close)):
                 prev_c = base_ltp if j == 0 else f_close[j-1]
+                # 1.2% RETEST PULLBACK TOLERANCE
                 if f_close[j] < prev_c and f_high[j] <= (prev_c * 1.012):
                     linear_periods += 1
                 else: break
