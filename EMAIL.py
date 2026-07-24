@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE (INSTITUTIONAL ATR EDITION)
-- Dynamic ATR Anchoring: Replaces hardcoded 4% spans with asset-specific 14-period True Range.
-- WEBP Tensor Compression: Reduces HD SQLite database bloat by 80% without geometry loss.
-- Global TCP Session Pooling: Reuses a single HTTP tunnel to prevent Upstox API IP bans.
-- Daily Linear Momentum: Strict rejection of any setup with post-breakout mean reversion.
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE (v16.0 INSTITUTIONAL)
+- Masked Gradient Convolution (X-Ray): 75% Shape / 25% Color strict matching.
+- Realistic Linear Momentum: 20-Day Body Breakout with 1.2% wick retest tolerance.
+- Dynamic ATR Anchoring: Canvas span scales to 2.5x of a 14-period True Range.
+- WEBP Tensor Compression & Global TCP Pooling: Protects DB storage and network limits.
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -52,9 +52,9 @@ except FileNotFoundError:
     cfg = {}
 
 MACRO_WINDOW = cfg.get("macro_window_min", 30)
-HIST_TRAVERSAL_LOOKBACK = cfg.get("historical_traversal_lookback", "365 Days")
+HIST_TRAVERSAL_LOOKBACK = cfg.get("historical_traversal_lookback", "1 year")
 LIVE_LOOKBACK_DAYS = cfg.get("live_lookback_days", 30)
-TRIGGER_THRESH = cfg.get("correlation", {}).get("initial_trigger_threshold", 0.75)
+TRIGGER_THRESH = cfg.get("correlation", {}).get("initial_trigger_threshold", 0.60)
 COMPRESSION_MAX = 0.06  
 MATCH_MARGIN = 0.02 
 
@@ -99,7 +99,7 @@ def get_last_timestamp_from_db(symbol, timeframe):
     return None
 
 # =================================================================================================
-# 3. CORE MULTI-CHANNEL VISUAL SPATIAL MATRIX ENGINE (DYNAMIC ATR ANCHORING)
+# 3. CORE MULTI-CHANNEL VISUAL SPATIAL MATRIX ENGINE
 # =================================================================================================
 def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume):
     if len(p_high) < MACRO_WINDOW: return None
@@ -110,11 +110,6 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
     actual_min, actual_max = p_low.min(), p_high.max()
     actual_span = actual_max - actual_min if actual_max > actual_min else 1.0
     
-    # -------------------------------------------------------------------------------------
-    # UPGRADE 1: DYNAMIC ATR ANCHORING
-    # Instead of a flat 4%, we calculate the 14-period True Range of the specific asset.
-    # The canvas is forced to represent at least 2.5x the asset's normal daily volatility.
-    # -------------------------------------------------------------------------------------
     shifted_close = np.roll(p_close, 1)
     shifted_close[0] = p_open[0] 
     tr = np.maximum(p_high - p_low, np.maximum(np.abs(p_high - shifted_close), np.abs(p_low - shifted_close)))
@@ -198,7 +193,7 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
     return canvas
 
 # =================================================================================================
-# 4. ASYNC HISTORICAL PROFILER & UPSTOX NATIVE INGESTION
+# 4. ASYNC HISTORICAL PROFILER
 # =================================================================================================
 def parse_traversal_window(window_str):
     clean = window_str.lower().strip()
@@ -209,7 +204,6 @@ def parse_traversal_window(window_str):
     if 'day' in clean: return digits
     return 365
 
-# UPGRADE 2: Accepting global `session` directly to prevent 200+ TCP socket creations
 async def fetch_historical_raw_data_async(session, symbol, resolution, total_days_back, target_end_dt=None, context="HIST"):
     end_date = target_end_dt if target_end_dt else pd.Timestamp.now(tz="Asia/Kolkata")
     cache_key = f"{symbol}_{resolution}_{total_days_back}_{end_date.strftime('%Y-%m-%d_%H')}"
@@ -296,14 +290,18 @@ def _cpu_process_historical_data(symbol, res, df):
         if len(f_close) < 2: continue
             
         trigger_price = f_close[0]
-        direction = "UP" if trigger_price > h_slice.max() else ("DOWN" if trigger_price < l_slice.min() else None)
+        local_max_close = c_slice[-20:].max()
+        local_min_close = c_slice[-20:].min()
+        
+        direction = "UP" if trigger_price > local_max_close else ("DOWN" if trigger_price < local_min_close else None)
         if not direction: continue
             
         linear_periods = 0
         if direction == "UP":
             for j in range(len(f_close)):
                 prev_c = base_ltp if j == 0 else f_close[j-1]
-                if f_close[j] > prev_c and f_low[j] >= (prev_c * 0.995): linear_periods += 1
+                if f_close[j] > prev_c and f_low[j] >= (prev_c * 0.988):
+                    linear_periods += 1
                 else: break 
             if linear_periods < 2: continue
             max_move_pct = ((f_high[:linear_periods].max() - base_ltp) / base_ltp) * 100.0
@@ -311,7 +309,8 @@ def _cpu_process_historical_data(symbol, res, df):
         else: 
             for j in range(len(f_close)):
                 prev_c = base_ltp if j == 0 else f_close[j-1]
-                if f_close[j] < prev_c and f_high[j] <= (prev_c * 1.005): linear_periods += 1
+                if f_close[j] < prev_c and f_high[j] <= (prev_c * 1.012):
+                    linear_periods += 1
                 else: break
             if linear_periods < 2: continue
             max_move_pct = ((base_ltp - f_low[:linear_periods].min()) / base_ltp) * 100.0
@@ -320,7 +319,6 @@ def _cpu_process_historical_data(symbol, res, df):
         spatial_mat = generate_multichannel_spatial_matrix(o_slice, h_slice, l_slice, c_slice, v_slice)
         if spatial_mat is None: continue
         
-        # UPGRADE 3: WEBP Compression encoding for massive SQLite storage reduction
         success_enc, encoded_bytes = cv2.imencode('.webp', spatial_mat, [cv2.IMWRITE_WEBP_QUALITY, 85])
         if not success_enc: continue
         
@@ -329,7 +327,7 @@ def _cpu_process_historical_data(symbol, res, df):
     return db_records
 
 # =================================================================================================
-# 5. LIVE HIERARCHICAL MATCHING ENGINE (Cutting-Edge Masked X-Ray Tensor)
+# 5. LIVE EVALUATOR & SCANNER
 # =================================================================================================
 def _cpu_evaluate_live_market(symbol, live_canvas, res):
     best_success_score, best_trap_score = 0.0, 0.0
@@ -350,7 +348,6 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
         
     for bp in blueprints:
         try:
-            # Blueprint decoded perfectly from WEBP database blobs
             bp_img = cv2.imdecode(np.frombuffer(bp['image_blob'], dtype=np.uint8), cv2.IMREAD_COLOR)
             
             bp_gray = cv2.cvtColor(bp_img, cv2.COLOR_BGR2GRAY)
@@ -395,8 +392,6 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
         return None
 
     logger.info(f"🚀 [{symbol}-{res}] PASSED CUTTING-EDGE FILTER! Target locked. (Score: {best_success_score:.3f})")
-    
-    # We re-encode to standardized PNG here just for Email client compatibility
     return {
         'Symbol': symbol,
         'Direction': matched_blueprint_row['direction'],
@@ -582,10 +577,9 @@ async def async_main():
     symbols = fetch_fo_universe()
     if not symbols: return
     
-    # UPGRADE 4: Global HTTP Session passed downstream to prevent TCP socket exhaustion
     async with aiohttp.ClientSession() as global_session:
         if args.seed_history:
-            logger.info("⚙️ Initiating 1-year deep historical profiling...")
+            logger.info("⚙️ Initiating deep historical profiling...")
             loop = asyncio.get_running_loop()
             tasks = []
             for sym in symbols:
@@ -599,7 +593,10 @@ async def async_main():
             if flat_records:
                 with sqlite3.connect(DB_PATH) as conn:
                     conn.executemany("INSERT OR IGNORE INTO spatial_blueprints (symbol, timeframe, direction, matrix_type, image_blob, hist_max_move_pct, hist_linear_periods, detected_timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", flat_records)
-            logger.info("✅ Deep database generation finalized.")
+            
+            with sqlite3.connect(DB_PATH) as conn:
+                count = conn.execute("SELECT COUNT(*) FROM spatial_blueprints").fetchone()[0]
+            logger.info(f"✅ Deep database generation finalized. Indexed {count} institutional blueprints.")
             
         if args.date and args.from_time and args.to_time:
             start_dt = pd.to_datetime(f"{args.date} {args.from_time}").tz_localize("Asia/Kolkata")
