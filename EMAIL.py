@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE (v16.0 INSTITUTIONAL)
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE (v16.1 INSTITUTIONAL)
+- True Color Mapping: BGR corrected. Bullish = Green, Bearish = Red, EMA = Magenta.
 - Masked Gradient Convolution (X-Ray): 75% Shape / 25% Color strict matching.
 - Realistic Linear Momentum: 20-Day Body Breakout with 1.2% wick retest tolerance.
 - Dynamic ATR Anchoring: Canvas span scales to 2.5x of a 14-period True Range.
@@ -99,7 +100,7 @@ def get_last_timestamp_from_db(symbol, timeframe):
     return None
 
 # =================================================================================================
-# 3. CORE MULTI-CHANNEL VISUAL SPATIAL MATRIX ENGINE
+# 3. CORE MULTI-CHANNEL VISUAL SPATIAL MATRIX ENGINE (COLOR CORRECTED)
 # =================================================================================================
 def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume):
     if len(p_high) < MACRO_WINDOW: return None
@@ -165,8 +166,10 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
         wick_w = max(3, int(base_w * 0.08)) 
             
         if prev_x is not None:
-            cv2.line(canvas, (prev_x, prev_vwap_y), (x_center, vwap_y), (200, 0, 0), 5, cv2.LINE_AA)  
-            cv2.line(canvas, (prev_x, prev_ema_y), (x_center, ema_y), (0, 150, 0), 5, cv2.LINE_AA)    
+            # Blue VWAP Line (255, 0, 0 in BGR)
+            cv2.line(canvas, (prev_x, prev_vwap_y), (x_center, vwap_y), (255, 0, 0), 5, cv2.LINE_AA)  
+            # Magenta EMA Line (255, 0, 255 in BGR) so it stands out against green candles
+            cv2.line(canvas, (prev_x, prev_ema_y), (x_center, ema_y), (255, 0, 255), 5, cv2.LINE_AA)    
         prev_x, prev_vwap_y, prev_ema_y = x_center, vwap_y, ema_y
 
         body_len = max(1, abs(p_close[idx] - p_open[idx]))
@@ -175,8 +178,13 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
         upper_wick_len = p_high[idx] - top_price
         lower_wick_len = bot_price - p_low[idx]
         
-        up_wick_color = (0, 255, 255) if (upper_wick_len > body_len * 2) else (0, 0, 150)
-        dn_wick_color = (0, 255, 255) if (lower_wick_len > body_len * 2) else (0, 0, 150)
+        # COLOR CORRECTION: OpenCV uses BGR (Blue, Green, Red)
+        is_bullish = p_close[idx] >= p_open[idx]
+        candle_color = (0, 200, 0) if is_bullish else (0, 0, 200) # Green for UP, Red for DOWN
+        
+        # Yellow (0, 255, 255) for violent exhaustion wicks
+        up_wick_color = (0, 255, 255) if (upper_wick_len > body_len * 2) else candle_color
+        dn_wick_color = (0, 255, 255) if (lower_wick_len > body_len * 2) else candle_color
         
         top_y, bot_y = min(o_y, c_y), max(o_y, c_y)
         
@@ -184,9 +192,9 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
         cv2.line(canvas, (x_center, bot_y), (x_center, l_y), dn_wick_color, wick_w, cv2.LINE_AA)
         
         if top_y == bot_y: bot_y += 1 
-        body_intensity = 255 if p_close[idx] >= p_open[idx] else 60 
-        cv2.rectangle(canvas, (x_center - body_w, top_y), (x_center + body_w, bot_y), (0, 0, body_intensity), -1)
+        cv2.rectangle(canvas, (x_center - body_w, top_y), (x_center + body_w, bot_y), candle_color, -1)
 
+        # Volume Profile (Green)
         v_h = int(np.clip((volume[idx] - v_min) / (v_max - v_min) * 200, 1, 200)) if v_max > v_min else 1
         cv2.rectangle(canvas, (x_center - body_w, grid_h - v_h), (x_center + body_w, grid_h), (0, 100, 0), -1)
 
