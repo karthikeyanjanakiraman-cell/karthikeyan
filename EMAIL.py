@@ -2,6 +2,7 @@
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE (v16.2 FINAL)
+- Strict Visual Lockdown: Replaces masks with TM_CCOEFF_NORMED to strictly punish visual noise.
 - True Color Mapping: BGR corrected. Bullish = Green, Bearish = Red, EMA = Magenta.
 - Wick Resistance Breakouts: Demands the price breaks the highest wick of the last 20 days.
 - Realistic Linear Momentum: Permits a 1.2% wick retest pullback post-breakout.
@@ -55,7 +56,8 @@ except FileNotFoundError:
 MACRO_WINDOW = cfg.get("macro_window_min", 30)
 HIST_TRAVERSAL_LOOKBACK = cfg.get("historical_traversal_lookback", "1 year")
 LIVE_LOOKBACK_DAYS = cfg.get("live_lookback_days", 30)
-TRIGGER_THRESH = cfg.get("correlation", {}).get("initial_trigger_threshold", 0.60)
+# Shifted back to 0.80 since the strict visual lockdown math normalizes the scores again
+TRIGGER_THRESH = cfg.get("correlation", {}).get("initial_trigger_threshold", 0.80)
 COMPRESSION_MAX = 0.06  
 MATCH_MARGIN = 0.02 
 
@@ -339,7 +341,7 @@ def _cpu_process_historical_data(symbol, res, df):
     return db_records
 
 # =================================================================================================
-# 5. LIVE EVALUATOR & SCANNER
+# 5. LIVE EVALUATOR & SCANNER (STRICT VISUAL LOCKDOWN)
 # =================================================================================================
 def _cpu_evaluate_live_market(symbol, live_canvas, res):
     best_success_score, best_trap_score = 0.0, 0.0
@@ -352,40 +354,37 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
         
     if not blueprints: return None
         
+    # Phase 1: Grayscale Conversion & Softening
     live_gray = cv2.cvtColor(live_canvas, cv2.COLOR_BGR2GRAY)
-    live_grad_x = cv2.Sobel(live_gray, cv2.CV_32F, 1, 0, ksize=3)
-    live_grad_y = cv2.Sobel(live_gray, cv2.CV_32F, 0, 1, ksize=3)
-    live_edges = cv2.magnitude(live_grad_x, live_grad_y)
-    live_edges = cv2.normalize(live_edges, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+    live_gray_blur = cv2.GaussianBlur(live_gray, (5, 5), 0)
         
     for bp in blueprints:
         try:
+            # Decode the compressed WEBP database blob
             bp_img = cv2.imdecode(np.frombuffer(bp['image_blob'], dtype=np.uint8), cv2.IMREAD_COLOR)
-            
             bp_gray = cv2.cvtColor(bp_img, cv2.COLOR_BGR2GRAY)
-            bp_grad_x = cv2.Sobel(bp_gray, cv2.CV_32F, 1, 0, ksize=3)
-            bp_grad_y = cv2.Sobel(bp_gray, cv2.CV_32F, 0, 1, ksize=3)
-            bp_edges = cv2.magnitude(bp_grad_x, bp_grad_y)
-            bp_edges = cv2.normalize(bp_edges, None, 0, 255, cv2.NORM_MINMAX, dtype=cv2.CV_8U)
+            bp_gray_blur = cv2.GaussianBlur(bp_gray, (5, 5), 0)
             
-            _, bp_mask = cv2.threshold(bp_gray, 1, 255, cv2.THRESH_BINARY)
-            
+            # Phase 2: Spatial Core Crop (64 pixels)
             crop_margin = 64
-            bp_core_edges = bp_edges[crop_margin:-crop_margin, crop_margin:-crop_margin]
-            bp_core_mask = bp_mask[crop_margin:-crop_margin, crop_margin:-crop_margin]
+            bp_core = bp_gray_blur[crop_margin:-crop_margin, crop_margin:-crop_margin]
             
-            match_res = cv2.matchTemplate(live_edges, bp_core_edges, cv2.TM_CCORR_NORMED, mask=bp_core_mask)
+            # Phase 3: BIDIRECTIONAL STRUCTURAL PENALTY (Pessimistic Matching)
+            match_res = cv2.matchTemplate(live_gray_blur, bp_core, cv2.TM_CCOEFF_NORMED)
             _, shape_score, _, max_loc = cv2.minMaxLoc(match_res)
             shape_score = float(max(0.0, min(1.0, shape_score)))
             
-            h, w = bp_core_edges.shape
+            # Phase 4: Strict Color Verification
+            h, w = bp_core.shape
             live_color_crop = live_canvas[max_loc[1]:max_loc[1]+h, max_loc[0]:max_loc[0]+w]
             bp_color_core = bp_img[crop_margin:-crop_margin, crop_margin:-crop_margin]
             
             color_res = cv2.matchTemplate(live_color_crop, bp_color_core, cv2.TM_CCOEFF_NORMED)
-            color_score = float(max(0.0, min(1.0, (cv2.minMaxLoc(color_res)[1] + 1.0) / 2.0)))
+            _, color_score, _, _ = cv2.minMaxLoc(color_res)
+            color_score = float(max(0.0, min(1.0, color_score)))
             
-            final_score = (shape_score * 0.75) + (color_score * 0.25)
+            # Blend: 80% Strict Visual Structure, 20% Exact Colors
+            final_score = (shape_score * 0.80) + (color_score * 0.20)
             
             if bp['matrix_type'] == 'SUCCESS':
                 if final_score > best_success_score:
@@ -403,7 +402,7 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
         logger.info(f"   -> FILTERED: {symbol} Trap ({best_trap_score:.3f}) neutralized Success ({best_success_score:.3f}).")
         return None
 
-    logger.info(f"🚀 [{symbol}-{res}] PASSED CUTTING-EDGE FILTER! Target locked. (Score: {best_success_score:.3f})")
+    logger.info(f"🚀 [{symbol}-{res}] PASSED STRICT VISUAL FILTER! Target locked. (Score: {best_success_score:.3f})")
     return {
         'Symbol': symbol,
         'Direction': matched_blueprint_row['direction'],
