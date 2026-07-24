@@ -1,13 +1,14 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE (v16.2 FINAL)
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE (v16.3 FINAL DUAL-IMAGE)
+- Dual-Image Architecture: AI uses a 30-candle math blob, but emails a 32+ candle visual blob.
+- Future Visualization: The emailed blueprint explicitly highlights the post-breakout momentum.
 - Strict Visual Lockdown: Replaces masks with TM_CCOEFF_NORMED to strictly punish visual noise.
 - True Color Mapping: BGR corrected. Bullish = Green, Bearish = Red, EMA = Magenta.
 - Wick Resistance Breakouts: Demands the price breaks the highest wick of the last 20 days.
 - Realistic Linear Momentum: Permits a 1.2% wick retest pullback post-breakout.
 - Dynamic ATR Anchoring: Canvas span scales to 2.5x of a 14-period True Range.
-- WEBP Tensor Compression & Global TCP Pooling: Protects DB storage and network limits.
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -56,7 +57,6 @@ except FileNotFoundError:
 MACRO_WINDOW = cfg.get("macro_window_min", 30)
 HIST_TRAVERSAL_LOOKBACK = cfg.get("historical_traversal_lookback", "1 year")
 LIVE_LOOKBACK_DAYS = cfg.get("live_lookback_days", 30)
-# Shifted back to 0.80 since the strict visual lockdown math normalizes the scores again
 TRIGGER_THRESH = cfg.get("correlation", {}).get("initial_trigger_threshold", 0.80)
 COMPRESSION_MAX = 0.06  
 MATCH_MARGIN = 0.02 
@@ -81,11 +81,13 @@ async def initialize_spatial_database():
             conn.execute("PRAGMA synchronous = NORMAL;")
             conn.execute("PRAGMA cache_size = -10000;") 
             
+            # SCHEMA UPDATE: Two separate blobs. One for OpenCV math, one for Email Display
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS spatial_blueprints (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     symbol TEXT, timeframe TEXT, direction TEXT, matrix_type TEXT,
-                    image_blob BLOB, hist_max_move_pct REAL, hist_linear_periods INTEGER,
+                    match_blob BLOB, display_blob BLOB, 
+                    hist_max_move_pct REAL, hist_linear_periods INTEGER,
                     detected_timestamp TEXT,
                     UNIQUE(symbol, timeframe, detected_timestamp, matrix_type)
                 )
@@ -102,9 +104,9 @@ def get_last_timestamp_from_db(symbol, timeframe):
     return None
 
 # =================================================================================================
-# 3. CORE MULTI-CHANNEL VISUAL SPATIAL MATRIX ENGINE (TRUE COLORS)
+# 3. CORE MULTI-CHANNEL VISUAL SPATIAL MATRIX ENGINE (FUTURE HIGHLIGHTER)
 # =================================================================================================
-def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume):
+def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume, future_candles=0):
     if len(p_high) < MACRO_WINDOW: return None
         
     grid_h, grid_w = 1024, 1024 
@@ -140,6 +142,15 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
     num_candles = len(p_high)
     base_w = grid_w / num_candles
     
+    # Draw future shading if this is the display blob
+    if future_candles > 0:
+        sep_idx = num_candles - future_candles
+        sep_x = int(sep_idx * base_w)
+        overlay = canvas.copy()
+        cv2.rectangle(overlay, (sep_x, 0), (grid_w, grid_h), (30, 0, 0), -1) # Dark blue tint for future
+        cv2.addWeighted(overlay, 0.4, canvas, 0.6, 0, canvas)
+        cv2.line(canvas, (sep_x, 0), (sep_x, grid_h), (255, 255, 255), 2, cv2.LINE_AA) # White Breakout Line
+    
     anchor_idx = max(1, int(num_candles * 0.8))
     ch_high = p_high[:anchor_idx].max()
     ch_low = p_low[:anchor_idx].min()
@@ -168,9 +179,7 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
         wick_w = max(3, int(base_w * 0.08)) 
             
         if prev_x is not None:
-            # Blue VWAP Line (255, 0, 0 in BGR)
             cv2.line(canvas, (prev_x, prev_vwap_y), (x_center, vwap_y), (255, 0, 0), 5, cv2.LINE_AA)  
-            # Magenta EMA Line (255, 0, 255 in BGR)
             cv2.line(canvas, (prev_x, prev_ema_y), (x_center, ema_y), (255, 0, 255), 5, cv2.LINE_AA)    
         prev_x, prev_vwap_y, prev_ema_y = x_center, vwap_y, ema_y
 
@@ -180,11 +189,9 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
         upper_wick_len = p_high[idx] - top_price
         lower_wick_len = bot_price - p_low[idx]
         
-        # BGR True Colors: Green for UP, Red for DOWN
         is_bullish = p_close[idx] >= p_open[idx]
         candle_color = (0, 200, 0) if is_bullish else (0, 0, 200) 
         
-        # Yellow wicks for violent exhaustion
         up_wick_color = (0, 255, 255) if (upper_wick_len > body_len * 2) else candle_color
         dn_wick_color = (0, 255, 255) if (lower_wick_len > body_len * 2) else candle_color
         
@@ -196,14 +203,13 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume)
         if top_y == bot_y: bot_y += 1 
         cv2.rectangle(canvas, (x_center - body_w, top_y), (x_center + body_w, bot_y), candle_color, -1)
 
-        # Volume Profile (Green)
         v_h = int(np.clip((volume[idx] - v_min) / (v_max - v_min) * 200, 1, 200)) if v_max > v_min else 1
         cv2.rectangle(canvas, (x_center - body_w, grid_h - v_h), (x_center + body_w, grid_h), (0, 100, 0), -1)
 
     return canvas
 
 # =================================================================================================
-# 4. ASYNC HISTORICAL PROFILER (WICK RESISTANCE LOGIC)
+# 4. ASYNC HISTORICAL PROFILER (DUAL GENERATION)
 # =================================================================================================
 def parse_traversal_window(window_str):
     clean = window_str.lower().strip()
@@ -290,7 +296,12 @@ def _cpu_process_historical_data(symbol, res, df):
     db_records = []
     
     for i in range(MACRO_WINDOW, len(df) - 10):
-        o_slice, c_slice, h_slice, l_slice, v_slice = opens[i-MACRO_WINDOW:i], closes[i-MACRO_WINDOW:i], highs[i-MACRO_WINDOW:i], lows[i-MACRO_WINDOW:i], volumes[i-MACRO_WINDOW:i]
+        # Base Slices for Matching
+        o_slice = opens[i-MACRO_WINDOW:i]
+        c_slice = closes[i-MACRO_WINDOW:i]
+        h_slice = highs[i-MACRO_WINDOW:i]
+        l_slice = lows[i-MACRO_WINDOW:i]
+        v_slice = volumes[i-MACRO_WINDOW:i]
         
         base_ltp = c_slice[-1]
         if base_ltp == 0 or ((h_slice.max() - l_slice.min()) / base_ltp) >= COMPRESSION_MAX: 
@@ -301,7 +312,6 @@ def _cpu_process_historical_data(symbol, res, df):
             
         trigger_price = f_close[0]
         
-        # WICK RESISTANCE FIX: Demands the price breaks the absolute highest wick.
         local_max_high = h_slice[-20:].max()
         local_min_low = l_slice[-20:].min()
         
@@ -312,7 +322,6 @@ def _cpu_process_historical_data(symbol, res, df):
         if direction == "UP":
             for j in range(len(f_close)):
                 prev_c = base_ltp if j == 0 else f_close[j-1]
-                # 1.2% RETEST PULLBACK TOLERANCE
                 if f_close[j] > prev_c and f_low[j] >= (prev_c * 0.988):
                     linear_periods += 1
                 else: break 
@@ -322,7 +331,6 @@ def _cpu_process_historical_data(symbol, res, df):
         else: 
             for j in range(len(f_close)):
                 prev_c = base_ltp if j == 0 else f_close[j-1]
-                # 1.2% RETEST PULLBACK TOLERANCE
                 if f_close[j] < prev_c and f_high[j] <= (prev_c * 1.012):
                     linear_periods += 1
                 else: break
@@ -330,13 +338,26 @@ def _cpu_process_historical_data(symbol, res, df):
             max_move_pct = ((base_ltp - f_low[:linear_periods].min()) / base_ltp) * 100.0
                 
         matrix_type = "SUCCESS" if max_move_pct >= 4.0 else "TRAP"
-        spatial_mat = generate_multichannel_spatial_matrix(o_slice, h_slice, l_slice, c_slice, v_slice)
-        if spatial_mat is None: continue
         
-        success_enc, encoded_bytes = cv2.imencode('.webp', spatial_mat, [cv2.IMWRITE_WEBP_QUALITY, 85])
-        if not success_enc: continue
+        # IMAGE 1: The math matrix (strict 30 candles)
+        match_mat = generate_multichannel_spatial_matrix(o_slice, h_slice, l_slice, c_slice, v_slice, future_candles=0)
+        if match_mat is None: continue
         
-        db_records.append((symbol, res, direction, matrix_type, encoded_bytes.tobytes(), float(max_move_pct), int(linear_periods), timestamps[i-1]))
+        # IMAGE 2: The display matrix (30 candles + future momentum)
+        disp_o = opens[i-MACRO_WINDOW : i+linear_periods]
+        disp_h = highs[i-MACRO_WINDOW : i+linear_periods]
+        disp_l = lows[i-MACRO_WINDOW : i+linear_periods]
+        disp_c = closes[i-MACRO_WINDOW : i+linear_periods]
+        disp_v = volumes[i-MACRO_WINDOW : i+linear_periods]
+        display_mat = generate_multichannel_spatial_matrix(disp_o, disp_h, disp_l, disp_c, disp_v, future_candles=linear_periods)
+        if display_mat is None: continue
+
+        # Encode both safely
+        success_m, enc_match = cv2.imencode('.webp', match_mat, [cv2.IMWRITE_WEBP_QUALITY, 85])
+        success_d, enc_disp = cv2.imencode('.webp', display_mat, [cv2.IMWRITE_WEBP_QUALITY, 85])
+        if not success_m or not success_d: continue
+        
+        db_records.append((symbol, res, direction, matrix_type, enc_match.tobytes(), enc_disp.tobytes(), float(max_move_pct), int(linear_periods), timestamps[i-1]))
         
     return db_records
 
@@ -346,7 +367,7 @@ def _cpu_process_historical_data(symbol, res, df):
 def _cpu_evaluate_live_market(symbol, live_canvas, res):
     best_success_score, best_trap_score = 0.0, 0.0
     matched_blueprint_row = None
-    matched_bp_img_cache = None
+    matched_display_blob_cache = None
     
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
@@ -354,27 +375,23 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
         
     if not blueprints: return None
         
-    # Phase 1: Grayscale Conversion & Softening
     live_gray = cv2.cvtColor(live_canvas, cv2.COLOR_BGR2GRAY)
     live_gray_blur = cv2.GaussianBlur(live_gray, (5, 5), 0)
         
     for bp in blueprints:
         try:
-            # Decode the compressed WEBP database blob
-            bp_img = cv2.imdecode(np.frombuffer(bp['image_blob'], dtype=np.uint8), cv2.IMREAD_COLOR)
+            # Decode the math blob for strict CV2 geometry
+            bp_img = cv2.imdecode(np.frombuffer(bp['match_blob'], dtype=np.uint8), cv2.IMREAD_COLOR)
             bp_gray = cv2.cvtColor(bp_img, cv2.COLOR_BGR2GRAY)
             bp_gray_blur = cv2.GaussianBlur(bp_gray, (5, 5), 0)
             
-            # Phase 2: Spatial Core Crop (64 pixels)
             crop_margin = 64
             bp_core = bp_gray_blur[crop_margin:-crop_margin, crop_margin:-crop_margin]
             
-            # Phase 3: BIDIRECTIONAL STRUCTURAL PENALTY (Pessimistic Matching)
             match_res = cv2.matchTemplate(live_gray_blur, bp_core, cv2.TM_CCOEFF_NORMED)
             _, shape_score, _, max_loc = cv2.minMaxLoc(match_res)
             shape_score = float(max(0.0, min(1.0, shape_score)))
             
-            # Phase 4: Strict Color Verification
             h, w = bp_core.shape
             live_color_crop = live_canvas[max_loc[1]:max_loc[1]+h, max_loc[0]:max_loc[0]+w]
             bp_color_core = bp_img[crop_margin:-crop_margin, crop_margin:-crop_margin]
@@ -383,14 +400,14 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
             _, color_score, _, _ = cv2.minMaxLoc(color_res)
             color_score = float(max(0.0, min(1.0, color_score)))
             
-            # Blend: 80% Strict Visual Structure, 20% Exact Colors
             final_score = (shape_score * 0.80) + (color_score * 0.20)
             
             if bp['matrix_type'] == 'SUCCESS':
                 if final_score > best_success_score:
                     best_success_score = final_score
                     matched_blueprint_row = bp
-                    matched_bp_img_cache = bp_img
+                    # Cache the DISPLAY blob for the email output, not the match blob
+                    matched_display_blob_cache = bp['display_blob']
             else:
                 if final_score > best_trap_score:
                     best_trap_score = final_score
@@ -403,6 +420,10 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
         return None
 
     logger.info(f"🚀 [{symbol}-{res}] PASSED STRICT VISUAL FILTER! Target locked. (Score: {best_success_score:.3f})")
+    
+    # Decode the display blob to BGR, then encode to standard PNG for Gmail
+    disp_img = cv2.imdecode(np.frombuffer(matched_display_blob_cache, dtype=np.uint8), cv2.IMREAD_COLOR)
+    
     return {
         'Symbol': symbol,
         'Direction': matched_blueprint_row['direction'],
@@ -411,7 +432,7 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
         'Hist_Linear_Periods': matched_blueprint_row['hist_linear_periods'],
         'Timeframe': matched_blueprint_row['timeframe'],
         'Live_Image_Bytes': cv2.imencode('.png', live_canvas)[1].tobytes(),
-        'Blueprint_Image_Bytes': cv2.imencode('.png', matched_bp_img_cache)[1].tobytes()
+        'Blueprint_Image_Bytes': cv2.imencode('.png', disp_img)[1].tobytes()
     }
 
 async def process_live_scanning_sequence_async(session, symbol, target_dt):
@@ -433,8 +454,8 @@ async def process_live_scanning_sequence_async(session, symbol, target_dt):
                         with sqlite3.connect(DB_PATH) as conn:
                             conn.executemany("""
                                 INSERT OR IGNORE INTO spatial_blueprints 
-                                (symbol, timeframe, direction, matrix_type, image_blob, hist_max_move_pct, hist_linear_periods, detected_timestamp)
-                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                (symbol, timeframe, direction, matrix_type, match_blob, display_blob, hist_max_move_pct, hist_linear_periods, detected_timestamp)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                             """, records)
                     await loop.run_in_executor(CPU_EXECUTOR, _batch_insert)
         
@@ -442,7 +463,7 @@ async def process_live_scanning_sequence_async(session, symbol, target_dt):
         ltp = float(r_slice['close'].iloc[-1])
         
         live_canvas = await loop.run_in_executor(CPU_EXECUTOR, generate_multichannel_spatial_matrix, 
-            r_slice['open'].values, r_slice['high'].values, r_slice['low'].values, r_slice['close'].values, r_slice['volume'].values)
+            r_slice['open'].values, r_slice['high'].values, r_slice['low'].values, r_slice['close'].values, r_slice['volume'].values, 0)
             
         if live_canvas is None: continue
             
@@ -603,7 +624,7 @@ async def async_main():
             flat_records = [item for sublist in all_records for item in sublist if item]
             if flat_records:
                 with sqlite3.connect(DB_PATH) as conn:
-                    conn.executemany("INSERT OR IGNORE INTO spatial_blueprints (symbol, timeframe, direction, matrix_type, image_blob, hist_max_move_pct, hist_linear_periods, detected_timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?)", flat_records)
+                    conn.executemany("INSERT OR IGNORE INTO spatial_blueprints (symbol, timeframe, direction, matrix_type, match_blob, display_blob, hist_max_move_pct, hist_linear_periods, detected_timestamp) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)", flat_records)
             
             with sqlite3.connect(DB_PATH) as conn:
                 count = conn.execute("SELECT COUNT(*) FROM spatial_blueprints").fetchone()[0]
