@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE (v16.3 FINAL DUAL-IMAGE)
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE (v16.4 FINAL LABELED DUAL-IMAGE)
+- Direct Canvas Labeling: Stamps clear text headers directly onto historical and live charts.
 - Dual-Image Architecture: AI uses a 30-candle math blob, but emails a 32+ candle visual blob.
-- Future Visualization: The emailed blueprint explicitly highlights the post-breakout momentum.
+- Future Visualization: The emailed blueprint explicitly highlights post-breakout momentum.
 - Strict Visual Lockdown: Replaces masks with TM_CCOEFF_NORMED to strictly punish visual noise.
 - True Color Mapping: BGR corrected. Bullish = Green, Bearish = Red, EMA = Magenta.
 - Wick Resistance Breakouts: Demands the price breaks the highest wick of the last 20 days.
@@ -81,7 +82,6 @@ async def initialize_spatial_database():
             conn.execute("PRAGMA synchronous = NORMAL;")
             conn.execute("PRAGMA cache_size = -10000;") 
             
-            # SCHEMA UPDATE: Two separate blobs. One for OpenCV math, one for Email Display
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS spatial_blueprints (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -104,9 +104,9 @@ def get_last_timestamp_from_db(symbol, timeframe):
     return None
 
 # =================================================================================================
-# 3. CORE MULTI-CHANNEL VISUAL SPATIAL MATRIX ENGINE (FUTURE HIGHLIGHTER)
+# 3. CORE MULTI-CHANNEL VISUAL SPATIAL MATRIX ENGINE (LABELED)
 # =================================================================================================
-def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume, future_candles=0):
+def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume, future_candles=0, label_text=""):
     if len(p_high) < MACRO_WINDOW: return None
         
     grid_h, grid_w = 1024, 1024 
@@ -142,14 +142,13 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume,
     num_candles = len(p_high)
     base_w = grid_w / num_candles
     
-    # Draw future shading if this is the display blob
     if future_candles > 0:
         sep_idx = num_candles - future_candles
         sep_x = int(sep_idx * base_w)
         overlay = canvas.copy()
-        cv2.rectangle(overlay, (sep_x, 0), (grid_w, grid_h), (30, 0, 0), -1) # Dark blue tint for future
+        cv2.rectangle(overlay, (sep_x, 0), (grid_w, grid_h), (30, 0, 0), -1) 
         cv2.addWeighted(overlay, 0.4, canvas, 0.6, 0, canvas)
-        cv2.line(canvas, (sep_x, 0), (sep_x, grid_h), (255, 255, 255), 2, cv2.LINE_AA) # White Breakout Line
+        cv2.line(canvas, (sep_x, 0), (sep_x, grid_h), (255, 255, 255), 2, cv2.LINE_AA) 
     
     anchor_idx = max(1, int(num_candles * 0.8))
     ch_high = p_high[:anchor_idx].max()
@@ -206,10 +205,18 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume,
         v_h = int(np.clip((volume[idx] - v_min) / (v_max - v_min) * 200, 1, 200)) if v_max > v_min else 1
         cv2.rectangle(canvas, (x_center - body_w, grid_h - v_h), (x_center + body_w, grid_h), (0, 100, 0), -1)
 
+    # Stamp Direct Header Banner & Label Text onto Canvas
+    if label_text:
+        cv2.rectangle(canvas, (0, 0), (grid_w, 75), (20, 20, 20), -1)
+        cv2.line(canvas, (0, 75), (grid_w, 75), (100, 100, 100), 2)
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        color = (0, 255, 255) if "HISTORICAL" in label_text else (0, 255, 0)
+        cv2.putText(canvas, label_text, (35, 48), font, 1.1, color, 3, cv2.LINE_AA)
+
     return canvas
 
 # =================================================================================================
-# 4. ASYNC HISTORICAL PROFILER (DUAL GENERATION)
+# 4. ASYNC HISTORICAL PROFILER (DUAL GENERATION WITH LABELS)
 # =================================================================================================
 def parse_traversal_window(window_str):
     clean = window_str.lower().strip()
@@ -296,7 +303,6 @@ def _cpu_process_historical_data(symbol, res, df):
     db_records = []
     
     for i in range(MACRO_WINDOW, len(df) - 10):
-        # Base Slices for Matching
         o_slice = opens[i-MACRO_WINDOW:i]
         c_slice = closes[i-MACRO_WINDOW:i]
         h_slice = highs[i-MACRO_WINDOW:i]
@@ -339,20 +345,19 @@ def _cpu_process_historical_data(symbol, res, df):
                 
         matrix_type = "SUCCESS" if max_move_pct >= 4.0 else "TRAP"
         
-        # IMAGE 1: The math matrix (strict 30 candles)
-        match_mat = generate_multichannel_spatial_matrix(o_slice, h_slice, l_slice, c_slice, v_slice, future_candles=0)
+        # Clean Math Matrix (No labels for precise OpenCV matching)
+        match_mat = generate_multichannel_spatial_matrix(o_slice, h_slice, l_slice, c_slice, v_slice, future_candles=0, label_text="")
         if match_mat is None: continue
         
-        # IMAGE 2: The display matrix (30 candles + future momentum)
+        # Labeled Display Matrix (With future candles & clear banner)
         disp_o = opens[i-MACRO_WINDOW : i+linear_periods]
         disp_h = highs[i-MACRO_WINDOW : i+linear_periods]
         disp_l = lows[i-MACRO_WINDOW : i+linear_periods]
         disp_c = closes[i-MACRO_WINDOW : i+linear_periods]
         disp_v = volumes[i-MACRO_WINDOW : i+linear_periods]
-        display_mat = generate_multichannel_spatial_matrix(disp_o, disp_h, disp_l, disp_c, disp_v, future_candles=linear_periods)
+        display_mat = generate_multichannel_spatial_matrix(disp_o, disp_h, disp_l, disp_c, disp_v, future_candles=linear_periods, label_text="HISTORICAL BLUEPRINT (POST-BREAKOUT)")
         if display_mat is None: continue
 
-        # Encode both safely
         success_m, enc_match = cv2.imencode('.webp', match_mat, [cv2.IMWRITE_WEBP_QUALITY, 85])
         success_d, enc_disp = cv2.imencode('.webp', display_mat, [cv2.IMWRITE_WEBP_QUALITY, 85])
         if not success_m or not success_d: continue
@@ -362,7 +367,7 @@ def _cpu_process_historical_data(symbol, res, df):
     return db_records
 
 # =================================================================================================
-# 5. LIVE EVALUATOR & SCANNER (STRICT VISUAL LOCKDOWN)
+# 5. LIVE EVALUATOR & SCANNER
 # =================================================================================================
 def _cpu_evaluate_live_market(symbol, live_canvas, res):
     best_success_score, best_trap_score = 0.0, 0.0
@@ -380,7 +385,6 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
         
     for bp in blueprints:
         try:
-            # Decode the math blob for strict CV2 geometry
             bp_img = cv2.imdecode(np.frombuffer(bp['match_blob'], dtype=np.uint8), cv2.IMREAD_COLOR)
             bp_gray = cv2.cvtColor(bp_img, cv2.COLOR_BGR2GRAY)
             bp_gray_blur = cv2.GaussianBlur(bp_gray, (5, 5), 0)
@@ -406,7 +410,6 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
                 if final_score > best_success_score:
                     best_success_score = final_score
                     matched_blueprint_row = bp
-                    # Cache the DISPLAY blob for the email output, not the match blob
                     matched_display_blob_cache = bp['display_blob']
             else:
                 if final_score > best_trap_score:
@@ -421,7 +424,6 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
 
     logger.info(f"🚀 [{symbol}-{res}] PASSED STRICT VISUAL FILTER! Target locked. (Score: {best_success_score:.3f})")
     
-    # Decode the display blob to BGR, then encode to standard PNG for Gmail
     disp_img = cv2.imdecode(np.frombuffer(matched_display_blob_cache, dtype=np.uint8), cv2.IMREAD_COLOR)
     
     return {
@@ -462,8 +464,9 @@ async def process_live_scanning_sequence_async(session, symbol, target_dt):
         r_slice = df.tail(MACRO_WINDOW)
         ltp = float(r_slice['close'].iloc[-1])
         
+        # Generate Live Canvas with clear label
         live_canvas = await loop.run_in_executor(CPU_EXECUTOR, generate_multichannel_spatial_matrix, 
-            r_slice['open'].values, r_slice['high'].values, r_slice['low'].values, r_slice['close'].values, r_slice['volume'].values, 0)
+            r_slice['open'].values, r_slice['high'].values, r_slice['low'].values, r_slice['close'].values, r_slice['volume'].values, 0, "LIVE MARKET SCAN (CURRENT)")
             
         if live_canvas is None: continue
             
