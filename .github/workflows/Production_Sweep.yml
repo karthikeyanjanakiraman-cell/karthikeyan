@@ -1,0 +1,36 @@
+name: Institutional Hybrid AI Sweep
+
+on:
+  schedule:
+    # Triggers at 4:00 PM IST (10:30 AM UTC) every Monday through Friday
+    - cron: '30 10 * * 1-5'
+  workflow_dispatch:
+    # Allows you to manually trigger the script by pushing a button on the GitHub app
+
+jobs:
+  run_quant_engine:
+    runs-on: ubuntu-latest
+    
+    steps:
+    - name: Checkout Code Repository
+      uses: actions/checkout@v4
+
+    - name: Initialize Python 3.11 Runtime
+      uses: actions/setup-python@v5
+      with:
+        python-version: '3.11'
+        cache: 'pip'
+
+    - name: Install AI Architecture Dependencies
+      run: |
+        python -m pip install --upgrade pip
+        pip install torch numpy pandas faiss-cpu xgboost scikit-learn requests
+
+    - name: Execute Live Hybrid Engine Scan
+      env:
+        UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+        SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+        SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+        RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+      run: |
+        python engine.py
