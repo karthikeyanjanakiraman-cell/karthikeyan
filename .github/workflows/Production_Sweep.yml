@@ -2,10 +2,8 @@ name: Institutional Hybrid AI Sweep
 
 on:
   schedule:
-    # Triggers at 4:00 PM IST (10:30 AM UTC) every Monday through Friday
     - cron: '30 10 * * 1-5'
   workflow_dispatch:
-    # Allows you to manually trigger the script by pushing a button on the GitHub app
 
 jobs:
   run_quant_engine:
@@ -19,7 +17,7 @@ jobs:
       uses: actions/setup-python@v5
       with:
         python-version: '3.11'
-        cache: 'pip'
+        # Removed the cache line from here to prevent the file-matching error
 
     - name: Install AI Architecture Dependencies
       run: |
@@ -34,3 +32,4 @@ jobs:
         RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
       run: |
         python engine.py
+        
