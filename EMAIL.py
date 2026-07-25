@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE (v16.5 QUANTITATIVE)
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE (v16.5 QUANTITATIVE FIXED)
 - Direct Canvas Labeling: Stamps clear text headers directly onto historical and live charts.
 - Dual-Image Architecture: AI uses a 30-candle math blob, but emails a 32+ candle visual blob.
 - Strict Visual Lockdown: Replaces masks with TM_CCOEFF_NORMED to strictly punish visual noise.
@@ -414,8 +414,7 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
     
     occurrence_count = 0
     success_count = 0
-    last_counted_ts = pd.Timestamp.min
-    if last_counted_ts.tzinfo is not None: last_counted_ts = last_counted_ts.tz_localize(None)
+    last_counted_ts = None
     
     best_success_score = 0.0
     best_trap_score = 0.0
@@ -427,7 +426,7 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
         if ts.tzinfo is not None: ts = ts.tz_localize(None)
 
         # TIME CLUSTERING: Minimum 15 days between separate occurrences
-        if (ts - last_counted_ts).days > 15:
+        if last_counted_ts is None or (ts - last_counted_ts).days > 15:
             occurrence_count += 1
             if m['type'] == 'SUCCESS':
                 success_count += 1
