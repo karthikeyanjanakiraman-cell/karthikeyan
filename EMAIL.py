@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE (v16.4 FINAL LABELED DUAL-IMAGE)
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE (v16.5 QUANTITATIVE)
 - Direct Canvas Labeling: Stamps clear text headers directly onto historical and live charts.
 - Dual-Image Architecture: AI uses a 30-candle math blob, but emails a 32+ candle visual blob.
-- Future Visualization: The emailed blueprint explicitly highlights post-breakout momentum.
 - Strict Visual Lockdown: Replaces masks with TM_CCOEFF_NORMED to strictly punish visual noise.
-- True Color Mapping: BGR corrected. Bullish = Green, Bearish = Red, EMA = Magenta.
-- Wick Resistance Breakouts: Demands the price breaks the highest wick of the last 20 days.
-- Realistic Linear Momentum: Permits a 1.2% wick retest pullback post-breakout.
+- Quantitative Win Rate: Tracks occurrences using a 15-day time-clustering cooldown filter.
 - Dynamic ATR Anchoring: Canvas span scales to 2.5x of a 14-period True Range.
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
@@ -205,7 +202,6 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume,
         v_h = int(np.clip((volume[idx] - v_min) / (v_max - v_min) * 200, 1, 200)) if v_max > v_min else 1
         cv2.rectangle(canvas, (x_center - body_w, grid_h - v_h), (x_center + body_w, grid_h), (0, 100, 0), -1)
 
-    # Stamp Direct Header Banner & Label Text onto Canvas
     if label_text:
         cv2.rectangle(canvas, (0, 0), (grid_w, 75), (20, 20, 20), -1)
         cv2.line(canvas, (0, 75), (grid_w, 75), (100, 100, 100), 2)
@@ -216,7 +212,7 @@ def generate_multichannel_spatial_matrix(p_open, p_high, p_low, p_close, volume,
     return canvas
 
 # =================================================================================================
-# 4. ASYNC HISTORICAL PROFILER (DUAL GENERATION WITH LABELS)
+# 4. ASYNC HISTORICAL PROFILER 
 # =================================================================================================
 def parse_traversal_window(window_str):
     clean = window_str.lower().strip()
@@ -345,11 +341,9 @@ def _cpu_process_historical_data(symbol, res, df):
                 
         matrix_type = "SUCCESS" if max_move_pct >= 4.0 else "TRAP"
         
-        # Clean Math Matrix (No labels for precise OpenCV matching)
         match_mat = generate_multichannel_spatial_matrix(o_slice, h_slice, l_slice, c_slice, v_slice, future_candles=0, label_text="")
         if match_mat is None: continue
         
-        # Labeled Display Matrix (With future candles & clear banner)
         disp_o = opens[i-MACRO_WINDOW : i+linear_periods]
         disp_h = highs[i-MACRO_WINDOW : i+linear_periods]
         disp_l = lows[i-MACRO_WINDOW : i+linear_periods]
@@ -367,13 +361,9 @@ def _cpu_process_historical_data(symbol, res, df):
     return db_records
 
 # =================================================================================================
-# 5. LIVE EVALUATOR & SCANNER
+# 5. LIVE EVALUATOR & SCANNER (QUANTITATIVE TRACKING)
 # =================================================================================================
 def _cpu_evaluate_live_market(symbol, live_canvas, res):
-    best_success_score, best_trap_score = 0.0, 0.0
-    matched_blueprint_row = None
-    matched_display_blob_cache = None
-    
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
         blueprints = conn.execute("SELECT * FROM spatial_blueprints WHERE symbol=? AND timeframe=?", (symbol, res)).fetchall()
@@ -382,6 +372,8 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
         
     live_gray = cv2.cvtColor(live_canvas, cv2.COLOR_BGR2GRAY)
     live_gray_blur = cv2.GaussianBlur(live_gray, (5, 5), 0)
+    
+    valid_matches = []
         
     for bp in blueprints:
         try:
@@ -406,15 +398,49 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
             
             final_score = (shape_score * 0.80) + (color_score * 0.20)
             
-            if bp['matrix_type'] == 'SUCCESS':
-                if final_score > best_success_score:
-                    best_success_score = final_score
-                    matched_blueprint_row = bp
-                    matched_display_blob_cache = bp['display_blob']
-            else:
-                if final_score > best_trap_score:
-                    best_trap_score = final_score
+            if final_score >= TRIGGER_THRESH:
+                valid_matches.append({
+                    'score': final_score,
+                    'type': bp['matrix_type'],
+                    'timestamp': pd.to_datetime(bp['detected_timestamp']),
+                    'bp': bp
+                })
         except Exception: continue
+
+    if not valid_matches: return None
+
+    # Sort chronologically to filter overlaps accurately
+    valid_matches.sort(key=lambda x: x['timestamp'])
+    
+    occurrence_count = 0
+    success_count = 0
+    last_counted_ts = pd.Timestamp.min
+    if last_counted_ts.tzinfo is not None: last_counted_ts = last_counted_ts.tz_localize(None)
+    
+    best_success_score = 0.0
+    best_trap_score = 0.0
+    matched_blueprint_row = None
+    matched_display_blob_cache = None
+
+    for m in valid_matches:
+        ts = m['timestamp']
+        if ts.tzinfo is not None: ts = ts.tz_localize(None)
+
+        # TIME CLUSTERING: Minimum 15 days between separate occurrences
+        if (ts - last_counted_ts).days > 15:
+            occurrence_count += 1
+            if m['type'] == 'SUCCESS':
+                success_count += 1
+            last_counted_ts = ts
+            
+        if m['type'] == 'SUCCESS':
+            if m['score'] > best_success_score:
+                best_success_score = m['score']
+                matched_blueprint_row = m['bp']
+                matched_display_blob_cache = m['bp']['display_blob']
+        else:
+            if m['score'] > best_trap_score:
+                best_trap_score = m['score']
 
     if best_success_score < TRIGGER_THRESH: return None
     
@@ -422,7 +448,10 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
         logger.info(f"   -> FILTERED: {symbol} Trap ({best_trap_score:.3f}) neutralized Success ({best_success_score:.3f}).")
         return None
 
-    logger.info(f"🚀 [{symbol}-{res}] PASSED STRICT VISUAL FILTER! Target locked. (Score: {best_success_score:.3f})")
+    # Calculate True Historical Win Rate
+    historical_win_rate = (success_count / occurrence_count * 100.0) if occurrence_count > 0 else 0.0
+
+    logger.info(f"🚀 [{symbol}-{res}] TARGET LOCKED! (Score: {best_success_score:.3f} | Win Rate: {historical_win_rate:.1f}%)")
     
     disp_img = cv2.imdecode(np.frombuffer(matched_display_blob_cache, dtype=np.uint8), cv2.IMREAD_COLOR)
     
@@ -430,6 +459,8 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
         'Symbol': symbol,
         'Direction': matched_blueprint_row['direction'],
         'Match_Score': best_success_score,
+        'Total_Occurrences': occurrence_count,
+        'Success_Rate': historical_win_rate,
         'Hist_Max_Move_Pct': matched_blueprint_row['hist_max_move_pct'],
         'Hist_Linear_Periods': matched_blueprint_row['hist_linear_periods'],
         'Timeframe': matched_blueprint_row['timeframe'],
@@ -464,7 +495,6 @@ async def process_live_scanning_sequence_async(session, symbol, target_dt):
         r_slice = df.tail(MACRO_WINDOW)
         ltp = float(r_slice['close'].iloc[-1])
         
-        # Generate Live Canvas with clear label
         live_canvas = await loop.run_in_executor(CPU_EXECUTOR, generate_multichannel_spatial_matrix, 
             r_slice['open'].values, r_slice['high'].values, r_slice['low'].values, r_slice['close'].values, r_slice['volume'].values, 0, "LIVE MARKET SCAN (CURRENT)")
             
@@ -484,7 +514,7 @@ async def process_live_scanning_sequence_async(session, symbol, target_dt):
     return None
 
 # =================================================================================================
-# 6. EMAIL TRANSMISSION & MASTER PIPELINE
+# 6. EMAIL TRANSMISSION & MASTER PIPELINE (WITH WIN RATES)
 # =================================================================================================
 def dispatch_predictive_analysis_report(df_matrix, target_dt):
     if not SENDER_EMAIL or not RECIPIENT_EMAIL: return
@@ -503,18 +533,24 @@ def dispatch_predictive_analysis_report(df_matrix, target_dt):
         dir_lbl = "📈 UPWARD" if row['Direction'] == 'UP' else "📉 DOWNWARD"
         live_cid, bp_cid = f"live_{sym}_{idx}", f"bp_{sym}_{idx}"
         
+        wr_color = "#1b5e20" if row['Success_Rate'] >= 70.0 else ("#f57f17" if row['Success_Rate'] >= 50.0 else "#b71c1c")
+        
         html_rows += f"""
         <tr style='border-bottom: 1px solid #ddd;'>
             <td style='padding: 12px; font-weight: bold; color: #1a73e8;'>{sym}</td>
             <td style='padding: 12px; font-weight: bold; color: {dir_col};'>{dir_lbl}</td>
-            <td style='padding: 12px;'>TF: {row['Timeframe']} | <b>{row['Match_Score']*100:.1f}% Match</b></td>
+            <td style='padding: 12px;'><b>{row['Match_Score']*100:.1f}%</b></td>
+            <td style='padding: 12px; text-align: center; background-color: #f8f9fa;'>
+                <b style='color: {wr_color}; font-size: 16px;'>{row['Success_Rate']:.1f}%</b><br/>
+                <span style='font-size: 11px; color: #666;'>({row['Total_Occurrences']} Occurrences)</span>
+            </td>
             <td style='padding: 12px;'>₹{row['LTP']:.2f}</td>
             <td style='padding: 12px; color: #2e7d32;'><b>{row['Hist_Max_Move_Pct']:.2f}%</b> ({row['Hist_Linear_Periods']} pd)</td>
             <td style='padding: 12px; color: #e65100;'><b>{row['Achieved_Pct']:.2f}%</b></td>
             <td style='padding: 12px; color: #1565c0; font-weight: bold;'>{row['Pending_Pct']:.2f}%</td>
         </tr>
         <tr>
-            <td colspan='7' style='padding: 15px; text-align: center;'>
+            <td colspan='8' style='padding: 15px; text-align: center;'>
                 <img src="cid:{live_cid}" width="400" height="400" style='border: 1px solid #ccc; margin-right: 10px;' />
                 <img src="cid:{bp_cid}" width="400" height="400" style='border: 1px solid #ccc;' />
             </td>
@@ -522,7 +558,7 @@ def dispatch_predictive_analysis_report(df_matrix, target_dt):
         """
         image_attachments.extend([(live_cid, row['Live_Image_Bytes']), (bp_cid, row['Blueprint_Image_Bytes'])])
 
-    html_body = f"<html><body style='font-family: Arial; padding: 20px;'><h2 style='color: #1a237e;'>🎯 HYPER-TENSOR TARGET DETECTOR</h2><table style='width: 100%; border-collapse: collapse;'><thead><tr style='background-color: #283593; color: white;'><th style='padding: 12px;'>Asset</th><th style='padding: 12px;'>Type</th><th style='padding: 12px;'>Confidence</th><th style='padding: 12px;'>LTP</th><th style='padding: 12px;'>Hist Benchmark</th><th style='padding: 12px;'>Achieved</th><th style='padding: 12px;'>Pending</th></tr></thead><tbody>{html_rows}</tbody></table></body></html>"
+    html_body = f"<html><body style='font-family: Arial; padding: 20px;'><h2 style='color: #1a237e;'>🎯 HYPER-TENSOR TARGET DETECTOR</h2><table style='width: 100%; border-collapse: collapse;'><thead><tr style='background-color: #283593; color: white;'><th style='padding: 12px;'>Asset</th><th style='padding: 12px;'>Type</th><th style='padding: 12px;'>Match Score</th><th style='padding: 12px;'>Win Rate</th><th style='padding: 12px;'>LTP</th><th style='padding: 12px;'>Target</th><th style='padding: 12px;'>Achieved</th><th style='padding: 12px;'>Pending</th></tr></thead><tbody>{html_rows}</tbody></table></body></html>"
     msg.attach(MIMEText(html_body, "html"))
     for cid, img_b in image_attachments:
         img_part = MIMEImage(img_b, name=f"{cid}.png")
