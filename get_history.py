@@ -4,49 +4,64 @@ import pandas as pd
 import json
 import gzip
 import io
+from datetime import datetime
 
 def get_dynamic_fno_universe():
-    print("🌐 Step 1: Downloading Live NSE_FO Master to identify F&O stocks...")
-    fo_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE_FO.json.gz"
-    fo_response = requests.get(fo_url)
-    fo_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(fo_response.content)))
+    print("🌐 Downloading Live Upstox NSE Master Contract (this may take a few seconds)...")
+    # We use the OFFICIAL main NSE file, avoiding the broken/non-existent NSE_FO link
+    nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
     
-    # Extract unique underlying stock symbols that have active F&O contracts
-    fno_symbols = set()
-    for item in fo_data:
-        if item.get("underlying_symbol"):
-            fno_symbols.add(item.get("underlying_symbol"))
+    response = requests.get(nse_url)
+    if response.status_code != 200:
+        print(f"❌ Failed to download NSE Master. HTTP {response.status_code}")
+        return []
+
+    print("📦 Decompressing and mapping the exchange file...")
+    try:
+        nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
+        
+        # 1. Find all active underlying symbols that currently have F&O contracts
+        fno_underlying_symbols = set()
+        for item in nse_data:
+            if item.get("segment") == "NSE_FO" and item.get("underlying_symbol"):
+                fno_underlying_symbols.add(item.get("underlying_symbol"))
+                
+        print(f"✅ Discovered {len(fno_underlying_symbols)} underlying F&O assets.")
+        
+        # 2. Map those underlying symbols to their base Equity/Index Instrument Keys
+        fno_universe = []
+        for item in nse_data:
+            segment = item.get("segment")
+            symbol = item.get("trading_symbol")
             
-    print(f"✅ Found {len(fno_symbols)} active F&O underlying symbols.")
-    
-    print("🌐 Step 2: Downloading Live NSE_EQ Master to get exact Instrument Keys...")
-    eq_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
-    eq_response = requests.get(eq_url)
-    eq_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(eq_response.content)))
-    
-    # Match the F&O symbols to their Equity keys
-    fno_universe = []
-    for item in eq_data:
-        if item.get("segment") == "NSE_EQ" and item.get("trading_symbol") in fno_symbols:
-            fno_universe.append({
-                "symbol": item.get("trading_symbol"),
-                "key": item.get("instrument_key")
-            })
-            
-    print(f"✅ Successfully mapped {len(fno_universe)} F&O Instrument Keys.")
-    return fno_universe
+            # Grabbing both Equities (Stocks) and Indices (Nifty, BankNifty, etc.)
+            if segment in ("NSE_EQ", "NSE_INDEX") and symbol in fno_underlying_symbols:
+                fno_universe.append({
+                    "symbol": symbol,
+                    "key": item.get("instrument_key")
+                })
+                
+        print(f"✅ Successfully mapped {len(fno_universe)} Instrument Keys for download.")
+        return fno_universe
+        
+    except Exception as e:
+        print(f"❌ JSON Parsing Error: {str(e)}")
+        return []
 
 def download_fno_history():
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
-    from_date = os.environ.get("PARAM_FROM_DATE")
-    to_date = os.environ.get("PARAM_TO_DATE")
+    from_date = os.environ.get("PARAM_FROM_DATE", "2024-01-01")
+    to_date = os.environ.get("PARAM_TO_DATE", datetime.now().strftime("%Y-%m-%d"))
     
     if not access_token:
-        print("❌ Error: UPSTOX_ACCESS_TOKEN missing.")
+        print("❌ Error: UPSTOX_ACCESS_TOKEN missing in GitHub Secrets.")
         return
 
-    # Fetch the live list directly from the exchange files
+    # Call the new dynamic loader
     fno_universe = get_dynamic_fno_universe()
+    if not fno_universe:
+        print("⚠️ Universe empty. Aborting download.")
+        return
     
     all_rows = []
     print(f"📥 Fetching Daily Candles from {from_date} to {to_date}...")
@@ -78,13 +93,12 @@ def download_fno_history():
 
     if all_rows:
         df = pd.DataFrame(all_rows)
-        # Sort chronologically so the Neural Network reads it in order
+        # Sort chronologically so the Neural Network reads it perfectly
         df = df.sort_values(['Symbol', 'Date']).reset_index(drop=True)
         df.to_csv("historical_fno.csv", index=False)
-        print("🎉 Success! Saved all data to 'historical_fno.csv'.")
+        print(f"🎉 Success! Saved {len(df)} rows of data to 'historical_fno.csv'.")
     else:
-        print("❌ No data collected.")
+        print("❌ No data collected. Please verify your UPSTOX_ACCESS_TOKEN and dates.")
 
 if __name__ == "__main__":
     download_fno_history()
-
