@@ -4,11 +4,11 @@ import pandas as pd
 import json
 import gzip
 import io
+import urllib.parse  # <-- Added to translate the pipe character
 from datetime import datetime
 
 def get_dynamic_fno_universe():
     print("🌐 Downloading Live Upstox NSE Master Contract (this may take a few seconds)...")
-    # We use the OFFICIAL main NSE file, avoiding the broken/non-existent NSE_FO link
     nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
     
     response = requests.get(nse_url)
@@ -20,7 +20,6 @@ def get_dynamic_fno_universe():
     try:
         nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
         
-        # 1. Find all active underlying symbols that currently have F&O contracts
         fno_underlying_symbols = set()
         for item in nse_data:
             if item.get("segment") == "NSE_FO" and item.get("underlying_symbol"):
@@ -28,13 +27,11 @@ def get_dynamic_fno_universe():
                 
         print(f"✅ Discovered {len(fno_underlying_symbols)} underlying F&O assets.")
         
-        # 2. Map those underlying symbols to their base Equity/Index Instrument Keys
         fno_universe = []
         for item in nse_data:
             segment = item.get("segment")
             symbol = item.get("trading_symbol")
             
-            # Grabbing both Equities (Stocks) and Indices (Nifty, BankNifty, etc.)
             if segment in ("NSE_EQ", "NSE_INDEX") and symbol in fno_underlying_symbols:
                 fno_universe.append({
                     "symbol": symbol,
@@ -57,7 +54,6 @@ def download_fno_history():
         print("❌ Error: UPSTOX_ACCESS_TOKEN missing in GitHub Secrets.")
         return
 
-    # Call the new dynamic loader
     fno_universe = get_dynamic_fno_universe()
     if not fno_universe:
         print("⚠️ Universe empty. Aborting download.")
@@ -70,7 +66,10 @@ def download_fno_history():
         symbol = asset["symbol"]
         key = asset["key"]
         
-        url = f"https://api.upstox.com/v2/historical-candle/{key}/day/{to_date}/{from_date}"
+        # URL-ENCODE THE KEY to fix the HTTP 400 error (translates the '|' to '%7C')
+        encoded_key = urllib.parse.quote(key)
+        
+        url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/day/{to_date}/{from_date}"
         headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
         
         response = requests.get(url, headers=headers)
@@ -93,7 +92,6 @@ def download_fno_history():
 
     if all_rows:
         df = pd.DataFrame(all_rows)
-        # Sort chronologically so the Neural Network reads it perfectly
         df = df.sort_values(['Symbol', 'Date']).reset_index(drop=True)
         df.to_csv("historical_fno.csv", index=False)
         print(f"🎉 Success! Saved {len(df)} rows of data to 'historical_fno.csv'.")
