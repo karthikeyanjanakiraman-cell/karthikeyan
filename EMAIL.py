@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 """
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
-SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE (v16.5 QUANTITATIVE FIXED)
+SPATIAL MATRIX & F&O MULTI-CHANNEL 64D HYPER-TENSOR ENGINE (v16.5 UNIVERSAL QUANTITATIVE)
+- Universal Cross-Asset Matching: Scans live charts against the history of the ENTIRE F&O market.
 - Direct Canvas Labeling: Stamps clear text headers directly onto historical and live charts.
 - Dual-Image Architecture: AI uses a 30-candle math blob, but emails a 32+ candle visual blob.
 - Strict Visual Lockdown: Replaces masks with TM_CCOEFF_NORMED to strictly punish visual noise.
 - Quantitative Win Rate: Tracks occurrences using a 15-day time-clustering cooldown filter.
-- Dynamic ATR Anchoring: Canvas span scales to 2.5x of a 14-period True Range.
+- Bug Fix: Pandas overflow error on timestamp subtraction permanently resolved.
 ═══════════════════════════════════════════════════════════════════════════════════════════════════
 """
 
@@ -361,12 +362,14 @@ def _cpu_process_historical_data(symbol, res, df):
     return db_records
 
 # =================================================================================================
-# 5. LIVE EVALUATOR & SCANNER (QUANTITATIVE TRACKING)
+# 5. LIVE EVALUATOR & SCANNER (UNIVERSAL CROSS-ASSET MATCHING)
 # =================================================================================================
 def _cpu_evaluate_live_market(symbol, live_canvas, res):
     with sqlite3.connect(DB_PATH) as conn:
         conn.row_factory = sqlite3.Row
-        blueprints = conn.execute("SELECT * FROM spatial_blueprints WHERE symbol=? AND timeframe=?", (symbol, res)).fetchall()
+        # We query by timeframe only. This allows the AI to scan the live chart 
+        # against the history of ALL 200 F&O stocks!
+        blueprints = conn.execute("SELECT * FROM spatial_blueprints WHERE timeframe=?", (res,)).fetchall()
         
     if not blueprints: return None
         
@@ -409,7 +412,6 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
 
     if not valid_matches: return None
 
-    # Sort chronologically to filter overlaps accurately
     valid_matches.sort(key=lambda x: x['timestamp'])
     
     occurrence_count = 0
@@ -425,7 +427,6 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
         ts = m['timestamp']
         if ts.tzinfo is not None: ts = ts.tz_localize(None)
 
-        # TIME CLUSTERING: Minimum 15 days between separate occurrences
         if last_counted_ts is None or (ts - last_counted_ts).days > 15:
             occurrence_count += 1
             if m['type'] == 'SUCCESS':
@@ -447,15 +448,15 @@ def _cpu_evaluate_live_market(symbol, live_canvas, res):
         logger.info(f"   -> FILTERED: {symbol} Trap ({best_trap_score:.3f}) neutralized Success ({best_success_score:.3f}).")
         return None
 
-    # Calculate True Historical Win Rate
     historical_win_rate = (success_count / occurrence_count * 100.0) if occurrence_count > 0 else 0.0
 
-    logger.info(f"🚀 [{symbol}-{res}] TARGET LOCKED! (Score: {best_success_score:.3f} | Win Rate: {historical_win_rate:.1f}%)")
+    logger.info(f"🚀 [{symbol}-{res}] MATCHED WITH [{matched_blueprint_row['symbol']}]! (Score: {best_success_score:.3f} | Win Rate: {historical_win_rate:.1f}%)")
     
     disp_img = cv2.imdecode(np.frombuffer(matched_display_blob_cache, dtype=np.uint8), cv2.IMREAD_COLOR)
     
     return {
         'Symbol': symbol,
+        'Hist_Symbol': matched_blueprint_row['symbol'],
         'Direction': matched_blueprint_row['direction'],
         'Match_Score': best_success_score,
         'Total_Occurrences': occurrence_count,
@@ -513,14 +514,14 @@ async def process_live_scanning_sequence_async(session, symbol, target_dt):
     return None
 
 # =================================================================================================
-# 6. EMAIL TRANSMISSION & MASTER PIPELINE (WITH WIN RATES)
+# 6. EMAIL TRANSMISSION & MASTER PIPELINE (UNIVERSAL FORMAT)
 # =================================================================================================
 def dispatch_predictive_analysis_report(df_matrix, target_dt):
     if not SENDER_EMAIL or not RECIPIENT_EMAIL: return
         
     scan_time_str = target_dt.strftime('%d %b %Y, %I:%M %p')
     msg = MIMEMultipart('related')
-    msg['Subject'] = f"🎯 SUCCESS MATRIX ALERT: F&O Spatial Breakout | {scan_time_str}"
+    msg['Subject'] = f"🎯 UNIVERSAL MATRIX ALERT: F&O Cross-Asset Match | {scan_time_str}"
     msg['From'] = SENDER_EMAIL
     msg['To'] = RECIPIENT_EMAIL
     
@@ -536,7 +537,10 @@ def dispatch_predictive_analysis_report(df_matrix, target_dt):
         
         html_rows += f"""
         <tr style='border-bottom: 1px solid #ddd;'>
-            <td style='padding: 12px; font-weight: bold; color: #1a73e8;'>{sym}</td>
+            <td style='padding: 12px;'>
+                <b style='color: #1a73e8; font-size: 16px;'>{sym}</b><br/>
+                <span style='font-size: 11px; color: #555;'>Mirrors: <b>{row['Hist_Symbol']}</b></span>
+            </td>
             <td style='padding: 12px; font-weight: bold; color: {dir_col};'>{dir_lbl}</td>
             <td style='padding: 12px;'><b>{row['Match_Score']*100:.1f}%</b></td>
             <td style='padding: 12px; text-align: center; background-color: #f8f9fa;'>
@@ -557,7 +561,7 @@ def dispatch_predictive_analysis_report(df_matrix, target_dt):
         """
         image_attachments.extend([(live_cid, row['Live_Image_Bytes']), (bp_cid, row['Blueprint_Image_Bytes'])])
 
-    html_body = f"<html><body style='font-family: Arial; padding: 20px;'><h2 style='color: #1a237e;'>🎯 HYPER-TENSOR TARGET DETECTOR</h2><table style='width: 100%; border-collapse: collapse;'><thead><tr style='background-color: #283593; color: white;'><th style='padding: 12px;'>Asset</th><th style='padding: 12px;'>Type</th><th style='padding: 12px;'>Match Score</th><th style='padding: 12px;'>Win Rate</th><th style='padding: 12px;'>LTP</th><th style='padding: 12px;'>Target</th><th style='padding: 12px;'>Achieved</th><th style='padding: 12px;'>Pending</th></tr></thead><tbody>{html_rows}</tbody></table></body></html>"
+    html_body = f"<html><body style='font-family: Arial; padding: 20px;'><h2 style='color: #1a237e;'>🎯 UNIVERSAL TARGET DETECTOR</h2><table style='width: 100%; border-collapse: collapse;'><thead><tr style='background-color: #283593; color: white;'><th style='padding: 12px;'>Live Asset</th><th style='padding: 12px;'>Type</th><th style='padding: 12px;'>Match Score</th><th style='padding: 12px;'>Universal Win Rate</th><th style='padding: 12px;'>LTP</th><th style='padding: 12px;'>Target</th><th style='padding: 12px;'>Achieved</th><th style='padding: 12px;'>Pending</th></tr></thead><tbody>{html_rows}</tbody></table></body></html>"
     msg.attach(MIMEText(html_body, "html"))
     for cid, img_b in image_attachments:
         img_part = MIMEImage(img_b, name=f"{cid}.png")
