@@ -59,7 +59,7 @@ class TemporalAutoencoder(nn.Module):
         return self.decoder(latent), latent
 
 # ==============================================================================
-# 2. HIGH-OCTANE HYPER-MOMENTUM TRAINING LOADER
+# 2. HIGH-OCTANE HYPER-MOMENTUM TRAINING LOADER (With Strict Linearity)
 # ==============================================================================
 def load_real_training_data(csv_filename="historical_fno.csv", target_date_str=None):
     if not os.path.exists(csv_filename):
@@ -88,23 +88,41 @@ def load_real_training_data(csv_filename="historical_fno.csv", target_date_str=N
             w_min = raw_window.min(axis=0)
             w_max = raw_window.max(axis=0)
             norm_window = (raw_window - w_min) / (w_max - w_min + 1e-8)
-            
             window = norm_window.T 
-            raw_future_window = values[i+30 : i+30+FUTURE_DAYS, 3] 
-            start_price = values[i+29, 3] 
             
-            max_price = raw_future_window.max()
-            min_price = raw_future_window.min()
+            # Extract Highs, Lows, and Closes to measure wicks and shakeouts
+            future_closes = values[i+30 : i+30+FUTURE_DAYS, 3]
+            future_highs  = values[i+30 : i+30+FUTURE_DAYS, 1]
+            future_lows   = values[i+30 : i+30+FUTURE_DAYS, 2]
+            start_price   = values[i+29, 3] 
             
-            if (max_price - start_price) > (start_price - min_price):
-                max_pct_move = ((max_price - start_price) / (start_price + 1e-8)) * 100
+            max_close = future_closes.max()
+            min_close = future_closes.min()
+            
+            if (max_close - start_price) > (start_price - min_close):
+                is_long = True
+                max_pct_move = ((max_close - start_price) / (start_price + 1e-8)) * 100
+                max_drawdown = ((future_lows.min() - start_price) / (start_price + 1e-8)) * 100
+                rejection_wick = ((future_highs.max() - max_close) / (start_price + 1e-8)) * 100
             else:
-                max_pct_move = ((min_price - start_price) / (start_price + 1e-8)) * 100
+                is_long = False
+                max_pct_move = ((min_close - start_price) / (start_price + 1e-8)) * 100
+                max_drawdown = ((future_highs.max() - start_price) / (start_price + 1e-8)) * 100
+                rejection_wick = ((min_close - future_lows.min()) / (start_price + 1e-8)) * 100
                 
+            # BASE FILTERS (Must be > 4%, < 50%, Price > 20)
             if abs(max_pct_move) < 4.0 or abs(max_pct_move) > 50.0 or start_price < 20.0:
                 continue
                 
-            days_to_target = float(np.argmax(np.abs(raw_future_window - start_price)) + 1)
+            # STRICT LINEARITY FILTERS (Protects against Stop-Loss hunting and Wicks)
+            if is_long:
+                if max_drawdown < -1.5: continue # Shakeout drop was too deep
+                if rejection_wick > (max_pct_move * 0.40): continue # Wick was too large
+            else:
+                if max_drawdown > 1.5: continue # Shakeout spike was too high
+                if rejection_wick > (abs(max_pct_move) * 0.40): continue # Wick was too large
+
+            days_to_target = float(np.argmax(np.abs(future_closes - start_price)) + 1)
             training_matrices.append(window)
             price_targets.append(max_pct_move)
             time_targets.append(days_to_target)
@@ -164,7 +182,7 @@ def fetch_upstox_data(instrument_key, target_date_str, interval="day", days_back
     return normalized_ohlcv.T, current_ltp
 
 # ==============================================================================
-# 4. DISPATCH ENGINE (With 2-Day Actual Validation Column)
+# 4. DISPATCH ENGINE (With Drawdown & Closing Validation)
 # ==============================================================================
 def send_mobile_alert(report_data_list, target_date_str, is_backtest):
     sender_email = os.environ.get("SENDER_EMAIL")
@@ -185,7 +203,7 @@ def send_mobile_alert(report_data_list, target_date_str, is_backtest):
     top_color = "#28a745" if top_trade['direction'] == "LONG 🟢" else "#dc3545"
     top_bg = "#e8f5e9" if top_trade['direction'] == "LONG 🟢" else "#f8d7da"
 
-    sim_warning = f"<div style='background-color: #fff3cd; color: #856404; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 15px;'>⚠️ VALIDATION MODE: SHOWING ACTUAL PERFORMANCE AFTER {target_date_str}</div>" if is_backtest else ""
+    sim_warning = f"<div style='background-color: #fff3cd; color: #856404; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 15px;'>⚠️ VALIDATION MODE: SHOWING ACTUAL LINEAR PERFORMANCE AFTER {target_date_str}</div>" if is_backtest else ""
 
     html_content = f"""
     <html>
@@ -198,7 +216,7 @@ def send_mobile_alert(report_data_list, target_date_str, is_backtest):
                 <p style="font-size: 16px; color: #333; margin-top: 10px; line-height: 1.6;">
                     <b>Match Score:</b> <span style="font-size: 18px; font-weight: bold;">{top_trade['conviction']:.2f}%</span><br>
                     <b>AI Target Price:</b> {top_trade['target_display']}<br>
-                    <b>Actual Result:</b> <b>{top_trade['actual_outcome']}</b>
+                    <b>Actual Result:</b> <br>{top_trade['actual_outcome']}
                 </p>
             </div>
         </div>
@@ -211,7 +229,7 @@ def send_mobile_alert(report_data_list, target_date_str, is_backtest):
             <th>Score</th>
             <th>Current LTP</th>
             <th>AI Target Price</th>
-            <th>Actual Result (2-Day)</th>
+            <th>Actual Result (2-Day Close)</th>
           </tr>
     """
     
@@ -227,7 +245,7 @@ def send_mobile_alert(report_data_list, target_date_str, is_backtest):
             <td>{row['conviction']:.2f}%</td>
             <td>₹{row['ltp']:.2f}</td>
             <td style="color: {dir_color}; font-weight: bold;">{row['target_display']}</td>
-            <td><b>{row['actual_outcome']}</b></td>
+            <td>{row['actual_outcome']}</td>
           </tr>
         """
         
@@ -264,7 +282,7 @@ def run_production_sweep():
     try:
         X_train_raw, Y_price_targets, Y_time_targets = load_real_training_data("historical_fno.csv", target_date_str)
         if len(X_train_raw) == 0:
-            print("❌ Training dataset empty after applying momentum filter.")
+            print("❌ Training dataset empty after applying strict linearity momentum filter.")
             return
     except Exception as e:
         print(f"❌ Critical failure reading CSV: {e}")
@@ -342,12 +360,12 @@ def run_production_sweep():
                 'days_display': days_display,
                 'ltp': float(current_ltp),
                 'target_display': target_display,
-                'actual_outcome': "Awaiting Market ⏳" # Default for live mode
+                'actual_outcome': "<b>Awaiting Market ⏳</b>" # Default for live mode
             })
             
-    # 🔮 THE TIME MACHINE: Calculate actual future performance if Backtesting
+    # 🔮 THE TIME MACHINE: Calculate actual linear future performance if Backtesting
     if is_backtest and os.path.exists("historical_fno.csv") and len(final_report_data) > 0:
-        print("🔮 Validating predictions against actual future data...")
+        print("🔮 Validating predictions against actual linear data...")
         df_full = pd.read_csv("historical_fno.csv")
         
         for row in final_report_data:
@@ -363,17 +381,19 @@ def run_production_sweep():
                 future_window = df_sym.iloc[idx+1 : idx+3] # Look exactly 2 days ahead
                 
                 if len(future_window) > 0:
-                    max_high = future_window['High'].max()
-                    min_low = future_window['Low'].min()
+                    max_close = future_window['Close'].max()
+                    min_close = future_window['Close'].min()
                     
                     if "LONG" in direction:
-                        actual_move = ((max_high - ltp) / ltp) * 100
+                        actual_move = ((max_close - ltp) / ltp) * 100
+                        max_drawdown = ((future_window['Low'].min() - ltp) / ltp) * 100
                         color = "#28a745" if actual_move > 0 else "#6c757d"
-                        row['actual_outcome'] = f"<span style='color: {color};'>Hit ₹{max_high:.2f} (+{actual_move:.2f}%)</span>"
+                        row['actual_outcome'] = f"<span style='color: {color};'>Closed ₹{max_close:.2f} (+{actual_move:.2f}%)</span><br><span style='color: #856404; font-size: 11px;'>Max Drawdown: {max_drawdown:.2f}%</span>"
                     else:
-                        actual_move = ((min_low - ltp) / ltp) * 100
+                        actual_move = ((min_close - ltp) / ltp) * 100
+                        max_drawdown = ((future_window['High'].max() - ltp) / ltp) * 100
                         color = "#28a745" if actual_move < 0 else "#6c757d"
-                        row['actual_outcome'] = f"<span style='color: {color};'>Hit ₹{min_low:.2f} ({actual_move:.2f}%)</span>"
+                        row['actual_outcome'] = f"<span style='color: {color};'>Closed ₹{min_close:.2f} ({actual_move:.2f}%)</span><br><span style='color: #856404; font-size: 11px;'>Max Drawdown: +{max_drawdown:.2f}%</span>"
                 else:
                     row['actual_outcome'] = "<span style='color: #6c757d;'>Data ended</span>"
                     
@@ -381,4 +401,4 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
-                             
+    
