@@ -81,17 +81,21 @@ def load_real_training_data(csv_filename="historical_fno.csv"):
         if len(values) < (30 + FUTURE_DAYS): 
             continue
             
-        v_min = values.min(axis=0)
-        v_max = values.max(axis=0)
-        norm_values = (values - v_min) / (v_max - v_min + 1e-8)
-        
-        for i in range(len(norm_values) - (30 + FUTURE_DAYS) + 1):
-            window = norm_values[i:i+30].T 
+        for i in range(len(values) - (30 + FUTURE_DAYS) + 1):
+            # CRITICAL FIX: Isolate the exact 30-day window FIRST before normalizing
+            raw_window = values[i : i+30]
+            
+            # Normalize ONLY based on these 30 days (Perfectly matches Live Data)
+            w_min = raw_window.min(axis=0)
+            w_max = raw_window.max(axis=0)
+            norm_window = (raw_window - w_min) / (w_max - w_min + 1e-8)
+            
+            window = norm_window.T 
             
             # Extract raw price actions for the next 2 trading sessions
             raw_future_window = values[i+30 : i+30+FUTURE_DAYS, 3] 
             
-            # Baseline price anchored to the current day's raw Close price (fixes leakage bug)
+            # Baseline price anchored to the current day's raw Close price
             start_price = values[i+29, 3] 
             
             max_price = raw_future_window.max()
@@ -171,11 +175,14 @@ def fetch_upstox_data(instrument_key, interval="day", days_back=60):
     ohlcv = np.array([candle[1:6] for candle in data], dtype=np.float32)
     ohlcv = ohlcv[::-1] # Convert chronological sequence (oldest -> newest)
     
-    ohlcv_min = ohlcv.min(axis=0)
-    ohlcv_max = ohlcv.max(axis=0)
-    normalized_ohlcv = (ohlcv - ohlcv_min) / (ohlcv_max - ohlcv_min + 1e-8)
+    # CRITICAL FIX: Isolate the exact last 30 trading days BEFORE normalizing
+    ohlcv_30 = ohlcv[-30:]
     
-    return normalized_ohlcv[-30:].T, current_ltp
+    ohlcv_min = ohlcv_30.min(axis=0)
+    ohlcv_max = ohlcv_30.max(axis=0)
+    normalized_ohlcv = (ohlcv_30 - ohlcv_min) / (ohlcv_max - ohlcv_min + 1e-8)
+    
+    return normalized_ohlcv.T, current_ltp
 
 # ==============================================================================
 # 4. DISPATCH ENGINE (High-Velocity Alert Output)
@@ -299,6 +306,9 @@ def run_production_sweep():
         return
     
     final_report_data = []
+    
+    # Minimum conviction parameter fetched from workflow variables
+    min_conviction = float(os.environ.get("PARAM_MIN_CONVICTION", 85.0))
 
     for asset in fno_universe:
         result = fetch_upstox_data(asset["key"], interval="day", days_back=60)
@@ -312,6 +322,7 @@ def run_production_sweep():
             live_vector = cnn_model.encode(live_tensor).numpy()
         
         predicted_target_pct = xgb_price_model.predict(live_vector)[0]
+        
         # Restrict structural range bounds strictly between day 1 and 2
         predicted_target_days = max(1, min(2, int(round(xgb_time_model.predict(live_vector)[0])))) 
         
@@ -320,7 +331,7 @@ def run_production_sweep():
         conviction_percentage = cosine_similarity_score[0][0] * 100
         
         # Stricter entry confirmation limits to protect capital deployment profile
-        if conviction_percentage > 85.0:
+        if conviction_percentage >= min_conviction:
             # Absolute target translation using currency unit calculations
             target_price_rupee = current_ltp * (1 + (predicted_target_pct / 100))
             direction_tag = "LONG 🟢" if predicted_target_pct > 0 else "SHORT 🔴"
