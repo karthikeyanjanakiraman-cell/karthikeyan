@@ -6,11 +6,11 @@ on:
       from_date:
         description: 'Start Date (YYYY-MM-DD)'
         required: true
-        default: '2024-01-01'
+        default: ''
       to_date:
         description: 'End Date (YYYY-MM-DD)'
         required: true
-        default: '2026-07-26'
+        default: ''
 
 jobs:
   build-indices-csv:
@@ -34,7 +34,7 @@ jobs:
         env:
           UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
         run: |
-          python indices.py "${{ github.event.inputs.from_date }}" "${{ github.event.inputs.to_date }}"
+          python Indices.py "${{ github.event.inputs.from_date }}" "${{ github.event.inputs.to_date }}"
 
       - name: Commit and Push CSV
         run: |
