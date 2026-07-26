@@ -1,0 +1,44 @@
+name: Generate Indices Historical CSV
+
+on:
+  workflow_dispatch:
+    inputs:
+      from_date:
+        description: 'Start Date (YYYY-MM-DD)'
+        required: true
+        default: '2024-01-01'
+      to_date:
+        description: 'End Date (YYYY-MM-DD)'
+        required: true
+        default: '2026-07-26'
+
+jobs:
+  build-indices-csv:
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install requests pandas numpy
+
+      - name: Run Indices Data Generator
+        env:
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+        run: |
+          python indices.py "${{ github.event.inputs.from_date }}" "${{ github.event.inputs.to_date }}"
+
+      - name: Commit and Push CSV
+        run: |
+          git config --global user.name "GitHub Actions Bot"
+          git config --global user.email "actions@github.com"
+          git add historical_indices.csv
+          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-generated historical_indices.csv for range ${{ github.event.inputs.from_date }} to ${{ github.event.inputs.to_date }}" && git push)
