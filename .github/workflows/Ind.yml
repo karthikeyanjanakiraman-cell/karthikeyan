@@ -22,7 +22,6 @@ jobs:
     runs-on: ubuntu-latest
     
     env:
-      # Fixed GitHub Actions expression syntax for fallbacks
       INTERVAL: ${{ vars.DEFAULT_INTERVAL || '1d' }}
       LOOKBACK_WINDOW: ${{ vars.DEFAULT_LOOKBACK || '252' }}
       ASSET_UNIVERSE: ${{ vars.DEFAULT_UNIVERSE || 'sp500' }}
@@ -37,14 +36,22 @@ jobs:
         with:
           python-version: '3.10'
 
+      # OPTION 1: Install specific packages directly if you don't have a requirements.txt
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install pandas numpy yfinance scikit-learn # <-- REPLACE with your actual packages
+          
+      # OR OPTION 2: If requirements.txt is in a folder, uncomment below and add working-directory
+      # - name: Install Dependencies
+      #   working-directory: ./your_folder_name
+      #   run: |
+      #     python -m pip install --upgrade pip
+      #     pip install -r requirements.txt
 
       - name: Run Backtest Script
+        # working-directory: ./your_folder_name # <-- Uncomment if your script is in a subfolder
         run: |
-          # Ensure output directory exists to prevent path errors
           mkdir -p output
           python main.py \
             --start-date "${{ inputs.start_date }}" \
@@ -62,7 +69,7 @@ jobs:
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
-        if: always() # Uploads artifacts even if a previous step fails
+        if: always()
         with:
           name: backtest-reports-and-csv
           path: |
