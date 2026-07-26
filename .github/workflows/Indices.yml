@@ -30,9 +30,7 @@ jobs:
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
-        with:
-          token: ${{ secrets.GITHUB_TOKEN }}
-          persist-credentials: true
+        # Note: No manual token needed here anymore; the permissions block handles it natively.
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -57,9 +55,10 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git remote set-url origin https://x-access-token:${{ secrets.GITHUB_TOKEN }}@github.com/${{ github.repository }}.git
           git add -A
-          git diff --staged --quiet || (git commit -m "Auto-update historical CSV files and reports" && git push)
+          
+          # Using "origin HEAD" ensures it pushes to the branch that triggered the workflow
+          git diff --staged --quiet || (git commit -m "Auto-update historical CSV files and reports" && git push origin HEAD)
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
@@ -68,4 +67,3 @@ jobs:
           path: |
             output/
             *.csv
-            
