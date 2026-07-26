@@ -1,0 +1,72 @@
+name: Backtest and Generate Reports
+
+on:
+  workflow_dispatch:
+    inputs:
+      start_date:
+        description: 'Backtest Start Date (YYYY-MM-DD)'
+        required: true
+        default: '2025-01-01'
+        type: string
+      end_date:
+        description: 'Backtest End Date (YYYY-MM-DD)'
+        required: true
+        default: '2026-01-01'
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  run-backtest:
+    runs-on: ubuntu-latest
+    
+    env:
+      # Fixed GitHub Actions expression syntax for fallbacks
+      INTERVAL: ${{ vars.DEFAULT_INTERVAL || '1d' }}
+      LOOKBACK_WINDOW: ${{ vars.DEFAULT_LOOKBACK || '252' }}
+      ASSET_UNIVERSE: ${{ vars.DEFAULT_UNIVERSE || 'sp500' }}
+      GENERATE_HISTORICAL_CSV: 'true'
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Backtest Script
+        run: |
+          # Ensure output directory exists to prevent path errors
+          mkdir -p output
+          python main.py \
+            --start-date "${{ inputs.start_date }}" \
+            --end-date "${{ inputs.end_date }}" \
+            --interval "$INTERVAL" \
+            --lookback "$LOOKBACK_WINDOW" \
+            --universe "$ASSET_UNIVERSE"
+
+      - name: Commit and Push Updated CSVs
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --staged --quiet || (git commit -m "Auto-update historical CSV files and reports" && git push origin HEAD)
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        if: always() # Uploads artifacts even if a previous step fails
+        with:
+          name: backtest-reports-and-csv
+          path: |
+            output/
+            *.csv
+          if-no-files-found: ignore
+          
