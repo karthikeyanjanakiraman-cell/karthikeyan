@@ -59,15 +59,39 @@ class TemporalAutoencoder(nn.Module):
         return self.decoder(latent), latent
 
 # ==============================================================================
-# 2. DYNAMIC TRAINING LOADER (Handles both Macro Index & Micro F&O)
+# 2. DYNAMIC TRAINING LOADER & STANDARDIZER
 # ==============================================================================
+def read_and_standardize_csv(filename):
+    """Universally maps Fyers, Upstox, or Yahoo CSV formats into standard ML inputs."""
+    if not os.path.exists(filename): return None
+    
+    df = pd.read_csv(filename)
+    rename_map = {}
+    
+    for c in df.columns:
+        cl = str(c).lower().strip()
+        if cl in ['date', 'time', 'timestamp']: rename_map[c] = 'Date'
+        elif cl in ['symbol', 'ticker', 'asset']: rename_map[c] = 'Symbol'
+        elif cl == 'open': rename_map[c] = 'Open'
+        elif cl == 'high': rename_map[c] = 'High'
+        elif cl == 'low': rename_map[c] = 'Low'
+        elif cl == 'close': rename_map[c] = 'Close'
+        elif cl in ['volume', 'vol']: rename_map[c] = 'Volume'
+        
+    df = df.rename(columns=rename_map)
+    
+    if 'Date' in df.columns:
+        # Strip timestamps (e.g. "2010-01-01 15:30") to purely "YYYY-MM-DD" for safe string comparisons
+        df['Date'] = df['Date'].astype(str).str[:10]
+        
+    return df
+
 def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_pct=50.0, max_dd=1.2, wick_ratio=0.40):
-    if not os.path.exists(csv_filename):
-        print(f"⚠️ Warning: Missing '{csv_filename}'")
+    df = read_and_standardize_csv(csv_filename)
+    if df is None or 'Date' not in df.columns:
+        print(f"⚠️ Warning: Missing or invalid '{csv_filename}'")
         return None, None, None
         
-    df = pd.read_csv(csv_filename)
-    
     # 🛑 PREVENT DATA LEAKAGE
     if target_date_str:
         df = df[df['Date'] <= target_date_str]
@@ -169,8 +193,8 @@ def train_ai_brain(X_raw, Y_price, Y_time, epochs=15):
 # 4. LIVE INGESTION TOOLS
 # ==============================================================================
 def get_live_tensor_from_csv(csv_filename, target_date_str):
-    """Safely extracts the clean 30-day chronological sequence"""
-    df = pd.read_csv(csv_filename)
+    df = read_and_standardize_csv(csv_filename)
+    if df is None or 'Date' not in df.columns: return None, None
     
     if 'Symbol' in df.columns:
         mask = df['Symbol'].astype(str).str.upper().str.replace("_", "").str.replace(" ", "").str.contains("NIFTY50|NIFTY")
@@ -317,9 +341,7 @@ def run_production_sweep():
         
     print(f"⚙️ EXECUTING DATE: {target_date_str}")
     
-    # ==========================================
-    # ULTIMATE PATH RESOLVER 
-    # ==========================================
+    # Path Resolver Strategy
     nifty_file = None
     
     for root, dirs, files in os.walk("."):
@@ -359,7 +381,6 @@ def run_production_sweep():
 
     nifty_cnn, nifty_xgb_p, nifty_xgb_t, nifty_faiss = train_ai_brain(X_nifty, Y_np, Y_nt)
     
-    # Infer Nifty Live
     nifty_live_matrix, nifty_ltp = get_live_tensor_from_csv(nifty_file, target_date_str)
     
     if nifty_live_matrix is not None:
@@ -424,26 +445,28 @@ def run_production_sweep():
             
     # VALIDATION LOGIC FOR BACKTEST
     if is_backtest and os.path.exists("historical_fno.csv") and len(final_report_data) > 0:
-        df_full = pd.read_csv("historical_fno.csv")
-        for row in final_report_data:
-            df_sym = df_full[df_full['Symbol'] == row['asset']].sort_values('Date').reset_index(drop=True)
-            past = df_sym[df_sym['Date'] <= target_date_str]
-            if len(past) > 0:
-                idx = past.index[-1]
-                fw = df_sym.iloc[idx+1 : idx+3] 
-                if len(fw) > 0:
-                    mx, mn = fw['Close'].max(), fw['Close'].min()
-                    if "LONG" in row['direction']:
-                        mv, dd = ((mx - row['ltp']) / row['ltp']) * 100, ((fw['Low'].min() - row['ltp']) / row['ltp']) * 100
-                        c = "#28a745" if mv > 0 else "#6c757d"
-                        row['actual_outcome'] = f"<span style='color: {c};'>Closed ₹{mx:.2f} (+{mv:.2f}%)</span><br><span style='color: #856404; font-size: 11px;'>Max DD: {dd:.2f}%</span>"
-                    else:
-                        mv, dd = ((mn - row['ltp']) / row['ltp']) * 100, ((fw['High'].max() - row['ltp']) / row['ltp']) * 100
-                        c = "#28a745" if mv < 0 else "#6c757d"
-                        row['actual_outcome'] = f"<span style='color: {c};'>Closed ₹{mn:.2f} ({mv:.2f}%)</span><br><span style='color: #856404; font-size: 11px;'>Max DD: +{dd:.2f}%</span>"
+        df_full = read_and_standardize_csv("historical_fno.csv")
+        if df_full is not None:
+            for row in final_report_data:
+                if 'Symbol' not in df_full.columns: continue
+                
+                df_sym = df_full[df_full['Symbol'] == row['asset']].sort_values('Date').reset_index(drop=True)
+                past = df_sym[df_sym['Date'] <= target_date_str]
+                if len(past) > 0:
+                    idx = past.index[-1]
+                    fw = df_sym.iloc[idx+1 : idx+3] 
+                    if len(fw) > 0:
+                        mx, mn = fw['Close'].max(), fw['Close'].min()
+                        if "LONG" in row['direction']:
+                            mv, dd = ((mx - row['ltp']) / row['ltp']) * 100, ((fw['Low'].min() - row['ltp']) / row['ltp']) * 100
+                            c = "#28a745" if mv > 0 else "#6c757d"
+                            row['actual_outcome'] = f"<span style='color: {c};'>Closed ₹{mx:.2f} (+{mv:.2f}%)</span><br><span style='color: #856404; font-size: 11px;'>Max DD: {dd:.2f}%</span>"
+                        else:
+                            mv, dd = ((mn - row['ltp']) / row['ltp']) * 100, ((fw['High'].max() - row['ltp']) / row['ltp']) * 100
+                            c = "#28a745" if mv < 0 else "#6c757d"
+                            row['actual_outcome'] = f"<span style='color: {c};'>Closed ₹{mn:.2f} ({mv:.2f}%)</span><br><span style='color: #856404; font-size: 11px;'>Max DD: +{dd:.2f}%</span>"
 
     send_mobile_alert(macro_report, final_report_data, target_date_str, is_backtest)
 
 if __name__ == "__main__":
     run_production_sweep()
-
