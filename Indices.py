@@ -6,7 +6,7 @@ import urllib.parse
 from datetime import datetime, timedelta
 import requests
 import pandas as pd
-import sys
+import argparse
 import time
 
 INDICES_TO_FETCH = {
@@ -59,7 +59,7 @@ def fetch_chunked_historical_data(instrument_key, access_token, from_date_str, t
         
     return all_candles
 
-def generate_historical_indices_csv(from_date_str, to_date_str, filename="historical_indices.csv"):
+def generate_historical_indices_csv(from_date_str, to_date_str, filename="output/historical_indices.csv"):
     print(f"🌐 Downloading Upstox NSE Master Contract (Range: {from_date_str} to {to_date_str})...")
     nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
     response = requests.get(nse_url)
@@ -94,7 +94,8 @@ def generate_historical_indices_csv(from_date_str, to_date_str, filename="histor
         
         if candles:
             df = pd.DataFrame(candles, columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
-            df['Date'] = pd.to_datetime(df['Date']).dt.strftime('%Y-%m-%d')
+            # Safely handle Upstox ISO-8601 date format strings 
+            df['Date'] = pd.to_datetime(df['Date'], utc=True).dt.strftime('%Y-%m-%d')
             df['Symbol'] = symbol_name
             
             # Filter strictly within the requested bounds, drop duplicates, sort
@@ -108,6 +109,8 @@ def generate_historical_indices_csv(from_date_str, to_date_str, filename="histor
             print(f"⚠️ No data retrieved for {symbol_name}")
             
     if all_data:
+        # Ensure the output directory exists before saving
+        os.makedirs(os.path.dirname(filename), exist_ok=True)
         final_df = pd.concat(all_data, ignore_index=True)
         final_df.to_csv(filename, index=False)
         print(f"🎉 Success! '{filename}' generated safely between {from_date_str} and {to_date_str}.")
@@ -115,15 +118,22 @@ def generate_historical_indices_csv(from_date_str, to_date_str, filename="histor
         print("❌ No index data was compiled.")
 
 if __name__ == "__main__":
-    # Expects arguments: python script.py YYYY-MM-DD YYYY-MM-DD
-    if len(sys.argv) >= 3:
-        f_date = sys.argv[1].strip()
-        t_date = sys.argv[2].strip()
-    else:
-        # Default fallback if arguments aren't provided via CLI
-        f_date = "2024-01-01"
-        t_date = datetime.now().strftime("%Y-%m-%d")
-        print(f"ℹ️ No date args provided. Using defaults: {f_date} to {t_date}")
+    # Use argparse to properly map the flags passed by your GitHub Actions YAML
+    parser = argparse.ArgumentParser(description="Generate Historical Indices Data")
+    parser.add_argument("--start-date", type=str, default="2024-01-01", help="Start Date (YYYY-MM-DD)")
+    parser.add_argument("--end-date", type=str, default=datetime.now().strftime("%Y-%m-%d"), help="End Date (YYYY-MM-DD)")
+    
+    # Accept the other parameters sent by your YAML so the script doesn't crash on unrecognized arguments
+    parser.add_argument("--interval", type=str, help="Interval parameter (ignored by this specific script)")
+    parser.add_argument("--lookback", type=str, help="Lookback window (ignored by this specific script)")
+    parser.add_argument("--universe", type=str, help="Asset universe (ignored by this specific script)")
+    
+    args = parser.parse_args()
+
+    f_date = args.start_date.strip()
+    t_date = args.end_date.strip()
+    
+    print(f"ℹ️ Running query from {f_date} to {t_date}")
         
-    generate_historical_indices_csv(f_date, t_date, filename="historical_indices.csv")
-            
+    generate_historical_indices_csv(f_date, t_date, filename="output/historical_indices.csv")
+    
