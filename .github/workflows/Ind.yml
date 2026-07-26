@@ -54,7 +54,7 @@ jobs:
       - name: Run Backtest Script
         run: |
           mkdir -p output
-          python Indces.py \
+          python Indices.py \
             --start-date "${{ inputs.start_date }}" \
             --end-date "${{ inputs.end_date }}" \
             --interval "$INTERVAL" \
