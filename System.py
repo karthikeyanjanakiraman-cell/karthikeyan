@@ -77,7 +77,14 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_pct=
     time_targets = []
     FUTURE_DAYS = 2 
     
-    for symbol, group in df.groupby('Symbol') if 'Symbol' in df.columns else [('NIFTY', df)]:
+    # Anti-Interleaving for Index files
+    if "historical_indices" in csv_filename.lower() or "nifty" in csv_filename.lower():
+        if 'Symbol' in df.columns:
+            mask = df['Symbol'].astype(str).str.upper().str.replace("_", "").str.replace(" ", "").str.contains("NIFTY50|NIFTY")
+            if mask.any():
+                df = df[mask]
+
+    for symbol, group in df.groupby('Symbol') if 'Symbol' in df.columns else [('ASSET', df)]:
         group = group.sort_values('Date').reset_index(drop=True)
         values = group[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)
         
@@ -110,7 +117,6 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_pct=
                 actual_drawdown = ((future_highs.max() - start_price) / (start_price + 1e-8)) * 100
                 rejection_wick = ((min_close - future_lows.min()) / (start_price + 1e-8)) * 100
                 
-            # BASE FILTERS (Dynamic based on Index vs Stock)
             if abs(actual_pct_move) < min_pct or abs(actual_pct_move) > max_pct or start_price < 10.0:
                 continue
                 
@@ -134,7 +140,6 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_pct=
 def train_ai_brain(X_raw, Y_price, Y_time, epochs=15):
     X_tensor = torch.tensor(X_raw)
     
-    # 1. Train CNN
     cnn_model = TemporalAutoencoder()
     optimizer = optim.Adam(cnn_model.parameters(), lr=0.002)
     criterion = nn.MSELoss()
@@ -147,16 +152,13 @@ def train_ai_brain(X_raw, Y_price, Y_time, epochs=15):
         loss.backward()
         optimizer.step()
 
-    # 2. Extract Latent Vectors
     cnn_model.eval()
     with torch.no_grad():
         latent_vectors = cnn_model.encode(X_tensor).numpy()
         
-    # 3. Train XGBoost predictors
     xgb_price = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=4).fit(latent_vectors, Y_price)
     xgb_time = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=4).fit(latent_vectors, Y_time)
 
-    # 4. Build FAISS Index
     faiss.normalize_L2(latent_vectors)
     index = faiss.IndexFlatIP(12) 
     index.add(latent_vectors)
@@ -167,8 +169,16 @@ def train_ai_brain(X_raw, Y_price, Y_time, epochs=15):
 # 4. LIVE INGESTION TOOLS
 # ==============================================================================
 def get_live_tensor_from_csv(csv_filename, target_date_str):
-    """Safely extracts the most recent 30-day window directly from a CSV"""
+    """Safely extracts the clean 30-day chronological sequence"""
     df = pd.read_csv(csv_filename)
+    
+    if 'Symbol' in df.columns:
+        mask = df['Symbol'].astype(str).str.upper().str.replace("_", "").str.replace(" ", "").str.contains("NIFTY50|NIFTY")
+        if mask.any():
+            df = df[mask]
+        else:
+            df = df[df['Symbol'] == df['Symbol'].unique()[0]]
+            
     df = df[df['Date'] <= target_date_str].sort_values('Date').reset_index(drop=True)
     
     if len(df) < 30: return None, None
@@ -240,7 +250,6 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
     msg['From'] = sender_email
     msg['To'] = recipient_email
 
-    # Macro Formatting
     macro_color = "#28a745" if "LONG" in macro_data['direction'] else "#dc3545"
     sim_warning = f"<div style='background-color: #fff3cd; color: #856404; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 15px;'>⚠️ VALIDATION MODE: SHOWING ACTUAL 2-DAY OUTCOMES</div>" if is_backtest else ""
 
@@ -309,19 +318,49 @@ def run_production_sweep():
     print(f"⚙️ EXECUTING DATE: {target_date_str}")
     
     # ==========================================
+    # ULTIMATE PATH RESOLVER 
+    # ==========================================
+    nifty_file = None
+    
+    for root, dirs, files in os.walk("."):
+        for file in files:
+            if "nifty" in file.lower() and file.lower().endswith(".csv"):
+                nifty_file = os.path.join(root, file)
+                print(f"✅ Auto-detected Nifty file at: {nifty_file}")
+                break
+        if nifty_file: break
+            
+    if not nifty_file:
+        for root, dirs, files in os.walk("."):
+            for file in files:
+                if "historical_indices.csv" in file.lower():
+                    nifty_file = os.path.join(root, file)
+                    print(f"✅ Auto-detected Nifty data inside: {nifty_file}")
+                    break
+            if nifty_file: break
+
+    if not nifty_file:
+        print("❌ Critical Error: Could not find ANY file containing 'nifty' or 'historical_indices'.")
+        print("📁 Here are the files the runner actually sees:")
+        for root, dirs, files in os.walk("."):
+            for file in files:
+                print(os.path.join(root, file))
+        return
+
+    # ==========================================
     # PHASE 1: MACRO NIFTY BRAIN
     # ==========================================
-    print("\n🧠 PHASE 1: Training NIFTY 50 Macro Brain...")
-    X_nifty, Y_np, Y_nt = load_training_data("nifty.csv", target_date_str, min_pct=0.75, max_pct=5.0, max_dd=0.5, wick_ratio=0.5)
+    print(f"\n🧠 PHASE 1: Training NIFTY 50 Macro Brain using {nifty_file}...")
+    X_nifty, Y_np, Y_nt = load_training_data(nifty_file, target_date_str, min_pct=0.75, max_pct=5.0, max_dd=0.5, wick_ratio=0.5)
     
     if X_nifty is None or len(X_nifty) == 0:
-        print("❌ Nifty Data failed to load or parse.")
+        print("❌ Nifty Data matrix construction failed.")
         return
 
     nifty_cnn, nifty_xgb_p, nifty_xgb_t, nifty_faiss = train_ai_brain(X_nifty, Y_np, Y_nt)
     
     # Infer Nifty Live
-    nifty_live_matrix, nifty_ltp = get_live_tensor_from_csv("nifty.csv", target_date_str)
+    nifty_live_matrix, nifty_ltp = get_live_tensor_from_csv(nifty_file, target_date_str)
     
     if nifty_live_matrix is not None:
         live_nifty_tensor = torch.tensor(nifty_live_matrix).unsqueeze(0)
@@ -407,3 +446,4 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
+
