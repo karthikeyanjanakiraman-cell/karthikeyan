@@ -1,24 +1,37 @@
-name: Generate Indices Historical CSV
+name: Backtest and Generate Reports
 
 on:
   workflow_dispatch:
     inputs:
-      from_date:
-        description: 'Start Date (YYYY-MM-DD)'
+      start_date:
+        description: 'Backtest Start Date (YYYY-MM-DD)'
         required: true
-        default: ''
-      to_date:
-        description: 'End Date (YYYY-MM-DD)'
+        default: '2025-01-01'
+        type: string
+      end_date:
+        description: 'Backtest End Date (YYYY-MM-DD)'
         required: true
-        default: ''
+        default: '2026-01-01'
+        type: string
+
+permissions:
+  contents: write
 
 jobs:
-  build-indices-csv:
+  run-backtest:
     runs-on: ubuntu-latest
     
+    env:
+      INTERVAL: ${{ vars.DEFAULT_INTERVAL | default('1d') }}
+      LOOKBACK_WINDOW: ${{ vars.DEFAULT_LOOKBACK | default('252') }}
+      ASSET_UNIVERSE: ${{ vars.DEFAULT_UNIVERSE | default('sp500') }}
+      GENERATE_HISTORICAL_CSV: 'true'
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -28,17 +41,28 @@ jobs:
       - name: Install Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install requests pandas numpy
+          pip install -r requirements.txt
 
-      - name: Run Indices Data Generator
-        env:
-          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+      - name: Run Backtest Script
         run: |
-          python Indices.py "${{ github.event.inputs.from_date }}" "${{ github.event.inputs.to_date }}"
+          python main.py \
+            --start-date "${{ inputs.start_date }}" \
+            --end-date "${{ inputs.end_date }}" \
+            --interval "$INTERVAL" \
+            --lookback "$LOOKBACK_WINDOW" \
+            --universe "$ASSET_UNIVERSE"
 
-      - name: Commit and Push CSV
+      - name: Commit and Push Updated CSVs
         run: |
-          git config --global user.name "GitHub Actions Bot"
-          git config --global user.email "actions@github.com"
-          git add historical_indices.csv
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto-generated historical_indices.csv for range ${{ github.event.inputs.from_date }} to ${{ github.event.inputs.to_date }}" && git push)
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add output/ *.csv
+          git diff --staged --quiet || (git commit -m "Auto-update historical CSV files and reports" && git push)
+
+      - name: Upload Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: backtest-reports-and-csv
+          path: |
+            output/
+            *.csv
