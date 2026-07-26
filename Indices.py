@@ -96,4 +96,4 @@ def generate_historical_indices_csv(filename="historical_indices.csv", days_back
         print("❌ No index data was compiled.")
 
 if __name__ == "__main__":
-    generate_historical_indices_csv(filename="historical_indices.csv", days_back=365)
+    generate_historical_indices_csv(filename="historical_indices.csv", days_back=3650)
