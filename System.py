@@ -59,7 +59,7 @@ class TemporalAutoencoder(nn.Module):
         return self.decoder(latent), latent
 
 # ==============================================================================
-# 2. HIGH-OCTANE HYPER-MOMENTUM TRAINING LOADER (With Strict Linearity)
+# 2. HIGH-OCTANE HYPER-MOMENTUM TRAINING LOADER (1.2% Max Drawdown Filter)
 # ==============================================================================
 def load_real_training_data(csv_filename="historical_fno.csv", target_date_str=None):
     if not os.path.exists(csv_filename):
@@ -114,12 +114,16 @@ def load_real_training_data(csv_filename="historical_fno.csv", target_date_str=N
             if abs(max_pct_move) < 4.0 or abs(max_pct_move) > 50.0 or start_price < 20.0:
                 continue
                 
-            # STRICT LINEARITY FILTERS (Protects against Stop-Loss hunting and Wicks)
+            # =========================================================
+            # THE INSTITUTIONAL SWEET SPOT (1.2% Max Drawdown)
+            # =========================================================
             if is_long:
-                if max_drawdown < -1.5: continue # Shakeout drop was too deep
+                # Discard if it dropped more than 1.2% (Hits Stop-Loss)
+                if max_drawdown < -1.2: continue 
                 if rejection_wick > (max_pct_move * 0.40): continue # Wick was too large
             else:
-                if max_drawdown > 1.5: continue # Shakeout spike was too high
+                # Discard if it spiked more than 1.2% against the short (Hits Stop-Loss)
+                if max_drawdown > 1.2: continue 
                 if rejection_wick > (abs(max_pct_move) * 0.40): continue # Wick was too large
 
             days_to_target = float(np.argmax(np.abs(future_closes - start_price)) + 1)
@@ -401,4 +405,4 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
-    
+        
