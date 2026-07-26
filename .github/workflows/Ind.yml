@@ -53,7 +53,7 @@ jobs:
         # working-directory: ./your_folder_name # <-- Uncomment if your script is in a subfolder
         run: |
           mkdir -p output
-          python Indicies.py \
+          python Indices.py \
             --start-date "${{ inputs.start_date }}" \
             --end-date "${{ inputs.end_date }}" \
             --interval "$INTERVAL" \
