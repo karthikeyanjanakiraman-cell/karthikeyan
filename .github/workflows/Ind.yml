@@ -6,12 +6,12 @@ on:
       start_date:
         description: 'Backtest Start Date (YYYY-MM-DD)'
         required: true
-        default: '2025-01-01'
+        default: ''
         type: string
       end_date:
         description: 'Backtest End Date (YYYY-MM-DD)'
         required: true
-        default: '2026-01-01'
+        default: ''
         type: string
 
 permissions:
@@ -53,7 +53,7 @@ jobs:
         # working-directory: ./your_folder_name # <-- Uncomment if your script is in a subfolder
         run: |
           mkdir -p output
-          python main.py \
+          python Indicies.py \
             --start-date "${{ inputs.start_date }}" \
             --end-date "${{ inputs.end_date }}" \
             --interval "$INTERVAL" \
