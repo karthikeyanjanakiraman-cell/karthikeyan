@@ -1,10 +1,15 @@
 import os
 import smtplib
+import urllib.parse
+import json
+import gzip
+import io
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta
 
 import requests
+import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
@@ -53,14 +58,82 @@ class TemporalAutoencoder(nn.Module):
         return self.decoder(latent), latent
 
 # ==============================================================================
-# 2. DATA INGESTION (Upstox API)
+# 2. REAL HISTORICAL DATA LOADER (For AI Training)
 # ==============================================================================
+def load_real_training_data(csv_filename="historical_fno.csv"):
+    """Loads actual historical CSV data and shapes it into 30-day tensors."""
+    if not os.path.exists(csv_filename):
+        raise FileNotFoundError(f"Missing '{csv_filename}' in repository! Please run the data generator workflow first.")
+        
+    df = pd.read_csv(csv_filename)
+    
+    training_matrices = []
+    price_targets = []
+    time_targets = []
+    
+    # Group by stock symbol to process individual chart histories
+    for symbol, group in df.groupby('Symbol'):
+        group = group.sort_values('Date').reset_index(drop=True)
+        values = group[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)
+        
+        if len(values) < 45: # Need at least 30 days history + 15 days future target window
+            continue
+            
+        # Normalize per stock chunk
+        v_min = values.min(axis=0)
+        v_max = values.max(axis=0)
+        norm_values = (values - v_min) / (v_max - v_min + 1e-8)
+        
+        # Slice into rolling 30-day windows
+        for i in range(len(norm_values) - 45):
+            window = norm_values[i:i+30].T # Shape: (5 features, 30 days)
+            future_window = norm_values[i+30:i+45, 3] # Future Close prices
+            
+            # Calculate actual % move that happened next
+            start_price = future_window[0]
+            max_or_min_price = future_window.max() if (future_window.max() - start_price) > (start_price - future_window.min()) else future_window.min()
+            pct_move = ((max_or_min_price - start_price) / (start_price + 1e-8)) * 100
+            
+            training_matrices.append(window)
+            price_targets.append(pct_move)
+            time_targets.append(float(np.argmax(np.abs(future_window - start_price)) + 1))
+            
+    return np.array(training_matrices, dtype=np.float32), np.array(price_targets, dtype=np.float32), np.array(time_targets, dtype=np.float32)
+
+# ==============================================================================
+# 3. DYNAMIC UNIVERSE LOADER & LIVE DATA INGESTION
+# ==============================================================================
+def get_dynamic_fno_universe():
+    """Dynamically fetches the current 180+ F&O stocks from the exchange."""
+    print("🌐 Downloading Live Upstox NSE Master Contract...")
+    nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+    
+    response = requests.get(nse_url)
+    if response.status_code != 200: return []
+
+    try:
+        nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
+        
+        fno_underlying = {item.get("underlying_symbol") for item in nse_data if item.get("segment") == "NSE_FO" and item.get("underlying_symbol")}
+        
+        fno_universe = []
+        for item in nse_data:
+            if item.get("segment") in ("NSE_EQ", "NSE_INDEX") and item.get("trading_symbol") in fno_underlying:
+                fno_universe.append({"symbol": item.get("trading_symbol"), "key": item.get("instrument_key")})
+                
+        return fno_universe
+    except:
+        return []
+
 def fetch_upstox_data(instrument_key, interval="day", days_back=60):
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
     to_date = datetime.now().strftime("%Y-%m-%d")
     from_date = (datetime.now() - timedelta(days=days_back)).strftime("%Y-%m-%d")
     
-    url = f"https://api.upstox.com/v2/historical-candle/{instrument_key}/{interval}/{to_date}/{from_date}"
+    # URL-encode the key to prevent HTTP 400 errors with the pipe character
+    encoded_key = urllib.parse.quote(instrument_key)
+    
+    url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/{interval}/{to_date}/{from_date}"
     headers = {
         'Accept': 'application/json',
         'Authorization': f'Bearer {access_token}'
@@ -84,7 +157,7 @@ def fetch_upstox_data(instrument_key, interval="day", days_back=60):
     return normalized_ohlcv[-30:].T, data[0][4]
 
 # ==============================================================================
-# 3. DISPATCH (Email Delivery Engine)
+# 4. DISPATCH (Email Delivery Engine)
 # ==============================================================================
 def send_mobile_alert(report_data_list):
     sender_email = os.environ.get("SENDER_EMAIL")
@@ -114,6 +187,9 @@ def send_mobile_alert(report_data_list):
             <th>Remaining Target</th>
           </tr>
     """
+    
+    # Sort the report by Conviction score (Highest to Lowest)
+    report_data_list.sort(key=lambda x: x['conviction'], reverse=True)
     
     for row in report_data_list:
         dir_color = "#28a745" if row['direction'] == "LONG 🟢" else "#dc3545"
@@ -148,18 +224,16 @@ def send_mobile_alert(report_data_list):
         print(f"Failed to send email: {str(e)}")
 
 # ==============================================================================
-# 4. MASTER EXECUTION LOOP
+# 5. MASTER EXECUTION LOOP
 # ==============================================================================
 def run_production_sweep():
-    print("📥 Ingesting simulated historical matrix...")
-    X_train_raw = np.random.rand(1000, 5, 30).astype(np.float32) 
-    
-    # 1. Target Data for PRICE MOVE (-10% to +10%)
-    Y_price_targets = (np.random.rand(1000).astype(np.float32) * 20.0) - 10.0 
-    
-    # 2. Target Data for TIME DURATION (1 to 14 days)
-    Y_time_targets = (np.random.rand(1000).astype(np.float32) * 13.0) + 1.0 
-    
+    print("📥 Loading real historical training data from CSV...")
+    try:
+        X_train_raw, Y_price_targets, Y_time_targets = load_real_training_data("historical_fno.csv")
+    except Exception as e:
+        print(f"Failed to load CSV: {e}")
+        return
+        
     X_tensor = torch.tensor(X_train_raw)
     
     print("🧠 Phase 1: Training PyTorch 1D CNN Timeline Extractor...")
@@ -197,12 +271,10 @@ def run_production_sweep():
     
     print("🎯 Phase 5: Scanning Live Market Data...")
     
-    fno_universe = [
-        {"symbol": "RELIANCE", "key": "NSE_EQ|INE002A01018"},
-        {"symbol": "HDFCBANK", "key": "NSE_EQ|INE040A01034"},
-        {"symbol": "TCS",      "key": "NSE_EQ|INE467B01029"},
-        {"symbol": "INFY",     "key": "NSE_EQ|INE009A01021"}
-    ]
+    fno_universe = get_dynamic_fno_universe()
+    if not fno_universe:
+        print("⚠️ Failed to load dynamic F&O universe. Exiting.")
+        return
     
     final_report_data = []
 
@@ -232,9 +304,9 @@ def run_production_sweep():
             final_report_data.append({
                 'asset': asset["symbol"],
                 'direction': direction_tag,
-                'conviction': conviction_percentage,
+                'conviction': float(conviction_percentage),
                 'days': predicted_target_days,
-                'ltp': current_ltp,
+                'ltp': float(current_ltp),
                 'remaining': f"{target_sign}{predicted_target_price:.2f}"
             })
             
