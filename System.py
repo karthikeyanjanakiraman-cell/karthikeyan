@@ -57,6 +57,7 @@ class TemporalAutoencoder(nn.Module):
         latent = self.encode(x)
         return self.decoder(latent), latent
 
+
 # ==============================================================================
 # 2. HIGH-OCTANE HYPER-MOMENTUM TRAINING LOADER
 # ==============================================================================
@@ -82,10 +83,10 @@ def load_real_training_data(csv_filename="historical_fno.csv"):
             continue
             
         for i in range(len(values) - (30 + FUTURE_DAYS) + 1):
-            # CRITICAL FIX: Isolate the exact 30-day window FIRST before normalizing
+            # Isolate the exact 30-day window FIRST before normalizing
             raw_window = values[i : i+30]
             
-            # Normalize ONLY based on these 30 days (Perfectly matches Live Data)
+            # Normalize ONLY based on these 30 days (Prevents data scale leakage)
             w_min = raw_window.min(axis=0)
             w_max = raw_window.max(axis=0)
             norm_window = (raw_window - w_min) / (w_max - w_min + 1e-8)
@@ -106,8 +107,11 @@ def load_real_training_data(csv_filename="historical_fno.csv"):
             else:
                 max_pct_move = ((min_price - start_price) / (start_price + 1e-8)) * 100
                 
-            # THE VOLATILITY FILTER: Ignore sideways market noise (< 4% move)
-            if abs(max_pct_move) < 4.0:
+            # THE DATA CLEANSER & VOLATILITY FILTER
+            # 1. < 4.0%   -> Ignore boring sideways markets.
+            # 2. > 50.0%  -> Ignore data glitches and stock splits.
+            # 3. Price<20 -> Ignore penny stocks & zero-price API errors.
+            if abs(max_pct_move) < 4.0 or abs(max_pct_move) > 50.0 or start_price < 20.0:
                 continue
                 
             # Detect exactly which day the peak rate achieved (Day 1 or Day 2)
@@ -118,6 +122,7 @@ def load_real_training_data(csv_filename="historical_fno.csv"):
             time_targets.append(days_to_target)
             
     return np.array(training_matrices, dtype=np.float32), np.array(price_targets, dtype=np.float32), np.array(time_targets, dtype=np.float32)
+
 
 # ==============================================================================
 # 3. DYNAMIC UNIVERSE INGESTION & LIVE FETCHING
@@ -145,6 +150,7 @@ def get_dynamic_fno_universe():
     except Exception as e:
         print(f"⚠️ Failed to map exchange directory: {str(e)}")
         return []
+
 
 def fetch_upstox_data(instrument_key, interval="day", days_back=60):
     """Queries live data feed, automatically escaping special key characters."""
@@ -175,7 +181,7 @@ def fetch_upstox_data(instrument_key, interval="day", days_back=60):
     ohlcv = np.array([candle[1:6] for candle in data], dtype=np.float32)
     ohlcv = ohlcv[::-1] # Convert chronological sequence (oldest -> newest)
     
-    # CRITICAL FIX: Isolate the exact last 30 trading days BEFORE normalizing
+    # Isolate the exact last 30 trading days BEFORE normalizing
     ohlcv_30 = ohlcv[-30:]
     
     ohlcv_min = ohlcv_30.min(axis=0)
@@ -183,6 +189,7 @@ def fetch_upstox_data(instrument_key, interval="day", days_back=60):
     normalized_ohlcv = (ohlcv_30 - ohlcv_min) / (ohlcv_max - ohlcv_min + 1e-8)
     
     return normalized_ohlcv.T, current_ltp
+
 
 # ==============================================================================
 # 4. DISPATCH ENGINE (High-Velocity Alert Output)
@@ -201,11 +208,31 @@ def send_mobile_alert(report_data_list):
     msg['From'] = sender_email
     msg['To'] = recipient_email
 
-    html_content = """
+    # MATHEMATICAL ISOLATION: Find the absolute highest conviction trade in the list
+    top_trade = max(report_data_list, key=lambda x: x['conviction'])
+    top_color = "#28a745" if top_trade['direction'] == "LONG 🟢" else "#dc3545"
+    top_bg = "#e8f5e9" if top_trade['direction'] == "LONG 🟢" else "#f8d7da"
+
+    html_content = f"""
     <html>
-      <body style="font-family: Arial, sans-serif;">
-        <h3 style="color: #333;">⚡ IMMEDIATE EXPLOSION DETECTOR (4% - 50% SETUPS)</h3>
-        <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%; text-align: center; font-size: 14px;">
+      <body style="font-family: Arial, sans-serif; background-color: #f4f7f6; padding: 10px;">
+        
+        <!-- THE TOP PICK BOX -->
+        <div style="background-color: white; padding: 15px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+            <h3 style="margin-top: 0; color: #333; border-bottom: 1px solid #ccc; padding-bottom: 5px;">👑 HIGHEST PROBABILITY TRADE</h3>
+            <div style="background-color: {top_bg}; border-left: 6px solid {top_color}; padding: 15px; border-radius: 4px;">
+                <h1 style="margin: 0; color: {top_color}; font-size: 24px;">{top_trade['asset']} : {top_trade['direction']}</h1>
+                <p style="font-size: 16px; color: #333; margin-top: 10px; line-height: 1.6;">
+                    <b>Match Score:</b> <span style="font-size: 18px; font-weight: bold;">{top_trade['conviction']:.2f}%</span><br>
+                    <b>Target Price:</b> {top_trade['target_display']}<br>
+                    <b>Expected Time:</b> {top_trade['days_display']}
+                </p>
+            </div>
+        </div>
+
+        <!-- THE REST OF THE MARKET SWEEP -->
+        <h3 style="color: #333;">⚡ ALL HYPER-MOMENTUM SETUPS</h3>
+        <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%; text-align: center; font-size: 14px; background-color: white;">
           <tr bgcolor="#f8f9fa" style="color: #333; font-weight: bold;">
             <th>Asset</th>
             <th>Direction</th>
@@ -252,6 +279,7 @@ def send_mobile_alert(report_data_list):
         print(f"✅ Live Quant Alert Dispatched with {len(report_data_list)} targets.")
     except Exception as e:
         print(f"Failed to send email: {str(e)}")
+
 
 # ==============================================================================
 # 5. MASTER PRODUCTION SWEEP EXECUTION
@@ -307,7 +335,7 @@ def run_production_sweep():
     
     final_report_data = []
     
-    # Minimum conviction parameter fetched from workflow variables
+    # Minimum conviction parameter fetched from workflow variables (Default: 85%)
     min_conviction = float(os.environ.get("PARAM_MIN_CONVICTION", 85.0))
 
     for asset in fno_universe:
@@ -330,7 +358,6 @@ def run_production_sweep():
         cosine_similarity_score, _ = index.search(live_vector, k=5)
         conviction_percentage = cosine_similarity_score[0][0] * 100
         
-        # Stricter entry confirmation limits to protect capital deployment profile
         if conviction_percentage >= min_conviction:
             # Absolute target translation using currency unit calculations
             target_price_rupee = current_ltp * (1 + (predicted_target_pct / 100))
@@ -358,4 +385,4 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
-        
+                                 
