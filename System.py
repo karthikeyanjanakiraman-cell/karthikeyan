@@ -416,7 +416,7 @@ def run_production_sweep():
     if not fno_universe: return
     
     final_report_data = []
-    min_conviction = float(os.environ.get("PARAM_MIN_CONVICTION", 99.95))
+    min_conviction = float(os.environ.get("PARAM_MIN_CONVICTION", 100))
 
     for asset in fno_universe:
         result = fetch_upstox_data(asset["key"], target_date_str, interval="day", days_back=60)
