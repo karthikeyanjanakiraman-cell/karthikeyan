@@ -1,4 +1,4 @@
-name: Fetch Market Data
+name: Fetch Market Data (Upstox)
 
 on:
   workflow_dispatch:
@@ -10,15 +10,15 @@ on:
       from_date:
         description: 'From Date (YYYY-MM-DD)'
         required: true
-        default: 'today'
+        default: '2024-01-01'
       to_date:
         description: 'To Date (YYYY-MM-DD)'
         required: true
-        default: 'today'
+        default: '2024-02-01'
       interval:
-        description: 'Interval (e.g., 1, 5, 15, 60, 1D)'
+        description: 'Interval (e.g., 1, 5, 15, 30, 60, 1D)'
         required: true
-        default: '5'
+        default: '1D'
 
 jobs:
   fetch_data:
@@ -33,74 +33,103 @@ jobs:
         with:
           python-version: '3.11'
 
+      # Upstox doesn't need a custom SDK, standard requests and pandas are perfect
       - name: Install dependencies
-        run: pip install fyers-apiv3 pandas
+        run: pip install requests pandas
 
       - name: Write Python script
         run: |
           cat << 'EOF' > fetch_data.py
           import os
-          from datetime import datetime, timedelta
+          import time
+          import urllib.parse
+          import json
+          import gzip
+          import io
+          import requests
           import pandas as pd
-          from fyers_apiv3 import fyersModel
+          from datetime import datetime, timedelta
 
-          CLIENT_ID      = os.environ["CLIENT_ID"]
-          ACCESS_TOKEN   = os.environ["ACCESS_TOKEN"]
+          ACCESS_TOKEN   = os.environ.get("UPSTOX_ACCESS_TOKEN")
           FROM_DATE      = os.environ["FROM_DATE"].strip()
           TO_DATE        = os.environ["TO_DATE"].strip()
-          FETCH_INTERVAL = os.environ["FETCH_INTERVAL"].strip()
+          FETCH_INTERVAL = os.environ["FETCH_INTERVAL"].strip().upper()
           STOCK_INPUT    = os.environ["STOCK_NAME"].strip().upper()
 
-          # Format the symbol for FYERS API
-          def normalize_symbol(stock_input: str) -> str:
-              if ":" in stock_input:
-                  return stock_input
-              special_map = {
-                  "NIFTY": "NSE:NIFTY50-INDEX",
-                  "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
-                  "FINNIFTY": "NSE:FINNIFTY-INDEX",
+          if not ACCESS_TOKEN:
+              raise ValueError("❌ UPSTOX_ACCESS_TOKEN is missing! Please check your repository secrets.")
+
+          # Map user intervals to Upstox API format
+          interval_map = {
+              "1": "1minute",
+              "5": "5minute",
+              "15": "15minute",
+              "30": "30minute",
+              "60": "60minute",
+              "1D": "day",
+              "DAY": "day"
+          }
+          upstox_interval = interval_map.get(FETCH_INTERVAL, "day")
+
+          # Download and parse Upstox Master Contract to map symbol to instrument_key
+          def get_instrument_key(symbol):
+              print("🌐 Downloading Upstox NSE Master Contract to map symbol...")
+              url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+              res = requests.get(url)
+              data = json.load(gzip.GzipFile(fileobj=io.BytesIO(res.content)))
+              
+              # Map common alias inputs to Upstox Index Names
+              aliases = {
+                  "NIFTY": "NIFTY 50",
+                  "NIFTY50": "NIFTY 50",
+                  "BANKNIFTY": "NIFTY BANK",
+                  "FINNIFTY": "NIFTY FIN SERVICE"
               }
-              return special_map.get(stock_input, f"NSE:{stock_input}-EQ")
+              search_sym = aliases.get(symbol, symbol)
 
-          SYMBOL = normalize_symbol(STOCK_INPUT)
+              for item in data:
+                  if item.get("segment") in ["NSE_EQ", "NSE_INDEX"]:
+                      # Strip out "-EQ" from Upstox equity symbols to match clean inputs
+                      ts = item.get("trading_symbol", "").upper().replace("-EQ", "")
+                      nm = item.get("name", "").upper()
+                      if search_sym == ts or search_sym == nm:
+                          return item.get("instrument_key")
+              return None
 
-          # Initialize FYERS API
-          fyers = fyersModel.FyersModel(
-              client_id=CLIENT_ID,
-              token=ACCESS_TOKEN,
-              log_path=""
-          )
+          inst_key = get_instrument_key(STOCK_INPUT)
+          if not inst_key:
+              raise ValueError(f"❌ Could not find an Upstox instrument key for symbol: {STOCK_INPUT}")
+          
+          print(f"✅ Mapped '{STOCK_INPUT}' to Upstox Key: {inst_key}")
 
-          def fetch_chunk(range_from: str, range_to: str):
-              params = {
-                  "symbol": SYMBOL,
-                  "resolution": FETCH_INTERVAL,
-                  "date_format": "1",
-                  "range_from": range_from,
-                  "range_to": range_to,
-                  "cont_flag": "1",
+          def fetch_chunk(range_from, range_to):
+              encoded_key = urllib.parse.quote(inst_key)
+              url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/{upstox_interval}/{range_to}/{range_from}"
+              headers = {
+                  'Accept': 'application/json',
+                  'Authorization': f'Bearer {ACCESS_TOKEN}'
               }
-              print(f"Fetching {range_from} to {range_to} ...")
-              response = fyers.history(data=params)
-              status = response.get("s")
-              if status != "ok":
-                  raise Exception(f"API Error for {range_from} to {range_to}: {response}")
-              candles = response.get("candles", [])
-              return candles
+              print(f"Fetching chunk {range_from} to {range_to} ...")
+              
+              response = requests.get(url, headers=headers)
+              if response.status_code == 200:
+                  return response.json().get("data", {}).get("candles", [])
+              else:
+                  print(f"⚠️ API Error ({response.status_code}): {response.text}")
+                  return []
 
           # Parse dates
           try:
               start_date = datetime.strptime(FROM_DATE, "%Y-%m-%d").date()
               end_date = datetime.strptime(TO_DATE, "%Y-%m-%d").date()
           except ValueError as e:
-              raise ValueError(f"Invalid date format. Use YYYY-MM-DD. Error: {e}")
+              raise ValueError(f"❌ Invalid date format. Use YYYY-MM-DD. Error: {e}")
 
           if start_date > end_date:
-              raise ValueError(f"FROM_DATE ({FROM_DATE}) cannot be after TO_DATE ({TO_DATE}).")
+              raise ValueError(f"❌ FROM_DATE ({FROM_DATE}) cannot be after TO_DATE ({TO_DATE}).")
 
-          # FYERS history API effectively limits the span per call (approx 100 days), so chunk it.[web:68][web:74]
-          max_span_days = 99  # inclusive: start .. end
-
+          # Chunk requests safely to avoid Upstox historical limits
+          max_span_days = 90
           all_candles = []
           current_start = start_date
 
@@ -108,45 +137,37 @@ jobs:
               current_end = min(current_start + timedelta(days=max_span_days), end_date)
               chunk_from = current_start.strftime("%Y-%m-%d")
               chunk_to = current_end.strftime("%Y-%m-%d")
+              
               candles = fetch_chunk(chunk_from, chunk_to)
               all_candles.extend(candles)
+              
               current_start = current_end + timedelta(days=1)
+              time.sleep(0.3) # Rate limit safety
 
           # Build DataFrame
           if all_candles:
-              df = pd.DataFrame(
-                  all_candles,
-                  columns=["timestamp", "open", "high", "low", "close", "volume"],
-              )
-              # Remove any accidental duplicates on timestamp
-              df = df.drop_duplicates(subset=["timestamp"]).sort_values("timestamp")
-
-              # Convert timestamp to IST "YYYY-MM-DD HH:MM"
-              df["time"] = (
-                  pd.to_datetime(df["timestamp"], unit="s")
-                  .dt.tz_localize("UTC")
-                  .dt.tz_convert("Asia/Kolkata")
-                  .dt.strftime("%Y-%m-%d %H:%M")
-              )
+              df = pd.DataFrame(all_candles, columns=["timestamp", "open", "high", "low", "close", "volume", "oi"])
+              
+              # Safely parse Upstox ISO-8601 timestamps and convert to IST
+              df["time"] = pd.to_datetime(df["timestamp"], utc=True).dt.tz_convert("Asia/Kolkata").dt.strftime("%Y-%m-%d %H:%M")
               df = df[["time", "open", "high", "low", "close", "volume"]]
+              
+              # Upstox returns data descending. Drop duplicates and sort ascending cleanly.
+              df = df.drop_duplicates(subset=["time"]).sort_values("time")
+
+              safe_symbol = STOCK_INPUT.replace(":", "_").replace("-", "_")
+              filename = f"{safe_symbol}_{FROM_DATE}_to_{TO_DATE}_{FETCH_INTERVAL}.csv"
+
+              df.to_csv(filename, index=False)
+              print(f"🎉 Success! Data saved: {filename}")
           else:
-              # No data returned for the entire range
-              df = pd.DataFrame(columns=["time", "open", "high", "low", "close", "volume"])
-              print("Warning: No candles returned for the given date range.")
+              print("⚠️ Warning: No candles returned for the given date range.")
 
-          # Save the file with the full requested date range in the name
-          safe_symbol = SYMBOL.replace(":", "_").replace("-", "_")
-          filename = f"{safe_symbol}_{FROM_DATE}_to_{TO_DATE}_{FETCH_INTERVAL}.csv"
-
-          df.to_csv(filename, index=False)
-          print(df.to_string(index=False))
-          print(f"Saved: {filename}")
           EOF
 
       - name: Run Python script
         env:
-          CLIENT_ID: ${{ secrets.CLIENT_ID }}
-          ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
           STOCK_NAME: ${{ github.event.inputs.stock }}
           FROM_DATE: ${{ github.event.inputs.from_date }}
           TO_DATE: ${{ github.event.inputs.to_date }}
@@ -159,3 +180,4 @@ jobs:
           name: data-${{ github.event.inputs.stock }}-${{ github.event.inputs.interval }}-${{ github.event.inputs.from_date }}-to-${{ github.event.inputs.to_date }}
           path: "*.csv"
           retention-days: 1
+          
