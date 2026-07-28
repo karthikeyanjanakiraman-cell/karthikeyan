@@ -12,9 +12,6 @@ on:
         required: true
         default: ''
 
-permissions:
-  contents: write
-
 jobs:
   build-dataset:
     runs-on: ubuntu-latest
@@ -41,11 +38,10 @@ jobs:
       run: |
         python get_history.py
 
-    - name: Save CSV File to GitHub Repository
-      run: |
-        git config --global user.name 'github-actions[bot]'
-        git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-        git add historical_fno.csv
-        git commit -m "Auto-generated dynamic F&O historical dataset" || echo "No data changed"
-        git push
-
+    - name: Upload CSV as Downloadable Artifact
+      uses: actions/upload-artifact@v4
+      with:
+        name: historical_fno_dataset
+        path: historical_fno.csv
+        retention-days: 7 # Optional: Deletes the artifact after 7 days to save space
+        
