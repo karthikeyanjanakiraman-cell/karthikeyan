@@ -236,9 +236,9 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_dd=1
     return np.array(training_matrices, dtype=np.float32), np.array(labels, dtype=np.float32), min_pct
 
 # ==============================================================================
-# 3. MODULAR AI TRAINING ENGINE (Supervised End-to-End)
+# 3. MODULAR AI TRAINING ENGINE (Batched to prevent RAM crashes)
 # ==============================================================================
-def train_ai_brain(X_raw, Y_labels, epochs=15):
+def train_ai_brain(X_raw, Y_labels, epochs=10, batch_size=256):
     X_tensor = torch.tensor(X_raw)
     Y_tensor = torch.tensor(Y_labels).view(-1, 1)
     
@@ -246,22 +246,39 @@ def train_ai_brain(X_raw, Y_labels, epochs=15):
     optimizer = optim.Adam(cnn_model.parameters(), lr=0.002)
     criterion = nn.BCELoss() # Binary Cross Entropy Loss
     
+    dataset_size = X_tensor.size(0)
+    
+    # 1. Train with Mini-Batches to prevent Out-Of-Memory (OOM) crashes
     cnn_model.train()
-    for _ in range(epochs): 
-        optimizer.zero_grad()
-        probs, _ = cnn_model(X_tensor)
-        loss = criterion(probs, Y_tensor)
-        loss.backward()
-        optimizer.step()
-
-    cnn_model.eval()
-    with torch.no_grad():
-        latent_vectors = cnn_model.encode(X_tensor).numpy()
+    for epoch in range(epochs): 
+        permutation = torch.randperm(dataset_size)
         
-    # FIX: Removed the deprecated use_label_encoder parameter to resolve warnings
+        for i in range(0, dataset_size, batch_size):
+            indices = permutation[i : i + batch_size]
+            batch_x, batch_y = X_tensor[indices], Y_tensor[indices]
+            
+            optimizer.zero_grad()
+            probs, _ = cnn_model(batch_x)
+            loss = criterion(probs, batch_y)
+            loss.backward()
+            optimizer.step()
+
+    # 2. Extract Latent Vectors (Batched to save RAM)
+    cnn_model.eval()
+    latent_vectors_list = []
+    with torch.no_grad():
+        for i in range(0, dataset_size, batch_size):
+            batch_x = X_tensor[i : i + batch_size]
+            latent_batch = cnn_model.encode(batch_x).numpy()
+            latent_vectors_list.append(latent_batch)
+            
+    latent_vectors = np.vstack(latent_vectors_list)
+        
+    # 3. Train XGBoost
     xgb_model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=4, eval_metric='logloss')
     xgb_model.fit(latent_vectors, Y_labels)
 
+    # 4. Save to FAISS Memory
     faiss.normalize_L2(latent_vectors)
     index = faiss.IndexFlatIP(32)
     index.add(latent_vectors)
