@@ -164,7 +164,10 @@ def normalize_mega_tensor(values):
     
     price_cols = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18, 19, 29, 30, 31]
     for col in price_cols:
-        norm_values[:, col] = np.log((norm_values[:, col] + 1e-8) / base_price)
+        # FIX: Clip values to prevent lower bands (BB_Dn, ST_Lower, etc.) 
+        # from dropping below zero and crashing the np.log() calculation.
+        safe_values = np.clip(norm_values[:, col], a_min=1e-6, a_max=None)
+        norm_values[:, col] = np.log(safe_values / base_price)
         
     zscore_cols = [4, 13, 20, 21, 22, 23, 24, 26, 27, 28]
     for col in zscore_cols:
@@ -255,7 +258,8 @@ def train_ai_brain(X_raw, Y_labels, epochs=15):
     with torch.no_grad():
         latent_vectors = cnn_model.encode(X_tensor).numpy()
         
-    xgb_model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=4, use_label_encoder=False, eval_metric='logloss')
+    # FIX: Removed the deprecated use_label_encoder parameter to resolve warnings
+    xgb_model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=4, eval_metric='logloss')
     xgb_model.fit(latent_vectors, Y_labels)
 
     faiss.normalize_L2(latent_vectors)
