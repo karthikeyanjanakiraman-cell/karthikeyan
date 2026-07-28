@@ -518,7 +518,7 @@ def run_production_sweep():
     if not fno_universe: return
     
     final_report_data = []
-    min_prob_threshold = float(os.environ.get("PARAM_MIN_PROBABILITY", 80.0))
+    min_prob_threshold = float(os.environ.get("PARAM_MIN_PROBABILITY", 60.0))
 
     for asset in fno_universe:
         result = fetch_upstox_data(asset["key"], target_date_str, interval="day", days_back=100)
