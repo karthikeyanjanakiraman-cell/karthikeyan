@@ -19,36 +19,34 @@ import faiss
 import xgboost as xgb
 
 # ==============================================================================
-# 1. TEMPORAL AUTOENCODER (The 1D CNN Brain)
+# 1. UPGRADED TEMPORAL CNN (34-Feature Probability Classifier)
 # ==============================================================================
-class TemporalAutoencoder(nn.Module):
-    def __init__(self, num_features=5, latent_dim=12):
-        super(TemporalAutoencoder, self).__init__()
+class TemporalCNNClassifier(nn.Module):
+    def __init__(self, num_features=34, latent_dim=32): 
+        super(TemporalCNNClassifier, self).__init__()
         
         self.encoder = nn.Sequential(
-            nn.Conv1d(in_channels=num_features, out_channels=16, kernel_size=3, padding=1),
-            nn.BatchNorm1d(16),
+            nn.Conv1d(in_channels=num_features, out_channels=64, kernel_size=3, padding=1),
+            nn.BatchNorm1d(64),
             nn.ReLU(inplace=True),
             nn.MaxPool1d(2),
             
-            nn.Conv1d(in_channels=16, out_channels=32, kernel_size=3, padding=1),
-            nn.BatchNorm1d(32),
+            nn.Conv1d(in_channels=64, out_channels=128, kernel_size=3, padding=1),
+            nn.BatchNorm1d(128),
             nn.ReLU(inplace=True),
             nn.MaxPool1d(3),
             
             nn.Flatten(),
-            nn.Linear(32 * 5, latent_dim)
+            nn.Linear(128 * 5, latent_dim),
+            nn.ReLU(inplace=True)
         )
         
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 32 * 5),
+        # Binary Classifier for Win Probability
+        self.classifier = nn.Sequential(
+            nn.Linear(latent_dim, 16),
             nn.ReLU(inplace=True),
-            nn.Unflatten(1, (32, 5)),
-            nn.ConvTranspose1d(32, 16, kernel_size=3, stride=3, output_padding=0),
-            nn.BatchNorm1d(16),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose1d(16, num_features, kernel_size=2, stride=2, output_padding=0),
-            nn.Sigmoid()
+            nn.Linear(16, 1),
+            nn.Sigmoid() 
         )
 
     def encode(self, x):
@@ -56,18 +54,131 @@ class TemporalAutoencoder(nn.Module):
 
     def forward(self, x):
         latent = self.encode(x)
-        return self.decoder(latent), latent
+        prob = self.classifier(latent)
+        return prob, latent
 
 # ==============================================================================
-# 2. DYNAMIC TRAINING LOADER & STANDARDIZER
+# 2. MEGA FEATURE ENGINEERING & NORMALIZATION
 # ==============================================================================
-def read_and_standardize_csv(filename):
-    """Universally maps Fyers, Upstox, or Yahoo CSV formats into standard ML inputs."""
-    if not os.path.exists(filename): return None
+def add_mega_technical_indicators(df):
+    """Calculates all 34 quantitative confluence indicators."""
     
+    # --- 1. MOVING AVERAGES ---
+    df['EMA_8'] = df['Close'].ewm(span=8, adjust=False).mean()
+    df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
+    df['EMA_21'] = df['Close'].ewm(span=21, adjust=False).mean()
+    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
+    
+    wma_half = df['Close'].rolling(7).apply(lambda x: np.dot(x, np.arange(1, 8)) / 28, raw=True)
+    wma_full = df['Close'].rolling(14).apply(lambda x: np.dot(x, np.arange(1, 15)) / 105, raw=True)
+    df['HMA'] = (2 * wma_half - wma_full).rolling(int(np.sqrt(14))).mean()
+
+    df['Alligator_Jaw'] = df['Close'].rolling(13).mean().shift(8)
+    df['Alligator_Teeth'] = df['Close'].rolling(8).mean().shift(5)
+    df['Alligator_Lips'] = df['Close'].rolling(5).mean().shift(3)
+
+    # --- 2. VOLATILITY & BANDS ---
+    df['TR'] = np.maximum(df['High'] - df['Low'], np.maximum(abs(df['High'] - df['Close'].shift()), abs(df['Low'] - df['Close'].shift())))
+    df['ATR'] = df['TR'].rolling(14).mean()
+
+    std_20 = df['Close'].rolling(20).std()
+    df['BB_Up'] = df['EMA_20'] + (2 * std_20)
+    df['BB_Dn'] = df['EMA_20'] - (2 * std_20)
+
+    df['KC_Up'] = df['EMA_20'] + (1.5 * df['ATR'])
+    df['KC_Dn'] = df['EMA_20'] - (1.5 * df['ATR'])
+
+    hl2 = (df['High'] + df['Low']) / 2
+    df['ST_Upper'] = hl2 + (3 * df['ATR'])
+    df['ST_Lower'] = hl2 - (3 * df['ATR'])
+
+    # --- 3. MOMENTUM & OSCILLATORS ---
+    delta = df['Close'].diff()
+    gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
+    rs = gain / (loss + 1e-8)
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    exp12 = df['Close'].ewm(span=12, adjust=False).mean()
+    exp26 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = exp12 - exp26
+    df['MACD_Signal'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    df['MACD_Hist'] = df['MACD'] - df['MACD_Signal']
+
+    low14 = df['Low'].rolling(14).min()
+    high14 = df['High'].rolling(14).max()
+    df['Stoch_K'] = 100 * ((df['Close'] - low14) / (high14 - low14 + 1e-8))
+
+    up, down = df['High'].diff(), -df['Low'].diff()
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    plus_di = 100 * (pd.Series(plus_dm).rolling(14).mean() / (df['ATR'] + 1e-8))
+    minus_di = 100 * (pd.Series(minus_dm).rolling(14).mean() / (df['ATR'] + 1e-8))
+    df['ADX'] = (100 * abs(plus_di - minus_di) / (plus_di + minus_di + 1e-8)).rolling(14).mean()
+
+    ema13 = df['Close'].ewm(span=13, adjust=False).mean()
+    bull_impulse = (ema13 > ema13.shift(1)) & (df['MACD_Hist'] > df['MACD_Hist'].shift(1))
+    bear_impulse = (ema13 < ema13.shift(1)) & (df['MACD_Hist'] < df['MACD_Hist'].shift(1))
+    df['EIS'] = np.where(bull_impulse, 1, np.where(bear_impulse, -1, 0))
+
+    # --- 4. VOLUME DYNAMICS ---
+    df['OBV'] = (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
+    
+    typical_price = (df['High'] + df['Low'] + df['Close']) / 3
+    raw_money_flow = typical_price * df['Volume']
+    pos_flow = np.where(typical_price > typical_price.shift(1), raw_money_flow, 0)
+    neg_flow = np.where(typical_price < typical_price.shift(1), raw_money_flow, 0)
+    mf_ratio = pd.Series(pos_flow).rolling(14).sum() / (pd.Series(neg_flow).rolling(14).sum() + 1e-8)
+    df['MFI'] = 100 - (100 / (1 + mf_ratio))
+
+    df['VSA_Spread'] = (df['High'] - df['Low']) / (df['Volume'] + 1e-8)
+
+    # --- 5. VWAP & PIVOTS ---
+    df['VWAP'] = (typical_price * df['Volume']).cumsum() / (df['Volume'].cumsum() + 1e-8)
+    
+    range_prev = df['High'].shift(1) - df['Low'].shift(1)
+    df['Cam_H3'] = df['Close'].shift(1) + (range_prev * 0.275)
+    df['Cam_L3'] = df['Close'].shift(1) - (range_prev * 0.275)
+
+    range_daily = df['High'] - df['Low']
+    df['NR4'] = (range_daily == range_daily.rolling(4).min()).astype(float)
+    df['NR7'] = (range_daily == range_daily.rolling(7).min()).astype(float)
+
+    df.bfill(inplace=True)
+    df.fillna(0, inplace=True)
+    
+    feature_cols = [
+        'Open', 'High', 'Low', 'Close', 'Volume', 
+        'EMA_8', 'EMA_20', 'EMA_21', 'EMA_50', 'HMA', 
+        'Alligator_Jaw', 'Alligator_Teeth', 'Alligator_Lips',
+        'ATR', 'BB_Up', 'BB_Dn', 'KC_Up', 'KC_Dn', 'ST_Upper', 'ST_Lower',
+        'RSI', 'MACD', 'MACD_Hist', 'Stoch_K', 'ADX', 'EIS',
+        'OBV', 'MFI', 'VSA_Spread', 'VWAP', 'Cam_H3', 'Cam_L3', 'NR4', 'NR7'
+    ]
+    return df[feature_cols]
+
+def normalize_mega_tensor(values):
+    """Applies Multi-Tiered Normalization (Log Returns, Z-Score, and State Preservation)"""
+    norm_values = values.copy()
+    base_price = norm_values[0, 3] + 1e-8 
+    
+    price_cols = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18, 19, 29, 30, 31]
+    for col in price_cols:
+        norm_values[:, col] = np.log((norm_values[:, col] + 1e-8) / base_price)
+        
+    zscore_cols = [4, 13, 20, 21, 22, 23, 24, 26, 27, 28]
+    for col in zscore_cols:
+        col_mean = np.mean(norm_values[:, col])
+        col_std = np.std(norm_values[:, col]) + 1e-8
+        norm_values[:, col] = (norm_values[:, col] - col_mean) / col_std
+        
+    # Indices 25 (EIS), 32 (NR4), 33 (NR7) remain unchanged
+    return norm_values.T
+
+def read_and_standardize_csv(filename):
+    if not os.path.exists(filename): return None
     df = pd.read_csv(filename)
     rename_map = {}
-    
     for c in df.columns:
         cl = str(c).lower().strip()
         if cl in ['date', 'time', 'timestamp']: rename_map[c] = 'Date'
@@ -77,102 +188,66 @@ def read_and_standardize_csv(filename):
         elif cl == 'low': rename_map[c] = 'Low'
         elif cl == 'close': rename_map[c] = 'Close'
         elif cl in ['volume', 'vol']: rename_map[c] = 'Volume'
-        
     df = df.rename(columns=rename_map)
-    
-    if 'Date' in df.columns:
-        # Strip timestamps (e.g. "2010-01-01 15:30") to purely "YYYY-MM-DD" for safe string comparisons
-        df['Date'] = df['Date'].astype(str).str[:10]
-        
+    if 'Date' in df.columns: df['Date'] = df['Date'].astype(str).str[:10]
     return df
 
-def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_pct=50.0, max_dd=1.2, wick_ratio=0.40):
+def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_dd=1.2):
     df = read_and_standardize_csv(csv_filename)
-    if df is None or 'Date' not in df.columns:
-        print(f"⚠️ Warning: Missing or invalid '{csv_filename}'")
-        return None, None, None
-        
-    # 🛑 PREVENT DATA LEAKAGE
-    if target_date_str:
-        df = df[df['Date'] <= target_date_str]
+    if df is None or 'Date' not in df.columns: return None, None, None
+    if target_date_str: df = df[df['Date'] <= target_date_str]
     
-    training_matrices = []
-    price_targets = []
-    time_targets = []
+    training_matrices, labels = [], []
     FUTURE_DAYS = 2 
     
-    # Anti-Interleaving for Index files
     if "historical_indices" in csv_filename.lower() or "nifty" in csv_filename.lower():
         if 'Symbol' in df.columns:
             mask = df['Symbol'].astype(str).str.upper().str.replace("_", "").str.replace(" ", "").str.contains("NIFTY50|NIFTY")
-            if mask.any():
-                df = df[mask]
+            if mask.any(): df = df[mask]
 
     for symbol, group in df.groupby('Symbol') if 'Symbol' in df.columns else [('ASSET', df)]:
         group = group.sort_values('Date').reset_index(drop=True)
-        values = group[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)
+        group = add_mega_technical_indicators(group)
         
-        if len(values) < (30 + FUTURE_DAYS): 
-            continue
+        values = group.values.astype(np.float32)
+        if len(values) < (30 + FUTURE_DAYS): continue
             
         for i in range(len(values) - (30 + FUTURE_DAYS) + 1):
             raw_window = values[i : i+30]
-            w_min = raw_window.min(axis=0)
-            w_max = raw_window.max(axis=0)
-            norm_window = (raw_window - w_min) / (w_max - w_min + 1e-8)
-            window = norm_window.T 
+            window = normalize_mega_tensor(raw_window)
             
-            future_closes = values[i+30 : i+30+FUTURE_DAYS, 3]
-            future_highs  = values[i+30 : i+30+FUTURE_DAYS, 1]
-            future_lows   = values[i+30 : i+30+FUTURE_DAYS, 2]
+            future_closes = values[i+30 : i+30+FUTURE_DAYS, 3] 
+            future_lows   = values[i+30 : i+30+FUTURE_DAYS, 2] 
             start_price   = values[i+29, 3] 
             
             max_close = future_closes.max()
-            min_close = future_closes.min()
+            actual_pct_move = ((max_close - start_price) / (start_price + 1e-8)) * 100
+            actual_drawdown = ((future_lows.min() - start_price) / (start_price + 1e-8)) * 100
             
-            if (max_close - start_price) > (start_price - min_close):
-                is_long = True
-                actual_pct_move = ((max_close - start_price) / (start_price + 1e-8)) * 100
-                actual_drawdown = ((future_lows.min() - start_price) / (start_price + 1e-8)) * 100
-                rejection_wick = ((future_highs.max() - max_close) / (start_price + 1e-8)) * 100
-            else:
-                is_long = False
-                actual_pct_move = ((min_close - start_price) / (start_price + 1e-8)) * 100
-                actual_drawdown = ((future_highs.max() - start_price) / (start_price + 1e-8)) * 100
-                rejection_wick = ((min_close - future_lows.min()) / (start_price + 1e-8)) * 100
-                
-            if abs(actual_pct_move) < min_pct or abs(actual_pct_move) > max_pct or start_price < 10.0:
-                continue
-                
-            if is_long:
-                if actual_drawdown < -max_dd: continue 
-                if rejection_wick > (actual_pct_move * wick_ratio): continue 
-            else:
-                if actual_drawdown > max_dd: continue 
-                if rejection_wick > (abs(actual_pct_move) * wick_ratio): continue 
-
-            days_to_target = float(np.argmax(np.abs(future_closes - start_price)) + 1)
+            # Label = 1 (Win) if target hit without hitting stop loss, else 0
+            is_success = 1.0 if (actual_pct_move >= min_pct and actual_drawdown >= -max_dd) else 0.0
+            
             training_matrices.append(window)
-            price_targets.append(actual_pct_move)
-            time_targets.append(days_to_target)
+            labels.append(is_success)
             
-    return np.array(training_matrices, dtype=np.float32), np.array(price_targets, dtype=np.float32), np.array(time_targets, dtype=np.float32)
+    return np.array(training_matrices, dtype=np.float32), np.array(labels, dtype=np.float32), min_pct
 
 # ==============================================================================
-# 3. MODULAR AI TRAINING ENGINE
+# 3. MODULAR AI TRAINING ENGINE (Supervised End-to-End)
 # ==============================================================================
-def train_ai_brain(X_raw, Y_price, Y_time, epochs=15):
+def train_ai_brain(X_raw, Y_labels, epochs=15):
     X_tensor = torch.tensor(X_raw)
+    Y_tensor = torch.tensor(Y_labels).view(-1, 1)
     
-    cnn_model = TemporalAutoencoder()
+    cnn_model = TemporalCNNClassifier(num_features=34)
     optimizer = optim.Adam(cnn_model.parameters(), lr=0.002)
-    criterion = nn.MSELoss()
+    criterion = nn.BCELoss() # Binary Cross Entropy Loss
     
     cnn_model.train()
     for _ in range(epochs): 
         optimizer.zero_grad()
-        reconstructed, _ = cnn_model(X_tensor)
-        loss = criterion(reconstructed, X_tensor)
+        probs, _ = cnn_model(X_tensor)
+        loss = criterion(probs, Y_tensor)
         loss.backward()
         optimizer.step()
 
@@ -180,14 +255,14 @@ def train_ai_brain(X_raw, Y_price, Y_time, epochs=15):
     with torch.no_grad():
         latent_vectors = cnn_model.encode(X_tensor).numpy()
         
-    xgb_price = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=4).fit(latent_vectors, Y_price)
-    xgb_time = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=4).fit(latent_vectors, Y_time)
+    xgb_model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=4, use_label_encoder=False, eval_metric='logloss')
+    xgb_model.fit(latent_vectors, Y_labels)
 
     faiss.normalize_L2(latent_vectors)
-    index = faiss.IndexFlatIP(12) 
+    index = faiss.IndexFlatIP(32)
     index.add(latent_vectors)
     
-    return cnn_model, xgb_price, xgb_time, index
+    return cnn_model, xgb_model, index
 
 # ==============================================================================
 # 4. LIVE INGESTION TOOLS
@@ -198,23 +273,19 @@ def get_live_tensor_from_csv(csv_filename, target_date_str):
     
     if 'Symbol' in df.columns:
         mask = df['Symbol'].astype(str).str.upper().str.replace("_", "").str.replace(" ", "").str.contains("NIFTY50|NIFTY")
-        if mask.any():
-            df = df[mask]
-        else:
-            df = df[df['Symbol'] == df['Symbol'].unique()[0]]
+        if mask.any(): df = df[mask]
+        else: df = df[df['Symbol'] == df['Symbol'].unique()[0]]
             
     df = df[df['Date'] <= target_date_str].sort_values('Date').reset_index(drop=True)
+    df = add_mega_technical_indicators(df)
     
     if len(df) < 30: return None, None
     
-    values = df[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)[-30:]
+    values = df.values.astype(np.float32)[-30:]
     current_ltp = values[-1, 3] 
+    window = normalize_mega_tensor(values)
     
-    w_min = values.min(axis=0)
-    w_max = values.max(axis=0)
-    norm_window = (values - w_min) / (w_max - w_min + 1e-8)
-    
-    return norm_window.T, current_ltp
+    return window, current_ltp
 
 def get_dynamic_fno_universe():
     nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
@@ -232,31 +303,30 @@ def get_dynamic_fno_universe():
     except:
         return []
 
-def fetch_upstox_data(instrument_key, target_date_str, interval="day", days_back=60):
+def fetch_upstox_data(instrument_key, target_date_str, interval="day", days_back=100):
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
     target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
-    to_date = target_date_str
     from_date = (target_dt - timedelta(days=days_back)).strftime("%Y-%m-%d")
     
     encoded_key = urllib.parse.quote(instrument_key)
-    url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/{interval}/{to_date}/{from_date}"
+    url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/{interval}/{target_date_str}/{from_date}"
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
     
     response = requests.get(url, headers=headers)
     if response.status_code != 200: return None
         
     data = response.json().get('data', {}).get('candles', [])
-    if not data or len(data) < 30: return None
+    if not data or len(data) < 60: return None # Buffer requirement
         
-    current_ltp = float(data[0][4])
-    ohlcv = np.array([candle[1:6] for candle in data], dtype=np.float32)[::-1] 
+    df = pd.DataFrame(data[::-1], columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
+    df = df[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
+    df = add_mega_technical_indicators(df)
     
-    ohlcv_30 = ohlcv[-30:]
-    ohlcv_min = ohlcv_30.min(axis=0)
-    ohlcv_max = ohlcv_30.max(axis=0)
-    normalized_ohlcv = (ohlcv_30 - ohlcv_min) / (ohlcv_max - ohlcv_min + 1e-8)
+    values = df.values.astype(np.float32)[-30:]
+    current_ltp = values[-1, 3]
+    window = normalize_mega_tensor(values)
     
-    return normalized_ohlcv.T, current_ltp
+    return window, current_ltp
 
 # ==============================================================================
 # 5. DUAL-BRAIN MASTER EXECUTION & DISPATCH
@@ -296,7 +366,7 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
             <th>Asset</th>
             <th>Signal</th>
             <th>Trend Match?</th>
-            <th>Score</th>
+            <th>Score (Prob)</th>
             <th>Current LTP</th>
             <th>AI Target</th>
             <th>Result (2-Day Close)</th>
@@ -341,9 +411,7 @@ def run_production_sweep():
         
     print(f"⚙️ EXECUTING DATE: {target_date_str}")
     
-    # Path Resolver Strategy
     nifty_file = None
-    
     for root, dirs, files in os.walk("."):
         for file in files:
             if "nifty" in file.lower() and file.lower().endswith(".csv"):
@@ -363,83 +431,78 @@ def run_production_sweep():
 
     if not nifty_file:
         print("❌ Critical Error: Could not find ANY file containing 'nifty' or 'historical_indices'.")
-        print("📁 Here are the files the runner actually sees:")
-        for root, dirs, files in os.walk("."):
-            for file in files:
-                print(os.path.join(root, file))
         return
 
     # ==========================================
     # PHASE 1: MACRO NIFTY BRAIN
     # ==========================================
-    print(f"\n🧠 PHASE 1: Training NIFTY 50 Macro Brain using {nifty_file}...")
-    X_nifty, Y_np, Y_nt = load_training_data(nifty_file, target_date_str, min_pct=0.75, max_pct=5.0, max_dd=0.5, wick_ratio=0.5)
+    print(f"\n🧠 PHASE 1: Training NIFTY 50 Macro Brain (34-Features)...")
+    X_nifty, Y_labels, min_macro_pct = load_training_data(nifty_file, target_date_str, min_pct=0.75, max_dd=0.5)
     
     if X_nifty is None or len(X_nifty) == 0:
         print("❌ Nifty Data matrix construction failed.")
-        return
-
-    nifty_cnn, nifty_xgb_p, nifty_xgb_t, nifty_faiss = train_ai_brain(X_nifty, Y_np, Y_nt)
-    
-    nifty_live_matrix, nifty_ltp = get_live_tensor_from_csv(nifty_file, target_date_str)
-    
-    if nifty_live_matrix is not None:
-        live_nifty_tensor = torch.tensor(nifty_live_matrix).unsqueeze(0)
-        with torch.no_grad():
-            nifty_latent = nifty_cnn.encode(live_nifty_tensor).numpy()
-            
-        n_pct = nifty_xgb_p.predict(nifty_latent)[0]
-        faiss.normalize_L2(nifty_latent)
-        n_score, _ = nifty_faiss.search(nifty_latent, k=5)
-        n_conviction = n_score[0][0] * 100
-        
-        macro_report = {
-            'direction': "LONG 🟢" if n_pct > 0 else "SHORT 🔴",
-            'conviction': float(n_conviction),
-            'target_display': f"₹{nifty_ltp * (1 + (n_pct / 100)):.2f} ({'+' if n_pct>0 else ''}{n_pct:.2f}%)"
-        }
-        print(f"🌍 MACRO REGIME: {macro_report['direction']} (Score: {n_conviction:.2f}%)")
-    else:
         macro_report = {'direction': "UNKNOWN", 'conviction': 0, 'target_display': "N/A"}
+    else:
+        nifty_cnn, nifty_xgb, nifty_faiss = train_ai_brain(X_nifty, Y_labels)
+        nifty_live_matrix, nifty_ltp = get_live_tensor_from_csv(nifty_file, target_date_str)
+        
+        if nifty_live_matrix is not None:
+            live_tensor = torch.tensor(nifty_live_matrix).unsqueeze(0)
+            with torch.no_grad():
+                prob_tensor, nifty_latent = nifty_cnn(live_tensor)
+                cnn_prob = prob_tensor.item() * 100
+                
+            xgb_prob = nifty_xgb.predict_proba(nifty_latent)[0][1] * 100
+            blended_prob = (cnn_prob + xgb_prob) / 2
+            
+            macro_report = {
+                'direction': "LONG 🟢" if blended_prob > 50 else "SHORT 🔴",
+                'conviction': blended_prob,
+                'target_display': f"Expected Move: +{min_macro_pct}%"
+            }
+            print(f"🌍 MACRO REGIME: {macro_report['direction']} (Score: {blended_prob:.2f}%)")
+        else:
+            macro_report = {'direction': "UNKNOWN", 'conviction': 0, 'target_display': "N/A"}
 
     # ==========================================
     # PHASE 2: MICRO F&O BRAIN
     # ==========================================
     print("\n⚡ PHASE 2: Training F&O Micro Brain (Hyper-Momentum)...")
-    X_fno, Y_fp, Y_ft = load_training_data("historical_fno.csv", target_date_str, min_pct=4.0, max_pct=50.0, max_dd=1.2, wick_ratio=0.4)
+    X_fno, Y_fno_labels, min_micro_pct = load_training_data("historical_fno.csv", target_date_str, min_pct=4.0, max_dd=1.2)
     if X_fno is None or len(X_fno) == 0: return
 
-    fno_cnn, fno_xgb_p, fno_xgb_t, fno_faiss = train_ai_brain(X_fno, Y_fp, Y_ft)
+    fno_cnn, fno_xgb, fno_faiss = train_ai_brain(X_fno, Y_fno_labels)
     
     print("🎯 Phase 3: Sweeping Active Market Universe...")
     fno_universe = get_dynamic_fno_universe()
     if not fno_universe: return
     
     final_report_data = []
-    min_conviction = float(os.environ.get("PARAM_MIN_CONVICTION", 99.92))
+    # Probability threshold replaces strict FAISS matching
+    min_prob_threshold = float(os.environ.get("PARAM_MIN_PROBABILITY", 85.0))
 
     for asset in fno_universe:
-        result = fetch_upstox_data(asset["key"], target_date_str, interval="day", days_back=60)
+        result = fetch_upstox_data(asset["key"], target_date_str, interval="day", days_back=100)
         time.sleep(0.15) 
         
         if result is None: continue
         live_matrix, current_ltp = result
         
         with torch.no_grad():
-            live_vector = fno_cnn.encode(torch.tensor(live_matrix).unsqueeze(0)).numpy()
+            live_tensor = torch.tensor(live_matrix).unsqueeze(0)
+            cnn_prob_tensor, live_latent = fno_cnn(live_tensor)
+            cnn_prob = cnn_prob_tensor.item() * 100
+            
+        xgb_prob = fno_xgb.predict_proba(live_latent.numpy())[0][1] * 100
+        blended_prob = (cnn_prob + xgb_prob) / 2
         
-        pred_pct = fno_xgb_p.predict(live_vector)[0]
-        faiss.normalize_L2(live_vector)
-        score, _ = fno_faiss.search(live_vector, k=5)
-        conviction = score[0][0] * 100
-        
-        if conviction >= min_conviction:
+        if blended_prob >= min_prob_threshold:
             final_report_data.append({
                 'asset': asset["symbol"],
-                'direction': "LONG 🟢" if pred_pct > 0 else "SHORT 🔴",
-                'conviction': float(conviction),
+                'direction': "LONG 🟢",
+                'conviction': float(blended_prob),
                 'ltp': float(current_ltp),
-                'target_display': f"₹{current_ltp * (1 + (pred_pct / 100)):.2f} ({'+' if pred_pct>0 else ''}{pred_pct:.2f}%)",
+                'target_display': f"Expected Move: +{min_micro_pct}%",
                 'actual_outcome': "<b>Awaiting Market ⏳</b>"
             })
             
@@ -461,10 +524,6 @@ def run_production_sweep():
                             mv, dd = ((mx - row['ltp']) / row['ltp']) * 100, ((fw['Low'].min() - row['ltp']) / row['ltp']) * 100
                             c = "#28a745" if mv > 0 else "#6c757d"
                             row['actual_outcome'] = f"<span style='color: {c};'>Closed ₹{mx:.2f} (+{mv:.2f}%)</span><br><span style='color: #856404; font-size: 11px;'>Max DD: {dd:.2f}%</span>"
-                        else:
-                            mv, dd = ((mn - row['ltp']) / row['ltp']) * 100, ((fw['High'].max() - row['ltp']) / row['ltp']) * 100
-                            c = "#28a745" if mv < 0 else "#6c757d"
-                            row['actual_outcome'] = f"<span style='color: {c};'>Closed ₹{mn:.2f} ({mv:.2f}%)</span><br><span style='color: #856404; font-size: 11px;'>Max DD: +{dd:.2f}%</span>"
 
     send_mobile_alert(macro_report, final_report_data, target_date_str, is_backtest)
 
