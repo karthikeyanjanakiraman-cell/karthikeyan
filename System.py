@@ -352,9 +352,18 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
         print(f"Failed to send email: {str(e)}")
 
 def run_production_sweep():
-    target_date_str = os.environ.get("PARAM_BACKTEST_DATE", "").strip()
-    is_backtest = bool(target_date_str)
-    if not is_backtest: target_date_str = datetime.now().strftime("%Y-%m-%d")
+    raw_date_str = os.environ.get("PARAM_BACKTEST_DATE", "").strip()
+    is_backtest = bool(raw_date_str)
+    
+    if is_backtest:
+        # FIX: Intercept DD-MM-YYYY formats and convert to strict YYYY-MM-DD
+        try:
+            target_date_str = pd.to_datetime(raw_date_str, dayfirst=True).strftime("%Y-%m-%d")
+        except Exception as e:
+            print(f"❌ Could not parse date: {raw_date_str}. Error: {e}")
+            return
+    else:
+        target_date_str = datetime.now().strftime("%Y-%m-%d")
         
     print(f"⚙️ EXECUTING DATE: {target_date_str}")
     
