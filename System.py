@@ -24,19 +24,15 @@ def extract_deep_history_features(ohlcv_250):
     opens, highs, lows, closes, volumes = ohlcv_250[:, 0], ohlcv_250[:, 1], ohlcv_250[:, 2], ohlcv_250[:, 3], ohlcv_250[:, 4]
     last_close = closes[-1]
     
-    # 🌟 Yearly Macro Scales (250 Days)
     macro_min, macro_max = lows.min(), highs.max()
     pos_in_yearly_range = (last_close - macro_min) / (macro_max - macro_min + 1e-8)
     
-    # 🌟 Intermediate Scales (50 Days)
     mid_min, max_mid = lows[-50:].min(), highs[-50:].max()
     pos_in_50d_range = (last_close - mid_min) / (max_mid - mid_min + 1e-8)
     
-    # 🌟 Micro Scales (10 Days)
     micro_min, max_micro = lows[-10:].min(), highs[-10:].max()
     pos_in_10d_range = (last_close - micro_min) / (max_micro - micro_min + 1e-8)
     
-    # 🌟 Multi-Timeframe Momentum Vectors
     ret_1d = (last_close - closes[-2]) / (closes[-2] + 1e-8) if len(closes) >= 2 else 0
     ret_5d = (last_close - closes[-6]) / (closes[-6] + 1e-8) if len(closes) >= 6 else 0
     ret_20d = (last_close - closes[-21]) / (closes[-21] + 1e-8) if len(closes) >= 21 else 0
@@ -44,13 +40,11 @@ def extract_deep_history_features(ohlcv_250):
     ret_100d = (last_close - closes[-101]) / (closes[-101] + 1e-8) if len(closes) >= 101 else 0
     ret_250d = (last_close - closes[0]) / (closes[0] + 1e-8)
     
-    # 🌟 Volatility Baselines
     daily_returns_250 = np.diff(closes) / (closes[:-1] + 1e-8)
     vol_long = np.std(daily_returns_250) if len(daily_returns_250) > 0 else 1e-8
     vol_short = np.std(daily_returns_250[-10:]) if len(daily_returns_250) >= 10 else vol_long
     vol_ratio = vol_short / (vol_long + 1e-8)
     
-    # 🌟 Volume Outflows
     mean_vol_250 = volumes.mean()
     mean_vol_10 = volumes[-10:].mean()
     vol_expansion_long = volumes[-1] / (mean_vol_250 + 1e-8)
@@ -106,7 +100,7 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=1.0):
             
         for i in range(len(values) - (LOOKBACK + FUTURE_DAYS) + 1):
             raw_window = values[i : i+LOOKBACK]
-            entry_price = values[i+LOOKBACK, 0] 
+            entry_price = values[i+LOOKBACK, 0] # STRICTLY T+1 OPEN ANCHOR
             if entry_price <= 0: continue
             
             future_closes = values[i+LOOKBACK : i+LOOKBACK+FUTURE_DAYS, 3]
@@ -132,7 +126,7 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=1.0):
     return np.array(features_matrices, dtype=np.float32), np.array(price_targets, dtype=np.float32), np.array(risk_targets, dtype=np.float32)
 
 # ==============================================================================
-# 3. PURE K-NEAREST NEIGHBORS ENGINE (No more XGBoost averaging)
+# 3. PURE K-NEAREST NEIGHBORS ENGINE
 # ==============================================================================
 def train_quantitative_model(X_features, Y_price, Y_risk):
     features_contig = np.ascontiguousarray(X_features, dtype=np.float32)
@@ -142,7 +136,7 @@ def train_quantitative_model(X_features, Y_price, Y_risk):
     return index, Y_price, Y_risk
 
 # ==============================================================================
-# 4. DEEP LIVE INGESTION INTERFACES
+# 4. DEEP LIVE INGESTION INTERFACES (Strict 9:15 Open Enforcement)
 # ==============================================================================
 def fetch_915_open_from_upstox(instrument_key, target_date_str):
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
@@ -167,13 +161,15 @@ def get_fno_live_features(asset_symbol, asset_key, target_date_str, is_backtest,
         df_history = df_sym[df_sym['Date'] < target_date_str]
         if len(df_history) < 250: return None, None
         values = df_history[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)[-250:]
+        
         df_future = df_sym[df_sym['Date'] >= target_date_str]
         if df_future.empty: return None, None
+        
+        # 🎯 STRICT 9:15 OPEN ANCHOR FROM CSV OPEN COLUMN
         entry_price = float(df_future.iloc[0]['Open']) 
         features = extract_deep_history_features(values)
         return features, entry_price
     else:
-        # Fallback Live API Fetch
         access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
         if not access_token: return None, None
         target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
@@ -187,8 +183,11 @@ def get_fno_live_features(asset_symbol, asset_key, target_date_str, is_backtest,
         data = response.json().get('data', {}).get('candles', [])
         if not data or len(data) < 250: return None, None
         ohlcv = np.array([candle[1:6] for candle in data], dtype=np.float32)[::-1] 
+        
+        # 🎯 STRICT 9:15 OPEN ANCHOR FROM UPSTOX INTRA-DAY API
         entry_price = fetch_915_open_from_upstox(asset_key, target_date_str)
-        if entry_price is None: entry_price = float(ohlcv[-1][3])
+        if entry_price is None: return None, None # Drop if live open cannot be verified
+        
         features = extract_deep_history_features(ohlcv[-250:])
         return features, entry_price
 
@@ -202,13 +201,16 @@ def get_live_nifty_features_from_csv(csv_filename, target_date_str, instrument_k
     df_history = df[df['Date'] < target_date_str].sort_values('Date').reset_index(drop=True)
     if len(df_history) < 250: return None, None
     values = df_history[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)[-250:]
-    close_t = values[-1, 3] 
+    
     entry_price = None
     df_future = df[df['Date'] >= target_date_str].sort_values('Date').reset_index(drop=True)
+    
     if not is_backtest and instrument_key:
         entry_price = fetch_915_open_from_upstox(instrument_key, target_date_str)
-    if entry_price is None and not df_future.empty: entry_price = float(df_future.iloc[0]['Open'])
-    if entry_price is None: entry_price = close_t
+    if entry_price is None and not df_future.empty: 
+        entry_price = float(df_future.iloc[0]['Open']) # 🎯 STRICT T+1 OPEN ANCHOR
+        
+    if entry_price is None: return None, None
     return extract_deep_history_features(values), entry_price
 
 def get_dynamic_fno_universe():
@@ -228,7 +230,7 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
     if not all([sender_email, sender_pass, recipient_email]): return
 
     msg = MIMEMultipart('alternative')
-    prefix = "⏪ BACKTEST" if is_backtest else "🚀 LIVE PURE-KNN ALERT"
+    prefix = "⏪ BACKTEST" if is_backtest else "🚀 LIVE STRICT-OPEN ALERT"
     msg['Subject'] = f"{prefix} | {target_date_str}"
     msg['From'], msg['To'] = sender_email, recipient_email
 
@@ -247,10 +249,10 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
                 <b>Geometric Similarity:</b> {macro_data['conviction']:.2f}%
             </p>
         </div>
-        <h3 style="color: #333;">⚡ MICRO F&O SWEEP (KNN MEMORY FILTER)</h3>
+        <h3 style="color: #333;">⚡ MICRO F&O SWEEP (STRICT 9:15 OPEN ANCHOR)</h3>
         <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%; text-align: center; font-size: 14px; background-color: white;">
           <tr bgcolor="#f8f9fa" style="color: #333; font-weight: bold;">
-            <th>Asset</th><th>Consensus</th><th>Similarity</th><th>Entry (9:15)</th><th>Max Hist. Pain (SL)</th><th>Hist. Expected Target</th><th>Result</th>
+            <th>Asset</th><th>Consensus</th><th>Similarity</th><th>Entry (9:15 Open)</th><th>Max Hist. Pain (SL)</th><th>Hist. Expected Target</th><th>Result</th>
           </tr>"""
     
     fno_data_list.sort(key=lambda x: x['conviction'], reverse=True)
@@ -280,7 +282,7 @@ def run_production_sweep():
     is_backtest = bool(target_date_str)
     if not is_backtest: target_date_str = datetime.now().strftime("%Y-%m-%d")
         
-    print(f"⚙️ EXECUTING KNN MEMORY ENGINE | DATE: {target_date_str}")
+    print(f"⚙️ EXECUTING STRICT 9:15 OPEN ENGINE | DATE: {target_date_str}")
     
     nifty_file = None
     for root, dirs, files in os.walk("."):
@@ -289,12 +291,8 @@ def run_production_sweep():
             elif "historical_indices.csv" in file.lower(): nifty_file = os.path.join(root, file); break
         if nifty_file: break
 
-    # ==========================================
-    # PHASE 1: MACRO NIFTY KNN
-    # ==========================================
     print(f"\n🧠 PHASE 1: Compiling NIFTY 50 Memory Space...")
     X_nifty, Y_np, Y_nr = load_training_data(nifty_file, target_date_str, min_pct=0.5)
-    
     if X_nifty is None: return
     nifty_faiss, nifty_yp, nifty_yr = train_quantitative_model(X_nifty, Y_np, Y_nr)
     
@@ -303,8 +301,7 @@ def run_production_sweep():
     nifty_live_features, nifty_entry = get_live_nifty_features_from_csv(nifty_file, target_date_str, nifty_key, is_backtest)
     
     macro_report = {'direction': "CHAOTIC 🟡", 'conviction': 0, 'risk_pct': 0, 'target_display': "N/A"}
-    
-    if nifty_live_features is not None:
+    if nifty_live_features is not None and nifty_entry is not None:
         live_feat_arr = np.ascontiguousarray(nifty_live_features.reshape(1, -1), dtype=np.float32)
         faiss.normalize_L2(live_feat_arr)
         scores, indices = nifty_faiss.search(live_feat_arr, k=5)
@@ -316,7 +313,6 @@ def run_production_sweep():
         pos_count = sum(1 for r in past_returns if r > 0)
         neg_count = sum(1 for r in past_returns if r < 0)
         
-        # Determine Consensus
         if pos_count >= 4:
             n_pct = np.mean([r for r in past_returns if r > 0])
             n_risk = np.max([r for r, pr in zip(past_risks, past_returns) if pr > 0])
@@ -325,16 +321,10 @@ def run_production_sweep():
             n_pct = np.mean([r for r in past_returns if r < 0])
             n_risk = np.max([r for r, pr in zip(past_risks, past_returns) if pr < 0])
             macro_report = {'direction': "SHORT 🔴", 'conviction': n_conviction, 'risk_pct': n_risk, 'target_display': f"₹{nifty_entry * (1 + (n_pct / 100)):.2f} ({n_pct:.2f}%)"}
-            
-        print(f"🌍 MACRO REGIME: {macro_report['direction']} | Conviction: {macro_report['conviction']:.2f}%")
 
-    # ==========================================
-    # PHASE 2: MICRO F&O KNN
-    # ==========================================
     print("\n⚡ PHASE 2: Re-Indexing F&O Universe...")
     X_fno, Y_fp, Y_fr = load_training_data("historical_fno.csv", target_date_str, min_pct=1.0)
     if X_fno is None: return
-
     fno_faiss, fno_yp, fno_yr = train_quantitative_model(X_fno, Y_fp, Y_fr)
     
     print("🎯 Phase 3: Sweeping Active Market Universe...")
@@ -360,7 +350,6 @@ def run_production_sweep():
         pos_count = sum(1 for r in past_returns if r > 0)
         neg_count = sum(1 for r in past_returns if r < 0)
         
-        # Strict Directional Consensus Gate
         if pos_count >= 4:
             direction = "LONG 🟢"
             pred_pct = np.mean([r for r in past_returns if r > 0])
@@ -369,25 +358,19 @@ def run_production_sweep():
             direction = "SHORT 🔴"
             pred_pct = np.mean([r for r in past_returns if r < 0])
             pred_risk = np.max([r for r, pr in zip(past_risks, past_returns) if pr < 0])
-        else:
-            print(f"   [FILTERED] {asset['symbol']}: Consensus Failed (Up: {pos_count}, Down: {neg_count}).")
-            continue
+        else: continue
             
-        if abs(pred_pct) < 1.0: continue
-        if abs(pred_pct) < pred_risk: continue # Pain > Gain
+        if abs(pred_pct) < 1.0 or abs(pred_pct) < pred_risk: continue
             
         target_price = entry_price * (1 + (pred_pct / 100.0))
         ai_stop_loss = entry_price * (1 - (pred_risk / 100.0)) if pred_pct > 0 else entry_price * (1 + (pred_risk / 100.0))
         
-        print(f"   🌟 [ACCEPTED] {asset['symbol']} | Consensus: {max(pos_count, neg_count)}/5 | Sim: {final_conviction:.1f}%")
         outcome_text = "<b>Awaiting Market ⏳</b>"
-        
         if is_backtest and fno_df_full is not None:
             df_sym = fno_df_full[fno_df_full['Symbol'] == asset['symbol']].sort_values('Date').reset_index(drop=True)
             df_future = df_sym[df_sym['Date'] >= target_date_str]
             if len(df_future) >= 2:
                 fw = df_future.iloc[:2] 
-                mx, mn = fw['High'].max(), fw['Low'].min()
                 if "LONG" in direction:
                     outcome_text = f"<span style='color: #dc3545;'>❌ MAX PAIN HIT (₹{ai_stop_loss:.2f})</span>" if fw['Low'].min() <= ai_stop_loss else f"<span style='color: #28a745;'>Closed ₹{fw['Close'].iloc[-1]:.2f} (+{((fw['Close'].iloc[-1]-entry_price)/entry_price)*100:.2f}%)</span>"
                 else:
