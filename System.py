@@ -19,10 +19,10 @@ import faiss
 import xgboost as xgb
 
 # ==============================================================================
-# 1. UPGRADED TEMPORAL CNN (Multi-Class 3-State Classifier)
+# 1. UPGRADED TEMPORAL CNN (33-Feature Probability Classifier)
 # ==============================================================================
 class TemporalCNNClassifier(nn.Module):
-    def __init__(self, num_features=34, latent_dim=32): 
+    def __init__(self, num_features=33, latent_dim=32): 
         super(TemporalCNNClassifier, self).__init__()
         
         self.encoder = nn.Sequential(
@@ -41,11 +41,12 @@ class TemporalCNNClassifier(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # Output strictly maps to 3 classes: 0=Neutral, 1=Long, 2=Short
+        # Binary Classifier for Win Probability
         self.classifier = nn.Sequential(
             nn.Linear(latent_dim, 16),
             nn.ReLU(inplace=True),
-            nn.Linear(16, 3) 
+            nn.Linear(16, 1),
+            nn.Sigmoid() 
         )
 
     def encode(self, x):
@@ -53,19 +54,19 @@ class TemporalCNNClassifier(nn.Module):
 
     def forward(self, x):
         latent = self.encode(x)
-        logits = self.classifier(latent)
-        return logits, latent
+        prob = self.classifier(latent)
+        return prob, latent
 
 # ==============================================================================
 # 2. MEGA FEATURE ENGINEERING & NORMALIZATION
 # ==============================================================================
 def add_mega_technical_indicators(df):
-    """Calculates all 34 indicators. Lookahead bias eliminated by dropping NaNs."""
+    """Calculates all 33 quantitative confluence indicators."""
     
+    # --- 1. MOVING AVERAGES ---
     df['EMA_8'] = df['Close'].ewm(span=8, adjust=False).mean()
     df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
     df['EMA_21'] = df['Close'].ewm(span=21, adjust=False).mean()
-    df['EMA_50'] = df['Close'].ewm(span=50, adjust=False).mean()
     
     wma_half = df['Close'].rolling(7).apply(lambda x: np.dot(x, np.arange(1, 8)) / 28, raw=True)
     wma_full = df['Close'].rolling(14).apply(lambda x: np.dot(x, np.arange(1, 15)) / 105, raw=True)
@@ -75,6 +76,7 @@ def add_mega_technical_indicators(df):
     df['Alligator_Teeth'] = df['Close'].rolling(8).mean().shift(5)
     df['Alligator_Lips'] = df['Close'].rolling(5).mean().shift(3)
 
+    # --- 2. VOLATILITY & BANDS ---
     df['TR'] = np.maximum(df['High'] - df['Low'], np.maximum(abs(df['High'] - df['Close'].shift()), abs(df['Low'] - df['Close'].shift())))
     df['ATR'] = df['TR'].rolling(14).mean()
 
@@ -89,6 +91,7 @@ def add_mega_technical_indicators(df):
     df['ST_Upper'] = hl2 + (3 * df['ATR'])
     df['ST_Lower'] = hl2 - (3 * df['ATR'])
 
+    # --- 3. MOMENTUM & OSCILLATORS ---
     delta = df['Close'].diff()
     gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
     loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
@@ -117,6 +120,7 @@ def add_mega_technical_indicators(df):
     bear_impulse = (ema13 < ema13.shift(1)) & (df['MACD_Hist'] < df['MACD_Hist'].shift(1))
     df['EIS'] = np.where(bull_impulse, 1, np.where(bear_impulse, -1, 0))
 
+    # --- 4. VOLUME DYNAMICS ---
     df['OBV'] = (np.sign(df['Close'].diff()) * df['Volume']).fillna(0).cumsum()
     
     typical_price = (df['High'] + df['Low'] + df['Close']) / 3
@@ -128,6 +132,7 @@ def add_mega_technical_indicators(df):
 
     df['VSA_Spread'] = (df['High'] - df['Low']) / (df['Volume'] + 1e-8)
 
+    # --- 5. VWAP & PIVOTS ---
     df['VWAP'] = (typical_price * df['Volume']).cumsum() / (df['Volume'].cumsum() + 1e-8)
     
     range_prev = df['High'].shift(1) - df['Low'].shift(1)
@@ -138,12 +143,12 @@ def add_mega_technical_indicators(df):
     df['NR4'] = (range_daily == range_daily.rolling(4).min()).astype(float)
     df['NR7'] = (range_daily == range_daily.rolling(7).min()).astype(float)
 
-    # NO BACKFILL. Drop rows with NaNs to completely kill lookahead bias.
-    df.dropna(inplace=True)
+    df.bfill(inplace=True)
+    df.fillna(0, inplace=True)
     
     feature_cols = [
         'Open', 'High', 'Low', 'Close', 'Volume', 
-        'EMA_8', 'EMA_20', 'EMA_21', 'EMA_50', 'HMA', 
+        'EMA_8', 'EMA_20', 'EMA_21', 'HMA', 
         'Alligator_Jaw', 'Alligator_Teeth', 'Alligator_Lips',
         'ATR', 'BB_Up', 'BB_Dn', 'KC_Up', 'KC_Dn', 'ST_Upper', 'ST_Lower',
         'RSI', 'MACD', 'MACD_Hist', 'Stoch_K', 'ADX', 'EIS',
@@ -152,20 +157,25 @@ def add_mega_technical_indicators(df):
     return df[feature_cols]
 
 def normalize_mega_tensor(values):
-    """Upgraded to Percentage Deviation instead of Log Returns to avoid math crashes on negative bands."""
+    """Applies Multi-Tiered Normalization (Log Returns, Z-Score, and State Preservation)"""
     norm_values = values.copy()
-    base_price = norm_values[-1, 3] + 1e-8 # Scale relative to the Day 30 Close
+    base_price = norm_values[0, 3] + 1e-8 
     
-    price_cols = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18, 19, 29, 30, 31]
+    # Indices shifted to account for EMA_50 removal
+    price_cols = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 13, 14, 15, 16, 17, 18, 28, 29, 30]
     for col in price_cols:
-        norm_values[:, col] = (norm_values[:, col] - base_price) / base_price
+        # FIX: Clip values to prevent lower bands (BB_Dn, ST_Lower, etc.) 
+        # from dropping below zero and crashing the np.log() calculation.
+        safe_values = np.clip(norm_values[:, col], a_min=1e-6, a_max=None)
+        norm_values[:, col] = np.log(safe_values / base_price)
         
-    zscore_cols = [4, 13, 20, 21, 22, 23, 24, 26, 27, 28]
+    zscore_cols = [4, 12, 19, 20, 21, 22, 23, 25, 26, 27]
     for col in zscore_cols:
         col_mean = np.mean(norm_values[:, col])
         col_std = np.std(norm_values[:, col]) + 1e-8
         norm_values[:, col] = (norm_values[:, col] - col_mean) / col_std
         
+    # Indices 24 (EIS), 31 (NR4), 32 (NR7) remain unchanged
     return norm_values.T
 
 def read_and_standardize_csv(filename):
@@ -200,7 +210,7 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_dd=1
 
     for symbol, group in df.groupby('Symbol') if 'Symbol' in df.columns else [('ASSET', df)]:
         group = group.sort_values('Date').reset_index(drop=True)
-        group = add_mega_technical_indicators(group) # NaNs drop here
+        group = add_mega_technical_indicators(group)
         
         values = group.values.astype(np.float32)
         if len(values) < (30 + FUTURE_DAYS): continue
@@ -209,62 +219,36 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_dd=1
             raw_window = values[i : i+30]
             window = normalize_mega_tensor(raw_window)
             
-            future_slice = values[i+30 : i+30+FUTURE_DAYS] 
-            exec_price = future_slice[0, 0] # Real-world logic: Enter at Day 1 Open
+            future_closes = values[i+30 : i+30+FUTURE_DAYS, 3] 
+            future_lows   = values[i+30 : i+30+FUTURE_DAYS, 2] 
+            start_price   = values[i+29, 3] 
             
-            long_tp = exec_price * (1 + (min_pct / 100))
-            long_sl = exec_price * (1 - (max_dd / 100))
-            short_tp = exec_price * (1 - (min_pct / 100))
-            short_sl = exec_price * (1 + (max_dd / 100))
+            max_close = future_closes.max()
+            actual_pct_move = ((max_close - start_price) / (start_price + 1e-8)) * 100
+            actual_drawdown = ((future_lows.min() - start_price) / (start_price + 1e-8)) * 100
             
-            label = 0 # Default Neutral
-            
-            # Chronological Execution Loop
-            for day_idx in range(FUTURE_DAYS):
-                day_high = future_slice[day_idx, 1]
-                day_low  = future_slice[day_idx, 2]
-                
-                # Check for Whipsaws first (Pessimistic labeling)
-                if (day_high >= long_tp) and (day_low <= long_sl):
-                    label = 0
-                    break
-                if (day_low <= short_tp) and (day_high >= short_sl):
-                    label = 0
-                    break
-                    
-                # Clean Long Win
-                if day_high >= long_tp and day_low > long_sl:
-                    label = 1
-                    break
-                    
-                # Clean Short Win
-                if day_low <= short_tp and day_high < short_sl:
-                    label = 2
-                    break
-                    
-                # Stop Loss Hit
-                if day_low <= long_sl or day_high >= short_sl:
-                    label = 0
-                    break
+            # Label = 1 (Win) if target hit without hitting stop loss, else 0
+            is_success = 1.0 if (actual_pct_move >= min_pct and actual_drawdown >= -max_dd) else 0.0
             
             training_matrices.append(window)
-            labels.append(label)
+            labels.append(is_success)
             
-    return np.array(training_matrices, dtype=np.float32), np.array(labels, dtype=np.int64), min_pct
+    return np.array(training_matrices, dtype=np.float32), np.array(labels, dtype=np.float32), min_pct
 
 # ==============================================================================
-# 3. MODULAR AI TRAINING ENGINE (Batched Multi-Class)
+# 3. MODULAR AI TRAINING ENGINE (Batched to prevent RAM crashes)
 # ==============================================================================
 def train_ai_brain(X_raw, Y_labels, epochs=10, batch_size=256):
     X_tensor = torch.tensor(X_raw)
-    Y_tensor = torch.tensor(Y_labels, dtype=torch.long)
+    Y_tensor = torch.tensor(Y_labels).view(-1, 1)
     
-    cnn_model = TemporalCNNClassifier(num_features=34)
+    cnn_model = TemporalCNNClassifier(num_features=33)
     optimizer = optim.Adam(cnn_model.parameters(), lr=0.002)
-    criterion = nn.CrossEntropyLoss()
+    criterion = nn.BCELoss() # Binary Cross Entropy Loss
     
     dataset_size = X_tensor.size(0)
     
+    # 1. Train with Mini-Batches to prevent Out-Of-Memory (OOM) crashes
     cnn_model.train()
     for epoch in range(epochs): 
         permutation = torch.randperm(dataset_size)
@@ -274,11 +258,12 @@ def train_ai_brain(X_raw, Y_labels, epochs=10, batch_size=256):
             batch_x, batch_y = X_tensor[indices], Y_tensor[indices]
             
             optimizer.zero_grad()
-            logits, _ = cnn_model(batch_x)
-            loss = criterion(logits, batch_y)
+            probs, _ = cnn_model(batch_x)
+            loss = criterion(probs, batch_y)
             loss.backward()
             optimizer.step()
 
+    # 2. Extract Latent Vectors (Batched to save RAM)
     cnn_model.eval()
     latent_vectors_list = []
     with torch.no_grad():
@@ -289,28 +274,16 @@ def train_ai_brain(X_raw, Y_labels, epochs=10, batch_size=256):
             
     latent_vectors = np.vstack(latent_vectors_list)
         
-    xgb_model = xgb.XGBClassifier(
-        n_estimators=100, 
-        learning_rate=0.05, 
-        max_depth=4, 
-        objective='multi:softprob', 
-        num_class=3, 
-        eval_metric='mlogloss'
-    )
+    # 3. Train XGBoost
+    xgb_model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=4, eval_metric='logloss')
     xgb_model.fit(latent_vectors, Y_labels)
-    
-    return cnn_model, xgb_model
 
-def extract_xgb_probs(xgb_model, latent_array):
-    """Safely extracts probabilities avoiding crashes if a class was missing from training data."""
-    raw_probs = xgb_model.predict_proba(latent_array)[0]
-    classes = xgb_model.classes_
-    prob_dict = {0: 0.0, 1: 0.0, 2: 0.0}
+    # 4. Save to FAISS Memory
+    faiss.normalize_L2(latent_vectors)
+    index = faiss.IndexFlatIP(32)
+    index.add(latent_vectors)
     
-    for cls_val, prob in zip(classes, raw_probs):
-        prob_dict[cls_val] = prob
-        
-    return prob_dict[0], prob_dict[1], prob_dict[2]
+    return cnn_model, xgb_model, index
 
 # ==============================================================================
 # 4. LIVE INGESTION TOOLS
@@ -351,7 +324,7 @@ def get_dynamic_fno_universe():
     except:
         return []
 
-def fetch_upstox_data(instrument_key, target_date_str, interval="day", days_back=150): # Increased to survive dropna buffer
+def fetch_upstox_data(instrument_key, target_date_str, interval="day", days_back=45):
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
     target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
     from_date = (target_dt - timedelta(days=days_back)).strftime("%Y-%m-%d")
@@ -364,13 +337,11 @@ def fetch_upstox_data(instrument_key, target_date_str, interval="day", days_back
     if response.status_code != 200: return None
         
     data = response.json().get('data', {}).get('candles', [])
-    if not data or len(data) < 80: return None 
+    if not data or len(data) < 30: return None # Strict 30 day limit enforced here
         
     df = pd.DataFrame(data[::-1], columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
     df = df[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
     df = add_mega_technical_indicators(df)
-    
-    if len(df) < 30: return None
     
     values = df.values.astype(np.float32)[-30:]
     current_ltp = values[-1, 3]
@@ -394,11 +365,7 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
     msg['From'] = sender_email
     msg['To'] = recipient_email
 
-    # HTML Color logic updated to handle NEUTRAL visually
-    if "LONG" in macro_data['direction']: macro_color = "#28a745"
-    elif "SHORT" in macro_data['direction']: macro_color = "#dc3545"
-    else: macro_color = "#6c757d" # Gray for Neutral
-
+    macro_color = "#28a745" if "LONG" in macro_data['direction'] else "#dc3545"
     sim_warning = f"<div style='background-color: #fff3cd; color: #856404; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 15px;'>⚠️ VALIDATION MODE: SHOWING ACTUAL 2-DAY OUTCOMES</div>" if is_backtest else ""
 
     html_content = f"""
@@ -414,7 +381,7 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
             </p>
         </div>
 
-        <h3 style="color: #333;">⚡ MICRO F&O SWEEP (LONG & SHORT MULTI-CLASS)</h3>
+        <h3 style="color: #333;">⚡ MICRO F&O SWEEP (HYPER-MOMENTUM)</h3>
         <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%; text-align: center; font-size: 14px; background-color: white;">
           <tr bgcolor="#f8f9fa" style="color: #333; font-weight: bold;">
             <th>Asset</th>
@@ -423,7 +390,7 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
             <th>Score (Prob)</th>
             <th>Current LTP</th>
             <th>AI Target</th>
-            <th>Result (Next Open -> 2-Day Outcome)</th>
+            <th>Result (2-Day Close)</th>
           </tr>
     """
     
@@ -431,7 +398,7 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
     
     for row in fno_data_list:
         dir_color = "#28a745" if "LONG" in row['direction'] else "#dc3545"
-        trend_match = "✅" if macro_data['direction'] in row['direction'] else ("⚠️" if "NEUTRAL" in macro_data['direction'] else "❌")
+        trend_match = "✅" if row['direction'] == macro_data['direction'] else "⚠️"
         
         html_content += f"""
           <tr>
@@ -490,67 +457,53 @@ def run_production_sweep():
     # ==========================================
     # PHASE 1: MACRO NIFTY BRAIN
     # ==========================================
-    print(f"\n🧠 PHASE 1: Training NIFTY 50 Macro Brain (Multi-Class)...")
-    # Reduced Nifty target expectations since it's an index, not a stock
+    print(f"\n🧠 PHASE 1: Training NIFTY 50 Macro Brain (33-Features)...")
     X_nifty, Y_labels, min_macro_pct = load_training_data(nifty_file, target_date_str, min_pct=0.75, max_dd=0.5)
     
     if X_nifty is None or len(X_nifty) == 0:
         print("❌ Nifty Data matrix construction failed.")
         macro_report = {'direction': "UNKNOWN", 'conviction': 0, 'target_display': "N/A"}
     else:
-        nifty_cnn, nifty_xgb = train_ai_brain(X_nifty, Y_labels)
+        nifty_cnn, nifty_xgb, nifty_faiss = train_ai_brain(X_nifty, Y_labels)
         nifty_live_matrix, nifty_ltp = get_live_tensor_from_csv(nifty_file, target_date_str)
         
         if nifty_live_matrix is not None:
             live_tensor = torch.tensor(nifty_live_matrix).unsqueeze(0)
             with torch.no_grad():
-                logits, nifty_latent = nifty_cnn(live_tensor)
-                cnn_probs = torch.softmax(logits, dim=1).numpy()[0]
+                prob_tensor, nifty_latent = nifty_cnn(live_tensor)
+                cnn_prob = prob_tensor.item() * 100
                 
-            xgb_n0, xgb_n1, xgb_n2 = extract_xgb_probs(nifty_xgb, nifty_latent.numpy())
+            xgb_prob = nifty_xgb.predict_proba(nifty_latent)[0][1] * 100
+            blended_prob = (cnn_prob + xgb_prob) / 2
             
-            blended_neutral = ((cnn_probs[0] + xgb_n0) / 2) * 100
-            blended_long = ((cnn_probs[1] + xgb_n1) / 2) * 100
-            blended_short = ((cnn_probs[2] + xgb_n2) / 2) * 100
-            
-            probs_array = [blended_neutral, blended_long, blended_short]
-            winner_idx = np.argmax(probs_array)
-            best_macro_prob = probs_array[winner_idx]
-            
-            if winner_idx == 1:
-                macro_dir, macro_tgt = "LONG 🟢", f"Expected Move: +{min_macro_pct}%"
-            elif winner_idx == 2:
-                macro_dir, macro_tgt = "SHORT 🔴", f"Expected Drop: -{min_macro_pct}%"
-            else:
-                macro_dir, macro_tgt = "NEUTRAL ⚪", "Choppy / Sideways"
-                
             macro_report = {
-                'direction': macro_dir,
-                'conviction': best_macro_prob,
-                'target_display': macro_tgt
+                'direction': "LONG 🟢" if blended_prob > 50 else "SHORT 🔴",
+                'conviction': blended_prob,
+                'target_display': f"Expected Move: +{min_macro_pct}%"
             }
-            print(f"🌍 MACRO REGIME: {macro_report['direction']} (Score: {best_macro_prob:.2f}%)")
+            print(f"🌍 MACRO REGIME: {macro_report['direction']} (Score: {blended_prob:.2f}%)")
         else:
             macro_report = {'direction': "UNKNOWN", 'conviction': 0, 'target_display': "N/A"}
 
     # ==========================================
     # PHASE 2: MICRO F&O BRAIN
     # ==========================================
-    print("\n⚡ PHASE 2: Training F&O Micro Brain (Multi-Class)...")
+    print("\n⚡ PHASE 2: Training F&O Micro Brain (Hyper-Momentum)...")
     X_fno, Y_fno_labels, min_micro_pct = load_training_data("historical_fno.csv", target_date_str, min_pct=4.0, max_dd=1.2)
     if X_fno is None or len(X_fno) == 0: return
 
-    fno_cnn, fno_xgb = train_ai_brain(X_fno, Y_fno_labels)
+    fno_cnn, fno_xgb, fno_faiss = train_ai_brain(X_fno, Y_fno_labels)
     
     print("🎯 Phase 3: Sweeping Active Market Universe...")
     fno_universe = get_dynamic_fno_universe()
     if not fno_universe: return
     
     final_report_data = []
-    min_prob_threshold = float(os.environ.get("PARAM_MIN_PROBABILITY", 10.0))
+    # Probability threshold replaces strict FAISS matching
+    min_prob_threshold = float(os.environ.get("PARAM_MIN_PROBABILITY", 65.0))
 
     for asset in fno_universe:
-        result = fetch_upstox_data(asset["key"], target_date_str, interval="day", days_back=150)
+        result = fetch_upstox_data(asset["key"], target_date_str, interval="day", days_back=45)
         time.sleep(0.15) 
         
         if result is None: continue
@@ -558,36 +511,19 @@ def run_production_sweep():
         
         with torch.no_grad():
             live_tensor = torch.tensor(live_matrix).unsqueeze(0)
-            logits, live_latent = fno_cnn(live_tensor)
-            cnn_probs = torch.softmax(logits, dim=1).numpy()[0]
+            cnn_prob_tensor, live_latent = fno_cnn(live_tensor)
+            cnn_prob = cnn_prob_tensor.item() * 100
             
-        xgb_f0, xgb_f1, xgb_f2 = extract_xgb_probs(fno_xgb, live_latent.numpy())
+        xgb_prob = fno_xgb.predict_proba(live_latent.numpy())[0][1] * 100
+        blended_prob = (cnn_prob + xgb_prob) / 2
         
-        blended_neutral = ((cnn_probs[0] + xgb_f0) / 2) * 100
-        blended_long = ((cnn_probs[1] + xgb_f1) / 2) * 100
-        blended_short = ((cnn_probs[2] + xgb_f2) / 2) * 100
-        
-        probs_array = [blended_neutral, blended_long, blended_short]
-        winner_idx = np.argmax(probs_array)
-        best_prob = probs_array[winner_idx]
-        
-        # Only report if Long (1) or Short (2) is the strict winner AND crosses threshold
-        if winner_idx == 1 and best_prob >= min_prob_threshold:
+        if blended_prob >= min_prob_threshold:
             final_report_data.append({
                 'asset': asset["symbol"],
                 'direction': "LONG 🟢",
-                'conviction': float(best_prob),
+                'conviction': float(blended_prob),
                 'ltp': float(current_ltp),
                 'target_display': f"Expected Move: +{min_micro_pct}%",
-                'actual_outcome': "<b>Awaiting Market ⏳</b>"
-            })
-        elif winner_idx == 2 and best_prob >= min_prob_threshold:
-            final_report_data.append({
-                'asset': asset["symbol"],
-                'direction': "SHORT 🔴",
-                'conviction': float(best_prob),
-                'ltp': float(current_ltp),
-                'target_display': f"Expected Drop: -{min_micro_pct}%",
                 'actual_outcome': "<b>Awaiting Market ⏳</b>"
             })
             
@@ -604,17 +540,11 @@ def run_production_sweep():
                     idx = past.index[-1]
                     fw = df_sym.iloc[idx+1 : idx+3] 
                     if len(fw) > 0:
-                        exec_price = fw.iloc[0]['Open'] # Simulates entering at Next Day's Open
-                        mx, mn = fw['High'].max(), fw['Low'].min()
-                        
+                        mx, mn = fw['Close'].max(), fw['Close'].min()
                         if "LONG" in row['direction']:
-                            mv, dd = ((mx - exec_price) / exec_price) * 100, ((mn - exec_price) / exec_price) * 100
-                            c = "#28a745" if mv > 0 else "#dc3545"
-                            row['actual_outcome'] = f"<span style='color: {c};'>High ₹{mx:.2f} (+{mv:.2f}%)</span><br><span style='color: #856404; font-size: 11px;'>Max DD: {dd:.2f}%</span>"
-                        else:
-                            mv, dd = ((mn - exec_price) / exec_price) * 100, ((mx - exec_price) / exec_price) * 100
-                            c = "#28a745" if mv < 0 else "#dc3545"
-                            row['actual_outcome'] = f"<span style='color: {c};'>Low ₹{mn:.2f} ({mv:.2f}%)</span><br><span style='color: #856404; font-size: 11px;'>Max DD: +{dd:.2f}%</span>"
+                            mv, dd = ((mx - row['ltp']) / row['ltp']) * 100, ((fw['Low'].min() - row['ltp']) / row['ltp']) * 100
+                            c = "#28a745" if mv > 0 else "#6c757d"
+                            row['actual_outcome'] = f"<span style='color: {c};'>Closed ₹{mx:.2f} (+{mv:.2f}%)</span><br><span style='color: #856404; font-size: 11px;'>Max DD: {dd:.2f}%</span>"
 
     send_mobile_alert(macro_report, final_report_data, target_date_str, is_backtest)
 
