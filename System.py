@@ -81,8 +81,9 @@ def read_and_standardize_csv(filename):
     df = df.rename(columns=rename_map)
     
     if 'Date' in df.columns:
-        # Strip timestamps (e.g. "2010-01-01 15:30") to purely "YYYY-MM-DD" for safe string comparisons
-        df['Date'] = df['Date'].astype(str).str[:10]
+        # Robust parsing ensures consistent YYYY-MM-DD for accurate sorting
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.strftime('%Y-%m-%d')
+        df = df.dropna(subset=['Date'])
         
     return df
 
@@ -162,7 +163,10 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_pct=
 # 3. MODULAR AI TRAINING ENGINE
 # ==============================================================================
 def train_ai_brain(X_raw, Y_price, Y_time, epochs=15):
-    X_tensor = torch.tensor(X_raw)
+    if X_raw is None or len(X_raw) == 0:
+        return None, None, None, None
+        
+    X_tensor = torch.tensor(X_raw, dtype=torch.float32)
     
     cnn_model = TemporalAutoencoder()
     optimizer = optim.Adam(cnn_model.parameters(), lr=0.002)
@@ -179,6 +183,9 @@ def train_ai_brain(X_raw, Y_price, Y_time, epochs=15):
     cnn_model.eval()
     with torch.no_grad():
         latent_vectors = cnn_model.encode(X_tensor).numpy()
+        
+    # Strictly enforce contiguous float32 for Faiss integration
+    latent_vectors = np.ascontiguousarray(latent_vectors, dtype=np.float32)
         
     xgb_price = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=4).fit(latent_vectors, Y_price)
     xgb_time = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=4).fit(latent_vectors, Y_time)
@@ -229,11 +236,16 @@ def get_dynamic_fno_universe():
             if item.get("segment") in ("NSE_EQ", "NSE_INDEX") and item.get("trading_symbol") in fno_underlying:
                 fno_universe.append({"symbol": item.get("trading_symbol"), "key": item.get("instrument_key")})
         return fno_universe
-    except:
+    except Exception as e:
+        print(f"Error fetching FNO universe: {e}")
         return []
 
 def fetch_upstox_data(instrument_key, target_date_str, interval="day", days_back=60):
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
+    if not access_token:
+        print("⚠️ Warning: UPSTOX_ACCESS_TOKEN not set in environment.")
+        return None
+        
     target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
     to_date = target_date_str
     from_date = (target_dt - timedelta(days=days_back)).strftime("%Y-%m-%d")
@@ -245,7 +257,10 @@ def fetch_upstox_data(instrument_key, target_date_str, interval="day", days_back
     response = requests.get(url, headers=headers)
     if response.status_code != 200: return None
         
-    data = response.json().get('data', {}).get('candles', [])
+    json_resp = response.json()
+    data_block = json_resp.get('data') if isinstance(json_resp, dict) else None
+    data = data_block.get('candles', []) if isinstance(data_block, dict) else []
+    
     if not data or len(data) < 30: return None
         
     current_ltp = float(data[0][4])
@@ -266,7 +281,9 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
     sender_pass = os.environ.get("SENDER_PASSWORD")
     recipient_email = os.environ.get("RECIPIENT_EMAIL")
     
-    if not all([sender_email, sender_pass, recipient_email]): return
+    if not all([sender_email, sender_pass, recipient_email]):
+        print("⚠️ Email credentials missing, skipping alert dispatch.")
+        return
 
     msg = MIMEMultipart('alternative')
     prefix = "⏪ BACKTEST" if is_backtest else "🚀 LIVE ALERT"
@@ -383,11 +400,12 @@ def run_production_sweep():
     
     nifty_live_matrix, nifty_ltp = get_live_tensor_from_csv(nifty_file, target_date_str)
     
-    if nifty_live_matrix is not None:
-        live_nifty_tensor = torch.tensor(nifty_live_matrix).unsqueeze(0)
+    if nifty_live_matrix is not None and nifty_cnn is not None:
+        live_nifty_tensor = torch.tensor(nifty_live_matrix, dtype=torch.float32).unsqueeze(0)
         with torch.no_grad():
             nifty_latent = nifty_cnn.encode(live_nifty_tensor).numpy()
             
+        nifty_latent = np.ascontiguousarray(nifty_latent, dtype=np.float32)
         n_pct = nifty_xgb_p.predict(nifty_latent)[0]
         faiss.normalize_L2(nifty_latent)
         n_score, _ = nifty_faiss.search(nifty_latent, k=5)
@@ -407,13 +425,17 @@ def run_production_sweep():
     # ==========================================
     print("\n⚡ PHASE 2: Training F&O Micro Brain (Hyper-Momentum)...")
     X_fno, Y_fp, Y_ft = load_training_data("historical_fno.csv", target_date_str, min_pct=4.0, max_pct=50.0, max_dd=1.2, wick_ratio=0.4)
-    if X_fno is None or len(X_fno) == 0: return
+    if X_fno is None or len(X_fno) == 0: 
+        print("❌ F&O Data matrix construction failed.")
+        return
 
     fno_cnn, fno_xgb_p, fno_xgb_t, fno_faiss = train_ai_brain(X_fno, Y_fp, Y_ft)
     
     print("🎯 Phase 3: Sweeping Active Market Universe...")
     fno_universe = get_dynamic_fno_universe()
-    if not fno_universe: return
+    if not fno_universe: 
+        print("⚠️ FNO universe empty.")
+        return
     
     final_report_data = []
     min_conviction = float(os.environ.get("PARAM_MIN_CONVICTION", 99.92))
@@ -425,23 +447,25 @@ def run_production_sweep():
         if result is None: continue
         live_matrix, current_ltp = result
         
-        with torch.no_grad():
-            live_vector = fno_cnn.encode(torch.tensor(live_matrix).unsqueeze(0)).numpy()
-        
-        pred_pct = fno_xgb_p.predict(live_vector)[0]
-        faiss.normalize_L2(live_vector)
-        score, _ = fno_faiss.search(live_vector, k=5)
-        conviction = score[0][0] * 100
-        
-        if conviction >= min_conviction:
-            final_report_data.append({
-                'asset': asset["symbol"],
-                'direction': "LONG 🟢" if pred_pct > 0 else "SHORT 🔴",
-                'conviction': float(conviction),
-                'ltp': float(current_ltp),
-                'target_display': f"₹{current_ltp * (1 + (pred_pct / 100)):.2f} ({'+' if pred_pct>0 else ''}{pred_pct:.2f}%)",
-                'actual_outcome': "<b>Awaiting Market ⏳</b>"
-            })
+        if fno_cnn is not None:
+            with torch.no_grad():
+                live_vector = fno_cnn.encode(torch.tensor(live_matrix, dtype=torch.float32).unsqueeze(0)).numpy()
+            
+            live_vector = np.ascontiguousarray(live_vector, dtype=np.float32)
+            pred_pct = fno_xgb_p.predict(live_vector)[0]
+            faiss.normalize_L2(live_vector)
+            score, _ = fno_faiss.search(live_vector, k=5)
+            conviction = score[0][0] * 100
+            
+            if conviction >= min_conviction:
+                final_report_data.append({
+                    'asset': asset["symbol"],
+                    'direction': "LONG 🟢" if pred_pct > 0 else "SHORT 🔴",
+                    'conviction': float(conviction),
+                    'ltp': float(current_ltp),
+                    'target_display': f"₹{current_ltp * (1 + (pred_pct / 100)):.2f} ({'+' if pred_pct>0 else ''}{pred_pct:.2f}%)",
+                    'actual_outcome': "<b>Awaiting Market ⏳</b>"
+                })
             
     # VALIDATION LOGIC FOR BACKTEST
     if is_backtest and os.path.exists("historical_fno.csv") and len(final_report_data) > 0:
