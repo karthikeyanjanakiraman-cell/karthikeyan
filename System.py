@@ -5,6 +5,7 @@ import json
 import gzip
 import io
 import time
+import random
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta
@@ -17,6 +18,21 @@ import torch.nn as nn
 import torch.optim as optim
 import faiss
 import xgboost as xgb
+
+# ==============================================================================
+# 0. DETERMINISTIC ENVIRONMENT LOCK
+# ==============================================================================
+def set_deterministic_seeds(seed=42):
+    """Ensures identical outputs on back-to-back runs."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
 
 # ==============================================================================
 # 1. TEMPORAL AUTOENCODER (The 1D CNN Brain)
@@ -82,7 +98,7 @@ def read_and_standardize_csv(filename):
     
     if 'Date' in df.columns:
         # Robust parsing ensures consistent YYYY-MM-DD for accurate sorting
-        df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.strftime('%Y-%m-%d')
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce', dayfirst=True).dt.strftime('%Y-%m-%d')
         df = df.dropna(subset=['Date'])
         
     return df
@@ -187,8 +203,8 @@ def train_ai_brain(X_raw, Y_price, Y_time, epochs=15):
     # Strictly enforce contiguous float32 for Faiss integration
     latent_vectors = np.ascontiguousarray(latent_vectors, dtype=np.float32)
         
-    xgb_price = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=4).fit(latent_vectors, Y_price)
-    xgb_time = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=4).fit(latent_vectors, Y_time)
+    xgb_price = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=4, random_state=42).fit(latent_vectors, Y_price)
+    xgb_time = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=4, random_state=42).fit(latent_vectors, Y_time)
 
     faiss.normalize_L2(latent_vectors)
     index = faiss.IndexFlatIP(12) 
@@ -352,11 +368,14 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
         print(f"Failed to send email: {str(e)}")
 
 def run_production_sweep():
+    # Force everything to be identical on every run
+    set_deterministic_seeds(42)
+    
     raw_date_str = os.environ.get("PARAM_BACKTEST_DATE", "").strip()
     is_backtest = bool(raw_date_str)
     
     if is_backtest:
-        # FIX: Intercept DD-MM-YYYY formats and convert to strict YYYY-MM-DD
+        # Intercept DD-MM-YYYY formats and convert to strict YYYY-MM-DD
         try:
             target_date_str = pd.to_datetime(raw_date_str, dayfirst=True).strftime("%Y-%m-%d")
         except Exception as e:
