@@ -34,7 +34,7 @@ def set_deterministic_seeds(seed=42):
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 # ==============================================================================
-# 1. UNIVERSAL CSV STANDARDIZER (Fixes Missing 'Date' KeyError)
+# 1. UNIVERSAL CSV STANDARDIZER
 # ==============================================================================
 def read_and_standardize_csv(filename):
     """Aggressively maps variations of Date, Symbol, and OHLCV columns."""
@@ -146,7 +146,7 @@ class TemporalAutoencoder(nn.Module):
     def forward(self, x): latent = self.encode(x); return self.decoder(latent), latent
 
 # ==============================================================================
-# 4. DYNAMIC DATA LOADER (Using Standardizer)
+# 4. DYNAMIC DATA LOADER
 # ==============================================================================
 def load_training_data(csv_filename, target_date_str=None, min_pct=2.0):
     df = read_and_standardize_csv(csv_filename)
@@ -280,12 +280,22 @@ def run_production_sweep():
     
     n_mat, n_ltp, n_sl = fetch_live_data_and_indicators(nifty_file, target_date_str, is_nifty=True)
     
-    macro_direction = "UNKNOWN"
-    if n_mat is not None:
+    macro_report = {'direction': "UNKNOWN", 'conviction': 0, 'target_display': "N/A"}
+    if n_mat is not None and n_ltp is not None:
         live_t = torch.tensor(n_mat, dtype=torch.float32).unsqueeze(0)
         n_lat = np.ascontiguousarray(nifty_cnn.encode(live_t).detach().numpy(), dtype=np.float32)
         n_pct = nifty_xgb_p.predict(n_lat)[0]
-        macro_direction = "LONG 🟢" if n_pct > 0 else "SHORT 🔴"
+        
+        faiss.normalize_L2(n_lat)
+        n_score, _ = nifty_faiss.search(n_lat, k=5)
+        n_conviction = n_score[0][0] * 100
+        
+        macro_dir = "LONG 🟢" if n_pct > 0 else "SHORT 🔴"
+        macro_report = {
+            'direction': macro_dir,
+            'conviction': float(n_conviction),
+            'target_display': f"₹{n_ltp * (1 + (n_pct / 100)):.2f} ({'+' if n_pct>0 else ''}{n_pct:.2f}%)"
+        }
 
     fno_file = "historical_fno.csv"
     if not os.path.exists(fno_file):
@@ -356,17 +366,56 @@ def run_production_sweep():
             })
 
     # 3. Email Dispatch
-    html = f"""<html><body style="font-family: Arial; padding: 10px;">
-        <h3>🌍 MACRO REGIME: {macro_direction}</h3>
-        <table border="1" cellpadding="8" cellspacing="0" width="100%">
-          <tr bgcolor="#f8f9fa"><th>Asset</th><th>Signal</th><th>Conviction</th><th>LTP</th><th>Invalidation (SL)</th><th>AI Target</th><th>Result</th></tr>"""
+    macro_color = "#28a745" if "LONG" in macro_report['direction'] else "#dc3545"
+    sim_warning = f"<div style='background-color: #fff3cd; color: #856404; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 15px;'>⚠️ VALIDATION MODE: SHOWING ACTUAL 2-DAY OUTCOMES</div>" if raw_date_str else ""
+
+    html = f"""
+    <html>
+      <body style="font-family: Arial, sans-serif; background-color: #f4f7f6; padding: 10px;">
+        {sim_warning}
+        
+        <div style="background-color: white; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 6px solid {macro_color};">
+            <h3 style="margin-top: 0; color: #333;">🌍 MACRO REGIME (NIFTY 50)</h3>
+            <p style="font-size: 16px; color: #333; margin: 5px 0;">
+                <b>Direction:</b> <span style="color: {macro_color}; font-weight: bold;">{macro_report['direction']}</span><br>
+                <b>AI Target:</b> {macro_report['target_display']} | <b>Conviction:</b> {macro_report['conviction']:.2f}%
+            </p>
+        </div>
+
+        <h3 style="color: #333;">⚡ MICRO F&O SWEEP (HYPER-MOMENTUM)</h3>
+        <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%; text-align: center; font-size: 14px; background-color: white;">
+          <tr bgcolor="#f8f9fa" style="color: #333; font-weight: bold;">
+            <th>Asset</th>
+            <th>Signal</th>
+            <th>Conviction</th>
+            <th>LTP</th>
+            <th>Invalidation (SL)</th>
+            <th>AI Target</th>
+            <th>Result</th>
+          </tr>
+    """
+    
     for r in sorted(final_report, key=lambda x: x['conviction'], reverse=True):
-        html += f"<tr><td><b>{r['asset']}</b></td><td>{r['direction']}</td><td>{r['conviction']:.1f}%</td><td>₹{r['ltp']:.2f}</td><td style='color:#dc3545;'>₹{r['sl']:.2f}</td><td>{r['target']}</td><td>{r['actual']}</td></tr>"
+        dir_color = "#28a745" if "LONG" in r['direction'] else "#dc3545"
+        html += f"""
+          <tr>
+            <td style="color: #0056b3;"><b>{r['asset']}</b></td>
+            <td style="color: {dir_color}; font-weight: bold;">{r['direction']}</td>
+            <td>{r['conviction']:.1f}%</td>
+            <td>₹{r['ltp']:.2f}</td>
+            <td style="color: #dc3545;">₹{r['sl']:.2f}</td>
+            <td style="color: {dir_color}; font-weight: bold;">{r['target']}</td>
+            <td>{r['actual']}</td>
+          </tr>
+        """
+        
     html += "</table></body></html>"
 
     msg = MIMEMultipart('alternative')
-    msg['Subject'] = f"🚀 AI SWEEP | {target_date_str}"
+    prefix = "⏪ BACKTEST" if raw_date_str else "🚀 LIVE ALERT"
+    msg['Subject'] = f"{prefix} | {target_date_str}"
     msg['From'], msg['To'] = os.environ.get("SENDER_EMAIL"), os.environ.get("RECIPIENT_EMAIL")
+    
     if msg['From'] and msg['To']:
         msg.attach(MIMEText(html, 'html'))
         server = smtplib.SMTP('smtp.gmail.com', 587); server.starttls()
