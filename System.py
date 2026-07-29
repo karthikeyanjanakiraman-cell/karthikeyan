@@ -165,7 +165,6 @@ def get_fno_live_features(asset_symbol, asset_key, target_date_str, is_backtest,
         df_future = df_sym[df_sym['Date'] >= target_date_str]
         if df_future.empty: return None, None
         
-        # 🎯 STRICT 9:15 OPEN ANCHOR FROM CSV OPEN COLUMN
         entry_price = float(df_future.iloc[0]['Open']) 
         features = extract_deep_history_features(values)
         return features, entry_price
@@ -184,9 +183,8 @@ def get_fno_live_features(asset_symbol, asset_key, target_date_str, is_backtest,
         if not data or len(data) < 250: return None, None
         ohlcv = np.array([candle[1:6] for candle in data], dtype=np.float32)[::-1] 
         
-        # 🎯 STRICT 9:15 OPEN ANCHOR FROM UPSTOX INTRA-DAY API
         entry_price = fetch_915_open_from_upstox(asset_key, target_date_str)
-        if entry_price is None: return None, None # Drop if live open cannot be verified
+        if entry_price is None: return None, None
         
         features = extract_deep_history_features(ohlcv[-250:])
         return features, entry_price
@@ -208,7 +206,7 @@ def get_live_nifty_features_from_csv(csv_filename, target_date_str, instrument_k
     if not is_backtest and instrument_key:
         entry_price = fetch_915_open_from_upstox(instrument_key, target_date_str)
     if entry_price is None and not df_future.empty: 
-        entry_price = float(df_future.iloc[0]['Open']) # 🎯 STRICT T+1 OPEN ANCHOR
+        entry_price = float(df_future.iloc[0]['Open'])
         
     if entry_price is None: return None, None
     return extract_deep_history_features(values), entry_price
@@ -249,7 +247,7 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
                 <b>Geometric Similarity:</b> {macro_data['conviction']:.2f}%
             </p>
         </div>
-        <h3 style="color: #333;">⚡ MICRO F&O SWEEP (STRICT 9:15 OPEN ANCHOR)</h3>
+        <h3 style="color: #333;">⚡ MICRO F&O SWEEP (3/5 MAJORITY CONSENSUS)</h3>
         <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%; text-align: center; font-size: 14px; background-color: white;">
           <tr bgcolor="#f8f9fa" style="color: #333; font-weight: bold;">
             <th>Asset</th><th>Consensus</th><th>Similarity</th><th>Entry (9:15 Open)</th><th>Max Hist. Pain (SL)</th><th>Hist. Expected Target</th><th>Result</th>
@@ -282,7 +280,7 @@ def run_production_sweep():
     is_backtest = bool(target_date_str)
     if not is_backtest: target_date_str = datetime.now().strftime("%Y-%m-%d")
         
-    print(f"⚙️ EXECUTING STRICT 9:15 OPEN ENGINE | DATE: {target_date_str}")
+    print(f"⚙️ EXECUTING 3/5 MAJORITY ENGINE | DATE: {target_date_str}")
     
     nifty_file = None
     for root, dirs, files in os.walk("."):
@@ -313,11 +311,12 @@ def run_production_sweep():
         pos_count = sum(1 for r in past_returns if r > 0)
         neg_count = sum(1 for r in past_returns if r < 0)
         
-        if pos_count >= 4:
+        # 🌟 3/5 Majority Gate for Nifty Macro
+        if pos_count >= 3:
             n_pct = np.mean([r for r in past_returns if r > 0])
             n_risk = np.max([r for r, pr in zip(past_risks, past_returns) if pr > 0])
             macro_report = {'direction': "LONG 🟢", 'conviction': n_conviction, 'risk_pct': n_risk, 'target_display': f"₹{nifty_entry * (1 + (n_pct / 100)):.2f} (+{n_pct:.2f}%)"}
-        elif neg_count >= 4:
+        elif neg_count >= 3:
             n_pct = np.mean([r for r in past_returns if r < 0])
             n_risk = np.max([r for r, pr in zip(past_risks, past_returns) if pr < 0])
             macro_report = {'direction': "SHORT 🔴", 'conviction': n_conviction, 'risk_pct': n_risk, 'target_display': f"₹{nifty_entry * (1 + (n_pct / 100)):.2f} ({n_pct:.2f}%)"}
@@ -329,7 +328,7 @@ def run_production_sweep():
     
     print("🎯 Phase 3: Sweeping Active Market Universe...")
     final_report_data = []
-    min_conviction = float(os.environ.get("PARAM_MIN_CONVICTION", 90.00))
+    min_conviction = float(os.environ.get("PARAM_MIN_CONVICTION", 80.00)) # Calibrated for deep 250D geometry
     fno_df_full = read_and_standardize_csv("historical_fno.csv") if is_backtest else None
 
     for asset in fno_universe:
@@ -350,11 +349,12 @@ def run_production_sweep():
         pos_count = sum(1 for r in past_returns if r > 0)
         neg_count = sum(1 for r in past_returns if r < 0)
         
-        if pos_count >= 4:
+        # 🌟 3/5 Majority Gate for F&O Universe
+        if pos_count >= 3:
             direction = "LONG 🟢"
             pred_pct = np.mean([r for r in past_returns if r > 0])
             pred_risk = np.max([r for r, pr in zip(past_risks, past_returns) if pr > 0])
-        elif neg_count >= 4:
+        elif neg_count >= 3:
             direction = "SHORT 🔴"
             pred_pct = np.mean([r for r in past_returns if r < 0])
             pred_risk = np.max([r for r, pr in zip(past_risks, past_returns) if pr < 0])
