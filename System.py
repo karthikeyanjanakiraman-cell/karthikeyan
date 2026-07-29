@@ -261,7 +261,12 @@ def run_production_sweep():
     set_deterministic_seeds(42)
     raw_date_str = os.environ.get("PARAM_BACKTEST_DATE", "").strip()
     target_date_str = pd.to_datetime(raw_date_str, dayfirst=True).strftime("%Y-%m-%d") if raw_date_str else datetime.now().strftime("%Y-%m-%d")
-    print(f"⚙️ EXECUTING DATE: {target_date_str}")
+    
+    # ROBUST USER-DEFINED MINIMUM CONVICTION (Defaults to 99.9% if not provided)
+    env_conviction = os.environ.get("PARAM_MIN_CONVICTION", "").strip()
+    min_user_conviction = float(env_conviction) if env_conviction else 99.90
+    
+    print(f"⚙️ EXECUTING DATE: {target_date_str} | MIN CONVICTION THRESHOLD: {min_user_conviction}%")
     
     nifty_file = "historical_indices.csv"
     if not os.path.exists(nifty_file):
@@ -313,7 +318,7 @@ def run_production_sweep():
     fno_df = read_and_standardize_csv(fno_file)
     symbols = fno_df['Symbol'].unique() if fno_df is not None and 'Symbol' in fno_df.columns else []
 
-    print("🎯 Phase 3: Sweeping Universe with Consensus Logic...")
+    print(f"🎯 Phase 3: Sweeping Universe (Filtering for Conviction >= {min_user_conviction}%)...")
     for sym in symbols:
         sym_file = f"temp_{sym}.csv"
         fno_df[fno_df['Symbol'] == sym].to_csv(sym_file, index=False)
@@ -340,7 +345,8 @@ def run_production_sweep():
         
         final_conviction = raw_conviction * consensus
         
-        if final_conviction >= 50.0:
+        # STRICT USER-GIVEN CONVICTION FILTER
+        if final_conviction >= min_user_conviction:
             outcome_text = "<b>Awaiting Market ⏳</b>"
             if raw_date_str:
                 df_sym = fno_df[(fno_df['Symbol'] == sym) & (fno_df['Date'] > target_date_str)].sort_values('Date')
@@ -382,7 +388,7 @@ def run_production_sweep():
             </p>
         </div>
 
-        <h3 style="color: #333;">⚡ MICRO F&O SWEEP (HYPER-MOMENTUM)</h3>
+        <h3 style="color: #333;">⚡ MICRO F&O SWEEP (Showing only ≥ {min_user_conviction}% Conviction)</h3>
         <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%; text-align: center; font-size: 14px; background-color: white;">
           <tr bgcolor="#f8f9fa" style="color: #333; font-weight: bold;">
             <th>Asset</th>
@@ -401,7 +407,7 @@ def run_production_sweep():
           <tr>
             <td style="color: #0056b3;"><b>{r['asset']}</b></td>
             <td style="color: {dir_color}; font-weight: bold;">{r['direction']}</td>
-            <td>{r['conviction']:.1f}%</td>
+            <td>{r['conviction']:.2f}%</td>
             <td>₹{r['ltp']:.2f}</td>
             <td style="color: #dc3545;">₹{r['sl']:.2f}</td>
             <td style="color: {dir_color}; font-weight: bold;">{r['target']}</td>
