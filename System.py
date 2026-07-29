@@ -5,6 +5,7 @@ import json
 import gzip
 import io
 import time
+import random
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta
@@ -17,6 +18,19 @@ import torch.nn as nn
 import torch.optim as optim
 import faiss
 import xgboost as xgb
+
+# ==============================================================================
+# 0. DETERMINISTIC ENVIRONMENT LOCK
+# ==============================================================================
+def set_deterministic_seeds(seed=42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    os.environ['PYTHONHASHSEED'] = str(seed)
 
 # ==============================================================================
 # 1. TEMPORAL AUTOENCODER (The 1D CNN Brain)
@@ -59,12 +73,10 @@ class TemporalAutoencoder(nn.Module):
         return self.decoder(latent), latent
 
 # ==============================================================================
-# 2. DYNAMIC TRAINING LOADER & STANDARDIZER
+# 2. DYNAMIC TRAINING LOADER & STANDARDIZER (Strict 9:15 AM Open Anchor)
 # ==============================================================================
 def read_and_standardize_csv(filename):
-    """Universally maps Fyers, Upstox, or Yahoo CSV formats into standard ML inputs."""
     if not os.path.exists(filename): return None
-    
     df = pd.read_csv(filename)
     rename_map = {}
     
@@ -79,69 +91,60 @@ def read_and_standardize_csv(filename):
         elif cl in ['volume', 'vol']: rename_map[c] = 'Volume'
         
     df = df.rename(columns=rename_map)
-    
     if 'Date' in df.columns:
-        # Strip timestamps (e.g. "2010-01-01 15:30") to purely "YYYY-MM-DD" for safe string comparisons
         df['Date'] = df['Date'].astype(str).str[:10]
-        
     return df
 
 def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_pct=50.0, max_dd=1.2, wick_ratio=0.40):
     df = read_and_standardize_csv(csv_filename)
-    if df is None or 'Date' not in df.columns:
-        print(f"⚠️ Warning: Missing or invalid '{csv_filename}'")
-        return None, None, None
+    if df is None or 'Date' not in df.columns: return None, None, None
         
-    # 🛑 PREVENT DATA LEAKAGE
     if target_date_str:
         df = df[df['Date'] <= target_date_str]
     
-    training_matrices = []
-    price_targets = []
-    time_targets = []
+    training_matrices, price_targets, time_targets = [], [], []
     FUTURE_DAYS = 2 
     
-    # Anti-Interleaving for Index files
     if "historical_indices" in csv_filename.lower() or "nifty" in csv_filename.lower():
         if 'Symbol' in df.columns:
             mask = df['Symbol'].astype(str).str.upper().str.replace("_", "").str.replace(" ", "").str.contains("NIFTY50|NIFTY")
-            if mask.any():
-                df = df[mask]
+            if mask.any(): df = df[mask]
 
     for symbol, group in df.groupby('Symbol') if 'Symbol' in df.columns else [('ASSET', df)]:
         group = group.sort_values('Date').reset_index(drop=True)
         values = group[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)
         
-        if len(values) < (30 + FUTURE_DAYS): 
-            continue
+        if len(values) < (30 + FUTURE_DAYS): continue
             
         for i in range(len(values) - (30 + FUTURE_DAYS) + 1):
             raw_window = values[i : i+30]
-            w_min = raw_window.min(axis=0)
-            w_max = raw_window.max(axis=0)
+            w_min, w_max = raw_window.min(axis=0), raw_window.max(axis=0)
             norm_window = (raw_window - w_min) / (w_max - w_min + 1e-8)
             window = norm_window.T 
+            
+            # 🎯 STRICT 9:15 AM ENTRY (Day T+1 Open)
+            entry_price = values[i+30, 0] 
+            if entry_price <= 0: continue
             
             future_closes = values[i+30 : i+30+FUTURE_DAYS, 3]
             future_highs  = values[i+30 : i+30+FUTURE_DAYS, 1]
             future_lows   = values[i+30 : i+30+FUTURE_DAYS, 2]
-            start_price   = values[i+29, 3] 
             
-            max_close = future_closes.max()
-            min_close = future_closes.min()
+            max_close, min_close = future_closes.max(), future_closes.min()
             
-            if (max_close - start_price) > (start_price - min_close):
+            # Calculate actual moves directly from the 9:15 AM Open Anchor
+            if (max_close - entry_price) > (entry_price - min_close):
                 is_long = True
-                actual_pct_move = ((max_close - start_price) / (start_price + 1e-8)) * 100
-                actual_drawdown = ((future_lows.min() - start_price) / (start_price + 1e-8)) * 100
-                rejection_wick = ((future_highs.max() - max_close) / (start_price + 1e-8)) * 100
+                actual_pct_move = ((max_close - entry_price) / entry_price) * 100
+                actual_drawdown = ((future_lows.min() - entry_price) / entry_price) * 100
+                rejection_wick = ((future_highs.max() - max_close) / entry_price) * 100
             else:
                 is_long = False
-                actual_pct_move = ((min_close - start_price) / (start_price + 1e-8)) * 100
-                actual_drawdown = ((future_highs.max() - start_price) / (start_price + 1e-8)) * 100
-                rejection_wick = ((min_close - future_lows.min()) / (start_price + 1e-8)) * 100
+                actual_pct_move = ((min_close - entry_price) / entry_price) * 100
+                actual_drawdown = ((future_highs.max() - entry_price) / entry_price) * 100
+                rejection_wick = ((min_close - future_lows.min()) / entry_price) * 100
                 
-            if abs(actual_pct_move) < min_pct or abs(actual_pct_move) > max_pct or start_price < 10.0:
+            if abs(actual_pct_move) < min_pct or abs(actual_pct_move) > max_pct or entry_price < 10.0:
                 continue
                 
             if is_long:
@@ -151,7 +154,7 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_pct=
                 if actual_drawdown > max_dd: continue 
                 if rejection_wick > (abs(actual_pct_move) * wick_ratio): continue 
 
-            days_to_target = float(np.argmax(np.abs(future_closes - start_price)) + 1)
+            days_to_target = float(np.argmax(np.abs(future_closes - entry_price)) + 1)
             training_matrices.append(window)
             price_targets.append(actual_pct_move)
             time_targets.append(days_to_target)
@@ -190,31 +193,113 @@ def train_ai_brain(X_raw, Y_price, Y_time, epochs=15):
     return cnn_model, xgb_price, xgb_time, index
 
 # ==============================================================================
-# 4. LIVE INGESTION TOOLS
+# 4. LIVE INGESTION TOOLS (API & 9:15 Anchors)
 # ==============================================================================
-def get_live_tensor_from_csv(csv_filename, target_date_str):
+def fetch_915_open_from_upstox(instrument_key, target_date_str):
+    """Fetches exact 9:15 AM Open price via Upstox intraday API."""
+    access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
+    if not access_token or not instrument_key: return None
+    
+    encoded_key = urllib.parse.quote(instrument_key)
+    url = f"https://api.upstox.com/v2/historical-candle/intraday/{encoded_key}/1minute"
+    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+        if response.status_code == 200:
+            candles = response.json().get('data', {}).get('candles', [])
+            if candles:
+                for c in candles:
+                    if target_date_str in str(c[0]) and "09:15" in str(c[0]): 
+                        return float(c[1]) # Index 1 is Open price
+                return float(candles[-1][1]) # Fallback to earliest available open
+    except Exception as e:
+        pass
+    return None
+
+def fetch_upstox_data_with_915_anchor(instrument_key, target_date_str, days_back=60):
+    access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
+    if not access_token: return None, None
+    
+    # 1. Fetch historical data STRICTLY prior to target date for clean 30-day matrix
+    target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
+    to_date = (target_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+    from_date = (target_dt - timedelta(days=days_back)).strftime("%Y-%m-%d")
+    
+    encoded_key = urllib.parse.quote(instrument_key)
+    url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/day/{to_date}/{from_date}"
+    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
+    
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200: return None, None
+        
+    data = response.json().get('data', {}).get('candles', [])
+    if not data or len(data) < 30: return None, None
+        
+    ohlcv = np.array([candle[1:6] for candle in data], dtype=np.float32)[::-1] 
+    
+    ohlcv_30 = ohlcv[-30:]
+    ohlcv_min = ohlcv_30.min(axis=0)
+    ohlcv_max = ohlcv_30.max(axis=0)
+    normalized_ohlcv = (ohlcv_30 - ohlcv_min) / (ohlcv_max - ohlcv_min + 1e-8)
+    
+    # 2. Fetch the true live execution anchor for the target date
+    entry_price = fetch_915_open_from_upstox(instrument_key, target_date_str)
+    if entry_price is None:
+        entry_price = float(ohlcv_30[-1][3]) # Failsafe to yesterday close if API drops
+        
+    return normalized_ohlcv.T, entry_price
+
+def get_fno_live_tensor(asset_symbol, asset_key, target_date_str, is_backtest, df_full=None):
+    """Dynamically routes between local fast-CSV for backtests and Upstox API for live runs."""
+    if is_backtest and df_full is not None:
+        df_sym = df_full[df_full['Symbol'] == asset_symbol].sort_values('Date').reset_index(drop=True)
+        df_history = df_sym[df_sym['Date'] < target_date_str]
+        if len(df_history) < 30: return None, None
+        
+        values = df_history[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)[-30:]
+        
+        df_future = df_sym[df_sym['Date'] >= target_date_str]
+        if df_future.empty: return None, None
+        
+        entry_price = float(df_future.iloc[0]['Open']) # True CSV Open Anchor
+        w_min, w_max = values.min(axis=0), values.max(axis=0)
+        norm_window = (values - w_min) / (w_max - w_min + 1e-8)
+        return norm_window.T, entry_price
+    else:
+        # Live Production Route
+        return fetch_upstox_data_with_915_anchor(asset_key, target_date_str)
+
+def get_live_nifty_tensor_from_csv(csv_filename, target_date_str, instrument_key=None, is_backtest=False):
     df = read_and_standardize_csv(csv_filename)
     if df is None or 'Date' not in df.columns: return None, None
     
     if 'Symbol' in df.columns:
         mask = df['Symbol'].astype(str).str.upper().str.replace("_", "").str.replace(" ", "").str.contains("NIFTY50|NIFTY")
-        if mask.any():
-            df = df[mask]
-        else:
-            df = df[df['Symbol'] == df['Symbol'].unique()[0]]
+        if mask.any(): df = df[mask]
+        else: df = df[df['Symbol'] == df['Symbol'].unique()[0]]
             
-    df = df[df['Date'] <= target_date_str].sort_values('Date').reset_index(drop=True)
+    df_history = df[df['Date'] < target_date_str].sort_values('Date').reset_index(drop=True)
+    if len(df_history) < 30: return None, None
     
-    if len(df) < 30: return None, None
+    values = df_history[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)[-30:]
+    close_t = values[-1, 3] 
     
-    values = df[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)[-30:]
-    current_ltp = values[-1, 3] 
+    entry_price = None
+    df_future = df[df['Date'] >= target_date_str].sort_values('Date').reset_index(drop=True)
     
-    w_min = values.min(axis=0)
-    w_max = values.max(axis=0)
+    if not is_backtest and instrument_key:
+        entry_price = fetch_915_open_from_upstox(instrument_key, target_date_str)
+        
+    if entry_price is None and not df_future.empty:
+        entry_price = float(df_future.iloc[0]['Open'])
+        
+    if entry_price is None:
+        entry_price = close_t # Failsafe
+        
+    w_min, w_max = values.min(axis=0), values.max(axis=0)
     norm_window = (values - w_min) / (w_max - w_min + 1e-8)
-    
-    return norm_window.T, current_ltp
+    return norm_window.T, entry_price
 
 def get_dynamic_fno_universe():
     nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
@@ -231,32 +316,6 @@ def get_dynamic_fno_universe():
         return fno_universe
     except:
         return []
-
-def fetch_upstox_data(instrument_key, target_date_str, interval="day", days_back=60):
-    access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
-    target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
-    to_date = target_date_str
-    from_date = (target_dt - timedelta(days=days_back)).strftime("%Y-%m-%d")
-    
-    encoded_key = urllib.parse.quote(instrument_key)
-    url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/{interval}/{to_date}/{from_date}"
-    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
-    
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200: return None
-        
-    data = response.json().get('data', {}).get('candles', [])
-    if not data or len(data) < 30: return None
-        
-    current_ltp = float(data[0][4])
-    ohlcv = np.array([candle[1:6] for candle in data], dtype=np.float32)[::-1] 
-    
-    ohlcv_30 = ohlcv[-30:]
-    ohlcv_min = ohlcv_30.min(axis=0)
-    ohlcv_max = ohlcv_30.max(axis=0)
-    normalized_ohlcv = (ohlcv_30 - ohlcv_min) / (ohlcv_max - ohlcv_min + 1e-8)
-    
-    return normalized_ohlcv.T, current_ltp
 
 # ==============================================================================
 # 5. DUAL-BRAIN MASTER EXECUTION & DISPATCH
@@ -297,7 +356,7 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
             <th>Signal</th>
             <th>Trend Match?</th>
             <th>Score</th>
-            <th>Current LTP</th>
+            <th>Entry (9:15)</th>
             <th>AI Target</th>
             <th>Result (2-Day Close)</th>
           </tr>
@@ -315,7 +374,7 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
             <td style="color: {dir_color}; font-weight: bold;">{row['direction']}</td>
             <td>{trend_match}</td>
             <td>{row['conviction']:.2f}%</td>
-            <td>₹{row['ltp']:.2f}</td>
+            <td>₹{row['entry']:.2f}</td>
             <td style="color: {dir_color}; font-weight: bold;">{row['target_display']}</td>
             <td>{row['actual_outcome']}</td>
           </tr>
@@ -341,9 +400,7 @@ def run_production_sweep():
         
     print(f"⚙️ EXECUTING DATE: {target_date_str}")
     
-    # Path Resolver Strategy
     nifty_file = None
-    
     for root, dirs, files in os.walk("."):
         for file in files:
             if "nifty" in file.lower() and file.lower().endswith(".csv"):
@@ -363,10 +420,6 @@ def run_production_sweep():
 
     if not nifty_file:
         print("❌ Critical Error: Could not find ANY file containing 'nifty' or 'historical_indices'.")
-        print("📁 Here are the files the runner actually sees:")
-        for root, dirs, files in os.walk("."):
-            for file in files:
-                print(os.path.join(root, file))
         return
 
     # ==========================================
@@ -381,7 +434,10 @@ def run_production_sweep():
 
     nifty_cnn, nifty_xgb_p, nifty_xgb_t, nifty_faiss = train_ai_brain(X_nifty, Y_np, Y_nt)
     
-    nifty_live_matrix, nifty_ltp = get_live_tensor_from_csv(nifty_file, target_date_str)
+    fno_universe = get_dynamic_fno_universe()
+    nifty_key = next((item["key"] for item in fno_universe if item["symbol"] in ["NIFTY 50", "NIFTY"]), None)
+    
+    nifty_live_matrix, nifty_entry = get_live_nifty_tensor_from_csv(nifty_file, target_date_str, nifty_key, is_backtest)
     
     if nifty_live_matrix is not None:
         live_nifty_tensor = torch.tensor(nifty_live_matrix).unsqueeze(0)
@@ -396,7 +452,7 @@ def run_production_sweep():
         macro_report = {
             'direction': "LONG 🟢" if n_pct > 0 else "SHORT 🔴",
             'conviction': float(n_conviction),
-            'target_display': f"₹{nifty_ltp * (1 + (n_pct / 100)):.2f} ({'+' if n_pct>0 else ''}{n_pct:.2f}%)"
+            'target_display': f"₹{nifty_entry * (1 + (n_pct / 100)):.2f} ({'+' if n_pct>0 else ''}{n_pct:.2f}%)"
         }
         print(f"🌍 MACRO REGIME: {macro_report['direction']} (Score: {n_conviction:.2f}%)")
     else:
@@ -412,18 +468,18 @@ def run_production_sweep():
     fno_cnn, fno_xgb_p, fno_xgb_t, fno_faiss = train_ai_brain(X_fno, Y_fp, Y_ft)
     
     print("🎯 Phase 3: Sweeping Active Market Universe...")
-    fno_universe = get_dynamic_fno_universe()
     if not fno_universe: return
     
     final_report_data = []
     min_conviction = float(os.environ.get("PARAM_MIN_CONVICTION", 99.92))
+    
+    fno_df_full = read_and_standardize_csv("historical_fno.csv") if is_backtest else None
 
     for asset in fno_universe:
-        result = fetch_upstox_data(asset["key"], target_date_str, interval="day", days_back=60)
-        time.sleep(0.15) 
+        live_matrix, entry_price = get_fno_live_tensor(asset["symbol"], asset["key"], target_date_str, is_backtest, fno_df_full)
         
-        if result is None: continue
-        live_matrix, current_ltp = result
+        if not is_backtest: time.sleep(0.15) # Protect API Rate Limits
+        if live_matrix is None or entry_price is None: continue
         
         with torch.no_grad():
             live_vector = fno_cnn.encode(torch.tensor(live_matrix).unsqueeze(0)).numpy()
@@ -438,33 +494,30 @@ def run_production_sweep():
                 'asset': asset["symbol"],
                 'direction': "LONG 🟢" if pred_pct > 0 else "SHORT 🔴",
                 'conviction': float(conviction),
-                'ltp': float(current_ltp),
-                'target_display': f"₹{current_ltp * (1 + (pred_pct / 100)):.2f} ({'+' if pred_pct>0 else ''}{pred_pct:.2f}%)",
+                'entry': float(entry_price),
+                'target_display': f"₹{entry_price * (1 + (pred_pct / 100)):.2f} ({'+' if pred_pct>0 else ''}{pred_pct:.2f}%)",
                 'actual_outcome': "<b>Awaiting Market ⏳</b>"
             })
             
     # VALIDATION LOGIC FOR BACKTEST
-    if is_backtest and os.path.exists("historical_fno.csv") and len(final_report_data) > 0:
-        df_full = read_and_standardize_csv("historical_fno.csv")
-        if df_full is not None:
-            for row in final_report_data:
-                if 'Symbol' not in df_full.columns: continue
-                
-                df_sym = df_full[df_full['Symbol'] == row['asset']].sort_values('Date').reset_index(drop=True)
-                past = df_sym[df_sym['Date'] <= target_date_str]
-                if len(past) > 0:
-                    idx = past.index[-1]
-                    fw = df_sym.iloc[idx+1 : idx+3] 
-                    if len(fw) > 0:
-                        mx, mn = fw['Close'].max(), fw['Close'].min()
-                        if "LONG" in row['direction']:
-                            mv, dd = ((mx - row['ltp']) / row['ltp']) * 100, ((fw['Low'].min() - row['ltp']) / row['ltp']) * 100
-                            c = "#28a745" if mv > 0 else "#6c757d"
-                            row['actual_outcome'] = f"<span style='color: {c};'>Closed ₹{mx:.2f} (+{mv:.2f}%)</span><br><span style='color: #856404; font-size: 11px;'>Max DD: {dd:.2f}%</span>"
-                        else:
-                            mv, dd = ((mn - row['ltp']) / row['ltp']) * 100, ((fw['High'].max() - row['ltp']) / row['ltp']) * 100
-                            c = "#28a745" if mv < 0 else "#6c757d"
-                            row['actual_outcome'] = f"<span style='color: {c};'>Closed ₹{mn:.2f} ({mv:.2f}%)</span><br><span style='color: #856404; font-size: 11px;'>Max DD: +{dd:.2f}%</span>"
+    if is_backtest and fno_df_full is not None and len(final_report_data) > 0:
+        for row in final_report_data:
+            if 'Symbol' not in fno_df_full.columns: continue
+            
+            df_sym = fno_df_full[fno_df_full['Symbol'] == row['asset']].sort_values('Date').reset_index(drop=True)
+            df_future = df_sym[df_sym['Date'] >= target_date_str]
+            
+            if len(df_future) >= 2:
+                fw = df_future.iloc[:2] 
+                mx, mn = fw['Close'].max(), fw['Close'].min()
+                if "LONG" in row['direction']:
+                    mv, dd = ((mx - row['entry']) / row['entry']) * 100, ((fw['Low'].min() - row['entry']) / row['entry']) * 100
+                    c = "#28a745" if mv > 0 else "#6c757d"
+                    row['actual_outcome'] = f"<span style='color: {c};'>Closed ₹{mx:.2f} (+{mv:.2f}%)</span><br><span style='color: #856404; font-size: 11px;'>Max DD: {dd:.2f}%</span>"
+                else:
+                    mv, dd = ((mn - row['entry']) / row['entry']) * 100, ((fw['High'].max() - row['entry']) / row['entry']) * 100
+                    c = "#28a745" if mv < 0 else "#6c757d"
+                    row['actual_outcome'] = f"<span style='color: {c};'>Closed ₹{mn:.2f} ({mv:.2f}%)</span><br><span style='color: #856404; font-size: 11px;'>Max DD: +{dd:.2f}%</span>"
 
     send_mobile_alert(macro_report, final_report_data, target_date_str, is_backtest)
 
