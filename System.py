@@ -16,6 +16,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
 import faiss
 import xgboost as xgb
 
@@ -71,22 +72,29 @@ def add_holy_trinity(df):
     
     st = [0.0] * len(df)
     st_dir = [1] * len(df)
+    
+    # Extract underlying numpy arrays for massive speedup in the loop
+    close_vals = df['Close'].values
+    ub_vals = upperband.values
+    lb_vals = lowerband.values
+    
     for i in range(1, len(df)):
         st_dir[i] = st_dir[i-1]
-        if df['Close'].iloc[i] > upperband.iloc[i-1]:
+        if close_vals[i] > ub_vals[i-1]:
             st_dir[i] = 1
-        elif df['Close'].iloc[i] < lowerband.iloc[i-1]:
+        elif close_vals[i] < lb_vals[i-1]:
             st_dir[i] = -1
         
         if st_dir[i] == 1:
-            st[i] = max(lowerband.iloc[i], st[i-1] if st_dir[i-1]==1 else 0)
+            st[i] = max(lb_vals[i], st[i-1] if st_dir[i-1]==1 else 0)
         else:
-            st[i] = min(upperband.iloc[i], st[i-1] if st_dir[i-1]==-1 else float('inf'))
+            st[i] = min(ub_vals[i], st[i-1] if st_dir[i-1]==-1 else float('inf'))
             
     df['ST_7_2'] = st
     df['ST_Dist'] = (df['Close'] - df['ST_7_2']) / (df['Close'] + 1e-8)
     
-    df.fillna(method='bfill', inplace=True)
+    # Fix Data Leak: Forward fill first, then backward fill only the beginning NA's
+    df = df.ffill().bfill()
     return df
 
 # ==============================================================================
@@ -114,12 +122,13 @@ class TemporalAutoencoder(nn.Module):
     def forward(self, x): latent = self.encode(x); return self.decoder(latent), latent
 
 # ==============================================================================
-# 3. DYNAMIC DATA LOADER
+# 3. DYNAMIC DATA LOADER (With SL Validation)
 # ==============================================================================
 def load_training_data(csv_filename, target_date_str=None):
     if not os.path.exists(csv_filename): return None, None, None
     df = pd.read_csv(csv_filename)
     df.columns = [str(c).title().strip() for c in df.columns]
+    
     if 'Date' in df.columns:
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce', dayfirst=True).dt.strftime('%Y-%m-%d')
         df = df.dropna(subset=['Date'])
@@ -130,17 +139,35 @@ def load_training_data(csv_filename, target_date_str=None):
     for symbol, group in df.groupby('Symbol') if 'Symbol' in df.columns else [('ASSET', df)]:
         group = group.sort_values('Date').reset_index(drop=True)
         group = add_holy_trinity(group)
-        values = group[['Open', 'High', 'Low', 'Close', 'Volume', 'RSI_7', 'ADX_14', 'ST_Dist']].values.astype(np.float32)
+        # Include Supertrend Value for stop-loss logic
+        values = group[['Open', 'High', 'Low', 'Close', 'Volume', 'RSI_7', 'ADX_14', 'ST_Dist', 'ST_7_2']].values.astype(np.float32)
         
         if len(values) < 32: continue
         for i in range(len(values) - 32 + 1):
-            raw_window = values[i : i+30]
+            raw_window = values[i : i+30, :8] # Only normalize the first 8 features
             w_min, w_max = raw_window.min(axis=0), raw_window.max(axis=0)
             norm_window = (raw_window - w_min) / (w_max - w_min + 1e-8)
             
             future_closes = values[i+30 : i+32, 3]
+            future_highs = values[i+30 : i+32, 1]
+            future_lows = values[i+30 : i+32, 2]
+            
             start_price = values[i+29, 3]
-            actual_pct_move = ((future_closes.max() if future_closes.max() - start_price > start_price - future_closes.min() else future_closes.min()) - start_price) / start_price * 100
+            start_sl = values[i+29, 8] # Actual Supertrend value
+            
+            # Smart Training Target: Penalize AI if it hits stop loss before target
+            is_long = start_price > start_sl
+            
+            if is_long:
+                if future_lows.min() < start_sl:
+                    actual_pct_move = ((start_sl - start_price) / start_price) * 100 # SL hit
+                else:
+                    actual_pct_move = ((future_closes.max() - start_price) / start_price) * 100
+            else:
+                if future_highs.max() > start_sl:
+                    actual_pct_move = ((start_sl - start_price) / start_price) * 100 # SL hit
+                else:
+                    actual_pct_move = ((future_closes.min() - start_price) / start_price) * 100
             
             if abs(actual_pct_move) < 2.0: continue
             
@@ -150,7 +177,7 @@ def load_training_data(csv_filename, target_date_str=None):
     return np.array(training_matrices, dtype=np.float32), np.array(price_targets, dtype=np.float32), None
 
 # ==============================================================================
-# 4. ALWAYS-TRAIN AI BRAIN (No Saving, No Loading)
+# 4. ALWAYS-TRAIN AI BRAIN (Mini-Batched)
 # ==============================================================================
 def get_ai_brain(X_raw, Y_price, prefix="fno"):
     print(f"⚙️ Initiating Deep Training (50 Epochs) for [{prefix}]...")
@@ -158,28 +185,32 @@ def get_ai_brain(X_raw, Y_price, prefix="fno"):
     
     cnn_model = TemporalAutoencoder()
     X_tensor = torch.tensor(X_raw, dtype=torch.float32)
+    
+    # Implement Mini-Batching to prevent memory overload & improve learning
+    dataset = TensorDataset(X_tensor, X_tensor)
+    dataloader = DataLoader(dataset, batch_size=256, shuffle=True)
+    
     optimizer = optim.Adam(cnn_model.parameters(), lr=0.001)
     criterion = nn.MSELoss()
     
-    # Always train for 50 epochs
     cnn_model.train()
     for e in range(50):
-        optimizer.zero_grad()
-        reconstructed, _ = cnn_model(X_tensor)
-        loss = criterion(reconstructed, X_tensor)
-        loss.backward()
-        optimizer.step()
+        for batch_x, _ in dataloader:
+            optimizer.zero_grad()
+            reconstructed, _ = cnn_model(batch_x)
+            loss = criterion(reconstructed, batch_x)
+            loss.backward()
+            optimizer.step()
 
     cnn_model.eval()
     
+    # Process latent vectors in evaluation mode
     with torch.no_grad(): 
         latent_vectors = cnn_model.encode(X_tensor).numpy()
     latent_vectors = np.ascontiguousarray(latent_vectors, dtype=np.float32)
         
-    # Always fit XGBoost
     xgb_price = xgb.XGBRegressor(n_estimators=150, learning_rate=0.03, max_depth=5, random_state=42).fit(latent_vectors, Y_price)
     
-    # Always build Faiss index
     faiss.normalize_L2(latent_vectors)
     index = faiss.IndexFlatIP(12) 
     index.add(latent_vectors)
@@ -306,12 +337,14 @@ def run_production_sweep():
     msg = MIMEMultipart('alternative')
     msg['Subject'] = f"🚀 AI SWEEP | {target_date_str}"
     msg['From'], msg['To'] = os.environ.get("SENDER_EMAIL"), os.environ.get("RECIPIENT_EMAIL")
-    if msg['From']:
+    if msg['From'] and msg['To']:
         msg.attach(MIMEText(html, 'html'))
         server = smtplib.SMTP('smtp.gmail.com', 587); server.starttls()
         server.login(msg['From'], os.environ.get("SENDER_PASSWORD"))
         server.sendmail(msg['From'], msg['To'], msg.as_string()); server.quit()
         print("✅ Alert Dispatched!")
+    else:
+        print("⚠️ Email skipped (Credentials not found).")
 
 if __name__ == "__main__":
     run_production_sweep()
