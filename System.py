@@ -73,7 +73,6 @@ def add_holy_trinity(df):
     st = [0.0] * len(df)
     st_dir = [1] * len(df)
     
-    # Extract underlying numpy arrays for massive speedup in the loop
     close_vals = df['Close'].values
     ub_vals = upperband.values
     lb_vals = lowerband.values
@@ -93,12 +92,11 @@ def add_holy_trinity(df):
     df['ST_7_2'] = st
     df['ST_Dist'] = (df['Close'] - df['ST_7_2']) / (df['Close'] + 1e-8)
     
-    # Fix Data Leak: Forward fill first, then backward fill only the beginning NA's
     df = df.ffill().bfill()
     return df
 
 # ==============================================================================
-# 2. TEMPORAL AUTOENCODER (Upgraded to 8 Features)
+# 2. TEMPORAL AUTOENCODER
 # ==============================================================================
 class TemporalAutoencoder(nn.Module):
     def __init__(self, num_features=8, latent_dim=12):
@@ -122,10 +120,13 @@ class TemporalAutoencoder(nn.Module):
     def forward(self, x): latent = self.encode(x); return self.decoder(latent), latent
 
 # ==============================================================================
-# 3. DYNAMIC DATA LOADER (With SL Validation)
+# 3. DYNAMIC DATA LOADER (Fixed Thresholds)
 # ==============================================================================
-def load_training_data(csv_filename, target_date_str=None):
-    if not os.path.exists(csv_filename): return None, None, None
+def load_training_data(csv_filename, target_date_str=None, min_pct=2.0):
+    if not os.path.exists(csv_filename): 
+        print(f"❌ ERROR: File '{csv_filename}' not found.")
+        return None, None, None
+        
     df = pd.read_csv(csv_filename)
     df.columns = [str(c).title().strip() for c in df.columns]
     
@@ -139,12 +140,11 @@ def load_training_data(csv_filename, target_date_str=None):
     for symbol, group in df.groupby('Symbol') if 'Symbol' in df.columns else [('ASSET', df)]:
         group = group.sort_values('Date').reset_index(drop=True)
         group = add_holy_trinity(group)
-        # Include Supertrend Value for stop-loss logic
         values = group[['Open', 'High', 'Low', 'Close', 'Volume', 'RSI_7', 'ADX_14', 'ST_Dist', 'ST_7_2']].values.astype(np.float32)
         
         if len(values) < 32: continue
         for i in range(len(values) - 32 + 1):
-            raw_window = values[i : i+30, :8] # Only normalize the first 8 features
+            raw_window = values[i : i+30, :8]
             w_min, w_max = raw_window.min(axis=0), raw_window.max(axis=0)
             norm_window = (raw_window - w_min) / (w_max - w_min + 1e-8)
             
@@ -153,23 +153,22 @@ def load_training_data(csv_filename, target_date_str=None):
             future_lows = values[i+30 : i+32, 2]
             
             start_price = values[i+29, 3]
-            start_sl = values[i+29, 8] # Actual Supertrend value
+            start_sl = values[i+29, 8] 
             
-            # Smart Training Target: Penalize AI if it hits stop loss before target
             is_long = start_price > start_sl
-            
             if is_long:
                 if future_lows.min() < start_sl:
-                    actual_pct_move = ((start_sl - start_price) / start_price) * 100 # SL hit
+                    actual_pct_move = ((start_sl - start_price) / start_price) * 100
                 else:
                     actual_pct_move = ((future_closes.max() - start_price) / start_price) * 100
             else:
                 if future_highs.max() > start_sl:
-                    actual_pct_move = ((start_sl - start_price) / start_price) * 100 # SL hit
+                    actual_pct_move = ((start_sl - start_price) / start_price) * 100
                 else:
                     actual_pct_move = ((future_closes.min() - start_price) / start_price) * 100
             
-            if abs(actual_pct_move) < 2.0: continue
+            # Use dynamic threshold passed to function!
+            if abs(actual_pct_move) < min_pct: continue
             
             training_matrices.append(norm_window.T)
             price_targets.append(actual_pct_move)
@@ -181,12 +180,15 @@ def load_training_data(csv_filename, target_date_str=None):
 # ==============================================================================
 def get_ai_brain(X_raw, Y_price, prefix="fno"):
     print(f"⚙️ Initiating Deep Training (50 Epochs) for [{prefix}]...")
-    if X_raw is None or len(X_raw) == 0: return None, None, None, None
     
+    # LOUD ERROR IF DATA IS EMPTY
+    if X_raw is None or len(X_raw) == 0: 
+        print(f"❌ ERROR: Matrix for [{prefix}] is empty. Not enough volatile historical data found.")
+        return None, None, None, None
+        
     cnn_model = TemporalAutoencoder()
     X_tensor = torch.tensor(X_raw, dtype=torch.float32)
     
-    # Implement Mini-Batching to prevent memory overload & improve learning
     dataset = TensorDataset(X_tensor, X_tensor)
     dataloader = DataLoader(dataset, batch_size=256, shuffle=True)
     
@@ -203,10 +205,7 @@ def get_ai_brain(X_raw, Y_price, prefix="fno"):
             optimizer.step()
 
     cnn_model.eval()
-    
-    # Process latent vectors in evaluation mode
-    with torch.no_grad(): 
-        latent_vectors = cnn_model.encode(X_tensor).numpy()
+    with torch.no_grad(): latent_vectors = cnn_model.encode(X_tensor).numpy()
     latent_vectors = np.ascontiguousarray(latent_vectors, dtype=np.float32)
         
     xgb_price = xgb.XGBRegressor(n_estimators=150, learning_rate=0.03, max_depth=5, random_state=42).fit(latent_vectors, Y_price)
@@ -221,6 +220,7 @@ def get_ai_brain(X_raw, Y_price, prefix="fno"):
 # 5. LIVE INGESTION
 # ==============================================================================
 def fetch_live_data_and_indicators(csv_filename, target_date_str, is_nifty=False):
+    if not os.path.exists(csv_filename): return None, None, None
     df = pd.read_csv(csv_filename)
     df.columns = [str(c).title().strip() for c in df.columns]
     df['Date'] = pd.to_datetime(df['Date'], errors='coerce', dayfirst=True).dt.strftime('%Y-%m-%d')
@@ -247,13 +247,24 @@ def run_production_sweep():
     target_date_str = pd.to_datetime(raw_date_str, dayfirst=True).strftime("%Y-%m-%d") if raw_date_str else datetime.now().strftime("%Y-%m-%d")
     print(f"⚙️ EXECUTING DATE: {target_date_str}")
     
-    # 1. Macro Brain
-    X_nifty, Y_np, _ = load_training_data("historical_indices.csv", target_date_str)
+    # Path Resolver for Nifty (In case it's named something else)
+    nifty_file = "historical_indices.csv"
+    if not os.path.exists(nifty_file):
+        for root, dirs, files in os.walk("."):
+            for f in files:
+                if "nifty" in f.lower() or "indices" in f.lower():
+                    nifty_file = os.path.join(root, f)
+                    break
+    
+    # 1. Macro Brain (0.75% threshold so it actually finds Nifty data)
+    X_nifty, Y_np, _ = load_training_data(nifty_file, target_date_str, min_pct=0.75)
     nifty_cnn, nifty_xgb_p, nifty_faiss, nifty_hist_y = get_ai_brain(X_nifty, Y_np, prefix="macro")
     
-    if not nifty_cnn: return 
+    if not nifty_cnn: 
+        print("🛑 Macro Brain failed to initialize. Halting sweep.")
+        return 
     
-    n_mat, n_ltp, n_sl = fetch_live_data_and_indicators("historical_indices.csv", target_date_str, is_nifty=True)
+    n_mat, n_ltp, n_sl = fetch_live_data_and_indicators(nifty_file, target_date_str, is_nifty=True)
     
     macro_direction = "UNKNOWN"
     if n_mat is not None:
@@ -262,14 +273,21 @@ def run_production_sweep():
         n_pct = nifty_xgb_p.predict(n_lat)[0]
         macro_direction = "LONG 🟢" if n_pct > 0 else "SHORT 🔴"
 
-    # 2. Micro F&O Brain
-    X_fno, Y_fp, _ = load_training_data("historical_fno.csv", target_date_str)
+    # 2. Micro F&O Brain (3.0% threshold for explosive stocks)
+    fno_file = "historical_fno.csv"
+    if not os.path.exists(fno_file):
+        print(f"❌ CRITICAL ERROR: Could not find {fno_file} to train stocks.")
+        return
+        
+    X_fno, Y_fp, _ = load_training_data(fno_file, target_date_str, min_pct=3.0)
     fno_cnn, fno_xgb_p, fno_faiss, fno_hist_y = get_ai_brain(X_fno, Y_fp, prefix="micro")
     
-    if not fno_cnn: return 
+    if not fno_cnn: 
+        print("🛑 Micro Brain failed to initialize. Halting sweep.")
+        return 
     
     final_report = []
-    fno_df = pd.read_csv("historical_fno.csv")
+    fno_df = pd.read_csv(fno_file)
     fno_df.columns = [str(c).title().strip() for c in fno_df.columns]
     symbols = fno_df['Symbol'].unique() if 'Symbol' in fno_df.columns else []
 
