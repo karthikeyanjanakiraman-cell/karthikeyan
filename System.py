@@ -37,7 +37,6 @@ def set_deterministic_seeds(seed=42):
 # 1. UNIVERSAL CSV STANDARDIZER
 # ==============================================================================
 def read_and_standardize_csv(filename):
-    """Aggressively maps variations of Date, Symbol, and OHLCV columns."""
     if not os.path.exists(filename): return None
     try:
         df = pd.read_csv(filename)
@@ -155,7 +154,7 @@ class TemporalAutoencoder(nn.Module):
 def load_training_data(csv_filename, target_date_str=None, min_pct=2.0):
     df = read_and_standardize_csv(csv_filename)
     if df is None or 'Date' not in df.columns: 
-        print(f"❌ ERROR: File '{csv_filename}' missing 'Date' column after standardization.")
+        print(f"❌ ERROR: File '{csv_filename}' missing 'Date' column.")
         return None, None, None
         
     if target_date_str: df = df[df['Date'] <= target_date_str]
@@ -205,7 +204,7 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=2.0):
 def get_ai_brain(X_raw, Y_price, prefix="fno"):
     print(f"⚙️ Initiating Deep Training (50 Epochs) for [{prefix}]...")
     if X_raw is None or len(X_raw) == 0: 
-        print(f"❌ ERROR: Matrix for [{prefix}] is empty.")
+        print(f"❌ ERROR: Matrix for [{prefix}] is empty. Not enough volatile historical data found.")
         return None, None, None, None
         
     cnn_model = TemporalAutoencoder()
@@ -242,11 +241,12 @@ def get_ai_brain(X_raw, Y_price, prefix="fno"):
 # 6. LIVE INGESTION & 9:15 AM OPEN ANCHOR
 # ==============================================================================
 def fetch_915_open_from_upstox(instrument_key, target_date_str):
-    """Fetches exact 9:15 AM Open price via Upstox intraday API with safe fallbacks."""
+    """Fetches exact 9:15 AM Open price via Upstox intraday API v2."""
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
     if not access_token or not instrument_key: return None
     
-    url = f"https://api.upstox.com/v3/historical-candle/intraday/{urllib.parse.quote(instrument_key)}/minutes/1"
+    # Fixed Upstox endpoint to v2 1minute intraday
+    url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key)}/1minute"
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
     
     try:
@@ -259,7 +259,7 @@ def fetch_915_open_from_upstox(instrument_key, target_date_str):
                     t_str = str(c[0])
                     if target_date_str in t_str and "09:15" in t_str:
                         return float(c[1]) # Index 1 is Open price
-                return float(candles[-1][1])
+                return float(candles[0][1]) # Fallback to earliest available open in current subset
     except Exception as e:
         print(f"⚠️ 9:15 AM Open LTP Fetch warning for {instrument_key}: {e}")
     return None
@@ -276,7 +276,7 @@ def fetch_live_data_and_indicators(csv_filename, target_date_str, instrument_key
     df_ind = add_holy_trinity(df_window)
     values = df_ind[['Open', 'High', 'Low', 'Close', 'Volume', 'RSI_7', 'ADX_14', 'ST_Dist']].values.astype(np.float32)[-30:]
     
-    # 🎯 STRICT 9:15 AM OPEN ANCHOR
+    # 🎯 9:15 AM OPEN ANCHOR
     current_ltp = None
     if not is_backtest and instrument_key:
         current_ltp = fetch_915_open_from_upstox(instrument_key, target_date_str)
@@ -351,8 +351,12 @@ def run_production_sweep():
         n_pct = nifty_xgb_p.predict(n_lat)[0]
         
         faiss.normalize_L2(n_lat)
-        n_score, _ = nifty_faiss.search(n_lat, k=5)
-        n_conviction = n_score[0][0] * 100
+        k_search = min(5, nifty_faiss.ntotal) # Dynamic bounding to prevent Faiss crash
+        
+        n_conviction = 0.0
+        if k_search > 0:
+            n_score, _ = nifty_faiss.search(n_lat, k_search)
+            n_conviction = max(0.0, n_score[0][0]) * 100
         
         macro_dir = "LONG 🟢" if n_pct > 0 else "SHORT 🔴"
         macro_report = {
@@ -393,14 +397,17 @@ def run_production_sweep():
         direction = "LONG 🟢" if pred_pct > 0 else "SHORT 🔴"
         
         faiss.normalize_L2(lat)
-        scores, indices = fno_faiss.search(lat, k=5)
-        raw_conviction = scores[0][0] * 100
+        k_search = min(5, fno_faiss.ntotal) # Prevent Faiss crash on small filtered datasets
+        if k_search == 0: continue
+            
+        scores, indices = fno_faiss.search(lat, k_search)
+        raw_conviction = max(0.0, scores[0][0]) * 100
         
         historical_outcomes = fno_hist_y[indices[0]]
         if pred_pct > 0:
-            consensus = sum(1 for y in historical_outcomes if y > 0) / 5.0
+            consensus = sum(1 for y in historical_outcomes if y > 0) / float(k_search)
         else:
-            consensus = sum(1 for y in historical_outcomes if y < 0) / 5.0
+            consensus = sum(1 for y in historical_outcomes if y < 0) / float(k_search)
             
         if consensus < 0.6: continue 
         
@@ -478,17 +485,28 @@ def run_production_sweep():
     html += "</table></body></html>"
 
     msg = MIMEMultipart('alternative')
-    msg['Subject'] = f"🚀 AI SWEEP (9:15 Open) | {target_date_str}"
-    msg['From'], msg['To'] = os.environ.get("SENDER_EMAIL"), os.environ.get("RECIPIENT_EMAIL")
+    prefix = "⏪ BACKTEST" if is_backtest else "🚀 LIVE ALERT"
+    msg['Subject'] = f"{prefix} | {target_date_str}"
     
-    if msg['From'] and msg['To']:
+    sender_email = os.environ.get("SENDER_EMAIL")
+    recipient_email = os.environ.get("RECIPIENT_EMAIL")
+    sender_pass = os.environ.get("SENDER_PASSWORD")
+    
+    if sender_email and recipient_email and sender_pass:
+        msg['From'] = sender_email
+        msg['To'] = recipient_email
         msg.attach(MIMEText(html, 'html'))
-        server = smtplib.SMTP('smtp.gmail.com', 587); server.starttls()
-        server.login(msg['From'], os.environ.get("SENDER_PASSWORD"))
-        server.sendmail(msg['From'], msg['To'], msg.as_string()); server.quit()
-        print("✅ Alert Dispatched!")
+        try:
+            server = smtplib.SMTP('smtp.gmail.com', 587)
+            server.starttls()
+            server.login(sender_email, sender_pass)
+            server.sendmail(sender_email, recipient_email, msg.as_string())
+            server.quit()
+            print("✅ Alert Dispatched!")
+        except Exception as e:
+            print(f"❌ Failed to send email: {e}")
     else:
-        print("⚠️ Email skipped (Credentials not found).")
+        print("⚠️ Email skipped (Credentials missing). Please set SENDER_EMAIL, RECIPIENT_EMAIL, and SENDER_PASSWORD.")
 
 if __name__ == "__main__":
     run_production_sweep()
