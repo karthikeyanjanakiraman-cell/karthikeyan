@@ -23,173 +23,147 @@ import xgboost as xgb
 # 0. DETERMINISTIC ENVIRONMENT LOCK
 # ==============================================================================
 def set_deterministic_seeds(seed=42):
-    """Ensures identical outputs on back-to-back runs."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 # ==============================================================================
-# 1. TEMPORAL AUTOENCODER (The 1D CNN Brain)
+# 1. INDICATOR ENGINE (The Holy Trinity)
+# ==============================================================================
+def add_holy_trinity(df):
+    """Calculates RSI(7), ADX(14), and Supertrend(7,2) without external libraries."""
+    df = df.copy()
+    
+    # 1. RSI (7)
+    delta = df['Close'].diff()
+    gain = delta.where(delta > 0, 0.0).ewm(alpha=1/7, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0.0)).ewm(alpha=1/7, adjust=False).mean()
+    rs = gain / (loss + 1e-8)
+    df['RSI_7'] = 100 - (100 / (1 + rs))
+
+    # 2. ADX (14)
+    plus_dm = df['High'].diff()
+    minus_dm = -df['Low'].diff()
+    plus_dm = np.where((plus_dm > minus_dm) & (plus_dm > 0), plus_dm, 0.0)
+    minus_dm = np.where((minus_dm > plus_dm) & (minus_dm > 0), minus_dm, 0.0)
+    
+    tr1 = df['High'] - df['Low']
+    tr2 = np.abs(df['High'] - df['Close'].shift(1))
+    tr3 = np.abs(df['Low'] - df['Close'].shift(1))
+    tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+    
+    atr14 = tr.ewm(alpha=1/14, adjust=False).mean()
+    plus_di = 100 * (pd.Series(plus_dm).ewm(alpha=1/14, adjust=False).mean() / atr14)
+    minus_di = 100 * (pd.Series(minus_dm).ewm(alpha=1/14, adjust=False).mean() / atr14)
+    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-8)
+    df['ADX_14'] = dx.ewm(alpha=1/14, adjust=False).mean()
+
+    # 3. Supertrend (7, 2)
+    atr7 = tr.ewm(alpha=1/7, adjust=False).mean()
+    hl2 = (df['High'] + df['Low']) / 2
+    upperband = hl2 + (2 * atr7)
+    lowerband = hl2 - (2 * atr7)
+    
+    st = [0.0] * len(df)
+    st_dir = [1] * len(df)
+    for i in range(1, len(df)):
+        st_dir[i] = st_dir[i-1]
+        if df['Close'].iloc[i] > upperband.iloc[i-1]:
+            st_dir[i] = 1
+        elif df['Close'].iloc[i] < lowerband.iloc[i-1]:
+            st_dir[i] = -1
+        
+        if st_dir[i] == 1:
+            st[i] = max(lowerband.iloc[i], st[i-1] if st_dir[i-1]==1 else 0)
+        else:
+            st[i] = min(upperband.iloc[i], st[i-1] if st_dir[i-1]==-1 else float('inf'))
+            
+    df['ST_7_2'] = st
+    df['ST_Dist'] = (df['Close'] - df['ST_7_2']) / (df['Close'] + 1e-8)
+    
+    df.fillna(method='bfill', inplace=True)
+    return df
+
+# ==============================================================================
+# 2. TEMPORAL AUTOENCODER (Upgraded to 8 Features)
 # ==============================================================================
 class TemporalAutoencoder(nn.Module):
-    def __init__(self, num_features=5, latent_dim=12):
+    def __init__(self, num_features=8, latent_dim=12):
         super(TemporalAutoencoder, self).__init__()
-        
         self.encoder = nn.Sequential(
             nn.Conv1d(in_channels=num_features, out_channels=16, kernel_size=3, padding=1),
-            nn.BatchNorm1d(16),
-            nn.ReLU(inplace=True),
-            nn.MaxPool1d(2),
-            
+            nn.BatchNorm1d(16), nn.ReLU(inplace=True), nn.MaxPool1d(2),
             nn.Conv1d(in_channels=16, out_channels=32, kernel_size=3, padding=1),
-            nn.BatchNorm1d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool1d(3),
-            
-            nn.Flatten(),
-            nn.Linear(32 * 5, latent_dim)
+            nn.BatchNorm1d(32), nn.ReLU(inplace=True), nn.MaxPool1d(3),
+            nn.Flatten(), nn.Linear(32 * 5, latent_dim)
         )
-        
         self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 32 * 5),
-            nn.ReLU(inplace=True),
-            nn.Unflatten(1, (32, 5)),
+            nn.Linear(latent_dim, 32 * 5), nn.ReLU(inplace=True), nn.Unflatten(1, (32, 5)),
             nn.ConvTranspose1d(32, 16, kernel_size=3, stride=3, output_padding=0),
-            nn.BatchNorm1d(16),
-            nn.ReLU(inplace=True),
+            nn.BatchNorm1d(16), nn.ReLU(inplace=True),
             nn.ConvTranspose1d(16, num_features, kernel_size=2, stride=2, output_padding=0),
             nn.Sigmoid()
         )
 
-    def encode(self, x):
-        return self.encoder(x)
-
-    def forward(self, x):
-        latent = self.encode(x)
-        return self.decoder(latent), latent
+    def encode(self, x): return self.encoder(x)
+    def forward(self, x): latent = self.encode(x); return self.decoder(latent), latent
 
 # ==============================================================================
-# 2. DYNAMIC TRAINING LOADER & STANDARDIZER
+# 3. DYNAMIC DATA LOADER
 # ==============================================================================
-def read_and_standardize_csv(filename):
-    """Universally maps Fyers, Upstox, or Yahoo CSV formats into standard ML inputs."""
-    if not os.path.exists(filename): return None
-    
-    df = pd.read_csv(filename)
-    rename_map = {}
-    
-    for c in df.columns:
-        cl = str(c).lower().strip()
-        if cl in ['date', 'time', 'timestamp']: rename_map[c] = 'Date'
-        elif cl in ['symbol', 'ticker', 'asset']: rename_map[c] = 'Symbol'
-        elif cl == 'open': rename_map[c] = 'Open'
-        elif cl == 'high': rename_map[c] = 'High'
-        elif cl == 'low': rename_map[c] = 'Low'
-        elif cl == 'close': rename_map[c] = 'Close'
-        elif cl in ['volume', 'vol']: rename_map[c] = 'Volume'
-        
-    df = df.rename(columns=rename_map)
-    
+def load_training_data(csv_filename, target_date_str=None):
+    if not os.path.exists(csv_filename): return None, None, None
+    df = pd.read_csv(csv_filename)
+    df.columns = [str(c).title().strip() for c in df.columns]
     if 'Date' in df.columns:
-        # Robust parsing ensures consistent YYYY-MM-DD for accurate sorting
         df['Date'] = pd.to_datetime(df['Date'], errors='coerce', dayfirst=True).dt.strftime('%Y-%m-%d')
         df = df.dropna(subset=['Date'])
-        
-    return df
-
-def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_pct=50.0, max_dd=1.2, wick_ratio=0.40):
-    df = read_and_standardize_csv(csv_filename)
-    if df is None or 'Date' not in df.columns:
-        print(f"⚠️ Warning: Missing or invalid '{csv_filename}'")
-        return None, None, None
-        
-    # 🛑 PREVENT DATA LEAKAGE
-    if target_date_str:
-        df = df[df['Date'] <= target_date_str]
+    if target_date_str: df = df[df['Date'] <= target_date_str]
     
-    training_matrices = []
-    price_targets = []
-    time_targets = []
-    FUTURE_DAYS = 2 
+    training_matrices, price_targets = [], []
     
-    # Anti-Interleaving for Index files
-    if "historical_indices" in csv_filename.lower() or "nifty" in csv_filename.lower():
-        if 'Symbol' in df.columns:
-            mask = df['Symbol'].astype(str).str.upper().str.replace("_", "").str.replace(" ", "").str.contains("NIFTY50|NIFTY")
-            if mask.any():
-                df = df[mask]
-
     for symbol, group in df.groupby('Symbol') if 'Symbol' in df.columns else [('ASSET', df)]:
         group = group.sort_values('Date').reset_index(drop=True)
-        values = group[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)
+        group = add_holy_trinity(group)
+        values = group[['Open', 'High', 'Low', 'Close', 'Volume', 'RSI_7', 'ADX_14', 'ST_Dist']].values.astype(np.float32)
         
-        if len(values) < (30 + FUTURE_DAYS): 
-            continue
-            
-        for i in range(len(values) - (30 + FUTURE_DAYS) + 1):
+        if len(values) < 32: continue
+        for i in range(len(values) - 32 + 1):
             raw_window = values[i : i+30]
-            w_min = raw_window.min(axis=0)
-            w_max = raw_window.max(axis=0)
+            w_min, w_max = raw_window.min(axis=0), raw_window.max(axis=0)
             norm_window = (raw_window - w_min) / (w_max - w_min + 1e-8)
-            window = norm_window.T 
             
-            future_closes = values[i+30 : i+30+FUTURE_DAYS, 3]
-            future_highs  = values[i+30 : i+30+FUTURE_DAYS, 1]
-            future_lows   = values[i+30 : i+30+FUTURE_DAYS, 2]
-            start_price   = values[i+29, 3] 
+            future_closes = values[i+30 : i+32, 3]
+            start_price = values[i+29, 3]
+            actual_pct_move = ((future_closes.max() if future_closes.max() - start_price > start_price - future_closes.min() else future_closes.min()) - start_price) / start_price * 100
             
-            max_close = future_closes.max()
-            min_close = future_closes.min()
+            if abs(actual_pct_move) < 2.0: continue
             
-            if (max_close - start_price) > (start_price - min_close):
-                is_long = True
-                actual_pct_move = ((max_close - start_price) / (start_price + 1e-8)) * 100
-                actual_drawdown = ((future_lows.min() - start_price) / (start_price + 1e-8)) * 100
-                rejection_wick = ((future_highs.max() - max_close) / (start_price + 1e-8)) * 100
-            else:
-                is_long = False
-                actual_pct_move = ((min_close - start_price) / (start_price + 1e-8)) * 100
-                actual_drawdown = ((future_highs.max() - start_price) / (start_price + 1e-8)) * 100
-                rejection_wick = ((min_close - future_lows.min()) / (start_price + 1e-8)) * 100
-                
-            if abs(actual_pct_move) < min_pct or abs(actual_pct_move) > max_pct or start_price < 10.0:
-                continue
-                
-            if is_long:
-                if actual_drawdown < -max_dd: continue 
-                if rejection_wick > (actual_pct_move * wick_ratio): continue 
-            else:
-                if actual_drawdown > max_dd: continue 
-                if rejection_wick > (abs(actual_pct_move) * wick_ratio): continue 
-
-            days_to_target = float(np.argmax(np.abs(future_closes - start_price)) + 1)
-            training_matrices.append(window)
+            training_matrices.append(norm_window.T)
             price_targets.append(actual_pct_move)
-            time_targets.append(days_to_target)
             
-    return np.array(training_matrices, dtype=np.float32), np.array(price_targets, dtype=np.float32), np.array(time_targets, dtype=np.float32)
+    return np.array(training_matrices, dtype=np.float32), np.array(price_targets, dtype=np.float32), None
 
 # ==============================================================================
-# 3. MODULAR AI TRAINING ENGINE
+# 4. ALWAYS-TRAIN AI BRAIN (No Saving, No Loading)
 # ==============================================================================
-def train_ai_brain(X_raw, Y_price, Y_time, epochs=15):
-    if X_raw is None or len(X_raw) == 0:
-        return None, None, None, None
-        
-    X_tensor = torch.tensor(X_raw, dtype=torch.float32)
+def get_ai_brain(X_raw, Y_price, prefix="fno"):
+    print(f"⚙️ Initiating Deep Training (50 Epochs) for [{prefix}]...")
+    if X_raw is None or len(X_raw) == 0: return None, None, None, None
     
     cnn_model = TemporalAutoencoder()
-    optimizer = optim.Adam(cnn_model.parameters(), lr=0.002)
+    X_tensor = torch.tensor(X_raw, dtype=torch.float32)
+    optimizer = optim.Adam(cnn_model.parameters(), lr=0.001)
     criterion = nn.MSELoss()
     
+    # Always train for 50 epochs
     cnn_model.train()
-    for _ in range(epochs): 
+    for e in range(50):
         optimizer.zero_grad()
         reconstructed, _ = cnn_model(X_tensor)
         loss = criterion(reconstructed, X_tensor)
@@ -197,328 +171,147 @@ def train_ai_brain(X_raw, Y_price, Y_time, epochs=15):
         optimizer.step()
 
     cnn_model.eval()
-    with torch.no_grad():
+    
+    with torch.no_grad(): 
         latent_vectors = cnn_model.encode(X_tensor).numpy()
-        
-    # Strictly enforce contiguous float32 for Faiss integration
     latent_vectors = np.ascontiguousarray(latent_vectors, dtype=np.float32)
         
-    xgb_price = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=4, random_state=42).fit(latent_vectors, Y_price)
-    xgb_time = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=4, random_state=42).fit(latent_vectors, Y_time)
-
+    # Always fit XGBoost
+    xgb_price = xgb.XGBRegressor(n_estimators=150, learning_rate=0.03, max_depth=5, random_state=42).fit(latent_vectors, Y_price)
+    
+    # Always build Faiss index
     faiss.normalize_L2(latent_vectors)
     index = faiss.IndexFlatIP(12) 
     index.add(latent_vectors)
     
-    return cnn_model, xgb_price, xgb_time, index
+    return cnn_model, xgb_price, index, Y_price
 
 # ==============================================================================
-# 4. LIVE INGESTION TOOLS
+# 5. LIVE INGESTION
 # ==============================================================================
-def get_live_tensor_from_csv(csv_filename, target_date_str):
-    df = read_and_standardize_csv(csv_filename)
-    if df is None or 'Date' not in df.columns: return None, None
-    
-    if 'Symbol' in df.columns:
-        mask = df['Symbol'].astype(str).str.upper().str.replace("_", "").str.replace(" ", "").str.contains("NIFTY50|NIFTY")
-        if mask.any():
-            df = df[mask]
-        else:
-            df = df[df['Symbol'] == df['Symbol'].unique()[0]]
-            
+def fetch_live_data_and_indicators(csv_filename, target_date_str, is_nifty=False):
+    df = pd.read_csv(csv_filename)
+    df.columns = [str(c).title().strip() for c in df.columns]
+    df['Date'] = pd.to_datetime(df['Date'], errors='coerce', dayfirst=True).dt.strftime('%Y-%m-%d')
+    if is_nifty and 'Symbol' in df.columns:
+        df = df[df['Symbol'].astype(str).str.contains("NIFTY")]
     df = df[df['Date'] <= target_date_str].sort_values('Date').reset_index(drop=True)
+    if len(df) < 30: return None, None, None
     
-    if len(df) < 30: return None, None
+    df = add_holy_trinity(df)
+    values = df[['Open', 'High', 'Low', 'Close', 'Volume', 'RSI_7', 'ADX_14', 'ST_Dist']].values.astype(np.float32)[-30:]
+    current_ltp = values[-1, 3]
+    current_sl = df['ST_7_2'].iloc[-1] 
     
-    values = df[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)[-30:]
-    current_ltp = values[-1, 3] 
-    
-    w_min = values.min(axis=0)
-    w_max = values.max(axis=0)
+    w_min, w_max = values.min(axis=0), values.max(axis=0)
     norm_window = (values - w_min) / (w_max - w_min + 1e-8)
-    
-    return norm_window.T, current_ltp
-
-def get_dynamic_fno_universe():
-    nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
-    response = requests.get(nse_url)
-    if response.status_code != 200: return []
-    try:
-        nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
-        fno_underlying = {item.get("underlying_symbol") for item in nse_data if item.get("segment") == "NSE_FO" and item.get("underlying_symbol")}
-        
-        fno_universe = []
-        for item in nse_data:
-            if item.get("segment") in ("NSE_EQ", "NSE_INDEX") and item.get("trading_symbol") in fno_underlying:
-                fno_universe.append({"symbol": item.get("trading_symbol"), "key": item.get("instrument_key")})
-        return fno_universe
-    except Exception as e:
-        print(f"Error fetching FNO universe: {e}")
-        return []
-
-def fetch_upstox_data(instrument_key, target_date_str, interval="day", days_back=60):
-    access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
-    if not access_token:
-        print("⚠️ Warning: UPSTOX_ACCESS_TOKEN not set in environment.")
-        return None
-        
-    target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
-    to_date = target_date_str
-    from_date = (target_dt - timedelta(days=days_back)).strftime("%Y-%m-%d")
-    
-    encoded_key = urllib.parse.quote(instrument_key)
-    url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/{interval}/{to_date}/{from_date}"
-    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
-    
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200: return None
-        
-    json_resp = response.json()
-    data_block = json_resp.get('data') if isinstance(json_resp, dict) else None
-    data = data_block.get('candles', []) if isinstance(data_block, dict) else []
-    
-    if not data or len(data) < 30: return None
-        
-    current_ltp = float(data[0][4])
-    ohlcv = np.array([candle[1:6] for candle in data], dtype=np.float32)[::-1] 
-    
-    ohlcv_30 = ohlcv[-30:]
-    ohlcv_min = ohlcv_30.min(axis=0)
-    ohlcv_max = ohlcv_30.max(axis=0)
-    normalized_ohlcv = (ohlcv_30 - ohlcv_min) / (ohlcv_max - ohlcv_min + 1e-8)
-    
-    return normalized_ohlcv.T, current_ltp
+    return norm_window.T, current_ltp, current_sl
 
 # ==============================================================================
-# 5. DUAL-BRAIN MASTER EXECUTION & DISPATCH
+# 6. MASTER EXECUTION & DISPATCH
 # ==============================================================================
-def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
-    sender_email = os.environ.get("SENDER_EMAIL")
-    sender_pass = os.environ.get("SENDER_PASSWORD")
-    recipient_email = os.environ.get("RECIPIENT_EMAIL")
-    
-    if not all([sender_email, sender_pass, recipient_email]):
-        print("⚠️ Email credentials missing, skipping alert dispatch.")
-        return
-
-    msg = MIMEMultipart('alternative')
-    prefix = "⏪ BACKTEST" if is_backtest else "🚀 LIVE ALERT"
-    msg['Subject'] = f"{prefix} | {target_date_str}"
-    msg['From'] = sender_email
-    msg['To'] = recipient_email
-
-    macro_color = "#28a745" if "LONG" in macro_data['direction'] else "#dc3545"
-    sim_warning = f"<div style='background-color: #fff3cd; color: #856404; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 15px;'>⚠️ VALIDATION MODE: SHOWING ACTUAL 2-DAY OUTCOMES</div>" if is_backtest else ""
-
-    html_content = f"""
-    <html>
-      <body style="font-family: Arial, sans-serif; background-color: #f4f7f6; padding: 10px;">
-        {sim_warning}
-        
-        <div style="background-color: white; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 6px solid {macro_color};">
-            <h3 style="margin-top: 0; color: #333;">🌍 MACRO REGIME (NIFTY 50)</h3>
-            <p style="font-size: 16px; color: #333; margin: 5px 0;">
-                <b>Direction:</b> <span style="color: {macro_color}; font-weight: bold;">{macro_data['direction']}</span><br>
-                <b>AI Target:</b> {macro_data['target_display']} | <b>Conviction:</b> {macro_data['conviction']:.2f}%
-            </p>
-        </div>
-
-        <h3 style="color: #333;">⚡ MICRO F&O SWEEP (HYPER-MOMENTUM)</h3>
-        <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%; text-align: center; font-size: 14px; background-color: white;">
-          <tr bgcolor="#f8f9fa" style="color: #333; font-weight: bold;">
-            <th>Asset</th>
-            <th>Signal</th>
-            <th>Trend Match?</th>
-            <th>Score</th>
-            <th>Current LTP</th>
-            <th>AI Target</th>
-            <th>Result (2-Day Close)</th>
-          </tr>
-    """
-    
-    fno_data_list.sort(key=lambda x: x['conviction'], reverse=True)
-    
-    for row in fno_data_list:
-        dir_color = "#28a745" if "LONG" in row['direction'] else "#dc3545"
-        trend_match = "✅" if row['direction'] == macro_data['direction'] else "⚠️"
-        
-        html_content += f"""
-          <tr>
-            <td style="color: #0056b3;"><b>{row['asset']}</b></td>
-            <td style="color: {dir_color}; font-weight: bold;">{row['direction']}</td>
-            <td>{trend_match}</td>
-            <td>{row['conviction']:.2f}%</td>
-            <td>₹{row['ltp']:.2f}</td>
-            <td style="color: {dir_color}; font-weight: bold;">{row['target_display']}</td>
-            <td>{row['actual_outcome']}</td>
-          </tr>
-        """
-        
-    html_content += "</table></body></html>"
-    msg.attach(MIMEText(html_content, 'html'))
-
-    try:
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
-        server.login(sender_email, sender_pass)
-        server.sendmail(sender_email, recipient_email, msg.as_string())
-        server.quit()
-        print(f"✅ Alert Dispatched with {len(fno_data_list)} F&O targets.")
-    except Exception as e:
-        print(f"Failed to send email: {str(e)}")
-
 def run_production_sweep():
-    # Force everything to be identical on every run
     set_deterministic_seeds(42)
-    
     raw_date_str = os.environ.get("PARAM_BACKTEST_DATE", "").strip()
-    is_backtest = bool(raw_date_str)
-    
-    if is_backtest:
-        # Intercept DD-MM-YYYY formats and convert to strict YYYY-MM-DD
-        try:
-            target_date_str = pd.to_datetime(raw_date_str, dayfirst=True).strftime("%Y-%m-%d")
-        except Exception as e:
-            print(f"❌ Could not parse date: {raw_date_str}. Error: {e}")
-            return
-    else:
-        target_date_str = datetime.now().strftime("%Y-%m-%d")
-        
+    target_date_str = pd.to_datetime(raw_date_str, dayfirst=True).strftime("%Y-%m-%d") if raw_date_str else datetime.now().strftime("%Y-%m-%d")
     print(f"⚙️ EXECUTING DATE: {target_date_str}")
     
-    # Path Resolver Strategy
-    nifty_file = None
+    # 1. Macro Brain
+    X_nifty, Y_np, _ = load_training_data("historical_indices.csv", target_date_str)
+    nifty_cnn, nifty_xgb_p, nifty_faiss, nifty_hist_y = get_ai_brain(X_nifty, Y_np, prefix="macro")
     
-    for root, dirs, files in os.walk("."):
-        for file in files:
-            if "nifty" in file.lower() and file.lower().endswith(".csv"):
-                nifty_file = os.path.join(root, file)
-                print(f"✅ Auto-detected Nifty file at: {nifty_file}")
-                break
-        if nifty_file: break
-            
-    if not nifty_file:
-        for root, dirs, files in os.walk("."):
-            for file in files:
-                if "historical_indices.csv" in file.lower():
-                    nifty_file = os.path.join(root, file)
-                    print(f"✅ Auto-detected Nifty data inside: {nifty_file}")
-                    break
-            if nifty_file: break
+    if not nifty_cnn: return 
+    
+    n_mat, n_ltp, n_sl = fetch_live_data_and_indicators("historical_indices.csv", target_date_str, is_nifty=True)
+    
+    macro_direction = "UNKNOWN"
+    if n_mat is not None:
+        live_t = torch.tensor(n_mat, dtype=torch.float32).unsqueeze(0)
+        n_lat = np.ascontiguousarray(nifty_cnn.encode(live_t).detach().numpy(), dtype=np.float32)
+        n_pct = nifty_xgb_p.predict(n_lat)[0]
+        macro_direction = "LONG 🟢" if n_pct > 0 else "SHORT 🔴"
 
-    if not nifty_file:
-        print("❌ Critical Error: Could not find ANY file containing 'nifty' or 'historical_indices'.")
-        print("📁 Here are the files the runner actually sees:")
-        for root, dirs, files in os.walk("."):
-            for file in files:
-                print(os.path.join(root, file))
-        return
+    # 2. Micro F&O Brain
+    X_fno, Y_fp, _ = load_training_data("historical_fno.csv", target_date_str)
+    fno_cnn, fno_xgb_p, fno_faiss, fno_hist_y = get_ai_brain(X_fno, Y_fp, prefix="micro")
+    
+    if not fno_cnn: return 
+    
+    final_report = []
+    fno_df = pd.read_csv("historical_fno.csv")
+    fno_df.columns = [str(c).title().strip() for c in fno_df.columns]
+    symbols = fno_df['Symbol'].unique() if 'Symbol' in fno_df.columns else []
 
-    # ==========================================
-    # PHASE 1: MACRO NIFTY BRAIN
-    # ==========================================
-    print(f"\n🧠 PHASE 1: Training NIFTY 50 Macro Brain using {nifty_file}...")
-    X_nifty, Y_np, Y_nt = load_training_data(nifty_file, target_date_str, min_pct=0.75, max_pct=5.0, max_dd=0.5, wick_ratio=0.5)
-    
-    if X_nifty is None or len(X_nifty) == 0:
-        print("❌ Nifty Data matrix construction failed.")
-        return
-
-    nifty_cnn, nifty_xgb_p, nifty_xgb_t, nifty_faiss = train_ai_brain(X_nifty, Y_np, Y_nt)
-    
-    nifty_live_matrix, nifty_ltp = get_live_tensor_from_csv(nifty_file, target_date_str)
-    
-    if nifty_live_matrix is not None and nifty_cnn is not None:
-        live_nifty_tensor = torch.tensor(nifty_live_matrix, dtype=torch.float32).unsqueeze(0)
-        with torch.no_grad():
-            nifty_latent = nifty_cnn.encode(live_nifty_tensor).numpy()
-            
-        nifty_latent = np.ascontiguousarray(nifty_latent, dtype=np.float32)
-        n_pct = nifty_xgb_p.predict(nifty_latent)[0]
-        faiss.normalize_L2(nifty_latent)
-        n_score, _ = nifty_faiss.search(nifty_latent, k=5)
-        n_conviction = n_score[0][0] * 100
+    print("🎯 Phase 3: Sweeping Universe with Consensus Logic...")
+    for sym in symbols:
+        sym_file = f"temp_{sym}.csv"
+        fno_df[fno_df['Symbol'] == sym].to_csv(sym_file, index=False)
+        mat, ltp, sl = fetch_live_data_and_indicators(sym_file, target_date_str)
+        os.remove(sym_file)
+        if mat is None: continue
         
-        macro_report = {
-            'direction': "LONG 🟢" if n_pct > 0 else "SHORT 🔴",
-            'conviction': float(n_conviction),
-            'target_display': f"₹{nifty_ltp * (1 + (n_pct / 100)):.2f} ({'+' if n_pct>0 else ''}{n_pct:.2f}%)"
-        }
-        print(f"🌍 MACRO REGIME: {macro_report['direction']} (Score: {n_conviction:.2f}%)")
-    else:
-        macro_report = {'direction': "UNKNOWN", 'conviction': 0, 'target_display': "N/A"}
-
-    # ==========================================
-    # PHASE 2: MICRO F&O BRAIN
-    # ==========================================
-    print("\n⚡ PHASE 2: Training F&O Micro Brain (Hyper-Momentum)...")
-    X_fno, Y_fp, Y_ft = load_training_data("historical_fno.csv", target_date_str, min_pct=4.0, max_pct=50.0, max_dd=1.2, wick_ratio=0.4)
-    if X_fno is None or len(X_fno) == 0: 
-        print("❌ F&O Data matrix construction failed.")
-        return
-
-    fno_cnn, fno_xgb_p, fno_xgb_t, fno_faiss = train_ai_brain(X_fno, Y_fp, Y_ft)
-    
-    print("🎯 Phase 3: Sweeping Active Market Universe...")
-    fno_universe = get_dynamic_fno_universe()
-    if not fno_universe: 
-        print("⚠️ FNO universe empty.")
-        return
-    
-    final_report_data = []
-    min_conviction = float(os.environ.get("PARAM_MIN_CONVICTION", 99.92))
-
-    for asset in fno_universe:
-        result = fetch_upstox_data(asset["key"], target_date_str, interval="day", days_back=60)
-        time.sleep(0.15) 
+        live_t = torch.tensor(mat, dtype=torch.float32).unsqueeze(0)
+        lat = np.ascontiguousarray(fno_cnn.encode(live_t).detach().numpy(), dtype=np.float32)
+        pred_pct = fno_xgb_p.predict(lat)[0]
+        direction = "LONG 🟢" if pred_pct > 0 else "SHORT 🔴"
         
-        if result is None: continue
-        live_matrix, current_ltp = result
+        faiss.normalize_L2(lat)
+        scores, indices = fno_faiss.search(lat, k=5)
+        raw_conviction = scores[0][0] * 100
         
-        if fno_cnn is not None:
-            with torch.no_grad():
-                live_vector = fno_cnn.encode(torch.tensor(live_matrix, dtype=torch.float32).unsqueeze(0)).numpy()
+        historical_outcomes = fno_hist_y[indices[0]]
+        if pred_pct > 0:
+            consensus = sum(1 for y in historical_outcomes if y > 0) / 5.0
+        else:
+            consensus = sum(1 for y in historical_outcomes if y < 0) / 5.0
             
-            live_vector = np.ascontiguousarray(live_vector, dtype=np.float32)
-            pred_pct = fno_xgb_p.predict(live_vector)[0]
-            faiss.normalize_L2(live_vector)
-            score, _ = fno_faiss.search(live_vector, k=5)
-            conviction = score[0][0] * 100
-            
-            if conviction >= min_conviction:
-                final_report_data.append({
-                    'asset': asset["symbol"],
-                    'direction': "LONG 🟢" if pred_pct > 0 else "SHORT 🔴",
-                    'conviction': float(conviction),
-                    'ltp': float(current_ltp),
-                    'target_display': f"₹{current_ltp * (1 + (pred_pct / 100)):.2f} ({'+' if pred_pct>0 else ''}{pred_pct:.2f}%)",
-                    'actual_outcome': "<b>Awaiting Market ⏳</b>"
-                })
-            
-    # VALIDATION LOGIC FOR BACKTEST
-    if is_backtest and os.path.exists("historical_fno.csv") and len(final_report_data) > 0:
-        df_full = read_and_standardize_csv("historical_fno.csv")
-        if df_full is not None:
-            for row in final_report_data:
-                if 'Symbol' not in df_full.columns: continue
-                
-                df_sym = df_full[df_full['Symbol'] == row['asset']].sort_values('Date').reset_index(drop=True)
-                past = df_sym[df_sym['Date'] <= target_date_str]
-                if len(past) > 0:
-                    idx = past.index[-1]
-                    fw = df_sym.iloc[idx+1 : idx+3] 
-                    if len(fw) > 0:
-                        mx, mn = fw['Close'].max(), fw['Close'].min()
-                        if "LONG" in row['direction']:
-                            mv, dd = ((mx - row['ltp']) / row['ltp']) * 100, ((fw['Low'].min() - row['ltp']) / row['ltp']) * 100
-                            c = "#28a745" if mv > 0 else "#6c757d"
-                            row['actual_outcome'] = f"<span style='color: {c};'>Closed ₹{mx:.2f} (+{mv:.2f}%)</span><br><span style='color: #856404; font-size: 11px;'>Max DD: {dd:.2f}%</span>"
+        if consensus < 0.6: continue 
+        
+        final_conviction = raw_conviction * consensus
+        
+        if final_conviction >= 50.0:
+            outcome_text = "<b>Awaiting Market ⏳</b>"
+            if raw_date_str:
+                df_sym = fno_df[(fno_df['Symbol'] == sym) & (fno_df['Date'] > target_date_str)].sort_values('Date')
+                if len(df_sym) >= 2:
+                    fw = df_sym.iloc[:2]
+                    mx, mn, c2 = fw['High'].max(), fw['Low'].min(), fw['Close'].iloc[1]
+                    
+                    if direction == "LONG 🟢":
+                        if mn < sl:
+                            outcome_text = f"<span style='color: #dc3545;'>❌ STOP HIT (₹{sl:.2f})</span>"
                         else:
-                            mv, dd = ((mn - row['ltp']) / row['ltp']) * 100, ((fw['High'].max() - row['ltp']) / row['ltp']) * 100
-                            c = "#28a745" if mv < 0 else "#6c757d"
-                            row['actual_outcome'] = f"<span style='color: {c};'>Closed ₹{mn:.2f} ({mv:.2f}%)</span><br><span style='color: #856404; font-size: 11px;'>Max DD: +{dd:.2f}%</span>"
+                            outcome_text = f"<span style='color: #28a745;'>✅ Closed ₹{mx:.2f}</span>"
+                    else:
+                        if mx > sl:
+                            outcome_text = f"<span style='color: #dc3545;'>❌ STOP HIT (₹{sl:.2f})</span>"
+                        else:
+                            outcome_text = f"<span style='color: #28a745;'>✅ Closed ₹{mn:.2f}</span>"
+            
+            final_report.append({
+                'asset': sym, 'direction': direction, 'conviction': final_conviction,
+                'ltp': float(ltp), 'sl': float(sl), 
+                'target': f"₹{ltp * (1 + (pred_pct / 100)):.2f}", 'actual': outcome_text
+            })
 
-    send_mobile_alert(macro_report, final_report_data, target_date_str, is_backtest)
+    # 3. Email Dispatch
+    html = f"""<html><body style="font-family: Arial; padding: 10px;">
+        <h3>🌍 MACRO REGIME: {macro_direction}</h3>
+        <table border="1" cellpadding="8" cellspacing="0" width="100%">
+          <tr bgcolor="#f8f9fa"><th>Asset</th><th>Signal</th><th>Conviction</th><th>LTP</th><th>Invalidation (SL)</th><th>AI Target</th><th>Result</th></tr>"""
+    for r in sorted(final_report, key=lambda x: x['conviction'], reverse=True):
+        html += f"<tr><td><b>{r['asset']}</b></td><td>{r['direction']}</td><td>{r['conviction']:.1f}%</td><td>₹{r['ltp']:.2f}</td><td style='color:#dc3545;'>₹{r['sl']:.2f}</td><td>{r['target']}</td><td>{r['actual']}</td></tr>"
+    html += "</table></body></html>"
+
+    msg = MIMEMultipart('alternative')
+    msg['Subject'] = f"🚀 AI SWEEP | {target_date_str}"
+    msg['From'], msg['To'] = os.environ.get("SENDER_EMAIL"), os.environ.get("RECIPIENT_EMAIL")
+    if msg['From']:
+        msg.attach(MIMEText(html, 'html'))
+        server = smtplib.SMTP('smtp.gmail.com', 587); server.starttls()
+        server.login(msg['From'], os.environ.get("SENDER_PASSWORD"))
+        server.sendmail(msg['From'], msg['To'], msg.as_string()); server.quit()
+        print("✅ Alert Dispatched!")
 
 if __name__ == "__main__":
     run_production_sweep()
