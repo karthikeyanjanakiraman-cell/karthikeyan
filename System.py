@@ -39,9 +39,13 @@ def set_deterministic_seeds(seed=42):
 def read_and_standardize_csv(filename):
     """Aggressively maps variations of Date, Symbol, and OHLCV columns."""
     if not os.path.exists(filename): return None
-    df = pd.read_csv(filename)
+    try:
+        df = pd.read_csv(filename)
+    except Exception as e:
+        print(f"⚠️ Error reading {filename}: {e}")
+        return None
+        
     rename_map = {}
-    
     for c in df.columns:
         cl = str(c).lower().strip()
         if cl in ['date', 'time', 'timestamp', 'datetime']: rename_map[c] = 'Date'
@@ -196,7 +200,7 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=2.0):
     return np.array(training_matrices, dtype=np.float32), np.array(price_targets, dtype=np.float32), None
 
 # ==============================================================================
-# 5. ALWAYS-TRAIN AI BRAIN
+# 5. STATELESS 50-EPOCH AI BRAIN TRAINING
 # ==============================================================================
 def get_ai_brain(X_raw, Y_price, prefix="fno"):
     print(f"⚙️ Initiating Deep Training (50 Epochs) for [{prefix}]...")
@@ -235,24 +239,77 @@ def get_ai_brain(X_raw, Y_price, prefix="fno"):
     return cnn_model, xgb_price, index, Y_price
 
 # ==============================================================================
-# 6. LIVE INGESTION
+# 6. LIVE INGESTION & 9:15 AM OPEN ANCHOR
 # ==============================================================================
-def fetch_live_data_and_indicators(csv_filename, target_date_str, is_nifty=False):
+def fetch_915_open_from_upstox(instrument_key, target_date_str):
+    """Fetches exact 9:15 AM Open price via Upstox intraday API with safe fallbacks."""
+    access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
+    if not access_token or not instrument_key: return None
+    
+    url = f"https://api.upstox.com/v3/historical-candle/intraday/{urllib.parse.quote(instrument_key)}/minutes/1"
+    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+        if response.status_code == 200:
+            res_json = response.json()
+            candles = res_json.get('data', {}).get('candles', [])
+            if candles:
+                for c in candles:
+                    t_str = str(c[0])
+                    if target_date_str in t_str and "09:15" in t_str:
+                        return float(c[1]) # Index 1 is Open price
+                return float(candles[-1][1])
+    except Exception as e:
+        print(f"⚠️ 9:15 AM Open LTP Fetch warning for {instrument_key}: {e}")
+    return None
+
+def fetch_live_data_and_indicators(csv_filename, target_date_str, instrument_key=None, is_nifty=False, is_backtest=False):
     df = read_and_standardize_csv(csv_filename)
     if df is None or 'Date' not in df.columns: return None, None, None
     if is_nifty and 'Symbol' in df.columns:
         df = df[df['Symbol'].astype(str).str.contains("NIFTY")]
-    df = df[df['Date'] <= target_date_str].sort_values('Date').reset_index(drop=True)
-    if len(df) < 30: return None, None, None
+        
+    df_window = df[df['Date'] <= target_date_str].sort_values('Date').reset_index(drop=True)
+    if len(df_window) < 30: return None, None, None
     
-    df = add_holy_trinity(df)
-    values = df[['Open', 'High', 'Low', 'Close', 'Volume', 'RSI_7', 'ADX_14', 'ST_Dist']].values.astype(np.float32)[-30:]
-    current_ltp = values[-1, 3]
-    current_sl = df['ST_7_2'].iloc[-1] 
+    df_ind = add_holy_trinity(df_window)
+    values = df_ind[['Open', 'High', 'Low', 'Close', 'Volume', 'RSI_7', 'ADX_14', 'ST_Dist']].values.astype(np.float32)[-30:]
+    
+    # 🎯 STRICT 9:15 AM OPEN ANCHOR
+    current_ltp = None
+    if not is_backtest and instrument_key:
+        current_ltp = fetch_915_open_from_upstox(instrument_key, target_date_str)
+        
+    if current_ltp is None:
+        target_row = df[df['Date'] == target_date_str]
+        if not target_row.empty:
+            current_ltp = float(target_row['Open'].values[0])
+        else:
+            current_ltp = float(df_window.iloc[-1]['Open'])
+            
+    current_sl = float(df_ind['ST_7_2'].iloc[-1]) 
     
     w_min, w_max = values.min(axis=0), values.max(axis=0)
     norm_window = (values - w_min) / (w_max - w_min + 1e-8)
     return norm_window.T, current_ltp, current_sl
+
+def get_dynamic_fno_universe():
+    nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+    try:
+        response = requests.get(nse_url, timeout=10)
+        if response.status_code != 200: return {}
+        nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
+        fno_underlying = {item.get("underlying_symbol") for item in nse_data if item.get("segment") == "NSE_FO" and item.get("underlying_symbol")}
+        
+        symbol_to_key = {}
+        for item in nse_data:
+            if item.get("segment") in ("NSE_EQ", "NSE_INDEX") and item.get("trading_symbol") in fno_underlying:
+                symbol_to_key[item.get("trading_symbol")] = item.get("instrument_key")
+        return symbol_to_key
+    except Exception as e:
+        print(f"⚠️ Error fetching live F&O universe map: {e}")
+        return {}
 
 # ==============================================================================
 # 7. MASTER EXECUTION & DISPATCH
@@ -260,13 +317,13 @@ def fetch_live_data_and_indicators(csv_filename, target_date_str, is_nifty=False
 def run_production_sweep():
     set_deterministic_seeds(42)
     raw_date_str = os.environ.get("PARAM_BACKTEST_DATE", "").strip()
-    target_date_str = pd.to_datetime(raw_date_str, dayfirst=True).strftime("%Y-%m-%d") if raw_date_str else datetime.now().strftime("%Y-%m-%d")
+    is_backtest = bool(raw_date_str)
+    target_date_str = pd.to_datetime(raw_date_str, dayfirst=True).strftime("%Y-%m-%d") if is_backtest else datetime.now().strftime("%Y-%m-%d")
     
-    # ROBUST USER-DEFINED MINIMUM CONVICTION (Defaults to 99.9% if not provided)
     env_conviction = os.environ.get("PARAM_MIN_CONVICTION", "").strip()
     min_user_conviction = float(env_conviction) if env_conviction else 95.00
     
-    print(f"⚙️ EXECUTING DATE: {target_date_str} | MIN CONVICTION THRESHOLD: {min_user_conviction}%")
+    print(f"⚙️ EXECUTING DATE: {target_date_str} | MODE: {'BACKTEST' if is_backtest else 'LIVE (9:15 AM Open LTP)'} | MIN CONVICTION: {min_user_conviction}%")
     
     nifty_file = "historical_indices.csv"
     if not os.path.exists(nifty_file):
@@ -283,7 +340,9 @@ def run_production_sweep():
         print("🛑 Macro Brain failed to initialize. Halting sweep.")
         return 
     
-    n_mat, n_ltp, n_sl = fetch_live_data_and_indicators(nifty_file, target_date_str, is_nifty=True)
+    nifty_universe_map = get_dynamic_fno_universe()
+    nifty_key = nifty_universe_map.get("NIFTY 50", nifty_universe_map.get("NIFTY", None))
+    n_mat, n_ltp, n_sl = fetch_live_data_and_indicators(nifty_file, target_date_str, instrument_key=nifty_key, is_nifty=True, is_backtest=is_backtest)
     
     macro_report = {'direction': "UNKNOWN", 'conviction': 0, 'target_display': "N/A"}
     if n_mat is not None and n_ltp is not None:
@@ -322,7 +381,9 @@ def run_production_sweep():
     for sym in symbols:
         sym_file = f"temp_{sym}.csv"
         fno_df[fno_df['Symbol'] == sym].to_csv(sym_file, index=False)
-        mat, ltp, sl = fetch_live_data_and_indicators(sym_file, target_date_str)
+        
+        sym_key = nifty_universe_map.get(sym, None)
+        mat, ltp, sl = fetch_live_data_and_indicators(sym_file, target_date_str, instrument_key=sym_key, is_backtest=is_backtest)
         if os.path.exists(sym_file): os.remove(sym_file)
         if mat is None: continue
         
@@ -345,10 +406,9 @@ def run_production_sweep():
         
         final_conviction = raw_conviction * consensus
         
-        # STRICT USER-GIVEN CONVICTION FILTER
         if final_conviction >= min_user_conviction:
             outcome_text = "<b>Awaiting Market ⏳</b>"
-            if raw_date_str:
+            if is_backtest:
                 df_sym = fno_df[(fno_df['Symbol'] == sym) & (fno_df['Date'] > target_date_str)].sort_values('Date')
                 if len(df_sym) >= 2:
                     fw = df_sym.iloc[:2]
@@ -373,7 +433,7 @@ def run_production_sweep():
 
     # 3. Email Dispatch
     macro_color = "#28a745" if "LONG" in macro_report['direction'] else "#dc3545"
-    sim_warning = f"<div style='background-color: #fff3cd; color: #856404; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 15px;'>⚠️ VALIDATION MODE: SHOWING ACTUAL 2-DAY OUTCOMES</div>" if raw_date_str else ""
+    sim_warning = f"<div style='background-color: #fff3cd; color: #856404; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 15px;'>⚠️ VALIDATION MODE: SHOWING ACTUAL 2-DAY OUTCOMES</div>" if is_backtest else ""
 
     html = f"""
     <html>
@@ -394,7 +454,7 @@ def run_production_sweep():
             <th>Asset</th>
             <th>Signal</th>
             <th>Conviction</th>
-            <th>LTP</th>
+            <th>LTP (9:15 Open)</th>
             <th>Invalidation (SL)</th>
             <th>AI Target</th>
             <th>Result</th>
@@ -418,8 +478,7 @@ def run_production_sweep():
     html += "</table></body></html>"
 
     msg = MIMEMultipart('alternative')
-    prefix = "⏪ BACKTEST" if raw_date_str else "🚀 LIVE ALERT"
-    msg['Subject'] = f"{prefix} | {target_date_str}"
+    msg['Subject'] = f"🚀 AI SWEEP (9:15 Open) | {target_date_str}"
     msg['From'], msg['To'] = os.environ.get("SENDER_EMAIL"), os.environ.get("RECIPIENT_EMAIL")
     
     if msg['From'] and msg['To']:
