@@ -264,7 +264,7 @@ def run_production_sweep():
     
     # ROBUST USER-DEFINED MINIMUM CONVICTION (Defaults to 99.9% if not provided)
     env_conviction = os.environ.get("PARAM_MIN_CONVICTION", "").strip()
-    min_user_conviction = float(env_conviction) if env_conviction else 99.90
+    min_user_conviction = float(env_conviction) if env_conviction else 95.00
     
     print(f"⚙️ EXECUTING DATE: {target_date_str} | MIN CONVICTION THRESHOLD: {min_user_conviction}%")
     
