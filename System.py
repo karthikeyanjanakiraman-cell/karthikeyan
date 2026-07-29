@@ -5,7 +5,6 @@ import json
 import gzip
 import io
 import time
-import random
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta
@@ -20,57 +19,49 @@ import faiss
 import xgboost as xgb
 
 # ==============================================================================
-# 0. DETERMINISTIC ENVIRONMENT LOCK
+# 1. EXPLICIT STATISTICAL FEATURE ENGINE (Replaces Unconverged CNN Layer)
 # ==============================================================================
-def set_deterministic_seeds(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    os.environ['PYTHONHASHSEED'] = str(seed)
-
-# ==============================================================================
-# 1. TEMPORAL AUTOENCODER (The 1D CNN Brain)
-# ==============================================================================
-class TemporalAutoencoder(nn.Module):
-    def __init__(self, num_features=5, latent_dim=12):
-        super(TemporalAutoencoder, self).__init__()
-        
-        self.encoder = nn.Sequential(
-            nn.Conv1d(in_channels=num_features, out_channels=16, kernel_size=3, padding=1),
-            nn.BatchNorm1d(16),
-            nn.ReLU(inplace=True),
-            nn.MaxPool1d(2),
-            
-            nn.Conv1d(in_channels=16, out_channels=32, kernel_size=3, padding=1),
-            nn.BatchNorm1d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool1d(3),
-            
-            nn.Flatten(),
-            nn.Linear(32 * 5, latent_dim)
-        )
-        
-        self.decoder = nn.Sequential(
-            nn.Linear(latent_dim, 32 * 5),
-            nn.ReLU(inplace=True),
-            nn.Unflatten(1, (32, 5)),
-            nn.ConvTranspose1d(32, 16, kernel_size=3, stride=3, output_padding=0),
-            nn.BatchNorm1d(16),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose1d(16, num_features, kernel_size=2, stride=2, output_padding=0),
-            nn.Sigmoid()
-        )
-
-    def encode(self, x):
-        return self.encoder(x)
-
-    def forward(self, x):
-        latent = self.encode(x)
-        return self.decoder(latent), latent
+def extract_window_features(ohlcv_window):
+    """
+    Transforms raw (30, 5) sequential bars into clear mathematical matrices 
+    providing explicit boundaries tree models can resolve instantly.
+    """
+    opens = ohlcv_window[:, 0]
+    highs = ohlcv_window[:, 1]
+    lows = ohlcv_window[:, 2]
+    closes = ohlcv_window[:, 3]
+    volumes = ohlcv_window[:, 4]
+    
+    last_close = closes[-1]
+    win_min = lows.min()
+    win_max = highs.max()
+    win_range = win_max - win_min + 1e-8
+    
+    # Structural range positioning
+    pos_close = (last_close - win_min) / win_range
+    pos_open = (opens[-1] - win_min) / win_range
+    pos_high = (highs[-1] - win_min) / win_range
+    pos_low = (lows[-1] - win_min) / win_range
+    
+    # Multi-Lookback returns vector
+    returns = np.diff(closes) / (closes[:-1] + 1e-8)
+    ret_1d = returns[-1] if len(returns) > 0 else 0
+    ret_3d = (closes[-1] - closes[-4]) / (closes[-4] + 1e-8) if len(closes) >= 4 else 0
+    ret_5d = (closes[-1] - closes[-6]) / (closes[-6] + 1e-8) if len(closes) >= 6 else 0
+    ret_10d = (closes[-1] - closes[-11]) / (closes[-11] + 1e-8) if len(closes) >= 11 else 0
+    ret_20d = (closes[-1] - closes[-21]) / (closes[-21] + 1e-8) if len(closes) >= 21 else 0
+    
+    # Realized volatility & Volume expansion tracking
+    volatility = np.std(returns) if len(returns) > 0 else 0
+    mean_volume = volumes.mean()
+    vol_ratio = volumes[-1] / (mean_volume + 1e-8)
+    
+    features = [
+        pos_close, pos_open, pos_high, pos_low,
+        ret_1d, ret_3d, ret_5d, ret_10d, ret_20d,
+        volatility, vol_ratio
+    ]
+    return np.array(features, dtype=np.float32)
 
 # ==============================================================================
 # 2. DYNAMIC TRAINING LOADER & STANDARDIZER (Strict 9:15 AM Open Anchor)
@@ -97,12 +88,14 @@ def read_and_standardize_csv(filename):
 
 def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_pct=50.0, max_dd=1.2, wick_ratio=0.40):
     df = read_and_standardize_csv(csv_filename)
-    if df is None or 'Date' not in df.columns: return None, None, None
+    if df is None or 'Date' not in df.columns:
+        print(f"⚠️ Warning: Missing or invalid '{csv_filename}'")
+        return None, None, None
         
     if target_date_str:
         df = df[df['Date'] <= target_date_str]
     
-    training_matrices, price_targets, time_targets = [], [], []
+    features_matrices, price_targets, time_targets = [], [], []
     FUTURE_DAYS = 2 
     
     if "historical_indices" in csv_filename.lower() or "nifty" in csv_filename.lower():
@@ -118,11 +111,8 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_pct=
             
         for i in range(len(values) - (30 + FUTURE_DAYS) + 1):
             raw_window = values[i : i+30]
-            w_min, w_max = raw_window.min(axis=0), raw_window.max(axis=0)
-            norm_window = (raw_window - w_min) / (w_max - w_min + 1e-8)
-            window = norm_window.T 
             
-            # 🎯 STRICT 9:15 AM ENTRY (Day T+1 Open)
+            # 🎯 ANCHOR ALL TARGET CALCULATIONS STRICTLY TO T+1 OPEN (9:15 AM)
             entry_price = values[i+30, 0] 
             if entry_price <= 0: continue
             
@@ -130,9 +120,9 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_pct=
             future_highs  = values[i+30 : i+30+FUTURE_DAYS, 1]
             future_lows   = values[i+30 : i+30+FUTURE_DAYS, 2]
             
-            max_close, min_close = future_closes.max(), future_closes.min()
+            max_close = future_closes.max()
+            min_close = future_closes.min()
             
-            # Calculate actual moves directly from the 9:15 AM Open Anchor
             if (max_close - entry_price) > (entry_price - min_close):
                 is_long = True
                 actual_pct_move = ((max_close - entry_price) / entry_price) * 100
@@ -155,48 +145,35 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_pct=
                 if rejection_wick > (abs(actual_pct_move) * wick_ratio): continue 
 
             days_to_target = float(np.argmax(np.abs(future_closes - entry_price)) + 1)
-            training_matrices.append(window)
+            
+            features_matrices.append(extract_window_features(raw_window))
             price_targets.append(actual_pct_move)
             time_targets.append(days_to_target)
             
-    return np.array(training_matrices, dtype=np.float32), np.array(price_targets, dtype=np.float32), np.array(time_targets, dtype=np.float32)
+    if len(features_matrices) == 0: return None, None, None
+    return np.array(features_matrices, dtype=np.float32), np.array(price_targets, dtype=np.float32), np.array(time_targets, dtype=np.float32)
 
 # ==============================================================================
-# 3. MODULAR AI TRAINING ENGINE
+# 3. QUANTITATIVE MODEL TRAINING ENGINE
 # ==============================================================================
-def train_ai_brain(X_raw, Y_price, Y_time, epochs=15):
-    X_tensor = torch.tensor(X_raw)
-    
-    cnn_model = TemporalAutoencoder()
-    optimizer = optim.Adam(cnn_model.parameters(), lr=0.002)
-    criterion = nn.MSELoss()
-    
-    cnn_model.train()
-    for _ in range(epochs): 
-        optimizer.zero_grad()
-        reconstructed, _ = cnn_model(X_tensor)
-        loss = criterion(reconstructed, X_tensor)
-        loss.backward()
-        optimizer.step()
+def train_quantitative_model(X_features, Y_price, Y_time):
+    # Train robust estimators directly on mathematical structural feature states
+    xgb_price = xgb.XGBRegressor(n_estimators=150, learning_rate=0.05, max_depth=5, random_state=42).fit(X_features, Y_price)
+    xgb_time = xgb.XGBRegressor(n_estimators=150, learning_rate=0.05, max_depth=5, random_state=42).fit(X_features, Y_time)
 
-    cnn_model.eval()
-    with torch.no_grad():
-        latent_vectors = cnn_model.encode(X_tensor).numpy()
-        
-    xgb_price = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=4).fit(latent_vectors, Y_price)
-    xgb_time = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=4).fit(latent_vectors, Y_time)
-
-    faiss.normalize_L2(latent_vectors)
-    index = faiss.IndexFlatIP(12) 
-    index.add(latent_vectors)
+    features_contig = np.ascontiguousarray(X_features, dtype=np.float32)
+    faiss.normalize_L2(features_contig)
     
-    return cnn_model, xgb_price, xgb_time, index
+    # Establish Index spatial dimensions from feature shape width
+    index = faiss.IndexFlatIP(features_contig.shape[1]) 
+    index.add(features_contig)
+    
+    return xgb_price, xgb_time, index
 
 # ==============================================================================
-# 4. LIVE INGESTION TOOLS (API & 9:15 Anchors)
+# 4. LIVE INGESTION TOOLS
 # ==============================================================================
 def fetch_915_open_from_upstox(instrument_key, target_date_str):
-    """Fetches exact 9:15 AM Open price via Upstox intraday API."""
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
     if not access_token or not instrument_key: return None
     
@@ -211,9 +188,9 @@ def fetch_915_open_from_upstox(instrument_key, target_date_str):
             if candles:
                 for c in candles:
                     if target_date_str in str(c[0]) and "09:15" in str(c[0]): 
-                        return float(c[1]) # Index 1 is Open price
-                return float(candles[-1][1]) # Fallback to earliest available open
-    except Exception as e:
+                        return float(c[1]) 
+                return float(candles[-1][1]) 
+    except:
         pass
     return None
 
@@ -221,7 +198,6 @@ def fetch_upstox_data_with_915_anchor(instrument_key, target_date_str, days_back
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
     if not access_token: return None, None
     
-    # 1. Fetch historical data STRICTLY prior to target date for clean 30-day matrix
     target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
     to_date = (target_dt - timedelta(days=1)).strftime("%Y-%m-%d")
     from_date = (target_dt - timedelta(days=days_back)).strftime("%Y-%m-%d")
@@ -237,40 +213,33 @@ def fetch_upstox_data_with_915_anchor(instrument_key, target_date_str, days_back
     if not data or len(data) < 30: return None, None
         
     ohlcv = np.array([candle[1:6] for candle in data], dtype=np.float32)[::-1] 
-    
     ohlcv_30 = ohlcv[-30:]
-    ohlcv_min = ohlcv_30.min(axis=0)
-    ohlcv_max = ohlcv_30.max(axis=0)
-    normalized_ohlcv = (ohlcv_30 - ohlcv_min) / (ohlcv_max - ohlcv_min + 1e-8)
     
-    # 2. Fetch the true live execution anchor for the target date
     entry_price = fetch_915_open_from_upstox(instrument_key, target_date_str)
     if entry_price is None:
-        entry_price = float(ohlcv_30[-1][3]) # Failsafe to yesterday close if API drops
+        entry_price = float(ohlcv_30[-1][3]) # Failsafe
         
-    return normalized_ohlcv.T, entry_price
+    features = extract_window_features(ohlcv_30)
+    return features, entry_price
 
-def get_fno_live_tensor(asset_symbol, asset_key, target_date_str, is_backtest, df_full=None):
-    """Dynamically routes between local fast-CSV for backtests and Upstox API for live runs."""
+def get_fno_live_features(asset_symbol, asset_key, target_date_str, is_backtest, df_full=None):
     if is_backtest and df_full is not None:
         df_sym = df_full[df_full['Symbol'] == asset_symbol].sort_values('Date').reset_index(drop=True)
         df_history = df_sym[df_sym['Date'] < target_date_str]
         if len(df_history) < 30: return None, None
         
-        values = df_history[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)[-30:]
+        values = df_history[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)[[-30]]
         
         df_future = df_sym[df_sym['Date'] >= target_date_str]
         if df_future.empty: return None, None
         
-        entry_price = float(df_future.iloc[0]['Open']) # True CSV Open Anchor
-        w_min, w_max = values.min(axis=0), values.max(axis=0)
-        norm_window = (values - w_min) / (w_max - w_min + 1e-8)
-        return norm_window.T, entry_price
+        entry_price = float(df_future.iloc[0]['Open']) 
+        features = extract_window_features(values)
+        return features, entry_price
     else:
-        # Live Production Route
         return fetch_upstox_data_with_915_anchor(asset_key, target_date_str)
 
-def get_live_nifty_tensor_from_csv(csv_filename, target_date_str, instrument_key=None, is_backtest=False):
+def get_live_nifty_features_from_csv(csv_filename, target_date_str, instrument_key=None, is_backtest=False):
     df = read_and_standardize_csv(csv_filename)
     if df is None or 'Date' not in df.columns: return None, None
     
@@ -295,17 +264,15 @@ def get_live_nifty_tensor_from_csv(csv_filename, target_date_str, instrument_key
         entry_price = float(df_future.iloc[0]['Open'])
         
     if entry_price is None:
-        entry_price = close_t # Failsafe
+        entry_price = close_t
         
-    w_min, w_max = values.min(axis=0), values.max(axis=0)
-    norm_window = (values - w_min) / (w_max - w_min + 1e-8)
-    return norm_window.T, entry_price
+    features = extract_window_features(values)
+    return features, entry_price
 
 def get_dynamic_fno_universe():
-    nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
-    response = requests.get(nse_url)
-    if response.status_code != 200: return []
     try:
+        response = requests.get("https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz", timeout=10)
+        if response.status_code != 200: return []
         nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
         fno_underlying = {item.get("underlying_symbol") for item in nse_data if item.get("segment") == "NSE_FO" and item.get("underlying_symbol")}
         
@@ -356,7 +323,7 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
             <th>Signal</th>
             <th>Trend Match?</th>
             <th>Score</th>
-            <th>Entry (9:15)</th>
+            <th>Entry (9:15 Open)</th>
             <th>AI Target</th>
             <th>Result (2-Day Close)</th>
           </tr>
@@ -432,21 +399,19 @@ def run_production_sweep():
         print("❌ Nifty Data matrix construction failed.")
         return
 
-    nifty_cnn, nifty_xgb_p, nifty_xgb_t, nifty_faiss = train_ai_brain(X_nifty, Y_np, Y_nt)
+    nifty_xgb_p, nifty_xgb_t, nifty_faiss = train_quantitative_model(X_nifty, Y_np, Y_nt)
     
     fno_universe = get_dynamic_fno_universe()
     nifty_key = next((item["key"] for item in fno_universe if item["symbol"] in ["NIFTY 50", "NIFTY"]), None)
     
-    nifty_live_matrix, nifty_entry = get_live_nifty_tensor_from_csv(nifty_file, target_date_str, nifty_key, is_backtest)
+    nifty_live_features, nifty_entry = get_live_nifty_features_from_csv(nifty_file, target_date_str, nifty_key, is_backtest)
     
-    if nifty_live_matrix is not None:
-        live_nifty_tensor = torch.tensor(nifty_live_matrix).unsqueeze(0)
-        with torch.no_grad():
-            nifty_latent = nifty_cnn.encode(live_nifty_tensor).numpy()
-            
-        n_pct = nifty_xgb_p.predict(nifty_latent)[0]
-        faiss.normalize_L2(nifty_latent)
-        n_score, _ = nifty_faiss.search(nifty_latent, k=5)
+    if nifty_live_features is not None:
+        live_feat_arr = np.ascontiguousarray(nifty_live_features.reshape(1, -1), dtype=np.float32)
+        n_pct = nifty_xgb_p.predict(live_feat_arr)[0]
+        
+        faiss.normalize_L2(live_feat_arr)
+        n_score, _ = nifty_faiss.search(live_feat_arr, k=5)
         n_conviction = n_score[0][0] * 100
         
         macro_report = {
@@ -465,28 +430,28 @@ def run_production_sweep():
     X_fno, Y_fp, Y_ft = load_training_data("historical_fno.csv", target_date_str, min_pct=4.0, max_pct=50.0, max_dd=1.2, wick_ratio=0.4)
     if X_fno is None or len(X_fno) == 0: return
 
-    fno_cnn, fno_xgb_p, fno_xgb_t, fno_faiss = train_ai_brain(X_fno, Y_fp, Y_ft)
+    fno_xgb_p, fno_xgb_t, fno_faiss = train_quantitative_model(X_fno, Y_fp, Y_ft)
     
     print("🎯 Phase 3: Sweeping Active Market Universe...")
     if not fno_universe: return
     
     final_report_data = []
-    min_conviction = float(os.environ.get("PARAM_MIN_CONVICTION", 99.92))
+    # Structural features map realistic variances (Default minimum threshold calibrated to 85.00%)
+    min_conviction = float(os.environ.get("PARAM_MIN_CONVICTION", 85.00))
     
     fno_df_full = read_and_standardize_csv("historical_fno.csv") if is_backtest else None
 
     for asset in fno_universe:
-        live_matrix, entry_price = get_fno_live_tensor(asset["symbol"], asset["key"], target_date_str, is_backtest, fno_df_full)
+        live_features, entry_price = get_fno_live_features(asset["symbol"], asset["key"], target_date_str, is_backtest, fno_df_full)
         
-        if not is_backtest: time.sleep(0.15) # Protect API Rate Limits
-        if live_matrix is None or entry_price is None: continue
+        if not is_backtest: time.sleep(0.15) 
+        if live_features is None or entry_price is None: continue
         
-        with torch.no_grad():
-            live_vector = fno_cnn.encode(torch.tensor(live_matrix).unsqueeze(0)).numpy()
+        live_feat_arr = np.ascontiguousarray(live_features.reshape(1, -1), dtype=np.float32)
+        pred_pct = fno_xgb_p.predict(live_feat_arr)[0]
         
-        pred_pct = fno_xgb_p.predict(live_vector)[0]
-        faiss.normalize_L2(live_vector)
-        score, _ = fno_faiss.search(live_vector, k=5)
+        faiss.normalize_L2(live_feat_arr)
+        score, _ = fno_faiss.search(live_feat_arr, k=5)
         conviction = score[0][0] * 100
         
         if conviction >= min_conviction:
@@ -523,3 +488,4 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
+
