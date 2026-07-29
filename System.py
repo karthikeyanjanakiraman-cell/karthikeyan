@@ -34,10 +34,36 @@ def set_deterministic_seeds(seed=42):
     os.environ['PYTHONHASHSEED'] = str(seed)
 
 # ==============================================================================
-# 1. INDICATOR ENGINE (The Holy Trinity)
+# 1. UNIVERSAL CSV STANDARDIZER (Fixes Missing 'Date' KeyError)
+# ==============================================================================
+def read_and_standardize_csv(filename):
+    """Aggressively maps variations of Date, Symbol, and OHLCV columns."""
+    if not os.path.exists(filename): return None
+    df = pd.read_csv(filename)
+    rename_map = {}
+    
+    for c in df.columns:
+        cl = str(c).lower().strip()
+        if cl in ['date', 'time', 'timestamp', 'datetime']: rename_map[c] = 'Date'
+        elif cl in ['symbol', 'ticker', 'asset', 'instrument']: rename_map[c] = 'Symbol'
+        elif cl in ['open', 'o']: rename_map[c] = 'Open'
+        elif cl in ['high', 'h']: rename_map[c] = 'High'
+        elif cl in ['low', 'l']: rename_map[c] = 'Low'
+        elif cl in ['close', 'c']: rename_map[c] = 'Close'
+        elif cl in ['volume', 'vol', 'v']: rename_map[c] = 'Volume'
+        
+    df = df.rename(columns=rename_map)
+    
+    if 'Date' in df.columns:
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce', dayfirst=True).dt.strftime('%Y-%m-%d')
+        df = df.dropna(subset=['Date'])
+        
+    return df
+
+# ==============================================================================
+# 2. INDICATOR ENGINE (The Holy Trinity)
 # ==============================================================================
 def add_holy_trinity(df):
-    """Calculates RSI(7), ADX(14), and Supertrend(7,2) without external libraries."""
     df = df.copy()
     
     # 1. RSI (7)
@@ -96,7 +122,7 @@ def add_holy_trinity(df):
     return df
 
 # ==============================================================================
-# 2. TEMPORAL AUTOENCODER
+# 3. TEMPORAL AUTOENCODER
 # ==============================================================================
 class TemporalAutoencoder(nn.Module):
     def __init__(self, num_features=8, latent_dim=12):
@@ -120,19 +146,14 @@ class TemporalAutoencoder(nn.Module):
     def forward(self, x): latent = self.encode(x); return self.decoder(latent), latent
 
 # ==============================================================================
-# 3. DYNAMIC DATA LOADER (Fixed Thresholds)
+# 4. DYNAMIC DATA LOADER (Using Standardizer)
 # ==============================================================================
 def load_training_data(csv_filename, target_date_str=None, min_pct=2.0):
-    if not os.path.exists(csv_filename): 
-        print(f"❌ ERROR: File '{csv_filename}' not found.")
+    df = read_and_standardize_csv(csv_filename)
+    if df is None or 'Date' not in df.columns: 
+        print(f"❌ ERROR: File '{csv_filename}' missing 'Date' column after standardization.")
         return None, None, None
         
-    df = pd.read_csv(csv_filename)
-    df.columns = [str(c).title().strip() for c in df.columns]
-    
-    if 'Date' in df.columns:
-        df['Date'] = pd.to_datetime(df['Date'], errors='coerce', dayfirst=True).dt.strftime('%Y-%m-%d')
-        df = df.dropna(subset=['Date'])
     if target_date_str: df = df[df['Date'] <= target_date_str]
     
     training_matrices, price_targets = [], []
@@ -167,7 +188,6 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=2.0):
                 else:
                     actual_pct_move = ((future_closes.min() - start_price) / start_price) * 100
             
-            # Use dynamic threshold passed to function!
             if abs(actual_pct_move) < min_pct: continue
             
             training_matrices.append(norm_window.T)
@@ -176,14 +196,12 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=2.0):
     return np.array(training_matrices, dtype=np.float32), np.array(price_targets, dtype=np.float32), None
 
 # ==============================================================================
-# 4. ALWAYS-TRAIN AI BRAIN (Mini-Batched)
+# 5. ALWAYS-TRAIN AI BRAIN
 # ==============================================================================
 def get_ai_brain(X_raw, Y_price, prefix="fno"):
     print(f"⚙️ Initiating Deep Training (50 Epochs) for [{prefix}]...")
-    
-    # LOUD ERROR IF DATA IS EMPTY
     if X_raw is None or len(X_raw) == 0: 
-        print(f"❌ ERROR: Matrix for [{prefix}] is empty. Not enough volatile historical data found.")
+        print(f"❌ ERROR: Matrix for [{prefix}] is empty.")
         return None, None, None, None
         
     cnn_model = TemporalAutoencoder()
@@ -217,13 +235,11 @@ def get_ai_brain(X_raw, Y_price, prefix="fno"):
     return cnn_model, xgb_price, index, Y_price
 
 # ==============================================================================
-# 5. LIVE INGESTION
+# 6. LIVE INGESTION
 # ==============================================================================
 def fetch_live_data_and_indicators(csv_filename, target_date_str, is_nifty=False):
-    if not os.path.exists(csv_filename): return None, None, None
-    df = pd.read_csv(csv_filename)
-    df.columns = [str(c).title().strip() for c in df.columns]
-    df['Date'] = pd.to_datetime(df['Date'], errors='coerce', dayfirst=True).dt.strftime('%Y-%m-%d')
+    df = read_and_standardize_csv(csv_filename)
+    if df is None or 'Date' not in df.columns: return None, None, None
     if is_nifty and 'Symbol' in df.columns:
         df = df[df['Symbol'].astype(str).str.contains("NIFTY")]
     df = df[df['Date'] <= target_date_str].sort_values('Date').reset_index(drop=True)
@@ -239,7 +255,7 @@ def fetch_live_data_and_indicators(csv_filename, target_date_str, is_nifty=False
     return norm_window.T, current_ltp, current_sl
 
 # ==============================================================================
-# 6. MASTER EXECUTION & DISPATCH
+# 7. MASTER EXECUTION & DISPATCH
 # ==============================================================================
 def run_production_sweep():
     set_deterministic_seeds(42)
@@ -247,7 +263,6 @@ def run_production_sweep():
     target_date_str = pd.to_datetime(raw_date_str, dayfirst=True).strftime("%Y-%m-%d") if raw_date_str else datetime.now().strftime("%Y-%m-%d")
     print(f"⚙️ EXECUTING DATE: {target_date_str}")
     
-    # Path Resolver for Nifty (In case it's named something else)
     nifty_file = "historical_indices.csv"
     if not os.path.exists(nifty_file):
         for root, dirs, files in os.walk("."):
@@ -256,7 +271,6 @@ def run_production_sweep():
                     nifty_file = os.path.join(root, f)
                     break
     
-    # 1. Macro Brain (0.75% threshold so it actually finds Nifty data)
     X_nifty, Y_np, _ = load_training_data(nifty_file, target_date_str, min_pct=0.75)
     nifty_cnn, nifty_xgb_p, nifty_faiss, nifty_hist_y = get_ai_brain(X_nifty, Y_np, prefix="macro")
     
@@ -273,7 +287,6 @@ def run_production_sweep():
         n_pct = nifty_xgb_p.predict(n_lat)[0]
         macro_direction = "LONG 🟢" if n_pct > 0 else "SHORT 🔴"
 
-    # 2. Micro F&O Brain (3.0% threshold for explosive stocks)
     fno_file = "historical_fno.csv"
     if not os.path.exists(fno_file):
         print(f"❌ CRITICAL ERROR: Could not find {fno_file} to train stocks.")
@@ -287,16 +300,15 @@ def run_production_sweep():
         return 
     
     final_report = []
-    fno_df = pd.read_csv(fno_file)
-    fno_df.columns = [str(c).title().strip() for c in fno_df.columns]
-    symbols = fno_df['Symbol'].unique() if 'Symbol' in fno_df.columns else []
+    fno_df = read_and_standardize_csv(fno_file)
+    symbols = fno_df['Symbol'].unique() if fno_df is not None and 'Symbol' in fno_df.columns else []
 
     print("🎯 Phase 3: Sweeping Universe with Consensus Logic...")
     for sym in symbols:
         sym_file = f"temp_{sym}.csv"
         fno_df[fno_df['Symbol'] == sym].to_csv(sym_file, index=False)
         mat, ltp, sl = fetch_live_data_and_indicators(sym_file, target_date_str)
-        os.remove(sym_file)
+        if os.path.exists(sym_file): os.remove(sym_file)
         if mat is None: continue
         
         live_t = torch.tensor(mat, dtype=torch.float32).unsqueeze(0)
@@ -324,7 +336,7 @@ def run_production_sweep():
                 df_sym = fno_df[(fno_df['Symbol'] == sym) & (fno_df['Date'] > target_date_str)].sort_values('Date')
                 if len(df_sym) >= 2:
                     fw = df_sym.iloc[:2]
-                    mx, mn, c2 = fw['High'].max(), fw['Low'].min(), fw['Close'].iloc[1]
+                    mx, mn = fw['High'].max(), fw['Low'].min()
                     
                     if direction == "LONG 🟢":
                         if mn < sl:
