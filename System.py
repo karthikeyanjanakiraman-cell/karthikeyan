@@ -1,6 +1,7 @@
 import os
 import io 
 import time
+import urllib.request
 import urllib.parse
 import random
 import warnings
@@ -19,7 +20,7 @@ import torch.optim as optim
 warnings.filterwarnings('ignore')
 
 # ==============================================================================
-# 0. ALL NSE F&O SYMBOLS (180+ UNIVERSE)
+# 0. ALL NSE F&O SYMBOLS (184 UNIVERSE)
 # ==============================================================================
 FO_SYMBOLS = [
     "AARTIIND", "ABB", "ABBOTINDIA", "ABCAPITAL", "ABFRL", "ACC", "ADANIENT", "ADANIPORTS", 
@@ -140,43 +141,49 @@ class HamiltonianEnergyLoss(nn.Module):
 # ==============================================================================
 # 6. ENTERPRISE LIVE DATA COMPILER (LOCAL BYPASS PROTOCOL)
 # ==============================================================================
-def get_mock_data(max_assets, seq_len, target_symbols):
-    """Helper to return fake data if execution fails."""
-    mock_tickers = target_symbols[:max_assets]
-    mock_prices = {t: 100.0 for t in mock_tickers}
-    return torch.randn(32, max_assets, seq_len, 4), torch.randn(32, max_assets) * 0.05, mock_tickers, mock_prices
+def get_mock_data(seq_len, target_symbols):
+    """Helper to return fake data if execution fails (Fixed Length Dimension Bug)"""
+    actual_assets = len(target_symbols)
+    mock_prices = {t: 100.0 for t in target_symbols}
+    return torch.randn(32, actual_assets, seq_len, 4), torch.randn(32, actual_assets) * 0.05, target_symbols, mock_prices
 
 def compile_fo_universe_upstox(seq_len=10, max_assets=200):
     upstox_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
     target_symbols = FO_SYMBOLS[:max_assets]
+    actual_assets = len(target_symbols)
 
     if not upstox_token:
         print("\n🚨 ERROR: 'UPSTOX_ACCESS_TOKEN' missing from environment variables!")
-        return get_mock_data(max_assets, seq_len, target_symbols)
+        return get_mock_data(seq_len, target_symbols)
 
-    print("📥 Loading Upstox Master Instrument List...")
-    symbol_to_key = {}
-    
     local_file = "instruments.csv.gz"
     
-    if os.path.exists(local_file):
-        print(f"✅ Found local file: {local_file}. Processing dictionary...")
+    # Auto-Download if running in GitHub Actions and file doesn't exist
+    if not os.path.exists(local_file):
+        print(f"📥 '{local_file}' not found. Attempting to download directly to runner...")
         try:
-            instruments_df = pd.read_csv(local_file, compression='gzip')
-            nse_eq = instruments_df[instruments_df['exchange'] == 'NSE_EQ']
-            
-            for sym in target_symbols:
-                match = nse_eq[nse_eq['tradingsymbol'] == sym]
-                if not match.empty:
-                    symbol_to_key[sym] = match.iloc[0]['instrument_key']
+            req = urllib.request.Request("https://assets.upstox.com/ts/instruments/data.csv.gz", headers={'User-Agent': 'Mozilla/5.0'})
+            with urllib.request.urlopen(req) as response, open(local_file, 'wb') as out_file:
+                out_file.write(response.read())
+            print("✅ Successfully downloaded Upstox Master List to environment.")
         except Exception as e:
-            print(f"❌ Failed to parse local {local_file}: {e}")
-            return get_mock_data(max_assets, seq_len, target_symbols)
-    else:
-        print(f"\n🚨 ERROR: Local dictionary '{local_file}' not found!")
-        print("⚠️ Please manually download the file from: https://assets.upstox.com/ts/instruments/data.csv.gz")
-        print("⚠️ Save it in this folder as 'instruments.csv.gz' and run the script again.\n")
-        return get_mock_data(max_assets, seq_len, target_symbols)
+            print(f"\n❌ Auto-download blocked by Cloudflare or Network: {e}")
+            print("⚠️ Falling back to synthetic Mock Data.\n")
+            return get_mock_data(seq_len, target_symbols)
+
+    print("🧩 Processing Upstox Dictionary...")
+    symbol_to_key = {}
+    try:
+        instruments_df = pd.read_csv(local_file, compression='gzip')
+        nse_eq = instruments_df[instruments_df['exchange'] == 'NSE_EQ']
+        
+        for sym in target_symbols:
+            match = nse_eq[nse_eq['tradingsymbol'] == sym]
+            if not match.empty:
+                symbol_to_key[sym] = match.iloc[0]['instrument_key']
+    except Exception as e:
+        print(f"❌ Failed to parse local {local_file}: {e}")
+        return get_mock_data(seq_len, target_symbols)
 
     print(f"\n⚛️ Initiating Mass Download for {len(symbol_to_key)} F&O Assets...")
     print("⏳ This will take about ~45 seconds due to API limits. Do not terminate.")
@@ -217,9 +224,9 @@ def compile_fo_universe_upstox(seq_len=10, max_assets=200):
                     latest_prices[sym] = float(df['Close'].iloc[-1])
             elif res.status_code == 401:
                 print("\n🚨 Upstox Token EXPIRED! Aborting mass download.")
-                return get_mock_data(max_assets, seq_len, target_symbols)
+                return get_mock_data(seq_len, target_symbols)
         except Exception:
-            pass # Silently skip network errors to keep the massive loop running
+            pass 
             
         if counter % 25 == 0:
             print(f"   -> Fetched {counter}/{total} assets...")
@@ -229,7 +236,7 @@ def compile_fo_universe_upstox(seq_len=10, max_assets=200):
 
     if len(all_data) < 10:
         print("\n❌ CRITICAL: Failed to download sufficient market data.")
-        return get_mock_data(max_assets, seq_len, target_symbols)
+        return get_mock_data(seq_len, target_symbols)
 
     print("🧩 Aligning Massive Multi-Index Dataframes...")
     combined_df = pd.concat(all_data, axis=1).ffill().bfill()
@@ -315,7 +322,8 @@ def run_quantum_desk():
         live_allocations = brain(X_data[-1].unsqueeze(0))[0] 
         
     sorted_indices = torch.argsort(live_allocations, descending=True)
-    # Output the absolute best 5 Longs and best 5 Shorts from the entire 184 universe
+    
+    # Absolute best 5 Longs and best 5 Shorts
     top_longs = sorted_indices[:5]   
     top_shorts = sorted_indices[-5:] 
     
