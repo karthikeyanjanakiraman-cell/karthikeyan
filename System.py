@@ -1,16 +1,9 @@
 import os
-import io 
-import time
-import urllib.request
-import urllib.parse
 import random
 import warnings
-import smtplib
-from email.mime.multipart import MIMEMultipart
-from email.mime.text import MIMEText
-from datetime import datetime, timedelta
+from datetime import datetime
 
-import requests
+import yfinance as yf
 import numpy as np
 import pandas as pd
 import torch
@@ -20,32 +13,35 @@ import torch.optim as optim
 warnings.filterwarnings('ignore')
 
 # ==============================================================================
-# 0. ALL NSE F&O SYMBOLS (184 UNIVERSE)
+# 0. ALL NSE F&O SYMBOLS (LIVE TICKERS)
 # ==============================================================================
+# Suffix '.NS' routes the request directly to the National Stock Exchange of India
 FO_SYMBOLS = [
-    "AARTIIND", "ABB", "ABBOTINDIA", "ABCAPITAL", "ABFRL", "ACC", "ADANIENT", "ADANIPORTS", 
-    "ALKEM", "AMBUJACEM", "APOLLOHOSP", "APOLLOTYRE", "ASHOKLEY", "ASIANPAINT", "ASTRAL", 
-    "ATUL", "AUBANK", "AUROPHARMA", "AXISBANK", "BAJAJ-AUTO", "BAJAJFINSV", "BAJFINANCE", 
-    "BALKRISIND", "BALRAMCHIN", "BANDHANBNK", "BANKBARODA", "BATAINDIA", "BEL", "BERGEPAINT", 
-    "BHARATFORG", "BHARTIARTL", "BHEL", "BIOCON", "BOSCHLTD", "BPCL", "BRITANNIA", "CANBK", 
-    "CANFINHOME", "CHAMBLFERT", "CHOLAFIN", "CIPLA", "COALINDIA", "COFORGE", "COLPAL", "CONCOR", 
-    "COROMANDEL", "CROMPTON", "CUB", "CUMMINSIND", "DABUR", "DALBHARAT", "DEEPAKNTR", "DIVISLAB", 
-    "DIXON", "DLF", "DRREDDY", "EICHERMOT", "ESCORTS", "EXIDEIND", "FEDERALBNK", "GAIL", 
-    "GLENMARK", "GMRINFRA", "GNFC", "GODREJCP", "GODREJPROP", "GRANULES", "GRASIM", "GUJGASLTD", 
-    "HAL", "HAVELLS", "HCLTECH", "HDFCAMC", "HDFCBANK", "HDFCLIFE", "HEROMOTOCO", "HINDALCO", 
-    "HINDCOPPER", "HINDPETRO", "HINDUNILVR", "ICICIBANK", "ICICIGI", "ICICIPRULI", "IDEA", 
-    "IDFCFIRSTB", "IEX", "IGL", "INDHOTEL", "INDIACEM", "INDIAMART", "INDIGO", "INDUSINDBK", 
-    "INDUSTOWER", "INFY", "INTELLECT", "IOC", "IPCALAB", "IRCTC", "ITC", "JINDALSTEL", 
-    "JKCEMENT", "JSWSTEEL", "JUBLFOOD", "KOTAKBANK", "LALPATHLAB", "LAURUSLABS", "LICHSGFIN", 
-    "LT", "LTIM", "LTTS", "LUPIN", "M&M", "M&MFIN", "MANAPPURAM", "MARICO", "MARUTI", "MCDOWELL-N", 
-    "MCX", "METROPOLIS", "MFSL", "MGL", "MOTHERSON", "MPHASIS", "MRF", "MUTHOOTFIN", "NATIONALUM", 
-    "NAUKRI", "NAVINFLUOR", "NESTLEIND", "NMDC", "NTPC", "OBEROIRLTY", "OFSS", "ONGC", "PAGEIND", 
-    "PEL", "PERSISTENT", "PETRONET", "PFC", "PIDILITIND", "PIIND", "PNB", "POLYCAB", "POWERGRID", 
-    "PVRINOX", "RAMCOCEM", "RBLBANK", "RECLTD", "RELIANCE", "SAIL", "SBICARD", "SBILIFE", "SBIN", 
-    "SHREECEM", "SHRIRAMFIN", "SIEMENS", "SRF", "SUNTV", "SUNPHARMA", "SYNGENE", "TATACHEM", 
-    "TATACOMM", "TATACONSUM", "TATAMOTORS", "TATAPOWER", "TATASTEEL", "TCS", "TECHM", "TITAN", 
-    "TORNTPHARM", "TRENT", "TVSMOTOR", "UBL", "ULTRACEMCO", "UPL", "VEDL", "VOLTAS", "WIPRO", 
-    "ZEEL", "ZYDUSLIFE"
+    f"{sym}.NS" for sym in [
+        "AARTIIND", "ABB", "ABBOTINDIA", "ABCAPITAL", "ABFRL", "ACC", "ADANIENT", "ADANIPORTS", 
+        "ALKEM", "AMBUJACEM", "APOLLOHOSP", "APOLLOTYRE", "ASHOKLEY", "ASIANPAINT", "ASTRAL", 
+        "ATUL", "AUBANK", "AUROPHARMA", "AXISBANK", "BAJAJ-AUTO", "BAJAJFINSV", "BAJFINANCE", 
+        "BALKRISIND", "BALRAMCHIN", "BANDHANBNK", "BANKBARODA", "BATAINDIA", "BEL", "BERGEPAINT", 
+        "BHARATFORG", "BHARTIARTL", "BHEL", "BIOCON", "BOSCHLTD", "BPCL", "BRITANNIA", "CANBK", 
+        "CANFINHOME", "CHAMBLFERT", "CHOLAFIN", "CIPLA", "COALINDIA", "COFORGE", "COLPAL", "CONCOR", 
+        "COROMANDEL", "CROMPTON", "CUB", "CUMMINSIND", "DABUR", "DALBHARAT", "DEEPAKNTR", "DIVISLAB", 
+        "DIXON", "DLF", "DRREDDY", "EICHERMOT", "ESCORTS", "EXIDEIND", "FEDERALBNK", "GAIL", 
+        "GLENMARK", "GMRINFRA", "GNFC", "GODREJCP", "GODREJPROP", "GRANULES", "GRASIM", "GUJGASLTD", 
+        "HAL", "HAVELLS", "HCLTECH", "HDFCAMC", "HDFCBANK", "HDFCLIFE", "HEROMOTOCO", "HINDALCO", 
+        "HINDCOPPER", "HINDPETRO", "HINDUNILVR", "ICICIBANK", "ICICIGI", "ICICIPRULI", "IDEA", 
+        "IDFCFIRSTB", "IEX", "IGL", "INDHOTEL", "INDIACEM", "INDIAMART", "INDIGO", "INDUSINDBK", 
+        "INDUSTOWER", "INFY", "INTELLECT", "IOC", "IPCALAB", "IRCTC", "ITC", "JINDALSTEL", 
+        "JKCEMENT", "JSWSTEEL", "JUBLFOOD", "KOTAKBANK", "LALPATHLAB", "LAURUSLABS", "LICHSGFIN", 
+        "LT", "LTIM", "LTTS", "LUPIN", "M&M", "M&MFIN", "MANAPPURAM", "MARICO", "MARUTI", "MCDOWELL-N", 
+        "MCX", "METROPOLIS", "MFSL", "MGL", "MOTHERSON", "MPHASIS", "MRF", "MUTHOOTFIN", "NATIONALUM", 
+        "NAUKRI", "NAVINFLUOR", "NESTLEIND", "NMDC", "NTPC", "OBEROIRLTY", "OFSS", "ONGC", "PAGEIND", 
+        "PEL", "PERSISTENT", "PETRONET", "PFC", "PIDILITIND", "PIIND", "PNB", "POLYCAB", "POWERGRID", 
+        "PVRINOX", "RAMCOCEM", "RBLBANK", "RECLTD", "RELIANCE", "SAIL", "SBICARD", "SBILIFE", "SBIN", 
+        "SHREECEM", "SHRIRAMFIN", "SIEMENS", "SRF", "SUNTV", "SUNPHARMA", "SYNGENE", "TATACHEM", 
+        "TATACOMM", "TATACONSUM", "TATAMOTORS", "TATAPOWER", "TATASTEEL", "TCS", "TECHM", "TITAN", 
+        "TORNTPHARM", "TRENT", "TVSMOTOR", "UBL", "ULTRACEMCO", "UPL", "VEDL", "VOLTAS", "WIPRO", 
+        "ZEEL", "ZYDUSLIFE"
+    ]
 ]
 
 # ==============================================================================
@@ -64,15 +60,12 @@ def compute_path_signatures(path):
     dX = path[:, -1, :] - path[:, 0, :]
     X_shifted = path[:, :-1, :] - path[:, 0:1, :]
     dX_t = path[:, 1:, :] - path[:, :-1, :]
-    
-    sig2 = torch.matmul(X_shifted.unsqueeze(-1), dX_t.unsqueeze(-2))
-    sig2 = sig2.sum(dim=1) 
-    
+    sig2 = torch.matmul(X_shifted.unsqueeze(-1), dX_t.unsqueeze(-2)).sum(dim=1) 
     sig_flat = torch.cat([dX, sig2.reshape(sig2.shape[0], -1)], dim=1)
     return torch.clamp(sig_flat, -50.0, 50.0)
 
 # ==============================================================================
-# 3. MATRIX PRODUCT STATE (Tensor Network)
+# 3. MATRIX PRODUCT STATE (Tensor Network) & QUANTUM BRAIN
 # ==============================================================================
 class MatrixProductState(nn.Module):
     def __init__(self, num_nodes, phys_dim, bond_dim):
@@ -95,9 +88,6 @@ class MatrixProductState(nn.Module):
                 state = self.norm_layers[i+1](state)
         return state 
 
-# ==============================================================================
-# 4. LONG/SHORT QUANTUM BRAIN
-# ==============================================================================
 class EntangledQuantumBrain(nn.Module):
     def __init__(self, num_assets, num_features, bond_dim=16):
         super().__init__()
@@ -124,9 +114,6 @@ class EntangledQuantumBrain(nn.Module):
         probabilities = raw_signals / (torch.sum(torch.abs(raw_signals), dim=1, keepdim=True) + 1e-8)
         return probabilities
 
-# ==============================================================================
-# 5. HAMILTONIAN ENERGY LOSS (Market Neutral)
-# ==============================================================================
 class HamiltonianEnergyLoss(nn.Module):
     def __init__(self, risk_penalty=0.5):
         super().__init__()
@@ -139,121 +126,42 @@ class HamiltonianEnergyLoss(nn.Module):
         return torch.mean(hamiltonian)
 
 # ==============================================================================
-# 6. ENTERPRISE LIVE DATA COMPILER (LOCAL BYPASS PROTOCOL)
+# 4. INSTANT LIVE DATA COMPILER (NO FILES REQUIRED)
 # ==============================================================================
-def get_mock_data(seq_len, target_symbols):
-    """Helper to return fake data if execution fails (Fixed Length Dimension Bug)"""
-    actual_assets = len(target_symbols)
-    mock_prices = {t: 100.0 for t in target_symbols}
-    return torch.randn(32, actual_assets, seq_len, 4), torch.randn(32, actual_assets) * 0.05, target_symbols, mock_prices
-
-def compile_fo_universe_upstox(seq_len=10, max_assets=200):
-    upstox_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
-    target_symbols = FO_SYMBOLS[:max_assets]
-    actual_assets = len(target_symbols)
-
-    if not upstox_token:
-        print("\n🚨 ERROR: 'UPSTOX_ACCESS_TOKEN' missing from environment variables!")
-        return get_mock_data(seq_len, target_symbols)
-
-    local_file = "instruments.csv.gz"
+def fetch_live_fo_data(seq_len=10):
+    print(f"\n📥 Fetching LIVE data for {len(FO_SYMBOLS)} F&O Assets from NSE feeds...")
+    print("⏳ This will take ~10 seconds. No files or tokens required.")
     
-    # Auto-Download if running in GitHub Actions and file doesn't exist
-    if not os.path.exists(local_file):
-        print(f"📥 '{local_file}' not found. Attempting to download directly to runner...")
-        try:
-            req = urllib.request.Request("https://assets.upstox.com/ts/instruments/data.csv.gz", headers={'User-Agent': 'Mozilla/5.0'})
-            with urllib.request.urlopen(req) as response, open(local_file, 'wb') as out_file:
-                out_file.write(response.read())
-            print("✅ Successfully downloaded Upstox Master List to environment.")
-        except Exception as e:
-            print(f"\n❌ Auto-download blocked by Cloudflare or Network: {e}")
-            print("⚠️ Falling back to synthetic Mock Data.\n")
-            return get_mock_data(seq_len, target_symbols)
-
-    print("🧩 Processing Upstox Dictionary...")
-    symbol_to_key = {}
-    try:
-        instruments_df = pd.read_csv(local_file, compression='gzip')
-        nse_eq = instruments_df[instruments_df['exchange'] == 'NSE_EQ']
-        
-        for sym in target_symbols:
-            match = nse_eq[nse_eq['tradingsymbol'] == sym]
-            if not match.empty:
-                symbol_to_key[sym] = match.iloc[0]['instrument_key']
-    except Exception as e:
-        print(f"❌ Failed to parse local {local_file}: {e}")
-        return get_mock_data(seq_len, target_symbols)
-
-    print(f"\n⚛️ Initiating Mass Download for {len(symbol_to_key)} F&O Assets...")
-    print("⏳ This will take about ~45 seconds due to API limits. Do not terminate.")
+    # Download 1-year bulk data instantly using yfinance multi-threading
+    df = yf.download(FO_SYMBOLS, period="1y", interval="1d", progress=False)
     
-    headers = {
-        'Accept': 'application/json',
-        'Authorization': f'Bearer {upstox_token}'
-    }
+    # Clean the data (forward fill missing days, backward fill early gaps)
+    df = df.ffill().bfill()
     
-    to_date = datetime.now().strftime("%Y-%m-%d")
-    from_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+    # Extract only the symbols that successfully downloaded
+    available_tickers = list(df['Close'].columns)
     
-    all_data = {}
-    available_tickers = []
-    latest_prices = {}
-    
-    counter = 1
-    total = len(symbol_to_key)
-
-    for sym, inst_key in symbol_to_key.items():
-        encoded_key = urllib.parse.quote(inst_key)
-        api_url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/day/{to_date}/{from_date}"
-        
-        try:
-            res = requests.get(api_url, headers=headers)
-            if res.status_code == 200:
-                data = res.json()
-                if 'data' in data and 'candles' in data['data'] and len(data['data']['candles']) > 0:
-                    candles = data['data']['candles']
-                    candles = candles[::-1] # Oldest-First
-                    
-                    df = pd.DataFrame(candles, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
-                    df['timestamp'] = pd.to_datetime(df['timestamp']).dt.date
-                    df.set_index('timestamp', inplace=True)
-                    
-                    all_data[sym] = df[['Open', 'High', 'Low', 'Close']].astype(float)
-                    available_tickers.append(sym)
-                    latest_prices[sym] = float(df['Close'].iloc[-1])
-            elif res.status_code == 401:
-                print("\n🚨 Upstox Token EXPIRED! Aborting mass download.")
-                return get_mock_data(seq_len, target_symbols)
-        except Exception:
-            pass 
-            
-        if counter % 25 == 0:
-            print(f"   -> Fetched {counter}/{total} assets...")
-            
-        counter += 1
-        time.sleep(0.12) # Strict Upstox Rate Limiter
-
-    if len(all_data) < 10:
-        print("\n❌ CRITICAL: Failed to download sufficient market data.")
-        return get_mock_data(seq_len, target_symbols)
-
-    print("🧩 Aligning Massive Multi-Index Dataframes...")
-    combined_df = pd.concat(all_data, axis=1).ffill().bfill()
+    print(f"✅ Successfully acquired live historical data for {len(available_tickers)} assets.")
     
     features = ['Open', 'High', 'Low', 'Close']
-    data_3d = np.zeros((len(combined_df), len(available_tickers), len(features)))
+    data_3d = np.zeros((len(df), len(available_tickers), len(features)))
+    latest_prices = {}
     
+    # Construct Tensor Matrix
     for j, ticker in enumerate(available_tickers):
         for k, feat in enumerate(features):
-            data_3d[:, j, k] = combined_df[(ticker, feat)].values
+            data_3d[:, j, k] = df[feat][ticker].values
+        # Save the current real-time closing price
+        latest_prices[ticker.replace('.NS', '')] = float(df['Close'][ticker].iloc[-1])
 
+    # Normalize data
     mean = np.mean(data_3d, axis=0, keepdims=True)
     std = np.std(data_3d, axis=0, keepdims=True) + 1e-8
     data_3d_norm = (data_3d - mean) / std
     
     X_list, Y_list = [], []
     
+    # 48-HOUR SHIFT WINDOW
     for i in range(len(data_3d_norm) - seq_len):
         x_window = data_3d_norm[i : i + seq_len]
         current_close = data_3d_norm[i + seq_len - 1, :, 3]
@@ -271,11 +179,10 @@ def compile_fo_universe_upstox(seq_len=10, max_assets=200):
     Y = torch.tensor(np.array(Y_list), dtype=torch.float32)
     X = X.permute(0, 2, 1, 3).contiguous()
     
-    print(f"✅ Full Universe Data Compiled. Final Tensor Shape: {X.shape}")
-    return X, Y, available_tickers, latest_prices
+    return X, Y, [t.replace('.NS', '') for t in available_tickers], latest_prices
 
 # ==============================================================================
-# 7. MASTER EXECUTION
+# 5. MASTER EXECUTION
 # ==============================================================================
 def run_quantum_desk():
     set_seeds(42)
@@ -284,7 +191,8 @@ def run_quantum_desk():
     BOND_DIM = 16       
     EPOCHS = 10
     
-    X_data, Y_data, asset_names, latest_prices = compile_fo_universe_upstox(seq_len=SEQ_LEN)
+    # FETCH LIVE DATA
+    X_data, Y_data, asset_names, latest_prices = fetch_live_fo_data(seq_len=SEQ_LEN)
     actual_assets = X_data.shape[1] 
     
     brain = EntangledQuantumBrain(num_assets=actual_assets, num_features=FEATURES, bond_dim=BOND_DIM)
@@ -292,7 +200,7 @@ def run_quantum_desk():
     loss_function = HamiltonianEnergyLoss(risk_penalty=1.0)
     
     print("\n🌌 WAKING THE ENTANGLED QUANTUM BRAIN (LONG/SHORT HORIZON)")
-    print(f"-> Integrated Upstox Universe: {actual_assets} Assets")
+    print(f"-> Crunching Multi-Dimensional Tensors for {actual_assets} Assets")
     print("-" * 65)
     
     brain.train()
@@ -329,6 +237,7 @@ def run_quantum_desk():
     
     target_indices = torch.cat((top_longs, top_shorts))
     
+    print("\n==================================================================")
     for idx in target_indices:
         asset_idx = idx.item()
         asset_symbol = asset_names[asset_idx]
@@ -336,7 +245,7 @@ def run_quantum_desk():
         
         abs_weight = abs(raw_alloc) * 100
         is_long = raw_alloc > 0
-        direction_text = "LONG 🟢" if is_long else "SHORT 🔴"
+        direction_text = "LONG 🟢 " if is_long else "SHORT 🔴"
         
         entry_price = latest_prices.get(asset_symbol, 100.0)
         target_pct = (abs_weight / 100.0) * 15.0 
@@ -349,7 +258,8 @@ def run_quantum_desk():
             target = entry_price * (1 - (target_pct / 100.0))
             sl = entry_price * (1 + (sl_pct / 100.0))
         
-        print(f"-> {direction_text} | ALLOCATE {abs_weight:05.2f}% TO [ {asset_symbol} ] | Current Price: ₹{entry_price:.2f} | Target: ₹{target:.2f}")
+        print(f"-> {direction_text} | ALLOCATE {abs_weight:05.2f}% TO [ {asset_symbol:<10} ] | CMP: ₹{entry_price:8.2f} | TGT: ₹{target:8.2f} | SL: ₹{sl:8.2f}")
+    print("==================================================================\n")
 
 if __name__ == "__main__":
     run_quantum_desk()
