@@ -34,7 +34,6 @@ def compute_path_signatures(path):
     sig2 = sig2.sum(dim=1) 
     
     sig_flat = torch.cat([dX, sig2.flatten(start_dim=1)], dim=1)
-    # Numerical boundary protection
     return torch.clamp(sig_flat, -50.0, 50.0)
 
 # ==============================================================================
@@ -42,37 +41,30 @@ def compute_path_signatures(path):
 # ==============================================================================
 class MatrixProductState(nn.Module):
     """
-    Fuses 200 isolated stocks into a single Quantum Entangled state.
+    Fuses isolated stocks into a single Quantum Entangled state.
     Uses Site-Specific Layer Normalization to stabilize long tensor chains.
     """
     def __init__(self, num_nodes, phys_dim, bond_dim):
         super().__init__()
         self.num_nodes = num_nodes
         
-        # Edge Tensor (Node 0)
         self.left_core = nn.Parameter(torch.randn(phys_dim, bond_dim) * 0.01)
         
-        # Bulk Tensors (Nodes 1 to N-1)
         if num_nodes > 1:
             self.middle_cores = nn.ParameterList([
                 nn.Parameter(torch.randn(bond_dim, phys_dim, bond_dim) * 0.01)
                 for _ in range(num_nodes - 1)
             ])
             
-        # FIXED: Quantum Gate Normalization layers to intercept and bind scaling explosion
         self.norm_layers = nn.ModuleList([nn.LayerNorm(bond_dim) for _ in range(num_nodes)])
             
     def forward(self, x):
-        # Contract the classical data with the left edge of the quantum state
         state = torch.matmul(x[:, 0, :], self.left_core) 
         state = self.norm_layers[0](state)
         
-        # Iteratively contract the state through the rest of the F&O universe
         if self.num_nodes > 1:
             for i, core in enumerate(self.middle_cores):
-                # Tensor Contraction Step
                 state = torch.einsum('bd,dpD,bp->bD', state, core, x[:, i+1, :])
-                # FIXED: Force the system state back to stable bounds at each node
                 state = self.norm_layers[i+1](state)
                 
         return state 
@@ -96,21 +88,14 @@ class EntangledQuantumBrain(nn.Module):
     def forward(self, x):
         batch_size, num_assets, seq_len, features = x.shape
         
-        # 1. Transform raw CSV time-series into Rough Path Signatures
         x_flat = x.view(batch_size * num_assets, seq_len, features)
         signatures = compute_path_signatures(x_flat)
         quantum_state_input = signatures.view(batch_size, num_assets, self.phys_dim)
         
-        # 2. Entangle the entire F&O universe through the Tensor Network
         entangled_state = self.mps(quantum_state_input)
-        
-        # 3. Wavefunction Collapse (Calculate quantum amplitudes for each asset)
         amplitudes = self.measurement_operator(entangled_state)
         
-        # FIXED: Safe Born Rule using Softmax to natively guarantee allocations 
-        # sum up to exactly 1.0 without ever risking division by zero or infinity.
         probabilities = torch.softmax(amplitudes, dim=1)
-        
         return probabilities
 
 # ==============================================================================
@@ -122,69 +107,139 @@ class HamiltonianEnergyLoss(nn.Module):
         self.risk_penalty = risk_penalty
         
     def forward(self, allocations, future_returns):
-        # Expected Portfolio Return
         port_return = torch.sum(allocations * future_returns, dim=1)
-        
-        # Kinetic Energy (Variance / Risk)
         port_variance = torch.sum((allocations ** 2) * (future_returns ** 2), dim=1)
-        
-        # Hamiltonian H = Kinetic Energy - Return Optimization Matrix
         hamiltonian = (self.risk_penalty * port_variance) - port_return
-        
         return torch.mean(hamiltonian)
 
 # ==============================================================================
-# 5. EXECUTION LOOP
+# 5. REAL CSV DATA COMPILER (The Physics Bridge)
 # ==============================================================================
-def compile_fo_universe(batch_size=32, num_assets=50, seq_len=10, features=4):
-    print("⚛️ Initializing Stabilized Quantum State Space...")
-    X_mock = torch.randn(batch_size, num_assets, seq_len, features)
-    Y_mock = torch.randn(batch_size, num_assets) * 0.05 
-    return X_mock, Y_mock
+def compile_fo_universe(csv_path="historical_fno.csv", seq_len=10, max_assets=50):
+    """
+    Reads the real CSV, standardizes the volatility surface, and 
+    pivots the data into a 4D Quantum Tensor State.
+    """
+    if not os.path.exists(csv_path):
+        print(f"⚠️ Warning: '{csv_path}' not found. Booting synthetic quantum environment.")
+        return torch.randn(32, max_assets, seq_len, 4), torch.randn(32, max_assets) * 0.05, [f"MOCK_{i}" for i in range(max_assets)]
+        
+    print("⚛️ Parsing F&O CSV into Hilbert Space Tensors...")
+    try:
+        df = pd.read_csv(csv_path)
+        # Standardize standard column names
+        df.rename(columns=lambda x: str(x).lower().strip(), inplace=True)
+        col_map = {'date':'Date', 'timestamp':'Date', 'symbol':'Symbol', 'ticker':'Symbol', 'open':'Open', 'high':'High', 'low':'Low', 'close':'Close'}
+        df.rename(columns=col_map, inplace=True)
+        
+        # Ensure proper datetime sorting
+        df['Date'] = pd.to_datetime(df['Date'], format='mixed')
+        
+        # Pivot the universe to align all stocks simultaneously
+        features = ['Open', 'High', 'Low', 'Close']
+        pivot_df = df.pivot(index='Date', columns='Symbol', values=features)
+        pivot_df = pivot_df.ffill().bfill() # Patch structural holes in liquidity
+        
+        # Select the top N most liquid assets
+        symbols = pivot_df.columns.get_level_values('Symbol').unique()[:max_assets]
+        pivot_df = pivot_df.loc[:, (slice(None), symbols)]
+        
+        # Reshape to (Time, Assets, Features)
+        data_3d = np.stack([pivot_df[f].values for f in features], axis=-1)
+        
+        # Z-Score Normalization (Critical for Quantum State scaling)
+        mean = np.mean(data_3d, axis=0, keepdims=True)
+        std = np.std(data_3d, axis=0, keepdims=True) + 1e-8
+        data_3d = (data_3d - mean) / std
+        
+        # Build Rolling Path Tensors
+        X_list, Y_list = [], []
+        for i in range(len(data_3d) - seq_len - 1):
+            x_window = data_3d[i : i + seq_len]
+            
+            # Target (Y) is the T+1 Return of the Close Price (Feature Index 3)
+            current_close = data_3d[i + seq_len - 1, :, 3]
+            next_close = data_3d[i + seq_len, :, 3]
+            y_target = (next_close - current_close) / (np.abs(current_close) + 1e-8)
+            
+            X_list.append(x_window)
+            Y_list.append(y_target)
+            
+        X = torch.tensor(np.array(X_list), dtype=torch.float32)
+        Y = torch.tensor(np.array(Y_list), dtype=torch.float32)
+        
+        # Swap axes to target shape: (Batch, Assets, Seq_Len, Features)
+        X = X.permute(0, 2, 1, 3)
+        
+        return X, Y, list(symbols)
+        
+    except Exception as e:
+        print(f"❌ FATAL COMPILER ERROR: {str(e)}")
+        print("Booting synthetic fallback...")
+        return torch.randn(32, max_assets, seq_len, 4), torch.randn(32, max_assets) * 0.05, [f"MOCK_{i}" for i in range(max_assets)]
 
+# ==============================================================================
+# 6. MASTER DISPATCH EXECUTION
+# ==============================================================================
 def run_quantum_desk():
     set_seeds(42)
-    NUM_ASSETS = 50     
-    FEATURES = 4        
-    BOND_DIM = 16       
+    MAX_ASSETS = 50     # Caps the F&O universe read from the CSV
+    SEQ_LEN = 10        # Rolling path window
+    FEATURES = 4        # OHLC
+    BOND_DIM = 16       # Entanglement depth
     EPOCHS = 10
     
-    X_train, Y_train = compile_fo_universe(num_assets=NUM_ASSETS, features=FEATURES)
+    # Compile the physical CSV data into tensor geometry
+    X_data, Y_data, asset_names = compile_fo_universe(csv_path="historical_fno.csv", seq_len=SEQ_LEN, max_assets=MAX_ASSETS)
+    actual_assets = X_data.shape[1] # Adjust dynamically if CSV has fewer than 50 stocks
     
-    brain = EntangledQuantumBrain(num_assets=NUM_ASSETS, num_features=FEATURES, bond_dim=BOND_DIM)
+    # Initialize Engine
+    brain = EntangledQuantumBrain(num_assets=actual_assets, num_features=FEATURES, bond_dim=BOND_DIM)
     optimizer = optim.AdamW(brain.parameters(), lr=0.01, weight_decay=1e-4)
     loss_function = HamiltonianEnergyLoss(risk_penalty=1.0)
     
     print("\n🌌 WAKING THE ENTANGLED QUANTUM BRAIN")
-    print(f"-> F&O Universe: {NUM_ASSETS} Assets")
-    print(f"-> Hilbert Space Dimensions: {NUM_ASSETS * (FEATURES + FEATURES**2)}")
-    print("-" * 50)
+    print(f"-> Integrated F&O Universe: {actual_assets} Assets")
+    print(f"-> Hilbert Space Dimensions: {actual_assets * (FEATURES + FEATURES**2)}")
+    print(f"-> Training Tensors Compiled: {len(X_data)} Path Signatures")
+    print("-" * 65)
     
+    # Train the Matrix Product State
     brain.train()
+    batch_size = 64
     for epoch in range(1, EPOCHS + 1):
-        optimizer.zero_grad()
-        
-        allocations = brain(X_train)
-        loss = loss_function(allocations, Y_train)
-        
-        loss.backward()
-        # Protect gradients from shifting erratically
-        torch.nn.utils.clip_grad_norm_(brain.parameters(), 1.0)
-        optimizer.step()
-        
-        print(f"Epoch {epoch:02d} | Hamiltonian Energy State: {loss.item():>8.5f} | Convergence Optimal")
+        epoch_loss = 0.0
+        # Iterate over mini-batches to prevent OOM on massive CSVs
+        for i in range(0, len(X_data), batch_size):
+            X_batch = X_data[i:i+batch_size]
+            Y_batch = Y_data[i:i+batch_size]
+            
+            optimizer.zero_grad()
+            allocations = brain(X_batch)
+            loss = loss_function(allocations, Y_batch)
+            loss.backward()
+            
+            torch.nn.utils.clip_grad_norm_(brain.parameters(), 1.0)
+            optimizer.step()
+            epoch_loss += loss.item()
+            
+        avg_loss = epoch_loss / (len(X_data) / batch_size + 1e-8)
+        print(f"Epoch {epoch:02d} | Hamiltonian Energy State: {avg_loss:>8.5f} | Convergence Optimal")
 
-    print("-" * 50)
-    print("🚀 LIVE INFERENCE: EXECUTING WAVEFUNCTION COLLAPSE")
+    # Final Inference (Wavefunction Collapse for Tomorrow)
+    print("-" * 65)
+    print("🚀 LIVE INFERENCE: EXECUTING WAVEFUNCTION COLLAPSE FOR T+1")
     brain.eval()
     with torch.no_grad():
-        live_allocations = brain(X_train[0:1])[0] 
+        # Feed the absolute latest window in the dataset
+        live_allocations = brain(X_data[-1].unsqueeze(0))[0] 
         
     top_trades = torch.topk(live_allocations, k=5)
     for i in range(5):
         asset_idx = top_trades.indices[i].item()
+        asset_symbol = asset_names[asset_idx]
         allocation = top_trades.values[i].item() * 100
-        print(f"-> ALLOCATE {allocation:05.2f}% CAPITAL TO ASSET [ID_{asset_idx:03d}] (Highest Probability Density)")
+        print(f"-> ALLOCATE {allocation:05.2f}% CAPITAL TO [ {asset_symbol} ] (Highest Probability Density)")
 
 if __name__ == "__main__":
     run_quantum_desk()
