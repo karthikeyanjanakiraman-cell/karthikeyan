@@ -114,6 +114,12 @@ class HamiltonianEnergyLoss(nn.Module):
 # ==============================================================================
 # 5. UPSTOX LIVE DATA COMPILER (2-DAY TARGET)
 # ==============================================================================
+def get_mock_data(max_assets, seq_len, target_symbols):
+    """Helper to return fake data if Upstox API fails."""
+    mock_tickers = target_symbols[:max_assets]
+    mock_prices = {t: 100.0 for t in mock_tickers}
+    return torch.randn(32, max_assets, seq_len, 4), torch.randn(32, max_assets) * 0.05, mock_tickers, mock_prices
+
 def compile_fo_universe_upstox(seq_len=10, max_assets=30):
     upstox_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
     
@@ -127,13 +133,12 @@ def compile_fo_universe_upstox(seq_len=10, max_assets=30):
     ][:max_assets]
 
     if not upstox_token:
-        print("⚠️ 'UPSTOX_ACCESS_TOKEN' missing. Booting synthetic mock environment...")
-        mock_tickers = [f"MOCK_{i}" for i in range(max_assets)]
-        return torch.randn(32, max_assets, seq_len, 4), torch.randn(32, max_assets) * 0.05, mock_tickers, {t: 100.0 for t in mock_tickers}
+        print("\n🚨 ERROR: 'UPSTOX_ACCESS_TOKEN' missing from environment variables!")
+        print("⚠️ Falling back to synthetic MOCK DATA (₹100.00 prices).\n")
+        return get_mock_data(max_assets, seq_len, target_symbols)
 
     print("📥 Fetching Upstox Master Instrument List...")
     try:
-        # Download Upstox instrument dictionary mapping to resolve API Instrument Keys
         url = "https://assets.upstox.com/ts/instruments/data.csv.gz"
         instruments_df = pd.read_csv(url)
         nse_eq = instruments_df[instruments_df['exchange'] == 'NSE_EQ']
@@ -145,8 +150,9 @@ def compile_fo_universe_upstox(seq_len=10, max_assets=30):
                 symbol_to_key[sym] = match.iloc[0]['instrument_key']
                 
     except Exception as e:
-        print(f"❌ Failed to fetch Upstox Instruments: {e}")
-        return torch.randn(32, max_assets, seq_len, 4), torch.randn(32, max_assets) * 0.05, target_symbols, {t: 100.0 for t in target_symbols}
+        print(f"\n❌ Failed to fetch Upstox Instruments: {e}")
+        print("⚠️ Falling back to synthetic MOCK DATA.\n")
+        return get_mock_data(max_assets, seq_len, target_symbols)
 
     print(f"⚛️ Fetching LIVE 1-Year Candle Data from Upstox for {len(symbol_to_key)} assets...")
     
@@ -170,31 +176,36 @@ def compile_fo_universe_upstox(seq_len=10, max_assets=30):
             res = requests.get(api_url, headers=headers)
             if res.status_code == 200:
                 data = res.json()
-                if 'data' in data and 'candles' in data['data']:
+                if 'data' in data and 'candles' in data['data'] and len(data['data']['candles']) > 0:
                     candles = data['data']['candles']
-                    # Upstox returns newest-first; reverse to oldest-first
-                    candles = candles[::-1] 
+                    candles = candles[::-1] # Reverse to Oldest-First
                     
                     df = pd.DataFrame(candles, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
                     df['timestamp'] = pd.to_datetime(df['timestamp']).dt.date
                     df.set_index('timestamp', inplace=True)
                     
-                    # Store float representations of OHLC
                     all_data[sym] = df[['Open', 'High', 'Low', 'Close']].astype(float)
                     available_tickers.append(sym)
                     latest_prices[sym] = float(df['Close'].iloc[-1])
             elif res.status_code == 401:
-                print("\n❌ Upstox Token Expired or Invalid! Terminating.")
-                exit(1)
+                print("\n🚨 ERROR: Upstox Token is EXPIRED or INVALID! (Status 401)")
+                print("⚠️ Please generate a new access token today.")
+                print("⚠️ Falling back to synthetic MOCK DATA.\n")
+                return get_mock_data(max_assets, seq_len, target_symbols)
+            else:
+                print(f"⚠️ Warning: Failed to fetch {sym} - Status {res.status_code}")
+                
         except Exception as e:
-            print(f"Error fetching {sym}: {e}")
+            print(f"⚠️ Error fetching {sym}: {e}")
             
-        time.sleep(0.15) # Avoid tripping Upstox Rate Limits (10 req/sec)
+        time.sleep(0.15) # Prevent Rate-Limit Bans (10 req/sec max)
 
     if not all_data:
-        raise ValueError("No ticker data successfully downloaded from Upstox.")
+        print("\n❌ ERROR: No ticker data successfully downloaded from Upstox.")
+        print("⚠️ Falling back to synthetic MOCK DATA.\n")
+        return get_mock_data(max_assets, seq_len, target_symbols)
 
-    # Align all time-series by combining them into a massive MultiIndex dataframe and filling gaps
+    # Combine time-series
     combined_df = pd.concat(all_data, axis=1).ffill().bfill()
     
     features = ['Open', 'High', 'Low', 'Close']
@@ -204,14 +215,14 @@ def compile_fo_universe_upstox(seq_len=10, max_assets=30):
         for k, feat in enumerate(features):
             data_3d[:, j, k] = combined_df[(ticker, feat)].values
 
-    # Normalize data per asset & feature
+    # Normalize data
     mean = np.mean(data_3d, axis=0, keepdims=True)
     std = np.std(data_3d, axis=0, keepdims=True) + 1e-8
     data_3d_norm = (data_3d - mean) / std
     
     X_list, Y_list = [], []
     
-    # EXACT 48-HOUR SHIFT
+    # 48-HOUR SHIFT WINDOW
     for i in range(len(data_3d_norm) - seq_len):
         x_window = data_3d_norm[i : i + seq_len]
         current_close = data_3d_norm[i + seq_len - 1, :, 3]
@@ -355,7 +366,6 @@ def run_quantum_desk():
         direction_text = "LONG 🟢" if is_long else "SHORT 🔴"
         dir_color = "#28a745" if is_long else "#dc3545"
         
-        # Pull real-time price fetched dynamically from Upstox
         entry_price = latest_prices.get(asset_symbol, 100.0)
                 
         target_pct = (abs_weight / 100.0) * 15.0 
