@@ -1,11 +1,14 @@
 import os
+import time
+import urllib.parse
 import random
 import warnings
 import smtplib
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
-from datetime import datetime
+from datetime import datetime, timedelta
 
+import requests
 import numpy as np
 import pandas as pd
 import torch
@@ -90,11 +93,7 @@ class EntangledQuantumBrain(nn.Module):
         entangled_state = self.mps(quantum_state_input)
         amplitudes = self.measurement_operator(entangled_state)
         
-        # FIXED: Removed Softmax (Long-only). Replaced with Normalized Tanh (Long/Short).
-        # Generates signals between -1 (Strong Short) and +1 (Strong Long).
         raw_signals = torch.tanh(amplitudes)
-        
-        # Normalize so absolute weights sum to 1.0 (100% Capital Allocation)
         probabilities = raw_signals / (torch.sum(torch.abs(raw_signals), dim=1, keepdim=True) + 1e-8)
         return probabilities
 
@@ -107,72 +106,135 @@ class HamiltonianEnergyLoss(nn.Module):
         self.risk_penalty = risk_penalty
         
     def forward(self, allocations, future_returns):
-        # A negative allocation * negative return = Positive Profit
         port_return = torch.sum(allocations * future_returns, dim=1)
-        
-        # Variance uses squared allocations to treat shorts and longs as equal risk
         port_variance = torch.sum((allocations ** 2) * (future_returns ** 2), dim=1)
         hamiltonian = (self.risk_penalty * port_variance) - port_return
         return torch.mean(hamiltonian)
 
 # ==============================================================================
-# 5. REAL CSV DATA COMPILER (2-DAY TARGET)
+# 5. UPSTOX LIVE DATA COMPILER (2-DAY TARGET)
 # ==============================================================================
-def compile_fo_universe(csv_path="historical_fno.csv", seq_len=10, max_assets=50):
-    if not os.path.exists(csv_path):
-        print(f"⚠️ Warning: '{csv_path}' not found. Booting synthetic environment.")
-        return torch.randn(32, max_assets, seq_len, 4), torch.randn(32, max_assets) * 0.05, [f"MOCK_{i}" for i in range(max_assets)]
-        
-    print("⚛️ Parsing F&O CSV into Hilbert Space Tensors (2-Day Target Horizon)...")
+def compile_fo_universe_upstox(seq_len=10, max_assets=30):
+    upstox_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
+    
+    # Target heavily liquid F&O stocks (NSE EQ pure names)
+    target_symbols = [
+        "RELIANCE", "TCS", "HDFCBANK", "INFY", "ICICIBANK", 
+        "SBIN", "BHARTIARTL", "ITC", "LT", "BAJFINANCE",
+        "AXISBANK", "KOTAKBANK", "MARUTI", "SUNPHARMA", "TATAMOTORS",
+        "TATASTEEL", "ASIANPAINT", "TITAN", "NTPC", "HCLTECH",
+        "ADANIENT", "WIPRO", "ULTRACEMCO", "M&M", "ONGC"
+    ][:max_assets]
+
+    if not upstox_token:
+        print("⚠️ 'UPSTOX_ACCESS_TOKEN' missing. Booting synthetic mock environment...")
+        mock_tickers = [f"MOCK_{i}" for i in range(max_assets)]
+        return torch.randn(32, max_assets, seq_len, 4), torch.randn(32, max_assets) * 0.05, mock_tickers, {t: 100.0 for t in mock_tickers}
+
+    print("📥 Fetching Upstox Master Instrument List...")
     try:
-        df = pd.read_csv(csv_path)
-        df.rename(columns=lambda x: str(x).lower().strip(), inplace=True)
-        col_map = {'date':'Date', 'timestamp':'Date', 'symbol':'Symbol', 'ticker':'Symbol', 'open':'Open', 'high':'High', 'low':'Low', 'close':'Close'}
-        df.rename(columns=col_map, inplace=True)
+        # Download Upstox instrument dictionary mapping to resolve API Instrument Keys
+        url = "https://assets.upstox.com/ts/instruments/data.csv.gz"
+        instruments_df = pd.read_csv(url)
+        nse_eq = instruments_df[instruments_df['exchange'] == 'NSE_EQ']
         
-        df['Date'] = pd.to_datetime(df['Date'], format='mixed')
-        features = ['Open', 'High', 'Low', 'Close']
-        pivot_df = df.pivot(index='Date', columns='Symbol', values=features)
-        pivot_df = pivot_df.ffill().bfill() 
-        
-        symbols = pivot_df.columns.get_level_values('Symbol').unique()[:max_assets]
-        pivot_df = pivot_df.loc[:, (slice(None), symbols)]
-        
-        data_3d = np.stack([pivot_df[f].values for f in features], axis=-1)
-        
-        mean = np.mean(data_3d, axis=0, keepdims=True)
-        std = np.std(data_3d, axis=0, keepdims=True) + 1e-8
-        data_3d = (data_3d - mean) / std
-        
-        X_list, Y_list = [], []
-        
-        # EXACT 48-HOUR SHIFT
-        for i in range(len(data_3d) - seq_len):
-            x_window = data_3d[i : i + seq_len]
-            current_close = data_3d[i + seq_len - 1, :, 3]
-            
-            target_idx = i + seq_len + 1 
-            if target_idx >= len(data_3d):
-                break 
+        symbol_to_key = {}
+        for sym in target_symbols:
+            match = nse_eq[nse_eq['tradingsymbol'] == sym]
+            if not match.empty:
+                symbol_to_key[sym] = match.iloc[0]['instrument_key']
                 
-            future_close_t2 = data_3d[target_idx, :, 3]
-            y_target = (future_close_t2 - current_close) / (np.abs(current_close) + 1e-8)
-            
-            X_list.append(x_window)
-            Y_list.append(y_target)
-            
-        X = torch.tensor(np.array(X_list), dtype=torch.float32)
-        Y = torch.tensor(np.array(Y_list), dtype=torch.float32)
-        X = X.permute(0, 2, 1, 3).contiguous()
-        
-        return X, Y, list(symbols)
-        
     except Exception as e:
-        print(f"❌ FATAL COMPILER ERROR: {str(e)}")
-        return torch.randn(32, max_assets, seq_len, 4), torch.randn(32, max_assets) * 0.05, [f"MOCK_{i}" for i in range(max_assets)]
+        print(f"❌ Failed to fetch Upstox Instruments: {e}")
+        return torch.randn(32, max_assets, seq_len, 4), torch.randn(32, max_assets) * 0.05, target_symbols, {t: 100.0 for t in target_symbols}
+
+    print(f"⚛️ Fetching LIVE 1-Year Candle Data from Upstox for {len(symbol_to_key)} assets...")
+    
+    headers = {
+        'Accept': 'application/json',
+        'Authorization': f'Bearer {upstox_token}'
+    }
+    
+    to_date = datetime.now().strftime("%Y-%m-%d")
+    from_date = (datetime.now() - timedelta(days=365)).strftime("%Y-%m-%d")
+    
+    all_data = {}
+    available_tickers = []
+    latest_prices = {}
+    
+    for sym, inst_key in symbol_to_key.items():
+        encoded_key = urllib.parse.quote(inst_key)
+        api_url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/day/{to_date}/{from_date}"
+        
+        try:
+            res = requests.get(api_url, headers=headers)
+            if res.status_code == 200:
+                data = res.json()
+                if 'data' in data and 'candles' in data['data']:
+                    candles = data['data']['candles']
+                    # Upstox returns newest-first; reverse to oldest-first
+                    candles = candles[::-1] 
+                    
+                    df = pd.DataFrame(candles, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
+                    df['timestamp'] = pd.to_datetime(df['timestamp']).dt.date
+                    df.set_index('timestamp', inplace=True)
+                    
+                    # Store float representations of OHLC
+                    all_data[sym] = df[['Open', 'High', 'Low', 'Close']].astype(float)
+                    available_tickers.append(sym)
+                    latest_prices[sym] = float(df['Close'].iloc[-1])
+            elif res.status_code == 401:
+                print("\n❌ Upstox Token Expired or Invalid! Terminating.")
+                exit(1)
+        except Exception as e:
+            print(f"Error fetching {sym}: {e}")
+            
+        time.sleep(0.15) # Avoid tripping Upstox Rate Limits (10 req/sec)
+
+    if not all_data:
+        raise ValueError("No ticker data successfully downloaded from Upstox.")
+
+    # Align all time-series by combining them into a massive MultiIndex dataframe and filling gaps
+    combined_df = pd.concat(all_data, axis=1).ffill().bfill()
+    
+    features = ['Open', 'High', 'Low', 'Close']
+    data_3d = np.zeros((len(combined_df), len(available_tickers), len(features)))
+    
+    for j, ticker in enumerate(available_tickers):
+        for k, feat in enumerate(features):
+            data_3d[:, j, k] = combined_df[(ticker, feat)].values
+
+    # Normalize data per asset & feature
+    mean = np.mean(data_3d, axis=0, keepdims=True)
+    std = np.std(data_3d, axis=0, keepdims=True) + 1e-8
+    data_3d_norm = (data_3d - mean) / std
+    
+    X_list, Y_list = [], []
+    
+    # EXACT 48-HOUR SHIFT
+    for i in range(len(data_3d_norm) - seq_len):
+        x_window = data_3d_norm[i : i + seq_len]
+        current_close = data_3d_norm[i + seq_len - 1, :, 3]
+        
+        target_idx = i + seq_len + 1 
+        if target_idx >= len(data_3d_norm):
+            break 
+            
+        future_close_t2 = data_3d_norm[target_idx, :, 3]
+        y_target = (future_close_t2 - current_close) / (np.abs(current_close) + 1e-8)
+        
+        X_list.append(x_window)
+        Y_list.append(y_target)
+        
+    X = torch.tensor(np.array(X_list), dtype=torch.float32)
+    Y = torch.tensor(np.array(Y_list), dtype=torch.float32)
+    X = X.permute(0, 2, 1, 3).contiguous()
+    
+    print("✅ Live Upstox Data Successfully Compiled into Hilbert Space Tensors.")
+    return X, Y, available_tickers, latest_prices
 
 # ==============================================================================
-# 6. DISPATCH & NOTIFICATION ENGINE (LONG & SHORT SUPPORT)
+# 6. DISPATCH & NOTIFICATION ENGINE
 # ==============================================================================
 def send_quantum_alert(trade_data):
     sender_email = os.environ.get("SENDER_EMAIL")
@@ -180,11 +242,11 @@ def send_quantum_alert(trade_data):
     recipient_email = os.environ.get("RECIPIENT_EMAIL")
     
     if not all([sender_email, sender_pass, recipient_email]):
-        print("⚠️ Email credentials missing in GitHub Secrets. Report printed to console only.")
+        print("\n⚠️ Email credentials missing in environment variables. Outputting to console only.\n")
         return
 
     msg = MIMEMultipart('alternative')
-    msg['Subject'] = f"🌌 LONG/SHORT 2-DAY TARGETS | QUANTUM BRAIN ALLOCATIONS | {datetime.now().strftime('%Y-%m-%d')}"
+    msg['Subject'] = f"🌌 LONG/SHORT 2-DAY TARGETS | UPSTOX QUANTUM ALLOCATIONS | {datetime.now().strftime('%Y-%m-%d')}"
     msg['From'] = sender_email
     msg['To'] = recipient_email
 
@@ -196,7 +258,7 @@ def send_quantum_alert(trade_data):
             <th>Direction</th>
             <th>Asset</th>
             <th>Capital Weight</th>
-            <th>Entry (9:15 Open)</th>
+            <th>Entry (Latest Close)</th>
             <th>Max Hist. Pain (SL)</th>
             <th>Expected 2-Day Target</th>
             <th>Result</th>
@@ -232,13 +294,13 @@ def send_quantum_alert(trade_data):
 # ==============================================================================
 def run_quantum_desk():
     set_seeds(42)
-    MAX_ASSETS = 50     
+    MAX_ASSETS = 25     
     SEQ_LEN = 10        
     FEATURES = 4        
     BOND_DIM = 16       
     EPOCHS = 10
     
-    X_data, Y_data, asset_names = compile_fo_universe(csv_path="historical_fno.csv", seq_len=SEQ_LEN, max_assets=MAX_ASSETS)
+    X_data, Y_data, asset_names, latest_prices = compile_fo_universe_upstox(seq_len=SEQ_LEN, max_assets=MAX_ASSETS)
     actual_assets = X_data.shape[1] 
     
     brain = EntangledQuantumBrain(num_assets=actual_assets, num_features=FEATURES, bond_dim=BOND_DIM)
@@ -246,7 +308,7 @@ def run_quantum_desk():
     loss_function = HamiltonianEnergyLoss(risk_penalty=1.0)
     
     print("\n🌌 WAKING THE ENTANGLED QUANTUM BRAIN (LONG/SHORT HORIZON)")
-    print(f"-> Integrated F&O Universe: {actual_assets} Assets")
+    print(f"-> Integrated Upstox Universe: {actual_assets} Assets")
     print("-" * 65)
     
     brain.train()
@@ -275,21 +337,11 @@ def run_quantum_desk():
     with torch.no_grad():
         live_allocations = brain(X_data[-1].unsqueeze(0))[0] 
         
-    # Sort signals to find the extreme highs (Longs) and extreme lows (Shorts)
     sorted_indices = torch.argsort(live_allocations, descending=True)
-    
-    top_longs = sorted_indices[:3]   # Top 3 Positive allocations
-    top_shorts = sorted_indices[-3:] # Top 3 Negative allocations
+    top_longs = sorted_indices[:3]   
+    top_shorts = sorted_indices[-3:] 
     
     target_indices = torch.cat((top_longs, top_shorts))
-
-    try:
-        raw_df = pd.read_csv("historical_fno.csv")
-        raw_df.rename(columns=lambda x: str(x).lower().strip(), inplace=True)
-        raw_df.rename(columns={'symbol':'Symbol', 'ticker':'Symbol', 'close':'Close'}, inplace=True)
-    except:
-        raw_df = pd.DataFrame()
-
     trade_data = []
     
     for idx in target_indices:
@@ -299,22 +351,16 @@ def run_quantum_desk():
         
         abs_weight = abs(raw_alloc) * 100
         
-        # Handle directions and formatting
         is_long = raw_alloc > 0
         direction_text = "LONG 🟢" if is_long else "SHORT 🔴"
         dir_color = "#28a745" if is_long else "#dc3545"
         
-        entry_price = 100.0 
-        if not raw_df.empty and 'Symbol' in raw_df.columns and 'Close' in raw_df.columns:
-            sym_df = raw_df[raw_df['Symbol'] == asset_symbol]
-            if not sym_df.empty:
-                entry_price = float(sym_df['Close'].iloc[-1])
+        # Pull real-time price fetched dynamically from Upstox
+        entry_price = latest_prices.get(asset_symbol, 100.0)
                 
-        # Dynamic volatility width based on quantum confidence
         target_pct = (abs_weight / 100.0) * 15.0 
         sl_pct = target_pct / 1.5               
         
-        # INVERT Math if the asset is being Shorted
         if is_long:
             target = entry_price * (1 + (target_pct / 100.0))
             sl = entry_price * (1 - (sl_pct / 100.0))
@@ -333,7 +379,7 @@ def run_quantum_desk():
             'Result': "<b>Awaiting 2-Day Target ⏳</b>"
         })
         
-        print(f"-> {direction_text} | ALLOCATE {abs_weight:05.2f}% TO [ {asset_symbol} ] | Target: ₹{target:.2f}")
+        print(f"-> {direction_text} | ALLOCATE {abs_weight:05.2f}% TO [ {asset_symbol} ] | Current Price: ₹{entry_price:.2f} | Target: ₹{target:.2f}")
 
     send_quantum_alert(trade_data)
 
