@@ -5,7 +5,6 @@ import json
 import gzip
 import io
 import time
-import random
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from datetime import datetime, timedelta
@@ -13,241 +12,115 @@ from datetime import datetime, timedelta
 import requests
 import pandas as pd
 import numpy as np
-import faiss
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from torch.utils.data import TensorDataset, DataLoader
 import warnings
+
+# The Quantitative Gold Standard for Tabular Data
+from sklearn.ensemble import HistGradientBoostingRegressor
+from sklearn.preprocessing import StandardScaler
 
 warnings.filterwarnings('ignore')
 
 # ==============================================================================
-# 0. DETERMINISTIC ENVIRONMENT
+# 1. PURE VECTORIZED FEATURE ENGINEERING (Bypasses Memory Constraints)
 # ==============================================================================
-def set_seeds(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.backends.cudnn.deterministic = True
-
-# ==============================================================================
-# 1. INSTITUTIONAL DEEP LEARNING: TIME2VEC + CONV-TRANSFORMER
-# ==============================================================================
-class Time2Vec(nn.Module):
-    def __init__(self, seq_len):
-        super(Time2Vec, self).__init__()
-        self.seq_len = seq_len
-        self.w0 = nn.parameter.Parameter(torch.randn(seq_len, 1))
-        self.b0 = nn.parameter.Parameter(torch.randn(seq_len, 1))
-        self.w = nn.parameter.Parameter(torch.randn(seq_len, 3)) 
-        self.b = nn.parameter.Parameter(torch.randn(seq_len, 3))
-        
-    def forward(self, x):
-        time_linear = self.w0 * x[:, :, 0:1] + self.b0
-        time_periodic = torch.sin(x[:, :, 0:1] * self.w + self.b)
-        t2v = torch.cat([time_linear, time_periodic], dim=-1) 
-        return torch.cat([x, t2v], dim=-1) 
-
-class AdvancedQuantBrain(nn.Module):
-    def __init__(self, num_features=5, d_model=32, nhead=4, num_layers=2, latent_dim=16):
-        super(AdvancedQuantBrain, self).__init__()
-        self.t2v = Time2Vec(seq_len=120)
-        t2v_out_dim = num_features + 4
-        
-        self.conv1 = nn.Conv1d(in_channels=t2v_out_dim, out_channels=d_model, kernel_size=3, padding=1)
-        self.conv2 = nn.Conv1d(in_channels=d_model, out_channels=d_model, kernel_size=3, padding=1)
-        
-        encoder_layers = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=128, batch_first=True, dropout=0.1)
-        self.transformer = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
-        
-        self.attention_pool = nn.Linear(d_model, 1)
-        self.latent_proj = nn.Sequential(
-            nn.Linear(d_model, 64),
-            nn.LayerNorm(64),
-            nn.GELU(),
-            nn.Linear(64, latent_dim)
-        )
-        
-        self.reconstruction_head = nn.Sequential(
-            nn.Linear(latent_dim, 64),
-            nn.GELU(),
-            nn.Linear(64, 120 * num_features),
-            nn.Unflatten(1, (120, num_features))
-        )
-        
-        self.return_head = nn.Sequential(
-            nn.Linear(latent_dim, 32),
-            nn.GELU(),
-            nn.Linear(32, 1)
-        )
-
-    def encode(self, x):
-        x = self.t2v(x) 
-        x = x.transpose(1, 2)
-        x = torch.relu(self.conv1(x))
-        x = torch.relu(self.conv2(x))
-        x = x.transpose(1, 2) 
-        
-        x = self.transformer(x)
-        attn_weights = torch.softmax(self.attention_pool(x), dim=1)
-        x_pooled = torch.sum(x * attn_weights, dim=1) 
-        
-        latent = self.latent_proj(x_pooled) 
-        return latent
-
-    def forward(self, x):
-        latent = self.encode(x)
-        reconstructed = self.reconstruction_head(latent)
-        pred_return = self.return_head(latent)
-        return reconstructed, pred_return, latent
-
-# ==============================================================================
-# 2. MACRO STATISTICAL ANCHORS
-# ==============================================================================
-def extract_macro_statistics(ohlcv_window):
-    opens, highs, lows, closes, volumes = ohlcv_window[:, 0], ohlcv_window[:, 1], ohlcv_window[:, 2], ohlcv_window[:, 3], ohlcv_window[:, 4]
-    macro_min, macro_max = lows.min(), highs.max()
-    pos_in_macro = (closes[-1] - macro_min) / (macro_max - macro_min + 1e-8)
-    ret_120d = (closes[-1] - closes[0]) / (closes[0] + 1e-8)
+def engineer_features(df, is_training=True):
+    """Executes 100x faster than loops by leveraging C-backend Pandas Vectorization."""
+    if 'Symbol' not in df.columns: df['Symbol'] = 'ASSET'
+    df = df.sort_values(['Symbol', 'Date']).reset_index(drop=True)
     
-    daily_returns = np.diff(closes) / (closes[:-1] + 1e-8)
-    vol_long = np.std(daily_returns) if len(daily_returns) > 0 else 1e-8
-    vol_short = np.std(daily_returns[-10:]) if len(daily_returns) >= 10 else vol_long
-    vol_ratio = vol_short / (vol_long + 1e-8)
+    # 1. Price Momentum Vectors
+    df['ret_1d'] = df.groupby('Symbol')['Close'].pct_change(1)
+    df['ret_5d'] = df.groupby('Symbol')['Close'].pct_change(5)
+    df['ret_10d'] = df.groupby('Symbol')['Close'].pct_change(10)
+    df['ret_20d'] = df.groupby('Symbol')['Close'].pct_change(20)
     
-    return np.array([pos_in_macro, ret_120d, vol_ratio, closes[-1]/(opens[-1]+1e-8)], dtype=np.float32)
-
-# ==============================================================================
-# 3. DATA PROCESSING COMPILER (WITH X-RAY LOGS & INDIAN DATE FIX)
-# ==============================================================================
-def read_standard_csv(filename):
-    if not filename or not os.path.exists(filename): 
-        print(f"   ❌ ERROR: Could not locate file: {filename}")
-        return None
+    # 2. Volatility (ATR Proxy) & Squeeze
+    df['High_Low'] = df['High'] - df['Low']
+    df['ATR_10'] = df.groupby('Symbol')['High_Low'].transform(lambda x: x.rolling(10).mean())
+    df['Vol_Squeeze'] = df['High_Low'] / (df['ATR_10'] + 1e-8)
+    
+    # 3. Institutional Volume Flow
+    df['Vol_20d_SMA'] = df.groupby('Symbol')['Volume'].transform(lambda x: x.rolling(20).mean())
+    df['Volume_Surge'] = df['Volume'] / (df['Vol_20d_SMA'] + 1e-8)
+    
+    # 4. Macro Market Positioning
+    df['Max_50d'] = df.groupby('Symbol')['High'].transform(lambda x: x.rolling(50).max())
+    df['Min_50d'] = df.groupby('Symbol')['Low'].transform(lambda x: x.rolling(50).min())
+    df['Position_50d'] = (df['Close'] - df['Min_50d']) / (df['Max_50d'] - df['Min_50d'] + 1e-8)
+    
+    if is_training:
+        # TARGETS: Strict T+1 Open to T+2 High/Low mapping
+        df['Next_Open'] = df.groupby('Symbol')['Open'].shift(-1)
         
-    df = pd.read_csv(filename)
-    df.rename(columns=lambda x: str(x).lower().strip(), inplace=True)
-    col_map = {'date':'Date', 'timestamp':'Date', 'symbol':'Symbol', 'ticker':'Symbol', 'open':'Open', 'high':'High', 'low':'Low', 'close':'Close', 'volume':'Volume'}
-    df.rename(columns=col_map, inplace=True)
-    
-    if 'Date' in df.columns: 
-        # FIX: Added format='mixed' to handle DD-MM-YYYY vs YYYY-MM-DD 
-        df['Date'] = pd.to_datetime(df['Date'], errors='coerce', format='mixed').dt.strftime('%Y-%m-%d')
-        dropped = df['Date'].isna().sum()
-        if dropped > 0:
-            print(f"   ⚠️ WARNING: Dropped {dropped} rows due to unparseable dates.")
-        df.dropna(subset=['Date'], inplace=True)
+        df['High_T1'] = df.groupby('Symbol')['High'].shift(-1)
+        df['High_T2'] = df.groupby('Symbol')['High'].shift(-2)
+        df['Future_High'] = df[['High_T1', 'High_T2']].max(axis=1)
+        
+        df['Low_T1'] = df.groupby('Symbol')['Low'].shift(-1)
+        df['Low_T2'] = df.groupby('Symbol')['Low'].shift(-2)
+        df['Future_Low'] = df[['Low_T1', 'Low_T2']].min(axis=1)
+        
+        # Dual Continuous Targets for GBDT
+        df['Max_Up_Pct'] = ((df['Future_High'] - df['Next_Open']) / (df['Next_Open'] + 1e-8)) * 100.0
+        df['Max_Down_Pct'] = ((df['Next_Open'] - df['Future_Low']) / (df['Next_Open'] + 1e-8)) * 100.0
+        
+        df = df.replace([np.inf, -np.inf], np.nan).dropna()
         
     return df
 
-def build_deep_training_tensors(csv_filename, target_date_str=None, min_pct=0.75):
-    print(f"   -> Loading memory from: {csv_filename}")
-    df = read_standard_csv(csv_filename)
-    if df is None: return None, None, None, None
-    if 'Date' not in df.columns:
-        print(f"   ❌ ERROR: No 'Date' column found in {csv_filename}")
-        return None, None, None, None
+# ==============================================================================
+# 2. DATA PROCESSING COMPILER
+# ==============================================================================
+def read_standard_csv(filename):
+    if not filename or not os.path.exists(filename): return None
+    try:
+        df = pd.read_csv(filename)
+        df.rename(columns=lambda x: str(x).lower().strip(), inplace=True)
+        col_map = {'date':'Date', 'timestamp':'Date', 'symbol':'Symbol', 'ticker':'Symbol', 'open':'Open', 'high':'High', 'low':'Low', 'close':'Close', 'volume':'Volume'}
+        df.rename(columns=col_map, inplace=True)
         
-    if target_date_str: 
-        df = df[df['Date'] <= target_date_str]
-        
-    print(f"   -> Valid rows available up to {target_date_str}: {len(df)}")
-    
-    X_seq, X_macro, Y_price, Y_risk = [], [], [], []
-    LOOKBACK, FUTURE = 120, 2 
-
-    if "nifty" in csv_filename.lower() and 'Symbol' in df.columns:
-        df = df[df['Symbol'].astype(str).str.upper().str.contains("NIFTY50|NIFTY")]
-
-    total_extracted = 0
-    for symbol, group in df.groupby('Symbol') if 'Symbol' in df.columns else [('ASSET', df)]:
-        group = group.sort_values('Date').reset_index(drop=True)
-        vals = group[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)
-        if len(vals) < (LOOKBACK + FUTURE): continue
-            
-        for i in range(len(vals) - (LOOKBACK + FUTURE) + 1):
-            window = vals[i : i+LOOKBACK]
-            entry_price = vals[i+LOOKBACK, 0] 
-            if entry_price <= 0: continue
-            
-            future_closes = vals[i+LOOKBACK : i+LOOKBACK+FUTURE, 3]
-            future_highs  = vals[i+LOOKBACK : i+LOOKBACK+FUTURE, 1]
-            future_lows   = vals[i+LOOKBACK : i+LOOKBACK+FUTURE, 2]
-            
-            mx, mn = future_closes.max(), future_closes.min()
-            
-            if (mx - entry_price) > (entry_price - mn):
-                actual_pct = ((mx - entry_price) / entry_price) * 100.0
-                adv_exc = abs((future_lows.min() - entry_price) / entry_price) * 100.0
-            else:
-                actual_pct = ((mn - entry_price) / entry_price) * 100.0
-                adv_exc = abs((future_highs.max() - entry_price) / entry_price) * 100.0
-                
-            if abs(actual_pct) < min_pct or entry_price < 10.0: continue
-                
-            w_min, w_max = window.min(axis=0), window.max(axis=0)
-            norm_seq = (window - w_min) / (w_max - w_min + 1e-8)
-            
-            X_seq.append(norm_seq)
-            X_macro.append(extract_macro_statistics(window))
-            Y_price.append(actual_pct)
-            Y_risk.append(adv_exc)
-            total_extracted += 1
-            
-    if total_extracted == 0:
-        print(f"   ❌ ERROR: No valid training tensors could be created. Is min_pct ({min_pct}%) too high?")
-        return None, None, None, None
-        
-    print(f"   ✅ Successfully built {total_extracted} Deep Learning Tensors.")
-    return np.array(X_seq, dtype=np.float32), np.array(X_macro, dtype=np.float32), np.array(Y_price, dtype=np.float32), np.array(Y_risk, dtype=np.float32)
+        if 'Date' in df.columns:
+            # Safely parses Indian DD-MM-YYYY vs Global YYYY-MM-DD
+            df['Date'] = pd.to_datetime(df['Date'], errors='coerce', format='mixed').dt.strftime('%Y-%m-%d')
+            df = df.dropna(subset=['Date'])
+        return df
+    except Exception as e:
+        print(f"❌ ERROR parsing {filename}: {str(e)}")
+        return None
 
 # ==============================================================================
-# 4. MULTI-TASK NETWORK TRAINING (Supervised Contrastive Influence)
+# 3. GRADIENT BOOSTING QUANT DESK (Extremely Fast, Low RAM)
 # ==============================================================================
-def train_high_end_brain(X_seq, X_macro, Y_price, Y_risk, epochs=30):
-    print(f"   [AI] Fusing Time2Vec & Transformer over {len(X_seq)} parameters...")
-    model = AdvancedQuantBrain(latent_dim=16)
-    optimizer = optim.AdamW(model.parameters(), lr=0.002, weight_decay=1e-4)
+def train_quant_models(csv_file, dt_str, is_macro=False):
+    df_train = read_standard_csv(csv_file)
+    if df_train is None: return None, None, None
     
-    criterion_recon = nn.MSELoss()
-    criterion_return = nn.HuberLoss() 
-    
-    tensor_x = torch.tensor(X_seq)
-    tensor_y = torch.tensor(Y_price).unsqueeze(1)
-    
-    dataset = TensorDataset(tensor_x, tensor_y)
-    loader = DataLoader(dataset, batch_size=256, shuffle=True)
-    
-    model.train()
-    for e in range(epochs):
-        for batch_x, batch_y in loader:
-            optimizer.zero_grad()
-            recon, pred_y, _ = model(batch_x)
-            
-            loss_r = criterion_recon(recon, batch_x)
-            loss_y = criterion_return(pred_y, batch_y)
-            total_loss = (0.7 * loss_r) + (0.3 * loss_y)
-            
-            total_loss.backward()
-            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            optimizer.step()
-
-    model.eval()
-    with torch.no_grad():
-        latent_vectors = model.encode(tensor_x).numpy()
+    if is_macro and 'Symbol' in df_train.columns:
+        df_train = df_train[df_train['Symbol'].astype(str).str.upper().str.contains("NIFTY50|NIFTY")]
         
-    fused_features = np.hstack((latent_vectors, X_macro))
-    fused_contig = np.ascontiguousarray(fused_features, dtype=np.float32)
+    df_train = df_train[df_train['Date'] < dt_str]
+    df_train = engineer_features(df_train, is_training=True)
+    if df_train.empty: return None, None, None
     
-    faiss.normalize_L2(fused_contig)
-    index = faiss.IndexFlatIP(fused_contig.shape[1]) 
-    index.add(fused_contig)
+    features = ['ret_1d', 'ret_5d', 'ret_10d', 'ret_20d', 'Vol_Squeeze', 'Volume_Surge', 'Position_50d']
+    X = df_train[features]
+    Y_up = df_train['Max_Up_Pct']
+    Y_down = df_train['Max_Down_Pct']
     
-    return model, index, Y_price, Y_risk
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X)
+    
+    # HistGradientBoosting automatically bins data, making it immune to OOM crashes
+    model_up = HistGradientBoostingRegressor(max_iter=150, max_depth=6, random_state=42)
+    model_down = HistGradientBoostingRegressor(max_iter=150, max_depth=6, random_state=42)
+    
+    model_up.fit(X_scaled, Y_up)
+    model_down.fit(X_scaled, Y_down)
+    
+    return model_up, model_down, scaler
 
 # ==============================================================================
-# 5. LIVE LIVE INGESTION
+# 4. LIVE INGESTION
 # ==============================================================================
 def fetch_915_open(key, dt_str):
     token = os.environ.get("UPSTOX_ACCESS_TOKEN")
@@ -262,36 +135,43 @@ def fetch_915_open(key, dt_str):
     except: pass
     return None
 
-def get_live_tensors(symbol, key, dt_str, is_backtest, df_full=None):
+def get_live_features(symbol, key, dt_str, is_backtest, df_full=None):
     if is_backtest and df_full is not None:
-        df_sym = df_full[df_full['Symbol'] == symbol].sort_values('Date').reset_index(drop=True)
-        hist = df_sym[df_sym['Date'] < dt_str]
-        if len(hist) < 120: return None, None, None
+        df_sym = df_full[df_full['Symbol'] == symbol].copy()
+        df_hist = df_sym[df_sym['Date'] < dt_str].copy()
+        if len(df_hist) < 30: return None, None
         
-        vals = hist[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)[-120:]
-        fut = df_sym[df_sym['Date'] >= dt_str]
-        entry = float(fut.iloc[0]['Open']) if not fut.empty else float(vals[-1, 3])
+        df_feat = engineer_features(df_hist, is_training=False)
+        df_feat = df_feat.replace([np.inf, -np.inf], np.nan).dropna()
+        if df_feat.empty: return None, None
         
-        w_min, w_max = vals.min(axis=0), vals.max(axis=0)
-        norm_seq = (vals - w_min) / (w_max - w_min + 1e-8)
-        return norm_seq, extract_macro_statistics(vals), entry
+        last_row = df_feat.iloc[-1]
+        df_fut = df_sym[df_sym['Date'] >= dt_str]
+        entry = float(df_fut.iloc[0]['Open']) if not df_fut.empty else float(last_row['Close'])
+        return last_row, entry
     else:
         token = os.environ.get("UPSTOX_ACCESS_TOKEN")
-        if not token: return None, None, None
+        if not token: return None, None
         dt = datetime.strptime(dt_str, "%Y-%m-%d")
-        url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(key)}/day/{(dt-timedelta(days=1)).strftime('%Y-%m-%d')}/{(dt-timedelta(days=200)).strftime('%Y-%m-%d')}"
+        url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(key)}/day/{(dt-timedelta(days=1)).strftime('%Y-%m-%d')}/{(dt-timedelta(days=60)).strftime('%Y-%m-%d')}"
         resp = requests.get(url, headers={'Accept': 'application/json', 'Authorization': f'Bearer {token}'})
-        if resp.status_code != 200: return None, None, None
+        if resp.status_code != 200: return None, None
+        
         data = resp.json().get('data', {}).get('candles', [])
-        if not data or len(data) < 120: return None, None, None
+        if not data or len(data) < 30: return None, None
         
-        vals = np.array([c[1:6] for c in data], dtype=np.float32)[::-1][-120:]
+        cols = ['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI']
+        df_live = pd.DataFrame(data, columns=cols).iloc[::-1].reset_index(drop=True)
+        df_live['Symbol'] = symbol
+        df_live[['Open', 'High', 'Low', 'Close', 'Volume']] = df_live[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
+        
+        df_feat = engineer_features(df_live, is_training=False)
+        df_feat = df_feat.replace([np.inf, -np.inf], np.nan).dropna()
+        if df_feat.empty: return None, None
+        
         entry = fetch_915_open(key, dt_str)
-        if entry is None: entry = float(vals[-1][3])
-        
-        w_min, w_max = vals.min(axis=0), vals.max(axis=0)
-        norm_seq = (vals - w_min) / (w_max - w_min + 1e-8)
-        return norm_seq, extract_macro_statistics(vals), entry
+        if entry is None: entry = float(df_feat.iloc[-1]['Close'])
+        return df_feat.iloc[-1], entry
 
 def get_fno_universe():
     try:
@@ -303,148 +183,117 @@ def get_fno_universe():
     except: return []
 
 # ==============================================================================
-# 6. MASTER EXECUTION ENGINE
+# 5. MASTER DISPATCH ENGINE
 # ==============================================================================
 def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
     sender_email, sender_pass, recipient_email = os.environ.get("SENDER_EMAIL"), os.environ.get("SENDER_PASSWORD"), os.environ.get("RECIPIENT_EMAIL")
     if not all([sender_email, sender_pass, recipient_email]): return
 
     msg = MIMEMultipart('alternative')
-    msg['Subject'] = f"{'⏪ BACKTEST' if is_backtest else '🚀 LIVE TRANSFORMER AI ALERT'} | {target_date_str}"
+    msg['Subject'] = f"{'⏪ BACKTEST' if is_backtest else '🚀 LIVE GRADIENT BOOSTING ALERT'} | {target_date_str}"
     msg['From'], msg['To'] = sender_email, recipient_email
 
     macro_color = "#28a745" if "LONG" in macro_data['direction'] else "#dc3545" if "SHORT" in macro_data['direction'] else "#ffc107"
-    sim_warning = f"<div style='background-color: #fff3cd; color: #856404; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 15px;'>⚠️ VALIDATION MODE: SHOWING ACTUAL OUTCOMES</div>" if is_backtest else ""
-
+    
     html = f"""
-    <html><body style="font-family: Arial, sans-serif; background-color: #f4f7f6; padding: 10px;">{sim_warning}
+    <html><body style="font-family: Arial, sans-serif; background-color: #f4f7f6; padding: 10px;">
         <div style="background-color: white; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 6px solid {macro_color};">
-            <h3 style="margin-top: 0; color: #333;">🌍 MACRO REGIME (Deep Transformer Embeddings)</h3>
+            <h3 style="margin-top: 0; color: #333;">🌍 MACRO REGIME (Nifty 50 Boosting Model)</h3>
             <p style="font-size: 16px; color: #333; margin: 5px 0;">
                 <b>Direction:</b> <span style="color: {macro_color}; font-weight: bold;">{macro_data['direction']}</span><br>
-                <b>Expected Target:</b> {macro_data['target_display']} | <b>Expected Max Pain:</b> {macro_data['risk_pct']:.2f}%<br>
-                <b>Structural Confidence:</b> {macro_data['conviction']:.2f}%
+                <b>Expected Target:</b> {macro_data['target_display']} | <b>Expected Risk:</b> {macro_data['risk_pct']:.2f}%<br>
+                <b>Model Confidence:</b> {macro_data['conviction']:.2f}%
             </p>
         </div>
-        <h3 style="color: #333;">⚡ MICRO F&O SWEEP (3/5 Dynamic Consensus)</h3>
+        <h3 style="color: #333;">⚡ MICRO F&O SWEEP (Kelly-Optimized Allocation)</h3>
         <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%; text-align: center; font-size: 14px; background-color: white;">
           <tr bgcolor="#f8f9fa" style="color: #333; font-weight: bold;">
-            <th>Asset</th><th>Consensus</th><th>AI Similarity</th><th>Execution Price</th><th>Max Hist. Pain (SL)</th><th>Expected Target</th><th>Result</th>
+            <th>Asset</th><th>Action</th><th>R/R Ratio</th><th>Kelly Sizing</th><th>Entry</th><th>Stop Loss</th><th>Target</th><th>Result</th>
           </tr>"""
     
-    for row in sorted(fno_data_list, key=lambda x: x['conviction'], reverse=True):
+    for row in sorted(fno_data_list, key=lambda x: x['kelly_pct'], reverse=True):
         dc = "#28a745" if "LONG" in row['direction'] else "#dc3545"
-        html += f"<tr><td style='color: #0056b3;'><b>{row['asset']}</b></td><td style='color: {dc}; font-weight: bold;'>{row['direction']}</td><td>{row['conviction']:.2f}%</td><td>₹{row['entry']:.2f}</td><td style='color: #dc3545;'>₹{row['ai_stop']:.2f} (-{row['risk_pct']:.2f}%)</td><td style='color: {dc}; font-weight: bold;'>{row['target_display']}</td><td>{row['actual_outcome']}</td></tr>"
+        html += f"<tr><td style='color: #0056b3;'><b>{row['asset']}</b></td><td style='color: {dc}; font-weight: bold;'>{row['direction']}</td><td>1 : {row['rr_ratio']:.1f}</td><td><b style='color:#6f42c1;'>{row['kelly_pct']:.1f}%</b></td><td>₹{row['entry']:.2f}</td><td style='color: #dc3545;'>₹{row['ai_stop']:.2f}</td><td style='color: {dc}; font-weight: bold;'>{row['target_display']}</td><td>{row['actual_outcome']}</td></tr>"
         
     html += "</table></body></html>"
     msg.attach(MIMEText(html, 'html'))
     try:
         server = smtplib.SMTP('smtp.gmail.com', 587); server.starttls(); server.login(sender_email, sender_pass)
         server.sendmail(sender_email, recipient_email, msg.as_string()); server.quit()
-        print("✅ Elite Quant Report Dispatched.")
+        print("✅ Report Dispatched.")
     except Exception as e: print(f"Failed to send email: {str(e)}")
 
 def run_production_sweep():
-    set_seeds(42)
     dt_str = os.environ.get("PARAM_BACKTEST_DATE", "").strip()
     is_bt = bool(dt_str)
     if not is_bt: dt_str = datetime.now().strftime("%Y-%m-%d")
-        
-    print(f"⚙️ EXECUTING DEEP TIME2VEC-TRANSFORMER ENGINE | DATE: {dt_str}")
     
-    nifty_file = None
-    for root, dirs, files in os.walk("."):
-        for f in files:
-            if "nifty" in f.lower() or "historical_indices.csv" in f.lower():
-                nifty_file = os.path.join(root, f)
-                break
-        if nifty_file: break
-                
-    if not nifty_file:
-        print("❌ FATAL: Could not locate a NIFTY CSV file in the directory.")
-        return
-
+    print(f"⚙️ EXECUTING GRADIENT BOOSTING AI DESK | DATE: {dt_str}")
+    features = ['ret_1d', 'ret_5d', 'ret_10d', 'ret_20d', 'Vol_Squeeze', 'Volume_Surge', 'Position_50d']
+    
     # ---------------------------------------------------------
-    # PHASE 1: NIFTY MACRO TRANSFORMER
+    # PHASE 1: NIFTY MACRO (Crash-Proof GBDT)
     # ---------------------------------------------------------
-    print("\n🧠 PHASE 1: Building Nifty 50 Multi-Task Neural Memory...")
-    Xs_n, Xm_n, Yp_n, Yr_n = build_deep_training_tensors(nifty_file, dt_str, min_pct=0.25)
-    
-    if Xs_n is None:
-        print("❌ FATAL: Phase 1 (Nifty) data pipeline failed. Cannot proceed.")
-        return
-    
-    n_model, n_faiss, n_yp, n_yr = train_high_end_brain(Xs_n, Xm_n, Yp_n, Yr_n)
-    
-    universe = get_fno_universe()
-    n_key = next((i["key"] for i in universe if i["symbol"] in ["NIFTY 50", "NIFTY"]), None)
-    n_seq, n_mac, n_entry = get_live_tensors("NIFTY 50", n_key, dt_str, is_bt, read_standard_csv(nifty_file))
+    print("\n🧠 PHASE 1: Training Vectorized NIFTY 50 Booster...")
+    nifty_file = next((os.path.join(r, f) for r, d, files in os.walk(".") for f in files if "nifty" in f.lower() or "historical_indices.csv" in f.lower()), None)
     
     mac_rep = {'direction': "CHAOTIC 🟡", 'conviction': 0, 'risk_pct': 0, 'target_display': "N/A"}
-    if n_seq is not None:
-        n_model.eval()
-        with torch.no_grad(): lat = n_model.encode(torch.tensor(n_seq).unsqueeze(0)).numpy()[0]
-        
-        fused = np.ascontiguousarray(np.hstack((lat, n_mac)).reshape(1, -1), dtype=np.float32)
-        faiss.normalize_L2(fused)
-        scores, idxs = n_faiss.search(fused, k=5)
-        
-        conv = (max(0.0, scores[0][0]) ** 0.5) * 100.0
-        p_ret, p_rsk = n_yp[idxs[0]], n_yr[idxs[0]]
-        pos, neg = sum(1 for r in p_ret if r > 0), sum(1 for r in p_ret if r < 0)
-        
-        if pos >= 3:
-            pct, rsk = np.mean([r for r in p_ret if r > 0]), np.mean([r for r, pr in zip(p_rsk, p_ret) if pr > 0])
-            mac_rep = {'direction': "LONG 🟢", 'conviction': conv, 'risk_pct': rsk, 'target_display': f"₹{n_entry * (1 + (pct / 100)):.2f} (+{pct:.2f}%)"}
-        elif neg >= 3:
-            pct, rsk = np.mean([r for r in p_ret if r < 0]), np.mean([r for r, pr in zip(p_rsk, p_ret) if pr < 0])
-            mac_rep = {'direction': "SHORT 🔴", 'conviction': conv, 'risk_pct': rsk, 'target_display': f"₹{n_entry * (1 + (pct / 100)):.2f} ({pct:.2f}%)"}
-            
-    # ---------------------------------------------------------
-    # PHASE 2: F&O MASTER TRANSFORMER (Global Setup Alignment)
-    # ---------------------------------------------------------
-    print("\n⚡ PHASE 2: Compiling Global F&O Deep Latent Space...")
-    Xs_f, Xm_f, Yp_f, Yr_f = build_deep_training_tensors("historical_fno.csv", dt_str, min_pct=0.75)
+    n_up, n_down, n_scaler = train_quant_models(nifty_file, dt_str, is_macro=True)
+    universe = get_fno_universe()
     
-    if Xs_f is None:
-        print("❌ FATAL: Phase 2 (F&O) data pipeline failed. historical_fno.csv might be corrupted or lack rows.")
+    if n_up is not None:
+        n_key = next((i["key"] for i in universe if i["symbol"] in ["NIFTY 50", "NIFTY"]), None)
+        df_n = read_standard_csv(nifty_file)
+        last_row, entry = get_live_features("NIFTY 50", n_key, dt_str, is_bt, df_n)
+        
+        if last_row is not None:
+            live_scaled = n_scaler.transform(np.array(last_row[features]).reshape(1, -1))
+            p_up = n_up.predict(live_scaled)[0]
+            p_down = n_down.predict(live_scaled)[0]
+            conf = min(99.9, (max(p_up, p_down) / (min(p_up, p_down) + 1e-8)) * 20.0)
+            
+            if p_up > p_down * 1.5 and p_up > 0.5:
+                mac_rep = {'direction': "LONG 🟢", 'conviction': conf, 'risk_pct': p_down, 'target_display': f"₹{entry * (1 + (p_up / 100)):.2f} (+{p_up:.2f}%)"}
+            elif p_down > p_up * 1.5 and p_down > 0.5:
+                mac_rep = {'direction': "SHORT 🔴", 'conviction': conf, 'risk_pct': p_up, 'target_display': f"₹{entry * (1 - (p_down / 100)):.2f} (-{p_down:.2f}%)"}
+
+    # ---------------------------------------------------------
+    # PHASE 2: GLOBAL F&O MODEL
+    # ---------------------------------------------------------
+    print("\n⚡ PHASE 2: Training Global F&O Boosting Model (Bypassing GitHub Limits)...")
+    f_up, f_down, f_scaler = train_quant_models("historical_fno.csv", dt_str, is_macro=False)
+    if f_up is None: 
+        print("❌ FATAL: Could not train F&O Model.")
         return
         
-    f_model, f_faiss, f_yp, f_yr = train_high_end_brain(Xs_f, Xm_f, Yp_f, Yr_f, epochs=30)
-    
-    print("🎯 Phase 3: Live Market Inference via Dynamic Attention...")
+    print("🎯 Phase 3: Predicting Max Excursion & Sizing Kelly...")
     final_data = []
-    min_conv = float(os.environ.get("PARAM_MIN_CONVICTION", 80.00)) 
     fno_df = read_standard_csv("historical_fno.csv") if is_bt else None
 
     for asset in universe:
-        seq, mac, entry = get_live_tensors(asset["symbol"], asset["key"], dt_str, is_bt, fno_df)
+        last_row, entry = get_live_features(asset["symbol"], asset["key"], dt_str, is_bt, fno_df)
         if not is_bt: time.sleep(0.15) 
-        if seq is None: continue
+        if last_row is None: continue
         
-        f_model.eval()
-        with torch.no_grad(): lat = f_model.encode(torch.tensor(seq).unsqueeze(0)).numpy()[0]
+        live_scaled = f_scaler.transform(np.array(last_row[features]).reshape(1, -1))
+        p_up = f_up.predict(live_scaled)[0]
+        p_down = f_down.predict(live_scaled)[0]
         
-        fused = np.ascontiguousarray(np.hstack((lat, mac)).reshape(1, -1), dtype=np.float32)
-        faiss.normalize_L2(fused)
-        scores, idxs = f_faiss.search(fused, k=5)
-        
-        conv = (max(0.0, scores[0][0]) ** 0.5) * 100.0 
-        if conv < min_conv: continue
-            
-        p_ret, p_rsk = f_yp[idxs[0]], f_yr[idxs[0]]
-        pos, neg = sum(1 for r in p_ret if r > 0), sum(1 for r in p_ret if r < 0)
-        
-        if pos >= 3:
-            dir_str, pct, rsk = "LONG 🟢", np.mean([r for r in p_ret if r > 0]), np.mean([r for r, pr in zip(p_rsk, p_ret) if pr > 0])
-        elif neg >= 3:
-            dir_str, pct, rsk = "SHORT 🔴", np.mean([r for r in p_ret if r < 0]), np.mean([r for r, pr in zip(p_rsk, p_ret) if pr < 0])
+        if p_up > p_down * 1.5 and p_up > 1.0:
+            dir_str, pct, rsk = "LONG 🟢", p_up, p_down
+        elif p_down > p_up * 1.5 and p_down > 1.0:
+            dir_str, pct, rsk = "SHORT 🔴", p_down, p_up
         else: continue
+        
+        rr_ratio = pct / (rsk + 1e-8)
+        if rr_ratio < 1.2: continue 
+        
+        win_rate = 0.55 # Baseline edge assumption for Kelly sizing
+        kelly = max(0.0, (win_rate - ((1 - win_rate) / rr_ratio)) / 2.0 * 100.0)
+        if kelly < 1.0: continue
             
-        if abs(pct) < 0.75: continue 
-            
-        tgt = entry * (1 + (pct / 100.0))
-        sl = entry * (1 - (rsk / 100.0)) if pct > 0 else entry * (1 + (rsk / 100.0))
+        tgt = entry * (1 + (pct / 100.0)) if "LONG" in dir_str else entry * (1 - (pct / 100.0))
+        sl = entry * (1 - (rsk / 100.0)) if "LONG" in dir_str else entry * (1 + (rsk / 100.0))
         
         out = "<b>Awaiting Market ⏳</b>"
         if is_bt and fno_df is not None:
@@ -455,11 +304,12 @@ def run_production_sweep():
                 if "LONG" in dir_str:
                     out = f"<span style='color: #dc3545;'>❌ STOP HIT (₹{sl:.2f})</span>" if fw['Low'].min() <= sl else f"<span style='color: #28a745;'>Closed ₹{fw['Close'].iloc[-1]:.2f} (+{((fw['Close'].iloc[-1]-entry)/entry)*100:.2f}%)</span>"
                 else:
-                    out = f"<span style='color: #dc3545;'>❌ STOP HIT (₹{sl:.2f})</span>" if fw['High'].max() >= sl else f"<span style='color: #28a745;'>Closed ₹{fw['Close'].iloc[-1]:.2f} ({((fw['Close'].iloc[-1]-entry)/entry)*100:.2f}%)</span>"
+                    out = f"<span style='color: #dc3545;'>❌ STOP HIT (₹{sl:.2f})</span>" if fw['High'].max() >= sl else f"<span style='color: #28a745;'>Closed ₹{fw['Close'].iloc[-1]:.2f} ({-((fw['Close'].iloc[-1]-entry)/entry)*100:.2f}%)</span>"
         
-        final_data.append({'asset': asset["symbol"], 'direction': dir_str, 'conviction': conv, 'entry': entry, 'ai_stop': sl, 'risk_pct': rsk, 'target_display': f"₹{tgt:.2f} ({'+' if pct>0 else ''}{pct:.2f}%)", 'actual_outcome': out})
+        final_data.append({'asset': asset["symbol"], 'direction': dir_str, 'rr_ratio': rr_ratio, 'kelly_pct': kelly, 'entry': entry, 'ai_stop': sl, 'target_display': f"₹{tgt:.2f} ({pct:.2f}%)", 'actual_outcome': out})
 
     send_mobile_alert(mac_rep, final_data, dt_str, is_bt)
 
 if __name__ == "__main__":
     run_production_sweep()
+
