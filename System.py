@@ -15,7 +15,6 @@ warnings.filterwarnings('ignore')
 # ==============================================================================
 # 0. ALL NSE F&O SYMBOLS (LIVE TICKERS)
 # ==============================================================================
-# Suffix '.NS' routes the request directly to the National Stock Exchange of India
 FO_SYMBOLS = [
     f"{sym}.NS" for sym in [
         "AARTIIND", "ABB", "ABBOTINDIA", "ABCAPITAL", "ABFRL", "ACC", "ADANIENT", "ADANIPORTS", 
@@ -126,29 +125,42 @@ class HamiltonianEnergyLoss(nn.Module):
         return torch.mean(hamiltonian)
 
 # ==============================================================================
-# 4. INSTANT LIVE DATA COMPILER (NO FILES REQUIRED)
+# 4. INSTANT LIVE DATA COMPILER (WITH QUARANTINE PROTOCOL)
 # ==============================================================================
 def fetch_live_fo_data(seq_len=10):
     print(f"\n📥 Fetching LIVE data for {len(FO_SYMBOLS)} F&O Assets from NSE feeds...")
     print("⏳ This will take ~10 seconds. No files or tokens required.")
     
-    # Download 1-year bulk data instantly using yfinance multi-threading
+    # Download 1-year bulk data instantly
     df = yf.download(FO_SYMBOLS, period="1y", interval="1d", progress=False)
     
     # Clean the data (forward fill missing days, backward fill early gaps)
     df = df.ffill().bfill()
     
-    # Extract only the symbols that successfully downloaded
-    available_tickers = list(df['Close'].columns)
-    
-    print(f"✅ Successfully acquired live historical data for {len(available_tickers)} assets.")
-    
+    # QUARANTINE PROTOCOL: Strictly filter out any ticker containing NaN values
     features = ['Open', 'High', 'Low', 'Close']
-    data_3d = np.zeros((len(df), len(available_tickers), len(features)))
+    valid_tickers = []
+    
+    # Check all columns to ensure no NaNs survived the fill
+    for ticker in df['Close'].columns:
+        is_corrupted = False
+        for feat in features:
+            if df[feat][ticker].isna().any():
+                is_corrupted = True
+                break
+        
+        if not is_corrupted:
+            valid_tickers.append(ticker)
+
+    failed_count = len(FO_SYMBOLS) - len(valid_tickers)
+    print(f"✅ Download complete. Automatically dropped {failed_count} broken/delisted symbols to protect the Tensor Math.")
+    print(f"✅ Proceeding with {len(valid_tickers)} mathematically clean assets.")
+    
+    data_3d = np.zeros((len(df), len(valid_tickers), len(features)))
     latest_prices = {}
     
-    # Construct Tensor Matrix
-    for j, ticker in enumerate(available_tickers):
+    # Construct Tensor Matrix using ONLY clean valid tickers
+    for j, ticker in enumerate(valid_tickers):
         for k, feat in enumerate(features):
             data_3d[:, j, k] = df[feat][ticker].values
         # Save the current real-time closing price
@@ -179,7 +191,7 @@ def fetch_live_fo_data(seq_len=10):
     Y = torch.tensor(np.array(Y_list), dtype=torch.float32)
     X = X.permute(0, 2, 1, 3).contiguous()
     
-    return X, Y, [t.replace('.NS', '') for t in available_tickers], latest_prices
+    return X, Y, [t.replace('.NS', '') for t in valid_tickers], latest_prices
 
 # ==============================================================================
 # 5. MASTER EXECUTION
@@ -263,3 +275,4 @@ def run_quantum_desk():
 
 if __name__ == "__main__":
     run_quantum_desk()
+
