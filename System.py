@@ -125,13 +125,14 @@ def compile_fo_universe_upstox(seq_len=10, max_assets=25):
     upstox_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
     
     # HARDCODED INSTRUMENT KEYS TO BYPASS CLOUDFLARE 403 FORBIDDEN
+    # UPDATED: BAJFINANCE and KOTAKBANK ISINs patched to match new face-values
     fallback_keys = {
         "RELIANCE": "NSE_EQ|INE002A01018", "TCS": "NSE_EQ|INE467B01029", 
         "HDFCBANK": "NSE_EQ|INE040A01034", "INFY": "NSE_EQ|INE009A01021", 
         "ICICIBANK": "NSE_EQ|INE090A01021", "SBIN": "NSE_EQ|INE062A01020", 
         "BHARTIARTL": "NSE_EQ|INE397D01024", "ITC": "NSE_EQ|INE154A01025", 
-        "LT": "NSE_EQ|INE018A01030", "BAJFINANCE": "NSE_EQ|INE296A01024", 
-        "AXISBANK": "NSE_EQ|INE238A01034", "KOTAKBANK": "NSE_EQ|INE237A01028", 
+        "LT": "NSE_EQ|INE018A01030", "BAJFINANCE": "NSE_EQ|INE296A01032", 
+        "AXISBANK": "NSE_EQ|INE238A01034", "KOTAKBANK": "NSE_EQ|INE237A01036", 
         "MARUTI": "NSE_EQ|INE585B01010", "SUNPHARMA": "NSE_EQ|INE044A01036", 
         "TATAMOTORS": "NSE_EQ|INE155A01022", "TATASTEEL": "NSE_EQ|INE081A01020", 
         "ASIANPAINT": "NSE_EQ|INE021A01026", "TITAN": "NSE_EQ|INE280A01028", 
@@ -167,7 +168,6 @@ def compile_fo_universe_upstox(seq_len=10, max_assets=25):
     except Exception as e:
         print(f"❌ HTTP/Cloudflare Block Detected ({e})")
         print("🛡️ Activating Hardcoded ISIN Bypass Protocol...")
-        # Instantly fallback to our hardcoded map to bypass the block!
         symbol_to_key = {sym: fallback_keys[sym] for sym in target_symbols}
 
     print(f"⚛️ Fetching LIVE 1-Year Candle Data from Upstox for {len(symbol_to_key)} assets...")
@@ -409,4 +409,3 @@ def run_quantum_desk():
 
 if __name__ == "__main__":
     run_quantum_desk()
-
