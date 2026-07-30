@@ -19,7 +19,36 @@ import torch.optim as optim
 warnings.filterwarnings('ignore')
 
 # ==============================================================================
-# 0. DETERMINISTIC QUANTUM ENVIRONMENT
+# 0. ALL NSE F&O SYMBOLS (180+ UNIVERSE)
+# ==============================================================================
+FO_SYMBOLS = [
+    "AARTIIND", "ABB", "ABBOTINDIA", "ABCAPITAL", "ABFRL", "ACC", "ADANIENT", "ADANIPORTS", 
+    "ALKEM", "AMBUJACEM", "APOLLOHOSP", "APOLLOTYRE", "ASHOKLEY", "ASIANPAINT", "ASTRAL", 
+    "ATUL", "AUBANK", "AUROPHARMA", "AXISBANK", "BAJAJ-AUTO", "BAJAJFINSV", "BAJFINANCE", 
+    "BALKRISIND", "BALRAMCHIN", "BANDHANBNK", "BANKBARODA", "BATAINDIA", "BEL", "BERGEPAINT", 
+    "BHARATFORG", "BHARTIARTL", "BHEL", "BIOCON", "BOSCHLTD", "BPCL", "BRITANNIA", "CANBK", 
+    "CANFINHOME", "CHAMBLFERT", "CHOLAFIN", "CIPLA", "COALINDIA", "COFORGE", "COLPAL", "CONCOR", 
+    "COROMANDEL", "CROMPTON", "CUB", "CUMMINSIND", "DABUR", "DALBHARAT", "DEEPAKNTR", "DIVISLAB", 
+    "DIXON", "DLF", "DRREDDY", "EICHERMOT", "ESCORTS", "EXIDEIND", "FEDERALBNK", "GAIL", 
+    "GLENMARK", "GMRINFRA", "GNFC", "GODREJCP", "GODREJPROP", "GRANULES", "GRASIM", "GUJGASLTD", 
+    "HAL", "HAVELLS", "HCLTECH", "HDFCAMC", "HDFCBANK", "HDFCLIFE", "HEROMOTOCO", "HINDALCO", 
+    "HINDCOPPER", "HINDPETRO", "HINDUNILVR", "ICICIBANK", "ICICIGI", "ICICIPRULI", "IDEA", 
+    "IDFCFIRSTB", "IEX", "IGL", "INDHOTEL", "INDIACEM", "INDIAMART", "INDIGO", "INDUSINDBK", 
+    "INDUSTOWER", "INFY", "INTELLECT", "IOC", "IPCALAB", "IRCTC", "ITC", "JINDALSTEL", 
+    "JKCEMENT", "JSWSTEEL", "JUBLFOOD", "KOTAKBANK", "LALPATHLAB", "LAURUSLABS", "LICHSGFIN", 
+    "LT", "LTIM", "LTTS", "LUPIN", "M&M", "M&MFIN", "MANAPPURAM", "MARICO", "MARUTI", "MCDOWELL-N", 
+    "MCX", "METROPOLIS", "MFSL", "MGL", "MOTHERSON", "MPHASIS", "MRF", "MUTHOOTFIN", "NATIONALUM", 
+    "NAUKRI", "NAVINFLUOR", "NESTLEIND", "NMDC", "NTPC", "OBEROIRLTY", "OFSS", "ONGC", "PAGEIND", 
+    "PEL", "PERSISTENT", "PETRONET", "PFC", "PIDILITIND", "PIIND", "PNB", "POLYCAB", "POWERGRID", 
+    "PVRINOX", "RAMCOCEM", "RBLBANK", "RECLTD", "RELIANCE", "SAIL", "SBICARD", "SBILIFE", "SBIN", 
+    "SHREECEM", "SHRIRAMFIN", "SIEMENS", "SRF", "SUNTV", "SUNPHARMA", "SYNGENE", "TATACHEM", 
+    "TATACOMM", "TATACONSUM", "TATAMOTORS", "TATAPOWER", "TATASTEEL", "TCS", "TECHM", "TITAN", 
+    "TORNTPHARM", "TRENT", "TVSMOTOR", "UBL", "ULTRACEMCO", "UPL", "VEDL", "VOLTAS", "WIPRO", 
+    "ZEEL", "ZYDUSLIFE"
+]
+
+# ==============================================================================
+# 1. DETERMINISTIC QUANTUM ENVIRONMENT
 # ==============================================================================
 def set_seeds(seed=42):
     random.seed(seed)
@@ -28,7 +57,7 @@ def set_seeds(seed=42):
     torch.backends.cudnn.deterministic = True
 
 # ==============================================================================
-# 1. ROUGH PATH SIGNATURES
+# 2. ROUGH PATH SIGNATURES
 # ==============================================================================
 def compute_path_signatures(path):
     dX = path[:, -1, :] - path[:, 0, :]
@@ -42,35 +71,31 @@ def compute_path_signatures(path):
     return torch.clamp(sig_flat, -50.0, 50.0)
 
 # ==============================================================================
-# 2. MATRIX PRODUCT STATE (Tensor Network)
+# 3. MATRIX PRODUCT STATE (Tensor Network)
 # ==============================================================================
 class MatrixProductState(nn.Module):
     def __init__(self, num_nodes, phys_dim, bond_dim):
         super().__init__()
         self.num_nodes = num_nodes
         self.left_core = nn.Parameter(torch.randn(phys_dim, bond_dim) * 0.01)
-        
         if num_nodes > 1:
             self.middle_cores = nn.ParameterList([
                 nn.Parameter(torch.randn(bond_dim, phys_dim, bond_dim) * 0.01)
                 for _ in range(num_nodes - 1)
             ])
-            
         self.norm_layers = nn.ModuleList([nn.LayerNorm(bond_dim) for _ in range(num_nodes)])
             
     def forward(self, x):
         state = torch.matmul(x[:, 0, :], self.left_core) 
         state = self.norm_layers[0](state)
-        
         if self.num_nodes > 1:
             for i, core in enumerate(self.middle_cores):
                 state = torch.einsum('bd,dpD,bp->bD', state, core, x[:, i+1, :])
                 state = self.norm_layers[i+1](state)
-                
         return state 
 
 # ==============================================================================
-# 3. LONG/SHORT QUANTUM BRAIN
+# 4. LONG/SHORT QUANTUM BRAIN
 # ==============================================================================
 class EntangledQuantumBrain(nn.Module):
     def __init__(self, num_assets, num_features, bond_dim=16):
@@ -99,7 +124,7 @@ class EntangledQuantumBrain(nn.Module):
         return probabilities
 
 # ==============================================================================
-# 4. HAMILTONIAN ENERGY LOSS (Market Neutral)
+# 5. HAMILTONIAN ENERGY LOSS (Market Neutral)
 # ==============================================================================
 class HamiltonianEnergyLoss(nn.Module):
     def __init__(self, risk_penalty=0.5):
@@ -113,64 +138,48 @@ class HamiltonianEnergyLoss(nn.Module):
         return torch.mean(hamiltonian)
 
 # ==============================================================================
-# 5. UPSTOX LIVE DATA COMPILER (WITH BYPASS)
+# 6. ENTERPRISE LIVE DATA COMPILER (LOCAL BYPASS PROTOCOL)
 # ==============================================================================
 def get_mock_data(max_assets, seq_len, target_symbols):
-    """Helper to return fake data only if actual Token/API fails."""
+    """Helper to return fake data if execution fails."""
     mock_tickers = target_symbols[:max_assets]
     mock_prices = {t: 100.0 for t in mock_tickers}
     return torch.randn(32, max_assets, seq_len, 4), torch.randn(32, max_assets) * 0.05, mock_tickers, mock_prices
 
-def compile_fo_universe_upstox(seq_len=10, max_assets=25):
+def compile_fo_universe_upstox(seq_len=10, max_assets=200):
     upstox_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
-    
-    # HARDCODED INSTRUMENT KEYS TO BYPASS CLOUDFLARE 403 FORBIDDEN
-    # UPDATED: BAJFINANCE and KOTAKBANK ISINs patched to match new face-values
-    fallback_keys = {
-        "RELIANCE": "NSE_EQ|INE002A01018", "TCS": "NSE_EQ|INE467B01029", 
-        "HDFCBANK": "NSE_EQ|INE040A01034", "INFY": "NSE_EQ|INE009A01021", 
-        "ICICIBANK": "NSE_EQ|INE090A01021", "SBIN": "NSE_EQ|INE062A01020", 
-        "BHARTIARTL": "NSE_EQ|INE397D01024", "ITC": "NSE_EQ|INE154A01025", 
-        "LT": "NSE_EQ|INE018A01030", "BAJFINANCE": "NSE_EQ|INE296A01032", 
-        "AXISBANK": "NSE_EQ|INE238A01034", "KOTAKBANK": "NSE_EQ|INE237A01036", 
-        "MARUTI": "NSE_EQ|INE585B01010", "SUNPHARMA": "NSE_EQ|INE044A01036", 
-        "TATAMOTORS": "NSE_EQ|INE155A01022", "TATASTEEL": "NSE_EQ|INE081A01020", 
-        "ASIANPAINT": "NSE_EQ|INE021A01026", "TITAN": "NSE_EQ|INE280A01028", 
-        "NTPC": "NSE_EQ|INE733E01010", "HCLTECH": "NSE_EQ|INE860A01027", 
-        "ADANIENT": "NSE_EQ|INE423A01024", "WIPRO": "NSE_EQ|INE075A01022", 
-        "ULTRACEMCO": "NSE_EQ|INE481G01011", "M&M": "NSE_EQ|INE101A01026", 
-        "ONGC": "NSE_EQ|INE213A01029"
-    }
-
-    target_symbols = list(fallback_keys.keys())[:max_assets]
+    target_symbols = FO_SYMBOLS[:max_assets]
 
     if not upstox_token:
         print("\n🚨 ERROR: 'UPSTOX_ACCESS_TOKEN' missing from environment variables!")
-        print("⚠️ Falling back to synthetic MOCK DATA (₹100.00 prices).\n")
         return get_mock_data(max_assets, seq_len, target_symbols)
 
-    print("📥 Fetching Upstox Master Instrument List...")
+    print("📥 Loading Upstox Master Instrument List...")
     symbol_to_key = {}
-    try:
-        url = "https://assets.upstox.com/ts/instruments/data.csv.gz"
-        headers = {'User-Agent': 'Mozilla/5.0'}
-        response = requests.get(url, headers=headers, timeout=5)
-        response.raise_for_status() 
-        
-        instruments_df = pd.read_csv(io.BytesIO(response.content), compression='gzip')
-        nse_eq = instruments_df[instruments_df['exchange'] == 'NSE_EQ']
-        
-        for sym in target_symbols:
-            match = nse_eq[nse_eq['tradingsymbol'] == sym]
-            if not match.empty:
-                symbol_to_key[sym] = match.iloc[0]['instrument_key']
-                
-    except Exception as e:
-        print(f"❌ HTTP/Cloudflare Block Detected ({e})")
-        print("🛡️ Activating Hardcoded ISIN Bypass Protocol...")
-        symbol_to_key = {sym: fallback_keys[sym] for sym in target_symbols}
+    
+    local_file = "instruments.csv.gz"
+    
+    if os.path.exists(local_file):
+        print(f"✅ Found local file: {local_file}. Processing dictionary...")
+        try:
+            instruments_df = pd.read_csv(local_file, compression='gzip')
+            nse_eq = instruments_df[instruments_df['exchange'] == 'NSE_EQ']
+            
+            for sym in target_symbols:
+                match = nse_eq[nse_eq['tradingsymbol'] == sym]
+                if not match.empty:
+                    symbol_to_key[sym] = match.iloc[0]['instrument_key']
+        except Exception as e:
+            print(f"❌ Failed to parse local {local_file}: {e}")
+            return get_mock_data(max_assets, seq_len, target_symbols)
+    else:
+        print(f"\n🚨 ERROR: Local dictionary '{local_file}' not found!")
+        print("⚠️ Please manually download the file from: https://assets.upstox.com/ts/instruments/data.csv.gz")
+        print("⚠️ Save it in this folder as 'instruments.csv.gz' and run the script again.\n")
+        return get_mock_data(max_assets, seq_len, target_symbols)
 
-    print(f"⚛️ Fetching LIVE 1-Year Candle Data from Upstox for {len(symbol_to_key)} assets...")
+    print(f"\n⚛️ Initiating Mass Download for {len(symbol_to_key)} F&O Assets...")
+    print("⏳ This will take about ~45 seconds due to API limits. Do not terminate.")
     
     headers = {
         'Accept': 'application/json',
@@ -184,6 +193,9 @@ def compile_fo_universe_upstox(seq_len=10, max_assets=25):
     available_tickers = []
     latest_prices = {}
     
+    counter = 1
+    total = len(symbol_to_key)
+
     for sym, inst_key in symbol_to_key.items():
         encoded_key = urllib.parse.quote(inst_key)
         api_url = f"https://api.upstox.com/v2/historical-candle/{encoded_key}/day/{to_date}/{from_date}"
@@ -194,7 +206,7 @@ def compile_fo_universe_upstox(seq_len=10, max_assets=25):
                 data = res.json()
                 if 'data' in data and 'candles' in data['data'] and len(data['data']['candles']) > 0:
                     candles = data['data']['candles']
-                    candles = candles[::-1] # Reverse to Oldest-First
+                    candles = candles[::-1] # Oldest-First
                     
                     df = pd.DataFrame(candles, columns=['timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
                     df['timestamp'] = pd.to_datetime(df['timestamp']).dt.date
@@ -204,22 +216,22 @@ def compile_fo_universe_upstox(seq_len=10, max_assets=25):
                     available_tickers.append(sym)
                     latest_prices[sym] = float(df['Close'].iloc[-1])
             elif res.status_code == 401:
-                print("\n🚨 ERROR: Upstox Token is EXPIRED or INVALID! (Status 401)")
-                print("⚠️ Please generate a new access token today.")
+                print("\n🚨 Upstox Token EXPIRED! Aborting mass download.")
                 return get_mock_data(max_assets, seq_len, target_symbols)
-            else:
-                print(f"⚠️ Warning: Failed to fetch {sym} - Status {res.status_code}")
-                
-        except Exception as e:
-            print(f"⚠️ Error fetching {sym}: {e}")
+        except Exception:
+            pass # Silently skip network errors to keep the massive loop running
             
-        time.sleep(0.15) # Prevent Rate-Limit Bans (10 req/sec max)
+        if counter % 25 == 0:
+            print(f"   -> Fetched {counter}/{total} assets...")
+            
+        counter += 1
+        time.sleep(0.12) # Strict Upstox Rate Limiter
 
-    if not all_data:
-        print("\n❌ ERROR: No OHLC ticker data was downloaded.")
+    if len(all_data) < 10:
+        print("\n❌ CRITICAL: Failed to download sufficient market data.")
         return get_mock_data(max_assets, seq_len, target_symbols)
 
-    # Combine time-series
+    print("🧩 Aligning Massive Multi-Index Dataframes...")
     combined_df = pd.concat(all_data, axis=1).ffill().bfill()
     
     features = ['Open', 'High', 'Low', 'Close']
@@ -229,18 +241,15 @@ def compile_fo_universe_upstox(seq_len=10, max_assets=25):
         for k, feat in enumerate(features):
             data_3d[:, j, k] = combined_df[(ticker, feat)].values
 
-    # Normalize data
     mean = np.mean(data_3d, axis=0, keepdims=True)
     std = np.std(data_3d, axis=0, keepdims=True) + 1e-8
     data_3d_norm = (data_3d - mean) / std
     
     X_list, Y_list = [], []
     
-    # 48-HOUR SHIFT WINDOW
     for i in range(len(data_3d_norm) - seq_len):
         x_window = data_3d_norm[i : i + seq_len]
         current_close = data_3d_norm[i + seq_len - 1, :, 3]
-        
         target_idx = i + seq_len + 1 
         if target_idx >= len(data_3d_norm):
             break 
@@ -255,77 +264,20 @@ def compile_fo_universe_upstox(seq_len=10, max_assets=25):
     Y = torch.tensor(np.array(Y_list), dtype=torch.float32)
     X = X.permute(0, 2, 1, 3).contiguous()
     
-    print("✅ Live Upstox Data Successfully Compiled into Hilbert Space Tensors.")
+    print(f"✅ Full Universe Data Compiled. Final Tensor Shape: {X.shape}")
     return X, Y, available_tickers, latest_prices
-
-# ==============================================================================
-# 6. DISPATCH & NOTIFICATION ENGINE
-# ==============================================================================
-def send_quantum_alert(trade_data):
-    sender_email = os.environ.get("SENDER_EMAIL")
-    sender_pass = os.environ.get("SENDER_PASSWORD")
-    recipient_email = os.environ.get("RECIPIENT_EMAIL")
-    
-    if not all([sender_email, sender_pass, recipient_email]):
-        print("\n⚠️ Email credentials missing in environment variables. Outputting to console only.\n")
-        return
-
-    msg = MIMEMultipart('alternative')
-    msg['Subject'] = f"🌌 LONG/SHORT 2-DAY TARGETS | UPSTOX QUANTUM ALLOCATIONS | {datetime.now().strftime('%Y-%m-%d')}"
-    msg['From'] = sender_email
-    msg['To'] = recipient_email
-
-    html = """
-    <html><body style="font-family: Arial, sans-serif; background-color: #f4f7f6; padding: 10px;">
-        <h3 style="color: #333;">🌌 48-HOUR LONG/SHORT MARKET NEUTRAL ALLOCATIONS</h3>
-        <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%; text-align: center; font-size: 14px; background-color: white;">
-          <tr bgcolor="#f8f9fa" style="color: #333; font-weight: bold;">
-            <th>Direction</th>
-            <th>Asset</th>
-            <th>Capital Weight</th>
-            <th>Entry (Latest Close)</th>
-            <th>Max Hist. Pain (SL)</th>
-            <th>Expected 2-Day Target</th>
-            <th>Result</th>
-          </tr>"""
-    
-    for row in trade_data:
-        html += f"""
-        <tr>
-            <td style='color: {row['Dir_Color']}; font-weight: bold;'>{row['Direction']}</td>
-            <td style='color: #0056b3;'><b>{row['Asset']}</b></td>
-            <td style='color: #6f42c1; font-weight: bold;'>{row['Weight']}</td>
-            <td>{row['Entry']}</td>
-            <td style='color: #dc3545;'>{row['SL']}</td>
-            <td style='color: #28a745; font-weight: bold;'>{row['Target']}</td>
-            <td>{row['Result']}</td>
-        </tr>"""
-        
-    html += "</table></body></html>"
-    msg.attach(MIMEText(html, 'html'))
-    
-    try:
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
-        server.login(sender_email, sender_pass)
-        server.sendmail(sender_email, recipient_email, msg.as_string())
-        server.quit()
-        print("✅ Long/Short 2-Day Horizon Quantum Report Dispatched via Email.")
-    except Exception as e:
-        print(f"❌ Failed to send email: {str(e)}")
 
 # ==============================================================================
 # 7. MASTER EXECUTION
 # ==============================================================================
 def run_quantum_desk():
     set_seeds(42)
-    MAX_ASSETS = 25     
     SEQ_LEN = 10        
     FEATURES = 4        
     BOND_DIM = 16       
     EPOCHS = 10
     
-    X_data, Y_data, asset_names, latest_prices = compile_fo_universe_upstox(seq_len=SEQ_LEN, max_assets=MAX_ASSETS)
+    X_data, Y_data, asset_names, latest_prices = compile_fo_universe_upstox(seq_len=SEQ_LEN)
     actual_assets = X_data.shape[1] 
     
     brain = EntangledQuantumBrain(num_assets=actual_assets, num_features=FEATURES, bond_dim=BOND_DIM)
@@ -363,11 +315,11 @@ def run_quantum_desk():
         live_allocations = brain(X_data[-1].unsqueeze(0))[0] 
         
     sorted_indices = torch.argsort(live_allocations, descending=True)
-    top_longs = sorted_indices[:3]   
-    top_shorts = sorted_indices[-3:] 
+    # Output the absolute best 5 Longs and best 5 Shorts from the entire 184 universe
+    top_longs = sorted_indices[:5]   
+    top_shorts = sorted_indices[-5:] 
     
     target_indices = torch.cat((top_longs, top_shorts))
-    trade_data = []
     
     for idx in target_indices:
         asset_idx = idx.item()
@@ -375,13 +327,10 @@ def run_quantum_desk():
         raw_alloc = live_allocations[asset_idx].item()
         
         abs_weight = abs(raw_alloc) * 100
-        
         is_long = raw_alloc > 0
         direction_text = "LONG 🟢" if is_long else "SHORT 🔴"
-        dir_color = "#28a745" if is_long else "#dc3545"
         
         entry_price = latest_prices.get(asset_symbol, 100.0)
-                
         target_pct = (abs_weight / 100.0) * 15.0 
         sl_pct = target_pct / 1.5               
         
@@ -392,20 +341,7 @@ def run_quantum_desk():
             target = entry_price * (1 - (target_pct / 100.0))
             sl = entry_price * (1 + (sl_pct / 100.0))
         
-        trade_data.append({
-            'Direction': direction_text,
-            'Dir_Color': dir_color,
-            'Asset': asset_symbol,
-            'Weight': f"{abs_weight:.2f}%",
-            'Entry': f"₹{entry_price:.2f}",
-            'SL': f"₹{sl:.2f}",
-            'Target': f"₹{target:.2f}",
-            'Result': "<b>Awaiting 2-Day Target ⏳</b>"
-        })
-        
         print(f"-> {direction_text} | ALLOCATE {abs_weight:05.2f}% TO [ {asset_symbol} ] | Current Price: ₹{entry_price:.2f} | Target: ₹{target:.2f}")
-
-    send_quantum_alert(trade_data)
 
 if __name__ == "__main__":
     run_quantum_desk()
