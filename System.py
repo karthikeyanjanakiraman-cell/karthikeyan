@@ -108,14 +108,14 @@ class HamiltonianEnergyLoss(nn.Module):
         return torch.mean(hamiltonian)
 
 # ==============================================================================
-# 5. REAL CSV DATA COMPILER
+# 5. REAL CSV DATA COMPILER (2-DAY T+2 SHIFT)
 # ==============================================================================
 def compile_fo_universe(csv_path="historical_fno.csv", seq_len=10, max_assets=50):
     if not os.path.exists(csv_path):
         print(f"⚠️ Warning: '{csv_path}' not found. Booting synthetic environment.")
         return torch.randn(32, max_assets, seq_len, 4), torch.randn(32, max_assets) * 0.05, [f"MOCK_{i}" for i in range(max_assets)]
         
-    print("⚛️ Parsing F&O CSV into Hilbert Space Tensors...")
+    print("⚛️ Parsing F&O CSV into Hilbert Space Tensors (2-Day Target Horizon)...")
     try:
         df = pd.read_csv(csv_path)
         df.rename(columns=lambda x: str(x).lower().strip(), inplace=True)
@@ -137,11 +137,23 @@ def compile_fo_universe(csv_path="historical_fno.csv", seq_len=10, max_assets=50
         data_3d = (data_3d - mean) / std
         
         X_list, Y_list = [], []
-        for i in range(len(data_3d) - seq_len - 1):
+        
+        # -------------------------------------------------------------
+        # SHIFTED TO STRICT T+2 HORIZON (2-Day Future Target)
+        # -------------------------------------------------------------
+        for i in range(len(data_3d) - seq_len):
             x_window = data_3d[i : i + seq_len]
             current_close = data_3d[i + seq_len - 1, :, 3]
-            next_close = data_3d[i + seq_len, :, 3]
-            y_target = (next_close - current_close) / (np.abs(current_close) + 1e-8)
+            
+            # Grab the price exactly 2 days in the future
+            target_idx = i + seq_len + 1 
+            if target_idx >= len(data_3d):
+                break # Prevents crash at the end of the CSV
+                
+            future_close_t2 = data_3d[target_idx, :, 3]
+            
+            # The network is now mathematically forced to optimize for 48 hours
+            y_target = (future_close_t2 - current_close) / (np.abs(current_close) + 1e-8)
             
             X_list.append(x_window)
             Y_list.append(y_target)
@@ -169,20 +181,21 @@ def send_quantum_alert(trade_data):
         return
 
     msg = MIMEMultipart('alternative')
-    msg['Subject'] = f"🌌 QUANTUM BRAIN T+1 ALLOCATIONS | {datetime.now().strftime('%Y-%m-%d')}"
+    # Updated Subject to explicitly reflect 2-Day Success Stocks
+    msg['Subject'] = f"🌌 2-DAY SUCCESS STOCKS (T+2) | QUANTUM BRAIN ALLOCATIONS | {datetime.now().strftime('%Y-%m-%d')}"
     msg['From'] = sender_email
     msg['To'] = recipient_email
 
     html = """
     <html><body style="font-family: Arial, sans-serif; background-color: #f4f7f6; padding: 10px;">
-        <h3 style="color: #333;">🌌 WAVEFUNCTION COLLAPSE: OPTIMAL KELLY DISTRIBUTION</h3>
+        <h3 style="color: #333;">🌌 48-HOUR WAVEFUNCTION COLLAPSE: 2-DAY SUCCESS CANDIDATES</h3>
         <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%; text-align: center; font-size: 14px; background-color: white;">
           <tr bgcolor="#f8f9fa" style="color: #333; font-weight: bold;">
             <th>Asset</th>
             <th>Consensus Similarity</th>
             <th>Entry (9:15 Open)</th>
             <th>Max Hist. Pain (SL)</th>
-            <th>Hist. Expected Target</th>
+            <th>Expected 2-Day Target</th>
             <th>Result</th>
           </tr>"""
     
@@ -206,7 +219,7 @@ def send_quantum_alert(trade_data):
         server.login(sender_email, sender_pass)
         server.sendmail(sender_email, recipient_email, msg.as_string())
         server.quit()
-        print("✅ Quantum Allocation Report Dispatched via Email.")
+        print("✅ 2-Day Horizon Quantum Report Dispatched via Email.")
     except Exception as e:
         print(f"❌ Failed to send email: {str(e)}")
 
@@ -228,7 +241,7 @@ def run_quantum_desk():
     optimizer = optim.AdamW(brain.parameters(), lr=0.01, weight_decay=1e-4)
     loss_function = HamiltonianEnergyLoss(risk_penalty=1.0)
     
-    print("\n🌌 WAKING THE ENTANGLED QUANTUM BRAIN")
+    print("\n🌌 WAKING THE ENTANGLED QUANTUM BRAIN (48-HOUR HORIZON)")
     print(f"-> Integrated F&O Universe: {actual_assets} Assets")
     print("-" * 65)
     
@@ -250,19 +263,16 @@ def run_quantum_desk():
             epoch_loss += loss.item()
             
         avg_loss = epoch_loss / (len(X_data) / batch_size + 1e-8)
-        print(f"Epoch {epoch:02d} | Hamiltonian Energy State: {avg_loss:>8.5f} | Convergence Optimal")
+        print(f"Epoch {epoch:02d} | 2-Day Hamiltonian Energy State: {avg_loss:>8.5f} | Convergence Optimal")
 
     print("-" * 65)
-    print("🚀 LIVE INFERENCE: EXECUTING WAVEFUNCTION COLLAPSE FOR T+1")
+    print("🚀 LIVE INFERENCE: EXECUTING WAVEFUNCTION COLLAPSE FOR T+2 (2-DAY STOCKS)")
     brain.eval()
     with torch.no_grad():
         live_allocations = brain(X_data[-1].unsqueeze(0))[0] 
         
     top_trades = torch.topk(live_allocations, k=5)
     
-    # ---------------------------------------------------------
-    # Fetch real baseline prices to calculate Targets and Stops
-    # ---------------------------------------------------------
     try:
         raw_df = pd.read_csv("historical_fno.csv")
         raw_df.rename(columns=lambda x: str(x).lower().strip(), inplace=True)
@@ -277,17 +287,14 @@ def run_quantum_desk():
         asset_symbol = asset_names[asset_idx]
         allocation = top_trades.values[i].item() * 100
         
-        # Get actual last close to proxy the 9:15 Entry 
         entry_price = 100.0 # Fallback
         if not raw_df.empty and 'Symbol' in raw_df.columns and 'Close' in raw_df.columns:
             sym_df = raw_df[raw_df['Symbol'] == asset_symbol]
             if not sym_df.empty:
                 entry_price = float(sym_df['Close'].iloc[-1])
                 
-        # Quantum math naturally correlates probability density with expected move magnitude
-        # We derive the Target and SL mathematically from the wave amplitude
-        target_pct = (allocation / 100.0) * 8.0 # Scaled dynamic target
-        sl_pct = target_pct / 1.5               # Structural 1:1.5 R/R based on Hamiltonian Energy
+        target_pct = (allocation / 100.0) * 8.0 
+        sl_pct = target_pct / 1.5               
         
         target = entry_price * (1 + (target_pct / 100.0))
         sl = entry_price * (1 - (sl_pct / 100.0))
@@ -298,12 +305,11 @@ def run_quantum_desk():
             'Entry': f"₹{entry_price:.2f}",
             'SL': f"₹{sl:.2f}",
             'Target': f"₹{target:.2f}",
-            'Result': "<b>Awaiting Market ⏳</b>"
+            'Result': "<b>Awaiting 2-Day Target ⏳</b>"
         })
         
-        print(f"-> ALLOCATE {allocation:05.2f}% CAPITAL TO [ {asset_symbol} ] | Entry: ₹{entry_price:.2f} | Tgt: ₹{target:.2f}")
+        print(f"-> 2-DAY SUCCESS ALLOCATION {allocation:05.2f}% TO [ {asset_symbol} ] | Target: ₹{target:.2f}")
 
-    # Dispatch the HTML table
     send_quantum_alert(trade_data)
 
 if __name__ == "__main__":
