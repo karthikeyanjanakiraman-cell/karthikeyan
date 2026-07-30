@@ -19,13 +19,9 @@ def set_seeds(seed=42):
     torch.backends.cudnn.deterministic = True
 
 # ==============================================================================
-# 1. ROUGH PATH SIGNATURES (The Physics of the Time Series)
+# 1. ROUGH PATH SIGNATURES
 # ==============================================================================
 def compute_path_signatures(path):
-    """
-    Extracts the 1st and 2nd Order Iterated Integrals of the price path.
-    Includes an active clamp to prevent initial gradient explosion.
-    """
     dX = path[:, -1, :] - path[:, 0, :]
     X_shifted = path[:, :-1, :] - path[:, 0:1, :]
     dX_t = path[:, 1:, :] - path[:, :-1, :]
@@ -33,21 +29,16 @@ def compute_path_signatures(path):
     sig2 = torch.matmul(X_shifted.unsqueeze(-1), dX_t.unsqueeze(-2))
     sig2 = sig2.sum(dim=1) 
     
-    sig_flat = torch.cat([dX, sig2.flatten(start_dim=1)], dim=1)
+    sig_flat = torch.cat([dX, sig2.reshape(sig2.shape[0], -1)], dim=1)
     return torch.clamp(sig_flat, -50.0, 50.0)
 
 # ==============================================================================
-# 2. MATRIX PRODUCT STATE (Stabilized Entanglement Core)
+# 2. MATRIX PRODUCT STATE (Tensor Network)
 # ==============================================================================
 class MatrixProductState(nn.Module):
-    """
-    Fuses isolated stocks into a single Quantum Entangled state.
-    Uses Site-Specific Layer Normalization to stabilize long tensor chains.
-    """
     def __init__(self, num_nodes, phys_dim, bond_dim):
         super().__init__()
         self.num_nodes = num_nodes
-        
         self.left_core = nn.Parameter(torch.randn(phys_dim, bond_dim) * 0.01)
         
         if num_nodes > 1:
@@ -88,9 +79,10 @@ class EntangledQuantumBrain(nn.Module):
     def forward(self, x):
         batch_size, num_assets, seq_len, features = x.shape
         
-        x_flat = x.view(batch_size * num_assets, seq_len, features)
+        # MEMORY LOCK: Forces PyTorch to reallocate memory dynamically
+        x_flat = x.reshape(batch_size * num_assets, seq_len, features)
         signatures = compute_path_signatures(x_flat)
-        quantum_state_input = signatures.view(batch_size, num_assets, self.phys_dim)
+        quantum_state_input = signatures.reshape(batch_size, num_assets, self.phys_dim)
         
         entangled_state = self.mps(quantum_state_input)
         amplitudes = self.measurement_operator(entangled_state)
@@ -99,7 +91,7 @@ class EntangledQuantumBrain(nn.Module):
         return probabilities
 
 # ==============================================================================
-# 4. HAMILTONIAN ENERGY LOSS (Market Neutrality)
+# 4. HAMILTONIAN ENERGY LOSS
 # ==============================================================================
 class HamiltonianEnergyLoss(nn.Module):
     def __init__(self, risk_penalty=0.5):
@@ -113,51 +105,38 @@ class HamiltonianEnergyLoss(nn.Module):
         return torch.mean(hamiltonian)
 
 # ==============================================================================
-# 5. REAL CSV DATA COMPILER (The Physics Bridge)
+# 5. REAL CSV DATA COMPILER (With .contiguous() Hardware Lock)
 # ==============================================================================
 def compile_fo_universe(csv_path="historical_fno.csv", seq_len=10, max_assets=50):
-    """
-    Reads the real CSV, standardizes the volatility surface, and 
-    pivots the data into a 4D Quantum Tensor State.
-    """
     if not os.path.exists(csv_path):
-        print(f"⚠️ Warning: '{csv_path}' not found. Booting synthetic quantum environment.")
+        print(f"⚠️ Warning: '{csv_path}' not found. Booting synthetic environment.")
         return torch.randn(32, max_assets, seq_len, 4), torch.randn(32, max_assets) * 0.05, [f"MOCK_{i}" for i in range(max_assets)]
         
     print("⚛️ Parsing F&O CSV into Hilbert Space Tensors...")
     try:
         df = pd.read_csv(csv_path)
-        # Standardize standard column names
         df.rename(columns=lambda x: str(x).lower().strip(), inplace=True)
         col_map = {'date':'Date', 'timestamp':'Date', 'symbol':'Symbol', 'ticker':'Symbol', 'open':'Open', 'high':'High', 'low':'Low', 'close':'Close'}
         df.rename(columns=col_map, inplace=True)
         
-        # Ensure proper datetime sorting
         df['Date'] = pd.to_datetime(df['Date'], format='mixed')
         
-        # Pivot the universe to align all stocks simultaneously
         features = ['Open', 'High', 'Low', 'Close']
         pivot_df = df.pivot(index='Date', columns='Symbol', values=features)
-        pivot_df = pivot_df.ffill().bfill() # Patch structural holes in liquidity
+        pivot_df = pivot_df.ffill().bfill() 
         
-        # Select the top N most liquid assets
         symbols = pivot_df.columns.get_level_values('Symbol').unique()[:max_assets]
         pivot_df = pivot_df.loc[:, (slice(None), symbols)]
         
-        # Reshape to (Time, Assets, Features)
         data_3d = np.stack([pivot_df[f].values for f in features], axis=-1)
         
-        # Z-Score Normalization (Critical for Quantum State scaling)
         mean = np.mean(data_3d, axis=0, keepdims=True)
         std = np.std(data_3d, axis=0, keepdims=True) + 1e-8
         data_3d = (data_3d - mean) / std
         
-        # Build Rolling Path Tensors
         X_list, Y_list = [], []
         for i in range(len(data_3d) - seq_len - 1):
             x_window = data_3d[i : i + seq_len]
-            
-            # Target (Y) is the T+1 Return of the Close Price (Feature Index 3)
             current_close = data_3d[i + seq_len - 1, :, 3]
             next_close = data_3d[i + seq_len, :, 3]
             y_target = (next_close - current_close) / (np.abs(current_close) + 1e-8)
@@ -168,14 +147,14 @@ def compile_fo_universe(csv_path="historical_fno.csv", seq_len=10, max_assets=50
         X = torch.tensor(np.array(X_list), dtype=torch.float32)
         Y = torch.tensor(np.array(Y_list), dtype=torch.float32)
         
-        # Swap axes to target shape: (Batch, Assets, Seq_Len, Features)
-        X = X.permute(0, 2, 1, 3)
+        # HARDWARE LOCK: .contiguous() physically rebuilds the RAM block 
+        # so PyTorch can never throw a 'view size is not compatible' error.
+        X = X.permute(0, 2, 1, 3).contiguous()
         
         return X, Y, list(symbols)
         
     except Exception as e:
         print(f"❌ FATAL COMPILER ERROR: {str(e)}")
-        print("Booting synthetic fallback...")
         return torch.randn(32, max_assets, seq_len, 4), torch.randn(32, max_assets) * 0.05, [f"MOCK_{i}" for i in range(max_assets)]
 
 # ==============================================================================
@@ -183,17 +162,15 @@ def compile_fo_universe(csv_path="historical_fno.csv", seq_len=10, max_assets=50
 # ==============================================================================
 def run_quantum_desk():
     set_seeds(42)
-    MAX_ASSETS = 50     # Caps the F&O universe read from the CSV
-    SEQ_LEN = 10        # Rolling path window
-    FEATURES = 4        # OHLC
-    BOND_DIM = 16       # Entanglement depth
+    MAX_ASSETS = 50     
+    SEQ_LEN = 10        
+    FEATURES = 4        
+    BOND_DIM = 16       
     EPOCHS = 10
     
-    # Compile the physical CSV data into tensor geometry
     X_data, Y_data, asset_names = compile_fo_universe(csv_path="historical_fno.csv", seq_len=SEQ_LEN, max_assets=MAX_ASSETS)
-    actual_assets = X_data.shape[1] # Adjust dynamically if CSV has fewer than 50 stocks
+    actual_assets = X_data.shape[1] 
     
-    # Initialize Engine
     brain = EntangledQuantumBrain(num_assets=actual_assets, num_features=FEATURES, bond_dim=BOND_DIM)
     optimizer = optim.AdamW(brain.parameters(), lr=0.01, weight_decay=1e-4)
     loss_function = HamiltonianEnergyLoss(risk_penalty=1.0)
@@ -204,12 +181,10 @@ def run_quantum_desk():
     print(f"-> Training Tensors Compiled: {len(X_data)} Path Signatures")
     print("-" * 65)
     
-    # Train the Matrix Product State
     brain.train()
     batch_size = 64
     for epoch in range(1, EPOCHS + 1):
         epoch_loss = 0.0
-        # Iterate over mini-batches to prevent OOM on massive CSVs
         for i in range(0, len(X_data), batch_size):
             X_batch = X_data[i:i+batch_size]
             Y_batch = Y_data[i:i+batch_size]
@@ -226,12 +201,10 @@ def run_quantum_desk():
         avg_loss = epoch_loss / (len(X_data) / batch_size + 1e-8)
         print(f"Epoch {epoch:02d} | Hamiltonian Energy State: {avg_loss:>8.5f} | Convergence Optimal")
 
-    # Final Inference (Wavefunction Collapse for Tomorrow)
     print("-" * 65)
     print("🚀 LIVE INFERENCE: EXECUTING WAVEFUNCTION COLLAPSE FOR T+1")
     brain.eval()
     with torch.no_grad():
-        # Feed the absolute latest window in the dataset
         live_allocations = brain(X_data[-1].unsqueeze(0))[0] 
         
     top_trades = torch.topk(live_allocations, k=5)
