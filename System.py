@@ -32,67 +32,84 @@ def set_seeds(seed=42):
     torch.backends.cudnn.deterministic = True
 
 # ==============================================================================
-# 1. THE HIGH-END BRAIN: TIME-SERIES TRANSFORMER AUTOENCODER
+# 1. INSTITUTIONAL DEEP LEARNING: TIME2VEC + CONV-TRANSFORMER
 # ==============================================================================
-class PositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_len=120):
-        super(PositionalEncoding, self).__init__()
-        pe = torch.zeros(max_len, d_model)
-        position = torch.arange(0, max_len, dtype=torch.float).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2).float() * (-np.log(10000.0) / d_model))
-        pe[:, 0::2] = torch.sin(position * div_term)
-        pe[:, 1::2] = torch.cos(position * div_term)
-        self.register_buffer('pe', pe.unsqueeze(0))
-
+class Time2Vec(nn.Module):
+    def __init__(self, seq_len):
+        super(Time2Vec, self).__init__()
+        self.seq_len = seq_len
+        self.w0 = nn.parameter.Parameter(torch.randn(seq_len, 1))
+        self.b0 = nn.parameter.Parameter(torch.randn(seq_len, 1))
+        self.w = nn.parameter.Parameter(torch.randn(seq_len, 3)) 
+        self.b = nn.parameter.Parameter(torch.randn(seq_len, 3))
+        
     def forward(self, x):
-        return x + self.pe[:, :x.size(1)]
+        time_linear = self.w0 * x[:, :, 0:1] + self.b0
+        time_periodic = torch.sin(x[:, :, 0:1] * self.w + self.b)
+        t2v = torch.cat([time_linear, time_periodic], dim=-1) 
+        return torch.cat([x, t2v], dim=-1) 
 
-class TransformerBrain(nn.Module):
-    def __init__(self, num_features=5, d_model=16, nhead=4, num_layers=2, latent_dim=12):
-        super(TransformerBrain, self).__init__()
-        self.input_projection = nn.Linear(num_features, d_model)
-        self.pos_encoder = PositionalEncoding(d_model, max_len=120)
+class AdvancedQuantBrain(nn.Module):
+    def __init__(self, num_features=5, d_model=32, nhead=4, num_layers=2, latent_dim=16):
+        super(AdvancedQuantBrain, self).__init__()
+        self.t2v = Time2Vec(seq_len=120)
+        t2v_out_dim = num_features + 4
         
-        encoder_layers = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=64, batch_first=True)
-        self.transformer_encoder = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
+        self.conv1 = nn.Conv1d(in_channels=t2v_out_dim, out_channels=d_model, kernel_size=3, padding=1)
+        self.conv2 = nn.Conv1d(in_channels=d_model, out_channels=d_model, kernel_size=3, padding=1)
         
-        self.latent_projection = nn.Sequential(
-            nn.Flatten(),
-            nn.Linear(120 * d_model, 64),
-            nn.ReLU(),
+        encoder_layers = nn.TransformerEncoderLayer(d_model=d_model, nhead=nhead, dim_feedforward=128, batch_first=True, dropout=0.1)
+        self.transformer = nn.TransformerEncoder(encoder_layers, num_layers=num_layers)
+        
+        self.attention_pool = nn.Linear(d_model, 1)
+        self.latent_proj = nn.Sequential(
+            nn.Linear(d_model, 64),
+            nn.LayerNorm(64),
+            nn.GELU(),
             nn.Linear(64, latent_dim)
         )
         
-        self.decoder = nn.Sequential(
+        self.reconstruction_head = nn.Sequential(
             nn.Linear(latent_dim, 64),
-            nn.ReLU(),
+            nn.GELU(),
             nn.Linear(64, 120 * num_features),
             nn.Unflatten(1, (120, num_features))
         )
+        
+        self.return_head = nn.Sequential(
+            nn.Linear(latent_dim, 32),
+            nn.GELU(),
+            nn.Linear(32, 1)
+        )
 
     def encode(self, x):
-        x = self.input_projection(x)
-        x = self.pos_encoder(x)
-        x = self.transformer_encoder(x)
-        latent = self.latent_projection(x)
+        x = self.t2v(x) 
+        x = x.transpose(1, 2)
+        x = torch.relu(self.conv1(x))
+        x = torch.relu(self.conv2(x))
+        x = x.transpose(1, 2) 
+        
+        x = self.transformer(x)
+        attn_weights = torch.softmax(self.attention_pool(x), dim=1)
+        x_pooled = torch.sum(x * attn_weights, dim=1) 
+        
+        latent = self.latent_proj(x_pooled) 
         return latent
 
     def forward(self, x):
         latent = self.encode(x)
-        reconstructed = self.decoder(latent)
-        return reconstructed, latent
+        reconstructed = self.reconstruction_head(latent)
+        pred_return = self.return_head(latent)
+        return reconstructed, pred_return, latent
 
 # ==============================================================================
-# 2. FEATURE FUSION: DEEP EMBEDDINGS + MACRO MATH
+# 2. MACRO STATISTICAL ANCHORS
 # ==============================================================================
 def extract_macro_statistics(ohlcv_window):
-    """Calculates explicitly anchored statistical boundaries to ground the neural net."""
     opens, highs, lows, closes, volumes = ohlcv_window[:, 0], ohlcv_window[:, 1], ohlcv_window[:, 2], ohlcv_window[:, 3], ohlcv_window[:, 4]
-    last_close = closes[-1]
-    
     macro_min, macro_max = lows.min(), highs.max()
-    pos_in_macro = (last_close - macro_min) / (macro_max - macro_min + 1e-8)
-    ret_120d = (last_close - closes[0]) / (closes[0] + 1e-8)
+    pos_in_macro = (closes[-1] - macro_min) / (macro_max - macro_min + 1e-8)
+    ret_120d = (closes[-1] - closes[0]) / (closes[0] + 1e-8)
     
     daily_returns = np.diff(closes) / (closes[:-1] + 1e-8)
     vol_long = np.std(daily_returns) if len(daily_returns) > 0 else 1e-8
@@ -102,21 +119,40 @@ def extract_macro_statistics(ohlcv_window):
     return np.array([pos_in_macro, ret_120d, vol_ratio, closes[-1]/(opens[-1]+1e-8)], dtype=np.float32)
 
 # ==============================================================================
-# 3. DATA PROCESSING & DEEP LEARNING COMPILER
+# 3. DATA PROCESSING COMPILER (WITH X-RAY LOGS & INDIAN DATE FIX)
 # ==============================================================================
 def read_standard_csv(filename):
-    if not os.path.exists(filename): return None
+    if not filename or not os.path.exists(filename): 
+        print(f"   ❌ ERROR: Could not locate file: {filename}")
+        return None
+        
     df = pd.read_csv(filename)
     df.rename(columns=lambda x: str(x).lower().strip(), inplace=True)
     col_map = {'date':'Date', 'timestamp':'Date', 'symbol':'Symbol', 'ticker':'Symbol', 'open':'Open', 'high':'High', 'low':'Low', 'close':'Close', 'volume':'Volume'}
     df.rename(columns=col_map, inplace=True)
-    if 'Date' in df.columns: df['Date'] = pd.to_datetime(df['Date'], errors='coerce').dt.strftime('%Y-%m-%d'); df.dropna(subset=['Date'], inplace=True)
+    
+    if 'Date' in df.columns: 
+        # FIX: Added format='mixed' to handle DD-MM-YYYY vs YYYY-MM-DD 
+        df['Date'] = pd.to_datetime(df['Date'], errors='coerce', format='mixed').dt.strftime('%Y-%m-%d')
+        dropped = df['Date'].isna().sum()
+        if dropped > 0:
+            print(f"   ⚠️ WARNING: Dropped {dropped} rows due to unparseable dates.")
+        df.dropna(subset=['Date'], inplace=True)
+        
     return df
 
 def build_deep_training_tensors(csv_filename, target_date_str=None, min_pct=0.75):
+    print(f"   -> Loading memory from: {csv_filename}")
     df = read_standard_csv(csv_filename)
-    if df is None or 'Date' not in df.columns: return None, None, None, None
-    if target_date_str: df = df[df['Date'] <= target_date_str]
+    if df is None: return None, None, None, None
+    if 'Date' not in df.columns:
+        print(f"   ❌ ERROR: No 'Date' column found in {csv_filename}")
+        return None, None, None, None
+        
+    if target_date_str: 
+        df = df[df['Date'] <= target_date_str]
+        
+    print(f"   -> Valid rows available up to {target_date_str}: {len(df)}")
     
     X_seq, X_macro, Y_price, Y_risk = [], [], [], []
     LOOKBACK, FUTURE = 120, 2 
@@ -124,6 +160,7 @@ def build_deep_training_tensors(csv_filename, target_date_str=None, min_pct=0.75
     if "nifty" in csv_filename.lower() and 'Symbol' in df.columns:
         df = df[df['Symbol'].astype(str).str.upper().str.contains("NIFTY50|NIFTY")]
 
+    total_extracted = 0
     for symbol, group in df.groupby('Symbol') if 'Symbol' in df.columns else [('ASSET', df)]:
         group = group.sort_values('Date').reset_index(drop=True)
         vals = group[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)
@@ -149,7 +186,6 @@ def build_deep_training_tensors(csv_filename, target_date_str=None, min_pct=0.75
                 
             if abs(actual_pct) < min_pct or entry_price < 10.0: continue
                 
-            # Normalize Sequence for Transformer
             w_min, w_max = window.min(axis=0), window.max(axis=0)
             norm_seq = (window - w_min) / (w_max - w_min + 1e-8)
             
@@ -157,36 +193,50 @@ def build_deep_training_tensors(csv_filename, target_date_str=None, min_pct=0.75
             X_macro.append(extract_macro_statistics(window))
             Y_price.append(actual_pct)
             Y_risk.append(adv_exc)
+            total_extracted += 1
             
-    if len(X_seq) == 0: return None, None, None, None
+    if total_extracted == 0:
+        print(f"   ❌ ERROR: No valid training tensors could be created. Is min_pct ({min_pct}%) too high?")
+        return None, None, None, None
+        
+    print(f"   ✅ Successfully built {total_extracted} Deep Learning Tensors.")
     return np.array(X_seq, dtype=np.float32), np.array(X_macro, dtype=np.float32), np.array(Y_price, dtype=np.float32), np.array(Y_risk, dtype=np.float32)
 
 # ==============================================================================
-# 4. NEURAL NETWORK TRAINING & LATENT INDEXING
+# 4. MULTI-TASK NETWORK TRAINING (Supervised Contrastive Influence)
 # ==============================================================================
-def train_high_end_brain(X_seq, X_macro, Y_price, Y_risk, epochs=25):
-    print(f"   [Deep Learning] Training Transformer on {len(X_seq)} market sequences...")
-    model = TransformerBrain()
-    optimizer = optim.Adam(model.parameters(), lr=0.003)
-    criterion = nn.MSELoss()
+def train_high_end_brain(X_seq, X_macro, Y_price, Y_risk, epochs=30):
+    print(f"   [AI] Fusing Time2Vec & Transformer over {len(X_seq)} parameters...")
+    model = AdvancedQuantBrain(latent_dim=16)
+    optimizer = optim.AdamW(model.parameters(), lr=0.002, weight_decay=1e-4)
+    
+    criterion_recon = nn.MSELoss()
+    criterion_return = nn.HuberLoss() 
     
     tensor_x = torch.tensor(X_seq)
-    loader = DataLoader(TensorDataset(tensor_x, tensor_x), batch_size=256, shuffle=True)
+    tensor_y = torch.tensor(Y_price).unsqueeze(1)
+    
+    dataset = TensorDataset(tensor_x, tensor_y)
+    loader = DataLoader(dataset, batch_size=256, shuffle=True)
     
     model.train()
     for e in range(epochs):
-        for batch_x, _ in loader:
+        for batch_x, batch_y in loader:
             optimizer.zero_grad()
-            recon, _ = model(batch_x)
-            loss = criterion(recon, batch_x)
-            loss.backward()
+            recon, pred_y, _ = model(batch_x)
+            
+            loss_r = criterion_recon(recon, batch_x)
+            loss_y = criterion_return(pred_y, batch_y)
+            total_loss = (0.7 * loss_r) + (0.3 * loss_y)
+            
+            total_loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
 
     model.eval()
     with torch.no_grad():
         latent_vectors = model.encode(tensor_x).numpy()
         
-    # Fuse Deep Transformer Intuition + Explicit Macro Statistics
     fused_features = np.hstack((latent_vectors, X_macro))
     fused_contig = np.ascontiguousarray(fused_features, dtype=np.float32)
     
@@ -271,12 +321,12 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
         <div style="background-color: white; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 6px solid {macro_color};">
             <h3 style="margin-top: 0; color: #333;">🌍 MACRO REGIME (Deep Transformer Embeddings)</h3>
             <p style="font-size: 16px; color: #333; margin: 5px 0;">
-                <b>Consensus Direction:</b> <span style="color: {macro_color}; font-weight: bold;">{macro_data['direction']}</span><br>
+                <b>Direction:</b> <span style="color: {macro_color}; font-weight: bold;">{macro_data['direction']}</span><br>
                 <b>Expected Target:</b> {macro_data['target_display']} | <b>Expected Max Pain:</b> {macro_data['risk_pct']:.2f}%<br>
-                <b>Deep Latent Similarity:</b> {macro_data['conviction']:.2f}%
+                <b>Structural Confidence:</b> {macro_data['conviction']:.2f}%
             </p>
         </div>
-        <h3 style="color: #333;">⚡ MICRO F&O SWEEP (3/5 Deep Consensus)</h3>
+        <h3 style="color: #333;">⚡ MICRO F&O SWEEP (3/5 Dynamic Consensus)</h3>
         <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%; text-align: center; font-size: 14px; background-color: white;">
           <tr bgcolor="#f8f9fa" style="color: #333; font-weight: bold;">
             <th>Asset</th><th>Consensus</th><th>AI Similarity</th><th>Execution Price</th><th>Max Hist. Pain (SL)</th><th>Expected Target</th><th>Result</th>
@@ -291,7 +341,7 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
     try:
         server = smtplib.SMTP('smtp.gmail.com', 587); server.starttls(); server.login(sender_email, sender_pass)
         server.sendmail(sender_email, recipient_email, msg.as_string()); server.quit()
-        print("✅ Report Dispatched.")
+        print("✅ Elite Quant Report Dispatched.")
     except Exception as e: print(f"Failed to send email: {str(e)}")
 
 def run_production_sweep():
@@ -300,16 +350,29 @@ def run_production_sweep():
     is_bt = bool(dt_str)
     if not is_bt: dt_str = datetime.now().strftime("%Y-%m-%d")
         
-    print(f"⚙️ EXECUTING HIGH-END TRANSFORMER ENGINE | DATE: {dt_str}")
+    print(f"⚙️ EXECUTING DEEP TIME2VEC-TRANSFORMER ENGINE | DATE: {dt_str}")
     
-    nifty_file = next((os.path.join(r, f) for r, d, files in os.walk(".") for f in files if "nifty" in f.lower() or "historical_indices.csv" in f.lower()), None)
+    nifty_file = None
+    for root, dirs, files in os.walk("."):
+        for f in files:
+            if "nifty" in f.lower() or "historical_indices.csv" in f.lower():
+                nifty_file = os.path.join(root, f)
+                break
+        if nifty_file: break
+                
+    if not nifty_file:
+        print("❌ FATAL: Could not locate a NIFTY CSV file in the directory.")
+        return
 
     # ---------------------------------------------------------
     # PHASE 1: NIFTY MACRO TRANSFORMER
     # ---------------------------------------------------------
-    print("\n🧠 PHASE 1: Building Nifty 50 Transformer Memory...")
+    print("\n🧠 PHASE 1: Building Nifty 50 Multi-Task Neural Memory...")
     Xs_n, Xm_n, Yp_n, Yr_n = build_deep_training_tensors(nifty_file, dt_str, min_pct=0.25)
-    if Xs_n is None: return
+    
+    if Xs_n is None:
+        print("❌ FATAL: Phase 1 (Nifty) data pipeline failed. Cannot proceed.")
+        return
     
     n_model, n_faiss, n_yp, n_yr = train_high_end_brain(Xs_n, Xm_n, Yp_n, Yr_n)
     
@@ -338,15 +401,18 @@ def run_production_sweep():
             mac_rep = {'direction': "SHORT 🔴", 'conviction': conv, 'risk_pct': rsk, 'target_display': f"₹{n_entry * (1 + (pct / 100)):.2f} ({pct:.2f}%)"}
             
     # ---------------------------------------------------------
-    # PHASE 2: F&O MASTER TRANSFORMER
+    # PHASE 2: F&O MASTER TRANSFORMER (Global Setup Alignment)
     # ---------------------------------------------------------
-    print("\n⚡ PHASE 2: Training Global F&O Transformer Engine...")
+    print("\n⚡ PHASE 2: Compiling Global F&O Deep Latent Space...")
     Xs_f, Xm_f, Yp_f, Yr_f = build_deep_training_tensors("historical_fno.csv", dt_str, min_pct=0.75)
-    if Xs_f is None: return
     
-    f_model, f_faiss, f_yp, f_yr = train_high_end_brain(Xs_f, Xm_f, Yp_f, Yr_f, epochs=25)
+    if Xs_f is None:
+        print("❌ FATAL: Phase 2 (F&O) data pipeline failed. historical_fno.csv might be corrupted or lack rows.")
+        return
+        
+    f_model, f_faiss, f_yp, f_yr = train_high_end_brain(Xs_f, Xm_f, Yp_f, Yr_f, epochs=30)
     
-    print("🎯 Phase 3: Sweeping Universe against Transformer Embeddings...")
+    print("🎯 Phase 3: Live Market Inference via Dynamic Attention...")
     final_data = []
     min_conv = float(os.environ.get("PARAM_MIN_CONVICTION", 80.00)) 
     fno_df = read_standard_csv("historical_fno.csv") if is_bt else None
