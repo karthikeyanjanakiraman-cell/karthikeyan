@@ -1,4 +1,5 @@
 import os
+import io  # Added for handling memory downloads
 import time
 import urllib.parse
 import random
@@ -139,8 +140,17 @@ def compile_fo_universe_upstox(seq_len=10, max_assets=30):
 
     print("📥 Fetching Upstox Master Instrument List...")
     try:
+        # Spoofing Chrome User-Agent to bypass Cloudflare 403 Forbidden
         url = "https://assets.upstox.com/ts/instruments/data.csv.gz"
-        instruments_df = pd.read_csv(url)
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36'
+        }
+        
+        response = requests.get(url, headers=headers)
+        response.raise_for_status() # Will raise an exception if it hits 403 again
+        
+        # Read the gzip directly from the bytes buffer
+        instruments_df = pd.read_csv(io.BytesIO(response.content), compression='gzip')
         nse_eq = instruments_df[instruments_df['exchange'] == 'NSE_EQ']
         
         symbol_to_key = {}
@@ -395,3 +405,4 @@ def run_quantum_desk():
 
 if __name__ == "__main__":
     run_quantum_desk()
+
