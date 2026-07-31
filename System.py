@@ -1,6 +1,9 @@
 import os
 import random
 import warnings
+import smtplib
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
 from datetime import datetime
 
 import yfinance as yf
@@ -13,6 +16,14 @@ import torch.optim as optim
 warnings.filterwarnings('ignore')
 
 # ==============================================================================
+# 0. NOTIFICATION CONFIGURATION
+# ==============================================================================
+# Replace these with your actual credentials
+SENDER_EMAIL = "your_email@gmail.com"
+SENDER_PASSWORD = "your_16_character_app_password" # Use App Password, NOT regular password
+RECEIVER_EMAIL = "receiver_email@gmail.com"
+
+# ==============================================================================
 # 1. DETERMINISTIC QUANTUM ENVIRONMENT
 # ==============================================================================
 def set_seeds(seed=42):
@@ -22,7 +33,7 @@ def set_seeds(seed=42):
     torch.backends.cudnn.deterministic = True
 
 # ==============================================================================
-# 2. DYNAMIC F&O UNIVERSE MATCHER (ZERO HARDCODING)
+# 2. DYNAMIC F&O UNIVERSE MATCHER
 # ==============================================================================
 def get_dynamic_fo_symbols():
     print("\n🔍 Scanning live market data for today's active F&O Universe...")
@@ -101,15 +112,7 @@ class EntangledQuantumBrain(nn.Module):
         amplitudes = self.measurement_operator(entangled_state)
         
         raw_signals = torch.tanh(amplitudes)
-        
-        # ======================================================================
-        # 🔥 NEW: MARKET NEUTRAL CONSTRAINT
-        # Subtract the mean signal across all assets for each batch.
-        # This mathematically forces 50% of allocations to be negative (Short) 
-        # and 50% to be positive (Long), breaking the 1-year bull market bias.
-        # ======================================================================
         raw_signals = raw_signals - raw_signals.mean(dim=1, keepdim=True)
-        
         probabilities = raw_signals / (torch.sum(torch.abs(raw_signals), dim=1, keepdim=True) + 1e-8)
         return probabilities
 
@@ -125,7 +128,7 @@ class HamiltonianEnergyLoss(nn.Module):
         return torch.mean(hamiltonian)
 
 # ==============================================================================
-# 5. INSTANT LIVE DATA COMPILER (NO LOOKAHEAD BIAS)
+# 5. INSTANT LIVE DATA COMPILER
 # ==============================================================================
 def fetch_live_fo_data(seq_len=10, forecast_horizon=2):
     fo_symbols = get_dynamic_fo_symbols()
@@ -134,8 +137,6 @@ def fetch_live_fo_data(seq_len=10, forecast_horizon=2):
 
     print(f"📥 Fetching LIVE DAILY price history for {len(fo_symbols)} assets from NSE feeds...")
     df = yf.download(fo_symbols, period="1y", interval="1d", progress=False)
-    
-    # Forward fill handles weekend/holiday gaps. Drops corrupt listings.
     df = df.ffill()
     
     features = ['Open', 'High', 'Low', 'Close']
@@ -162,10 +163,8 @@ def fetch_live_fo_data(seq_len=10, forecast_horizon=2):
 
     X_list, Y_list = [], []
     
-    # Rolling Window Normalization ensures ZERO lookahead bias
     for i in range(len(data_3d) - seq_len - forecast_horizon + 1):
         raw_window = data_3d[i : i + seq_len]
-        
         window_mean = np.mean(raw_window, axis=0, keepdims=True)
         window_std = np.std(raw_window, axis=0, keepdims=True) + 1e-8
         norm_window = (raw_window - window_mean) / window_std
@@ -183,7 +182,6 @@ def fetch_live_fo_data(seq_len=10, forecast_horizon=2):
     Y_train = torch.tensor(np.array(Y_list), dtype=torch.float32)
     X_train = X_train.permute(0, 2, 1, 3).contiguous()
     
-    # Create the Live Inference Tensor (Latest window)
     latest_raw_window = data_3d[-seq_len:]
     latest_mean = np.mean(latest_raw_window, axis=0, keepdims=True)
     latest_std = np.std(latest_raw_window, axis=0, keepdims=True) + 1e-8
@@ -195,7 +193,35 @@ def fetch_live_fo_data(seq_len=10, forecast_horizon=2):
     return X_train, Y_train, X_live, [t.replace('.NS', '') for t in valid_tickers], latest_prices
 
 # ==============================================================================
-# 6. MASTER EXECUTION (MARKET NEUTRAL PROTOCOL)
+# 6. EMAIL DISPATCH SYSTEM
+# ==============================================================================
+def send_trade_report_via_email(report_text):
+    if SENDER_EMAIL == "your_email@gmail.com":
+        print("\n⚠️ Email credentials not set in script. Skipping email dispatch.")
+        return
+
+    print("\n📧 Dispatching trade report via Email...")
+    try:
+        msg = MIMEMultipart()
+        msg['From'] = SENDER_EMAIL
+        msg['To'] = RECEIVER_EMAIL
+        msg['Subject'] = f"📈 Quantum AI Trade Signals - {datetime.now().strftime('%Y-%m-%d')}"
+
+        # Add the report text
+        msg.attach(MIMEText(report_text, 'plain'))
+
+        # Setup SMTP server (Gmail configuration)
+        server = smtplib.SMTP('smtp.gmail.com', 587)
+        server.starttls()
+        server.login(SENDER_EMAIL, SENDER_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        print(f"✅ Email successfully sent to {RECEIVER_EMAIL}!")
+    except Exception as e:
+        print(f"❌ Failed to send email: {e}")
+
+# ==============================================================================
+# 7. MASTER EXECUTION (MARKET NEUTRAL PROTOCOL)
 # ==============================================================================
 def run_quantum_desk():
     set_seeds(42)
@@ -240,16 +266,16 @@ def run_quantum_desk():
     with torch.no_grad():
         live_allocations = brain(X_live)[0] 
         
-    # ==========================================================================
-    # 🏆 MARKET NEUTRAL PROTOCOL: Select Top 10 by Absolute Signal Strength
-    # ==========================================================================
     abs_allocations = torch.abs(live_allocations)
     top_10_indices = torch.argsort(abs_allocations, descending=True)[:10]
     max_signal = torch.max(abs_allocations).item()
 
-    print("\n=======================================================================================")
-    print(" 🏆 TOP 10 SWING TRADES (Market-Neutral / Long & Short Candidates)")
-    print("=======================================================================================")
+    # Create the report string
+    report_lines = []
+    header = "\n=======================================================================================\n"
+    header += " 🏆 TOP 10 SWING TRADES (Market-Neutral / Long & Short Candidates)\n"
+    header += "=======================================================================================\n"
+    report_lines.append(header)
     
     for idx in top_10_indices:
         asset_idx = idx.item()
@@ -258,13 +284,11 @@ def run_quantum_desk():
         is_long = raw_alloc > 0
         direction_text = "LONG 🟢 " if is_long else "SHORT 🔴"
         
-        # Calculate Win Probability relative to the strongest setup of the day
         conviction_score = (abs(raw_alloc) / max_signal) * 99.0
         if conviction_score > 99.0: conviction_score = 99.0
         
         entry_price = latest_prices.get(asset_symbol, 100.0)
         
-        # 10% Position Size, 4% Target, 2% Stop Loss for swing trading
         position_size_pct = 10.0 
         target_pct = 4.0         
         sl_pct = 2.0             
@@ -276,8 +300,18 @@ def run_quantum_desk():
             target = entry_price * (1 - (target_pct / 100.0))
             sl = entry_price * (1 + (sl_pct / 100.0))
         
-        print(f"-> {direction_text} | WIN PROB: {conviction_score:5.1f}% | ALLOC: {position_size_pct:05.2f}% | [ {asset_symbol:<10} ] | CMP: ₹{entry_price:8.2f} | TGT: ₹{target:8.2f} | SL: ₹{sl:8.2f}")
-    print("=======================================================================================\n")
+        trade_line = f"-> {direction_text} | WIN PROB: {conviction_score:5.1f}% | ALLOC: {position_size_pct:05.2f}% | [ {asset_symbol:<10} ] | CMP: ₹{entry_price:8.2f} | TGT: ₹{target:8.2f} | SL: ₹{sl:8.2f}"
+        report_lines.append(trade_line)
+    
+    footer = "\n=======================================================================================\n"
+    report_lines.append(footer)
+    
+    # Print to console
+    final_report = "\n".join(report_lines)
+    print(final_report)
+    
+    # Send email
+    send_trade_report_via_email(final_report)
 
 if __name__ == "__main__":
     run_quantum_desk()
