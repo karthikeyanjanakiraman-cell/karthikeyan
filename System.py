@@ -116,16 +116,19 @@ class HamiltonianEnergyLoss(nn.Module):
         return torch.mean(hamiltonian)
 
 # ==============================================================================
-# 5. INSTANT LIVE DATA COMPILER
+# 5. INSTANT LIVE DATA COMPILER (FIXED PIPELINE, DAILY HORIZON)
 # ==============================================================================
-def fetch_live_fo_data(seq_len=10):
+def fetch_live_fo_data(seq_len=100, forecast_horizon=2):
     fo_symbols = get_dynamic_fo_symbols()
     if not fo_symbols:
         raise ValueError("Failed to retrieve dynamic F&O symbols. Cannot proceed.")
 
-    print(f"📥 Fetching LIVE price history for {len(fo_symbols)} assets from NSE feeds...")
+    print(f"📥 Fetching LIVE DAILY price history for {len(fo_symbols)} assets from NSE feeds...")
     df = yf.download(fo_symbols, period="1y", interval="1d", progress=False)
-    df = df.ffill().bfill()
+    
+    # Forward fill handles weekend/holiday gaps. 
+    # Drop any asset that was listed recently and still contains NaNs to prevent data leakage.
+    df = df.ffill()
     
     features = ['Open', 'High', 'Low', 'Close']
     valid_tickers = []
@@ -139,7 +142,7 @@ def fetch_live_fo_data(seq_len=10):
         if not is_corrupted:
             valid_tickers.append(ticker)
 
-    print(f"✅ Proceeding with {len(valid_tickers)} mathematically clean assets.")
+    print(f"✅ Proceeding with {len(valid_tickers)} mathematically clean assets (full history).")
     
     data_3d = np.zeros((len(df), len(valid_tickers), len(features)))
     latest_prices = {}
@@ -149,30 +152,41 @@ def fetch_live_fo_data(seq_len=10):
             data_3d[:, j, k] = df[feat][ticker].values
         latest_prices[ticker.replace('.NS', '')] = float(df['Close'][ticker].iloc[-1])
 
-    mean = np.mean(data_3d, axis=0, keepdims=True)
-    std = np.std(data_3d, axis=0, keepdims=True) + 1e-8
-    data_3d_norm = (data_3d - mean) / std
-    
     X_list, Y_list = [], []
     
-    for i in range(len(data_3d_norm) - seq_len):
-        x_window = data_3d_norm[i : i + seq_len]
-        current_close = data_3d_norm[i + seq_len - 1, :, 3]
-        target_idx = i + seq_len + 1 
-        if target_idx >= len(data_3d_norm):
-            break 
-            
-        future_close_t2 = data_3d_norm[target_idx, :, 3]
-        y_target = (future_close_t2 - current_close) / (np.abs(current_close) + 1e-8)
+    # Rolling Window Normalization ensures ZERO lookahead bias
+    for i in range(len(data_3d) - seq_len - forecast_horizon + 1):
+        raw_window = data_3d[i : i + seq_len]
         
-        X_list.append(x_window)
+        # Calculate mean/std based ONLY on the current sliding window
+        window_mean = np.mean(raw_window, axis=0, keepdims=True)
+        window_std = np.std(raw_window, axis=0, keepdims=True) + 1e-8
+        norm_window = (raw_window - window_mean) / window_std
+        
+        current_close = raw_window[-1, :, 3]
+        target_idx = i + seq_len + forecast_horizon - 1 
+        future_close = data_3d[target_idx, :, 3]
+        
+        # Calculate actual percentage return
+        y_target = (future_close - current_close) / (np.abs(current_close) + 1e-8)
+        
+        X_list.append(norm_window)
         Y_list.append(y_target)
         
-    X = torch.tensor(np.array(X_list), dtype=torch.float32)
-    Y = torch.tensor(np.array(Y_list), dtype=torch.float32)
-    X = X.permute(0, 2, 1, 3).contiguous()
+    X_train = torch.tensor(np.array(X_list), dtype=torch.float32)
+    Y_train = torch.tensor(np.array(Y_list), dtype=torch.float32)
+    X_train = X_train.permute(0, 2, 1, 3).contiguous()
     
-    return X, Y, [t.replace('.NS', '') for t in valid_tickers], latest_prices
+    # Create the Live Inference Tensor (Latest window)
+    latest_raw_window = data_3d[-seq_len:]
+    latest_mean = np.mean(latest_raw_window, axis=0, keepdims=True)
+    latest_std = np.std(latest_raw_window, axis=0, keepdims=True) + 1e-8
+    latest_norm_window = (latest_raw_window - latest_mean) / latest_std
+    
+    X_live = torch.tensor(latest_norm_window, dtype=torch.float32).unsqueeze(0)
+    X_live = X_live.permute(0, 2, 1, 3).contiguous()
+    
+    return X_train, Y_train, X_live, [t.replace('.NS', '') for t in valid_tickers], latest_prices
 
 # ==============================================================================
 # 6. MASTER EXECUTION (HIGH WIN-RATE FILTER)
@@ -184,14 +198,14 @@ def run_quantum_desk():
     BOND_DIM = 16       
     EPOCHS = 10
     
-    X_data, Y_data, asset_names, latest_prices = fetch_live_fo_data(seq_len=SEQ_LEN)
-    actual_assets = X_data.shape[1] 
+    X_train, Y_train, X_live, asset_names, latest_prices = fetch_live_fo_data(seq_len=SEQ_LEN, forecast_horizon=2)
+    actual_assets = X_train.shape[1] 
     
     brain = EntangledQuantumBrain(num_assets=actual_assets, num_features=FEATURES, bond_dim=BOND_DIM)
     optimizer = optim.AdamW(brain.parameters(), lr=0.01, weight_decay=1e-4)
     loss_function = HamiltonianEnergyLoss(risk_penalty=1.0)
     
-    print("\n🌌 WAKING THE ENTANGLED QUANTUM BRAIN (LONG/SHORT HORIZON)")
+    print("\n🌌 WAKING THE ENTANGLED QUANTUM BRAIN (DAILY/SWING HORIZON)")
     print(f"-> Crunching Multi-Dimensional Tensors for {actual_assets} Assets")
     print("-" * 65)
     
@@ -199,9 +213,9 @@ def run_quantum_desk():
     batch_size = 64
     for epoch in range(1, EPOCHS + 1):
         epoch_loss = 0.0
-        for i in range(0, len(X_data), batch_size):
-            X_batch = X_data[i:i+batch_size]
-            Y_batch = Y_data[i:i+batch_size]
+        for i in range(0, len(X_train), batch_size):
+            X_batch = X_train[i:i+batch_size]
+            Y_batch = Y_train[i:i+batch_size]
             
             optimizer.zero_grad()
             allocations = brain(X_batch)
@@ -212,13 +226,13 @@ def run_quantum_desk():
             optimizer.step()
             epoch_loss += loss.item()
             
-        avg_loss = epoch_loss / (len(X_data) / batch_size + 1e-8)
+        avg_loss = epoch_loss / (len(X_train) / batch_size + 1e-8)
         print(f"Epoch {epoch:02d} | 2-Day Hamiltonian Energy State: {avg_loss:>8.5f} | Convergence Optimal")
 
     print("-" * 65)
     brain.eval()
     with torch.no_grad():
-        live_allocations = brain(X_data[-1].unsqueeze(0))[0] 
+        live_allocations = brain(X_live)[0] 
         
     # ==========================================================================
     # 🏆 HIGH WIN-RATE PROTOCOL: Select Top 10 by Absolute Signal Strength
@@ -228,7 +242,7 @@ def run_quantum_desk():
     max_signal = torch.max(abs_allocations).item()
 
     print("\n=======================================================================================")
-    print(" 🏆 TOP 10 HIGH WIN-RATE TRADES (Ranked by AI Conviction Score)")
+    print(" 🏆 TOP 10 SWING TRADES (Ranked by AI Conviction Score)")
     print("=======================================================================================")
     
     for idx in top_10_indices:
@@ -244,7 +258,7 @@ def run_quantum_desk():
         
         entry_price = latest_prices.get(asset_symbol, 100.0)
         
-        # 10% Position Size, 4% Target, 2% Stop Loss
+        # 10% Position Size, 4% Target, 2% Stop Loss for swing trading
         position_size_pct = 10.0 
         target_pct = 4.0         
         sl_pct = 2.0             
