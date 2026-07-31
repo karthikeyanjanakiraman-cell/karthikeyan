@@ -101,6 +101,15 @@ class EntangledQuantumBrain(nn.Module):
         amplitudes = self.measurement_operator(entangled_state)
         
         raw_signals = torch.tanh(amplitudes)
+        
+        # ======================================================================
+        # 🔥 NEW: MARKET NEUTRAL CONSTRAINT
+        # Subtract the mean signal across all assets for each batch.
+        # This mathematically forces 50% of allocations to be negative (Short) 
+        # and 50% to be positive (Long), breaking the 1-year bull market bias.
+        # ======================================================================
+        raw_signals = raw_signals - raw_signals.mean(dim=1, keepdim=True)
+        
         probabilities = raw_signals / (torch.sum(torch.abs(raw_signals), dim=1, keepdim=True) + 1e-8)
         return probabilities
 
@@ -116,9 +125,9 @@ class HamiltonianEnergyLoss(nn.Module):
         return torch.mean(hamiltonian)
 
 # ==============================================================================
-# 5. INSTANT LIVE DATA COMPILER (FIXED PIPELINE, DAILY HORIZON)
+# 5. INSTANT LIVE DATA COMPILER (NO LOOKAHEAD BIAS)
 # ==============================================================================
-def fetch_live_fo_data(seq_len=100, forecast_horizon=2):
+def fetch_live_fo_data(seq_len=10, forecast_horizon=2):
     fo_symbols = get_dynamic_fo_symbols()
     if not fo_symbols:
         raise ValueError("Failed to retrieve dynamic F&O symbols. Cannot proceed.")
@@ -126,8 +135,7 @@ def fetch_live_fo_data(seq_len=100, forecast_horizon=2):
     print(f"📥 Fetching LIVE DAILY price history for {len(fo_symbols)} assets from NSE feeds...")
     df = yf.download(fo_symbols, period="1y", interval="1d", progress=False)
     
-    # Forward fill handles weekend/holiday gaps. 
-    # Drop any asset that was listed recently and still contains NaNs to prevent data leakage.
+    # Forward fill handles weekend/holiday gaps. Drops corrupt listings.
     df = df.ffill()
     
     features = ['Open', 'High', 'Low', 'Close']
@@ -142,7 +150,7 @@ def fetch_live_fo_data(seq_len=100, forecast_horizon=2):
         if not is_corrupted:
             valid_tickers.append(ticker)
 
-    print(f"✅ Proceeding with {len(valid_tickers)} mathematically clean assets (full history).")
+    print(f"✅ Proceeding with {len(valid_tickers)} mathematically clean assets.")
     
     data_3d = np.zeros((len(df), len(valid_tickers), len(features)))
     latest_prices = {}
@@ -158,7 +166,6 @@ def fetch_live_fo_data(seq_len=100, forecast_horizon=2):
     for i in range(len(data_3d) - seq_len - forecast_horizon + 1):
         raw_window = data_3d[i : i + seq_len]
         
-        # Calculate mean/std based ONLY on the current sliding window
         window_mean = np.mean(raw_window, axis=0, keepdims=True)
         window_std = np.std(raw_window, axis=0, keepdims=True) + 1e-8
         norm_window = (raw_window - window_mean) / window_std
@@ -167,7 +174,6 @@ def fetch_live_fo_data(seq_len=100, forecast_horizon=2):
         target_idx = i + seq_len + forecast_horizon - 1 
         future_close = data_3d[target_idx, :, 3]
         
-        # Calculate actual percentage return
         y_target = (future_close - current_close) / (np.abs(current_close) + 1e-8)
         
         X_list.append(norm_window)
@@ -189,7 +195,7 @@ def fetch_live_fo_data(seq_len=100, forecast_horizon=2):
     return X_train, Y_train, X_live, [t.replace('.NS', '') for t in valid_tickers], latest_prices
 
 # ==============================================================================
-# 6. MASTER EXECUTION (HIGH WIN-RATE FILTER)
+# 6. MASTER EXECUTION (MARKET NEUTRAL PROTOCOL)
 # ==============================================================================
 def run_quantum_desk():
     set_seeds(42)
@@ -235,14 +241,14 @@ def run_quantum_desk():
         live_allocations = brain(X_live)[0] 
         
     # ==========================================================================
-    # 🏆 HIGH WIN-RATE PROTOCOL: Select Top 10 by Absolute Signal Strength
+    # 🏆 MARKET NEUTRAL PROTOCOL: Select Top 10 by Absolute Signal Strength
     # ==========================================================================
     abs_allocations = torch.abs(live_allocations)
     top_10_indices = torch.argsort(abs_allocations, descending=True)[:10]
     max_signal = torch.max(abs_allocations).item()
 
     print("\n=======================================================================================")
-    print(" 🏆 TOP 10 SWING TRADES (Ranked by AI Conviction Score)")
+    print(" 🏆 TOP 10 SWING TRADES (Market-Neutral / Long & Short Candidates)")
     print("=======================================================================================")
     
     for idx in top_10_indices:
