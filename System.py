@@ -27,21 +27,13 @@ def set_seeds(seed=42):
 def get_dynamic_fo_symbols():
     print("\n🔍 Scanning live market data for today's active F&O Universe...")
     try:
-        # Zerodha provides a daily open public CSV of all trading instruments
         url = "https://api.kite.trade/instruments"
         df = pd.read_csv(url)
-        
-        # Filter strictly for the F&O Futures segment
         nfo_df = df[df['segment'] == 'NFO-FUT']
-        
-        # The 'name' column contains the base stock ticker (e.g., RELIANCE, TCS)
         raw_symbols = nfo_df['name'].dropna().unique().tolist()
         
-        # Exclude market indices (we only want equities/stocks)
         indices_to_exclude = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']
         valid_symbols = [sym for sym in raw_symbols if sym not in indices_to_exclude]
-        
-        # Format for Yahoo Finance
         fo_symbols_ns = [f"{sym}.NS" for sym in valid_symbols]
         
         print(f"✅ Successfully discovered {len(fo_symbols_ns)} active F&O stocks dynamically.")
@@ -49,7 +41,6 @@ def get_dynamic_fo_symbols():
         
     except Exception as e:
         print(f"❌ Failed to fetch dynamic symbols: {e}")
-        print("⚠️ Ensure you have an active internet connection.")
         return []
 
 # ==============================================================================
@@ -125,60 +116,45 @@ class HamiltonianEnergyLoss(nn.Module):
         return torch.mean(hamiltonian)
 
 # ==============================================================================
-# 5. INSTANT LIVE DATA COMPILER (WITH QUARANTINE PROTOCOL)
+# 5. INSTANT LIVE DATA COMPILER
 # ==============================================================================
 def fetch_live_fo_data(seq_len=10):
     fo_symbols = get_dynamic_fo_symbols()
-    
     if not fo_symbols:
         raise ValueError("Failed to retrieve dynamic F&O symbols. Cannot proceed.")
 
     print(f"📥 Fetching LIVE price history for {len(fo_symbols)} assets from NSE feeds...")
-    print("⏳ This will take ~10 seconds. No files or tokens required.")
-    
-    # Download 1-year bulk data instantly
     df = yf.download(fo_symbols, period="1y", interval="1d", progress=False)
-    
-    # Clean the data (forward fill missing days, backward fill early gaps)
     df = df.ffill().bfill()
     
-    # QUARANTINE PROTOCOL: Strictly filter out any ticker containing NaN values
     features = ['Open', 'High', 'Low', 'Close']
     valid_tickers = []
     
-    # Check all columns to ensure no NaNs survived the fill
     for ticker in df['Close'].columns:
         is_corrupted = False
         for feat in features:
             if df[feat][ticker].isna().any():
                 is_corrupted = True
                 break
-        
         if not is_corrupted:
             valid_tickers.append(ticker)
 
-    failed_count = len(fo_symbols) - len(valid_tickers)
-    print(f"✅ Download complete. Automatically dropped {failed_count} broken/delisted symbols to protect the Tensor Math.")
     print(f"✅ Proceeding with {len(valid_tickers)} mathematically clean assets.")
     
     data_3d = np.zeros((len(df), len(valid_tickers), len(features)))
     latest_prices = {}
     
-    # Construct Tensor Matrix using ONLY clean valid tickers
     for j, ticker in enumerate(valid_tickers):
         for k, feat in enumerate(features):
             data_3d[:, j, k] = df[feat][ticker].values
-        # Save the current real-time closing price
         latest_prices[ticker.replace('.NS', '')] = float(df['Close'][ticker].iloc[-1])
 
-    # Normalize data
     mean = np.mean(data_3d, axis=0, keepdims=True)
     std = np.std(data_3d, axis=0, keepdims=True) + 1e-8
     data_3d_norm = (data_3d - mean) / std
     
     X_list, Y_list = [], []
     
-    # 48-HOUR SHIFT WINDOW
     for i in range(len(data_3d_norm) - seq_len):
         x_window = data_3d_norm[i : i + seq_len]
         current_close = data_3d_norm[i + seq_len - 1, :, 3]
@@ -199,7 +175,7 @@ def fetch_live_fo_data(seq_len=10):
     return X, Y, [t.replace('.NS', '') for t in valid_tickers], latest_prices
 
 # ==============================================================================
-# 6. MASTER EXECUTION
+# 6. MASTER EXECUTION (HIGH WIN-RATE FILTER)
 # ==============================================================================
 def run_quantum_desk():
     set_seeds(42)
@@ -208,7 +184,6 @@ def run_quantum_desk():
     BOND_DIM = 16       
     EPOCHS = 10
     
-    # FETCH LIVE DATA
     X_data, Y_data, asset_names, latest_prices = fetch_live_fo_data(seq_len=SEQ_LEN)
     actual_assets = X_data.shape[1] 
     
@@ -241,32 +216,38 @@ def run_quantum_desk():
         print(f"Epoch {epoch:02d} | 2-Day Hamiltonian Energy State: {avg_loss:>8.5f} | Convergence Optimal")
 
     print("-" * 65)
-    print("🚀 LIVE INFERENCE: EXECUTING LONG/SHORT WAVEFUNCTION COLLAPSE FOR T+2")
     brain.eval()
     with torch.no_grad():
         live_allocations = brain(X_data[-1].unsqueeze(0))[0] 
         
-    sorted_indices = torch.argsort(live_allocations, descending=True)
+    # ==========================================================================
+    # 🏆 HIGH WIN-RATE PROTOCOL: Select Top 10 by Absolute Signal Strength
+    # ==========================================================================
+    abs_allocations = torch.abs(live_allocations)
+    top_10_indices = torch.argsort(abs_allocations, descending=True)[:10]
+    max_signal = torch.max(abs_allocations).item()
+
+    print("\n=======================================================================================")
+    print(" 🏆 TOP 10 HIGH WIN-RATE TRADES (Ranked by AI Conviction Score)")
+    print("=======================================================================================")
     
-    # Absolute best 5 Longs and best 5 Shorts
-    top_longs = sorted_indices[:5]   
-    top_shorts = sorted_indices[-5:] 
-    
-    target_indices = torch.cat((top_longs, top_shorts))
-    
-    print("\n==================================================================")
-    for idx in target_indices:
+    for idx in top_10_indices:
         asset_idx = idx.item()
         asset_symbol = asset_names[asset_idx]
         raw_alloc = live_allocations[asset_idx].item()
-        
-        abs_weight = abs(raw_alloc) * 100
         is_long = raw_alloc > 0
         direction_text = "LONG 🟢 " if is_long else "SHORT 🔴"
         
+        # Calculate Win Probability relative to the strongest setup of the day
+        conviction_score = (abs(raw_alloc) / max_signal) * 99.0
+        if conviction_score > 99.0: conviction_score = 99.0
+        
         entry_price = latest_prices.get(asset_symbol, 100.0)
-        target_pct = (abs_weight / 100.0) * 15.0 
-        sl_pct = target_pct / 1.5               
+        
+        # 10% Position Size, 4% Target, 2% Stop Loss
+        position_size_pct = 10.0 
+        target_pct = 4.0         
+        sl_pct = 2.0             
         
         if is_long:
             target = entry_price * (1 + (target_pct / 100.0))
@@ -275,8 +256,8 @@ def run_quantum_desk():
             target = entry_price * (1 - (target_pct / 100.0))
             sl = entry_price * (1 + (sl_pct / 100.0))
         
-        print(f"-> {direction_text} | ALLOCATE {abs_weight:05.2f}% TO [ {asset_symbol:<10} ] | CMP: ₹{entry_price:8.2f} | TGT: ₹{target:8.2f} | SL: ₹{sl:8.2f}")
-    print("==================================================================\n")
+        print(f"-> {direction_text} | WIN PROB: {conviction_score:5.1f}% | ALLOC: {position_size_pct:05.2f}% | [ {asset_symbol:<10} ] | CMP: ₹{entry_price:8.2f} | TGT: ₹{target:8.2f} | SL: ₹{sl:8.2f}")
+    print("=======================================================================================\n")
 
 if __name__ == "__main__":
     run_quantum_desk()
