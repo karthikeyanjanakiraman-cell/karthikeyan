@@ -13,37 +13,6 @@ import torch.optim as optim
 warnings.filterwarnings('ignore')
 
 # ==============================================================================
-# 0. ALL NSE F&O SYMBOLS (LIVE TICKERS)
-# ==============================================================================
-FO_SYMBOLS = [
-    f"{sym}.NS" for sym in [
-        "AARTIIND", "ABB", "ABBOTINDIA", "ABCAPITAL", "ABFRL", "ACC", "ADANIENT", "ADANIPORTS", 
-        "ALKEM", "AMBUJACEM", "APOLLOHOSP", "APOLLOTYRE", "ASHOKLEY", "ASIANPAINT", "ASTRAL", 
-        "ATUL", "AUBANK", "AUROPHARMA", "AXISBANK", "BAJAJ-AUTO", "BAJAJFINSV", "BAJFINANCE", 
-        "BALKRISIND", "BALRAMCHIN", "BANDHANBNK", "BANKBARODA", "BATAINDIA", "BEL", "BERGEPAINT", 
-        "BHARATFORG", "BHARTIARTL", "BHEL", "BIOCON", "BOSCHLTD", "BPCL", "BRITANNIA", "CANBK", 
-        "CANFINHOME", "CHAMBLFERT", "CHOLAFIN", "CIPLA", "COALINDIA", "COFORGE", "COLPAL", "CONCOR", 
-        "COROMANDEL", "CROMPTON", "CUB", "CUMMINSIND", "DABUR", "DALBHARAT", "DEEPAKNTR", "DIVISLAB", 
-        "DIXON", "DLF", "DRREDDY", "EICHERMOT", "ESCORTS", "EXIDEIND", "FEDERALBNK", "GAIL", 
-        "GLENMARK", "GMRINFRA", "GNFC", "GODREJCP", "GODREJPROP", "GRANULES", "GRASIM", "GUJGASLTD", 
-        "HAL", "HAVELLS", "HCLTECH", "HDFCAMC", "HDFCBANK", "HDFCLIFE", "HEROMOTOCO", "HINDALCO", 
-        "HINDCOPPER", "HINDPETRO", "HINDUNILVR", "ICICIBANK", "ICICIGI", "ICICIPRULI", "IDEA", 
-        "IDFCFIRSTB", "IEX", "IGL", "INDHOTEL", "INDIACEM", "INDIAMART", "INDIGO", "INDUSINDBK", 
-        "INDUSTOWER", "INFY", "INTELLECT", "IOC", "IPCALAB", "IRCTC", "ITC", "JINDALSTEL", 
-        "JKCEMENT", "JSWSTEEL", "JUBLFOOD", "KOTAKBANK", "LALPATHLAB", "LAURUSLABS", "LICHSGFIN", 
-        "LT", "LTIM", "LTTS", "LUPIN", "M&M", "M&MFIN", "MANAPPURAM", "MARICO", "MARUTI", "MCDOWELL-N", 
-        "MCX", "METROPOLIS", "MFSL", "MGL", "MOTHERSON", "MPHASIS", "MRF", "MUTHOOTFIN", "NATIONALUM", 
-        "NAUKRI", "NAVINFLUOR", "NESTLEIND", "NMDC", "NTPC", "OBEROIRLTY", "OFSS", "ONGC", "PAGEIND", 
-        "PEL", "PERSISTENT", "PETRONET", "PFC", "PIDILITIND", "PIIND", "PNB", "POLYCAB", "POWERGRID", 
-        "PVRINOX", "RAMCOCEM", "RBLBANK", "RECLTD", "RELIANCE", "SAIL", "SBICARD", "SBILIFE", "SBIN", 
-        "SHREECEM", "SHRIRAMFIN", "SIEMENS", "SRF", "SUNTV", "SUNPHARMA", "SYNGENE", "TATACHEM", 
-        "TATACOMM", "TATACONSUM", "TATAMOTORS", "TATAPOWER", "TATASTEEL", "TCS", "TECHM", "TITAN", 
-        "TORNTPHARM", "TRENT", "TVSMOTOR", "UBL", "ULTRACEMCO", "UPL", "VEDL", "VOLTAS", "WIPRO", 
-        "ZEEL", "ZYDUSLIFE"
-    ]
-]
-
-# ==============================================================================
 # 1. DETERMINISTIC QUANTUM ENVIRONMENT
 # ==============================================================================
 def set_seeds(seed=42):
@@ -53,7 +22,38 @@ def set_seeds(seed=42):
     torch.backends.cudnn.deterministic = True
 
 # ==============================================================================
-# 2. ROUGH PATH SIGNATURES
+# 2. DYNAMIC F&O UNIVERSE MATCHER (ZERO HARDCODING)
+# ==============================================================================
+def get_dynamic_fo_symbols():
+    print("\n🔍 Scanning live market data for today's active F&O Universe...")
+    try:
+        # Zerodha provides a daily open public CSV of all trading instruments
+        url = "https://api.kite.trade/instruments"
+        df = pd.read_csv(url)
+        
+        # Filter strictly for the F&O Futures segment
+        nfo_df = df[df['segment'] == 'NFO-FUT']
+        
+        # The 'name' column contains the base stock ticker (e.g., RELIANCE, TCS)
+        raw_symbols = nfo_df['name'].dropna().unique().tolist()
+        
+        # Exclude market indices (we only want equities/stocks)
+        indices_to_exclude = ['NIFTY', 'BANKNIFTY', 'FINNIFTY', 'MIDCPNIFTY']
+        valid_symbols = [sym for sym in raw_symbols if sym not in indices_to_exclude]
+        
+        # Format for Yahoo Finance
+        fo_symbols_ns = [f"{sym}.NS" for sym in valid_symbols]
+        
+        print(f"✅ Successfully discovered {len(fo_symbols_ns)} active F&O stocks dynamically.")
+        return fo_symbols_ns
+        
+    except Exception as e:
+        print(f"❌ Failed to fetch dynamic symbols: {e}")
+        print("⚠️ Ensure you have an active internet connection.")
+        return []
+
+# ==============================================================================
+# 3. ROUGH PATH SIGNATURES
 # ==============================================================================
 def compute_path_signatures(path):
     dX = path[:, -1, :] - path[:, 0, :]
@@ -64,7 +64,7 @@ def compute_path_signatures(path):
     return torch.clamp(sig_flat, -50.0, 50.0)
 
 # ==============================================================================
-# 3. MATRIX PRODUCT STATE (Tensor Network) & QUANTUM BRAIN
+# 4. MATRIX PRODUCT STATE (Tensor Network) & QUANTUM BRAIN
 # ==============================================================================
 class MatrixProductState(nn.Module):
     def __init__(self, num_nodes, phys_dim, bond_dim):
@@ -125,14 +125,19 @@ class HamiltonianEnergyLoss(nn.Module):
         return torch.mean(hamiltonian)
 
 # ==============================================================================
-# 4. INSTANT LIVE DATA COMPILER (WITH QUARANTINE PROTOCOL)
+# 5. INSTANT LIVE DATA COMPILER (WITH QUARANTINE PROTOCOL)
 # ==============================================================================
 def fetch_live_fo_data(seq_len=10):
-    print(f"\n📥 Fetching LIVE data for {len(FO_SYMBOLS)} F&O Assets from NSE feeds...")
+    fo_symbols = get_dynamic_fo_symbols()
+    
+    if not fo_symbols:
+        raise ValueError("Failed to retrieve dynamic F&O symbols. Cannot proceed.")
+
+    print(f"📥 Fetching LIVE price history for {len(fo_symbols)} assets from NSE feeds...")
     print("⏳ This will take ~10 seconds. No files or tokens required.")
     
     # Download 1-year bulk data instantly
-    df = yf.download(FO_SYMBOLS, period="1y", interval="1d", progress=False)
+    df = yf.download(fo_symbols, period="1y", interval="1d", progress=False)
     
     # Clean the data (forward fill missing days, backward fill early gaps)
     df = df.ffill().bfill()
@@ -152,7 +157,7 @@ def fetch_live_fo_data(seq_len=10):
         if not is_corrupted:
             valid_tickers.append(ticker)
 
-    failed_count = len(FO_SYMBOLS) - len(valid_tickers)
+    failed_count = len(fo_symbols) - len(valid_tickers)
     print(f"✅ Download complete. Automatically dropped {failed_count} broken/delisted symbols to protect the Tensor Math.")
     print(f"✅ Proceeding with {len(valid_tickers)} mathematically clean assets.")
     
@@ -194,7 +199,7 @@ def fetch_live_fo_data(seq_len=10):
     return X, Y, [t.replace('.NS', '') for t in valid_tickers], latest_prices
 
 # ==============================================================================
-# 5. MASTER EXECUTION
+# 6. MASTER EXECUTION
 # ==============================================================================
 def run_quantum_desk():
     set_seeds(42)
@@ -275,4 +280,3 @@ def run_quantum_desk():
 
 if __name__ == "__main__":
     run_quantum_desk()
-
