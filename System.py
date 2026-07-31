@@ -16,12 +16,11 @@ import torch.optim as optim
 warnings.filterwarnings('ignore')
 
 # ==============================================================================
-# 0. NOTIFICATION CONFIGURATION
+# 0. NOTIFICATION CONFIGURATION (SECURE GITHUB ACTIONS SETUP)
 # ==============================================================================
-# Replace these with your actual credentials
-SENDER_EMAIL = "your_email@gmail.com"
-SENDER_PASSWORD = "your_16_character_app_password" # Use App Password, NOT regular password
-RECEIVER_EMAIL = "receiver_email@gmail.com"
+SENDER_EMAIL = os.getenv("SENDER_EMAIL")
+SENDER_PASSWORD = os.getenv("SENDER_PASSWORD") 
+RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL")
 
 # ==============================================================================
 # 1. DETERMINISTIC QUANTUM ENVIRONMENT
@@ -33,7 +32,7 @@ def set_seeds(seed=42):
     torch.backends.cudnn.deterministic = True
 
 # ==============================================================================
-# 2. DYNAMIC F&O UNIVERSE MATCHER
+# 2. DYNAMIC F&O UNIVERSE MATCHER (ZERO HARDCODING)
 # ==============================================================================
 def get_dynamic_fo_symbols():
     print("\n🔍 Scanning live market data for today's active F&O Universe...")
@@ -112,7 +111,12 @@ class EntangledQuantumBrain(nn.Module):
         amplitudes = self.measurement_operator(entangled_state)
         
         raw_signals = torch.tanh(amplitudes)
+        
+        # ======================================================================
+        # 🔥 MARKET NEUTRAL CONSTRAINT
+        # ======================================================================
         raw_signals = raw_signals - raw_signals.mean(dim=1, keepdim=True)
+        
         probabilities = raw_signals / (torch.sum(torch.abs(raw_signals), dim=1, keepdim=True) + 1e-8)
         return probabilities
 
@@ -128,7 +132,7 @@ class HamiltonianEnergyLoss(nn.Module):
         return torch.mean(hamiltonian)
 
 # ==============================================================================
-# 5. INSTANT LIVE DATA COMPILER
+# 5. INSTANT LIVE DATA COMPILER (NO LOOKAHEAD BIAS)
 # ==============================================================================
 def fetch_live_fo_data(seq_len=10, forecast_horizon=2):
     fo_symbols = get_dynamic_fo_symbols()
@@ -137,6 +141,8 @@ def fetch_live_fo_data(seq_len=10, forecast_horizon=2):
 
     print(f"📥 Fetching LIVE DAILY price history for {len(fo_symbols)} assets from NSE feeds...")
     df = yf.download(fo_symbols, period="1y", interval="1d", progress=False)
+    
+    # Forward fill handles weekend/holiday gaps. Drops corrupt listings.
     df = df.ffill()
     
     features = ['Open', 'High', 'Low', 'Close']
@@ -163,8 +169,10 @@ def fetch_live_fo_data(seq_len=10, forecast_horizon=2):
 
     X_list, Y_list = [], []
     
+    # Rolling Window Normalization ensures ZERO lookahead bias
     for i in range(len(data_3d) - seq_len - forecast_horizon + 1):
         raw_window = data_3d[i : i + seq_len]
+        
         window_mean = np.mean(raw_window, axis=0, keepdims=True)
         window_std = np.std(raw_window, axis=0, keepdims=True) + 1e-8
         norm_window = (raw_window - window_mean) / window_std
@@ -182,6 +190,7 @@ def fetch_live_fo_data(seq_len=10, forecast_horizon=2):
     Y_train = torch.tensor(np.array(Y_list), dtype=torch.float32)
     X_train = X_train.permute(0, 2, 1, 3).contiguous()
     
+    # Create the Live Inference Tensor (Latest window)
     latest_raw_window = data_3d[-seq_len:]
     latest_mean = np.mean(latest_raw_window, axis=0, keepdims=True)
     latest_std = np.std(latest_raw_window, axis=0, keepdims=True) + 1e-8
@@ -196,8 +205,8 @@ def fetch_live_fo_data(seq_len=10, forecast_horizon=2):
 # 6. EMAIL DISPATCH SYSTEM
 # ==============================================================================
 def send_trade_report_via_email(report_text):
-    if SENDER_EMAIL == "your_email@gmail.com":
-        print("\n⚠️ Email credentials not set in script. Skipping email dispatch.")
+    if not SENDER_EMAIL or not SENDER_PASSWORD or not RECEIVER_EMAIL:
+        print("\n⚠️ Email credentials not found in environment variables. Skipping email dispatch.")
         return
 
     print("\n📧 Dispatching trade report via Email...")
@@ -310,7 +319,7 @@ def run_quantum_desk():
     final_report = "\n".join(report_lines)
     print(final_report)
     
-    # Send email
+    # Send email securely via environment variables
     send_trade_report_via_email(final_report)
 
 if __name__ == "__main__":
