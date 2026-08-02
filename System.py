@@ -41,7 +41,7 @@ class TemporalCNNClassifier(nn.Module):
             nn.ReLU(inplace=True)
         )
         
-        # Binary Classifier for Win Probability
+        # Binary Classifier (1 = Long, 0 = Short)
         self.classifier = nn.Sequential(
             nn.Linear(latent_dim, 16),
             nn.ReLU(inplace=True),
@@ -61,8 +61,6 @@ class TemporalCNNClassifier(nn.Module):
 # 2. MEGA FEATURE ENGINEERING & NORMALIZATION
 # ==============================================================================
 def add_mega_technical_indicators(df):
-    """Calculates all 34 quantitative confluence indicators."""
-    
     # --- 1. MOVING AVERAGES ---
     df['EMA_8'] = df['Close'].ewm(span=8, adjust=False).mean()
     df['EMA_20'] = df['Close'].ewm(span=20, adjust=False).mean()
@@ -158,14 +156,11 @@ def add_mega_technical_indicators(df):
     return df[feature_cols]
 
 def normalize_mega_tensor(values):
-    """Applies Multi-Tiered Normalization (Log Returns, Z-Score, and State Preservation)"""
     norm_values = values.copy()
     base_price = norm_values[0, 3] + 1e-8 
     
     price_cols = [0, 1, 2, 3, 5, 6, 7, 8, 9, 10, 11, 12, 14, 15, 16, 17, 18, 19, 29, 30, 31]
     for col in price_cols:
-        # FIX: Clip values to prevent lower bands (BB_Dn, ST_Lower, etc.) 
-        # from dropping below zero and crashing the np.log() calculation.
         safe_values = np.clip(norm_values[:, col], a_min=1e-6, a_max=None)
         norm_values[:, col] = np.log(safe_values / base_price)
         
@@ -175,7 +170,6 @@ def normalize_mega_tensor(values):
         col_std = np.std(norm_values[:, col]) + 1e-8
         norm_values[:, col] = (norm_values[:, col] - col_mean) / col_std
         
-    # Indices 25 (EIS), 32 (NR4), 33 (NR7) remain unchanged
     return norm_values.T
 
 def read_and_standardize_csv(filename):
@@ -220,23 +214,42 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_dd=1
             window = normalize_mega_tensor(raw_window)
             
             future_closes = values[i+30 : i+30+FUTURE_DAYS, 3] 
+            future_highs  = values[i+30 : i+30+FUTURE_DAYS, 1] 
             future_lows   = values[i+30 : i+30+FUTURE_DAYS, 2] 
             start_price   = values[i+29, 3] 
             
             max_close = future_closes.max()
-            actual_pct_move = ((max_close - start_price) / (start_price + 1e-8)) * 100
-            actual_drawdown = ((future_lows.min() - start_price) / (start_price + 1e-8)) * 100
+            min_close = future_closes.min()
             
-            # Label = 1 (Win) if target hit without hitting stop loss, else 0
-            is_success = 1.0 if (actual_pct_move >= min_pct and actual_drawdown >= -max_dd) else 0.0
-            
+            # Determine dominant direction
+            if (max_close - start_price) > (start_price - min_close):
+                is_long = True
+                actual_pct_move = ((max_close - start_price) / (start_price + 1e-8)) * 100
+                actual_drawdown = ((future_lows.min() - start_price) / (start_price + 1e-8)) * 100
+            else:
+                is_long = False
+                actual_pct_move = ((min_close - start_price) / (start_price + 1e-8)) * 100
+                actual_drawdown = ((future_highs.max() - start_price) / (start_price + 1e-8)) * 100
+                
+            # Skip sideways chop that doesn't meet our minimum target
+            if abs(actual_pct_move) < min_pct:
+                continue
+                
+            # Enforce drawdowns and assign directional labels (1 = Long, 0 = Short)
+            if is_long:
+                if actual_drawdown < -max_dd: continue 
+                label = 1.0 
+            else:
+                if actual_drawdown > max_dd: continue 
+                label = 0.0 
+
             training_matrices.append(window)
-            labels.append(is_success)
+            labels.append(label)
             
     return np.array(training_matrices, dtype=np.float32), np.array(labels, dtype=np.float32), min_pct
 
 # ==============================================================================
-# 3. MODULAR AI TRAINING ENGINE (Batched to prevent RAM crashes)
+# 3. MODULAR AI TRAINING ENGINE
 # ==============================================================================
 def train_ai_brain(X_raw, Y_labels, epochs=10, batch_size=256):
     X_tensor = torch.tensor(X_raw)
@@ -244,15 +257,13 @@ def train_ai_brain(X_raw, Y_labels, epochs=10, batch_size=256):
     
     cnn_model = TemporalCNNClassifier(num_features=34)
     optimizer = optim.Adam(cnn_model.parameters(), lr=0.002)
-    criterion = nn.BCELoss() # Binary Cross Entropy Loss
+    criterion = nn.BCELoss() 
     
     dataset_size = X_tensor.size(0)
     
-    # 1. Train with Mini-Batches to prevent Out-Of-Memory (OOM) crashes
     cnn_model.train()
     for epoch in range(epochs): 
         permutation = torch.randperm(dataset_size)
-        
         for i in range(0, dataset_size, batch_size):
             indices = permutation[i : i + batch_size]
             batch_x, batch_y = X_tensor[indices], Y_tensor[indices]
@@ -263,7 +274,6 @@ def train_ai_brain(X_raw, Y_labels, epochs=10, batch_size=256):
             loss.backward()
             optimizer.step()
 
-    # 2. Extract Latent Vectors (Batched to save RAM)
     cnn_model.eval()
     latent_vectors_list = []
     with torch.no_grad():
@@ -274,11 +284,9 @@ def train_ai_brain(X_raw, Y_labels, epochs=10, batch_size=256):
             
     latent_vectors = np.vstack(latent_vectors_list)
         
-    # 3. Train XGBoost
     xgb_model = xgb.XGBClassifier(n_estimators=100, learning_rate=0.05, max_depth=4, eval_metric='logloss')
     xgb_model.fit(latent_vectors, Y_labels)
 
-    # 4. Save to FAISS Memory
     faiss.normalize_L2(latent_vectors)
     index = faiss.IndexFlatIP(32)
     index.add(latent_vectors)
@@ -337,7 +345,7 @@ def fetch_upstox_data(instrument_key, target_date_str, interval="day", days_back
     if response.status_code != 200: return None
         
     data = response.json().get('data', {}).get('candles', [])
-    if not data or len(data) < 60: return None # Buffer requirement
+    if not data or len(data) < 60: return None 
         
     df = pd.DataFrame(data[::-1], columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
     df = df[['Open', 'High', 'Low', 'Close', 'Volume']].astype(float)
@@ -357,7 +365,6 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
     sender_pass = os.environ.get("SENDER_PASSWORD")
     recipient_email = os.environ.get("RECIPIENT_EMAIL")
     
-    # FIX: Added a clear warning message instead of failing silently
     if not all([sender_email, sender_pass, recipient_email]): 
         print("❌ Warning: Email credentials missing from environment variables. Alert skipped.")
         return
@@ -426,7 +433,6 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
         server.quit()
         print(f"✅ Alert Dispatched with {len(fno_data_list)} F&O targets.")
     except Exception as e:
-        # FIX: Added formatting to make the error visible in the console
         print(f"❌ Failed to send email: {str(e)}")
 
 def run_production_sweep():
@@ -480,12 +486,16 @@ def run_production_sweep():
             xgb_prob = nifty_xgb.predict_proba(nifty_latent)[0][1] * 100
             blended_prob = (cnn_prob + xgb_prob) / 2
             
+            # Map probabilities: > 50% means LONG, < 50% means SHORT
+            is_long = blended_prob >= 50
+            final_conviction = blended_prob if is_long else (100 - blended_prob)
+            
             macro_report = {
-                'direction': "LONG 🟢" if blended_prob > 50 else "SHORT 🔴",
-                'conviction': blended_prob,
-                'target_display': f"Expected Move: +{min_macro_pct}%"
+                'direction': "LONG 🟢" if is_long else "SHORT 🔴",
+                'conviction': final_conviction,
+                'target_display': f"Expected Move: {'+' if is_long else '-'}{min_macro_pct}%"
             }
-            print(f"🌍 MACRO REGIME: {macro_report['direction']} (Score: {blended_prob:.2f}%)")
+            print(f"🌍 MACRO REGIME: {macro_report['direction']} (Score: {final_conviction:.2f}%)")
         else:
             macro_report = {'direction': "UNKNOWN", 'conviction': 0, 'target_display': "N/A"}
 
@@ -503,8 +513,7 @@ def run_production_sweep():
     if not fno_universe: return
     
     final_report_data = []
-    # Probability threshold replaces strict FAISS matching
-    min_prob_threshold = float(os.environ.get("PARAM_MIN_PROBABILITY", 15.0))
+    min_prob_threshold = float(os.environ.get("PARAM_MIN_PROBABILITY", 65.0))
 
     for asset in fno_universe:
         result = fetch_upstox_data(asset["key"], target_date_str, interval="day", days_back=100)
@@ -521,13 +530,17 @@ def run_production_sweep():
         xgb_prob = fno_xgb.predict_proba(live_latent.numpy())[0][1] * 100
         blended_prob = (cnn_prob + xgb_prob) / 2
         
-        if blended_prob >= min_prob_threshold:
+        # Determine direction based on class probability
+        is_long = blended_prob >= 50
+        final_conviction = blended_prob if is_long else (100 - blended_prob)
+        
+        if final_conviction >= min_prob_threshold:
             final_report_data.append({
                 'asset': asset["symbol"],
-                'direction': "LONG 🟢",
-                'conviction': float(blended_prob),
+                'direction': "LONG 🟢" if is_long else "SHORT 🔴",
+                'conviction': float(final_conviction),
                 'ltp': float(current_ltp),
-                'target_display': f"Expected Move: +{min_micro_pct}%",
+                'target_display': f"Expected Move: {'+' if is_long else '-'}{min_micro_pct}%",
                 'actual_outcome': "<b>Awaiting Market ⏳</b>"
             })
             
@@ -545,13 +558,18 @@ def run_production_sweep():
                     fw = df_sym.iloc[idx+1 : idx+3] 
                     if len(fw) > 0:
                         mx, mn = fw['Close'].max(), fw['Close'].min()
+                        
                         if "LONG" in row['direction']:
                             mv, dd = ((mx - row['ltp']) / row['ltp']) * 100, ((fw['Low'].min() - row['ltp']) / row['ltp']) * 100
                             c = "#28a745" if mv > 0 else "#6c757d"
                             row['actual_outcome'] = f"<span style='color: {c};'>Closed ₹{mx:.2f} (+{mv:.2f}%)</span><br><span style='color: #856404; font-size: 11px;'>Max DD: {dd:.2f}%</span>"
+                        else:
+                            # Short validation logic
+                            mv, dd = ((mn - row['ltp']) / row['ltp']) * 100, ((fw['High'].max() - row['ltp']) / row['ltp']) * 100
+                            c = "#28a745" if mv < 0 else "#6c757d" 
+                            row['actual_outcome'] = f"<span style='color: {c};'>Closed ₹{mn:.2f} ({mv:.2f}%)</span><br><span style='color: #856404; font-size: 11px;'>Max DD: +{dd:.2f}%</span>"
 
     send_mobile_alert(macro_report, final_report_data, target_date_str, is_backtest)
 
 if __name__ == "__main__":
     run_production_sweep()
-
