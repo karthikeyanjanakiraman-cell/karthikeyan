@@ -504,7 +504,7 @@ def run_production_sweep():
     
     final_report_data = []
     # Probability threshold replaces strict FAISS matching
-    min_prob_threshold = float(os.environ.get("PARAM_MIN_PROBABILITY", 65.0))
+    min_prob_threshold = float(os.environ.get("PARAM_MIN_PROBABILITY", 15.0))
 
     for asset in fno_universe:
         result = fetch_upstox_data(asset["key"], target_date_str, interval="day", days_back=100)
