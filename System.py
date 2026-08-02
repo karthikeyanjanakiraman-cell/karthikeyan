@@ -19,6 +19,14 @@ import faiss
 import xgboost as xgb
 
 # ==============================================================================
+# CONFIGURATION (Uncomment and fill these in if not using system env variables)
+# ==============================================================================
+# os.environ["SENDER_EMAIL"] = "your_email@gmail.com"
+# os.environ["SENDER_PASSWORD"] = "your_16_character_app_password"
+# os.environ["RECIPIENT_EMAIL"] = "where_to_send_it@email.com"
+# os.environ["UPSTOX_ACCESS_TOKEN"] = "your_upstox_api_token"
+
+# ==============================================================================
 # 1. TEMPORAL AUTOENCODER (The 1D CNN Brain)
 # ==============================================================================
 class TemporalAutoencoder(nn.Module):
@@ -234,6 +242,11 @@ def get_dynamic_fno_universe():
 
 def fetch_upstox_data(instrument_key, target_date_str, interval="day", days_back=60):
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
+    
+    if not access_token:
+        print("❌ Error: UPSTOX_ACCESS_TOKEN is missing. Cannot fetch live data.")
+        return None
+        
     target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
     to_date = target_date_str
     from_date = (target_dt - timedelta(days=days_back)).strftime("%Y-%m-%d")
@@ -266,7 +279,10 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
     sender_pass = os.environ.get("SENDER_PASSWORD")
     recipient_email = os.environ.get("RECIPIENT_EMAIL")
     
-    if not all([sender_email, sender_pass, recipient_email]): return
+    # 🛑 Fix: Added print statement to avoid silent failure
+    if not all([sender_email, sender_pass, recipient_email]): 
+        print("❌ Warning: Email credentials missing from environment variables. Alert skipped.")
+        return
 
     msg = MIMEMultipart('alternative')
     prefix = "⏪ BACKTEST" if is_backtest else "🚀 LIVE ALERT"
@@ -332,7 +348,7 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
         server.quit()
         print(f"✅ Alert Dispatched with {len(fno_data_list)} F&O targets.")
     except Exception as e:
-        print(f"Failed to send email: {str(e)}")
+        print(f"❌ Failed to send email: {str(e)}")
 
 def run_production_sweep():
     target_date_str = os.environ.get("PARAM_BACKTEST_DATE", "").strip()
