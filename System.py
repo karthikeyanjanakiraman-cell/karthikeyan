@@ -1,4 +1,6 @@
 import os
+import sys
+import argparse
 import smtplib
 import urllib.parse
 import json
@@ -335,11 +337,29 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
         print(f"Failed to send email: {str(e)}")
 
 def run_production_sweep():
-    target_date_str = os.environ.get("PARAM_BACKTEST_DATE", "").strip()
-    is_backtest = bool(target_date_str)
-    if not is_backtest: target_date_str = datetime.now().strftime("%Y-%m-%d")
-        
+    # --- BULLETPROOF DATE PARSING ---
+    parser = argparse.ArgumentParser(description="Run production AI sweep.")
+    parser.add_argument("-d", "--date", type=str, default="", help="Target date in YYYY-MM-DD format")
+    parser.add_argument("positional_date", nargs="?", default="", help="Target date in YYYY-MM-DD format")
+    args, unknown = parser.parse_known_args()
+
+    # Priority: 1. --date flag -> 2. Positional string -> 3. Environment Variable
+    raw_date_str = args.date or args.positional_date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
+    is_backtest = bool(raw_date_str)
+
+    if not is_backtest:
+        target_date_str = datetime.now().strftime("%Y-%m-%d")
+    else:
+        # Strictly validate and enforce YYYY-MM-DD formatting to prevent API/Email crashes
+        try:
+            parsed_dt = datetime.strptime(raw_date_str, "%Y-%m-%d")
+            target_date_str = parsed_dt.strftime("%Y-%m-%d")
+        except ValueError:
+            print(f"❌ Critical Error: Date '{raw_date_str}' is invalid. Please use exact YYYY-MM-DD format.")
+            return
+
     print(f"⚙️ EXECUTING DATE: {target_date_str}")
+    print(f"🕵️ MODE: {'BACKTEST' if is_backtest else 'LIVE/CURRENT'}")
     
     # Path Resolver Strategy
     nifty_file = None
