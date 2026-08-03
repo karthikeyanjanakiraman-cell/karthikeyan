@@ -54,14 +54,23 @@ def get_dynamic_fo_symbols():
         return []
 
 # ==============================================================================
-# 3. ROUGH PATH SIGNATURES
+# 3. ROUGH PATH SIGNATURES (UPGRADED: LEAD-LAG TRANSFORMATION)
 # ==============================================================================
 def compute_path_signatures(path):
-    dX = path[:, -1, :] - path[:, 0, :]
-    X_shifted = path[:, :-1, :] - path[:, 0:1, :]
-    dX_t = path[:, 1:, :] - path[:, :-1, :]
+    # Split into Lead and Lag streams to capture cross-temporal friction
+    lead = path[:, 1:, :]
+    lag = path[:, :-1, :]
+    
+    # Augment feature space: (Batch, Time-1, Features*2)
+    aug_path = torch.cat([lead, lag], dim=-1)
+    
+    dX = aug_path[:, -1, :] - aug_path[:, 0, :]
+    X_shifted = aug_path[:, :-1, :] - aug_path[:, 0:1, :]
+    dX_t = aug_path[:, 1:, :] - aug_path[:, :-1, :]
+    
     sig2 = torch.matmul(X_shifted.unsqueeze(-1), dX_t.unsqueeze(-2)).sum(dim=1) 
     sig_flat = torch.cat([dX, sig2.reshape(sig2.shape[0], -1)], dim=1)
+    
     return torch.clamp(sig_flat, -50.0, 50.0)
 
 # ==============================================================================
@@ -74,12 +83,10 @@ class MatrixProductState(nn.Module):
         self.left_core = nn.Parameter(torch.randn(phys_dim, bond_dim) * 0.01)
         
         if num_nodes > 1:
-            # OPTIMIZATION: Single consolidated tensor block instead of ParameterList
             self.middle_cores = nn.Parameter(
                 torch.randn(num_nodes - 1, bond_dim, phys_dim, bond_dim) * 0.01
             )
             
-        # OPTIMIZATION: Single LayerNorm applies dynamically
         self.norm = nn.LayerNorm(bond_dim)
             
     def forward(self, x):
@@ -88,7 +95,6 @@ class MatrixProductState(nn.Module):
         
         if self.num_nodes > 1:
             for i in range(self.num_nodes - 1):
-                # Slices directly from C-memory block
                 core = self.middle_cores[i]
                 state = torch.einsum('bd,dpD,bp->bD', state, core, x[:, i+1, :])
                 state = self.norm(state)
@@ -98,7 +104,10 @@ class EntangledQuantumBrain(nn.Module):
     def __init__(self, num_assets, num_features, bond_dim=16):
         super().__init__()
         self.num_assets = num_assets
-        self.phys_dim = num_features + (num_features ** 2)
+        
+        # Lead-Lag doubles the features going into the signature
+        aug_features = num_features * 2 
+        self.phys_dim = aug_features + (aug_features ** 2)
         
         self.mps = MatrixProductState(num_assets, self.phys_dim, bond_dim)
         self.measurement_operator = nn.Sequential(
@@ -110,6 +119,7 @@ class EntangledQuantumBrain(nn.Module):
     def forward(self, x):
         batch_size, num_assets, seq_len, features = x.shape
         x_flat = x.reshape(batch_size * num_assets, seq_len, features)
+        
         signatures = compute_path_signatures(x_flat)
         quantum_state_input = signatures.reshape(batch_size, num_assets, self.phys_dim)
         
@@ -118,27 +128,39 @@ class EntangledQuantumBrain(nn.Module):
         
         raw_signals = torch.tanh(amplitudes)
         
-        # ======================================================================
-        # 🔥 MARKET NEUTRAL CONSTRAINT
-        # ======================================================================
+        # Market Neutral Constraint
         raw_signals = raw_signals - raw_signals.mean(dim=1, keepdim=True)
         
         probabilities = raw_signals / (torch.sum(torch.abs(raw_signals), dim=1, keepdim=True) + 1e-8)
         return probabilities
 
-class HamiltonianEnergyLoss(nn.Module):
-    def __init__(self, risk_penalty=0.5):
+# ==============================================================================
+# UPGRADED: SORTINO HAMILTONIAN ENERGY LOSS (ASYMMETRIC RISK)
+# ==============================================================================
+class SortinoHamiltonianEnergyLoss(nn.Module):
+    def __init__(self, risk_penalty=1.0, l1_penalty=0.001):
         super().__init__()
         self.risk_penalty = risk_penalty
+        self.l1_penalty = l1_penalty # Simulates 0.1% friction (Brokerage, STT, Slippage)
         
     def forward(self, allocations, future_returns):
-        port_return = torch.sum(allocations * future_returns, dim=1)
-        port_variance = torch.sum((allocations ** 2) * (future_returns ** 2), dim=1)
-        hamiltonian = (self.risk_penalty * port_variance) - port_return
+        # Calculate actual returns based on allocation direction
+        position_returns = allocations * future_returns
+        port_return = torch.sum(position_returns, dim=1)
+        
+        # Sortino Variance: Only penalize trades that lost money
+        downside_returns = torch.clamp(position_returns, max=0.0)
+        downside_variance = torch.sum(downside_returns ** 2, dim=1)
+        
+        # Friction penalty for making trades
+        friction = self.l1_penalty * torch.sum(torch.abs(allocations), dim=1)
+        
+        # Energy state minimizes downside + friction, maximizes upside
+        hamiltonian = (self.risk_penalty * downside_variance) + friction - port_return
         return torch.mean(hamiltonian)
 
 # ==============================================================================
-# 5. INSTANT LIVE DATA COMPILER (VECTORIZED - NO LOOPS)
+# 5. INSTANT LIVE DATA COMPILER (VECTORIZED + CORRELATION CHAINING)
 # ==============================================================================
 def fetch_live_fo_data(seq_len=10, forecast_horizon=2):
     fo_symbols = get_dynamic_fo_symbols()
@@ -148,9 +170,7 @@ def fetch_live_fo_data(seq_len=10, forecast_horizon=2):
     print(f"📥 Fetching LIVE DAILY price history for {len(fo_symbols)} assets from NSE feeds...")
     df = yf.download(fo_symbols, period="1y", interval="1d", progress=False)
     
-    # Forward fill handles weekend/holiday gaps. Drops corrupt listings.
     df = df.ffill()
-    
     features = ['Open', 'High', 'Low', 'Close']
     valid_tickers = []
     
@@ -163,13 +183,27 @@ def fetch_live_fo_data(seq_len=10, forecast_horizon=2):
         if not is_corrupted:
             valid_tickers.append(ticker)
 
-    print(f"✅ Proceeding with {len(valid_tickers)} mathematically clean assets.")
-    
-    # OPTIMIZATION: Vectorized 3D Data Creation
+    # 3D Data Creation
     data_3d = np.stack([df[feat][valid_tickers].values for feat in features], axis=2)
+    
+    # 🔥 UPGRADE: CORRELATION NODE ORDERING
+    print("🧬 Ordering assets via Pearson Correlation for Quantum Chain stabilization...")
+    close_prices = data_3d[:, :, 3] 
+    returns = np.diff(close_prices, axis=0) / (close_prices[:-1] + 1e-8)
+    corr_matrix = np.corrcoef(returns, rowvar=False)
+    corr_matrix = np.nan_to_num(corr_matrix) # Clean NaNs
+    
+    avg_corr = np.mean(corr_matrix, axis=0)
+    sort_indices = np.argsort(avg_corr)
+    
+    valid_tickers = [valid_tickers[i] for i in sort_indices]
+    data_3d = data_3d[:, sort_indices, :]
+    
+    print(f"✅ Proceeding with {len(valid_tickers)} mathematically ordered assets.")
+    
     latest_prices = {t.replace('.NS', ''): float(df['Close'][t].iloc[-1]) for t in valid_tickers}
 
-    # OPTIMIZATION: NumPy Broadcasting for Instant Rolling Windows
+    # Vectorized Rolling Windows
     total_len = len(data_3d)
     window_count = total_len - seq_len - forecast_horizon + 1
     
@@ -189,7 +223,7 @@ def fetch_live_fo_data(seq_len=10, forecast_horizon=2):
     X_train = torch.tensor(norm_windows, dtype=torch.float32).permute(0, 2, 1, 3).contiguous()
     Y_train = torch.tensor(y_target, dtype=torch.float32)
     
-    # Create the Live Inference Tensor (Latest window)
+    # Live Inference Tensor
     latest_raw_window = data_3d[-seq_len:]
     latest_mean = np.mean(latest_raw_window, axis=0, keepdims=True)
     latest_std = np.std(latest_raw_window, axis=0, keepdims=True) + 1e-8
@@ -215,10 +249,8 @@ def send_trade_report_via_email(report_text):
         msg['To'] = RECIPIENT_EMAIL
         msg['Subject'] = f"📈 Quantum AI Trade Signals - {datetime.now().strftime('%Y-%m-%d')}"
 
-        # Add the report text
         msg.attach(MIMEText(report_text, 'plain'))
 
-        # Setup SMTP server (Gmail configuration)
         server = smtplib.SMTP('smtp.gmail.com', 587)
         server.starttls()
         server.login(SENDER_EMAIL, SENDER_PASSWORD)
@@ -243,7 +275,7 @@ def run_quantum_desk():
     
     brain = EntangledQuantumBrain(num_assets=actual_assets, num_features=FEATURES, bond_dim=BOND_DIM)
     optimizer = optim.AdamW(brain.parameters(), lr=0.01, weight_decay=1e-4)
-    loss_function = HamiltonianEnergyLoss(risk_penalty=1.0)
+    loss_function = SortinoHamiltonianEnergyLoss(risk_penalty=1.0, l1_penalty=0.001)
     
     print("\n🌌 WAKING THE ENTANGLED QUANTUM BRAIN (DAILY/SWING HORIZON)")
     print(f"-> Crunching Multi-Dimensional Tensors for {actual_assets} Assets")
@@ -278,7 +310,6 @@ def run_quantum_desk():
     top_10_indices = torch.argsort(abs_allocations, descending=True)[:10]
     max_signal = torch.max(abs_allocations).item()
 
-    # Create the report string
     report_lines = []
     header = "\n=======================================================================================\n"
     header += " 🏆 TOP 10 SWING TRADES (Market-Neutral / Long & Short Candidates)\n"
@@ -314,11 +345,9 @@ def run_quantum_desk():
     footer = "\n=======================================================================================\n"
     report_lines.append(footer)
     
-    # Print to console
     final_report = "\n".join(report_lines)
     print(final_report)
     
-    # Send email securely via environment variables
     send_trade_report_via_email(final_report)
 
 if __name__ == "__main__":
