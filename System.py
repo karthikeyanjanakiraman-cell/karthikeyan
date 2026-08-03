@@ -265,7 +265,7 @@ def run_quantum_desk():
     SEQ_LEN = 10        
     FEATURES = 4        
     BOND_DIM = 16       
-    EPOCHS = 100
+    EPOCHS = 21
     
     # Determine if we are live trading today or backtesting a past date
     current_date = datetime.now().strftime('%Y-%m-%d')
