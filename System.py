@@ -20,7 +20,7 @@ warnings.filterwarnings('ignore')
 # ==============================================================================
 SENDER_EMAIL = os.getenv("SENDER_EMAIL")
 SENDER_PASSWORD = os.getenv("SENDER_PASSWORD") 
-RECEIVER_EMAIL = os.getenv("RECEIVER_EMAIL")
+RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
 
 # ==============================================================================
 # 1. DETERMINISTIC QUANTUM ENVIRONMENT
@@ -204,7 +204,7 @@ def fetch_live_fo_data(seq_len=10, forecast_horizon=2):
 # 6. EMAIL DISPATCH SYSTEM
 # ==============================================================================
 def send_trade_report_via_email(report_text):
-    if not SENDER_EMAIL or not SENDER_PASSWORD or not RECEIVER_EMAIL:
+    if not SENDER_EMAIL or not SENDER_PASSWORD or not RECIPIENT_EMAIL:
         print("\n⚠️ Email credentials not found in environment variables. Skipping email dispatch.")
         return
 
@@ -212,7 +212,7 @@ def send_trade_report_via_email(report_text):
     try:
         msg = MIMEMultipart()
         msg['From'] = SENDER_EMAIL
-        msg['To'] = RECEIVER_EMAIL
+        msg['To'] = RECIPIENT_EMAIL
         msg['Subject'] = f"📈 Quantum AI Trade Signals - {datetime.now().strftime('%Y-%m-%d')}"
 
         # Add the report text
@@ -224,7 +224,7 @@ def send_trade_report_via_email(report_text):
         server.login(SENDER_EMAIL, SENDER_PASSWORD)
         server.send_message(msg)
         server.quit()
-        print(f"✅ Email successfully sent to {RECEIVER_EMAIL}!")
+        print(f"✅ Email successfully sent to {RECIPIENT_EMAIL}!")
     except Exception as e:
         print(f"❌ Failed to send email: {e}")
 
