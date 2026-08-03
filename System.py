@@ -162,13 +162,13 @@ def fetch_live_fo_data(seq_len=10, forecast_horizon=2, target_date=None):
             # yfinance 'end' is exclusive. Add 1 day to ensure the target date is included.
             end_date_obj = datetime.strptime(target_date.strip(), '%Y-%m-%d') + timedelta(days=1)
             end_date_str = end_date_obj.strftime('%Y-%m-%d')
-            df = yf.download(fo_symbols, period="1y", interval="1d", end=end_date_str, progress=False)
+            df = yf.download(fo_symbols, period="5y", interval="1d", end=end_date_str, progress=False)
             print(f"⏪ BACKTEST MODE ENGAGED: Processing data exactly up to {target_date}")
         except Exception as e:
             print(f"⚠️ Invalid date format. Defaulting to live data. Error: {e}")
-            df = yf.download(fo_symbols, period="1y", interval="1d", progress=False)
+            df = yf.download(fo_symbols, period="5y", interval="1d", progress=False)
     else:
-        df = yf.download(fo_symbols, period="1y", interval="1d", progress=False)
+        df = yf.download(fo_symbols, period="5y", interval="1d", progress=False)
     
     df = df.ffill()
     features = ['Open', 'High', 'Low', 'Close']
