@@ -451,7 +451,11 @@ def run_production_sweep():
         pred_pct = fno_xgb_p.predict(live_vector)[0]
         faiss.normalize_L2(live_vector)
         score, _ = fno_faiss.search(live_vector, k=5)
-        conviction = score[0][0] * 100
+        
+        # --- SCORE CALCULATION ---
+        # The raw score (0 to 1) is `score[0][0]`. 
+        # To display it as 0 to 1, change this to: conviction = score[0][0]
+        conviction = score[0][0] * 100 
         
         if conviction >= min_conviction:
             final_report_data.append({
