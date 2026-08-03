@@ -268,7 +268,7 @@ def run_quantum_desk():
     SEQ_LEN = 10        
     FEATURES = 4        
     BOND_DIM = 16       
-    EPOCHS = 10
+    EPOCHS = 100
     
     X_train, Y_train, X_live, asset_names, latest_prices = fetch_live_fo_data(seq_len=SEQ_LEN, forecast_horizon=2)
     actual_assets = X_train.shape[1] 
