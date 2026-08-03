@@ -4,7 +4,7 @@ import warnings
 import smtplib
 from email.mime.text import MIMEText
 from email.mime.multipart import MIMEMultipart
-from datetime import datetime
+from datetime import datetime, timedelta
 
 import yfinance as yf
 import numpy as np
@@ -21,6 +21,7 @@ warnings.filterwarnings('ignore')
 SENDER_EMAIL = os.getenv("SENDER_EMAIL")
 SENDER_PASSWORD = os.getenv("SENDER_PASSWORD") 
 RECIPIENT_EMAIL = os.getenv("RECIPIENT_EMAIL")
+PARAM_BACKTEST_DATE = os.getenv("PARAM_BACKTEST_DATE") # Pulled from .yml
 
 # ==============================================================================
 # 1. DETERMINISTIC QUANTUM ENVIRONMENT
@@ -54,14 +55,12 @@ def get_dynamic_fo_symbols():
         return []
 
 # ==============================================================================
-# 3. ROUGH PATH SIGNATURES (UPGRADED: LEAD-LAG TRANSFORMATION)
+# 3. ROUGH PATH SIGNATURES (LEAD-LAG TRANSFORMATION)
 # ==============================================================================
 def compute_path_signatures(path):
-    # Split into Lead and Lag streams to capture cross-temporal friction
     lead = path[:, 1:, :]
     lag = path[:, :-1, :]
     
-    # Augment feature space: (Batch, Time-1, Features*2)
     aug_path = torch.cat([lead, lag], dim=-1)
     
     dX = aug_path[:, -1, :] - aug_path[:, 0, :]
@@ -104,8 +103,6 @@ class EntangledQuantumBrain(nn.Module):
     def __init__(self, num_assets, num_features, bond_dim=16):
         super().__init__()
         self.num_assets = num_assets
-        
-        # Lead-Lag doubles the features going into the signature
         aug_features = num_features * 2 
         self.phys_dim = aug_features + (aug_features ** 2)
         
@@ -127,48 +124,51 @@ class EntangledQuantumBrain(nn.Module):
         amplitudes = self.measurement_operator(entangled_state)
         
         raw_signals = torch.tanh(amplitudes)
-        
-        # Market Neutral Constraint
         raw_signals = raw_signals - raw_signals.mean(dim=1, keepdim=True)
         
         probabilities = raw_signals / (torch.sum(torch.abs(raw_signals), dim=1, keepdim=True) + 1e-8)
         return probabilities
 
-# ==============================================================================
-# UPGRADED: SORTINO HAMILTONIAN ENERGY LOSS (ASYMMETRIC RISK)
-# ==============================================================================
 class SortinoHamiltonianEnergyLoss(nn.Module):
     def __init__(self, risk_penalty=1.0, l1_penalty=0.001):
         super().__init__()
         self.risk_penalty = risk_penalty
-        self.l1_penalty = l1_penalty # Simulates 0.1% friction (Brokerage, STT, Slippage)
+        self.l1_penalty = l1_penalty 
         
     def forward(self, allocations, future_returns):
-        # Calculate actual returns based on allocation direction
         position_returns = allocations * future_returns
         port_return = torch.sum(position_returns, dim=1)
         
-        # Sortino Variance: Only penalize trades that lost money
         downside_returns = torch.clamp(position_returns, max=0.0)
         downside_variance = torch.sum(downside_returns ** 2, dim=1)
         
-        # Friction penalty for making trades
         friction = self.l1_penalty * torch.sum(torch.abs(allocations), dim=1)
-        
-        # Energy state minimizes downside + friction, maximizes upside
         hamiltonian = (self.risk_penalty * downside_variance) + friction - port_return
         return torch.mean(hamiltonian)
 
 # ==============================================================================
-# 5. INSTANT LIVE DATA COMPILER (VECTORIZED + CORRELATION CHAINING)
+# 5. INSTANT LIVE DATA COMPILER (TIME-TRAVEL ENABLED)
 # ==============================================================================
-def fetch_live_fo_data(seq_len=10, forecast_horizon=2):
+def fetch_live_fo_data(seq_len=10, forecast_horizon=2, target_date=None):
     fo_symbols = get_dynamic_fo_symbols()
     if not fo_symbols:
         raise ValueError("Failed to retrieve dynamic F&O symbols. Cannot proceed.")
 
-    print(f"📥 Fetching LIVE DAILY price history for {len(fo_symbols)} assets from NSE feeds...")
-    df = yf.download(fo_symbols, period="1y", interval="1d", progress=False)
+    print(f"📥 Fetching DAILY price history for {len(fo_symbols)} assets...")
+    
+    # 🔥 UPGRADE: Time-Travel logic for backtesting
+    if target_date and target_date.strip():
+        try:
+            # yfinance 'end' is exclusive. Add 1 day to ensure the target date is included.
+            end_date_obj = datetime.strptime(target_date.strip(), '%Y-%m-%d') + timedelta(days=1)
+            end_date_str = end_date_obj.strftime('%Y-%m-%d')
+            df = yf.download(fo_symbols, period="1y", interval="1d", end=end_date_str, progress=False)
+            print(f"⏪ BACKTEST MODE ENGAGED: Processing data exactly up to {target_date}")
+        except Exception as e:
+            print(f"⚠️ Invalid date format. Defaulting to live data. Error: {e}")
+            df = yf.download(fo_symbols, period="1y", interval="1d", progress=False)
+    else:
+        df = yf.download(fo_symbols, period="1y", interval="1d", progress=False)
     
     df = df.ffill()
     features = ['Open', 'High', 'Low', 'Close']
@@ -183,15 +183,13 @@ def fetch_live_fo_data(seq_len=10, forecast_horizon=2):
         if not is_corrupted:
             valid_tickers.append(ticker)
 
-    # 3D Data Creation
     data_3d = np.stack([df[feat][valid_tickers].values for feat in features], axis=2)
     
-    # 🔥 UPGRADE: CORRELATION NODE ORDERING
     print("🧬 Ordering assets via Pearson Correlation for Quantum Chain stabilization...")
     close_prices = data_3d[:, :, 3] 
     returns = np.diff(close_prices, axis=0) / (close_prices[:-1] + 1e-8)
     corr_matrix = np.corrcoef(returns, rowvar=False)
-    corr_matrix = np.nan_to_num(corr_matrix) # Clean NaNs
+    corr_matrix = np.nan_to_num(corr_matrix) 
     
     avg_corr = np.mean(corr_matrix, axis=0)
     sort_indices = np.argsort(avg_corr)
@@ -203,7 +201,6 @@ def fetch_live_fo_data(seq_len=10, forecast_horizon=2):
     
     latest_prices = {t.replace('.NS', ''): float(df['Close'][t].iloc[-1]) for t in valid_tickers}
 
-    # Vectorized Rolling Windows
     total_len = len(data_3d)
     window_count = total_len - seq_len - forecast_horizon + 1
     
@@ -223,7 +220,6 @@ def fetch_live_fo_data(seq_len=10, forecast_horizon=2):
     X_train = torch.tensor(norm_windows, dtype=torch.float32).permute(0, 2, 1, 3).contiguous()
     Y_train = torch.tensor(y_target, dtype=torch.float32)
     
-    # Live Inference Tensor
     latest_raw_window = data_3d[-seq_len:]
     latest_mean = np.mean(latest_raw_window, axis=0, keepdims=True)
     latest_std = np.std(latest_raw_window, axis=0, keepdims=True) + 1e-8
@@ -237,17 +233,18 @@ def fetch_live_fo_data(seq_len=10, forecast_horizon=2):
 # ==============================================================================
 # 6. EMAIL DISPATCH SYSTEM
 # ==============================================================================
-def send_trade_report_via_email(report_text):
+def send_trade_report_via_email(report_text, target_date):
     if not SENDER_EMAIL or not SENDER_PASSWORD or not RECIPIENT_EMAIL:
         print("\n⚠️ Email credentials not found in environment variables. Skipping email dispatch.")
         return
 
-    print("\n📧 Dispatching trade report via Email...")
+    print(f"\n📧 Dispatching trade report for {target_date} via Email...")
     try:
         msg = MIMEMultipart()
         msg['From'] = SENDER_EMAIL
         msg['To'] = RECIPIENT_EMAIL
-        msg['Subject'] = f"📈 Quantum AI Trade Signals - {datetime.now().strftime('%Y-%m-%d')}"
+        # 🔥 UPGRADE: Dynamic Email Subject based on backtest or live date
+        msg['Subject'] = f"📈 Quantum AI Trade Signals - {target_date}"
 
         msg.attach(MIMEText(report_text, 'plain'))
 
@@ -268,16 +265,24 @@ def run_quantum_desk():
     SEQ_LEN = 10        
     FEATURES = 4        
     BOND_DIM = 16       
-    EPOCHS = 100
+    EPOCHS = 10
     
-    X_train, Y_train, X_live, asset_names, latest_prices = fetch_live_fo_data(seq_len=SEQ_LEN, forecast_horizon=2)
+    # Determine if we are live trading today or backtesting a past date
+    current_date = datetime.now().strftime('%Y-%m-%d')
+    process_date = PARAM_BACKTEST_DATE.strip() if PARAM_BACKTEST_DATE and PARAM_BACKTEST_DATE.strip() else current_date
+    
+    X_train, Y_train, X_live, asset_names, latest_prices = fetch_live_fo_data(
+        seq_len=SEQ_LEN, 
+        forecast_horizon=2, 
+        target_date=process_date
+    )
     actual_assets = X_train.shape[1] 
     
     brain = EntangledQuantumBrain(num_assets=actual_assets, num_features=FEATURES, bond_dim=BOND_DIM)
     optimizer = optim.AdamW(brain.parameters(), lr=0.01, weight_decay=1e-4)
     loss_function = SortinoHamiltonianEnergyLoss(risk_penalty=1.0, l1_penalty=0.001)
     
-    print("\n🌌 WAKING THE ENTANGLED QUANTUM BRAIN (DAILY/SWING HORIZON)")
+    print(f"\n🌌 WAKING THE ENTANGLED QUANTUM BRAIN (HORIZON: {process_date})")
     print(f"-> Crunching Multi-Dimensional Tensors for {actual_assets} Assets")
     print("-" * 65)
     
@@ -312,7 +317,7 @@ def run_quantum_desk():
 
     report_lines = []
     header = "\n=======================================================================================\n"
-    header += " 🏆 TOP 10 SWING TRADES (Market-Neutral / Long & Short Candidates)\n"
+    header += f" 🏆 TOP 10 SWING TRADES ({process_date}) - Market-Neutral Protocol\n"
     header += "=======================================================================================\n"
     report_lines.append(header)
     
@@ -348,7 +353,7 @@ def run_quantum_desk():
     final_report = "\n".join(report_lines)
     print(final_report)
     
-    send_trade_report_via_email(final_report)
+    send_trade_report_via_email(final_report, process_date)
 
 if __name__ == "__main__":
     run_quantum_desk()
