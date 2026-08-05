@@ -37,7 +37,7 @@ def scan_historical_pristine_breakouts(csv_filename="historical_fno.csv", min_pc
     Scans the 5-year historical daily database for rare, trap-free LONG breakouts:
     - Minimum 2-day net positive move >= +5.0%
     - Zero overnight gaps (Open matches prior Close within max_gap %)
-    - Zero mean reversion / drawdown during the move (Lews do not breach baseline)
+    - Zero mean reversion / drawdown during the move (Lows do not breach baseline)
     """
     if not os.path.exists(csv_filename):
         print(f"❌ Error: '{csv_filename}' not found. Run the downloader script first.")
@@ -124,7 +124,10 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str):
     if target_date_str == today_str:
         url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key)}/1minute"
     else:
-        url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{target_date_str}/{target_date_str}"
+        # Fixed: Upstox historical intraday endpoint expects [to_date] / [from_date] where to_date >= from_date
+        target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
+        next_date_str = (target_dt + timedelta(days=1)).strftime("%Y-%m-%d")
+        url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{next_date_str}/{target_date_str}"
     
     response = requests.get(url, headers=headers)
     if response.status_code != 200:
@@ -206,3 +209,4 @@ if __name__ == "__main__":
     
     target_date = datetime.now().strftime("%Y-%m-%d")
     scan_live_cumulative_compression(target_date)
+
