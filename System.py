@@ -273,8 +273,28 @@ def get_dynamic_fno_universe():
         return []
 
 # ==============================================================================
-# 5. HOURLY TURNOVER SCANNER (Dual-Percentile Power Score)
+# 5. HOURLY TURNOVER SCANNER (Triple-Percentile Power Score with Hurst PR Filter)
 # ==============================================================================
+def calculate_hurst(price_series):
+    """
+    Calculates the Hurst Exponent to measure directional persistence (One-Way vs Whipsaw).
+    """
+    try:
+        prices = np.array(price_series, dtype=np.float32)
+        if len(prices) < 15:
+            return 0.5
+        lags = range(2, min(len(prices) // 2, 20))
+        tau = [np.std(prices[lag:] - prices[:-lag]) for lag in lags]
+        lags_arr = np.array(list(lags))
+        tau_arr = np.array(tau)
+        valid = tau_arr > 0
+        if np.sum(valid) < 2:
+            return 0.5
+        poly = np.polyfit(np.log(lags_arr[valid]), np.log(tau_arr[valid]), 1)
+        return float(poly[0] * 2.0)
+    except:
+        return 0.5
+
 def fetch_upstox_intraday_candles(instrument_key, target_date_str):
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
     if not access_token:
@@ -302,7 +322,7 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str):
     return c_df
 
 def scan_hourly_top_turnover(target_date_str):
-    print(f"\n⏳ Initializing Dual-Percentile (Turnover PR × Momentum PR) Scan for {target_date_str}...")
+    print(f"\n⏳ Initializing Triple-Percentile (Turnover PR × Momentum PR × Hurst PR) Scan for {target_date_str}...")
     universe = get_dynamic_fno_universe()
     if not universe:
         print("⚠️ No F&O universe found. Please check Upstox API.")
@@ -326,7 +346,7 @@ def scan_hourly_top_turnover(target_date_str):
         '12:15 - 13:15', '13:15 - 14:15', '14:15 - 15:15', '15:15 - 15:30'
     ]
     
-    print(f"📡 Downloading intraday data for {len(universe)} stocks to calculate Dual-PR Scores...")
+    print(f"📡 Downloading intraday data and computing Hurst persistence for {len(universe)} stocks...")
     for item in universe:
         df = fetch_upstox_intraday_candles(item['key'], target_date_str)
         if df is None or df.empty: continue
@@ -334,52 +354,63 @@ def scan_hourly_top_turnover(target_date_str):
         df['Turnover'] = df['Volume'] * df['Close']
         df['Time_Window'] = pd.cut(df['Datetime'], bins=bins, labels=labels, include_lowest=True, right=False)
         
-        hourly = df.groupby('Time_Window', observed=False).agg({
-            'Turnover': 'sum',
-            'Volume': 'sum',
-            'Open': 'first',
-            'Close': 'last'
-        }).reset_index()
-        
-        hourly['Symbol'] = item['symbol']
-        hourly = hourly[hourly['Turnover'] > 0]
-        
-        all_hourly_records.append(hourly)
+        for tw, group_window in df.groupby('Time_Window', observed=False):
+            if group_window.empty: continue
+            turnover_sum = group_window['Turnover'].sum()
+            if turnover_sum <= 0: continue
+            
+            open_val = group_window['Open'].iloc[0]
+            close_val = group_window['Close'].iloc[-1]
+            closes_1m = group_window['Close'].values
+            
+            hurst_val = calculate_hurst(closes_1m)
+            
+            all_hourly_records.append({
+                'Time_Window': tw,
+                'Symbol': item['symbol'],
+                'Turnover': turnover_sum,
+                'Open': open_val,
+                'Close': close_val,
+                'Hurst': hurst_val
+            })
         
     if not all_hourly_records:
         print("❌ Could not retrieve valid intraday data.")
         return
         
-    master_df = pd.concat(all_hourly_records, ignore_index=True)
+    master_df = pd.DataFrame(all_hourly_records)
     
-    # 1. Rank 1: The Liquidity Percentile (Turnover PR)
+    # 1. Rank 1: Liquidity Percentile (Turnover PR)
     master_df['Turnover_PR'] = master_df.groupby('Time_Window', observed=False)['Turnover'].rank(pct=True) * 100
     
-    # 2. Rank 2: The Price Displacement Percentile (Momentum PR)
+    # 2. Rank 2: Price Displacement Percentile (Momentum PR)
     master_df['Hourly_Pct_Move'] = ((master_df['Close'] - master_df['Open']) / master_df['Open']) * 100
     master_df['Abs_Move'] = master_df['Hourly_Pct_Move'].abs()
     master_df['Momentum_PR'] = master_df.groupby('Time_Window', observed=False)['Abs_Move'].rank(pct=True) * 100
     
-    # 3. Dual-Percentile Power Score (Max Score = 10,000)
-    master_df['Power_Score'] = master_df['Turnover_PR'] * master_df['Momentum_PR']
+    # 3. Rank 3: One-Way Volatility Percentile (Hurst PR - Filters out Whipsaw Traps)
+    master_df['Hurst_PR'] = master_df.groupby('Time_Window', observed=False)['Hurst'].rank(pct=True) * 100
+    
+    # 4. Triple-Percentile Composite Power Score (Multiplicative Hurst Gatekeeper)
+    master_df['Power_Score'] = master_df['Turnover_PR'] * master_df['Momentum_PR'] * (master_df['Hurst_PR'] / 100.0)
     
     # Sort strictly by the Composite Power Score
     master_df = master_df.sort_values(by=['Time_Window', 'Power_Score'], ascending=[True, False])
     top5_per_hour = master_df.groupby('Time_Window', observed=False).head(5)
     
-    print("\n" + "="*115)
-    print(f"🔥 TOP 5 STOCKS BY COMPOSITE POWER SCORE (Turnover PR × Momentum PR) | DATE: {target_date_str}")
-    print("="*115)
+    print("\n" + "="*125)
+    print(f"🔥 TOP 5 UNIDIRECTIONAL TRENDERS (Turnover PR × Momentum PR × Hurst PR Filter) | DATE: {target_date_str}")
+    print("="*125)
     
     for time_window, group in top5_per_hour.groupby('Time_Window', observed=False):
         if group.empty: continue
         print(f"\n⏰ TIME BLOCK: {time_window} IST")
-        print(f"{'Rank':<5} {'Symbol':<15} {'Power Score':<12} | {'Turnover PR':<12} | {'Momentum PR':<12} | {'% Move':<8} {'LTP':<10}")
-        print("-" * 115)
+        print(f"{'Rank':<5} {'Symbol':<15} {'Power Score':<12} | {'Turnover PR':<12} | {'Momentum PR':<12} | {'Hurst PR':<10} | {'% Move':<8} {'LTP':<10}")
+        print("-" * 125)
         
         for rank, (_, row) in enumerate(group.iterrows(), 1):
             move_str = f"+{row['Hourly_Pct_Move']:.2f}%" if row['Hourly_Pct_Move'] > 0 else f"{row['Hourly_Pct_Move']:.2f}%"
-            print(f"{rank:<5} {row['Symbol']:<15} {row['Power_Score']:<12.1f} | {row['Turnover_PR']:>8.2f} PR | {row['Momentum_PR']:>8.2f} PR | {move_str:<8} ₹{row['Close']:<10.2f}")
+            print(f"{rank:<5} {row['Symbol']:<15} {row['Power_Score']:<12.1f} | {row['Turnover_PR']:>8.2f} PR | {row['Momentum_PR']:>8.2f} PR | {row['Hurst_PR']:>6.2f} PR | {move_str:<8} ₹{row['Close']:<10.2f}")
 
 # ==============================================================================
 # 6. MAIN CONTROLLER
@@ -424,8 +455,9 @@ def run_production_sweep():
     else:
         print("⚠️ Not enough historical Nifty data available for AI training.")
     
-    # Execute the new Dual-Percentile Power Scan
+    # Execute the new Triple-Percentile Power Scan with Hurst PR
     scan_hourly_top_turnover(target_date_str)
 
 if __name__ == "__main__":
     run_production_sweep()
+
