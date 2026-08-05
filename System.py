@@ -124,14 +124,16 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str):
     if target_date_str == today_str:
         url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key)}/1minute"
     else:
-        # Fixed: Upstox historical intraday endpoint expects [to_date] / [from_date] where to_date >= from_date
         target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
         next_date_str = (target_dt + timedelta(days=1)).strftime("%Y-%m-%d")
         url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{next_date_str}/{target_date_str}"
     
     response = requests.get(url, headers=headers)
     if response.status_code != 200:
+        # Diagnostic print for debugging API token/limit issues
+        print(f"⚠️ API Error [{response.status_code}] for {instrument_key}: {response.text}")
         return None
+        
     data = response.json().get('data', {}).get('candles', [])
     if not data:
         return None
@@ -184,7 +186,7 @@ def scan_live_cumulative_compression(target_date_str):
         time.sleep(0.1)
 
     if not records:
-        print("❌ No intraday records collected (Market might be closed or date is invalid).")
+        print("❌ No intraday records collected (Market might be closed, token invalid, or date format rejected).")
         return
 
     master = pd.DataFrame(records)
@@ -209,4 +211,3 @@ if __name__ == "__main__":
     
     target_date = datetime.now().strftime("%Y-%m-%d")
     scan_live_cumulative_compression(target_date)
-
