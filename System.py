@@ -1,3 +1,4 @@
+
 import os
 import sys
 import argparse
@@ -282,7 +283,6 @@ def fetch_upstox_data(instrument_key, target_date_str, days_back=180):
     data = response.json().get('data', {}).get('candles', [])
     if not data or len(data) < 40: return None
         
-    # Convert raw list into pandas framework to execute aligned timeframe conversion
     c_df = pd.DataFrame(data, columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
     c_df = c_df.iloc[::-1].reset_index(drop=True)
     c_df['Date'] = c_df['Date'].astype(str).str[:10]
@@ -363,6 +363,97 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
     except Exception as e:
         print(f"Failed to send email: {str(e)}")
 
+# ==============================================================================
+# 6. HOURLY TURNOVER SCANNER (Top 5 Volume x Price)
+# ==============================================================================
+def fetch_upstox_intraday_candles(instrument_key, target_date_str):
+    access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
+    if not access_token: return None
+    
+    url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{target_date_str}/{target_date_str}"
+    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
+    
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200: return None
+        
+    data = response.json().get('data', {}).get('candles', [])
+    if not data: return None
+        
+    c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
+    c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).dt.tz_localize(None) 
+    c_df = c_df.sort_values('Datetime').reset_index(drop=True)
+    return c_df
+
+def scan_hourly_top_turnover(target_date_str):
+    print(f"\n⏳ Initializing Hourly Turnover Scan (Volume * Price) for {target_date_str}...")
+    universe = get_dynamic_fno_universe()
+    if not universe:
+        print("⚠️ No F&O universe found. Please check Upstox API.")
+        return
+        
+    all_hourly_records = []
+    
+    target_dt = pd.to_datetime(target_date_str)
+    bins = [
+        target_dt + pd.Timedelta(hours=9, minutes=15),
+        target_dt + pd.Timedelta(hours=10, minutes=15),
+        target_dt + pd.Timedelta(hours=11, minutes=15),
+        target_dt + pd.Timedelta(hours=12, minutes=15),
+        target_dt + pd.Timedelta(hours=13, minutes=15),
+        target_dt + pd.Timedelta(hours=14, minutes=15),
+        target_dt + pd.Timedelta(hours=15, minutes=15),
+        target_dt + pd.Timedelta(hours=15, minutes=30)
+    ]
+    labels = [
+        '09:15 - 10:15', '10:15 - 11:15', '11:15 - 12:15', 
+        '12:15 - 13:15', '13:15 - 14:15', '14:15 - 15:15', '15:15 - 15:30'
+    ]
+    
+    print(f"📡 Downloading 1-minute intraday data for {len(universe)} F&O stocks...")
+    for item in universe:
+        df = fetch_upstox_intraday_candles(item['key'], target_date_str)
+        if df is None or df.empty: continue
+        df['Turnover'] = df['Volume'] * df['Close']
+        df['Time_Window'] = pd.cut(df['Datetime'], bins=bins, labels=labels, include_lowest=True, right=False)
+        
+        hourly = df.groupby('Time_Window', observed=False).agg({
+            'Turnover': 'sum',
+            'Volume': 'sum',
+            'Close': 'last'
+        }).reset_index()
+        
+        hourly['Symbol'] = item['symbol']
+        all_hourly_records.append(hourly)
+        
+    if not all_hourly_records:
+        print("❌ Could not retrieve valid intraday data.")
+        return
+        
+    master_df = pd.concat(all_hourly_records, ignore_index=True)
+    
+    top5_per_hour = (
+        master_df.groupby('Time_Window', observed=False, group_keys=False)
+        .apply(lambda x: x.nlargest(5, 'Turnover'))
+        .reset_index(drop=True)
+    )
+    
+    print("\n" + "="*85)
+    print(f"🔥 TOP 5 STOCKS PER HOUR BY TRADED TURNOVER (Volume × Price) | DATE: {target_date_str}")
+    print("="*85)
+    
+    for time_window, group in top5_per_hour.groupby('Time_Window', observed=False):
+        if group.empty: continue
+        print(f"\n⏰ TIME BLOCK: {time_window} IST")
+        print(f"{'Rank':<5} {'Symbol':<15} {'Turnover (₹ Crores)':<25} {'Volume Executed':<18} {'LTP (₹)':<10}")
+        print("-" * 85)
+        
+        for rank, (_, row) in enumerate(group.iterrows(), 1):
+            turnover_cr = row['Turnover'] / 1e7
+            print(f"{rank:<5} {row['Symbol']:<15} ₹{turnover_cr:>10.2f} Cr {int(row['Volume']):>18,d}  ₹{row['Close']:<10.2f}")
+
+# ==============================================================================
+# 7. MAIN CONTROLLER
+# ==============================================================================
 def run_production_sweep():
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--date", type=str, default="")
@@ -395,91 +486,15 @@ def run_production_sweep():
         print("❌ Critical Error: No Nifty data sets located.")
         return
 
-    # ==========================================
-    # PHASE 1: MACRO NIFTY MATRIX (DUAL ENCODER)
-    # ==========================================
+    # PHASE 1: MACRO NIFTY MATRIX
     print(f"\n🧠 TRAINING PHASE 1: Processing Macro System on {nifty_file}...")
     X_d_nifty, X_w_nifty, Y_np, Y_nt = load_training_data(nifty_file, target_date_str, min_pct=0.75, max_pct=5.0, max_dd=0.5, wick_ratio=0.5)
     if X_d_nifty is None or len(X_d_nifty) == 0: return
 
     nifty_brain, nifty_xgb_p, nifty_xgb_t, nifty_faiss = train_ai_brain(X_d_nifty, X_w_nifty, Y_np, Y_nt)
-    nifty_live_d, nifty_live_w, nifty_ltp = get_live_tensor_from_csv(nifty_file, target_date_str)
     
-    if nifty_live_d is not None:
-        with torch.no_grad():
-            n_latent = nifty_brain.encode(torch.tensor(nifty_live_d).unsqueeze(0), torch.tensor(nifty_live_w).unsqueeze(0)).numpy()
-        n_pct = nifty_xgb_p.predict(n_latent)[0]
-        faiss.normalize_L2(n_latent)
-        n_score, _ = nifty_faiss.search(n_latent, k=5)
-        
-        macro_report = {
-            'direction': "LONG 🟢" if n_pct > 0 else "SHORT 🔴",
-            'conviction': float(n_score[0][0] * 100),
-            'target_display': f"₹{nifty_ltp * (1 + (n_pct / 100)):.2f} ({'+' if n_pct>0 else ''}{n_pct:.2f}%)"
-        }
-    else:
-        macro_report = {'direction': "UNKNOWN", 'conviction': 0, 'target_display': "N/A"}
-
-    # ==========================================
-    # PHASE 2: MICRO F&O BRAIN (DUAL ENCODER)
-    # ==========================================
-    print("\n⚡ TRAINING PHASE 2: Processing Multi-Timeframe F&O Universe...")
-    X_d_fno, X_w_fno, Y_fp, Y_ft = load_training_data("historical_fno.csv", target_date_str, min_pct=4.0, max_pct=50.0, max_dd=1.2, wick_ratio=0.4)
-    if X_d_fno is None or len(X_d_fno) == 0: return
-
-    fno_brain, fno_xgb_p, fno_xgb_t, fno_faiss = train_ai_brain(X_d_fno, X_w_fno, Y_fp, Y_ft)
-    fno_universe = get_dynamic_fno_universe()
-    
-    final_report_data = []
-    min_conviction = float(os.environ.get("PARAM_MIN_CONVICTION", 97.0))
-
-    for asset in fno_universe:
-        result = fetch_upstox_data(asset["key"], target_date_str, days_back=180)
-        time.sleep(0.15)
-        if result is None: continue
-        live_d, live_w, current_ltp = result
-        
-        with torch.no_grad():
-            l_vector = fno_brain.encode(torch.tensor(live_d).unsqueeze(0), torch.tensor(live_w).unsqueeze(0)).numpy()
-        
-        pred_pct = fno_xgb_p.predict(l_vector)[0]
-        faiss.normalize_L2(l_vector)
-        score, _ = fno_faiss.search(l_vector, k=5)
-        conviction = score[0][0] * 100
-        
-        if conviction >= min_conviction:
-            final_report_data.append({
-                'asset': asset["symbol"],
-                'direction': "LONG 🟢" if pred_pct > 0 else "SHORT 🔴",
-                'conviction': float(conviction),
-                'ltp': float(current_ltp),
-                'target_display': f"₹{current_ltp * (1 + (pred_pct / 100)):.2f} ({'+' if pred_pct>0 else ''}{pred_pct:.2f}%)",
-                'actual_outcome': "<b>Awaiting Market ⏳</b>"
-            })
-            
-    # Automated Multi-Timeframe Backtest Engine Validation
-    if is_backtest and os.path.exists("historical_fno.csv") and final_report_data:
-        df_full = read_and_standardize_csv("historical_fno.csv")
-        if df_full is not None and 'Symbol' in df_full.columns:
-            for row in final_report_data:
-                df_sym = df_full[df_full['Symbol'] == row['asset']].sort_values('Date').reset_index(drop=True)
-                past = df_sym[df_sym['Date'] <= target_date_str]
-                if len(past) > 0 and past.index[-1] + 1 < len(df_sym):
-                    idx = past.index[-1]
-                    fw = df_sym.iloc[idx+1 : idx+3]
-                    if len(fw) > 0:
-                        mx, mn = fw['Close'].max(), fw['Close'].min()
-                        if "LONG" in row['direction']:
-                            mv, dd = ((mx - row['ltp']) / row['ltp']) * 100, ((fw['Low'].min() - row['ltp']) / row['ltp']) * 100
-                            c = "#28a745" if mv > 0 else "#6c757d"
-                            row['actual_outcome'] = f"<span style='color: {c};'>Closed ₹{mx:.2f} (+{mv:.2f}%)</span><br><span style='color: #856404; font-size: 11px;'>Max DD: {dd:.2f}%</span>"
-                        else:
-                            mv, dd = ((mn - row['ltp']) / row['ltp']) * 100, ((fw['High'].max() - row['ltp']) / row['ltp']) * 100
-                            c = "#28a745" if mv < 0 else "#6c757d"
-                            row['actual_outcome'] = f"<span style='color: {c};'>{mv:.2f}%</span><br><span style='color: #856404; font-size: 11px;'>Max DD: +{dd:.2f}%</span>"
-
-    send_mobile_alert(macro_report, final_report_data, target_date_str, is_backtest)
+    # Run the new Hourly Turnover Ranking Scan
+    scan_hourly_top_turnover(target_date_str)
 
 if __name__ == "__main__":
     run_production_sweep()
-
