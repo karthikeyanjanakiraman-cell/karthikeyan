@@ -162,7 +162,6 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_pct=
             raw_window_w = sub_w[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)[-15:]
             raw_window_d = values_d[i : i+30]
             
-            # Application of Equi-Percentile method for AI Engine
             norm_window_d = convert_to_equi_percentile(raw_window_d)
             norm_window_w = convert_to_equi_percentile(raw_window_w)
             
@@ -255,7 +254,6 @@ def get_live_tensor_from_csv(csv_filename, target_date_str):
     
     current_ltp = vals_d[-1, 3]
     
-    # Application of Equi-Percentile method
     norm_d = convert_to_equi_percentile(vals_d)
     norm_w = convert_to_equi_percentile(vals_w)
     
@@ -273,12 +271,9 @@ def get_dynamic_fno_universe():
         return []
 
 # ==============================================================================
-# 5. HOURLY TURNOVER SCANNER (Triple-Percentile Power Score with Hurst PR Filter)
+# 5. CUMULATIVE INTRADAY SCANNER (Session-to-Date Expanding Windows)
 # ==============================================================================
 def calculate_hurst(price_series):
-    """
-    Calculates the Hurst Exponent to measure directional persistence (One-Way vs Whipsaw).
-    """
     try:
         prices = np.array(price_series, dtype=np.float32)
         if len(prices) < 15:
@@ -321,74 +316,73 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str):
     c_df = c_df.sort_values('Datetime').reset_index(drop=True)
     return c_df
 
-def scan_hourly_top_turnover(target_date_str):
-    print(f"\n⏳ Initializing Triple-Percentile (Turnover PR × Momentum PR × Hurst PR) Scan for {target_date_str}...")
+def scan_cumulative_turnover(target_date_str):
+    print(f"\n⏳ Initializing Cumulative Session-to-Date Scan (09:15 Open to Checkpoint) for {target_date_str}...")
     universe = get_dynamic_fno_universe()
     if not universe:
         print("⚠️ No F&O universe found. Please check Upstox API.")
         return
         
-    all_hourly_records = []
+    all_cumulative_records = []
     
     target_dt = pd.to_datetime(target_date_str)
-    bins = [
-        target_dt + pd.Timedelta(hours=9, minutes=15),
-        target_dt + pd.Timedelta(hours=10, minutes=15),
-        target_dt + pd.Timedelta(hours=11, minutes=15),
-        target_dt + pd.Timedelta(hours=12, minutes=15),
-        target_dt + pd.Timedelta(hours=13, minutes=15),
-        target_dt + pd.Timedelta(hours=14, minutes=15),
-        target_dt + pd.Timedelta(hours=15, minutes=15),
-        target_dt + pd.Timedelta(hours=15, minutes=30)
-    ]
-    labels = [
-        '09:15 - 10:15', '10:15 - 11:15', '11:15 - 12:15', 
-        '12:15 - 13:15', '13:15 - 14:15', '14:15 - 15:15', '15:15 - 15:30'
+    session_open = target_dt + pd.Timedelta(hours=9, minutes=15)
+    
+    # Cumulative checkpoints expanding from market open (09:15)
+    checkpoints = [
+        ('09:15 - 10:15', target_dt + pd.Timedelta(hours=10, minutes=15)),
+        ('09:15 - 11:15', target_dt + pd.Timedelta(hours=11, minutes=15)),
+        ('09:15 - 12:15', target_dt + pd.Timedelta(hours=12, minutes=15)),
+        ('09:15 - 13:15', target_dt + pd.Timedelta(hours=13, minutes=15)),
+        ('09:15 - 14:15', target_dt + pd.Timedelta(hours=14, minutes=15)),
+        ('09:15 - 15:15', target_dt + pd.Timedelta(hours=15, minutes=15)),
+        ('09:15 - 15:30', target_dt + pd.Timedelta(hours=15, minutes=30))
     ]
     
-    print(f"📡 Downloading intraday data and computing Hurst persistence for {len(universe)} stocks...")
+    print(f"📡 Downloading intraday data and computing cumulative session metrics for {len(universe)} stocks...")
     for item in universe:
         df = fetch_upstox_intraday_candles(item['key'], target_date_str)
         if df is None or df.empty: continue
             
         df['Turnover'] = df['Volume'] * df['Close']
-        df['Time_Window'] = pd.cut(df['Datetime'], bins=bins, labels=labels, include_lowest=True, right=False)
         
-        for tw, group_window in df.groupby('Time_Window', observed=False):
-            if group_window.empty: continue
-            turnover_sum = group_window['Turnover'].sum()
-            if turnover_sum <= 0: continue
+        for label, cp_time in checkpoints:
+            sub_df = df[(df['Datetime'] >= session_open) & (df['Datetime'] <= cp_time)]
+            if sub_df.empty: continue
             
-            open_val = group_window['Open'].iloc[0]
-            close_val = group_window['Close'].iloc[-1]
-            closes_1m = group_window['Close'].values
+            cum_turnover = sub_df['Turnover'].sum()
+            if cum_turnover <= 0: continue
+            
+            open_val = sub_df['Open'].iloc[0]
+            close_val = sub_df['Close'].iloc[-1]
+            closes_1m = sub_df['Close'].values
             
             hurst_val = calculate_hurst(closes_1m)
             
-            all_hourly_records.append({
-                'Time_Window': tw,
+            all_cumulative_records.append({
+                'Time_Window': label,
                 'Symbol': item['symbol'],
-                'Turnover': turnover_sum,
+                'Turnover': cum_turnover,
                 'Open': open_val,
                 'Close': close_val,
                 'Hurst': hurst_val
             })
         
-    if not all_hourly_records:
+    if not all_cumulative_records:
         print("❌ Could not retrieve valid intraday data.")
         return
         
-    master_df = pd.DataFrame(all_hourly_records)
+    master_df = pd.DataFrame(all_cumulative_records)
     
-    # 1. Rank 1: Liquidity Percentile (Turnover PR)
+    # 1. Rank 1: Cumulative Liquidity Percentile (Turnover PR)
     master_df['Turnover_PR'] = master_df.groupby('Time_Window', observed=False)['Turnover'].rank(pct=True) * 100
     
-    # 2. Rank 2: Price Displacement Percentile (Momentum PR)
+    # 2. Rank 2: Cumulative Price Displacement Percentile (Momentum PR from 09:15 Open)
     master_df['Hourly_Pct_Move'] = ((master_df['Close'] - master_df['Open']) / master_df['Open']) * 100
     master_df['Abs_Move'] = master_df['Hourly_Pct_Move'].abs()
     master_df['Momentum_PR'] = master_df.groupby('Time_Window', observed=False)['Abs_Move'].rank(pct=True) * 100
     
-    # 3. Rank 3: One-Way Volatility Percentile (Hurst PR - Filters out Whipsaw Traps)
+    # 3. Rank 3: Cumulative One-Way Volatility Percentile (Hurst PR)
     master_df['Hurst_PR'] = master_df.groupby('Time_Window', observed=False)['Hurst'].rank(pct=True) * 100
     
     # 4. Triple-Percentile Composite Power Score (Multiplicative Hurst Gatekeeper)
@@ -396,15 +390,15 @@ def scan_hourly_top_turnover(target_date_str):
     
     # Sort strictly by the Composite Power Score
     master_df = master_df.sort_values(by=['Time_Window', 'Power_Score'], ascending=[True, False])
-    top5_per_hour = master_df.groupby('Time_Window', observed=False).head(5)
+    top5_per_window = master_df.groupby('Time_Window', observed=False).head(5)
     
     print("\n" + "="*125)
-    print(f"🔥 TOP 5 UNIDIRECTIONAL TRENDERS (Turnover PR × Momentum PR × Hurst PR Filter) | DATE: {target_date_str}")
+    print(f"🔥 TOP 5 CUMULATIVE TRENDERS (From 09:15 Open | Turnover PR × Momentum PR × Hurst PR) | DATE: {target_date_str}")
     print("="*125)
     
-    for time_window, group in top5_per_hour.groupby('Time_Window', observed=False):
+    for time_window, group in top5_per_window.groupby('Time_Window', observed=False):
         if group.empty: continue
-        print(f"\n⏰ TIME BLOCK: {time_window} IST")
+        print(f"\n⏰ CUMULATIVE WINDOW: {time_window} IST")
         print(f"{'Rank':<5} {'Symbol':<15} {'Power Score':<12} | {'Turnover PR':<12} | {'Momentum PR':<12} | {'Hurst PR':<10} | {'% Move':<8} {'LTP':<10}")
         print("-" * 125)
         
@@ -455,9 +449,8 @@ def run_production_sweep():
     else:
         print("⚠️ Not enough historical Nifty data available for AI training.")
     
-    # Execute the new Triple-Percentile Power Scan with Hurst PR
-    scan_hourly_top_turnover(target_date_str)
+    # Execute the cumulative session-to-date scan
+    scan_cumulative_turnover(target_date_str)
 
 if __name__ == "__main__":
     run_production_sweep()
-
