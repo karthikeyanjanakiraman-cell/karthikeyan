@@ -32,12 +32,12 @@ class MultiTimeframeAutoencoder(nn.Module):
             nn.Conv1d(in_channels=num_features, out_channels=16, kernel_size=3, padding=1),
             nn.BatchNorm1d(16),
             nn.ReLU(inplace=True),
-            nn.MaxPool1d(2),  # 30 -> 15
+            nn.MaxPool1d(2),
             
             nn.Conv1d(in_channels=16, out_channels=32, kernel_size=3, padding=1),
             nn.BatchNorm1d(32),
             nn.ReLU(inplace=True),
-            nn.MaxPool1d(3),  # 15 -> 5
+            nn.MaxPool1d(3),
             
             nn.Flatten(),
             nn.Linear(32 * 5, latent_dim_daily)
@@ -48,7 +48,7 @@ class MultiTimeframeAutoencoder(nn.Module):
             nn.Conv1d(in_channels=num_features, out_channels=16, kernel_size=3, padding=1),
             nn.BatchNorm1d(16),
             nn.ReLU(inplace=True),
-            nn.MaxPool1d(3),  # 15 -> 5
+            nn.MaxPool1d(3),
             
             nn.Flatten(),
             nn.Linear(16 * 5, latent_dim_weekly)
@@ -59,10 +59,10 @@ class MultiTimeframeAutoencoder(nn.Module):
             nn.Linear(latent_dim_daily, 32 * 5),
             nn.ReLU(inplace=True),
             nn.Unflatten(1, (32, 5)),
-            nn.ConvTranspose1d(32, 16, kernel_size=3, stride=3, output_padding=0),  # 5 -> 15
+            nn.ConvTranspose1d(32, 16, kernel_size=3, stride=3, output_padding=0),
             nn.BatchNorm1d(16),
             nn.ReLU(inplace=True),
-            nn.ConvTranspose1d(16, num_features, kernel_size=2, stride=2, output_padding=0),  # 15 -> 30
+            nn.ConvTranspose1d(16, num_features, kernel_size=2, stride=2, output_padding=0),
             nn.Sigmoid()
         )
         
@@ -71,14 +71,14 @@ class MultiTimeframeAutoencoder(nn.Module):
             nn.Linear(latent_dim_weekly, 16 * 5),
             nn.ReLU(inplace=True),
             nn.Unflatten(1, (16, 5)),
-            nn.ConvTranspose1d(16, num_features, kernel_size=3, stride=3, output_padding=0),  # 5 -> 15
+            nn.ConvTranspose1d(16, num_features, kernel_size=3, stride=3, output_padding=0),
             nn.Sigmoid()
         )
 
     def encode(self, x_daily, x_weekly):
         ld = self.encoder_daily(x_daily)
         lw = self.encoder_weekly(x_weekly)
-        return torch.cat((ld, lw), dim=1)  # Master 24-Dimensional Feature Map
+        return torch.cat((ld, lw), dim=1)
 
     def forward(self, x_daily, x_weekly):
         ld = self.encoder_daily(x_daily)
@@ -263,7 +263,7 @@ def get_dynamic_fno_universe():
         return []
 
 # ==============================================================================
-# 5. HOURLY TURNOVER SCANNER & INTRADAY HANDLER (DEFINED BEFORE USAGE)
+# 5. HOURLY TURNOVER SCANNER & INTRADAY HANDLER (Fix Applied)
 # ==============================================================================
 def fetch_upstox_intraday_candles(instrument_key, target_date_str):
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
@@ -325,6 +325,7 @@ def scan_hourly_top_turnover(target_date_str):
         df['Turnover'] = df['Volume'] * df['Close']
         df['Time_Window'] = pd.cut(df['Datetime'], bins=bins, labels=labels, include_lowest=True, right=False)
         
+        # Aggregate hourly
         hourly = df.groupby('Time_Window', observed=False).agg({
             'Turnover': 'sum',
             'Volume': 'sum',
@@ -332,6 +333,10 @@ def scan_hourly_top_turnover(target_date_str):
         }).reset_index()
         
         hourly['Symbol'] = item['symbol']
+        
+        # Only append rows that actually have turnover data for that hour
+        hourly = hourly[hourly['Turnover'] > 0]
+        
         all_hourly_records.append(hourly)
         
     if not all_hourly_records:
@@ -340,11 +345,12 @@ def scan_hourly_top_turnover(target_date_str):
         
     master_df = pd.concat(all_hourly_records, ignore_index=True)
     
-    top5_per_hour = (
-        master_df.groupby('Time_Window', observed=False, group_keys=False)
-        .apply(lambda x: x.nlargest(5, 'Turnover'))
-        .reset_index(drop=True)
-    )
+    # ---------------------------------------------------------------------
+    # FIX APPLIED: Replaced .apply(nlargest) with sort_values + head(5)
+    # This prevents Pandas from dropping the 'Time_Window' column
+    # ---------------------------------------------------------------------
+    master_df = master_df.sort_values(by=['Time_Window', 'Turnover'], ascending=[True, False])
+    top5_per_hour = master_df.groupby('Time_Window', observed=False).head(5)
     
     print("\n" + "="*85)
     print(f"🔥 TOP 5 STOCKS PER HOUR BY TRADED TURNOVER (Volume × Price) | DATE: {target_date_str}")
@@ -397,13 +403,12 @@ def run_production_sweep():
 
     print(f"\n🧠 TRAINING PHASE 1: Processing Macro System on {nifty_file}...")
     X_d_nifty, X_w_nifty, Y_np, Y_nt = load_training_data(nifty_file, target_date_str, min_pct=0.75, max_pct=5.0, max_dd=0.5, wick_ratio=0.5)
-    if X_d_nifty is None or len(X_d_nifty) == 0: return
-
-    nifty_brain, nifty_xgb_p, nifty_xgb_t, nifty_faiss = train_ai_brain(X_d_nifty, X_w_nifty, Y_np, Y_nt)
     
-    # Execute the Hourly Turnover Ranking Scan successfully
+    if X_d_nifty is not None and len(X_d_nifty) > 0:
+        nifty_brain, nifty_xgb_p, nifty_xgb_t, nifty_faiss = train_ai_brain(X_d_nifty, X_w_nifty, Y_np, Y_nt)
+    
+    # Execute the Hourly Turnover Ranking Scan safely
     scan_hourly_top_turnover(target_date_str)
 
 if __name__ == "__main__":
     run_production_sweep()
-
