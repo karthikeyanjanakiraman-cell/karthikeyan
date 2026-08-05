@@ -30,20 +30,20 @@ def calculate_hurst(price_series):
         return 0.5
 
 # ==============================================================================
-# 2. HISTORICAL 5-YEAR SCANNER: Pristine Breakouts (Zero Gap & Zero Drawdown)
+# 2. HISTORICAL 5-YEAR SCANNER: Long-Only Pristine Breakouts
 # ==============================================================================
 def scan_historical_pristine_breakouts(csv_filename="historical_fno.csv", min_pct=5.0, max_drawdown=0.5, max_gap=0.2):
     """
-    Scans the 5-year historical daily database for rare, trap-free breakouts:
-    - Minimum 2-day net move >= 5%
-    - Zero overnight gaps (Open matches prior Close within tolerance)
-    - Zero mean reversion / drawdown during the move
+    Scans the 5-year historical daily database for rare, trap-free LONG breakouts:
+    - Minimum 2-day net positive move >= +5.0%
+    - Zero overnight gaps (Open matches prior Close within max_gap %)
+    - Zero mean reversion / drawdown during the move (Lews do not breach baseline)
     """
     if not os.path.exists(csv_filename):
         print(f"❌ Error: '{csv_filename}' not found. Run the downloader script first.")
         return
 
-    print(f"\n⏳ Scanning historical F&O database for zero-gap, zero-drawdown breakouts (>= {min_pct}% in 2 days)...")
+    print(f"\n⏳ Scanning historical F&O database for zero-gap, zero-drawdown LONG breakouts (>= +{min_pct}% in 2 days)...")
     df = pd.read_csv(csv_filename)
     df['Date'] = pd.to_datetime(df['Date'])
     df = df.sort_values(['Symbol', 'Date']).reset_index(drop=True)
@@ -72,23 +72,16 @@ def scan_historical_pristine_breakouts(csv_filename="historical_fno.csv", min_pc
             if gap_t1 > max_gap or gap_t2 > max_gap:
                 continue
 
-            # 2. Calculate 2-Day Net Move
+            # 2. Calculate 2-Day Net Move (Strictly Positive for Long Breakouts)
             net_move = ((t2_close - t0_close) / t0_close) * 100
-            if abs(net_move) < min_pct:
+            if net_move < min_pct:
                 continue
 
-            is_long = net_move > 0
-
-            # 3. Check for Zero Drawdown / Mean Reversion
-            if is_long:
-                # Long breakout: Lows cannot drop significantly below baseline
-                drawdown_t1 = ((t1_low - t0_close) / t0_close) * 100
-                drawdown_t2 = ((t2_low - t1_close) / t1_close) * 100
-                if drawdown_t1 < -max_drawdown or drawdown_t2 < -max_drawdown:
-                    continue
-            else:
-                # Short breakout: Highs cannot spike significantly above baseline
-                pass # (Focused primarily on clean long breakouts)
+            # 3. Check for Zero Drawdown / Mean Reversion (Lows cannot drop below baseline)
+            drawdown_t1 = ((t1_low - t0_close) / t0_close) * 100
+            drawdown_t2 = ((t2_low - t1_close) / t1_close) * 100
+            if drawdown_t1 < -max_drawdown or drawdown_t2 < -max_drawdown:
+                continue
 
             pristine_breakouts.append({
                 'Symbol': symbol,
@@ -100,11 +93,11 @@ def scan_historical_pristine_breakouts(csv_filename="historical_fno.csv", min_pc
 
     result_df = pd.DataFrame(pristine_breakouts)
     if not result_df.empty:
-        print(f"\n🎉 Found {len(result_df)} pristine, gap-free, zero-drawdown breakout instances across history!")
+        print(f"\n🎉 Found {len(result_df)} pristine, gap-free, zero-drawdown LONG breakout instances across history!")
         print(result_df.head(15).to_string(index=False))
-        result_df.to_csv("pristine_breakouts_catalog.csv", index=False)
+        result_df.to_csv("pristine_long_breakouts_catalog.csv", index=False)
     else:
-        print("⚠️ No instances matched the strict criteria.")
+        print("⚠️ No long instances matched the strict criteria.")
 
 # ==============================================================================
 # 3. LIVE CUMULATIVE PRE-BREAKOUT COMPRESSION SCANNER (Intraday)
@@ -144,7 +137,13 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str):
     return c_df.sort_values('Datetime').reset_index(drop=True)
 
 def scan_live_cumulative_compression(target_date_str):
-    print(f"\n🔍 Scanning live/backtest session for cumulative pre-breakout compression on {target_date_str}...")
+    access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
+    if not access_token:
+        print("\n⚠️ Skipping Live Intraday Scan: 'UPSTOX_ACCESS_TOKEN' environment variable is missing or not set.")
+        print("💡 Tip: Set your token in your terminal using: export UPSTOX_ACCESS_TOKEN='your_token_here'")
+        return
+
+    print(f"\n🔍 Scanning session for cumulative pre-breakout compression on {target_date_str}...")
     universe = get_dynamic_fno_universe()
     if not universe:
         print("⚠️ No F&O universe found.")
@@ -179,10 +178,10 @@ def scan_live_cumulative_compression(target_date_str):
             'Hurst': hurst,
             'LTP': close_val
         })
-        time.sleep(0.1) # Rate limiter
+        time.sleep(0.1)
 
     if not records:
-        print("❌ No intraday records collected.")
+        print("❌ No intraday records collected (Market might be closed or date is invalid).")
         return
 
     master = pd.DataFrame(records)
@@ -202,10 +201,8 @@ def scan_live_cumulative_compression(target_date_str):
         print(f"{row['Symbol']:<15} {row['Power_Score']:<12.1f} | {row['Turnover_PR']:>8.2f} PR | {row['Momentum_PR']:>8.2f} PR | {row['Hurst_PR']:>6.2f} PR | {move_str:<8} ₹{row['LTP']:<10.2f}")
 
 if __name__ == "__main__":
-    # Execute historical scan first, or live scan if historical CSV exists
     if os.path.exists("historical_fno.csv"):
         scan_historical_pristine_breakouts()
     
-    # Run cumulative scan for today or specified date
     target_date = datetime.now().strftime("%Y-%m-%d")
     scan_live_cumulative_compression(target_date)
