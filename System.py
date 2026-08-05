@@ -368,89 +368,36 @@ def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
 # ==============================================================================
 def fetch_upstox_intraday_candles(instrument_key, target_date_str):
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
-    if not access_token: return None
+    if not access_token:
+        print("❌ Upstox Access Token missing in environment variables.")
+        return None
     
-    url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{target_date_str}/{target_date_str}"
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    
+    # Route correctly based on whether target date is today or a past date
+    if target_date_str == today_str:
+        # Live Intraday Endpoint for the current session
+        url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key)}/1minute"
+    else:
+        # Historical Endpoint for past dates (to_date / from_date)
+        url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{target_date_str}/{target_date_str}"
     
     response = requests.get(url, headers=headers)
-    if response.status_code != 200: return None
+    if response.status_code != 200:
+        print(f"⚠️ Upstox API Error [{response.status_code}] for {instrument_key}: {response.text}")
+        return None
         
     data = response.json().get('data', {}).get('candles', [])
-    if not data: return None
+    if not data:
+        return None
         
     c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
     c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).dt.tz_localize(None) 
     c_df = c_df.sort_values('Datetime').reset_index(drop=True)
     return c_df
 
-def scan_hourly_top_turnover(target_date_str):
-    print(f"\n⏳ Initializing Hourly Turnover Scan (Volume * Price) for {target_date_str}...")
-    universe = get_dynamic_fno_universe()
-    if not universe:
-        print("⚠️ No F&O universe found. Please check Upstox API.")
-        return
-        
-    all_hourly_records = []
-    
-    target_dt = pd.to_datetime(target_date_str)
-    bins = [
-        target_dt + pd.Timedelta(hours=9, minutes=15),
-        target_dt + pd.Timedelta(hours=10, minutes=15),
-        target_dt + pd.Timedelta(hours=11, minutes=15),
-        target_dt + pd.Timedelta(hours=12, minutes=15),
-        target_dt + pd.Timedelta(hours=13, minutes=15),
-        target_dt + pd.Timedelta(hours=14, minutes=15),
-        target_dt + pd.Timedelta(hours=15, minutes=15),
-        target_dt + pd.Timedelta(hours=15, minutes=30)
-    ]
-    labels = [
-        '09:15 - 10:15', '10:15 - 11:15', '11:15 - 12:15', 
-        '12:15 - 13:15', '13:15 - 14:15', '14:15 - 15:15', '15:15 - 15:30'
-    ]
-    
-    print(f"📡 Downloading 1-minute intraday data for {len(universe)} F&O stocks...")
-    for item in universe:
-        df = fetch_upstox_intraday_candles(item['key'], target_date_str)
-        if df is None or df.empty: continue
-        df['Turnover'] = df['Volume'] * df['Close']
-        df['Time_Window'] = pd.cut(df['Datetime'], bins=bins, labels=labels, include_lowest=True, right=False)
-        
-        hourly = df.groupby('Time_Window', observed=False).agg({
-            'Turnover': 'sum',
-            'Volume': 'sum',
-            'Close': 'last'
-        }).reset_index()
-        
-        hourly['Symbol'] = item['symbol']
-        all_hourly_records.append(hourly)
-        
-    if not all_hourly_records:
-        print("❌ Could not retrieve valid intraday data.")
-        return
-        
-    master_df = pd.concat(all_hourly_records, ignore_index=True)
-    
-    top5_per_hour = (
-        master_df.groupby('Time_Window', observed=False, group_keys=False)
-        .apply(lambda x: x.nlargest(5, 'Turnover'))
-        .reset_index(drop=True)
-    )
-    
-    print("\n" + "="*85)
-    print(f"🔥 TOP 5 STOCKS PER HOUR BY TRADED TURNOVER (Volume × Price) | DATE: {target_date_str}")
-    print("="*85)
-    
-    for time_window, group in top5_per_hour.groupby('Time_Window', observed=False):
-        if group.empty: continue
-        print(f"\n⏰ TIME BLOCK: {time_window} IST")
-        print(f"{'Rank':<5} {'Symbol':<15} {'Turnover (₹ Crores)':<25} {'Volume Executed':<18} {'LTP (₹)':<10}")
-        print("-" * 85)
-        
-        for rank, (_, row) in enumerate(group.iterrows(), 1):
-            turnover_cr = row['Turnover'] / 1e7
-            print(f"{rank:<5} {row['Symbol']:<15} ₹{turnover_cr:>10.2f} Cr {int(row['Volume']):>18,d}  ₹{row['Close']:<10.2f}")
-
+     
 # ==============================================================================
 # 7. MAIN CONTROLLER
 # ==============================================================================
