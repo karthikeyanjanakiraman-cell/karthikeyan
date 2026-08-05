@@ -21,18 +21,14 @@ import faiss
 import xgboost as xgb
 
 # ==============================================================================
-# 0. EQUI-PERCENTILE EQUATING (Replacing Min-Max Normalization)
+# 0. EQUI-PERCENTILE EQUATING (Neutralizes Absolute Price Differences)
 # ==============================================================================
 def convert_to_equi_percentile(raw_matrix):
     """
     Transforms a raw price/volume matrix into a strict Equi-Percentile distribution (0.0 to 1.0).
-    Instead of calculating distances from min/max boundaries, this converts every data point 
-    into its exact mathematical rank within the time window.
+    Converts every data point into its exact mathematical rank within the time window.
     """
-    # argsort(argsort) generates the exact mathematical rank (0, 1, 2... N) for each value in the column
     ranks = np.argsort(np.argsort(raw_matrix, axis=0), axis=0)
-    
-    # Divide by (Total Rows - 1) to map perfectly between 0.0000 and 1.0000
     percentile_matrix = ranks.astype(np.float32) / (raw_matrix.shape[0] - 1 + 1e-8)
     return percentile_matrix
 
@@ -166,7 +162,7 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_pct=
             raw_window_w = sub_w[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)[-15:]
             raw_window_d = values_d[i : i+30]
             
-            # --- EQUI-PERCENTILE EQUATING DEPLOYED HERE ---
+            # Application of Equi-Percentile method for AI Engine
             norm_window_d = convert_to_equi_percentile(raw_window_d)
             norm_window_w = convert_to_equi_percentile(raw_window_w)
             
@@ -234,7 +230,7 @@ def train_ai_brain(X_daily, X_weekly, Y_price, Y_time, epochs=15):
     return model, xgb_price, xgb_time, index
 
 # ==============================================================================
-# 4. LIVE INGESTION & UNIVERSE PACKS (Using Percentiles)
+# 4. LIVE INGESTION & UNIVERSE PACKS
 # ==============================================================================
 def get_live_tensor_from_csv(csv_filename, target_date_str):
     df = read_and_standardize_csv(csv_filename)
@@ -259,7 +255,7 @@ def get_live_tensor_from_csv(csv_filename, target_date_str):
     
     current_ltp = vals_d[-1, 3]
     
-    # --- EQUI-PERCENTILE EQUATING DEPLOYED HERE ---
+    # Application of Equi-Percentile method
     norm_d = convert_to_equi_percentile(vals_d)
     norm_w = convert_to_equi_percentile(vals_w)
     
@@ -277,7 +273,7 @@ def get_dynamic_fno_universe():
         return []
 
 # ==============================================================================
-# 5. HOURLY TURNOVER SCANNER (Cross-Sectional Percentile Rank)
+# 5. HOURLY TURNOVER SCANNER (Dual-Percentile Power Score)
 # ==============================================================================
 def fetch_upstox_intraday_candles(instrument_key, target_date_str):
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
@@ -306,7 +302,7 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str):
     return c_df
 
 def scan_hourly_top_turnover(target_date_str):
-    print(f"\n⏳ Initializing Cross-Sectional Percentile Turnover Scan for {target_date_str}...")
+    print(f"\n⏳ Initializing Dual-Percentile (Turnover PR × Momentum PR) Scan for {target_date_str}...")
     universe = get_dynamic_fno_universe()
     if not universe:
         print("⚠️ No F&O universe found. Please check Upstox API.")
@@ -330,7 +326,7 @@ def scan_hourly_top_turnover(target_date_str):
         '12:15 - 13:15', '13:15 - 14:15', '14:15 - 15:15', '15:15 - 15:30'
     ]
     
-    print(f"📡 Downloading intraday data and mapping CAT/IBPS Equi-Percentiles for {len(universe)} stocks...")
+    print(f"📡 Downloading intraday data for {len(universe)} stocks to calculate Dual-PR Scores...")
     for item in universe:
         df = fetch_upstox_intraday_candles(item['key'], target_date_str)
         if df is None or df.empty: continue
@@ -341,6 +337,7 @@ def scan_hourly_top_turnover(target_date_str):
         hourly = df.groupby('Time_Window', observed=False).agg({
             'Turnover': 'sum',
             'Volume': 'sum',
+            'Open': 'first',
             'Close': 'last'
         }).reset_index()
         
@@ -355,28 +352,34 @@ def scan_hourly_top_turnover(target_date_str):
         
     master_df = pd.concat(all_hourly_records, ignore_index=True)
     
-    # --- CROSS-SECTIONAL EQUI-PERCENTILE CALCULATION ---
-    # Ranks every stock's turnover against the rest of the market for that specific hour, creating a 0-100 Percentile Rank (PR)
-    master_df['Turnover_Percentile'] = master_df.groupby('Time_Window', observed=False)['Turnover'].rank(pct=True) * 100
+    # 1. Rank 1: The Liquidity Percentile (Turnover PR)
+    master_df['Turnover_PR'] = master_df.groupby('Time_Window', observed=False)['Turnover'].rank(pct=True) * 100
     
-    # Sort to isolate the Top 5 Absolute Turnovers (which will naturally have ~99.9% PR)
-    master_df = master_df.sort_values(by=['Time_Window', 'Turnover'], ascending=[True, False])
+    # 2. Rank 2: The Price Displacement Percentile (Momentum PR)
+    master_df['Hourly_Pct_Move'] = ((master_df['Close'] - master_df['Open']) / master_df['Open']) * 100
+    master_df['Abs_Move'] = master_df['Hourly_Pct_Move'].abs()
+    master_df['Momentum_PR'] = master_df.groupby('Time_Window', observed=False)['Abs_Move'].rank(pct=True) * 100
+    
+    # 3. Dual-Percentile Power Score (Max Score = 10,000)
+    master_df['Power_Score'] = master_df['Turnover_PR'] * master_df['Momentum_PR']
+    
+    # Sort strictly by the Composite Power Score
+    master_df = master_df.sort_values(by=['Time_Window', 'Power_Score'], ascending=[True, False])
     top5_per_hour = master_df.groupby('Time_Window', observed=False).head(5)
     
-    print("\n" + "="*95)
-    print(f"🔥 TOP 5 STOCKS BY CROSS-SECTIONAL EQUI-PERCENTILE TURNOVER | DATE: {target_date_str}")
-    print("="*95)
+    print("\n" + "="*115)
+    print(f"🔥 TOP 5 STOCKS BY COMPOSITE POWER SCORE (Turnover PR × Momentum PR) | DATE: {target_date_str}")
+    print("="*115)
     
     for time_window, group in top5_per_hour.groupby('Time_Window', observed=False):
         if group.empty: continue
         print(f"\n⏰ TIME BLOCK: {time_window} IST")
-        print(f"{'Rank':<5} {'Symbol':<15} {'Turnover':<14} | {'Percentile':<10} | {'Volume':<12} {'LTP':<10}")
-        print("-" * 95)
+        print(f"{'Rank':<5} {'Symbol':<15} {'Power Score':<12} | {'Turnover PR':<12} | {'Momentum PR':<12} | {'% Move':<8} {'LTP':<10}")
+        print("-" * 115)
         
         for rank, (_, row) in enumerate(group.iterrows(), 1):
-            turnover_cr = row['Turnover'] / 1e7
-            # Displaying the Percentile Rank (PR) just like a competitive exam
-            print(f"{rank:<5} {row['Symbol']:<15} ₹{turnover_cr:>8.2f} Cr | {row['Turnover_Percentile']:>6.2f} PR | {int(row['Volume']):>12,d}  ₹{row['Close']:<10.2f}")
+            move_str = f"+{row['Hourly_Pct_Move']:.2f}%" if row['Hourly_Pct_Move'] > 0 else f"{row['Hourly_Pct_Move']:.2f}%"
+            print(f"{rank:<5} {row['Symbol']:<15} {row['Power_Score']:<12.1f} | {row['Turnover_PR']:>8.2f} PR | {row['Momentum_PR']:>8.2f} PR | {move_str:<8} ₹{row['Close']:<10.2f}")
 
 # ==============================================================================
 # 6. MAIN CONTROLLER
@@ -418,8 +421,10 @@ def run_production_sweep():
     
     if X_d_nifty is not None and len(X_d_nifty) > 0:
         nifty_brain, nifty_xgb_p, nifty_xgb_t, nifty_faiss = train_ai_brain(X_d_nifty, X_w_nifty, Y_np, Y_nt)
+    else:
+        print("⚠️ Not enough historical Nifty data available for AI training.")
     
-    # Execute the Hourly Percentile Turnover Ranking Scan
+    # Execute the new Dual-Percentile Power Scan
     scan_hourly_top_turnover(target_date_str)
 
 if __name__ == "__main__":
