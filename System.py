@@ -258,24 +258,22 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str):
         return None
 
 # ==============================================================================
-# 4. DISCRETE HOURLY SCANNER WITH ISOLATED WINDOW BLOCKS
+# 4. ACCELERATION DELTA SCANNER (Discrete Hourly vs. Cumulative Session)
 # ==============================================================================
 def scan_discrete_hourly_turnover(target_date_str):
-    print(f"\n⏳ Initializing Discrete Hourly Scanner (1-Hour Isolated Blocks) for {target_date_str}...")
+    print(f"\n⏳ Initializing Acceleration Delta Scanner for {target_date_str}...")
     universe = get_dynamic_fno_universe()
     if not universe:
         print("⚠️ No F&O universe found. Please check Upstox API.")
         return
         
     target_dt = pd.to_datetime(target_date_str)
+    start_of_day = target_dt + pd.Timedelta(hours=9, minutes=15)
     
     # STRICT IST CLOCK ENFORCEMENT
     current_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    
-    # Identify if we are running in live conditions today
     is_live_today = (target_date_str == current_now.strftime("%Y-%m-%d"))
 
-    # Discrete Isolated Time Windows (Start, End, Base Label)
     windows = [
         (target_dt + pd.Timedelta(hours=9, minutes=15), target_dt + pd.Timedelta(hours=10, minutes=15), "09:15 - 10:15"),
         (target_dt + pd.Timedelta(hours=10, minutes=15), target_dt + pd.Timedelta(hours=11, minutes=15), "10:15 - 11:15"),
@@ -286,7 +284,7 @@ def scan_discrete_hourly_turnover(target_date_str):
         (target_dt + pd.Timedelta(hours=15, minutes=15), target_dt + pd.Timedelta(hours=15, minutes=30), "15:15 - 15:30")
     ]
     
-    print(f"📡 Downloading intraday data and computing discrete 1-hour metrics for {len(universe)} stocks...")
+    print(f"📡 Downloading intraday data for {len(universe)} stocks...")
     
     master_intraday_list = []
     for item in universe:
@@ -294,7 +292,6 @@ def scan_discrete_hourly_turnover(target_date_str):
         if df is not None and not df.empty:
             df['Symbol'] = item['symbol']
             df['Turnover'] = df['Volume'] * df['Close']
-            # Compute absolute movement per minute for Hurst Proxy calculation
             df['abs_move'] = (df['Close'] - df['Open']).abs()
             master_intraday_list.append(df)
             
@@ -304,76 +301,81 @@ def scan_discrete_hourly_turnover(target_date_str):
         
     master_df = pd.concat(master_intraday_list, ignore_index=True)
     
-    print("\n" + "="*125)
-    print(f"🔥 TOP 5 DISCRETE HOURLY TRENDERS (Isolated Blocks | Turnover PR × Momentum PR × Hurst PR) | DATE: {target_date_str}")
-    print("="*125)
+    print("\n" + "="*145)
+    print(f"🔥 TOP 5 ACCELERATION DELTA BREAKOUTS (Discrete Hourly Score minus Cumulative Session Score) | DATE: {target_date_str}")
+    print("="*145)
     
     for start_time, end_time, base_label in windows:
-        
-        # If market hasn't reached this window's start time yet, exit loop entirely
         if is_live_today and current_now < start_time:
             break
             
         is_active_live = False
         label = base_label
         
-        # If we are currently inside this window, cap the end time to 'now' and rename label
         if is_live_today and start_time <= current_now < end_time:
             is_active_live = True
             end_time = current_now
             label = f"{start_time.strftime('%H:%M')} - {current_now.strftime('%H:%M')} (LIVE ONGOING)"
             
-        # ISOLATION: Filter strictly for candles that fall INSIDE this specific time block
-        df_window = master_df[(master_df['Datetime'] >= start_time) & (master_df['Datetime'] < end_time)]
+        # 1. ISOLATED DISCRETE WINDOW DATA
+        df_discrete = master_df[(master_df['Datetime'] >= start_time) & (master_df['Datetime'] < end_time)]
+        # 2. CUMULATIVE SESSION DATA (From 09:15 up to current window end)
+        df_cumulative = master_df[(master_df['Datetime'] >= start_of_day) & (master_df['Datetime'] < end_time)]
         
-        if df_window.empty: 
+        if df_discrete.empty or df_cumulative.empty: 
             if is_active_live: break
             continue
             
-        # Aggregate Discrete Values for just this isolated period
-        grouped = df_window.groupby('Symbol').agg({
-            'Turnover': 'sum',
-            'Volume': 'sum',
-            'Open': 'first',
-            'Close': 'last',
-            'abs_move': 'sum' # The cumulative absolute path distance for the hour
+        # --- COMPUTE DISCRETE SCORES ---
+        grouped_disc = df_discrete.groupby('Symbol').agg({
+            'Turnover': 'sum', 'Volume': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'
         }).reset_index()
-        
-        grouped = grouped[grouped['Turnover'] > 0]
-        if grouped.empty: 
+        grouped_disc = grouped_disc[grouped_disc['Turnover'] > 0]
+        if grouped_disc.empty: 
             if is_active_live: break
             continue
+            
+        grouped_disc['Turnover_PR'] = grouped_disc['Turnover'].rank(pct=True) * 100
+        grouped_disc['Pct_Move'] = ((grouped_disc['Close'] - grouped_disc['Open']) / grouped_disc['Open']) * 100
+        grouped_disc['Momentum_PR'] = grouped_disc['Pct_Move'].abs().rank(pct=True) * 100
+        grouped_disc['Net_Disp'] = (grouped_disc['Close'] - grouped_disc['Open']).abs()
+        grouped_disc['Efficiency'] = grouped_disc['Net_Disp'] / (grouped_disc['abs_move'] + 1e-8)
+        grouped_disc['Hurst_PR'] = grouped_disc['Efficiency'].rank(pct=True) * 100
+        grouped_disc['Discrete_Power'] = (grouped_disc['Turnover_PR'] * grouped_disc['Momentum_PR'] * grouped_disc['Hurst_PR']) / 100.0
+
+        # --- COMPUTE CUMULATIVE SCORES ---
+        grouped_cum = df_cumulative.groupby('Symbol').agg({
+            'Turnover': 'sum', 'Volume': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'
+        }).reset_index()
+        grouped_cum = grouped_cum[grouped_cum['Turnover'] > 0]
         
-        # ---------------------------------------------------------
-        # PR METRICS CALCULATION (Evaluating performance solely during this 1 hour)
-        # ---------------------------------------------------------
-        # 1. Turnover PR
-        grouped['Turnover_PR'] = grouped['Turnover'].rank(pct=True) * 100
+        grouped_cum['Cum_Turnover_PR'] = grouped_cum['Turnover'].rank(pct=True) * 100
+        grouped_cum['Cum_Pct_Move'] = ((grouped_cum['Close'] - grouped_cum['Open']) / grouped_cum['Open']) * 100
+        grouped_cum['Cum_Momentum_PR'] = grouped_cum['Cum_Pct_Move'].abs().rank(pct=True) * 100
+        grouped_cum['Cum_Net_Disp'] = (grouped_cum['Close'] - grouped_cum['Open']).abs()
+        grouped_cum['Cum_Efficiency'] = grouped_cum['Cum_Net_Disp'] / (grouped_cum['abs_move'] + 1e-8)
+        grouped_cum['Cum_Hurst_PR'] = grouped_cum['Cum_Efficiency'].rank(pct=True) * 100
+        grouped_cum['Cumulative_Power'] = (grouped_cum['Cum_Turnover_PR'] * grouped_cum['Cum_Momentum_PR'] * grouped_cum['Cum_Hurst_PR']) / 100.0
+
+        # --- MERGE AND CALCULATE ACCELERATION DELTA ---
+        merged = pd.merge(grouped_disc[['Symbol', 'Discrete_Power', 'Pct_Move', 'Close']], 
+                          grouped_cum[['Symbol', 'Cumulative_Power']], 
+                          on='Symbol', how='inner')
         
-        # 2. Momentum PR (Percentage change between the hour's Open and the hour's Close)
-        grouped['Pct_Move'] = ((grouped['Close'] - grouped['Open']) / grouped['Open']) * 100
-        grouped['Momentum_PR'] = grouped['Pct_Move'].abs().rank(pct=True) * 100
+        merged['Acceleration_Delta'] = merged['Discrete_Power'] - merged['Cumulative_Power']
         
-        # 3. Hurst PR (Directional Efficiency Proxy within the hour)
-        grouped['Net_Displacement'] = (grouped['Close'] - grouped['Open']).abs()
-        grouped['Efficiency_Ratio'] = grouped['Net_Displacement'] / (grouped['abs_move'] + 1e-8)
-        grouped['Hurst_PR'] = grouped['Efficiency_Ratio'].rank(pct=True) * 100
-        
-        # 4. Power Score Compilation 
-        grouped['Power_Score'] = (grouped['Turnover_PR'] * grouped['Momentum_PR'] * grouped['Hurst_PR']) / 100.0
-        
-        # Sort and select Top 5
-        top5 = grouped.nlargest(5, 'Power_Score')
+        # Select Top 5 by highest acceleration delta
+        top5 = merged.nlargest(5, 'Acceleration_Delta')
         
         print(f"\n⏰ DISCRETE WINDOW: {label} IST")
-        print(f"{'Rank':<5} {'Symbol':<15} {'Power Score':<12} | {'Turnover PR':<13} | {'Momentum PR':<13} | {'Hurst PR':<10} | {'% Move':<8} {'LTP (₹)':<10}")
-        print("-" * 125)
+        print(f"{'Rank':<5} {'Symbol':<15} {'Accel Delta':<14} | {'Discrete Power':<15} | {'Cumulative Power':<16} | {'% Move':<8} {'LTP (₹)':<10}")
+        print("-" * 145)
         
         for rank, (_, row) in enumerate(top5.iterrows(), 1):
             move_sign = "+" if row['Pct_Move'] > 0 else ""
-            print(f"{rank:<5} {row['Symbol']:<15} {row['Power_Score']:<12.1f} | {row['Turnover_PR']:>9.2f} PR | {row['Momentum_PR']:>9.2f} PR | {row['Hurst_PR']:>6.2f} PR | {move_sign}{row['Pct_Move']:<6.2f}%   ₹{row['Close']:<10.2f}")
+            delta_sign = "+" if row['Acceleration_Delta'] > 0 else ""
+            print(f"{rank:<5} {row['Symbol']:<15} {delta_sign}{row['Acceleration_Delta']:<12.1f} | {row['Discrete_Power']:>13.1f}   | {row['Cumulative_Power']:>14.1f}   | {move_sign}{row['Pct_Move']:<6.2f}%   ₹{row['Close']:<10.2f}")
 
-        # Break the loop immediately after processing the live fractional hour so we don't print empty futures
         if is_active_live:
             break
 
@@ -389,7 +391,6 @@ def run_production_sweep():
     raw_date_str = args.date or args.positional_date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
     is_backtest = bool(raw_date_str)
 
-    # STRICT IST CLOCK ENFORCEMENT
     if not is_backtest:
         target_date_str = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
     else:
