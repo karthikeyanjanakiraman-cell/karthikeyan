@@ -21,9 +21,13 @@ import faiss
 import xgboost as xgb
 
 # ==============================================================================
-# 0. EQUI-PERCENTILE EQUATING
+# 0. EQUI-PERCENTILE EQUATING (Neutralizes Absolute Price Differences)
 # ==============================================================================
 def convert_to_equi_percentile(raw_matrix):
+    """
+    Transforms a raw price/volume matrix into a strict Equi-Percentile distribution (0.0 to 1.0).
+    Converts every data point into its exact mathematical rank within the time window.
+    """
     ranks = np.argsort(np.argsort(raw_matrix, axis=0), axis=0)
     percentile_matrix = ranks.astype(np.float32) / (raw_matrix.shape[0] - 1 + 1e-8)
     return percentile_matrix
@@ -35,28 +39,34 @@ class MultiTimeframeAutoencoder(nn.Module):
     def __init__(self, num_features=5, latent_dim_daily=12, latent_dim_weekly=12):
         super(MultiTimeframeAutoencoder, self).__init__()
         
+        # Branch A: Processes the 30-day Daily Matrix (5 features x 30 steps)
         self.encoder_daily = nn.Sequential(
             nn.Conv1d(in_channels=num_features, out_channels=16, kernel_size=3, padding=1),
             nn.BatchNorm1d(16),
             nn.ReLU(inplace=True),
             nn.MaxPool1d(2),
+            
             nn.Conv1d(in_channels=16, out_channels=32, kernel_size=3, padding=1),
             nn.BatchNorm1d(32),
             nn.ReLU(inplace=True),
             nn.MaxPool1d(3),
+            
             nn.Flatten(),
             nn.Linear(32 * 5, latent_dim_daily)
         )
         
+        # Branch B: Processes the 15-week Weekly Matrix (5 features x 15 steps)
         self.encoder_weekly = nn.Sequential(
             nn.Conv1d(in_channels=num_features, out_channels=16, kernel_size=3, padding=1),
             nn.BatchNorm1d(16),
             nn.ReLU(inplace=True),
             nn.MaxPool1d(3),
+            
             nn.Flatten(),
             nn.Linear(16 * 5, latent_dim_weekly)
         )
         
+        # Decoder A: Reconstructs back to the original 30-day Daily Shape
         self.decoder_daily = nn.Sequential(
             nn.Linear(latent_dim_daily, 32 * 5),
             nn.ReLU(inplace=True),
@@ -68,6 +78,7 @@ class MultiTimeframeAutoencoder(nn.Module):
             nn.Sigmoid()
         )
         
+        # Decoder B: Reconstructs back to the original 15-week Weekly Shape
         self.decoder_weekly = nn.Sequential(
             nn.Linear(latent_dim_weekly, 16 * 5),
             nn.ReLU(inplace=True),
@@ -89,7 +100,7 @@ class MultiTimeframeAutoencoder(nn.Module):
         return recon_d, recon_w, torch.cat((ld, lw), dim=1)
 
 # ==============================================================================
-# 2. ALIGNED DUAL-TIMEFRAME TRAINING DATA LOADER
+# 2. ALIGNED DUAL-TIMEFRAME TRAINING DATA LOADER (Using Percentiles)
 # ==============================================================================
 def read_and_standardize_csv(filename):
     if not os.path.exists(filename): return None
@@ -113,6 +124,7 @@ def read_and_standardize_csv(filename):
 def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_pct=50.0, max_dd=1.2, wick_ratio=0.40):
     df = read_and_standardize_csv(csv_filename)
     if df is None or 'Date' not in df.columns:
+        print(f"⚠️ Warning: Missing or invalid '{csv_filename}'")
         return None, None, None, None
         
     if target_date_str:
@@ -184,6 +196,9 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_pct=
             
     return np.array(training_daily, dtype=np.float32), np.array(training_weekly, dtype=np.float32), np.array(price_targets, dtype=np.float32), np.array(time_targets, dtype=np.float32)
 
+# ==============================================================================
+# 3. MULTI-TIMEFRAME BRAIN TRAINING ENGINE
+# ==============================================================================
 def train_ai_brain(X_daily, X_weekly, Y_price, Y_time, epochs=15):
     X_d_tensor = torch.tensor(X_daily)
     X_w_tensor = torch.tensor(X_weekly)
@@ -214,18 +229,66 @@ def train_ai_brain(X_daily, X_weekly, Y_price, Y_time, epochs=15):
     return model, xgb_price, xgb_time, index
 
 # ==============================================================================
-# 3. LIVE INGESTION & UNIVERSE PACKS
+# 4. LIVE INGESTION & UNIVERSE PACKS
 # ==============================================================================
+def get_live_tensor_from_csv(csv_filename, target_date_str):
+    df = read_and_standardize_csv(csv_filename)
+    if df is None or 'Date' not in df.columns: return None, None, None
+    
+    if 'Symbol' in df.columns:
+        mask = df['Symbol'].astype(str).str.upper().str.replace("_", "").str.replace(" ", "").str.contains("NIFTY50|NIFTY")
+        df = df[mask] if mask.any() else df[df['Symbol'] == df['Symbol'].unique()[0]]
+            
+    df['Datetime'] = pd.to_datetime(df['Date'])
+    df_w = df.set_index('Datetime').resample('W').agg({
+        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum', 'Date': 'last'
+    }).reset_index().sort_values('Date').reset_index(drop=True)
+    
+    past_d = df[df['Date'] <= target_date_str].sort_values('Date').reset_index(drop=True)
+    past_w = df_w[df_w['Date'] <= target_date_str].sort_values('Date').reset_index(drop=True)
+    
+    if len(past_d) < 30 or len(past_w) < 15: return None, None, None
+    
+    vals_d = past_d[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)[-30:]
+    vals_w = past_w[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)[-15:]
+    
+    current_ltp = vals_d[-1, 3]
+    
+    norm_d = convert_to_equi_percentile(vals_d)
+    norm_w = convert_to_equi_percentile(vals_w)
+    
+    return norm_d.T, norm_w.T, current_ltp
+
 def get_dynamic_fno_universe():
     nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+    response = requests.get(nse_url)
+    if response.status_code != 200: return []
     try:
-        response = requests.get(nse_url, timeout=5)
-        if response.status_code != 200: return []
         nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
         fno_underlying = {item.get("underlying_symbol") for item in nse_data if item.get("segment") == "NSE_FO" and item.get("underlying_symbol")}
         return [{"symbol": item.get("trading_symbol"), "key": item.get("instrument_key")} for item in nse_data if item.get("segment") in ("NSE_EQ", "NSE_INDEX") and item.get("trading_symbol") in fno_underlying]
     except:
         return []
+
+# ==============================================================================
+# 5. CUMULATIVE INTRADAY SCANNER (Session-to-Date Expanding Windows)
+# ==============================================================================
+def calculate_hurst(price_series):
+    try:
+        prices = np.array(price_series, dtype=np.float32)
+        if len(prices) < 15:
+            return 0.5
+        lags = range(2, min(len(prices) // 2, 20))
+        tau = [np.std(prices[lag:] - prices[:-lag]) for lag in lags]
+        lags_arr = np.array(list(lags))
+        tau_arr = np.array(tau)
+        valid = tau_arr > 0
+        if np.sum(valid) < 2:
+            return 0.5
+        poly = np.polyfit(np.log(lags_arr[valid]), np.log(tau_arr[valid]), 1)
+        return float(poly[0] * 2.0)
+    except:
+        return 0.5
 
 def fetch_upstox_intraday_candles(instrument_key, target_date_str):
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
@@ -233,125 +296,118 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str):
         return None
     
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
-    # FORCE IST TIME
-    today_str = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
+    today_str = datetime.now().strftime("%Y-%m-%d")
     
     if target_date_str == today_str:
         url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key)}/1minute"
     else:
         url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{target_date_str}/{target_date_str}"
     
-    try:
-        response = requests.get(url, headers=headers, timeout=5)
-        if response.status_code != 200:
-            return None
-            
-        data = response.json().get('data', {}).get('candles', [])
-        if not data:
-            return None
-            
-        c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
-        c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).dt.tz_localize(None) 
-        c_df = c_df.sort_values('Datetime').reset_index(drop=True)
-        return c_df
-    except Exception:
+    response = requests.get(url, headers=headers)
+    if response.status_code != 200:
         return None
+        
+    data = response.json().get('data', {}).get('candles', [])
+    if not data:
+        return None
+        
+    c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
+    c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).dt.tz_localize(None) 
+    c_df = c_df.sort_values('Datetime').reset_index(drop=True)
+    return c_df
 
-# ==============================================================================
-# 4. FIXED CUMULATIVE SCANNER WITH LIVE TIME-GUARD
-# ==============================================================================
-def scan_cumulative_top_turnover(target_date_str):
+def scan_cumulative_turnover(target_date_str):
     print(f"\n⏳ Initializing Cumulative Session-to-Date Scan (09:15 Open to Checkpoint) for {target_date_str}...")
     universe = get_dynamic_fno_universe()
     if not universe:
         print("⚠️ No F&O universe found. Please check Upstox API.")
         return
         
+    all_cumulative_records = []
+    
     target_dt = pd.to_datetime(target_date_str)
+    session_open = target_dt + pd.Timedelta(hours=9, minutes=15)
     
-    # FORCE IST TIME HERE
-    current_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    
-    # Identify if we are running in live conditions today
-    is_live_today = (target_date_str == current_now.strftime("%Y-%m-%d"))
-
-    # Cumulative Checkpoint Logic
+    # Cumulative checkpoints expanding from market open (09:15)
     checkpoints = [
-        ("09:15 - 10:15", target_dt + pd.Timedelta(hours=10, minutes=15)),
-        ("09:15 - 11:15", target_dt + pd.Timedelta(hours=11, minutes=15)),
-        ("09:15 - 12:15", target_dt + pd.Timedelta(hours=12, minutes=15)),
-        ("09:15 - 13:15", target_dt + pd.Timedelta(hours=13, minutes=15)),
-        ("09:15 - 14:15", target_dt + pd.Timedelta(hours=14, minutes=15)),
-        ("09:15 - 15:15", target_dt + pd.Timedelta(hours=15, minutes=15)),
-        ("09:15 - 15:30", target_dt + pd.Timedelta(hours=15, minutes=30))
+        ('09:15 - 10:15', target_dt + pd.Timedelta(hours=10, minutes=15)),
+        ('09:15 - 11:15', target_dt + pd.Timedelta(hours=11, minutes=15)),
+        ('09:15 - 12:15', target_dt + pd.Timedelta(hours=12, minutes=15)),
+        ('09:15 - 13:15', target_dt + pd.Timedelta(hours=13, minutes=15)),
+        ('09:15 - 14:15', target_dt + pd.Timedelta(hours=14, minutes=15)),
+        ('09:15 - 15:15', target_dt + pd.Timedelta(hours=15, minutes=15)),
+        ('09:15 - 15:30', target_dt + pd.Timedelta(hours=15, minutes=30))
     ]
     
     print(f"📡 Downloading intraday data and computing cumulative session metrics for {len(universe)} stocks...")
-    
-    master_intraday_list = []
     for item in universe:
         df = fetch_upstox_intraday_candles(item['key'], target_date_str)
-        if df is not None and not df.empty:
-            df['Symbol'] = item['symbol']
-            df['Turnover'] = df['Volume'] * df['Close']
-            master_intraday_list.append(df)
+        if df is None or df.empty: continue
             
-    if not master_intraday_list:
-        print("⚠️ Warning: No valid intraday market volume found yet.")
+        df['Turnover'] = df['Volume'] * df['Close']
+        
+        for label, cp_time in checkpoints:
+            sub_df = df[(df['Datetime'] >= session_open) & (df['Datetime'] <= cp_time)]
+            if sub_df.empty: continue
+            
+            cum_turnover = sub_df['Turnover'].sum()
+            if cum_turnover <= 0: continue
+            
+            open_val = sub_df['Open'].iloc[0]
+            close_val = sub_df['Close'].iloc[-1]
+            closes_1m = sub_df['Close'].values
+            
+            hurst_val = calculate_hurst(closes_1m)
+            
+            all_cumulative_records.append({
+                'Time_Window': label,
+                'Symbol': item['symbol'],
+                'Turnover': cum_turnover,
+                'Open': open_val,
+                'Close': close_val,
+                'Hurst': hurst_val
+            })
+        
+    if not all_cumulative_records:
+        print("❌ Could not retrieve valid intraday data.")
         return
         
-    master_df = pd.concat(master_intraday_list, ignore_index=True)
+    master_df = pd.DataFrame(all_cumulative_records)
+    
+    # 1. Rank 1: Cumulative Liquidity Percentile (Turnover PR)
+    master_df['Turnover_PR'] = master_df.groupby('Time_Window', observed=False)['Turnover'].rank(pct=True) * 100
+    
+    # 2. Rank 2: Cumulative Price Displacement Percentile (Momentum PR from 09:15 Open)
+    master_df['Hourly_Pct_Move'] = ((master_df['Close'] - master_df['Open']) / master_df['Open']) * 100
+    master_df['Abs_Move'] = master_df['Hourly_Pct_Move'].abs()
+    master_df['Momentum_PR'] = master_df.groupby('Time_Window', observed=False)['Abs_Move'].rank(pct=True) * 100
+    
+    # 3. Rank 3: Cumulative One-Way Volatility Percentile (Hurst PR)
+    master_df['Hurst_PR'] = master_df.groupby('Time_Window', observed=False)['Hurst'].rank(pct=True) * 100
+    
+    # 4. Triple-Percentile Composite Power Score (Multiplicative Hurst Gatekeeper)
+    master_df['Power_Score'] = master_df['Turnover_PR'] * master_df['Momentum_PR'] * (master_df['Hurst_PR'] / 100.0)
+    
+    # Sort strictly by the Composite Power Score
+    master_df = master_df.sort_values(by=['Time_Window', 'Power_Score'], ascending=[True, False])
+    top5_per_window = master_df.groupby('Time_Window', observed=False).head(5)
     
     print("\n" + "="*125)
-    print(f"🔥 TOP 5 CUMULATIVE TRENDERS (From 09:15 Open | Turnover PR × Momentum PR) | DATE: {target_date_str}")
+    print(f"🔥 TOP 5 CUMULATIVE TRENDERS (From 09:15 Open | Turnover PR × Momentum PR × Hurst PR) | DATE: {target_date_str}")
     print("="*125)
     
-    for label, checkpoint_time in checkpoints:
-        
-        # ⚠️ CRITICAL TIME GUARD: Break out of the loop if the checkpoint is in the future
-        if is_live_today and checkpoint_time > current_now:
-            print(f"\n⏸️ Current time ({current_now.strftime('%H:%M')} IST) has not reached checkpoint {checkpoint_time.strftime('%H:%M')} IST. Halting future projections.")
-            break
-            
-        # Filter all candles up to the checkpoint
-        df_cum = master_df[master_df['Datetime'] <= checkpoint_time]
-        if df_cum.empty: 
-            continue
-            
-        # Aggregate Cumulative Values
-        grouped = df_cum.groupby('Symbol').agg({
-            'Turnover': 'sum',
-            'Volume': 'sum',
-            'Open': 'first',
-            'Close': 'last'
-        }).reset_index()
-        
-        grouped = grouped[grouped['Turnover'] > 0]
-        if grouped.empty: continue
-        
-        # Calculate Percentiles
-        grouped['Turnover_PR'] = grouped['Turnover'].rank(pct=True) * 100
-        
-        # Calculate Absolute % Move (Proxy for Momentum)
-        grouped['Pct_Move'] = ((grouped['Close'] - grouped['Open']) / grouped['Open']) * 100
-        grouped['Momentum_PR'] = grouped['Pct_Move'].abs().rank(pct=True) * 100
-        
-        # Combine into Power Score
-        grouped['Power_Score'] = grouped['Turnover_PR'] * grouped['Momentum_PR']
-        
-        # Sort and select Top 5
-        top5 = grouped.nlargest(5, 'Power_Score')
-        
-        print(f"\n⏰ CUMULATIVE WINDOW: {label} IST")
-        print(f"{'Rank':<5} {'Symbol':<15} {'Power Score':<12} | {'Turnover PR':<12} | {'Momentum PR':<12} | {'% Move':<8} {'LTP (₹)':<10}")
+    for time_window, group in top5_per_window.groupby('Time_Window', observed=False):
+        if group.empty: continue
+        print(f"\n⏰ CUMULATIVE WINDOW: {time_window} IST")
+        print(f"{'Rank':<5} {'Symbol':<15} {'Power Score':<12} | {'Turnover PR':<12} | {'Momentum PR':<12} | {'Hurst PR':<10} | {'% Move':<8} {'LTP':<10}")
         print("-" * 125)
         
-        for rank, (_, row) in enumerate(top5.iterrows(), 1):
-            move_sign = "+" if row['Pct_Move'] > 0 else ""
-            print(f"{rank:<5} {row['Symbol']:<15} {row['Power_Score']:<12.1f} | {row['Turnover_PR']:>9.2f} PR | {row['Momentum_PR']:>9.2f} PR | {move_sign}{row['Pct_Move']:<6.2f}%   ₹{row['Close']:<10.2f}")
+        for rank, (_, row) in enumerate(group.iterrows(), 1):
+            move_str = f"+{row['Hourly_Pct_Move']:.2f}%" if row['Hourly_Pct_Move'] > 0 else f"{row['Hourly_Pct_Move']:.2f}%"
+            print(f"{rank:<5} {row['Symbol']:<15} {row['Power_Score']:<12.1f} | {row['Turnover_PR']:>8.2f} PR | {row['Momentum_PR']:>8.2f} PR | {row['Hurst_PR']:>6.2f} PR | {move_str:<8} ₹{row['Close']:<10.2f}")
 
 # ==============================================================================
-# 5. MAIN CONTROLLER
+# 6. MAIN CONTROLLER
 # ==============================================================================
 def run_production_sweep():
     parser = argparse.ArgumentParser()
@@ -362,9 +418,8 @@ def run_production_sweep():
     raw_date_str = args.date or args.positional_date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
     is_backtest = bool(raw_date_str)
 
-    # FORCE IST TIME
     if not is_backtest:
-        target_date_str = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
+        target_date_str = datetime.now().strftime("%Y-%m-%d")
     else:
         try:
             target_date_str = datetime.strptime(raw_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
@@ -391,8 +446,11 @@ def run_production_sweep():
     
     if X_d_nifty is not None and len(X_d_nifty) > 0:
         nifty_brain, nifty_xgb_p, nifty_xgb_t, nifty_faiss = train_ai_brain(X_d_nifty, X_w_nifty, Y_np, Y_nt)
+    else:
+        print("⚠️ Not enough historical Nifty data available for AI training.")
     
-    scan_cumulative_top_turnover(target_date_str)
+    # Execute the cumulative session-to-date scan
+    scan_cumulative_turnover(target_date_str)
 
 if __name__ == "__main__":
     run_production_sweep()
