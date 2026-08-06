@@ -358,7 +358,8 @@ def scan_discrete_hourly_turnover(target_date_str):
         grouped_cum['Cumulative_Power'] = (grouped_cum['Cum_Turnover_PR'] * grouped_cum['Cum_Momentum_PR'] * grouped_cum['Cum_Hurst_PR']) / 100.0
 
         # --- MERGE AND CALCULATE ACCELERATION DELTA ---
-        merged = pd.merge(grouped_disc[['Symbol', 'Discrete_Power', 'Pct_Move', 'Close']], 
+        # Now passing through the underlying PR values for display
+        merged = pd.merge(grouped_disc[['Symbol', 'Discrete_Power', 'Turnover_PR', 'Momentum_PR', 'Hurst_PR', 'Pct_Move', 'Close']], 
                           grouped_cum[['Symbol', 'Cumulative_Power']], 
                           on='Symbol', how='inner')
         
@@ -368,13 +369,13 @@ def scan_discrete_hourly_turnover(target_date_str):
         top5 = merged.nlargest(5, 'Acceleration_Delta')
         
         print(f"\n⏰ DISCRETE WINDOW: {label} IST")
-        print(f"{'Rank':<5} {'Symbol':<15} {'Accel Delta':<14} | {'Discrete Power':<15} | {'Cumulative Power':<16} | {'% Move':<8} {'LTP (₹)':<10}")
+        print(f"{'Rank':<5} {'Symbol':<14} {'Accel Delta':<13} | {'Disc Pwr':<10} | {'Cum Pwr':<9} | {'Turnover':<11} | {'Momentum':<11} | {'Hurst':<9} | {'% Move':<8} {'LTP (₹)':<10}")
         print("-" * 145)
         
         for rank, (_, row) in enumerate(top5.iterrows(), 1):
             move_sign = "+" if row['Pct_Move'] > 0 else ""
             delta_sign = "+" if row['Acceleration_Delta'] > 0 else ""
-            print(f"{rank:<5} {row['Symbol']:<15} {delta_sign}{row['Acceleration_Delta']:<12.1f} | {row['Discrete_Power']:>13.1f}   | {row['Cumulative_Power']:>14.1f}   | {move_sign}{row['Pct_Move']:<6.2f}%   ₹{row['Close']:<10.2f}")
+            print(f"{rank:<5} {row['Symbol']:<14} {delta_sign}{row['Acceleration_Delta']:<12.1f} | {row['Discrete_Power']:>8.1f}   | {row['Cumulative_Power']:>7.1f}   | {row['Turnover_PR']:>7.2f} PR | {row['Momentum_PR']:>7.2f} PR | {row['Hurst_PR']:>5.2f} PR | {move_sign}{row['Pct_Move']:<6.2f}%   ₹{row['Close']:<10.2f}")
 
         if is_active_live:
             break
