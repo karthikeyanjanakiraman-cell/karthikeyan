@@ -258,10 +258,10 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str):
         return None
 
 # ==============================================================================
-# 4. ACCELERATION DELTA SCANNER (Discrete Hourly vs. Cumulative Session)
+# 4. CONFLUENCE LEADERS SCANNER (Best in Both: Cumulative × Discrete)
 # ==============================================================================
 def scan_discrete_hourly_turnover(target_date_str):
-    print(f"\n⏳ Initializing Acceleration Delta Scanner for {target_date_str}...")
+    print(f"\n⏳ Initializing Confluence Leaders Scanner for {target_date_str}...")
     universe = get_dynamic_fno_universe()
     if not universe:
         print("⚠️ No F&O universe found. Please check Upstox API.")
@@ -302,7 +302,7 @@ def scan_discrete_hourly_turnover(target_date_str):
     master_df = pd.concat(master_intraday_list, ignore_index=True)
     
     print("\n" + "="*145)
-    print(f"🔥 TOP 5 ACCELERATION DELTA BREAKOUTS (Discrete Hourly Score minus Cumulative Session Score) | DATE: {target_date_str}")
+    print(f"🔥 TOP 5 CONFLUENCE LEADERS (Best in Both: Cumulative × Discrete) | DATE: {target_date_str}")
     print("="*145)
     
     for start_time, end_time, base_label in windows:
@@ -357,25 +357,24 @@ def scan_discrete_hourly_turnover(target_date_str):
         grouped_cum['Cum_Hurst_PR'] = grouped_cum['Cum_Efficiency'].rank(pct=True) * 100
         grouped_cum['Cumulative_Power'] = (grouped_cum['Cum_Turnover_PR'] * grouped_cum['Cum_Momentum_PR'] * grouped_cum['Cum_Hurst_PR']) / 100.0
 
-        # --- MERGE AND CALCULATE ACCELERATION DELTA ---
-        # Now passing through the underlying PR values for display
+        # --- MERGE AND CALCULATE COMBINED POWER ---
         merged = pd.merge(grouped_disc[['Symbol', 'Discrete_Power', 'Turnover_PR', 'Momentum_PR', 'Hurst_PR', 'Pct_Move', 'Close']], 
                           grouped_cum[['Symbol', 'Cumulative_Power']], 
                           on='Symbol', how='inner')
         
-        merged['Acceleration_Delta'] = merged['Discrete_Power'] - merged['Cumulative_Power']
+        # Strict Agreement: Multiply them to naturally filter for stocks high in BOTH
+        merged['Combined_Power'] = (merged['Discrete_Power'] * merged['Cumulative_Power']) / 10000.0
         
-        # Select Top 5 by highest acceleration delta
-        top5 = merged.nlargest(5, 'Acceleration_Delta')
+        # Select Top 5 by highest Combined Power
+        top5 = merged.nlargest(5, 'Combined_Power')
         
         print(f"\n⏰ DISCRETE WINDOW: {label} IST")
-        print(f"{'Rank':<5} {'Symbol':<14} {'Accel Delta':<13} | {'Disc Pwr':<10} | {'Cum Pwr':<9} | {'Turnover':<11} | {'Momentum':<11} | {'Hurst':<9} | {'% Move':<8} {'LTP (₹)':<10}")
+        print(f"{'Rank':<5} {'Symbol':<14} {'Combined Pwr':<12} | {'Disc Pwr':<10} | {'Cum Pwr':<9} | {'Turnover':<11} | {'Momentum':<11} | {'Hurst':<9} | {'% Move':<8} {'LTP (₹)':<10}")
         print("-" * 145)
         
         for rank, (_, row) in enumerate(top5.iterrows(), 1):
             move_sign = "+" if row['Pct_Move'] > 0 else ""
-            delta_sign = "+" if row['Acceleration_Delta'] > 0 else ""
-            print(f"{rank:<5} {row['Symbol']:<14} {delta_sign}{row['Acceleration_Delta']:<12.1f} | {row['Discrete_Power']:>8.1f}   | {row['Cumulative_Power']:>7.1f}   | {row['Turnover_PR']:>7.2f} PR | {row['Momentum_PR']:>7.2f} PR | {row['Hurst_PR']:>5.2f} PR | {move_sign}{row['Pct_Move']:<6.2f}%   ₹{row['Close']:<10.2f}")
+            print(f"{rank:<5} {row['Symbol']:<14} {row['Combined_Power']:<12.1f} | {row['Discrete_Power']:>8.1f}   | {row['Cumulative_Power']:>7.1f}   | {row['Turnover_PR']:>7.2f} PR | {row['Momentum_PR']:>7.2f} PR | {row['Hurst_PR']:>5.2f} PR | {move_sign}{row['Pct_Move']:<6.2f}%   ₹{row['Close']:<10.2f}")
 
         if is_active_live:
             break
