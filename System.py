@@ -258,10 +258,10 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str):
         return None
 
 # ==============================================================================
-# 4. FIXED CUMULATIVE SCANNER WITH LIVE ONGOING TIME-GUARD
+# 4. DISCRETE HOURLY SCANNER WITH ISOLATED WINDOW BLOCKS
 # ==============================================================================
-def scan_cumulative_top_turnover(target_date_str):
-    print(f"\n⏳ Initializing Cumulative Session-to-Date Scan (09:15 Open to Checkpoint) for {target_date_str}...")
+def scan_discrete_hourly_turnover(target_date_str):
+    print(f"\n⏳ Initializing Discrete Hourly Scanner (1-Hour Isolated Blocks) for {target_date_str}...")
     universe = get_dynamic_fno_universe()
     if not universe:
         print("⚠️ No F&O universe found. Please check Upstox API.")
@@ -275,18 +275,18 @@ def scan_cumulative_top_turnover(target_date_str):
     # Identify if we are running in live conditions today
     is_live_today = (target_date_str == current_now.strftime("%Y-%m-%d"))
 
-    # Cumulative Checkpoint Logic
-    checkpoints = [
-        ("09:15 - 10:15", target_dt + pd.Timedelta(hours=10, minutes=15)),
-        ("09:15 - 11:15", target_dt + pd.Timedelta(hours=11, minutes=15)),
-        ("09:15 - 12:15", target_dt + pd.Timedelta(hours=12, minutes=15)),
-        ("09:15 - 13:15", target_dt + pd.Timedelta(hours=13, minutes=15)),
-        ("09:15 - 14:15", target_dt + pd.Timedelta(hours=14, minutes=15)),
-        ("09:15 - 15:15", target_dt + pd.Timedelta(hours=15, minutes=15)),
-        ("09:15 - 15:30", target_dt + pd.Timedelta(hours=15, minutes=30))
+    # Discrete Isolated Time Windows (Start, End, Base Label)
+    windows = [
+        (target_dt + pd.Timedelta(hours=9, minutes=15), target_dt + pd.Timedelta(hours=10, minutes=15), "09:15 - 10:15"),
+        (target_dt + pd.Timedelta(hours=10, minutes=15), target_dt + pd.Timedelta(hours=11, minutes=15), "10:15 - 11:15"),
+        (target_dt + pd.Timedelta(hours=11, minutes=15), target_dt + pd.Timedelta(hours=12, minutes=15), "11:15 - 12:15"),
+        (target_dt + pd.Timedelta(hours=12, minutes=15), target_dt + pd.Timedelta(hours=13, minutes=15), "12:15 - 13:15"),
+        (target_dt + pd.Timedelta(hours=13, minutes=15), target_dt + pd.Timedelta(hours=14, minutes=15), "13:15 - 14:15"),
+        (target_dt + pd.Timedelta(hours=14, minutes=15), target_dt + pd.Timedelta(hours=15, minutes=15), "14:15 - 15:15"),
+        (target_dt + pd.Timedelta(hours=15, minutes=15), target_dt + pd.Timedelta(hours=15, minutes=30), "15:15 - 15:30")
     ]
     
-    print(f"📡 Downloading intraday data and computing cumulative session metrics for {len(universe)} stocks...")
+    print(f"📡 Downloading intraday data and computing discrete 1-hour metrics for {len(universe)} stocks...")
     
     master_intraday_list = []
     for item in universe:
@@ -305,64 +305,67 @@ def scan_cumulative_top_turnover(target_date_str):
     master_df = pd.concat(master_intraday_list, ignore_index=True)
     
     print("\n" + "="*125)
-    print(f"🔥 TOP 5 CUMULATIVE TRENDERS (From 09:15 Open | Turnover PR × Momentum PR × Hurst PR) | DATE: {target_date_str}")
+    print(f"🔥 TOP 5 DISCRETE HOURLY TRENDERS (Isolated Blocks | Turnover PR × Momentum PR × Hurst PR) | DATE: {target_date_str}")
     print("="*125)
     
-    for label, checkpoint_time in checkpoints:
+    for start_time, end_time, base_label in windows:
         
-        is_future = False
-        
-        # ⚠️ LIVE ONGOING GUARD: Re-label and cap the fetch block to the current live minute
-        if is_live_today and checkpoint_time > current_now:
-            is_future = True
-            checkpoint_time = current_now
-            label = f"09:15 - {current_now.strftime('%H:%M')} (LIVE ONGOING)"
+        # If market hasn't reached this window's start time yet, exit loop entirely
+        if is_live_today and current_now < start_time:
+            break
             
-        # Filter all candles up to the checkpoint (or up to 'now')
-        df_cum = master_df[master_df['Datetime'] <= checkpoint_time]
+        is_active_live = False
+        label = base_label
         
-        if df_cum.empty: 
-            if is_future: break
+        # If we are currently inside this window, cap the end time to 'now' and rename label
+        if is_live_today and start_time <= current_now < end_time:
+            is_active_live = True
+            end_time = current_now
+            label = f"{start_time.strftime('%H:%M')} - {current_now.strftime('%H:%M')} (LIVE ONGOING)"
+            
+        # ISOLATION: Filter strictly for candles that fall INSIDE this specific time block
+        df_window = master_df[(master_df['Datetime'] >= start_time) & (master_df['Datetime'] < end_time)]
+        
+        if df_window.empty: 
+            if is_active_live: break
             continue
             
-        # Aggregate Cumulative Values
-        grouped = df_cum.groupby('Symbol').agg({
+        # Aggregate Discrete Values for just this isolated period
+        grouped = df_window.groupby('Symbol').agg({
             'Turnover': 'sum',
             'Volume': 'sum',
             'Open': 'first',
             'Close': 'last',
-            'abs_move': 'sum' # The cumulative absolute path distance
+            'abs_move': 'sum' # The cumulative absolute path distance for the hour
         }).reset_index()
         
         grouped = grouped[grouped['Turnover'] > 0]
         if grouped.empty: 
-            if is_future: break
+            if is_active_live: break
             continue
         
         # ---------------------------------------------------------
-        # PR METRICS CALCULATION
+        # PR METRICS CALCULATION (Evaluating performance solely during this 1 hour)
         # ---------------------------------------------------------
         # 1. Turnover PR
         grouped['Turnover_PR'] = grouped['Turnover'].rank(pct=True) * 100
         
-        # 2. Momentum PR
+        # 2. Momentum PR (Percentage change between the hour's Open and the hour's Close)
         grouped['Pct_Move'] = ((grouped['Close'] - grouped['Open']) / grouped['Open']) * 100
         grouped['Momentum_PR'] = grouped['Pct_Move'].abs().rank(pct=True) * 100
         
-        # 3. Hurst PR (Directional Efficiency Proxy)
-        # Ratio of Net Displacement over Total Path Length (1.0 = straight line trend, 0.0 = completely mean reverting/choppy)
+        # 3. Hurst PR (Directional Efficiency Proxy within the hour)
         grouped['Net_Displacement'] = (grouped['Close'] - grouped['Open']).abs()
         grouped['Efficiency_Ratio'] = grouped['Net_Displacement'] / (grouped['abs_move'] + 1e-8)
         grouped['Hurst_PR'] = grouped['Efficiency_Ratio'].rank(pct=True) * 100
         
         # 4. Power Score Compilation 
-        # (Turnover PR * Momentum PR * Hurst PR) / 100 to match the exact mathematical scaling of your target output (e.g. 9427.7)
         grouped['Power_Score'] = (grouped['Turnover_PR'] * grouped['Momentum_PR'] * grouped['Hurst_PR']) / 100.0
         
         # Sort and select Top 5
         top5 = grouped.nlargest(5, 'Power_Score')
         
-        print(f"\n⏰ CUMULATIVE WINDOW: {label} IST")
+        print(f"\n⏰ DISCRETE WINDOW: {label} IST")
         print(f"{'Rank':<5} {'Symbol':<15} {'Power Score':<12} | {'Turnover PR':<13} | {'Momentum PR':<13} | {'Hurst PR':<10} | {'% Move':<8} {'LTP (₹)':<10}")
         print("-" * 125)
         
@@ -370,8 +373,8 @@ def scan_cumulative_top_turnover(target_date_str):
             move_sign = "+" if row['Pct_Move'] > 0 else ""
             print(f"{rank:<5} {row['Symbol']:<15} {row['Power_Score']:<12.1f} | {row['Turnover_PR']:>9.2f} PR | {row['Momentum_PR']:>9.2f} PR | {row['Hurst_PR']:>6.2f} PR | {move_sign}{row['Pct_Move']:<6.2f}%   ₹{row['Close']:<10.2f}")
 
-        # Break the loop immediately after processing the live fractional hour
-        if is_future:
+        # Break the loop immediately after processing the live fractional hour so we don't print empty futures
+        if is_active_live:
             break
 
 # ==============================================================================
@@ -416,7 +419,7 @@ def run_production_sweep():
     if X_d_nifty is not None and len(X_d_nifty) > 0:
         nifty_brain, nifty_xgb_p, nifty_xgb_t, nifty_faiss = train_ai_brain(X_d_nifty, X_w_nifty, Y_np, Y_nt)
     
-    scan_cumulative_top_turnover(target_date_str)
+    scan_discrete_hourly_turnover(target_date_str)
 
 if __name__ == "__main__":
     run_production_sweep()
