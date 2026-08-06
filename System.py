@@ -229,20 +229,17 @@ def get_dynamic_fno_universe():
         return []
 
 # ==============================================================================
-# 5. FIXED INTRADAY FETCH ENGINE (Handles Live vs Historical Automatically)
+# 5. FIXED INTRADAY FETCH ENGINE
 # ==============================================================================
 def fetch_upstox_intraday_candles(instrument_key, target_date_str):
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
     if not access_token: return None
     
-    # ⚠️ CRITICAL FIX: Upstox uses completely different API endpoints depending on if the requested date is TODAY or in the PAST.
     current_date_str = datetime.now().strftime("%Y-%m-%d")
     
     if target_date_str == current_date_str:
-        # LIVE TODAY: Requires /intraday/ endpoint
         url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key)}/1minute"
     else:
-        # HISTORICAL: Requires /target_date/target_date/ endpoint
         url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{target_date_str}/{target_date_str}"
         
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
@@ -262,7 +259,7 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str):
         return None
 
 # ==============================================================================
-# 6. HOURLY TURNOVER SCANNER (Isolated 09:15 - 09:30 Window)
+# 6. HOURLY TURNOVER SCANNER (Bulletproof String Grouping Fix)
 # ==============================================================================
 def scan_hourly_top_turnover(target_date_str):
     print(f"\n⏳ Initializing Morning Turnover Scan (Volume * Price) for {target_date_str}...")
@@ -274,10 +271,9 @@ def scan_hourly_top_turnover(target_date_str):
     all_hourly_records = []
     target_dt = pd.to_datetime(target_date_str)
     
-    # ⚠️ CRITICAL FIX: Added explicit 09:15 - 09:30 block to measure metrics right at 9:30
     bins = [
         target_dt + pd.Timedelta(hours=9, minutes=15),
-        target_dt + pd.Timedelta(hours=9, minutes=30),  # Morning 15-min surge block
+        target_dt + pd.Timedelta(hours=9, minutes=30),
         target_dt + pd.Timedelta(hours=10, minutes=15),
         target_dt + pd.Timedelta(hours=11, minutes=15),
         target_dt + pd.Timedelta(hours=12, minutes=15),
@@ -294,30 +290,46 @@ def scan_hourly_top_turnover(target_date_str):
     
     print(f"📡 Downloading 1-minute intraday data for {len(universe)} F&O stocks...")
     success_count = 0
+    
     for item in universe:
         df = fetch_upstox_intraday_candles(item['key'], target_date_str)
         if df is None or df.empty: continue
         success_count += 1
-        df['Turnover'] = df['Volume'] * df['Close']
-        df['Time_Window'] = pd.cut(df['Datetime'], bins=bins, labels=labels, include_lowest=True, right=False)
         
-        hourly = df.groupby('Time_Window', observed=False).agg({
+        df['Turnover'] = df['Volume'] * df['Close']
+        
+        # FIXED: Enforce absolute string conversion to bypass Pandas categorical GroupBy bugs
+        raw_cut = pd.cut(df['Datetime'], bins=bins, labels=labels, include_lowest=True, right=False)
+        df['Time_Window'] = raw_cut.astype(str)
+        
+        # Filter out rows that didn't match a bin (e.g. pre-market ticks evaluating to 'nan' string)
+        df = df[df['Time_Window'] != 'nan']
+        
+        if df.empty:
+            continue
+            
+        hourly = df.groupby('Time_Window', as_index=False).agg({
             'Turnover': 'sum',
             'Volume': 'sum',
             'Close': 'last'
-        }).reset_index()
+        })
         
         hourly['Symbol'] = item['symbol']
         all_hourly_records.append(hourly)
         
     if not all_hourly_records or success_count == 0:
-        print("⚠️ Warning: Could not retrieve intraday candles. Ensure your UPSTOX_ACCESS_TOKEN is valid.")
+        print("⚠️ Warning: No valid market volume fell inside the tracked time windows yet.")
         return
         
     master_df = pd.concat(all_hourly_records, ignore_index=True)
     
+    if master_df.empty or 'Time_Window' not in master_df.columns:
+        print("⚠️ Warning: Could not compile turnover data correctly.")
+        return
+    
+    # Safe grouping without categorical dependencies
     top5_per_hour = (
-        master_df.groupby('Time_Window', observed=False, group_keys=False)
+        master_df.groupby('Time_Window', group_keys=False)
         .apply(lambda x: x.nlargest(5, 'Turnover'))
         .reset_index(drop=True)
     )
@@ -326,7 +338,7 @@ def scan_hourly_top_turnover(target_date_str):
     print(f"🔥 TOP 5 STOCKS PER WINDOW BY TRADED TURNOVER (Volume × Price) | DATE: {target_date_str}")
     print("="*85)
     
-    for time_window, group in top5_per_hour.groupby('Time_Window', observed=False):
+    for time_window, group in top5_per_hour.groupby('Time_Window'):
         if group.empty or group['Turnover'].sum() == 0: continue
         print(f"\n⏰ TIME BLOCK: {time_window} IST")
         print(f"{'Rank':<5} {'Symbol':<15} {'Turnover (₹ Crores)':<25} {'Volume Executed':<18} {'LTP (₹)':<10}")
@@ -375,7 +387,6 @@ def run_production_sweep():
     else:
         print("⚠️ No Nifty data sets located. Skipping Macro Training.")
 
-    # Execute the fixed Live Intraday fetcher for the 09:15-09:30 morning block!
     scan_hourly_top_turnover(target_date_str)
 
 if __name__ == "__main__":
