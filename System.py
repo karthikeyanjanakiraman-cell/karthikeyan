@@ -233,7 +233,8 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str):
         return None
     
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    # FORCE IST TIME
+    today_str = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
     
     if target_date_str == today_str:
         url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key)}/1minute"
@@ -267,7 +268,9 @@ def scan_cumulative_top_turnover(target_date_str):
         return
         
     target_dt = pd.to_datetime(target_date_str)
-    current_now = datetime.now()
+    
+    # FORCE IST TIME HERE
+    current_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
     
     # Identify if we are running in live conditions today
     is_live_today = (target_date_str == current_now.strftime("%Y-%m-%d"))
@@ -359,8 +362,9 @@ def run_production_sweep():
     raw_date_str = args.date or args.positional_date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
     is_backtest = bool(raw_date_str)
 
+    # FORCE IST TIME
     if not is_backtest:
-        target_date_str = datetime.now().strftime("%Y-%m-%d")
+        target_date_str = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
     else:
         try:
             target_date_str = datetime.strptime(raw_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
