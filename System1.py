@@ -18,12 +18,10 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str):
         return None
     
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
-    # FORCE IST TIME
-    today_str = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
     
-    if target_date_str == today_str:
-        url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key)}/1minute"
-    else:
+    url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key)}/1minute"
+    
+    if target_date_str != (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d"):
         url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{target_date_str}/{target_date_str}"
     
     try:
@@ -43,7 +41,7 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str):
         return None
 
 def get_options_universe(target_date_str):
-    print(f"\n📡 Building Options Universe (+/- 5 Strikes) for {target_date_str}...")
+    print(f"\n📡 Building Options Universe (+/- 5 Strikes) from Broker API...")
     
     master_data = []
     for url in ["https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz", 
@@ -61,53 +59,75 @@ def get_options_universe(target_date_str):
         print("⚠️ Failed to load broker instrument list.")
         return []
         
-    df_opt = df_inst[df_inst['instrument_type'] == 'OPTIDX'].copy()
+    # FIX 1: Force strike to be numeric so String/Float mismatches don't destroy the filter
+    if 'strike' in df_inst.columns:
+        df_inst['strike'] = pd.to_numeric(df_inst['strike'], errors='coerce')
     
-    # Parse expiries 
-    df_opt['expiry_dt'] = pd.to_datetime(df_opt['expiry'], unit='ms', errors='coerce')
-    mask = df_opt['expiry_dt'].isna()
-    if mask.any():
-        df_opt.loc[mask, 'expiry_dt'] = pd.to_datetime(df_opt.loc[mask, 'expiry'], errors='coerce')
-        
+    # Parse expiries safely
+    if 'expiry' in df_inst.columns:
+        df_inst['expiry_dt'] = pd.to_datetime(df_inst['expiry'], unit='ms', errors='coerce')
+        mask = df_inst['expiry_dt'].isna()
+        if mask.any():
+            df_inst.loc[mask, 'expiry_dt'] = pd.to_datetime(df_inst.loc[mask, 'expiry'], errors='coerce')
+    else:
+        print("⚠️ Critical API Change: 'expiry' column missing from broker JSON.")
+        return []
+
     indices_config = {
         "NIFTY": {"key": "NSE_INDEX|Nifty 50", "step": 50},
         "BANKNIFTY": {"key": "NSE_INDEX|Nifty Bank", "step": 100},
         "SENSEX": {"key": "BSE_INDEX|SENSEX", "step": 100}
     }
     
-    target_dt = pd.to_datetime(target_date_str)
     final_universe = []
+    today_dt = pd.to_datetime(datetime.utcnow().strftime("%Y-%m-%d"))
     
     for idx_name, info in indices_config.items():
-        # Step 1: Get Spot Price to calculate ATM
+        # Step 1: Spot Price Check
         spot_df = fetch_upstox_intraday_candles(info["key"], target_date_str)
         if spot_df is None or spot_df.empty:
-            print(f"⚠️ Warning: Could not fetch spot price for {idx_name}. Skipping index.")
+            print(f"⚠️ Warning: Could not fetch LIVE spot price for {idx_name}. Skipping.")
             continue
             
         latest_spot = spot_df['Close'].iloc[-1]
         step = info["step"]
         
-        # Step 2: Lock onto the ATM
+        # Step 2: ATM Calculation
         atm_strike = round(latest_spot / step) * step
-        
-        # Step 3: Build the 11-Strike Array (+5, ATM, -5)
         target_strikes = [atm_strike + (i * step) for i in range(-5, 6)]
         
-        # Step 4: Filter master list for this index
-        idx_opts = df_opt[df_opt['name'] == idx_name].copy()
-        if idx_opts.empty: continue
+        # Step 3: Match the Name (Fallback to underlying_symbol if needed)
+        match_condition = (df_inst['name'] == idx_name)
+        if 'underlying_symbol' in df_inst.columns:
+            match_condition = match_condition | (df_inst['underlying_symbol'] == idx_name)
+            
+        idx_opts = df_inst[match_condition].copy()
         
-        # Find closest upcoming expiry
-        valid_expiries = idx_opts[idx_opts['expiry_dt'] >= target_dt]['expiry_dt'].unique()
-        if len(valid_expiries) == 0:
+        if idx_opts.empty:
+            print(f"⚠️ Warning: Found 0 master instruments matching name '{idx_name}'. Skipping.")
             continue
+            
+        # Keep only valid options (strikes > 0)
+        idx_opts = idx_opts[idx_opts['strike'] > 0]
+        
+        # Step 4: Expiry Matching
+        valid_expiries = idx_opts['expiry_dt'].dropna().unique()
+        valid_expiries = [e for e in valid_expiries if e >= today_dt]
+        
+        if not valid_expiries:
+            print(f"⚠️ Warning: Found {idx_name} options, but 0 valid upcoming expiries. Skipping.")
+            continue
+            
         closest_expiry = min(valid_expiries)
         
-        # Filter strictly by closest expiry and the 11 target strikes
+        # Step 5: Strike Matching
         filtered_opts = idx_opts[(idx_opts['expiry_dt'] == closest_expiry) & (idx_opts['strike'].isin(target_strikes))]
         
-        print(f"🔍 {idx_name} -> Spot: {latest_spot:.2f} | ATM: {atm_strike} | Found {len(filtered_opts)} CE/PE contracts.")
+        if filtered_opts.empty:
+            print(f"⚠️ Warning: Found {idx_name} options, but 0 contracts matched our 11 strikes for {closest_expiry.strftime('%Y-%m-%d')}.")
+            continue
+            
+        print(f"🔍 {idx_name} -> Spot: {latest_spot:.2f} | ATM: {atm_strike} | Found {len(filtered_opts)} CE/PE contracts for {closest_expiry.strftime('%Y-%m-%d')}.")
         
         for _, row in filtered_opts.iterrows():
             final_universe.append({
@@ -123,29 +143,10 @@ def get_options_universe(target_date_str):
 def scan_discrete_hourly_turnover(target_date_str):
     universe = get_options_universe(target_date_str)
     if not universe:
-        print("⚠️ No valid Option universe could be built.")
+        print("\n⚠️ SYSTEM HALT: No option contracts survived the filter. Exiting scanner.")
         return
         
-    print(f"\n⏳ Initializing Confluence Leaders Scanner for {len(universe)} Option Contracts...")
-    
-    target_dt = pd.to_datetime(target_date_str)
-    start_of_day = target_dt + pd.Timedelta(hours=9, minutes=15)
-    
-    # STRICT IST CLOCK ENFORCEMENT
-    current_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    is_live_today = (target_date_str == current_now.strftime("%Y-%m-%d"))
-
-    windows = [
-        (target_dt + pd.Timedelta(hours=9, minutes=15), target_dt + pd.Timedelta(hours=10, minutes=15), "09:15 - 10:15"),
-        (target_dt + pd.Timedelta(hours=10, minutes=15), target_dt + pd.Timedelta(hours=11, minutes=15), "10:15 - 11:15"),
-        (target_dt + pd.Timedelta(hours=11, minutes=15), target_dt + pd.Timedelta(hours=12, minutes=15), "11:15 - 12:15"),
-        (target_dt + pd.Timedelta(hours=12, minutes=15), target_dt + pd.Timedelta(hours=13, minutes=15), "12:15 - 13:15"),
-        (target_dt + pd.Timedelta(hours=13, minutes=15), target_dt + pd.Timedelta(hours=14, minutes=15), "13:15 - 14:15"),
-        (target_dt + pd.Timedelta(hours=14, minutes=15), target_dt + pd.Timedelta(hours=15, minutes=15), "14:15 - 15:15"),
-        (target_dt + pd.Timedelta(hours=15, minutes=15), target_dt + pd.Timedelta(hours=15, minutes=30), "15:15 - 15:30")
-    ]
-    
-    print(f"📡 Downloading intraday data for {len(universe)} option contracts...")
+    print(f"\n⏳ Downloading intraday data for {len(universe)} option contracts...")
     
     master_intraday_list = []
     for item in universe:
@@ -157,41 +158,52 @@ def scan_discrete_hourly_turnover(target_date_str):
             master_intraday_list.append(df)
             
     if not master_intraday_list:
-        print("⚠️ Warning: No valid intraday options data found.")
+        print("⚠️ Warning: Pulled the contracts, but Upstox returned 0 intraday volume for them.")
         return
         
     master_df = pd.concat(master_intraday_list, ignore_index=True)
+
+    real_market_date = master_df['Datetime'].max().normalize()
+    start_of_day = real_market_date + pd.Timedelta(hours=9, minutes=15)
+    current_now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    is_live_today = (real_market_date.date() == current_now_ist.date())
+
+    windows = [
+        (real_market_date + pd.Timedelta(hours=9, minutes=15), real_market_date + pd.Timedelta(hours=10, minutes=15), "09:15 - 10:15"),
+        (real_market_date + pd.Timedelta(hours=10, minutes=15), real_market_date + pd.Timedelta(hours=11, minutes=15), "10:15 - 11:15"),
+        (real_market_date + pd.Timedelta(hours=11, minutes=15), real_market_date + pd.Timedelta(hours=12, minutes=15), "11:15 - 12:15"),
+        (real_market_date + pd.Timedelta(hours=12, minutes=15), real_market_date + pd.Timedelta(hours=13, minutes=15), "12:15 - 13:15"),
+        (real_market_date + pd.Timedelta(hours=13, minutes=15), real_market_date + pd.Timedelta(hours=14, minutes=15), "13:15 - 14:15"),
+        (real_market_date + pd.Timedelta(hours=14, minutes=15), real_market_date + pd.Timedelta(hours=15, minutes=15), "14:15 - 15:15"),
+        (real_market_date + pd.Timedelta(hours=15, minutes=15), real_market_date + pd.Timedelta(hours=15, minutes=30), "15:15 - 15:30")
+    ]
     
     print("\n" + "="*155)
-    print(f"🔥 TOP 5 INSTITUTIONAL OPTION STRIKES (Best in Both: Cumulative × Discrete) | DATE: {target_date_str}")
+    print(f"🔥 TOP 5 INSTITUTIONAL OPTION STRIKES (Best in Both: Cumulative × Discrete) | REAL MARKET DATE: {real_market_date.strftime('%Y-%m-%d')}")
     print("="*155)
     
     for start_time, end_time, base_label in windows:
-        if is_live_today and current_now < start_time:
+        if is_live_today and current_now_ist < start_time:
             break
             
         is_active_live = False
         label = base_label
         
-        if is_live_today and start_time <= current_now < end_time:
+        if is_live_today and start_time <= current_now_ist < end_time:
             is_active_live = True
-            end_time = current_now
-            label = f"{start_time.strftime('%H:%M')} - {current_now.strftime('%H:%M')} (LIVE ONGOING)"
+            end_time = current_now_ist
+            label = f"{start_time.strftime('%H:%M')} - {current_now_ist.strftime('%H:%M')} (LIVE ONGOING)"
             
-        # 1. ISOLATED DISCRETE WINDOW DATA
         df_discrete = master_df[(master_df['Datetime'] >= start_time) & (master_df['Datetime'] < end_time)]
-        # 2. CUMULATIVE SESSION DATA (From 09:15 up to current window end)
         df_cumulative = master_df[(master_df['Datetime'] >= start_of_day) & (master_df['Datetime'] < end_time)]
         
         if df_discrete.empty or df_cumulative.empty: 
             if is_active_live: break
             continue
             
-        # --- COMPUTE DISCRETE SCORES ---
         grouped_disc = df_discrete.groupby('Symbol').agg({
             'Turnover': 'sum', 'Volume': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'
         }).reset_index()
-        # Options must have volume to rank
         grouped_disc = grouped_disc[grouped_disc['Turnover'] > 0]
         if grouped_disc.empty: 
             if is_active_live: break
@@ -205,7 +217,6 @@ def scan_discrete_hourly_turnover(target_date_str):
         grouped_disc['Hurst_PR'] = grouped_disc['Efficiency'].rank(pct=True) * 100
         grouped_disc['Discrete_Power'] = (grouped_disc['Turnover_PR'] * grouped_disc['Momentum_PR'] * grouped_disc['Hurst_PR']) / 100.0
 
-        # --- COMPUTE CUMULATIVE SCORES ---
         grouped_cum = df_cumulative.groupby('Symbol').agg({
             'Turnover': 'sum', 'Volume': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'
         }).reset_index()
@@ -219,15 +230,11 @@ def scan_discrete_hourly_turnover(target_date_str):
         grouped_cum['Cum_Hurst_PR'] = grouped_cum['Cum_Efficiency'].rank(pct=True) * 100
         grouped_cum['Cumulative_Power'] = (grouped_cum['Cum_Turnover_PR'] * grouped_cum['Cum_Momentum_PR'] * grouped_cum['Cum_Hurst_PR']) / 100.0
 
-        # --- MERGE AND CALCULATE COMBINED POWER ---
         merged = pd.merge(grouped_disc[['Symbol', 'Discrete_Power', 'Turnover_PR', 'Momentum_PR', 'Hurst_PR', 'Pct_Move', 'Close']], 
                           grouped_cum[['Symbol', 'Cumulative_Power']], 
                           on='Symbol', how='inner')
         
-        # Strict Agreement: Multiply them to naturally filter for strikes high in BOTH timeframes
         merged['Combined_Power'] = (merged['Discrete_Power'] * merged['Cumulative_Power']) / 10000.0
-        
-        # Select Top 5 by highest Combined Power overall for the hour
         top5 = merged.nlargest(5, 'Combined_Power')
         
         print(f"\n⏰ DISCRETE WINDOW: {label} IST")
@@ -262,10 +269,9 @@ def run_production_sweep():
             print(f"❌ Critical Error: Date '{raw_date_str}' is invalid. Use YYYY-MM-DD.")
             return
 
-    print(f"⚙️ METRICS DATE ACTIVE: {target_date_str} | MODE: {'BACKTEST' if is_backtest else 'LIVE'}")
+    print(f"⚙️ SYSTEM CLOCK START: {target_date_str} | MODE: {'BACKTEST' if is_backtest else 'LIVE'}")
     
     scan_discrete_hourly_turnover(target_date_str)
 
 if __name__ == "__main__":
     run_production_sweep()
-
