@@ -12,7 +12,7 @@ import pandas as pd
 # ==============================================================================
 # 1. LIVE INGESTION & +/- 5 STRIKES OPTIONS PACK
 # ==============================================================================
-def fetch_upstox_intraday_candles(instrument_key, target_date_str):
+def fetch_upstox_intraday_candles(instrument_key, target_date_str=None, is_live=True):
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
     if not access_token:
         print("⚠️ CRITICAL: UPSTOX_ACCESS_TOKEN not found in environment!")
@@ -20,22 +20,18 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str):
     
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
     
-    current_now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    today_str = current_now_ist.strftime("%Y-%m-%d")
-    
-    # If the target date is strictly today AND the market is open, use intraday live endpoint
-    if target_date_str == today_str and current_now_ist.hour >= 9:
+    # If LIVE, hit the intraday cache which always holds the most recent session
+    if is_live:
         url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key)}/1minute"
     else:
-        # It's a historical date (or yesterday). Pull a 3-day range to bypass the Upstox boundary bug.
+        # If BACKTEST, hit the historical endpoint with a 3-day window
         target_dt = pd.to_datetime(target_date_str)
         from_date_str = (target_dt - timedelta(days=3)).strftime("%Y-%m-%d")
         url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{target_date_str}/{from_date_str}"
-        
+    
     try:
         response = requests.get(url, headers=headers, timeout=5)
         if response.status_code != 200:
-            print(f"⚠️ API Error {response.status_code} for {instrument_key}")
             return None
             
         data = response.json().get('data', {}).get('candles', [])
@@ -43,19 +39,20 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str):
             return None
             
         c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
-        c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).dt.tz_localize(None) 
+        # Universally safe timezone strip to keep local IST wall time
+        c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).apply(lambda x: x.replace(tzinfo=None))
         c_df = c_df.sort_values('Datetime').reset_index(drop=True)
         
-        # Isolate exactly the date requested so previous days don't bleed into the scanner
-        c_df = c_df[c_df['Datetime'].dt.strftime('%Y-%m-%d') == target_date_str].reset_index(drop=True)
-        
+        # Isolate exactly the date requested if historical
+        if not is_live and target_date_str:
+            c_df = c_df[c_df['Datetime'].dt.strftime('%Y-%m-%d') == target_date_str].reset_index(drop=True)
+            
         return c_df
-    except Exception as e:
-        print(f"⚠️ Exception fetching data for {instrument_key}: {e}")
+    except Exception:
         return None
 
-def get_options_universe(target_date_str):
-    print(f"\n📡 Building Options Universe (+/- 5 Strikes) from Broker API...")
+def get_options_universe(target_date_str, is_live):
+    print(f"📡 Building Options Universe (+/- 5 Strikes) from Broker API...")
     
     master_data = []
     for url in ["https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz", 
@@ -97,6 +94,12 @@ def get_options_universe(target_date_str):
         print("⚠️ Critical API Change: 'expiry' column missing from broker JSON.")
         return []
 
+    # Filter strictly to Options
+    if 'instrument_type' in df_inst.columns:
+        df_opt = df_inst[df_inst['instrument_type'] == 'OPTIDX'].copy()
+    else:
+        df_opt = df_inst.copy()
+
     indices_config = {
         "NIFTY": {"key": "NSE_INDEX|Nifty 50", "step": 50},
         "BANKNIFTY": {"key": "NSE_INDEX|Nifty Bank", "step": 100},
@@ -106,10 +109,10 @@ def get_options_universe(target_date_str):
     final_universe = []
     
     for idx_name, info in indices_config.items():
-        # Step 1: Spot Price Check
-        spot_df = fetch_upstox_intraday_candles(info["key"], target_date_str)
+        # Step 1: Spot Price Check using explicitly propagated live/backtest mode
+        spot_df = fetch_upstox_intraday_candles(info["key"], target_date_str, is_live)
         if spot_df is None or spot_df.empty:
-            print(f"⚠️ Warning: Could not fetch Spot price for {idx_name} on {target_date_str}. Skipping.")
+            print(f"⚠️ Warning: Could not fetch Spot price for {idx_name}. Skipping.")
             continue
             
         latest_spot = spot_df['Close'].iloc[-1]
@@ -120,10 +123,10 @@ def get_options_universe(target_date_str):
         target_strikes = [atm_strike + (i * step) for i in range(-5, 6)]
         
         # Step 3: Match the Symbol securely
-        match_condition = df_inst[ts_col].astype(str).str.upper().str.startswith(idx_name)
-        idx_opts = df_inst[match_condition].copy()
+        match_condition = df_opt[ts_col].astype(str).str.upper().str.startswith(idx_name)
+        idx_opts = df_opt[match_condition].copy()
         
-        # Mathematically guarantees we only pull options (equities/futures have NaN or 0 strikes)
+        # Remove junk/futures by strictly enforcing a strike > 0
         idx_opts = idx_opts[idx_opts[strike_col] > 0]
         
         if idx_opts.empty:
@@ -158,8 +161,24 @@ def get_options_universe(target_date_str):
 # ==============================================================================
 # 2. CONFLUENCE LEADERS SCANNER (Options Only: Cumulative × Discrete)
 # ==============================================================================
-def scan_discrete_hourly_turnover(target_date_str):
-    universe = get_options_universe(target_date_str)
+def scan_discrete_hourly_turnover(target_date_str, is_live):
+    
+    # ---------------------------------------------------------
+    # SELF-SYNC PROBE (Avoids midnight and system clock bugs)
+    # ---------------------------------------------------------
+    if is_live:
+        print("🔍 Probing API to synchronize with actual market reality...")
+        probe_df = fetch_upstox_intraday_candles("NSE_INDEX|Nifty 50", is_live=True)
+        if probe_df is None or probe_df.empty:
+            print("⚠️ SYSTEM HALT: Upstox API returned no data for Nifty 50. Network might be down.")
+            return
+        
+        # Explicitly extract whatever date the broker's live cache currently holds
+        real_market_date_obj = probe_df['Datetime'].max().date()
+        target_date_str = real_market_date_obj.strftime("%Y-%m-%d")
+        print(f"✅ Real Market Date Locked: {target_date_str}\n")
+        
+    universe = get_options_universe(target_date_str, is_live)
     if not universe:
         print("\n⚠️ SYSTEM HALT: No option contracts survived the filter. Exiting scanner.")
         return
@@ -168,7 +187,7 @@ def scan_discrete_hourly_turnover(target_date_str):
     
     master_intraday_list = []
     for item in universe:
-        df = fetch_upstox_intraday_candles(item['key'], target_date_str)
+        df = fetch_upstox_intraday_candles(item['key'], target_date_str, is_live)
         if df is not None and not df.empty:
             df['Symbol'] = item['symbol']
             df['Turnover'] = df['Volume'] * df['Close']
@@ -185,6 +204,8 @@ def scan_discrete_hourly_turnover(target_date_str):
     start_of_day = real_market_date + pd.Timedelta(hours=9, minutes=15)
     
     current_now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    
+    # If the real market data is literally from today's date, we treat it as an active live session
     is_live_today = (real_market_date.date() == current_now_ist.date())
 
     windows = [
@@ -198,16 +219,18 @@ def scan_discrete_hourly_turnover(target_date_str):
     ]
     
     print("\n" + "="*155)
-    print(f"🔥 TOP 5 INSTITUTIONAL OPTION STRIKES (Best in Both: Cumulative × Discrete) | MARKET DATE: {real_market_date.strftime('%Y-%m-%d')}")
+    print(f"🔥 TOP 5 INSTITUTIONAL OPTION STRIKES (Best in Both: Cumulative × Discrete) | DATE: {real_market_date.strftime('%Y-%m-%d')}")
     print("="*155)
     
     for start_time, end_time, base_label in windows:
+        # If it's a live session and we haven't reached this window's start time yet, stop.
         if is_live_today and current_now_ist < start_time:
             break
             
         is_active_live = False
         label = base_label
         
+        # If we are currently inside this window, cap the end time to 'now'
         if is_live_today and start_time <= current_now_ist < end_time:
             is_active_live = True
             end_time = current_now_ist
@@ -279,27 +302,18 @@ def run_production_sweep():
     raw_date_str = args.date or args.positional_date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
     is_backtest = bool(raw_date_str)
 
-    current_now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-
-    if not is_backtest:
-        # MIDNIGHT BUG FIX: If it is before 9:15 AM IST, default to the previous trading day.
-        if current_now_ist.hour < 9 or (current_now_ist.hour == 9 and current_now_ist.minute < 15):
-            target_dt = current_now_ist - timedelta(days=1)
-            while target_dt.weekday() > 4:  # Skip Sat (5) and Sun (6)
-                target_dt -= timedelta(days=1)
-            target_date_str = target_dt.strftime("%Y-%m-%d")
-        else:
-            target_date_str = current_now_ist.strftime("%Y-%m-%d")
-    else:
+    if is_backtest:
         try:
             target_date_str = datetime.strptime(raw_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
         except ValueError:
             print(f"❌ Critical Error: Date '{raw_date_str}' is invalid. Use YYYY-MM-DD.")
             return
-
-    print(f"⚙️ METRICS TARGET DATE: {target_date_str} | MODE: {'BACKTEST' if is_backtest else 'LIVE'}")
-    
-    scan_discrete_hourly_turnover(target_date_str)
+            
+        print(f"⚙️ MODE: BACKTEST | EXPLICIT DATE: {target_date_str}")
+        scan_discrete_hourly_turnover(target_date_str, is_live=False)
+    else:
+        print(f"⚙️ MODE: LIVE | DETECTING LATEST MARKET SESSION...")
+        scan_discrete_hourly_turnover(target_date_str=None, is_live=True)
 
 if __name__ == "__main__":
     run_production_sweep()
