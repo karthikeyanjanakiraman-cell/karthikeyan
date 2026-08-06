@@ -36,4 +36,4 @@ jobs:
         RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
         PARAM_BACKTEST_DATE: ${{ github.event.inputs.backtest_date }}
       run: |
-        python System.py
+        python System1.py
