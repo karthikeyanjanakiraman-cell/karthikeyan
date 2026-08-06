@@ -15,18 +15,27 @@ import pandas as pd
 def fetch_upstox_intraday_candles(instrument_key, target_date_str):
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
     if not access_token:
+        print("⚠️ CRITICAL: UPSTOX_ACCESS_TOKEN not found in environment!")
         return None
     
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
     
-    url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key)}/1minute"
+    current_now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    today_str = current_now_ist.strftime("%Y-%m-%d")
     
-    if target_date_str != (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d"):
-        url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{target_date_str}/{target_date_str}"
-    
+    # If the target date is strictly today AND the market is open, use intraday live endpoint
+    if target_date_str == today_str and current_now_ist.hour >= 9:
+        url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key)}/1minute"
+    else:
+        # It's a historical date (or yesterday). Pull a 3-day range to bypass the Upstox boundary bug.
+        target_dt = pd.to_datetime(target_date_str)
+        from_date_str = (target_dt - timedelta(days=3)).strftime("%Y-%m-%d")
+        url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{target_date_str}/{from_date_str}"
+        
     try:
         response = requests.get(url, headers=headers, timeout=5)
         if response.status_code != 200:
+            print(f"⚠️ API Error {response.status_code} for {instrument_key}")
             return None
             
         data = response.json().get('data', {}).get('candles', [])
@@ -36,8 +45,13 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str):
         c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
         c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).dt.tz_localize(None) 
         c_df = c_df.sort_values('Datetime').reset_index(drop=True)
+        
+        # Isolate exactly the date requested so previous days don't bleed into the scanner
+        c_df = c_df[c_df['Datetime'].dt.strftime('%Y-%m-%d') == target_date_str].reset_index(drop=True)
+        
         return c_df
-    except Exception:
+    except Exception as e:
+        print(f"⚠️ Exception fetching data for {instrument_key}: {e}")
         return None
 
 def get_options_universe(target_date_str):
@@ -95,7 +109,7 @@ def get_options_universe(target_date_str):
         # Step 1: Spot Price Check
         spot_df = fetch_upstox_intraday_candles(info["key"], target_date_str)
         if spot_df is None or spot_df.empty:
-            print(f"⚠️ Warning: Could not fetch LIVE spot price for {idx_name}. Skipping.")
+            print(f"⚠️ Warning: Could not fetch Spot price for {idx_name} on {target_date_str}. Skipping.")
             continue
             
         latest_spot = spot_df['Close'].iloc[-1]
@@ -105,20 +119,18 @@ def get_options_universe(target_date_str):
         atm_strike = round(latest_spot / step) * step
         target_strikes = [atm_strike + (i * step) for i in range(-5, 6)]
         
-        # Step 3: Match the Symbol
-        # We use startswith() on the trading symbol because options are named like NIFTY24AUG...
-        # This is 100x more reliable than relying on the "name" or "instrument_type" columns.
+        # Step 3: Match the Symbol securely
         match_condition = df_inst[ts_col].astype(str).str.upper().str.startswith(idx_name)
         idx_opts = df_inst[match_condition].copy()
         
-        # Filter for actual options (must have a strike > 0)
+        # Mathematically guarantees we only pull options (equities/futures have NaN or 0 strikes)
         idx_opts = idx_opts[idx_opts[strike_col] > 0]
         
         if idx_opts.empty:
             print(f"⚠️ Warning: Found 0 option contracts starting with '{idx_name}'. Skipping.")
             continue
         
-        # Step 4: Expiry Matching (REMOVED time-travel date filter, just grab the closest one in the JSON)
+        # Step 4: Expiry Matching
         valid_expiries = idx_opts['expiry_dt'].dropna().unique()
         if not len(valid_expiries):
             print(f"⚠️ Warning: Found {idx_name} options, but 0 valid expiries parsed. Skipping.")
@@ -171,6 +183,7 @@ def scan_discrete_hourly_turnover(target_date_str):
 
     real_market_date = master_df['Datetime'].max().normalize()
     start_of_day = real_market_date + pd.Timedelta(hours=9, minutes=15)
+    
     current_now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
     is_live_today = (real_market_date.date() == current_now_ist.date())
 
@@ -185,7 +198,7 @@ def scan_discrete_hourly_turnover(target_date_str):
     ]
     
     print("\n" + "="*155)
-    print(f"🔥 TOP 5 INSTITUTIONAL OPTION STRIKES (Best in Both: Cumulative × Discrete) | REAL MARKET DATE: {real_market_date.strftime('%Y-%m-%d')}")
+    print(f"🔥 TOP 5 INSTITUTIONAL OPTION STRIKES (Best in Both: Cumulative × Discrete) | MARKET DATE: {real_market_date.strftime('%Y-%m-%d')}")
     print("="*155)
     
     for start_time, end_time, base_label in windows:
@@ -266,8 +279,17 @@ def run_production_sweep():
     raw_date_str = args.date or args.positional_date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
     is_backtest = bool(raw_date_str)
 
+    current_now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+
     if not is_backtest:
-        target_date_str = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
+        # MIDNIGHT BUG FIX: If it is before 9:15 AM IST, default to the previous trading day.
+        if current_now_ist.hour < 9 or (current_now_ist.hour == 9 and current_now_ist.minute < 15):
+            target_dt = current_now_ist - timedelta(days=1)
+            while target_dt.weekday() > 4:  # Skip Sat (5) and Sun (6)
+                target_dt -= timedelta(days=1)
+            target_date_str = target_dt.strftime("%Y-%m-%d")
+        else:
+            target_date_str = current_now_ist.strftime("%Y-%m-%d")
     else:
         try:
             target_date_str = datetime.strptime(raw_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
@@ -275,7 +297,7 @@ def run_production_sweep():
             print(f"❌ Critical Error: Date '{raw_date_str}' is invalid. Use YYYY-MM-DD.")
             return
 
-    print(f"⚙️ SYSTEM CLOCK START: {target_date_str} | MODE: {'BACKTEST' if is_backtest else 'LIVE'}")
+    print(f"⚙️ METRICS TARGET DATE: {target_date_str} | MODE: {'BACKTEST' if is_backtest else 'LIVE'}")
     
     scan_discrete_hourly_turnover(target_date_str)
 
