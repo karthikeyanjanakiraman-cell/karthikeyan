@@ -59,13 +59,18 @@ def get_options_universe(target_date_str):
         print("⚠️ Failed to load broker instrument list.")
         return []
         
-    # FIX: Safely detect the exact column name Upstox is using for strike prices
+    # Safely detect the exact column name Upstox is using for strike prices
     strike_col = 'strike_price' if 'strike_price' in df_inst.columns else 'strike' if 'strike' in df_inst.columns else None
-    
     if strike_col:
         df_inst[strike_col] = pd.to_numeric(df_inst[strike_col], errors='coerce')
     else:
-        print("⚠️ Critical API Change: 'strike_price' column missing from broker JSON.")
+        print("⚠️ Critical API Change: Strike price column missing from broker JSON.")
+        return []
+        
+    # Safely detect trading symbol column
+    ts_col = 'trading_symbol' if 'trading_symbol' in df_inst.columns else 'tradingsymbol' if 'tradingsymbol' in df_inst.columns else None
+    if not ts_col:
+        print("⚠️ Critical API Change: Trading symbol column missing from broker JSON.")
         return []
     
     # Parse expiries safely
@@ -78,12 +83,6 @@ def get_options_universe(target_date_str):
         print("⚠️ Critical API Change: 'expiry' column missing from broker JSON.")
         return []
 
-    # Filter to Options only
-    if 'instrument_type' in df_inst.columns:
-        df_opt = df_inst[df_inst['instrument_type'] == 'OPTIDX'].copy()
-    else:
-        df_opt = df_inst.copy()
-
     indices_config = {
         "NIFTY": {"key": "NSE_INDEX|Nifty 50", "step": 50},
         "BANKNIFTY": {"key": "NSE_INDEX|Nifty Bank", "step": 100},
@@ -91,7 +90,6 @@ def get_options_universe(target_date_str):
     }
     
     final_universe = []
-    today_dt = pd.to_datetime(datetime.utcnow().strftime("%Y-%m-%d"))
     
     for idx_name, info in indices_config.items():
         # Step 1: Spot Price Check
@@ -107,26 +105,23 @@ def get_options_universe(target_date_str):
         atm_strike = round(latest_spot / step) * step
         target_strikes = [atm_strike + (i * step) for i in range(-5, 6)]
         
-        # Step 3: Match the Name (Fallback to underlying_symbol if needed)
-        match_condition = (df_opt['name'] == idx_name)
-        if 'underlying_symbol' in df_opt.columns:
-            match_condition = match_condition | (df_opt['underlying_symbol'] == idx_name)
-            
-        idx_opts = df_opt[match_condition].copy()
+        # Step 3: Match the Symbol
+        # We use startswith() on the trading symbol because options are named like NIFTY24AUG...
+        # This is 100x more reliable than relying on the "name" or "instrument_type" columns.
+        match_condition = df_inst[ts_col].astype(str).str.upper().str.startswith(idx_name)
+        idx_opts = df_inst[match_condition].copy()
         
-        if idx_opts.empty:
-            print(f"⚠️ Warning: Found 0 master instruments matching name '{idx_name}'. Skipping.")
-            continue
-            
-        # Keep only valid options (strikes > 0) using dynamic column
+        # Filter for actual options (must have a strike > 0)
         idx_opts = idx_opts[idx_opts[strike_col] > 0]
         
-        # Step 4: Expiry Matching
-        valid_expiries = idx_opts['expiry_dt'].dropna().unique()
-        valid_expiries = [e for e in valid_expiries if e >= today_dt]
+        if idx_opts.empty:
+            print(f"⚠️ Warning: Found 0 option contracts starting with '{idx_name}'. Skipping.")
+            continue
         
-        if not valid_expiries:
-            print(f"⚠️ Warning: Found {idx_name} options, but 0 valid upcoming expiries. Skipping.")
+        # Step 4: Expiry Matching (REMOVED time-travel date filter, just grab the closest one in the JSON)
+        valid_expiries = idx_opts['expiry_dt'].dropna().unique()
+        if not len(valid_expiries):
+            print(f"⚠️ Warning: Found {idx_name} options, but 0 valid expiries parsed. Skipping.")
             continue
             
         closest_expiry = min(valid_expiries)
@@ -135,14 +130,14 @@ def get_options_universe(target_date_str):
         filtered_opts = idx_opts[(idx_opts['expiry_dt'] == closest_expiry) & (idx_opts[strike_col].isin(target_strikes))]
         
         if filtered_opts.empty:
-            print(f"⚠️ Warning: Found {idx_name} options, but 0 contracts matched our 11 strikes for {closest_expiry.strftime('%Y-%m-%d')}.")
+            print(f"⚠️ Warning: Found {idx_name} options, but 0 matched our 11 strikes for {closest_expiry.strftime('%Y-%m-%d')}.")
             continue
             
         print(f"🔍 {idx_name} -> Spot: {latest_spot:.2f} | ATM: {atm_strike} | Found {len(filtered_opts)} CE/PE contracts for {closest_expiry.strftime('%Y-%m-%d')}.")
         
         for _, row in filtered_opts.iterrows():
             final_universe.append({
-                "symbol": row.get('trading_symbol', row.get('name', 'UNKNOWN')),
+                "symbol": row[ts_col],
                 "key": row['instrument_key']
             })
             
