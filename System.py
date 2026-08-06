@@ -27,58 +27,51 @@ class MultiTimeframeAutoencoder(nn.Module):
     def __init__(self, num_features=5, latent_dim_daily=12, latent_dim_weekly=12):
         super(MultiTimeframeAutoencoder, self).__init__()
         
-        # Branch A: Processes the 30-day Daily Matrix (5 features x 30 steps)
         self.encoder_daily = nn.Sequential(
             nn.Conv1d(in_channels=num_features, out_channels=16, kernel_size=3, padding=1),
             nn.BatchNorm1d(16),
             nn.ReLU(inplace=True),
-            nn.MaxPool1d(2),  # 30 -> 15
-            
+            nn.MaxPool1d(2),  
             nn.Conv1d(in_channels=16, out_channels=32, kernel_size=3, padding=1),
             nn.BatchNorm1d(32),
             nn.ReLU(inplace=True),
-            nn.MaxPool1d(3),  # 15 -> 5
-            
+            nn.MaxPool1d(3),  
             nn.Flatten(),
             nn.Linear(32 * 5, latent_dim_daily)
         )
         
-        # Branch B: Processes the 15-week Weekly Matrix (5 features x 15 steps)
         self.encoder_weekly = nn.Sequential(
             nn.Conv1d(in_channels=num_features, out_channels=16, kernel_size=3, padding=1),
             nn.BatchNorm1d(16),
             nn.ReLU(inplace=True),
-            nn.MaxPool1d(3),  # 15 -> 5
-            
+            nn.MaxPool1d(3),  
             nn.Flatten(),
             nn.Linear(16 * 5, latent_dim_weekly)
         )
         
-        # Decoder A: Reconstructs back to the original 30-day Daily Shape
         self.decoder_daily = nn.Sequential(
             nn.Linear(latent_dim_daily, 32 * 5),
             nn.ReLU(inplace=True),
             nn.Unflatten(1, (32, 5)),
-            nn.ConvTranspose1d(32, 16, kernel_size=3, stride=3, output_padding=0),  # 5 -> 15
+            nn.ConvTranspose1d(32, 16, kernel_size=3, stride=3, output_padding=0),  
             nn.BatchNorm1d(16),
             nn.ReLU(inplace=True),
-            nn.ConvTranspose1d(16, num_features, kernel_size=2, stride=2, output_padding=0),  # 15 -> 30
+            nn.ConvTranspose1d(16, num_features, kernel_size=2, stride=2, output_padding=0),  
             nn.Sigmoid()
         )
         
-        # Decoder B: Reconstructs back to the original 15-week Weekly Shape
         self.decoder_weekly = nn.Sequential(
             nn.Linear(latent_dim_weekly, 16 * 5),
             nn.ReLU(inplace=True),
             nn.Unflatten(1, (16, 5)),
-            nn.ConvTranspose1d(16, num_features, kernel_size=3, stride=3, output_padding=0),  # 5 -> 15
+            nn.ConvTranspose1d(16, num_features, kernel_size=3, stride=3, output_padding=0),  
             nn.Sigmoid()
         )
 
     def encode(self, x_daily, x_weekly):
         ld = self.encoder_daily(x_daily)
         lw = self.encoder_weekly(x_weekly)
-        return torch.cat((ld, lw), dim=1)  # Master 24-Dimensional Feature Map
+        return torch.cat((ld, lw), dim=1) 
 
     def forward(self, x_daily, x_weekly):
         ld = self.encoder_daily(x_daily)
@@ -112,7 +105,6 @@ def read_and_standardize_csv(filename):
 def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_pct=50.0, max_dd=1.2, wick_ratio=0.40):
     df = read_and_standardize_csv(csv_filename)
     if df is None or 'Date' not in df.columns:
-        print(f"⚠️ Warning: Missing or invalid '{csv_filename}'")
         return None, None, None, None
         
     if target_date_str:
@@ -133,7 +125,6 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_pct=
         group = group.sort_values('Date').reset_index(drop=True)
         group['Datetime'] = pd.to_datetime(group['Date'])
         
-        # Generate the parallel macro Weekly resampled mapping
         group_w = group.set_index('Datetime').resample('W').agg({
             'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum', 'Date': 'last'
         }).reset_index().sort_values('Date').reset_index(drop=True)
@@ -146,19 +137,16 @@ def load_training_data(csv_filename, target_date_str=None, min_pct=4.0, max_pct=
         for i in range(len(values_d) - (30 + FUTURE_DAYS) + 1):
             end_date_d = dates_d[i + 29]
             
-            # Anti-leakage extraction of historical weeks ending on or before current daily date
             sub_w = group_w[group_w['Date'] <= end_date_d]
             if len(sub_w) < 15: continue
                 
             raw_window_w = sub_w[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)[-15:]
             raw_window_d = values_d[i : i+30]
             
-            # Normalize Daily Space (0 to 1)
             w_min_d = raw_window_d.min(axis=0)
             w_max_d = raw_window_d.max(axis=0)
             norm_window_d = (raw_window_d - w_min_d) / (w_max_d - w_min_d + 1e-8)
             
-            # Normalize Weekly Space (0 to 1)
             w_min_w = raw_window_w.min(axis=0)
             w_max_w = raw_window_w.max(axis=0)
             norm_window_w = (raw_window_w - w_min_w) / (w_max_w - w_min_w + 1e-8)
@@ -221,155 +209,42 @@ def train_ai_brain(X_daily, X_weekly, Y_price, Y_time, epochs=15):
     xgb_time = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=4).fit(latent_vectors, Y_time)
 
     faiss.normalize_L2(latent_vectors)
-    index = faiss.IndexFlatIP(24)  # 12 (Daily Dimensionality) + 12 (Weekly Dimensionality) = 24
+    index = faiss.IndexFlatIP(24)  
     index.add(latent_vectors)
     
     return model, xgb_price, xgb_time, index
 
 # ==============================================================================
-# 4. LIVE INGESTION PACKS (Local CSV & Upstox Multi-Timeframe Extractor)
+# 4. LIVE INGESTION PACKS & DYNAMIC UNIVERSE
 # ==============================================================================
-def get_live_tensor_from_csv(csv_filename, target_date_str):
-    df = read_and_standardize_csv(csv_filename)
-    if df is None or 'Date' not in df.columns: return None, None, None
-    
-    if 'Symbol' in df.columns:
-        mask = df['Symbol'].astype(str).str.upper().str.replace("_", "").str.replace(" ", "").str.contains("NIFTY50|NIFTY")
-        df = df[mask] if mask.any() else df[df['Symbol'] == df['Symbol'].unique()[0]]
-            
-    df['Datetime'] = pd.to_datetime(df['Date'])
-    df_w = df.set_index('Datetime').resample('W').agg({
-        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum', 'Date': 'last'
-    }).reset_index().sort_values('Date').reset_index(drop=True)
-    
-    past_d = df[df['Date'] <= target_date_str].sort_values('Date').reset_index(drop=True)
-    past_w = df_w[df_w['Date'] <= target_date_str].sort_values('Date').reset_index(drop=True)
-    
-    if len(past_d) < 30 or len(past_w) < 15: return None, None, None
-    
-    vals_d = past_d[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)[-30:]
-    vals_w = past_w[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)[-15:]
-    
-    current_ltp = vals_d[-1, 3]
-    norm_d = (vals_d - vals_d.min(axis=0)) / (vals_d.max(axis=0) - vals_d.min(axis=0) + 1e-8)
-    norm_w = (vals_w - vals_w.min(axis=0)) / (vals_w.max(axis=0) - vals_w.min(axis=0) + 1e-8)
-    
-    return norm_d.T, norm_w.T, current_ltp
-
 def get_dynamic_fno_universe():
     nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
-    response = requests.get(nse_url)
-    if response.status_code != 200: return []
     try:
+        response = requests.get(nse_url, timeout=5)
+        if response.status_code != 200: return []
         nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
         fno_underlying = {item.get("underlying_symbol") for item in nse_data if item.get("segment") == "NSE_FO" and item.get("underlying_symbol")}
         return [{"symbol": item.get("trading_symbol"), "key": item.get("instrument_key")} for item in nse_data if item.get("segment") in ("NSE_EQ", "NSE_INDEX") and item.get("trading_symbol") in fno_underlying]
     except:
         return []
 
-def fetch_upstox_data(instrument_key, target_date_str, days_back=180):
-    access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
-    target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
-    to_date = target_date_str
-    from_date = (target_dt - timedelta(days=days_back)).strftime("%Y-%m-%d")
-    
-    url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/day/{to_date}/{from_date}"
-    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
-    
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200: return None
-        
-    data = response.json().get('data', {}).get('candles', [])
-    if not data or len(data) < 40: return None
-        
-    c_df = pd.DataFrame(data, columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
-    c_df = c_df.iloc[::-1].reset_index(drop=True)
-    c_df['Date'] = c_df['Date'].astype(str).str[:10]
-    c_df['Datetime'] = pd.to_datetime(c_df['Date'])
-    
-    past_d = c_df[c_df['Date'] <= target_date_str].sort_values('Date').reset_index(drop=True)
-    if len(past_d) < 30: return None
-        
-    current_ltp = float(past_d.iloc[-1]['Close'])
-    raw_d = past_d[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)[-30:]
-    norm_d = (raw_d - raw_d.min(axis=0)) / (raw_d.max(axis=0) - raw_d.min(axis=0) + 1e-8)
-    
-    past_w = past_d.set_index('Datetime').resample('W').agg({
-        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum', 'Date': 'last'
-    }).reset_index().sort_values('Date').reset_index(drop=True)
-    
-    if len(past_w) < 15: return None
-    raw_w = past_w[['Open', 'High', 'Low', 'Close', 'Volume']].values.astype(np.float32)[-15:]
-    norm_w = (raw_w - raw_w.min(axis=0)) / (raw_w.max(axis=0) - raw_w.min(axis=0) + 1e-8)
-    
-    return norm_d.T, norm_w.T, current_ltp
-
 # ==============================================================================
-# 5. EXECUTION CORE & EMAIL ALERTS SYSTEM
-# ==============================================================================
-def send_mobile_alert(macro_data, fno_data_list, target_date_str, is_backtest):
-    sender_email, sender_pass, recipient_email = os.environ.get("SENDER_EMAIL"), os.environ.get("SENDER_PASSWORD"), os.environ.get("RECIPIENT_EMAIL")
-    if not all([sender_email, sender_pass, recipient_email]): return
-
-    msg = MIMEMultipart('alternative')
-    msg['Subject'] = f"{'⏪ BACKTEST' if is_backtest else '🚀 MULTI-TIMEFRAME LIVE'} | {target_date_str}"
-    msg['From'], msg['To'] = sender_email, recipient_email
-
-    macro_color = "#28a745" if "LONG" in macro_data['direction'] else "#dc3545"
-    sim_warning = "<div style='background-color: #fff3cd; color: #856404; padding: 10px; text-align: center; font-weight: bold; margin-bottom: 15px;'>⚠️ VALIDATION RUN ACTIVE</div>" if is_backtest else ""
-
-    html_content = f"""
-    <html>
-      <body style="font-family: Arial, sans-serif; background-color: #f4f7f6; padding: 10px;">
-        {sim_warning}
-        <div style="background-color: white; padding: 15px; border-radius: 8px; margin-bottom: 20px; border-left: 6px solid {macro_color};">
-            <h3 style="margin-top: 0; color: #333;">🌍 DUAL-TIMEFRAME MACRO REGIME (NIFTY 50)</h3>
-            <p style="font-size: 16px; color: #333; margin: 5px 0;">
-                <b>Direction:</b> <span style="color: {macro_color}; font-weight: bold;">{macro_data['direction']}</span><br>
-                <b>AI Target:</b> {macro_data['target_display']} | <b>Conviction:</b> {macro_data['conviction']:.2f}%
-            </p>
-        </div>
-        <h3 style="color: #333;">⚡ SNIPER F&O SCOPE SWEEP</h3>
-        <table border="1" cellpadding="8" cellspacing="0" style="border-collapse: collapse; width: 100%; text-align: center; font-size: 14px; background-color: white;">
-          <tr bgcolor="#f8f9fa" style="color: #333; font-weight: bold;">
-            <th>Asset</th><th>Signal</th><th>Trend Match?</th><th>Score</th><th>Current LTP</th><th>AI Target</th><th>Result (2-Day Close)</th>
-          </tr>
-    """
-    fno_data_list.sort(key=lambda x: x['conviction'], reverse=True)
-    for row in fno_data_list:
-        dir_color = "#28a745" if "LONG" in row['direction'] else "#dc3545"
-        html_content += f"""
-          <tr>
-            <td style="color: #0056b3;"><b>{row['asset']}</b></td>
-            <td style="color: {dir_color}; font-weight: bold;">{row['direction']}</td>
-            <td>{"✅" if row['direction'] == macro_data['direction'] else "⚠️"}</td>
-            <td>{row['conviction']:.2f}%</td>
-            <td>₹{row['ltp']:.2f}</td>
-            <td style="color: {dir_color}; font-weight: bold;">{row['target_display']}</td>
-            <td>{row['actual_outcome']}</td>
-          </tr>
-        """
-    html_content += "</table></body></html>"
-    msg.attach(MIMEText(html_content, 'html'))
-
-    try:
-        server = smtplib.SMTP('smtp.gmail.com', 587)
-        server.starttls()
-        server.login(sender_email, sender_pass)
-        server.sendmail(sender_email, recipient_email, msg.as_string())
-        server.quit()
-        print(f"✅ Alert Dispatched with {len(fno_data_list)} dual-timeframe filtered targets.")
-    except Exception as e:
-        print(f"Failed to send email: {str(e)}")
-
-# ==============================================================================
-# 6. HOURLY TURNOVER SCANNER (Top 5 Volume x Price)
+# 5. FIXED INTRADAY FETCH ENGINE (Handles Live vs Historical Automatically)
 # ==============================================================================
 def fetch_upstox_intraday_candles(instrument_key, target_date_str):
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
     if not access_token: return None
     
-    url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{target_date_str}/{target_date_str}"
+    # ⚠️ CRITICAL FIX: Upstox uses completely different API endpoints depending on if the requested date is TODAY or in the PAST.
+    current_date_str = datetime.now().strftime("%Y-%m-%d")
+    
+    if target_date_str == current_date_str:
+        # LIVE TODAY: Requires /intraday/ endpoint
+        url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key)}/1minute"
+    else:
+        # HISTORICAL: Requires /target_date/target_date/ endpoint
+        url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{target_date_str}/{target_date_str}"
+        
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
     
     try:
@@ -386,18 +261,23 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str):
     except Exception:
         return None
 
+# ==============================================================================
+# 6. HOURLY TURNOVER SCANNER (Isolated 09:15 - 09:30 Window)
+# ==============================================================================
 def scan_hourly_top_turnover(target_date_str):
-    print(f"\n⏳ Initializing Hourly Turnover Scan (Volume * Price) for {target_date_str}...")
+    print(f"\n⏳ Initializing Morning Turnover Scan (Volume * Price) for {target_date_str}...")
     universe = get_dynamic_fno_universe()
     if not universe:
         print("⚠️ No F&O universe found. Please check Upstox API.")
         return
         
     all_hourly_records = []
-    
     target_dt = pd.to_datetime(target_date_str)
+    
+    # ⚠️ CRITICAL FIX: Added explicit 09:15 - 09:30 block to measure metrics right at 9:30
     bins = [
         target_dt + pd.Timedelta(hours=9, minutes=15),
+        target_dt + pd.Timedelta(hours=9, minutes=30),  # Morning 15-min surge block
         target_dt + pd.Timedelta(hours=10, minutes=15),
         target_dt + pd.Timedelta(hours=11, minutes=15),
         target_dt + pd.Timedelta(hours=12, minutes=15),
@@ -406,9 +286,10 @@ def scan_hourly_top_turnover(target_date_str):
         target_dt + pd.Timedelta(hours=15, minutes=15),
         target_dt + pd.Timedelta(hours=15, minutes=30)
     ]
+    
     labels = [
-        '09:15 - 10:15', '10:15 - 11:15', '11:15 - 12:15', 
-        '12:15 - 13:15', '13:15 - 14:15', '14:15 - 15:15', '15:15 - 15:30'
+        '09:15 - 09:30 (Opening Rush)', '09:30 - 10:15', '10:15 - 11:15', 
+        '11:15 - 12:15', '12:15 - 13:15', '13:15 - 14:15', '14:15 - 15:15', '15:15 - 15:30'
     ]
     
     print(f"📡 Downloading 1-minute intraday data for {len(universe)} F&O stocks...")
@@ -430,7 +311,7 @@ def scan_hourly_top_turnover(target_date_str):
         all_hourly_records.append(hourly)
         
     if not all_hourly_records or success_count == 0:
-        print("⚠️ Warning: No intraday candles returned for today's live session yet (Markets may be pre-open, ongoing with no flushed minute bars, or API token lacks intraday scope). Skipping hourly turnover breakdown gracefully.")
+        print("⚠️ Warning: Could not retrieve intraday candles. Ensure your UPSTOX_ACCESS_TOKEN is valid.")
         return
         
     master_df = pd.concat(all_hourly_records, ignore_index=True)
@@ -442,11 +323,11 @@ def scan_hourly_top_turnover(target_date_str):
     )
     
     print("\n" + "="*85)
-    print(f"🔥 TOP 5 STOCKS PER HOUR BY TRADED TURNOVER (Volume × Price) | DATE: {target_date_str}")
+    print(f"🔥 TOP 5 STOCKS PER WINDOW BY TRADED TURNOVER (Volume × Price) | DATE: {target_date_str}")
     print("="*85)
     
     for time_window, group in top5_per_hour.groupby('Time_Window', observed=False):
-        if group.empty: continue
+        if group.empty or group['Turnover'].sum() == 0: continue
         print(f"\n⏰ TIME BLOCK: {time_window} IST")
         print(f"{'Rank':<5} {'Symbol':<15} {'Turnover (₹ Crores)':<25} {'Volume Executed':<18} {'LTP (₹)':<10}")
         print("-" * 85)
@@ -486,20 +367,16 @@ def run_production_sweep():
                 break
         if nifty_file: break
 
-    if not nifty_file:
-        print("❌ Critical Error: No Nifty data sets located.")
-        return
+    if nifty_file:
+        print(f"\n🧠 TRAINING PHASE 1: Processing Macro System on {nifty_file}...")
+        X_d_nifty, X_w_nifty, Y_np, Y_nt = load_training_data(nifty_file, target_date_str, min_pct=0.75, max_pct=5.0, max_dd=0.5, wick_ratio=0.5)
+        if X_d_nifty is not None and len(X_d_nifty) > 0:
+            nifty_brain, nifty_xgb_p, nifty_xgb_t, nifty_faiss = train_ai_brain(X_d_nifty, X_w_nifty, Y_np, Y_nt)
+    else:
+        print("⚠️ No Nifty data sets located. Skipping Macro Training.")
 
-    # PHASE 1: MACRO NIFTY MATRIX
-    print(f"\n🧠 TRAINING PHASE 1: Processing Macro System on {nifty_file}...")
-    X_d_nifty, X_w_nifty, Y_np, Y_nt = load_training_data(nifty_file, target_date_str, min_pct=0.75, max_pct=5.0, max_dd=0.5, wick_ratio=0.5)
-    if X_d_nifty is None or len(X_d_nifty) == 0: return
-
-    nifty_brain, nifty_xgb_p, nifty_xgb_t, nifty_faiss = train_ai_brain(X_d_nifty, X_w_nifty, Y_np, Y_nt)
-    
-    # Run the new Hourly Turnover Ranking Scan
+    # Execute the fixed Live Intraday fetcher for the 09:15-09:30 morning block!
     scan_hourly_top_turnover(target_date_str)
 
 if __name__ == "__main__":
     run_production_sweep()
-
