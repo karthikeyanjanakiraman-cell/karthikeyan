@@ -372,16 +372,19 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str):
     url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{target_date_str}/{target_date_str}"
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
     
-    response = requests.get(url, headers=headers)
-    if response.status_code != 200: return None
-        
-    data = response.json().get('data', {}).get('candles', [])
-    if not data: return None
-        
-    c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
-    c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).dt.tz_localize(None) 
-    c_df = c_df.sort_values('Datetime').reset_index(drop=True)
-    return c_df
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+        if response.status_code != 200: return None
+            
+        data = response.json().get('data', {}).get('candles', [])
+        if not data: return None
+            
+        c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
+        c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).dt.tz_localize(None) 
+        c_df = c_df.sort_values('Datetime').reset_index(drop=True)
+        return c_df
+    except Exception:
+        return None
 
 def scan_hourly_top_turnover(target_date_str):
     print(f"\n⏳ Initializing Hourly Turnover Scan (Volume * Price) for {target_date_str}...")
@@ -409,9 +412,11 @@ def scan_hourly_top_turnover(target_date_str):
     ]
     
     print(f"📡 Downloading 1-minute intraday data for {len(universe)} F&O stocks...")
+    success_count = 0
     for item in universe:
         df = fetch_upstox_intraday_candles(item['key'], target_date_str)
         if df is None or df.empty: continue
+        success_count += 1
         df['Turnover'] = df['Volume'] * df['Close']
         df['Time_Window'] = pd.cut(df['Datetime'], bins=bins, labels=labels, include_lowest=True, right=False)
         
@@ -424,8 +429,8 @@ def scan_hourly_top_turnover(target_date_str):
         hourly['Symbol'] = item['symbol']
         all_hourly_records.append(hourly)
         
-    if not all_hourly_records:
-        print("❌ Could not retrieve valid intraday data.")
+    if not all_hourly_records or success_count == 0:
+        print("⚠️ Warning: No intraday candles returned for today's live session yet (Markets may be pre-open, ongoing with no flushed minute bars, or API token lacks intraday scope). Skipping hourly turnover breakdown gracefully.")
         return
         
     master_df = pd.concat(all_hourly_records, ignore_index=True)
@@ -497,3 +502,4 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
+
