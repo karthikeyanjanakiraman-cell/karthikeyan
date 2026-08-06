@@ -59,9 +59,14 @@ def get_options_universe(target_date_str):
         print("⚠️ Failed to load broker instrument list.")
         return []
         
-    # FIX 1: Force strike to be numeric so String/Float mismatches don't destroy the filter
-    if 'strike' in df_inst.columns:
-        df_inst['strike'] = pd.to_numeric(df_inst['strike'], errors='coerce')
+    # FIX: Safely detect the exact column name Upstox is using for strike prices
+    strike_col = 'strike_price' if 'strike_price' in df_inst.columns else 'strike' if 'strike' in df_inst.columns else None
+    
+    if strike_col:
+        df_inst[strike_col] = pd.to_numeric(df_inst[strike_col], errors='coerce')
+    else:
+        print("⚠️ Critical API Change: 'strike_price' column missing from broker JSON.")
+        return []
     
     # Parse expiries safely
     if 'expiry' in df_inst.columns:
@@ -72,6 +77,12 @@ def get_options_universe(target_date_str):
     else:
         print("⚠️ Critical API Change: 'expiry' column missing from broker JSON.")
         return []
+
+    # Filter to Options only
+    if 'instrument_type' in df_inst.columns:
+        df_opt = df_inst[df_inst['instrument_type'] == 'OPTIDX'].copy()
+    else:
+        df_opt = df_inst.copy()
 
     indices_config = {
         "NIFTY": {"key": "NSE_INDEX|Nifty 50", "step": 50},
@@ -97,18 +108,18 @@ def get_options_universe(target_date_str):
         target_strikes = [atm_strike + (i * step) for i in range(-5, 6)]
         
         # Step 3: Match the Name (Fallback to underlying_symbol if needed)
-        match_condition = (df_inst['name'] == idx_name)
-        if 'underlying_symbol' in df_inst.columns:
-            match_condition = match_condition | (df_inst['underlying_symbol'] == idx_name)
+        match_condition = (df_opt['name'] == idx_name)
+        if 'underlying_symbol' in df_opt.columns:
+            match_condition = match_condition | (df_opt['underlying_symbol'] == idx_name)
             
-        idx_opts = df_inst[match_condition].copy()
+        idx_opts = df_opt[match_condition].copy()
         
         if idx_opts.empty:
             print(f"⚠️ Warning: Found 0 master instruments matching name '{idx_name}'. Skipping.")
             continue
             
-        # Keep only valid options (strikes > 0)
-        idx_opts = idx_opts[idx_opts['strike'] > 0]
+        # Keep only valid options (strikes > 0) using dynamic column
+        idx_opts = idx_opts[idx_opts[strike_col] > 0]
         
         # Step 4: Expiry Matching
         valid_expiries = idx_opts['expiry_dt'].dropna().unique()
@@ -121,7 +132,7 @@ def get_options_universe(target_date_str):
         closest_expiry = min(valid_expiries)
         
         # Step 5: Strike Matching
-        filtered_opts = idx_opts[(idx_opts['expiry_dt'] == closest_expiry) & (idx_opts['strike'].isin(target_strikes))]
+        filtered_opts = idx_opts[(idx_opts['expiry_dt'] == closest_expiry) & (idx_opts[strike_col].isin(target_strikes))]
         
         if filtered_opts.empty:
             print(f"⚠️ Warning: Found {idx_name} options, but 0 contracts matched our 11 strikes for {closest_expiry.strftime('%Y-%m-%d')}.")
@@ -131,7 +142,7 @@ def get_options_universe(target_date_str):
         
         for _, row in filtered_opts.iterrows():
             final_universe.append({
-                "symbol": row['trading_symbol'],
+                "symbol": row.get('trading_symbol', row.get('name', 'UNKNOWN')),
                 "key": row['instrument_key']
             })
             
@@ -238,12 +249,12 @@ def scan_discrete_hourly_turnover(target_date_str):
         top5 = merged.nlargest(5, 'Combined_Power')
         
         print(f"\n⏰ DISCRETE WINDOW: {label} IST")
-        print(f"{'Rank':<5} {'Symbol':<22} {'Combined Pwr':<12} | {'Disc Pwr':<10} | {'Cum Pwr':<9} | {'Turnover':<11} | {'Momentum':<11} | {'Hurst':<9} | {'% Move':<8} {'LTP (₹)':<10}")
+        print(f"{'Rank':<5} {'Symbol':<26} {'Combined Pwr':<12} | {'Disc Pwr':<10} | {'Cum Pwr':<9} | {'Turnover':<11} | {'Momentum':<11} | {'Hurst':<9} | {'% Move':<8} {'LTP (₹)':<10}")
         print("-" * 155)
         
         for rank, (_, row) in enumerate(top5.iterrows(), 1):
             move_sign = "+" if row['Pct_Move'] > 0 else ""
-            print(f"{rank:<5} {row['Symbol']:<22} {row['Combined_Power']:<12.1f} | {row['Discrete_Power']:>8.1f}   | {row['Cumulative_Power']:>7.1f}   | {row['Turnover_PR']:>7.2f} PR | {row['Momentum_PR']:>7.2f} PR | {row['Hurst_PR']:>5.2f} PR | {move_sign}{row['Pct_Move']:<6.2f}%   ₹{row['Close']:<10.2f}")
+            print(f"{rank:<5} {row['Symbol']:<26} {row['Combined_Power']:<12.1f} | {row['Discrete_Power']:>8.1f}   | {row['Cumulative_Power']:>7.1f}   | {row['Turnover_PR']:>7.2f} PR | {row['Momentum_PR']:>7.2f} PR | {row['Hurst_PR']:>5.2f} PR | {move_sign}{row['Pct_Move']:<6.2f}%   ₹{row['Close']:<10.2f}")
 
         if is_active_live:
             break
