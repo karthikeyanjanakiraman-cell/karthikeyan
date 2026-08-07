@@ -32,6 +32,8 @@ COLOR_BOLD = '\033[1m'
 # 1. EQUI-PERCENTILE EQUATING
 # ==============================================================================
 def convert_to_equi_percentile(raw_matrix):
+    if raw_matrix.size == 0 or raw_matrix.shape[0] <= 1:
+        return raw_matrix
     ranks = np.argsort(np.argsort(raw_matrix, axis=0), axis=0)
     percentile_matrix = ranks.astype(np.float32) / (raw_matrix.shape[0] - 1 + 1e-8)
     return percentile_matrix
@@ -257,8 +259,13 @@ def scan_institutional_tape(target_date_str):
     historical_burned_list = {}
     
     for day in trading_days:
-        day_start = pd.to_datetime(day) + pd.Timedelta(hours=9, minutes=15)
-        day_end = pd.to_datetime(day) + pd.Timedelta(hours=15, minutes=15)
+        day_dt = pd.to_datetime(day)
+        day_master = rolling_master_df[(rolling_master_df['Datetime'] >= day_dt) & (rolling_master_df['Datetime'] < day_dt + pd.Timedelta(days=1))]
+        if day_master.empty:
+            continue
+
+        day_start = day_dt + pd.Timedelta(hours=9, minutes=15)
+        day_end = day_dt + pd.Timedelta(hours=15, minutes=15)
         if day == target_date_str:
             day_end = eval_time_current
 
@@ -267,7 +274,7 @@ def scan_institutional_tape(target_date_str):
                                    freq='5min')
                                    
         for t in time_steps:
-            top_historical = calculate_velocity_leaderboard(rolling_master_df, t, window_mins=15)
+            top_historical = calculate_velocity_leaderboard(day_master, t, window_mins=15)
             if not top_historical.empty:
                 for _, row in top_historical.iterrows():
                     sym = row['Symbol']
@@ -279,11 +286,16 @@ def scan_institutional_tape(target_date_str):
                         }
 
     # ----------------------------------------------------------------------
-    # EVALUATE CURRENT MINUTE (-1)
+    # EVALUATE CURRENT MINUTE (-1) WITH VECTORIZED SLICING
     # ----------------------------------------------------------------------
-    today_master_df = rolling_master_df[rolling_master_df['Datetime'].dt.strftime('%Y-%m-%d'] == target_date_str]
+    target_dt_obj = pd.to_datetime(target_date_str)
+    today_master_df = rolling_master_df[
+        (rolling_master_df['Datetime'] >= target_dt_obj) & 
+        (rolling_master_df['Datetime'] < target_dt_obj + pd.Timedelta(days=1))
+    ].copy()
+
     if today_master_df.empty:
-        print(f"[{eval_time_current.strftime('%H:%M')} IST] Market compiling... no intraday candle data returned for {target_date_str} yet.")
+        print(f"\n{COLOR_YELLOW}[Terminal Standby] Market data for {target_date_str} is not available yet (or market is closed/empty).{COLOR_RESET}\n")
         return
 
     curr_top10 = calculate_velocity_leaderboard(today_master_df, eval_time_current, window_mins=15)
@@ -392,4 +404,3 @@ if __name__ == "__main__":
     import warnings
     warnings.filterwarnings("ignore")
     run_production_sweep()
-
