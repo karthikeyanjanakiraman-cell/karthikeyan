@@ -37,3 +37,14 @@ jobs:
         PARAM_BACKTEST_DATE: ${{ github.event.inputs.backtest_date }}
       run: |
         python System1.py
+
+    - name: Execute System (AI Engine)
+      if: always()
+      env:
+        UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+        SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+        SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+        RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        PARAM_BACKTEST_DATE: ${{ github.event.inputs.backtest_date }}
+      run: |
+        python System.py
