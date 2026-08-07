@@ -149,6 +149,9 @@ def get_past_trading_days(target_date_str, num_days=5):
 # 4. TRI-DELTA VELOCITY ENGINE (Independent Percentile Changes)
 # ==============================================================================
 def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15):
+    if master_df is None or master_df.empty or 'Datetime' not in master_df.columns:
+        return pd.DataFrame()
+
     start_of_day = pd.to_datetime(current_eval_time.date()) + pd.Timedelta(hours=9, minutes=15)
     recent_start = current_eval_time - pd.Timedelta(minutes=window_mins)
     
@@ -189,6 +192,8 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
     merged = pd.merge(g_rec[['Symbol', 'Rec_Pct_Move', 'Close', 'Datetime', 'Rec_Vol_Rank', 'Rec_Mom_Rank', 'Rec_Eff_Rank']], 
                       g_cum[['Symbol', 'Cum_Vol_Rank', 'Cum_Mom_Rank', 'Cum_Eff_Rank']], on='Symbol', how='inner')
     
+    if merged.empty: return pd.DataFrame()
+
     merged['Vol_Delta'] = merged['Rec_Vol_Rank'] - merged['Cum_Vol_Rank']
     merged['Mom_Delta'] = merged['Rec_Mom_Rank'] - merged['Cum_Mom_Rank']
     merged['Eff_Delta'] = merged['Rec_Eff_Rank'] - merged['Cum_Eff_Rank']
@@ -232,6 +237,10 @@ def scan_institutional_tape(target_date_str):
 
     rolling_master_df = pd.concat(historical_dfs, ignore_index=True)
     
+    if rolling_master_df.empty or 'Datetime' not in rolling_master_df.columns:
+        print("⚠️ Error: rolling_master_df is empty or missing 'Datetime' column.")
+        return
+    
     # Strict Current Minute - 1 Boundary Rule for Live Execution
     current_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
     is_live_today = (target_date_str == current_now.strftime("%Y-%m-%d"))
@@ -272,7 +281,11 @@ def scan_institutional_tape(target_date_str):
     # ----------------------------------------------------------------------
     # EVALUATE CURRENT MINUTE (-1)
     # ----------------------------------------------------------------------
-    today_master_df = rolling_master_df[rolling_master_df['Datetime'].dt.strftime('%Y-%m-%d') == target_date_str]
+    today_master_df = rolling_master_df[rolling_master_df['Datetime'].dt.strftime('%Y-%m-%d'] == target_date_str]
+    if today_master_df.empty:
+        print(f"[{eval_time_current.strftime('%H:%M')} IST] Market compiling... no intraday candle data returned for {target_date_str} yet.")
+        return
+
     curr_top10 = calculate_velocity_leaderboard(today_master_df, eval_time_current, window_mins=15)
     
     if curr_top10.empty:
@@ -379,3 +392,4 @@ if __name__ == "__main__":
     import warnings
     warnings.filterwarnings("ignore")
     run_production_sweep()
+
