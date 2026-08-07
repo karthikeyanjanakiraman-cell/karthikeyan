@@ -24,6 +24,7 @@ COLOR_GREEN = '\033[92m'
 COLOR_RED = '\033[91m'
 COLOR_CYAN = '\033[96m'
 COLOR_YELLOW = '\033[93m'
+COLOR_DIM = '\033[2m'
 COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 
@@ -205,7 +206,7 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
     return top10
 
 # ==============================================================================
-# 5. LIVE BURNED LIST & TAPE PRINTER (Zero Noise, Dual-Table Radar)
+# 5. LIVE BURNED LIST & TAPE PRINTER (Price-Aware Memory)
 # ==============================================================================
 def scan_institutional_tape(target_date_str):
     print(f"\n📡 Initiating Institutional Stealth Tape for {target_date_str}...")
@@ -244,11 +245,11 @@ def scan_institutional_tape(target_date_str):
     
     # ----------------------------------------------------------------------
     # SILENTLY BUILD THE MASTER LOG ("THE BURNED LIST") FROM 9:15 AM
+    # Now saving BOTH Time and Exact Price (LTP) of the first footprint
     # ----------------------------------------------------------------------
     historical_burned_list = {}
     last_known_top10 = []
     
-    # Simulate the day in 5-minute chunks to build perfect historical memory
     time_steps = pd.date_range(start=start_of_day + pd.Timedelta(minutes=15), 
                                end=eval_time_current - pd.Timedelta(minutes=5), 
                                freq='5min')
@@ -257,9 +258,14 @@ def scan_institutional_tape(target_date_str):
         historical_top10 = calculate_velocity_leaderboard(master_df, t, window_mins=15)
         if not historical_top10.empty:
             symbols = historical_top10['Symbol'].tolist()
-            for sym in symbols:
+            for _, row in historical_top10.iterrows():
+                sym = row['Symbol']
                 if sym not in historical_burned_list:
-                    historical_burned_list[sym] = t.strftime('%H:%M')
+                    # Save the snapshot!
+                    historical_burned_list[sym] = {
+                        'time': t.strftime('%H:%M'),
+                        'price': row['Close']
+                    }
             last_known_top10 = symbols
         else:
             last_known_top10 = []
@@ -285,7 +291,17 @@ def scan_institutional_tape(target_date_str):
             
         # 2. Is it a Reload? (It's on the Burned List from earlier today)
         elif sym in historical_burned_list:
-            row['First_Seen'] = historical_burned_list[sym]
+            first_time = historical_burned_list[sym]['time']
+            first_price = historical_burned_list[sym]['price']
+            current_price = row['Close']
+            
+            # Calculate the drift from the original institutional buy price
+            pct_change = ((current_price - first_price) / first_price) * 100
+            
+            row['First_Seen'] = first_time
+            row['First_Price'] = first_price
+            row['Pct_Change_Since_First'] = pct_change
+            
             algorithmic_reloads.append(row)
             
         # 3. Is it a Virgin Alert? (Never seen today)
@@ -295,9 +311,9 @@ def scan_institutional_tape(target_date_str):
     # ----------------------------------------------------------------------
     # TERMINAL OUTPUT: TWO CLEAN TABLES
     # ----------------------------------------------------------------------
-    print(f"\n{COLOR_CYAN}========================================================================{COLOR_RESET}")
+    print(f"\n{COLOR_CYAN}========================================================================================{COLOR_RESET}")
     print(f"{COLOR_BOLD}LIVE INSTITUTIONAL TAPE | TIME: {eval_time_current.strftime('%H:%M')} IST{COLOR_RESET}")
-    print(f"{COLOR_CYAN}========================================================================{COLOR_RESET}\n")
+    print(f"{COLOR_CYAN}========================================================================================{COLOR_RESET}\n")
 
     if not fresh_intrusions and not algorithmic_reloads:
         print(f"{COLOR_DIM}[Terminal Silent] No new block sweeps or reloads detected.{COLOR_RESET}\n")
@@ -311,7 +327,9 @@ def scan_institutional_tape(target_date_str):
             jump = row['Points_Jump']
             dir_str = "BULLISH" if row['Rec_Pct_Move'] > 0 else "BEARISH"
             color = COLOR_GREEN if row['Rec_Pct_Move'] > 0 else COLOR_RED
-            print(f"  {color}🚨 [{eval_time_current.strftime('%H:%M')}] {sym:<12} +{jump:<8.1f} points ({dir_str}) LTP: ₹{row['Close']:.2f}{COLOR_RESET}")
+            ltp = row['Close']
+            
+            print(f"  {color}🚨 [{eval_time_current.strftime('%H:%M')}] {sym:<12} +{jump:<7.1f} pts ({dir_str:<7}) | LTP: ₹{ltp:<8.2f}{COLOR_RESET}")
         print("")
 
     # TABLE 2: THE RELOAD TAPE
@@ -322,8 +340,13 @@ def scan_institutional_tape(target_date_str):
             jump = row['Points_Jump']
             dir_str = "BULLISH" if row['Rec_Pct_Move'] > 0 else "BEARISH"
             color = COLOR_GREEN if row['Rec_Pct_Move'] > 0 else COLOR_RED
+            
+            curr_ltp = row['Close']
             first_seen = row['First_Seen']
-            print(f"  {color}🔄 [{eval_time_current.strftime('%H:%M')}] {sym:<12} +{jump:<8.1f} points ({dir_str}) --> (First footprint at {first_seen}){COLOR_RESET}")
+            first_price = row['First_Price']
+            pct_chg = row['Pct_Change_Since_First']
+            
+            print(f"  {color}🔄 [{eval_time_current.strftime('%H:%M')}] {sym:<12} +{jump:<7.1f} pts ({dir_str:<7}) | LTP: ₹{curr_ltp:<8.2f} --> [1st Footprint at {first_seen} @ ₹{first_price:.2f} | {pct_chg:+.2f}%]{COLOR_RESET}")
         print("")
 
 # ==============================================================================
@@ -343,7 +366,6 @@ def run_production_sweep():
     else:
         target_date_str = datetime.strptime(raw_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
     
-    # Ensure Upstox Token exists before running
     if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
         print("❌ Error: UPSTOX_ACCESS_TOKEN not found in environment variables.")
         return
@@ -351,7 +373,6 @@ def run_production_sweep():
     scan_institutional_tape(target_date_str)
 
 if __name__ == "__main__":
-    # Disable warnings for cleaner output
     import warnings
     warnings.filterwarnings("ignore")
     run_production_sweep()
