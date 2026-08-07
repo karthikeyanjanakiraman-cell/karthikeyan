@@ -37,3 +37,5 @@ jobs:
         PARAM_BACKTEST_DATE: ${{ github.event.inputs.backtest_date }}
       run: |
         python System1.py
+        python System.py
+        
