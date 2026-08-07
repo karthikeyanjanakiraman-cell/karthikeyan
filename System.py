@@ -96,35 +96,6 @@ class MultiTimeframeAutoencoder(nn.Module):
         recon_w = self.decoder_weekly(lw)
         return recon_d, recon_w, torch.cat((ld, lw), dim=1)
 
-def train_ai_brain(X_daily, X_weekly, Y_price, Y_time, epochs=15):
-    X_d_tensor = torch.tensor(X_daily)
-    X_w_tensor = torch.tensor(X_weekly)
-    
-    model = MultiTimeframeAutoencoder()
-    optimizer = optim.Adam(model.parameters(), lr=0.002)
-    criterion = nn.MSELoss()
-    
-    model.train()
-    for _ in range(epochs): 
-        optimizer.zero_grad()
-        recon_d, recon_w, _ = model(X_d_tensor, X_w_tensor)
-        loss = criterion(recon_d, X_d_tensor) + criterion(recon_w, X_w_tensor)
-        loss.backward()
-        optimizer.step()
-
-    model.eval()
-    with torch.no_grad():
-        latent_vectors = model.encode(X_d_tensor, X_w_tensor).numpy()
-        
-    xgb_price = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=4).fit(latent_vectors, Y_price)
-    xgb_time = xgb.XGBRegressor(n_estimators=100, learning_rate=0.05, max_depth=4).fit(latent_vectors, Y_time)
-
-    faiss.normalize_L2(latent_vectors)
-    index = faiss.IndexFlatIP(24)
-    index.add(latent_vectors)
-    
-    return model, xgb_price, xgb_time, index
-
 # ==============================================================================
 # 3. LIVE INGESTION & UNIVERSE PACKS
 # ==============================================================================
@@ -164,7 +135,7 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str):
         return None
 
 # ==============================================================================
-# 4. VELOCITY ENGINE: DELTA CALCULATOR
+# 4. TRI-DELTA VELOCITY ENGINE (Independent Percentile Changes)
 # ==============================================================================
 def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15):
     start_of_day = pd.to_datetime(current_eval_time.date()) + pd.Timedelta(hours=9, minutes=15)
@@ -179,30 +150,44 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
     if cum_df.empty or rec_df.empty:
         return pd.DataFrame()
         
-    # Baseline (Morning to 15m ago)
+    # --- BASELINE (Morning up to 15m ago) ---
     g_cum = cum_df.groupby('Symbol').agg({'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'}).reset_index()
     g_cum = g_cum[g_cum['Turnover'] > 0]
     if g_cum.empty: return pd.DataFrame()
-    g_cum['Cum_Score'] = (g_cum['Turnover'].rank(pct=True) * 100 * 
-                          (((g_cum['Close'] - g_cum['Open']) / (g_cum['Open'] + 1e-8)).abs().rank(pct=True) * 100) * 
-                          ((g_cum['Close'] - g_cum['Open']).abs() / (g_cum['abs_move'] + 1e-8)).rank(pct=True) * 100) / 100.0
+    
+    g_cum['Cum_Pct_Move'] = ((g_cum['Close'] - g_cum['Open']) / (g_cum['Open'] + 1e-8)) * 100
+    g_cum['Cum_Efficiency'] = (g_cum['Close'] - g_cum['Open']).abs() / (g_cum['abs_move'] + 1e-8)
+    
+    g_cum['Cum_Vol_Rank'] = g_cum['Turnover'].rank(pct=True) * 100
+    g_cum['Cum_Mom_Rank'] = g_cum['Cum_Pct_Move'].abs().rank(pct=True) * 100
+    g_cum['Cum_Eff_Rank'] = g_cum['Cum_Efficiency'].rank(pct=True) * 100
 
-    # Recent (Last 15m)
+    # --- RECENT (Last 15 minutes) ---
     g_rec = rec_df.groupby('Symbol').agg({'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'}).reset_index()
     g_rec = g_rec[g_rec['Turnover'] > 0]
     if g_rec.empty: return pd.DataFrame()
     
     g_rec['Rec_Pct_Move'] = ((g_rec['Close'] - g_rec['Open']) / (g_rec['Open'] + 1e-8)) * 100
-    g_rec['Rec_Score'] = (g_rec['Turnover'].rank(pct=True) * 100 * 
-                          g_rec['Rec_Pct_Move'].abs().rank(pct=True) * 100 * 
-                          ((g_rec['Close'] - g_rec['Open']).abs() / (g_rec['abs_move'] + 1e-8)).rank(pct=True) * 100) / 100.0
-
-    # Delta
-    merged = pd.merge(g_rec[['Symbol', 'Rec_Score', 'Rec_Pct_Move', 'Close']], g_cum[['Symbol', 'Cum_Score']], on='Symbol', how='inner')
-    merged['Points_Jump'] = merged['Rec_Score'] - merged['Cum_Score']
+    g_rec['Rec_Efficiency'] = (g_rec['Close'] - g_rec['Open']).abs() / (g_rec['abs_move'] + 1e-8)
     
-    # Sort purely by Delta Jump descending and grab Top 10
-    top10 = merged.nlargest(10, 'Points_Jump')
+    g_rec['Rec_Vol_Rank'] = g_rec['Turnover'].rank(pct=True) * 100
+    g_rec['Rec_Mom_Rank'] = g_rec['Rec_Pct_Move'].abs().rank(pct=True) * 100
+    g_rec['Rec_Eff_Rank'] = g_rec['Rec_Efficiency'].rank(pct=True) * 100
+
+    # --- THE TRI-DELTA CALCULATION ---
+    merged = pd.merge(g_rec[['Symbol', 'Rec_Pct_Move', 'Close', 'Rec_Vol_Rank', 'Rec_Mom_Rank', 'Rec_Eff_Rank']], 
+                      g_cum[['Symbol', 'Cum_Vol_Rank', 'Cum_Mom_Rank', 'Cum_Eff_Rank']], on='Symbol', how='inner')
+    
+    # Calculate the raw percentile jump for each metric independently
+    merged['Vol_Delta'] = merged['Rec_Vol_Rank'] - merged['Cum_Vol_Rank']
+    merged['Mom_Delta'] = merged['Rec_Mom_Rank'] - merged['Cum_Mom_Rank']
+    merged['Eff_Delta'] = merged['Rec_Eff_Rank'] - merged['Cum_Eff_Rank']
+    
+    # Total Velocity = The sum of all three percentile jumps (Max 300)
+    merged['Velocity_Jump'] = merged['Vol_Delta'] + merged['Mom_Delta'] + merged['Eff_Delta']
+    
+    # Sort purely by the massive Tri-Delta Jump
+    top10 = merged.nlargest(10, 'Velocity_Jump')
     return top10
 
 # ==============================================================================
@@ -231,7 +216,6 @@ def scan_institutional_tape(target_date_str):
         
     master_df = pd.concat(master_intraday_list, ignore_index=True)
     
-    # Determine Current Evaluation Time
     current_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
     is_live_today = (target_date_str == current_now.strftime("%Y-%m-%d"))
     
@@ -245,7 +229,6 @@ def scan_institutional_tape(target_date_str):
     
     # ----------------------------------------------------------------------
     # SILENTLY BUILD THE MASTER LOG ("THE BURNED LIST") FROM 9:15 AM
-    # Now saving BOTH Time and Exact Price (LTP) of the first footprint
     # ----------------------------------------------------------------------
     historical_burned_list = {}
     last_known_top10 = []
@@ -261,7 +244,6 @@ def scan_institutional_tape(target_date_str):
             for _, row in historical_top10.iterrows():
                 sym = row['Symbol']
                 if sym not in historical_burned_list:
-                    # Save the snapshot!
                     historical_burned_list[sym] = {
                         'time': t.strftime('%H:%M'),
                         'price': row['Close']
@@ -285,17 +267,16 @@ def scan_institutional_tape(target_date_str):
     for _, row in curr_top10.iterrows():
         sym = row['Symbol']
         
-        # 1. Is it just stale momentum from 5 minutes ago? (Ignore completely)
+        # 1. Stale Momentum?
         if sym in last_known_top10:
             continue
             
-        # 2. Is it a Reload? (It's on the Burned List from earlier today)
+        # 2. Reload?
         elif sym in historical_burned_list:
             first_time = historical_burned_list[sym]['time']
             first_price = historical_burned_list[sym]['price']
             current_price = row['Close']
             
-            # Calculate the drift from the original institutional buy price
             pct_change = ((current_price - first_price) / first_price) * 100
             
             row['First_Seen'] = first_time
@@ -304,16 +285,16 @@ def scan_institutional_tape(target_date_str):
             
             algorithmic_reloads.append(row)
             
-        # 3. Is it a Virgin Alert? (Never seen today)
+        # 3. Virgin Alert?
         else:
             fresh_intrusions.append(row)
 
     # ----------------------------------------------------------------------
-    # TERMINAL OUTPUT: TWO CLEAN TABLES
+    # TERMINAL OUTPUT
     # ----------------------------------------------------------------------
-    print(f"\n{COLOR_CYAN}========================================================================================{COLOR_RESET}")
-    print(f"{COLOR_BOLD}LIVE INSTITUTIONAL TAPE | TIME: {eval_time_current.strftime('%H:%M')} IST{COLOR_RESET}")
-    print(f"{COLOR_CYAN}========================================================================================{COLOR_RESET}\n")
+    print(f"\n{COLOR_CYAN}================================================================================================{COLOR_RESET}")
+    print(f"{COLOR_BOLD}LIVE INSTITUTIONAL TAPE (TRI-DELTA) | TIME: {eval_time_current.strftime('%H:%M')} IST{COLOR_RESET}")
+    print(f"{COLOR_CYAN}================================================================================================{COLOR_RESET}\n")
 
     if not fresh_intrusions and not algorithmic_reloads:
         print(f"{COLOR_DIM}[Terminal Silent] No new block sweeps or reloads detected.{COLOR_RESET}\n")
@@ -324,12 +305,16 @@ def scan_institutional_tape(target_date_str):
         print(f"{COLOR_BOLD}⚡ FRESH INTRUSIONS (First Time Today since 09:15){COLOR_RESET}")
         for row in fresh_intrusions:
             sym = row['Symbol']
-            jump = row['Points_Jump']
+            jump = row['Velocity_Jump']
             dir_str = "BULLISH" if row['Rec_Pct_Move'] > 0 else "BEARISH"
             color = COLOR_GREEN if row['Rec_Pct_Move'] > 0 else COLOR_RED
             ltp = row['Close']
             
-            print(f"  {color}🚨 [{eval_time_current.strftime('%H:%M')}] {sym:<12} +{jump:<7.1f} pts ({dir_str:<7}) | LTP: ₹{ltp:<8.2f}{COLOR_RESET}")
+            # The Tri-Delta Breakdown (Volume, Momentum, Efficiency)
+            v_del, m_del, e_del = row['Vol_Delta'], row['Mom_Delta'], row['Eff_Delta']
+            delta_str = f"[V:{v_del:+.0f} M:{m_del:+.0f} E:{e_del:+.0f}]"
+            
+            print(f"  {color}🚨 [{eval_time_current.strftime('%H:%M')}] {sym:<12} +{jump:<5.0f} pts {delta_str:<20} ({dir_str:<7}) | LTP: ₹{ltp:<8.2f}{COLOR_RESET}")
         print("")
 
     # TABLE 2: THE RELOAD TAPE
@@ -337,16 +322,19 @@ def scan_institutional_tape(target_date_str):
         print(f"{COLOR_BOLD}🔄 ALGORITHMIC RELOADS (Second Waves){COLOR_RESET}")
         for row in algorithmic_reloads:
             sym = row['Symbol']
-            jump = row['Points_Jump']
+            jump = row['Velocity_Jump']
             dir_str = "BULLISH" if row['Rec_Pct_Move'] > 0 else "BEARISH"
             color = COLOR_GREEN if row['Rec_Pct_Move'] > 0 else COLOR_RED
+            
+            v_del, m_del, e_del = row['Vol_Delta'], row['Mom_Delta'], row['Eff_Delta']
+            delta_str = f"[V:{v_del:+.0f} M:{m_del:+.0f} E:{e_del:+.0f}]"
             
             curr_ltp = row['Close']
             first_seen = row['First_Seen']
             first_price = row['First_Price']
             pct_chg = row['Pct_Change_Since_First']
             
-            print(f"  {color}🔄 [{eval_time_current.strftime('%H:%M')}] {sym:<12} +{jump:<7.1f} pts ({dir_str:<7}) | LTP: ₹{curr_ltp:<8.2f} --> [1st Footprint at {first_seen} @ ₹{first_price:.2f} | {pct_chg:+.2f}%]{COLOR_RESET}")
+            print(f"  {color}🔄 [{eval_time_current.strftime('%H:%M')}] {sym:<12} +{jump:<5.0f} pts {delta_str:<20} ({dir_str:<7}) | LTP: ₹{curr_ltp:<8.2f} --> [1st Footprint at {first_seen} @ ₹{first_price:.2f} | {pct_chg:+.2f}%]{COLOR_RESET}")
         print("")
 
 # ==============================================================================
@@ -376,3 +364,4 @@ if __name__ == "__main__":
     import warnings
     warnings.filterwarnings("ignore")
     run_production_sweep()
+
