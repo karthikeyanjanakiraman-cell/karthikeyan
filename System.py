@@ -284,7 +284,7 @@ def scan_discrete_hourly_turnover(target_date_str):
         (target_dt + pd.Timedelta(hours=15, minutes=15), target_dt + pd.Timedelta(hours=15, minutes=30), "15:15 - 15:30")
     ]
     
-    print(f"📡 Downloading intraday data for {len(universe)} stocks...")
+    print(f"📡 Downloading intraday data for {len(universe)} stocks... (Respecting API limits)")
     
     master_intraday_list = []
     for item in universe:
@@ -294,6 +294,9 @@ def scan_discrete_hourly_turnover(target_date_str):
             df['Turnover'] = df['Volume'] * df['Close']
             df['abs_move'] = (df['Close'] - df['Open']).abs()
             master_intraday_list.append(df)
+            
+        # VERY IMPORTANT: Small delay to prevent Upstox from blocking you for hitting rate limits
+        time.sleep(0.05) 
             
     if not master_intraday_list:
         print("⚠️ Warning: No valid intraday market volume found yet.")
@@ -364,9 +367,16 @@ def scan_discrete_hourly_turnover(target_date_str):
         
         merged['Acceleration_Delta'] = merged['Discrete_Power'] - merged['Cumulative_Power']
         
-        # Select Top 5 by highest acceleration delta
-        top5 = merged.nlargest(5, 'Acceleration_Delta')
+        # --- NEW LOGIC: THE FIRST HOUR FIX ---
+        if base_label == "09:15 - 10:15":
+            top5 = merged.nlargest(5, 'Discrete_Power')
+        else:
+            top5 = merged.nlargest(5, 'Acceleration_Delta')
+            
+        # --- NEW LOGIC: 'SLEEPER WAKES UP' ALERT (The BIOCON Setup) ---
+        sleepers = merged[(merged['Cumulative_Power'] < 100) & (merged['Discrete_Power'] > 5000)]
         
+        # --- PRINTING THE TABLES ---
         print(f"\n⏰ DISCRETE WINDOW: {label} IST")
         print(f"{'Rank':<5} {'Symbol':<15} {'Accel Delta':<14} | {'Discrete Power':<15} | {'Cumulative Power':<16} | {'% Move':<8} {'LTP (₹)':<10}")
         print("-" * 145)
@@ -375,6 +385,15 @@ def scan_discrete_hourly_turnover(target_date_str):
             move_sign = "+" if row['Pct_Move'] > 0 else ""
             delta_sign = "+" if row['Acceleration_Delta'] > 0 else ""
             print(f"{rank:<5} {row['Symbol']:<15} {delta_sign}{row['Acceleration_Delta']:<12.1f} | {row['Discrete_Power']:>13.1f}   | {row['Cumulative_Power']:>14.1f}   | {move_sign}{row['Pct_Move']:<6.2f}%   ₹{row['Close']:<10.2f}")
+
+        # Print the Sleeper Alert if any are found
+        if not sleepers.empty and base_label != "09:15 - 10:15":
+            print("\n🚨 🚨 🚨 INSTITUTIONAL WAKE-UP ALERT DETECTED 🚨 🚨 🚨")
+            for _, sleeper in sleepers.iterrows():
+                move_dir = "BULLISH BREAKOUT" if sleeper['Pct_Move'] > 0 else "BEARISH BREAKDOWN"
+                print(f"   => {sleeper['Symbol']} is suddenly moving! ({move_dir})")
+                print(f"      Cumulative Power was: {sleeper['Cumulative_Power']:.1f} | Discrete Power is now: {sleeper['Discrete_Power']:.1f}")
+            print("🚨 🚨 🚨 ------------------------------------ 🚨 🚨 🚨\n")
 
         if is_active_live:
             break
@@ -411,14 +430,13 @@ def run_production_sweep():
         if nifty_file: break
 
     if not nifty_file:
-        print("❌ Critical Error: No Nifty data sets located.")
-        return
-
-    print(f"\n🧠 TRAINING PHASE 1: Processing Macro System on {nifty_file}...")
-    X_d_nifty, X_w_nifty, Y_np, Y_nt = load_training_data(nifty_file, target_date_str, min_pct=0.75, max_pct=5.0, max_dd=0.5, wick_ratio=0.5)
-    
-    if X_d_nifty is not None and len(X_d_nifty) > 0:
-        nifty_brain, nifty_xgb_p, nifty_xgb_t, nifty_faiss = train_ai_brain(X_d_nifty, X_w_nifty, Y_np, Y_nt)
+        print("⚠️ Warning: No Nifty data sets located for AI Training phase. Bypassing ML Engine.")
+    else:
+        print(f"\n🧠 TRAINING PHASE 1: Processing Macro System on {nifty_file}...")
+        X_d_nifty, X_w_nifty, Y_np, Y_nt = load_training_data(nifty_file, target_date_str, min_pct=0.75, max_pct=5.0, max_dd=0.5, wick_ratio=0.5)
+        
+        if X_d_nifty is not None and len(X_d_nifty) > 0:
+            nifty_brain, nifty_xgb_p, nifty_xgb_t, nifty_faiss = train_ai_brain(X_d_nifty, X_w_nifty, Y_np, Y_nt)
     
     scan_discrete_hourly_turnover(target_date_str)
 
