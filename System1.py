@@ -20,11 +20,9 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str=None, is_live=
     
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
     
-    # If LIVE, hit the intraday cache which always holds the most recent session
     if is_live:
         url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key)}/1minute"
     else:
-        # If BACKTEST, hit the historical endpoint with a 3-day window
         target_dt = pd.to_datetime(target_date_str)
         from_date_str = (target_dt - timedelta(days=3)).strftime("%Y-%m-%d")
         url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{target_date_str}/{from_date_str}"
@@ -39,11 +37,9 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str=None, is_live=
             return None
             
         c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
-        # Universally safe timezone strip to keep local IST wall time
         c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).apply(lambda x: x.replace(tzinfo=None))
         c_df = c_df.sort_values('Datetime').reset_index(drop=True)
         
-        # Isolate exactly the date requested if historical
         if not is_live and target_date_str:
             c_df = c_df[c_df['Datetime'].dt.strftime('%Y-%m-%d') == target_date_str].reset_index(drop=True)
             
@@ -52,64 +48,49 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str=None, is_live=
         return None
 
 def get_options_universe(target_date_str, is_live):
-    print(f"📡 Building Options Universe (+/- 5 Strikes) from Broker API...")
+    print(f"📡 Building Options Universe (+/- 5 Strikes)...")
     
-    master_data = []
-    for url in ["https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz", 
-                "https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz"]:
-        try:
-            resp = requests.get(url, timeout=5)
-            if resp.status_code == 200:
-                data = json.load(gzip.GzipFile(fileobj=io.BytesIO(resp.content)))
-                master_data.extend(data)
-        except Exception as e:
-            print(f"⚠️ Error fetching master JSON: {e}")
-            
-    df_inst = pd.DataFrame(master_data)
-    if df_inst.empty:
-        print("⚠️ Failed to load broker instrument list.")
-        return []
-        
-    # Safely detect the exact column name Upstox is using for strike prices
-    strike_col = 'strike_price' if 'strike_price' in df_inst.columns else 'strike' if 'strike' in df_inst.columns else None
-    if strike_col:
-        df_inst[strike_col] = pd.to_numeric(df_inst[strike_col], errors='coerce')
-    else:
-        print("⚠️ Critical API Change: Strike price column missing from broker JSON.")
-        return []
-        
-    # Safely detect trading symbol column
-    ts_col = 'trading_symbol' if 'trading_symbol' in df_inst.columns else 'tradingsymbol' if 'tradingsymbol' in df_inst.columns else None
-    if not ts_col:
-        print("⚠️ Critical API Change: Trading symbol column missing from broker JSON.")
-        return []
-    
-    # Parse expiries safely
-    if 'expiry' in df_inst.columns:
-        df_inst['expiry_dt'] = pd.to_datetime(df_inst['expiry'], unit='ms', errors='coerce')
-        mask = df_inst['expiry_dt'].isna()
-        if mask.any():
-            df_inst.loc[mask, 'expiry_dt'] = pd.to_datetime(df_inst.loc[mask, 'expiry'], errors='coerce')
-    else:
-        print("⚠️ Critical API Change: 'expiry' column missing from broker JSON.")
-        return []
-
-    # Filter strictly to Options
-    if 'instrument_type' in df_inst.columns:
-        df_opt = df_inst[df_inst['instrument_type'] == 'OPTIDX'].copy()
-    else:
-        df_opt = df_inst.copy()
-
     indices_config = {
-        "NIFTY": {"key": "NSE_INDEX|Nifty 50", "step": 50},
-        "BANKNIFTY": {"key": "NSE_INDEX|Nifty Bank", "step": 100},
-        "SENSEX": {"key": "BSE_INDEX|SENSEX", "step": 100}
+        "NIFTY": {"key": "NSE_INDEX|Nifty 50", "step": 50, "exch": "NSE_FO"},
+        "BANKNIFTY": {"key": "NSE_INDEX|Nifty Bank", "step": 100, "exch": "NSE_FO"},
+        "SENSEX": {"key": "BSE_INDEX|SENSEX", "step": 100, "exch": "BSE_FO"}
     }
+    
+    df_inst = pd.DataFrame()
+    strike_col, ts_col = None, None
+    
+    # If LIVE, fetch from broker JSON master
+    if is_live:
+        master_data = []
+        for url in ["https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz", 
+                    "https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz"]:
+            try:
+                resp = requests.get(url, timeout=5)
+                if resp.status_code == 200:
+                    data = json.load(gzip.GzipFile(fileobj=io.BytesIO(resp.content)))
+                    master_data.extend(data)
+            except Exception as e:
+                print(f"⚠️ Error fetching master JSON: {e}")
+                
+        df_inst = pd.DataFrame(master_data)
+        
+        if not df_inst.empty:
+            strike_col = 'strike_price' if 'strike_price' in df_inst.columns else 'strike' if 'strike' in df_inst.columns else None
+            ts_col = 'trading_symbol' if 'trading_symbol' in df_inst.columns else 'tradingsymbol' if 'tradingsymbol' in df_inst.columns else None
+            
+            if strike_col:
+                df_inst[strike_col] = pd.to_numeric(df_inst[strike_col], errors='coerce')
+                
+            if 'expiry' in df_inst.columns:
+                df_inst['expiry_dt'] = pd.to_datetime(df_inst['expiry'], unit='ms', errors='coerce')
+                mask = df_inst['expiry_dt'].isna()
+                if mask.any():
+                    df_inst.loc[mask, 'expiry_dt'] = pd.to_datetime(df_inst.loc[mask, 'expiry'], errors='coerce')
     
     final_universe = []
     
     for idx_name, info in indices_config.items():
-        # Step 1: Spot Price Check using explicitly propagated live/backtest mode
+        # Step 1: Get Spot Price
         spot_df = fetch_upstox_intraday_candles(info["key"], target_date_str, is_live)
         if spot_df is None or spot_df.empty:
             print(f"⚠️ Warning: Could not fetch Spot price for {idx_name}. Skipping.")
@@ -122,39 +103,41 @@ def get_options_universe(target_date_str, is_live):
         atm_strike = round(latest_spot / step) * step
         target_strikes = [atm_strike + (i * step) for i in range(-5, 6)]
         
-        # Step 3: Match the Symbol securely
-        match_condition = df_opt[ts_col].astype(str).str.upper().str.startswith(idx_name)
-        idx_opts = df_opt[match_condition].copy()
-        
-        # Remove junk/futures by strictly enforcing a strike > 0
-        idx_opts = idx_opts[idx_opts[strike_col] > 0]
-        
-        if idx_opts.empty:
-            print(f"⚠️ Warning: Found 0 option contracts starting with '{idx_name}'. Skipping.")
-            continue
-        
-        # Step 4: Expiry Matching
-        valid_expiries = idx_opts['expiry_dt'].dropna().unique()
-        if not len(valid_expiries):
-            print(f"⚠️ Warning: Found {idx_name} options, but 0 valid expiries parsed. Skipping.")
-            continue
+        # Step 3: Parse Expiries & Build Universe
+        if is_live and not df_inst.empty and strike_col and ts_col and 'expiry_dt' in df_inst.columns:
             
-        closest_expiry = min(valid_expiries)
-        
-        # Step 5: Strike Matching
-        filtered_opts = idx_opts[(idx_opts['expiry_dt'] == closest_expiry) & (idx_opts[strike_col].isin(target_strikes))]
-        
-        if filtered_opts.empty:
-            print(f"⚠️ Warning: Found {idx_name} options, but 0 matched our 11 strikes for {closest_expiry.strftime('%Y-%m-%d')}.")
-            continue
+            # Match directly on the trading symbol prefix and strictly enforce strike > 0 (Immune to broker tag changes)
+            match_condition = df_inst[ts_col].astype(str).str.upper().str.startswith(idx_name)
+            idx_opts = df_inst[match_condition & (df_inst[strike_col] > 0)].copy()
             
-        print(f"🔍 {idx_name} -> Spot: {latest_spot:.2f} | ATM: {atm_strike} | Found {len(filtered_opts)} CE/PE contracts for {closest_expiry.strftime('%Y-%m-%d')}.")
-        
-        for _, row in filtered_opts.iterrows():
-            final_universe.append({
-                "symbol": row[ts_col],
-                "key": row['instrument_key']
-            })
+            if idx_opts.empty:
+                print(f"⚠️ Warning: Found 0 valid options starting with '{idx_name}'. Skipping.")
+                continue
+                
+            valid_expiries = idx_opts['expiry_dt'].dropna().unique()
+            if not len(valid_expiries): 
+                continue
+                
+            closest_expiry = min(valid_expiries)
+            
+            filtered_opts = idx_opts[(idx_opts['expiry_dt'] == closest_expiry) & (idx_opts[strike_col].isin(target_strikes))]
+            print(f"🔍 [LIVE] {idx_name} -> Spot: {latest_spot:.2f} | ATM: {atm_strike} | Found {len(filtered_opts)} contracts.")
+            
+            for _, row in filtered_opts.iterrows():
+                final_universe.append({"symbol": row[ts_col], "key": row['instrument_key']})
+        else:
+            # BACKTEST FALLBACK: Synthesize Option Keys Directly (Bypasses Upstox auto-purging old contracts)
+            target_dt = pd.to_datetime(target_date_str)
+            date_str_code = target_dt.strftime("%y%b").upper() # e.g. 26AUG
+            
+            count = 0
+            for strike in target_strikes:
+                for opt_type in ["CE", "PE"]:
+                    sym = f"{idx_name}{date_str_code}{int(strike)}{opt_type}"
+                    key = f"{info['exch']}|{sym}"
+                    final_universe.append({"symbol": sym, "key": key})
+                    count += 1
+            print(f"🔍 [BACKTEST SYNTHESIS] {idx_name} -> Spot: {latest_spot:.2f} | ATM: {atm_strike} | Synthesized {count} contracts.")
             
     return final_universe
 
@@ -162,10 +145,7 @@ def get_options_universe(target_date_str, is_live):
 # 2. CONFLUENCE LEADERS SCANNER (Options Only: Cumulative × Discrete)
 # ==============================================================================
 def scan_discrete_hourly_turnover(target_date_str, is_live):
-    
-    # ---------------------------------------------------------
-    # SELF-SYNC PROBE (Avoids midnight and system clock bugs)
-    # ---------------------------------------------------------
+    # SELF-SYNC PROBE (Avoids midnight API delay bug)
     if is_live:
         print("🔍 Probing API to synchronize with actual market reality...")
         probe_df = fetch_upstox_intraday_candles("NSE_INDEX|Nifty 50", is_live=True)
@@ -173,7 +153,6 @@ def scan_discrete_hourly_turnover(target_date_str, is_live):
             print("⚠️ SYSTEM HALT: Upstox API returned no data for Nifty 50. Network might be down.")
             return
         
-        # Explicitly extract whatever date the broker's live cache currently holds
         real_market_date_obj = probe_df['Datetime'].max().date()
         target_date_str = real_market_date_obj.strftime("%Y-%m-%d")
         print(f"✅ Real Market Date Locked: {target_date_str}\n")
@@ -195,7 +174,7 @@ def scan_discrete_hourly_turnover(target_date_str, is_live):
             master_intraday_list.append(df)
             
     if not master_intraday_list:
-        print("⚠️ Warning: Pulled the contracts, but Upstox returned 0 intraday volume for them.")
+        print("⚠️ Warning: Pulled contracts, but Upstox returned 0 intraday volume (Historical options may be expired/purged).")
         return
         
     master_df = pd.concat(master_intraday_list, ignore_index=True)
@@ -204,8 +183,6 @@ def scan_discrete_hourly_turnover(target_date_str, is_live):
     start_of_day = real_market_date + pd.Timedelta(hours=9, minutes=15)
     
     current_now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    
-    # If the real market data is literally from today's date, we treat it as an active live session
     is_live_today = (real_market_date.date() == current_now_ist.date())
 
     windows = [
@@ -223,14 +200,12 @@ def scan_discrete_hourly_turnover(target_date_str, is_live):
     print("="*155)
     
     for start_time, end_time, base_label in windows:
-        # If it's a live session and we haven't reached this window's start time yet, stop.
         if is_live_today and current_now_ist < start_time:
             break
             
         is_active_live = False
         label = base_label
         
-        # If we are currently inside this window, cap the end time to 'now'
         if is_live_today and start_time <= current_now_ist < end_time:
             is_active_live = True
             end_time = current_now_ist
@@ -264,6 +239,9 @@ def scan_discrete_hourly_turnover(target_date_str, is_live):
         }).reset_index()
         grouped_cum = grouped_cum[grouped_cum['Turnover'] > 0]
         
+        if grouped_cum.empty:
+            continue
+            
         grouped_cum['Cum_Turnover_PR'] = grouped_cum['Turnover'].rank(pct=True) * 100
         grouped_cum['Cum_Pct_Move'] = ((grouped_cum['Close'] - grouped_cum['Open']) / grouped_cum['Open']) * 100
         grouped_cum['Cum_Momentum_PR'] = grouped_cum['Cum_Pct_Move'].abs().rank(pct=True) * 100
@@ -276,6 +254,9 @@ def scan_discrete_hourly_turnover(target_date_str, is_live):
                           grouped_cum[['Symbol', 'Cumulative_Power']], 
                           on='Symbol', how='inner')
         
+        if merged.empty:
+            continue
+            
         merged['Combined_Power'] = (merged['Discrete_Power'] * merged['Cumulative_Power']) / 10000.0
         top5 = merged.nlargest(5, 'Combined_Power')
         
