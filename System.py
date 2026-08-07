@@ -21,7 +21,16 @@ import faiss
 import xgboost as xgb
 
 # ==============================================================================
-# 0. EQUI-PERCENTILE EQUATING
+# 0. TERMINAL COLOR CODES (For Intrusion Highlighting)
+# ==============================================================================
+COLOR_GREEN = '\033[92m'
+COLOR_RED = '\033[91m'
+COLOR_RESET = '\033[0m'
+COLOR_BOLD = '\033[1m'
+COLOR_DIM = '\033[2m'
+
+# ==============================================================================
+# 1. EQUI-PERCENTILE EQUATING
 # ==============================================================================
 def convert_to_equi_percentile(raw_matrix):
     ranks = np.argsort(np.argsort(raw_matrix, axis=0), axis=0)
@@ -29,7 +38,7 @@ def convert_to_equi_percentile(raw_matrix):
     return percentile_matrix
 
 # ==============================================================================
-# 1. DUAL-INPUT TEMPORAL AUTOENCODER (The Siamese Multi-Timeframe Brain)
+# 2. DUAL-INPUT TEMPORAL AUTOENCODER (The Siamese Multi-Timeframe Brain)
 # ==============================================================================
 class MultiTimeframeAutoencoder(nn.Module):
     def __init__(self, num_features=5, latent_dim_daily=12, latent_dim_weekly=12):
@@ -89,7 +98,7 @@ class MultiTimeframeAutoencoder(nn.Module):
         return recon_d, recon_w, torch.cat((ld, lw), dim=1)
 
 # ==============================================================================
-# 2. ALIGNED DUAL-TIMEFRAME TRAINING DATA LOADER
+# 3. ALIGNED DUAL-TIMEFRAME TRAINING DATA LOADER
 # ==============================================================================
 def read_and_standardize_csv(filename):
     if not os.path.exists(filename): return None
@@ -214,7 +223,7 @@ def train_ai_brain(X_daily, X_weekly, Y_price, Y_time, epochs=15):
     return model, xgb_price, xgb_time, index
 
 # ==============================================================================
-# 3. LIVE INGESTION & UNIVERSE PACKS
+# 4. LIVE INGESTION & UNIVERSE PACKS
 # ==============================================================================
 def get_dynamic_fno_universe():
     nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
@@ -258,34 +267,62 @@ def fetch_upstox_intraday_candles(instrument_key, target_date_str):
         return None
 
 # ==============================================================================
-# 4. ACCELERATION DELTA SCANNER (Discrete Hourly vs. Cumulative Session)
+# 5. CONTINUOUS ROLLING VELOCITY LEADERBOARD (Delta Jump / Intrusion Scanner)
 # ==============================================================================
-def scan_discrete_hourly_turnover(target_date_str):
-    print(f"\n⏳ Initializing Acceleration Delta Scanner for {target_date_str}...")
+def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15):
+    start_of_day = pd.to_datetime(current_eval_time.date()) + pd.Timedelta(hours=9, minutes=15)
+    recent_start = current_eval_time - pd.Timedelta(minutes=window_mins)
+    
+    # If we are too close to market open, fallback gracefully
+    if recent_start <= start_of_day:
+        return pd.DataFrame()
+        
+    cum_df = master_df[(master_df['Datetime'] >= start_of_day) & (master_df['Datetime'] < recent_start)]
+    rec_df = master_df[(master_df['Datetime'] >= recent_start) & (master_df['Datetime'] <= current_eval_time)]
+    
+    if cum_df.empty or rec_df.empty:
+        return pd.DataFrame()
+        
+    # --- BASELINE SCORE (Morning up to 15 mins ago) ---
+    g_cum = cum_df.groupby('Symbol').agg({'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'}).reset_index()
+    g_cum = g_cum[g_cum['Turnover'] > 0]
+    if g_cum.empty: return pd.DataFrame()
+    
+    g_cum['Cum_Turnover_PR'] = g_cum['Turnover'].rank(pct=True) * 100
+    g_cum['Cum_Pct_Move'] = ((g_cum['Close'] - g_cum['Open']) / (g_cum['Open'] + 1e-8)) * 100
+    g_cum['Cum_Momentum_PR'] = g_cum['Cum_Pct_Move'].abs().rank(pct=True) * 100
+    g_cum['Cum_Efficiency'] = (g_cum['Close'] - g_cum['Open']).abs() / (g_cum['abs_move'] + 1e-8)
+    g_cum['Cum_Hurst_PR'] = g_cum['Cum_Efficiency'].rank(pct=True) * 100
+    g_cum['Cum_Score'] = (g_cum['Cum_Turnover_PR'] * g_cum['Cum_Momentum_PR'] * g_cum['Cum_Hurst_PR']) / 100.0
+
+    # --- RECENT SCORE (Last 15 minutes) ---
+    g_rec = rec_df.groupby('Symbol').agg({'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'}).reset_index()
+    g_rec = g_rec[g_rec['Turnover'] > 0]
+    if g_rec.empty: return pd.DataFrame()
+    
+    g_rec['Rec_Turnover_PR'] = g_rec['Turnover'].rank(pct=True) * 100
+    g_rec['Rec_Pct_Move'] = ((g_rec['Close'] - g_rec['Open']) / (g_rec['Open'] + 1e-8)) * 100
+    g_rec['Rec_Momentum_PR'] = g_rec['Rec_Pct_Move'].abs().rank(pct=True) * 100
+    g_rec['Rec_Efficiency'] = (g_rec['Close'] - g_rec['Open']).abs() / (g_rec['abs_move'] + 1e-8)
+    g_rec['Rec_Hurst_PR'] = g_rec['Rec_Efficiency'].rank(pct=True) * 100
+    g_rec['Rec_Score'] = (g_rec['Rec_Turnover_PR'] * g_rec['Rec_Momentum_PR'] * g_rec['Rec_Hurst_PR']) / 100.0
+
+    # --- THE DELTA JUMP ("Points gone up") ---
+    merged = pd.merge(g_rec[['Symbol', 'Rec_Score', 'Rec_Pct_Move', 'Close']], g_cum[['Symbol', 'Cum_Score']], on='Symbol', how='inner')
+    merged['Points_Jump'] = merged['Rec_Score'] - merged['Cum_Score']
+    
+    # Sort strictly by Delta Jump descending and grab Top 10
+    top10 = merged.nlargest(10, 'Points_Jump')
+    return top10
+
+def scan_live_rolling_leaderboard(target_date_str):
+    print(f"\n⏳ Initializing Live Rolling Velocity Radar for {target_date_str}...")
     universe = get_dynamic_fno_universe()
     if not universe:
         print("⚠️ No F&O universe found. Please check Upstox API.")
         return
         
-    target_dt = pd.to_datetime(target_date_str)
-    start_of_day = target_dt + pd.Timedelta(hours=9, minutes=15)
-    
-    # STRICT IST CLOCK ENFORCEMENT
-    current_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    is_live_today = (target_date_str == current_now.strftime("%Y-%m-%d"))
-
-    windows = [
-        (target_dt + pd.Timedelta(hours=9, minutes=15), target_dt + pd.Timedelta(hours=10, minutes=15), "09:15 - 10:15"),
-        (target_dt + pd.Timedelta(hours=10, minutes=15), target_dt + pd.Timedelta(hours=11, minutes=15), "10:15 - 11:15"),
-        (target_dt + pd.Timedelta(hours=11, minutes=15), target_dt + pd.Timedelta(hours=12, minutes=15), "11:15 - 12:15"),
-        (target_dt + pd.Timedelta(hours=12, minutes=15), target_dt + pd.Timedelta(hours=13, minutes=15), "12:15 - 13:15"),
-        (target_dt + pd.Timedelta(hours=13, minutes=15), target_dt + pd.Timedelta(hours=14, minutes=15), "13:15 - 14:15"),
-        (target_dt + pd.Timedelta(hours=14, minutes=15), target_dt + pd.Timedelta(hours=15, minutes=15), "14:15 - 15:15"),
-        (target_dt + pd.Timedelta(hours=15, minutes=15), target_dt + pd.Timedelta(hours=15, minutes=30), "15:15 - 15:30")
-    ]
-    
-    print(f"📡 Downloading intraday data for {len(universe)} stocks... (Respecting API limits)")
-    
+    print(f"📡 Downloading active data for {len(universe)} stocks... (Respecting API limits)")
     master_intraday_list = []
     for item in universe:
         df = fetch_upstox_intraday_candles(item['key'], target_date_str)
@@ -294,8 +331,6 @@ def scan_discrete_hourly_turnover(target_date_str):
             df['Turnover'] = df['Volume'] * df['Close']
             df['abs_move'] = (df['Close'] - df['Open']).abs()
             master_intraday_list.append(df)
-            
-        # VERY IMPORTANT: Small delay to prevent Upstox from blocking you for hitting rate limits
         time.sleep(0.05) 
             
     if not master_intraday_list:
@@ -304,95 +339,62 @@ def scan_discrete_hourly_turnover(target_date_str):
         
     master_df = pd.concat(master_intraday_list, ignore_index=True)
     
-    print("\n" + "="*80)
-    print(f"🔥 SCANNING FOR INSTITUTIONAL WAKE-UP ALERTS | DATE: {target_date_str}")
-    print("="*80)
+    # Define "Now" (If backtesting, simulate as End of Day. If Live, use actual IST time)
+    current_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    is_live_today = (target_date_str == current_now.strftime("%Y-%m-%d"))
     
-    for start_time, end_time, base_label in windows:
-        if is_live_today and current_now < start_time:
-            break
-            
-        is_active_live = False
-        label = base_label
-        
-        if is_live_today and start_time <= current_now < end_time:
-            is_active_live = True
-            end_time = current_now
-            label = f"{start_time.strftime('%H:%M')} - {current_now.strftime('%H:%M')} (LIVE ONGOING)"
-            
-        # 1. ISOLATED DISCRETE WINDOW DATA
-        df_discrete = master_df[(master_df['Datetime'] >= start_time) & (master_df['Datetime'] < end_time)]
-        # 2. CUMULATIVE SESSION DATA (From 09:15 up to current window end)
-        df_cumulative = master_df[(master_df['Datetime'] >= start_of_day) & (master_df['Datetime'] < end_time)]
-        
-        if df_discrete.empty or df_cumulative.empty: 
-            if is_active_live: break
-            continue
-            
-        # --- COMPUTE DISCRETE SCORES ---
-        grouped_disc = df_discrete.groupby('Symbol').agg({
-            'Turnover': 'sum', 'Volume': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'
-        }).reset_index()
-        grouped_disc = grouped_disc[grouped_disc['Turnover'] > 0]
-        if grouped_disc.empty: 
-            if is_active_live: break
-            continue
-            
-        grouped_disc['Turnover_PR'] = grouped_disc['Turnover'].rank(pct=True) * 100
-        grouped_disc['Pct_Move'] = ((grouped_disc['Close'] - grouped_disc['Open']) / grouped_disc['Open']) * 100
-        grouped_disc['Momentum_PR'] = grouped_disc['Pct_Move'].abs().rank(pct=True) * 100
-        grouped_disc['Net_Disp'] = (grouped_disc['Close'] - grouped_disc['Open']).abs()
-        grouped_disc['Efficiency'] = grouped_disc['Net_Disp'] / (grouped_disc['abs_move'] + 1e-8)
-        grouped_disc['Hurst_PR'] = grouped_disc['Efficiency'].rank(pct=True) * 100
-        grouped_disc['Discrete_Power'] = (grouped_disc['Turnover_PR'] * grouped_disc['Momentum_PR'] * grouped_disc['Hurst_PR']) / 100.0
+    if not is_live_today or current_now.hour >= 16:
+        target_dt = pd.to_datetime(target_date_str)
+        eval_time_current = target_dt + pd.Timedelta(hours=15, minutes=15) # Market Close Backtest
+    else:
+        eval_time_current = current_now
 
-        # --- COMPUTE CUMULATIVE SCORES ---
-        grouped_cum = df_cumulative.groupby('Symbol').agg({
-            'Turnover': 'sum', 'Volume': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'
-        }).reset_index()
-        grouped_cum = grouped_cum[grouped_cum['Turnover'] > 0]
-        
-        grouped_cum['Cum_Turnover_PR'] = grouped_cum['Turnover'].rank(pct=True) * 100
-        grouped_cum['Cum_Pct_Move'] = ((grouped_cum['Close'] - grouped_cum['Open']) / grouped_cum['Open']) * 100
-        grouped_cum['Cum_Momentum_PR'] = grouped_cum['Cum_Pct_Move'].abs().rank(pct=True) * 100
-        grouped_cum['Cum_Net_Disp'] = (grouped_cum['Close'] - grouped_cum['Open']).abs()
-        grouped_cum['Cum_Efficiency'] = grouped_cum['Cum_Net_Disp'] / (grouped_cum['abs_move'] + 1e-8)
-        grouped_cum['Cum_Hurst_PR'] = grouped_cum['Cum_Efficiency'].rank(pct=True) * 100
-        grouped_cum['Cumulative_Power'] = (grouped_cum['Cum_Turnover_PR'] * grouped_cum['Cum_Momentum_PR'] * grouped_cum['Cum_Hurst_PR']) / 100.0
+    # We simulate a "memory" by taking a snapshot 5 minutes prior to track "Intruders"
+    eval_time_previous = eval_time_current - pd.Timedelta(minutes=5)
+    
+    prev_top10 = calculate_velocity_leaderboard(master_df, eval_time_previous, window_mins=15)
+    curr_top10 = calculate_velocity_leaderboard(master_df, eval_time_current, window_mins=15)
+    
+    if curr_top10.empty:
+        print("⚠️ Not enough data collected today to form a leaderboard (Need > 15 mins of live action).")
+        return
 
-        # --- MERGE AND CALCULATE ACCELERATION DELTA ---
-        merged = pd.merge(grouped_disc[['Symbol', 'Discrete_Power', 'Pct_Move', 'Close']], 
-                          grouped_cum[['Symbol', 'Cumulative_Power']], 
-                          on='Symbol', how='inner')
-        
-        # --- NEW LOGIC: 'SLEEPER WAKES UP' TIERED ALERTS ---
-        # Loosened Cumulative to < 150 (allow for tiny morning noise) 
-        # Lowered Discrete to > 2500 to catch the move early
-        sleepers = merged[(merged['Cumulative_Power'] < 150) & (merged['Discrete_Power'] > 2500)]
-        
-        # --- PRINTING ONLY THE TIERED ALERTS ---
-        if not sleepers.empty and base_label != "09:15 - 10:15":
-            print(f"\n⏰ TIME WINDOW: {label} IST")
-            for _, sleeper in sleepers.iterrows():
-                move_dir = "BULLISH" if sleeper['Pct_Move'] > 0 else "BEARISH"
-                
-                # Assign visual tiers based on power intensity
-                if sleeper['Discrete_Power'] >= 5000:
-                    icon = "🚨 🚨 FULL EXPLOSION"
-                elif sleeper['Discrete_Power'] >= 3500:
-                    icon = "🟠 🟠 GAINING SPEED "
-                else:
-                    icon = "🟡 🟡 EARLY RADAR   "
-                    
-                print(f"{icon}: {sleeper['Symbol']:<10} ({move_dir})")
-                print(f"      Cum. Power: {sleeper['Cumulative_Power']:<5.1f} | Disc. Power: {sleeper['Discrete_Power']:<6.1f} | LTP: ₹{sleeper['Close']:.2f}")
-            print("-" * 55)
+    prev_symbols = prev_top10['Symbol'].tolist() if not prev_top10.empty else []
 
-        if is_active_live:
-            break
+    print("\n" + "="*85)
+    print(f"⚡ LIVE INTRUSION LEADERBOARD | WINDOW: LAST 15 MINS | TIME: {eval_time_current.strftime('%H:%M')} IST")
+    print("   (Ranked strictly by violent behavior change - Intruders highlighted)")
+    print("="*85)
+    print(f" {'Rank':<4} {'Symbol':<15} {'Points Jump':<15} {'Direction':<12} {'LTP (₹)':<10}")
+    print("-" * 85)
+
+    for rank, (_, row) in enumerate(curr_top10.iterrows(), 1):
+        sym = row['Symbol']
+        jump = row['Points_Jump']
+        pct_m = row['Rec_Pct_Move']
+        ltp = row['Close']
+        
+        move_dir = "BULLISH" if pct_m > 0 else "BEARISH"
+        
+        # Color coding logic: If the stock was NOT in the top 10 five minutes ago, highlight it!
+        if sym not in prev_symbols:
+            color = COLOR_GREEN if pct_m > 0 else COLOR_RED
+            prefix = "🚨 "
+            reset = COLOR_RESET
+            bold = COLOR_BOLD
+        else:
+            color = ""
+            prefix = "   "
+            reset = ""
+            bold = COLOR_DIM # Dim the ones already on the board to clear visual noise
+
+        print(f"{bold}{color}{prefix}{rank:<4} {sym:<15} +{jump:<14.1f} {move_dir:<12} ₹{ltp:<10.2f}{reset}")
+
+    print("-" * 85)
+    print("Wait for colored intrusions. Trade the momentum change, not the rank.\n")
 
 # ==============================================================================
-# 5. MAIN CONTROLLER
+# 6. MAIN CONTROLLER
 # ==============================================================================
 def run_production_sweep():
     parser = argparse.ArgumentParser()
@@ -431,7 +433,7 @@ def run_production_sweep():
         if X_d_nifty is not None and len(X_d_nifty) > 0:
             nifty_brain, nifty_xgb_p, nifty_xgb_t, nifty_faiss = train_ai_brain(X_d_nifty, X_w_nifty, Y_np, Y_nt)
     
-    scan_discrete_hourly_turnover(target_date_str)
+    scan_live_rolling_leaderboard(target_date_str)
 
 if __name__ == "__main__":
     run_production_sweep()
