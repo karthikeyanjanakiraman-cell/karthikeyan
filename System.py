@@ -191,7 +191,7 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
     g_rec['Rec_Eff_Rank'] = g_rec['Rec_Efficiency'].rank(pct=True) * 100
 
     # --- THE TRI-DELTA CALCULATION ---
-    merged = pd.merge(g_rec[['Symbol', 'Rec_Pct_Move', 'Close', 'Datetime', 'Rec_Vol_Rank', 'Rec_Mom_Rank', 'Rec_Eff_Rank']], 
+    merged = pd.merge(g_rec[['Symbol', 'Rec_Pct_Move', 'Close', 'Rec_Vol_Rank', 'Rec_Mom_Rank', 'Rec_Eff_Rank']], 
                       g_cum[['Symbol', 'Cum_Vol_Rank', 'Cum_Mom_Rank', 'Cum_Eff_Rank']], on='Symbol', how='inner')
     
     if merged.empty: return pd.DataFrame()
