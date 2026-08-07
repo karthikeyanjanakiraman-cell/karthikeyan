@@ -136,7 +136,7 @@ def fetch_upstox_candles_for_date(instrument_key, date_str):
     except:
         return None
 
-def get_past_trading_days(target_date_str, num_days=5):
+def get_past_trading_days(target_date_str, num_days=30):
     target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
     trading_days = []
     current_dt = target_dt
@@ -202,7 +202,7 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
     
     merged['Velocity_Jump'] = merged['Vol_Delta'] + merged['Mom_Delta'] + merged['Eff_Delta']
     
-    top10 = merged.nlargest(10, 'Velocity_Jump')
+    top10 = merged.nlargest(50, 'Velocity_Jump')
     return top10
 
 # ==============================================================================
@@ -215,7 +215,7 @@ def scan_institutional_tape(target_date_str):
         print("⚠️ No F&O universe found. Please check Upstox API.")
         return
         
-    trading_days = get_past_trading_days(target_date_str, num_days=5)
+    trading_days = get_past_trading_days(target_date_str, num_days=30)
     print(f"🔄 Backtracing rolling 1-week window across: {trading_days}")
 
     # Fetch multi-day historical candles into RAM
