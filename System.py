@@ -304,9 +304,9 @@ def scan_discrete_hourly_turnover(target_date_str):
         
     master_df = pd.concat(master_intraday_list, ignore_index=True)
     
-    print("\n" + "="*145)
-    print(f"🔥 TOP 5 ACCELERATION DELTA BREAKOUTS (Discrete Hourly Score minus Cumulative Session Score) | DATE: {target_date_str}")
-    print("="*145)
+    print("\n" + "="*80)
+    print(f"🔥 SCANNING FOR INSTITUTIONAL WAKE-UP ALERTS | DATE: {target_date_str}")
+    print("="*80)
     
     for start_time, end_time, base_label in windows:
         if is_live_today and current_now < start_time:
@@ -365,35 +365,28 @@ def scan_discrete_hourly_turnover(target_date_str):
                           grouped_cum[['Symbol', 'Cumulative_Power']], 
                           on='Symbol', how='inner')
         
-        merged['Acceleration_Delta'] = merged['Discrete_Power'] - merged['Cumulative_Power']
+        # --- NEW LOGIC: 'SLEEPER WAKES UP' TIERED ALERTS ---
+        # Loosened Cumulative to < 150 (allow for tiny morning noise) 
+        # Lowered Discrete to > 2500 to catch the move early
+        sleepers = merged[(merged['Cumulative_Power'] < 150) & (merged['Discrete_Power'] > 2500)]
         
-        # --- NEW LOGIC: THE FIRST HOUR FIX ---
-        if base_label == "09:15 - 10:15":
-            top5 = merged.nlargest(5, 'Discrete_Power')
-        else:
-            top5 = merged.nlargest(5, 'Acceleration_Delta')
-            
-        # --- NEW LOGIC: 'SLEEPER WAKES UP' ALERT (The BIOCON Setup) ---
-        sleepers = merged[(merged['Cumulative_Power'] < 100) & (merged['Discrete_Power'] > 5000)]
-        
-        # --- PRINTING THE TABLES ---
-        print(f"\n⏰ DISCRETE WINDOW: {label} IST")
-        print(f"{'Rank':<5} {'Symbol':<15} {'Accel Delta':<14} | {'Discrete Power':<15} | {'Cumulative Power':<16} | {'% Move':<8} {'LTP (₹)':<10}")
-        print("-" * 145)
-        
-        for rank, (_, row) in enumerate(top5.iterrows(), 1):
-            move_sign = "+" if row['Pct_Move'] > 0 else ""
-            delta_sign = "+" if row['Acceleration_Delta'] > 0 else ""
-            print(f"{rank:<5} {row['Symbol']:<15} {delta_sign}{row['Acceleration_Delta']:<12.1f} | {row['Discrete_Power']:>13.1f}   | {row['Cumulative_Power']:>14.1f}   | {move_sign}{row['Pct_Move']:<6.2f}%   ₹{row['Close']:<10.2f}")
-
-        # Print the Sleeper Alert if any are found
+        # --- PRINTING ONLY THE TIERED ALERTS ---
         if not sleepers.empty and base_label != "09:15 - 10:15":
-            print("\n🚨 🚨 🚨 INSTITUTIONAL WAKE-UP ALERT DETECTED 🚨 🚨 🚨")
+            print(f"\n⏰ TIME WINDOW: {label} IST")
             for _, sleeper in sleepers.iterrows():
-                move_dir = "BULLISH BREAKOUT" if sleeper['Pct_Move'] > 0 else "BEARISH BREAKDOWN"
-                print(f"   => {sleeper['Symbol']} is suddenly moving! ({move_dir})")
-                print(f"      Cumulative Power was: {sleeper['Cumulative_Power']:.1f} | Discrete Power is now: {sleeper['Discrete_Power']:.1f}")
-            print("🚨 🚨 🚨 ------------------------------------ 🚨 🚨 🚨\n")
+                move_dir = "BULLISH" if sleeper['Pct_Move'] > 0 else "BEARISH"
+                
+                # Assign visual tiers based on power intensity
+                if sleeper['Discrete_Power'] >= 5000:
+                    icon = "🚨 🚨 FULL EXPLOSION"
+                elif sleeper['Discrete_Power'] >= 3500:
+                    icon = "🟠 🟠 GAINING SPEED "
+                else:
+                    icon = "🟡 🟡 EARLY RADAR   "
+                    
+                print(f"{icon}: {sleeper['Symbol']:<10} ({move_dir})")
+                print(f"      Cum. Power: {sleeper['Cumulative_Power']:<5.1f} | Disc. Power: {sleeper['Discrete_Power']:<6.1f} | LTP: ₹{sleeper['Close']:.2f}")
+            print("-" * 55)
 
         if is_active_live:
             break
@@ -442,3 +435,4 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
+
