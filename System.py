@@ -26,7 +26,7 @@ COLOR_BOLD = '\033[1m'
 
 SCORE_THRESHOLD = 160    # Quad-Delta max is 400
 MIN_VECTOR_FLOOR = 10    # Minimum percentile contribution per variable
-BACKTRACE_DAYS = 5      # 1 F&O Monthly Derivative Cycle
+BACKTRACE_DAYS = 20      # 1 F&O Monthly Derivative Cycle
 MAX_BREACH_DAYS = 0      # Kill Switch: Days a stock can stay breached before memory purge
 
 
