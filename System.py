@@ -13,93 +13,24 @@ import pandas as pd
 import numpy as np
 import torch
 import torch.nn as nn
-import torch.optim as optim
-import faiss
-import xgboost as xgb
 
 # ==============================================================================
-# 0. TERMINAL COLOR CODES (For pure signal isolation)
+# 0. ENGINE CONSTANTS & TERMINAL COLORS
 # ==============================================================================
 COLOR_GREEN = '\033[92m'
 COLOR_RED = '\033[91m'
 COLOR_CYAN = '\033[96m'
 COLOR_YELLOW = '\033[93m'
+COLOR_MAGENTA = '\033[95m'
 COLOR_DIM = '\033[2m'
 COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 
-# ==============================================================================
-# 1. EQUI-PERCENTILE EQUATING
-# ==============================================================================
-def convert_to_equi_percentile(raw_matrix):
-    if raw_matrix.size == 0 or raw_matrix.shape[0] <= 1:
-        return raw_matrix
-    ranks = np.argsort(np.argsort(raw_matrix, axis=0), axis=0)
-    percentile_matrix = ranks.astype(np.float32) / (raw_matrix.shape[0] - 1 + 1e-8)
-    return percentile_matrix
+SCORE_THRESHOLD = 120    # Minimum absolute Tri-Delta score to trigger an anomaly
+BACKTRACE_DAYS = 20      # 1 F&O Monthly Derivative Cycle
 
 # ==============================================================================
-# 2. DUAL-INPUT TEMPORAL AUTOENCODER (The AI Engine)
-# ==============================================================================
-class MultiTimeframeAutoencoder(nn.Module):
-    def __init__(self, num_features=5, latent_dim_daily=12, latent_dim_weekly=12):
-        super(MultiTimeframeAutoencoder, self).__init__()
-        
-        self.encoder_daily = nn.Sequential(
-            nn.Conv1d(in_channels=num_features, out_channels=16, kernel_size=3, padding=1),
-            nn.BatchNorm1d(16),
-            nn.ReLU(inplace=True),
-            nn.MaxPool1d(2),
-            nn.Conv1d(in_channels=16, out_channels=32, kernel_size=3, padding=1),
-            nn.BatchNorm1d(32),
-            nn.ReLU(inplace=True),
-            nn.MaxPool1d(3),
-            nn.Flatten(),
-            nn.Linear(32 * 5, latent_dim_daily)
-        )
-        
-        self.encoder_weekly = nn.Sequential(
-            nn.Conv1d(in_channels=num_features, out_channels=16, kernel_size=3, padding=1),
-            nn.BatchNorm1d(16),
-            nn.ReLU(inplace=True),
-            nn.MaxPool1d(3),
-            nn.Flatten(),
-            nn.Linear(16 * 5, latent_dim_weekly)
-        )
-        
-        self.decoder_daily = nn.Sequential(
-            nn.Linear(latent_dim_daily, 32 * 5),
-            nn.ReLU(inplace=True),
-            nn.Unflatten(1, (32, 5)),
-            nn.ConvTranspose1d(32, 16, kernel_size=3, stride=3, output_padding=0),
-            nn.BatchNorm1d(16),
-            nn.ReLU(inplace=True),
-            nn.ConvTranspose1d(16, num_features, kernel_size=2, stride=2, output_padding=0),
-            nn.Sigmoid()
-        )
-        
-        self.decoder_weekly = nn.Sequential(
-            nn.Linear(latent_dim_weekly, 16 * 5),
-            nn.ReLU(inplace=True),
-            nn.Unflatten(1, (16, 5)),
-            nn.ConvTranspose1d(16, num_features, kernel_size=3, stride=3, output_padding=0),
-            nn.Sigmoid()
-        )
-
-    def encode(self, x_daily, x_weekly):
-        ld = self.encoder_daily(x_daily)
-        lw = self.encoder_weekly(x_weekly)
-        return torch.cat((ld, lw), dim=1)
-
-    def forward(self, x_daily, x_weekly):
-        ld = self.encoder_daily(x_daily)
-        lw = self.encoder_weekly(x_weekly)
-        recon_d = self.decoder_daily(ld)
-        recon_w = self.decoder_weekly(lw)
-        return recon_d, recon_w, torch.cat((ld, lw), dim=1)
-
-# ==============================================================================
-# 3. LIVE INGESTION & ROLLING 1-WEEK UNIVERSE PACKS
+# 1. LIVE INGESTION (F&O Universe)
 # ==============================================================================
 def get_dynamic_fno_universe():
     nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
@@ -136,7 +67,7 @@ def fetch_upstox_candles_for_date(instrument_key, date_str):
     except:
         return None
 
-def get_past_trading_days(target_date_str, num_days=30):
+def get_past_trading_days(target_date_str, num_days=20):
     target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
     trading_days = []
     current_dt = target_dt
@@ -148,7 +79,7 @@ def get_past_trading_days(target_date_str, num_days=30):
     return trading_days
 
 # ==============================================================================
-# 4. TRI-DELTA VELOCITY ENGINE (Independent Percentile Changes)
+# 2. TRI-DELTA VELOCITY ENGINE (Directional Percentile Math)
 # ==============================================================================
 def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15):
     if master_df is None or master_df.empty or 'Datetime' not in master_df.columns:
@@ -168,9 +99,6 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
         
     # --- BASELINE (Morning up to window start) ---
     g_cum = cum_df.groupby('Symbol').agg({'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'}).reset_index()
-    g_cum = g_cum[g_cum['Turnover'] > 0]
-    if g_cum.empty: return pd.DataFrame()
-    
     g_cum['Cum_Pct_Move'] = ((g_cum['Close'] - g_cum['Open']) / (g_cum['Open'] + 1e-8)) * 100
     g_cum['Cum_Efficiency'] = (g_cum['Close'] - g_cum['Open']).abs() / (g_cum['abs_move'] + 1e-8)
     
@@ -180,9 +108,6 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
 
     # --- RECENT (Last window minutes) ---
     g_rec = rec_df.groupby('Symbol').agg({'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'}).reset_index()
-    g_rec = g_rec[g_rec['Turnover'] > 0]
-    if g_rec.empty: return pd.DataFrame()
-    
     g_rec['Rec_Pct_Move'] = ((g_rec['Close'] - g_rec['Open']) / (g_rec['Open'] + 1e-8)) * 100
     g_rec['Rec_Efficiency'] = (g_rec['Close'] - g_rec['Open']).abs() / (g_rec['abs_move'] + 1e-8)
     
@@ -190,35 +115,47 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
     g_rec['Rec_Mom_Rank'] = g_rec['Rec_Pct_Move'].abs().rank(pct=True) * 100
     g_rec['Rec_Eff_Rank'] = g_rec['Rec_Efficiency'].rank(pct=True) * 100
 
-    # --- THE TRI-DELTA CALCULATION ---
+    # --- THE DIRECTIONAL TRI-DELTA CALCULATION ---
     merged = pd.merge(g_rec[['Symbol', 'Rec_Pct_Move', 'Close', 'Rec_Vol_Rank', 'Rec_Mom_Rank', 'Rec_Eff_Rank']], 
                       g_cum[['Symbol', 'Cum_Vol_Rank', 'Cum_Mom_Rank', 'Cum_Eff_Rank']], on='Symbol', how='inner')
     
     if merged.empty: return pd.DataFrame()
 
+    # Raw Delta Expansion (-100 to +100)
     merged['Vol_Delta'] = merged['Rec_Vol_Rank'] - merged['Cum_Vol_Rank']
     merged['Mom_Delta'] = merged['Rec_Mom_Rank'] - merged['Cum_Mom_Rank']
     merged['Eff_Delta'] = merged['Rec_Eff_Rank'] - merged['Cum_Eff_Rank']
     
-    merged['Velocity_Jump'] = merged['Vol_Delta'] + merged['Mom_Delta'] + merged['Eff_Delta']
+    # Vector Alignment: Force volume & efficiency to inherit price direction
+    merged['Direction'] = np.where(merged['Rec_Pct_Move'] > 0, 1, -1)
     
-    top10 = merged.nlargest(50, 'Velocity_Jump')
-    return top10
+    merged['V_Score'] = merged['Vol_Delta'] * merged['Direction']
+    merged['M_Score'] = merged['Mom_Delta'] * merged['Direction']
+    merged['E_Score'] = merged['Eff_Delta'] * merged['Direction']
+    
+    # Final Score (-300 to +300)
+    merged['Total_Score'] = merged['V_Score'] + merged['M_Score'] + merged['E_Score']
+    
+    # Filter by Absolute Threshold (Uncapped Universe)
+    merged = merged[merged['Total_Score'].abs() >= SCORE_THRESHOLD]
+    merged = merged.sort_values(by='Total_Score', key=abs, ascending=False)
+    
+    return merged
 
 # ==============================================================================
-# 5. STATELESS STATE MACHINE & TAPE PRINTER
+# 3. STATE-BASED MEMORY ENGINE & TAPE PRINTER
 # ==============================================================================
 def scan_institutional_tape(target_date_str):
-    print(f"\n📡 Initiating Stateless Rolling-Memory Tape for {target_date_str}...")
+    print(f"\n📡 Initiating State-Based Tri-Delta Engine for {target_date_str}...")
     universe = get_dynamic_fno_universe()
     if not universe:
         print("⚠️ No F&O universe found. Please check Upstox API.")
         return
         
-    trading_days = get_past_trading_days(target_date_str, num_days=30)
-    print(f"🔄 Backtracing rolling 1-week window across: {trading_days}")
+    trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
+    print(f"🔄 Backtracing structural memory across {BACKTRACE_DAYS} days...")
 
-    # Fetch multi-day historical candles into RAM
+    # Load history into RAM
     historical_dfs = []
     for day in trading_days:
         day_list = []
@@ -234,16 +171,11 @@ def scan_institutional_tape(target_date_str):
             historical_dfs.append(pd.concat(day_list, ignore_index=True))
 
     if not historical_dfs:
-        print("⚠️ Warning: No valid market volume found across the rolling window.")
+        print("⚠️ Warning: No valid market data found.")
         return
 
     rolling_master_df = pd.concat(historical_dfs, ignore_index=True)
     
-    if rolling_master_df.empty or 'Datetime' not in rolling_master_df.columns:
-        print("⚠️ Error: rolling_master_df is empty or missing 'Datetime' column.")
-        return
-    
-    # Strict Current Minute - 1 Boundary Rule for Live Execution
     current_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
     is_live_today = (target_date_str == current_now.strftime("%Y-%m-%d"))
     
@@ -254,131 +186,158 @@ def scan_institutional_tape(target_date_str):
         eval_time_current = current_now.replace(second=0, microsecond=0) - timedelta(minutes=1)
 
     # ----------------------------------------------------------------------
-    # BUILD ROLLING RAM MEMORY BANK (1-WEEK FOOTPRINTS)
+    # REBUILDING THE STATE MACHINE (Historical Fast-Forward)
     # ----------------------------------------------------------------------
-    historical_burned_list = {}
+    memory_bank = {}  # { sym: {state, origin, date, dir} }
     
     for day in trading_days:
         day_dt = pd.to_datetime(day)
         day_master = rolling_master_df[(rolling_master_df['Datetime'] >= day_dt) & (rolling_master_df['Datetime'] < day_dt + pd.Timedelta(days=1))]
-        if day_master.empty:
-            continue
+        if day_master.empty: continue
 
         day_start = day_dt + pd.Timedelta(hours=9, minutes=15)
-        day_end = day_dt + pd.Timedelta(hours=15, minutes=15)
-        if day == target_date_str:
-            day_end = eval_time_current
+        day_end = day_dt + pd.Timedelta(hours=15, minutes=15) if day != target_date_str else eval_time_current
 
-        time_steps = pd.date_range(start=day_start + pd.Timedelta(minutes=15), 
-                                   end=day_end, 
-                                   freq='5min')
+        # 15-min intervals for fast structural mapping
+        time_steps = pd.date_range(start=day_start + pd.Timedelta(minutes=15), end=day_end, freq='15min')
                                    
         for t in time_steps:
-            top_historical = calculate_velocity_leaderboard(day_master, t, window_mins=15)
-            if not top_historical.empty:
-                for _, row in top_historical.iterrows():
-                    sym = row['Symbol']
-                    if sym not in historical_burned_list:
-                        historical_burned_list[sym] = {
-                            'date': day,
-                            'time': t.strftime('%H:%M'),
-                            'price': row['Close']
-                        }
+            anomalies = calculate_velocity_leaderboard(day_master, t, window_mins=15)
+            for _, row in anomalies.iterrows():
+                sym = row['Symbol']
+                price = row['Close']
+                direction = row['Direction']
+                
+                if sym not in memory_bank:
+                    memory_bank[sym] = {
+                        'state': 'ACTIVE', 'origin': price, 'date': day, 'time': t.strftime('%H:%M'), 'dir': direction
+                    }
+                else:
+                    st = memory_bank[sym]
+                    if st['state'] == 'BREACHED' and st['dir'] == direction:
+                        # Reclaim Logic
+                        if (st['dir'] == 1 and price > st['origin']) or (st['dir'] == -1 and price < st['origin']):
+                            st['state'] = 'ACTIVE'
+                            
+        # End-of-Day Purge Protocol (Resolves BREACHED states)
+        daily_agg = day_master.groupby('Symbol').agg({'Low': 'min', 'High': 'max', 'Close': 'last'}).reset_index()
+        daily_dict = daily_agg.set_index('Symbol').to_dict('index')
+        
+        to_delete = []
+        for sym, st in memory_bank.items():
+            if sym not in daily_dict: continue
+            d_low, d_high, d_close = daily_dict[sym]['Low'], daily_dict[sym]['High'], daily_dict[sym]['Close']
+            
+            if st['dir'] == 1: # Bullish
+                if st['state'] == 'ACTIVE' and d_low < st['origin']:
+                    st['state'] = 'BREACHED'
+                if st['state'] == 'BREACHED' and d_close < st['origin'] * 0.99: # 1% failure purge
+                    to_delete.append(sym)
+            else: # Bearish
+                if st['state'] == 'ACTIVE' and d_high > st['origin']:
+                    st['state'] = 'BREACHED'
+                if st['state'] == 'BREACHED' and d_close > st['origin'] * 1.01:
+                    to_delete.append(sym)
+                    
+        for sym in to_delete:
+            del memory_bank[sym]
 
     # ----------------------------------------------------------------------
-    # EVALUATE CURRENT MINUTE (-1) WITH VECTORIZED SLICING
+    # LIVE EVALUATION (Current Minute)
     # ----------------------------------------------------------------------
     target_dt_obj = pd.to_datetime(target_date_str)
-    today_master_df = rolling_master_df[
+    today_master = rolling_master_df[
         (rolling_master_df['Datetime'] >= target_dt_obj) & 
         (rolling_master_df['Datetime'] < target_dt_obj + pd.Timedelta(days=1))
     ].copy()
 
-    if today_master_df.empty:
-        print(f"\n{COLOR_YELLOW}[Terminal Standby] Market data for {target_date_str} is not available yet (or market is closed/empty).{COLOR_RESET}\n")
-        return
+    if today_master.empty: return
 
-    curr_top10 = calculate_velocity_leaderboard(today_master_df, eval_time_current, window_mins=15)
-    
-    if curr_top10.empty:
-        print(f"[{eval_time_current.strftime('%H:%M')} IST] Market compiling... insufficient data window.")
-        return
+    # Pre-check 09:15 Gaps vs Active Anchors
+    today_latest_ltp = today_master.groupby('Symbol')['Close'].last().to_dict()
+    for sym, st in memory_bank.items():
+        if sym in today_latest_ltp:
+            ltp = today_latest_ltp[sym]
+            if st['dir'] == 1 and ltp < st['origin']: st['state'] = 'BREACHED'
+            elif st['dir'] == -1 and ltp > st['origin']: st['state'] = 'BREACHED'
 
-    fresh_intrusions = []
-    algorithmic_reloads = []
+    curr_anomalies = calculate_velocity_leaderboard(today_master, eval_time_current, window_mins=15)
 
-    for _, row in curr_top10.iterrows():
-        sym = row['Symbol']
-        
-        # Check against rolling RAM memory bank
-        if sym in historical_burned_list:
-            footprint = historical_burned_list[sym]
-            first_date = footprint['date']
-            first_time = footprint['time']
-            first_price = footprint['price']
-            current_price = row['Close']
-            
-            pct_change = ((current_price - first_price) / first_price) * 100
-            
-            row['First_Date'] = first_date
-            row['First_Seen'] = first_time
-            row['First_Price'] = first_price
-            row['Pct_Change_Since_First'] = pct_change
-            
-            algorithmic_reloads.append(row)
-        else:
-            fresh_intrusions.append(row)
+    fresh_intrusions, reloads, reclaims, breached = [], [], [], []
+
+    if not curr_anomalies.empty:
+        for _, row in curr_anomalies.iterrows():
+            sym = row['Symbol']
+            if sym not in memory_bank:
+                fresh_intrusions.append(row)
+            else:
+                st = memory_bank[sym]
+                row['Origin'] = st['origin']
+                row['First_Date'] = st['date']
+                row['Net_Drift'] = ((row['Close'] - st['origin']) / st['origin']) * 100
+                
+                if st['state'] == 'ACTIVE' and row['Direction'] == st['dir']:
+                    reloads.append(row)
+                elif st['state'] == 'BREACHED' and row['Direction'] == st['dir']:
+                    if (st['dir'] == 1 and row['Close'] > st['origin']) or (st['dir'] == -1 and row['Close'] < st['origin']):
+                        st['state'] = 'ACTIVE' # Reclaimed today
+                        reclaims.append(row)
+
+    # Gather any remaining breached pivots for observation
+    for sym, st in memory_bank.items():
+        if st['state'] == 'BREACHED' and sym in today_latest_ltp:
+            if not any(sym == r['Symbol'] for r in reclaims): # Don't list if it just reclaimed
+                breached.append({'Symbol': sym, 'LTP': today_latest_ltp[sym], 'Origin': st['origin'], 'Dir': "BULLISH" if st['dir']==1 else "BEARISH"})
 
     # ----------------------------------------------------------------------
-    # TERMINAL OUTPUT: DUAL TABLES
+    # TERMINAL OUTPUT
     # ----------------------------------------------------------------------
     print(f"\n{COLOR_CYAN}================================================================================================{COLOR_RESET}")
-    print(f"{COLOR_BOLD}STATELESS TRI-DELTA TAPE | TIME: {eval_time_current.strftime('%H:%M')} IST{COLOR_RESET}")
+    print(f"{COLOR_BOLD}FULL UNIVERSE TRI-DELTA TAPE | TIME: {eval_time_current.strftime('%H:%M')} IST{COLOR_RESET}")
     print(f"{COLOR_CYAN}================================================================================================{COLOR_RESET}\n")
-
-    if not fresh_intrusions and not algorithmic_reloads:
-        print(f"{COLOR_DIM}[Terminal Silent] No new block sweeps or reloads detected.{COLOR_RESET}\n")
-        return
 
     # TABLE 1: FRESH INTRUSIONS
     if fresh_intrusions:
-        print(f"{COLOR_BOLD}⚡ FRESH INTRUSIONS (First Time Seen in Rolling Window){COLOR_RESET}")
+        print(f"{COLOR_BOLD}⚡ FRESH INTRUSIONS (Phase 1 - Day-1 Births){COLOR_RESET}")
         for row in fresh_intrusions:
-            sym = row['Symbol']
-            jump = row['Velocity_Jump']
-            dir_str = "BULLISH" if row['Rec_Pct_Move'] > 0 else "BEARISH"
-            color = COLOR_GREEN if row['Rec_Pct_Move'] > 0 else COLOR_RED
-            ltp = row['Close']
-            
-            v_del, m_del, e_del = row['Vol_Delta'], row['Mom_Delta'], row['Eff_Delta']
-            delta_str = f"[V:{v_del:+.0f} M:{m_del:+.0f} E:{e_del:+.0f}]"
-            
-            print(f"  {color}🚨 [{eval_time_current.strftime('%H:%M')}] {sym:<12} +{jump:<5.0f} pts {delta_str:<20} ({dir_str:<7}) | LTP: ₹{ltp:<8.2f}{COLOR_RESET}")
+            sym, jump, ltp = row['Symbol'], row['Total_Score'], row['Close']
+            color = COLOR_GREEN if jump > 0 else COLOR_RED
+            d_str = "BULLISH" if jump > 0 else "BEARISH"
+            print(f"  {color}🚨 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str:<7}) | LTP: ₹{ltp:<8.2f}{COLOR_RESET}")
         print("")
 
-    # TABLE 2: ALGORITHMIC RELOADS (SECOND WAVES)
-    if algorithmic_reloads:
-        print(f"{COLOR_BOLD}🔄 ALGORITHMIC RELOADS (Second Waves / Multi-Day Footprints){COLOR_RESET}")
-        for row in algorithmic_reloads:
-            sym = row['Symbol']
-            jump = row['Velocity_Jump']
-            dir_str = "BULLISH" if row['Rec_Pct_Move'] > 0 else "BEARISH"
-            color = COLOR_GREEN if row['Rec_Pct_Move'] > 0 else COLOR_RED
-            
-            v_del, m_del, e_del = row['Vol_Delta'], row['Mom_Delta'], row['Eff_Delta']
-            delta_str = f"[V:{v_del:+.0f} M:{m_del:+.0f} E:{e_del:+.0f}]"
-            
-            curr_ltp = row['Close']
-            f_date = row['First_Date']
-            first_seen = row['First_Seen']
-            first_price = row['First_Price']
-            pct_chg = row['Pct_Change_Since_First']
-            
-            print(f"  {color}🔄 [{eval_time_current.strftime('%H:%M')}] {sym:<12} +{jump:<5.0f} pts {delta_str:<20} ({dir_str:<7}) | LTP: ₹{curr_ltp:<8.2f} --> [1st Footprint on {f_date} @ {first_seen} @ ₹{first_price:.2f} | {pct_chg:+.2f}%]{COLOR_RESET}")
+    # TABLE 2: ALGORITHMIC RELOADS
+    if reloads:
+        print(f"{COLOR_BOLD}🔄 ALGORITHMIC RELOADS (Phase 2 - Second Waves){COLOR_RESET}")
+        for row in reloads:
+            sym, jump, ltp, drift = row['Symbol'], row['Total_Score'], row['Close'], row['Net_Drift']
+            color = COLOR_GREEN if jump > 0 else COLOR_RED
+            d_str = "BULLISH" if jump > 0 else "BEARISH"
+            print(f"  {color}🔄 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str:<7}) | LTP: ₹{ltp:<8.2f} --> [Anchor: {row['First_Date']} @ ₹{row['Origin']:.2f} | Drift: {drift:+.2f}%]{COLOR_RESET}")
         print("")
+
+    # TABLE 3: INSTITUTIONAL RECLAIMS (LIQUIDITY TRAPS)
+    if reclaims:
+        print(f"{COLOR_BOLD}🪤 INSTITUTIONAL RECLAIMS (Phase 4 - Liquidity Traps / Squeezes){COLOR_RESET}")
+        for row in reclaims:
+            sym, jump, ltp = row['Symbol'], row['Total_Score'], row['Close']
+            color = COLOR_MAGENTA
+            d_str = "BULLISH" if jump > 0 else "BEARISH"
+            print(f"  {color}🔥 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str:<7}) | RECLAIMED ANCHOR: ₹{row['Origin']:.2f}{COLOR_RESET}")
+        print("")
+
+    # TABLE 4: BREACHED PIVOTS (Observation)
+    if breached:
+        print(f"{COLOR_DIM}⚠️ BREACHED PIVOTS (Phase 3 - Under Observation / Awaiting Resolution){COLOR_RESET}")
+        for b in breached:
+            print(f"  {COLOR_YELLOW}⚠️ {b['Symbol']:<12} Anchor: ₹{b['Origin']:.2f} ({b['Dir']}) | Currently trading at: ₹{b['LTP']:.2f} (Awaiting Reclaim or Daily Purge){COLOR_RESET}")
+        print("")
+
+    if not any([fresh_intrusions, reloads, reclaims, breached]):
+        print(f"{COLOR_DIM}[Terminal Silent] No active institutional structure passing strict filters.{COLOR_RESET}\n")
 
 # ==============================================================================
-# 6. RUN EXECUTOR
+# 4. RUN EXECUTOR
 # ==============================================================================
 def run_production_sweep():
     parser = argparse.ArgumentParser()
