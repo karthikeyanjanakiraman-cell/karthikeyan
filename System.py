@@ -24,8 +24,8 @@ COLOR_DIM = '\033[2m'
 COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 
-SCORE_THRESHOLD = 120    # Minimum absolute Tri-Delta score to trigger an anomaly
-BACKTRACE_DAYS = 20      # 1 F&O Monthly Derivative Cycle
+SCORE_THRESHOLD = 120    
+BACKTRACE_DAYS = 20      
 
 # ==============================================================================
 # 1. LIVE INGESTION (F&O Universe)
@@ -70,7 +70,7 @@ def get_past_trading_days(target_date_str, num_days=20):
     trading_days = []
     current_dt = target_dt
     while len(trading_days) < num_days:
-        if current_dt.weekday() < 5:  # Skip weekends (0=Mon, 4=Fri)
+        if current_dt.weekday() < 5:  
             trading_days.append(current_dt.strftime("%Y-%m-%d"))
         current_dt -= timedelta(days=1)
     trading_days.reverse()
@@ -86,16 +86,13 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
     start_of_day = pd.to_datetime(current_eval_time.date()) + pd.Timedelta(hours=9, minutes=15)
     recent_start = current_eval_time - pd.Timedelta(minutes=window_mins)
     
-    if recent_start <= start_of_day:
-        return pd.DataFrame()
+    if recent_start <= start_of_day: return pd.DataFrame()
         
     cum_df = master_df[(master_df['Datetime'] >= start_of_day) & (master_df['Datetime'] < recent_start)]
     rec_df = master_df[(master_df['Datetime'] >= recent_start) & (master_df['Datetime'] <= current_eval_time)]
     
-    if cum_df.empty or rec_df.empty:
-        return pd.DataFrame()
+    if cum_df.empty or rec_df.empty: return pd.DataFrame()
         
-    # --- BASELINE (Morning up to window start) ---
     g_cum = cum_df.groupby('Symbol').agg({'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'}).reset_index()
     g_cum = g_cum[g_cum['Turnover'] > 0]
     if g_cum.empty: return pd.DataFrame()
@@ -107,7 +104,6 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
     g_cum['Cum_Mom_Rank'] = g_cum['Cum_Pct_Move'].abs().rank(pct=True) * 100
     g_cum['Cum_Eff_Rank'] = g_cum['Cum_Efficiency'].rank(pct=True) * 100
 
-    # --- RECENT (Last window minutes) ---
     g_rec = rec_df.groupby('Symbol').agg({'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'}).reset_index()
     g_rec = g_rec[g_rec['Turnover'] > 0]
     if g_rec.empty: return pd.DataFrame()
@@ -119,7 +115,6 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
     g_rec['Rec_Mom_Rank'] = g_rec['Rec_Pct_Move'].abs().rank(pct=True) * 100
     g_rec['Rec_Eff_Rank'] = g_rec['Rec_Efficiency'].rank(pct=True) * 100
 
-    # --- THE DIRECTIONAL TRI-DELTA CALCULATION ---
     merged = pd.merge(g_rec[['Symbol', 'Rec_Pct_Move', 'Close', 'Rec_Vol_Rank', 'Rec_Mom_Rank', 'Rec_Eff_Rank']], 
                       g_cum[['Symbol', 'Cum_Vol_Rank', 'Cum_Mom_Rank', 'Cum_Eff_Rank']], on='Symbol', how='inner')
     
@@ -129,17 +124,13 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
     merged['Mom_Delta'] = merged['Rec_Mom_Rank'] - merged['Cum_Mom_Rank']
     merged['Eff_Delta'] = merged['Rec_Eff_Rank'] - merged['Cum_Eff_Rank']
     
-    # Vector Alignment: Force volume & efficiency to inherit price direction
     merged['Direction'] = np.where(merged['Rec_Pct_Move'] > 0, 1, -1)
     
     merged['V_Score'] = merged['Vol_Delta'] * merged['Direction']
     merged['M_Score'] = merged['Mom_Delta'] * merged['Direction']
     merged['E_Score'] = merged['Eff_Delta'] * merged['Direction']
     
-    # Final Score
     merged['Total_Score'] = merged['V_Score'] + merged['M_Score'] + merged['E_Score']
-    
-    # Filter by Absolute Threshold (Uncapped Universe)
     merged = merged[merged['Total_Score'].abs() >= SCORE_THRESHOLD]
     merged = merged.sort_values(by='Total_Score', key=abs, ascending=False)
     
@@ -158,7 +149,6 @@ def scan_institutional_tape(target_date_str):
     trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
     print(f"🔄 Backtracing structural memory across {BACKTRACE_DAYS} trading days...")
 
-    # Load history into RAM
     historical_dfs = []
     for day in trading_days:
         day_list = []
@@ -169,12 +159,11 @@ def scan_institutional_tape(target_date_str):
                 df['Turnover'] = df['Volume'] * df['Close']
                 df['abs_move'] = (df['Close'] - df['Open']).abs()
                 day_list.append(df)
-            # time.sleep(0.01) # Optional rate-limiting for Upstox
         if day_list:
             historical_dfs.append(pd.concat(day_list, ignore_index=True))
 
     if not historical_dfs:
-        print(f"⚠️ {COLOR_RED}Fatal Error: No valid market data fetched across the entire rolling window.{COLOR_RESET}")
+        print(f"⚠️ {COLOR_RED}Fatal Error: No valid market data fetched.{COLOR_RESET}")
         return
 
     rolling_master_df = pd.concat(historical_dfs, ignore_index=True)
@@ -189,9 +178,9 @@ def scan_institutional_tape(target_date_str):
         eval_time_current = current_now.replace(second=0, microsecond=0) - timedelta(minutes=1)
 
     # ----------------------------------------------------------------------
-    # REBUILDING THE STATE MACHINE (Historical Fast-Forward)
+    # REBUILDING THE STATE MACHINE (The Self-Healing Version)
     # ----------------------------------------------------------------------
-    memory_bank = {}  # { sym: {state, origin, date, time, dir} }
+    memory_bank = {} 
     
     for day in trading_days:
         day_dt = pd.to_datetime(day)
@@ -199,12 +188,8 @@ def scan_institutional_tape(target_date_str):
         if day_master.empty: continue
 
         day_start = day_dt + pd.Timedelta(hours=9, minutes=15)
-        # Prevent engine from scanning future hours if evaluating today
-        day_end = day_dt + pd.Timedelta(hours=15, minutes=15)
-        if day == target_date_str:
-            day_end = eval_time_current
+        day_end = day_dt + pd.Timedelta(hours=15, minutes=15) if day != target_date_str else eval_time_current
 
-        # Scan 15-min intervals to reconstruct state history
         time_steps = pd.date_range(start=day_start + pd.Timedelta(minutes=15), end=day_end, freq='15min')
                                    
         for t in time_steps:
@@ -221,32 +206,32 @@ def scan_institutional_tape(target_date_str):
                 else:
                     st = memory_bank[sym]
                     if st['state'] == 'BREACHED' and st['dir'] == direction:
-                        # Reclaim Logic
                         if (st['dir'] == 1 and price > st['origin']) or (st['dir'] == -1 and price < st['origin']):
                             st['state'] = 'ACTIVE'
                             
-        # End-of-Day Purge Protocol
-        daily_agg = day_master.groupby('Symbol').agg({'Low': 'min', 'High': 'max', 'Close': 'last'}).reset_index()
+        # End-of-Day Purge & HEAL Protocol (Fixes false breaches)
+        daily_agg = day_master.groupby('Symbol').agg({'Close': 'last'}).reset_index()
         daily_dict = daily_agg.set_index('Symbol').to_dict('index')
         
         to_delete = []
         for sym, st in memory_bank.items():
             if sym not in daily_dict: continue
-            d_low, d_high, d_close = daily_dict[sym]['Low'], daily_dict[sym]['High'], daily_dict[sym]['Close']
+            d_close = daily_dict[sym]['Close']
             
             if st['dir'] == 1: # Bullish
-                if st['state'] == 'ACTIVE' and d_low < st['origin']:
+                if d_close < st['origin']:
                     st['state'] = 'BREACHED'
-                if st['state'] == 'BREACHED' and d_close < st['origin'] * 0.99: # 1% structural failure
-                    to_delete.append(sym)
+                    if d_close < (st['origin'] * 0.985): to_delete.append(sym) # Purge 1.5% below
+                else:
+                    st['state'] = 'ACTIVE' # Self-heal!
             else: # Bearish
-                if st['state'] == 'ACTIVE' and d_high > st['origin']:
+                if d_close > st['origin']:
                     st['state'] = 'BREACHED'
-                if st['state'] == 'BREACHED' and d_close > st['origin'] * 1.01:
-                    to_delete.append(sym)
+                    if d_close > (st['origin'] * 1.015): to_delete.append(sym)
+                else:
+                    st['state'] = 'ACTIVE' # Self-heal!
                     
-        for sym in to_delete:
-            del memory_bank[sym]
+        for sym in to_delete: del memory_bank[sym]
 
     # ----------------------------------------------------------------------
     # LIVE EVALUATION (Current Minute / Target Time)
@@ -254,15 +239,12 @@ def scan_institutional_tape(target_date_str):
     target_dt_obj = pd.to_datetime(target_date_str)
     today_master = rolling_master_df[
         (rolling_master_df['Datetime'] >= target_dt_obj) & 
-        (rolling_master_df['Datetime'] < target_dt_obj + pd.Timedelta(days=1))
+        (rolling_master_df['Datetime'] <= eval_time_current)
     ].copy()
 
-    # The Empty Market Fix (Holiday/Data outage)
-    if today_master.empty: 
-        print(f"\n{COLOR_YELLOW}[Terminal Standby] Market data for {target_date_str} is entirely empty. (Market Closed / Holiday / No Liquidity).{COLOR_RESET}\n")
-        return
+    if today_master.empty: return
 
-    # Pre-check 09:15 Gaps vs Active Anchors
+    # STRICT REAL-TIME PRE-CHECK
     today_latest_ltp = today_master.groupby('Symbol')['Close'].last().to_dict()
     for sym, st in memory_bank.items():
         if sym in today_latest_ltp:
@@ -285,14 +267,19 @@ def scan_institutional_tape(target_date_str):
                 row['First_Date'] = st['date']
                 row['Net_Drift'] = ((row['Close'] - st['origin']) / st['origin']) * 100
                 
-                if st['state'] == 'ACTIVE' and row['Direction'] == st['dir']:
-                    reloads.append(row)
-                elif st['state'] == 'BREACHED' and row['Direction'] == st['dir']:
+                # STRICT PATH ROUTING
+                if st['state'] == 'ACTIVE':
+                    # Only reload if it is physically intact
+                    if (st['dir'] == 1 and row['Close'] >= st['origin']) or (st['dir'] == -1 and row['Close'] <= st['origin']):
+                        if row['Direction'] == st['dir']:
+                            reloads.append(row)
+                            
+                elif st['state'] == 'BREACHED':
                     if (st['dir'] == 1 and row['Close'] > st['origin']) or (st['dir'] == -1 and row['Close'] < st['origin']):
-                        st['state'] = 'ACTIVE' # Reclaimed today
+                        st['state'] = 'ACTIVE' 
                         reclaims.append(row)
 
-    # Gather any remaining breached pivots for observation
+    # Gather any TRUE breached pivots
     for sym, st in memory_bank.items():
         if st['state'] == 'BREACHED' and sym in today_latest_ltp:
             if not any(sym == r['Symbol'] for r in reclaims): 
@@ -335,16 +322,12 @@ def scan_institutional_tape(target_date_str):
     if breached:
         print(f"{COLOR_DIM}⚠️ BREACHED PIVOTS (Phase 3 - Under Observation / Awaiting Resolution){COLOR_RESET}")
         for b in breached:
-            print(f"  {COLOR_YELLOW}⚠️ {b['Symbol']:<12} Anchor: ₹{b['Origin']:.2f} ({b['Dir']}) | Currently trading at: ₹{b['LTP']:.2f} (Awaiting Reclaim or Daily Purge){COLOR_RESET}")
+            print(f"  {COLOR_YELLOW}⚠️ {b['Symbol']:<12} Anchor: ₹{b['Origin']:.2f} ({b['Dir']}) | Currently trading at: ₹{b['LTP']:.2f}{COLOR_RESET}")
         print("")
 
     if not any([fresh_intrusions, reloads, reclaims, breached]):
-        print(f"{COLOR_DIM}[Terminal Silent] No active institutional structure passing strict filters at this minute.{COLOR_RESET}\n")
+        print(f"{COLOR_DIM}[Terminal Silent] No active institutional structure passing strict filters.{COLOR_RESET}\n")
 
-
-# ==============================================================================
-# 4. RUN EXECUTOR (With Weekend Rollover Defense)
-# ==============================================================================
 def run_production_sweep():
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--date", type=str, default="")
@@ -355,20 +338,15 @@ def run_production_sweep():
     is_backtest = bool(raw_date_str)
 
     if not is_backtest:
-        # Live run: Get current date and handle weekends automatically
         target_dt = datetime.utcnow() + timedelta(hours=5, minutes=30)
-        
-        # Weekend Fallback Protocol
-        if target_dt.weekday() == 5: # Saturday
+        if target_dt.weekday() == 5: 
             print(f"{COLOR_YELLOW}[System Notice] Market closed (Saturday). Auto-rolling back to Friday's closing tape.{COLOR_RESET}")
             target_dt -= timedelta(days=1)
-        elif target_dt.weekday() == 6: # Sunday
+        elif target_dt.weekday() == 6: 
             print(f"{COLOR_YELLOW}[System Notice] Market closed (Sunday). Auto-rolling back to Friday's closing tape.{COLOR_RESET}")
             target_dt -= timedelta(days=2)
-            
         target_date_str = target_dt.strftime("%Y-%m-%d")
     else:
-        # Backtest run: Assume user explicitly wants this date
         target_date_str = datetime.strptime(raw_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
     
     if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
@@ -381,4 +359,3 @@ if __name__ == "__main__":
     import warnings
     warnings.filterwarnings("ignore")
     run_production_sweep()
-
