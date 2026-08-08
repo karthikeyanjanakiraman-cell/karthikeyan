@@ -77,7 +77,7 @@ def get_past_trading_days(target_date_str, num_days=20):
     return trading_days
 
 # ==============================================================================
-# 2. TRI-DELTA VELOCITY ENGINE (Directional Percentile Math)
+# 2. TRI-DELTA VELOCITY ENGINE
 # ==============================================================================
 def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15):
     if master_df is None or master_df.empty or 'Datetime' not in master_df.columns:
@@ -125,7 +125,6 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
     merged['Eff_Delta'] = merged['Rec_Eff_Rank'] - merged['Cum_Eff_Rank']
     
     merged['Direction'] = np.where(merged['Rec_Pct_Move'] > 0, 1, -1)
-    
     merged['V_Score'] = merged['Vol_Delta'] * merged['Direction']
     merged['M_Score'] = merged['Mom_Delta'] * merged['Direction']
     merged['E_Score'] = merged['Eff_Delta'] * merged['Direction']
@@ -137,13 +136,13 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
     return merged
 
 # ==============================================================================
-# 3. STATE-BASED MEMORY ENGINE & TAPE PRINTER
+# 3. STATE-BASED MEMORY ENGINE (With 09:15 Gap Check & TTL Zombie Purge)
 # ==============================================================================
 def scan_institutional_tape(target_date_str):
     print(f"\n📡 Initiating State-Based Tri-Delta Engine for {target_date_str}...")
     universe = get_dynamic_fno_universe()
     if not universe:
-        print(f"⚠️ {COLOR_RED}No F&O universe found. Please check Upstox API or Token.{COLOR_RESET}")
+        print(f"⚠️ {COLOR_RED}No F&O universe found.{COLOR_RESET}")
         return
         
     trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
@@ -178,7 +177,7 @@ def scan_institutional_tape(target_date_str):
         eval_time_current = current_now.replace(second=0, microsecond=0) - timedelta(minutes=1)
 
     # ----------------------------------------------------------------------
-    # REBUILDING THE STATE MACHINE (The Self-Healing Version)
+    # CONTINUOUS REBUILD 
     # ----------------------------------------------------------------------
     memory_bank = {} 
     
@@ -187,29 +186,50 @@ def scan_institutional_tape(target_date_str):
         day_master = rolling_master_df[(rolling_master_df['Datetime'] >= day_dt) & (rolling_master_df['Datetime'] < day_dt + pd.Timedelta(days=1))]
         if day_master.empty: continue
 
+        # 1. NEW: OVERNIGHT GAP DETECTION (09:15 AM OPEN PING)
+        morning_open = day_master.groupby('Symbol').first().reset_index()
+        m_dict = morning_open.set_index('Symbol')['Open'].to_dict()
+        
+        for sym, st in memory_bank.items():
+            if sym in m_dict:
+                op = m_dict[sym]
+                if st['state'] == 'ACTIVE':
+                    if (st['dir'] == 1 and op < st['origin']) or (st['dir'] == -1 and op > st['origin']):
+                        st['state'] = 'BREACHED'
+                        st['breach_time'] = f"{day} 09:15 (GAP)"
+                        st['breach_days'] = 0  # Reset TTL counter
+
+        # 2. STANDARD INTRADAY 15-MIN LOOP
         day_start = day_dt + pd.Timedelta(hours=9, minutes=15)
         day_end = day_dt + pd.Timedelta(hours=15, minutes=15) if day != target_date_str else eval_time_current
-
         time_steps = pd.date_range(start=day_start + pd.Timedelta(minutes=15), end=day_end, freq='15min')
                                    
         for t in time_steps:
+            t_candles = day_master[day_master['Datetime'] == t].set_index('Symbol')['Close'].to_dict()
+            for sym, st in memory_bank.items():
+                if sym in t_candles:
+                    ltp = t_candles[sym]
+                    if st['state'] == 'ACTIVE':
+                        if (st['dir'] == 1 and ltp < st['origin']) or (st['dir'] == -1 and ltp > st['origin']):
+                            st['state'] = 'BREACHED'
+                            st['breach_time'] = t.strftime('%Y-%m-%d %H:%M')
+                            st['breach_days'] = 0
+                    elif st['state'] == 'BREACHED':
+                        if (st['dir'] == 1 and ltp >= st['origin']) or (st['dir'] == -1 and ltp <= st['origin']):
+                            st['state'] = 'ACTIVE'
+                            st['breach_time'] = None
+                            st['breach_days'] = 0
+
             anomalies = calculate_velocity_leaderboard(day_master, t, window_mins=15)
             for _, row in anomalies.iterrows():
                 sym = row['Symbol']
                 price = row['Close']
                 direction = row['Direction']
-                
                 if sym not in memory_bank:
-                    memory_bank[sym] = {
-                        'state': 'ACTIVE', 'origin': price, 'date': day, 'time': t.strftime('%H:%M'), 'dir': direction
-                    }
-                else:
-                    st = memory_bank[sym]
-                    if st['state'] == 'BREACHED' and st['dir'] == direction:
-                        if (st['dir'] == 1 and price > st['origin']) or (st['dir'] == -1 and price < st['origin']):
-                            st['state'] = 'ACTIVE'
+                    # Initialize with 0 breach_days
+                    memory_bank[sym] = {'state': 'ACTIVE', 'origin': price, 'date': day, 'dir': direction, 'breach_time': None, 'breach_days': 0}
                             
-        # End-of-Day Purge & HEAL Protocol (Fixes false breaches)
+        # 3. END OF DAY PURGE (Structural Kill & Time Decay TTL)
         daily_agg = day_master.groupby('Symbol').agg({'Close': 'last'}).reset_index()
         daily_dict = daily_agg.set_index('Symbol').to_dict('index')
         
@@ -218,23 +238,24 @@ def scan_institutional_tape(target_date_str):
             if sym not in daily_dict: continue
             d_close = daily_dict[sym]['Close']
             
-            if st['dir'] == 1: # Bullish
-                if d_close < st['origin']:
-                    st['state'] = 'BREACHED'
-                    if d_close < (st['origin'] * 0.985): to_delete.append(sym) # Purge 1.5% below
-                else:
-                    st['state'] = 'ACTIVE' # Self-heal!
-            else: # Bearish
-                if d_close > st['origin']:
-                    st['state'] = 'BREACHED'
-                    if d_close > (st['origin'] * 1.015): to_delete.append(sym)
-                else:
-                    st['state'] = 'ACTIVE' # Self-heal!
+            if st['state'] == 'BREACHED':
+                # Kill Switch A: Price fell > 1.5% below anchor
+                if st['dir'] == 1 and d_close < (st['origin'] * 0.985): 
+                    to_delete.append(sym)
+                    continue
+                elif st['dir'] == -1 and d_close > (st['origin'] * 1.015): 
+                    to_delete.append(sym)
+                    continue
+                
+                # Kill Switch B: Zombie Footprint TTL (Fails to reclaim after 2 daily closes)
+                st['breach_days'] += 1
+                if st['breach_days'] >= 2:
+                    to_delete.append(sym)
                     
         for sym in to_delete: del memory_bank[sym]
 
     # ----------------------------------------------------------------------
-    # LIVE EVALUATION (Current Minute / Target Time)
+    # LIVE EVALUATION (Final Minute Check)
     # ----------------------------------------------------------------------
     target_dt_obj = pd.to_datetime(target_date_str)
     today_master = rolling_master_df[
@@ -244,16 +265,32 @@ def scan_institutional_tape(target_date_str):
 
     if today_master.empty: return
 
-    # STRICT REAL-TIME PRE-CHECK
+    # LIVE 09:15 OVERNIGHT GAP CHECK FOR TODAY
+    today_open = today_master.groupby('Symbol').first().reset_index()
+    t_open_dict = today_open.set_index('Symbol')['Open'].to_dict()
+    for sym, st in memory_bank.items():
+        if sym in t_open_dict:
+            op = t_open_dict[sym]
+            if st['state'] == 'ACTIVE':
+                if (st['dir'] == 1 and op < st['origin']) or (st['dir'] == -1 and op > st['origin']):
+                    st['state'] = 'BREACHED'
+                    st['breach_time'] = f"{target_date_str} 09:15 (GAP)"
+
+    # FINAL MINUTE PING
     today_latest_ltp = today_master.groupby('Symbol')['Close'].last().to_dict()
     for sym, st in memory_bank.items():
         if sym in today_latest_ltp:
             ltp = today_latest_ltp[sym]
-            if st['dir'] == 1 and ltp < st['origin']: st['state'] = 'BREACHED'
-            elif st['dir'] == -1 and ltp > st['origin']: st['state'] = 'BREACHED'
+            if st['state'] == 'ACTIVE':
+                if (st['dir'] == 1 and ltp < st['origin']) or (st['dir'] == -1 and ltp > st['origin']):
+                    st['state'] = 'BREACHED'
+                    st['breach_time'] = eval_time_current.strftime('%Y-%m-%d %H:%M')
+            elif st['state'] == 'BREACHED':
+                if (st['dir'] == 1 and ltp >= st['origin']) or (st['dir'] == -1 and ltp <= st['origin']):
+                    st['state'] = 'ACTIVE'
+                    st['breach_time'] = None
 
     curr_anomalies = calculate_velocity_leaderboard(today_master, eval_time_current, window_mins=15)
-
     fresh_intrusions, reloads, reclaims, breached = [], [], [], []
 
     if not curr_anomalies.empty:
@@ -267,23 +304,23 @@ def scan_institutional_tape(target_date_str):
                 row['First_Date'] = st['date']
                 row['Net_Drift'] = ((row['Close'] - st['origin']) / st['origin']) * 100
                 
-                # STRICT PATH ROUTING
-                if st['state'] == 'ACTIVE':
-                    # Only reload if it is physically intact
-                    if (st['dir'] == 1 and row['Close'] >= st['origin']) or (st['dir'] == -1 and row['Close'] <= st['origin']):
-                        if row['Direction'] == st['dir']:
-                            reloads.append(row)
-                            
-                elif st['state'] == 'BREACHED':
+                # STRICT GATEKEEPING
+                if st['state'] == 'ACTIVE' and row['Direction'] == st['dir']:
+                    reloads.append(row)
+                elif st['state'] == 'BREACHED' and row['Direction'] == st['dir']:
                     if (st['dir'] == 1 and row['Close'] > st['origin']) or (st['dir'] == -1 and row['Close'] < st['origin']):
                         st['state'] = 'ACTIVE' 
+                        st['breach_time'] = None
                         reclaims.append(row)
 
-    # Gather any TRUE breached pivots
     for sym, st in memory_bank.items():
         if st['state'] == 'BREACHED' and sym in today_latest_ltp:
             if not any(sym == r['Symbol'] for r in reclaims): 
-                breached.append({'Symbol': sym, 'LTP': today_latest_ltp[sym], 'Origin': st['origin'], 'Dir': "BULLISH" if st['dir']==1 else "BEARISH"})
+                breached.append({
+                    'Symbol': sym, 'LTP': today_latest_ltp[sym], 'Origin': st['origin'], 
+                    'Dir': "BULLISH" if st['dir']==1 else "BEARISH",
+                    'Time': st['breach_time']
+                })
 
     # ----------------------------------------------------------------------
     # TERMINAL OUTPUT
@@ -311,7 +348,7 @@ def scan_institutional_tape(target_date_str):
         print("")
 
     if reclaims:
-        print(f"{COLOR_BOLD}🪤 INSTITUTIONAL RECLAIMS (Phase 4 - Liquidity Traps / Squeezes){COLOR_RESET}")
+        print(f"{COLOR_BOLD}🪤 INSTITUTIONAL RECLAIMS (Phase 4 - Liquidity Traps){COLOR_RESET}")
         for row in reclaims:
             sym, jump, ltp = row['Symbol'], row['Total_Score'], row['Close']
             color = COLOR_MAGENTA
@@ -320,9 +357,10 @@ def scan_institutional_tape(target_date_str):
         print("")
 
     if breached:
-        print(f"{COLOR_DIM}⚠️ BREACHED PIVOTS (Phase 3 - Under Observation / Awaiting Resolution){COLOR_RESET}")
+        print(f"{COLOR_DIM}⚠️ BREACHED PIVOTS (Phase 3 - Under Observation){COLOR_RESET}")
         for b in breached:
-            print(f"  {COLOR_YELLOW}⚠️ {b['Symbol']:<12} Anchor: ₹{b['Origin']:.2f} ({b['Dir']}) | Currently trading at: ₹{b['LTP']:.2f}{COLOR_RESET}")
+            b_time = b['Time'] if b['Time'] else 'Pending'
+            print(f"  {COLOR_YELLOW}⚠️ {b['Symbol']:<12} Anchor: ₹{b['Origin']:.2f} ({b['Dir']}) | LTP: ₹{b['LTP']:.2f} | 🕒 Breached At: {b_time}{COLOR_RESET}")
         print("")
 
     if not any([fresh_intrusions, reloads, reclaims, breached]):
@@ -340,19 +378,18 @@ def run_production_sweep():
     if not is_backtest:
         target_dt = datetime.utcnow() + timedelta(hours=5, minutes=30)
         if target_dt.weekday() == 5: 
-            print(f"{COLOR_YELLOW}[System Notice] Market closed (Saturday). Auto-rolling back to Friday's closing tape.{COLOR_RESET}")
+            print(f"{COLOR_YELLOW}[System Notice] Market closed (Saturday). Auto-rolling back to Friday's tape.{COLOR_RESET}")
             target_dt -= timedelta(days=1)
         elif target_dt.weekday() == 6: 
-            print(f"{COLOR_YELLOW}[System Notice] Market closed (Sunday). Auto-rolling back to Friday's closing tape.{COLOR_RESET}")
+            print(f"{COLOR_YELLOW}[System Notice] Market closed (Sunday). Auto-rolling back to Friday's tape.{COLOR_RESET}")
             target_dt -= timedelta(days=2)
         target_date_str = target_dt.strftime("%Y-%m-%d")
     else:
         target_date_str = datetime.strptime(raw_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
     
     if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
-        print(f"❌ {COLOR_RED}Error: UPSTOX_ACCESS_TOKEN not found in environment variables.{COLOR_RESET}")
+        print(f"❌ {COLOR_RED}Error: UPSTOX_ACCESS_TOKEN not found.{COLOR_RESET}")
         return
-
     scan_institutional_tape(target_date_str)
 
 if __name__ == "__main__":
