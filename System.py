@@ -24,8 +24,8 @@ COLOR_DIM = '\033[2m'
 COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 
-SCORE_THRESHOLD = 120    
-BACKTRACE_DAYS = 20      
+SCORE_THRESHOLD = 120    # Minimum absolute Tri-Delta score to trigger an anomaly
+BACKTRACE_DAYS = 20      # 1 F&O Monthly Derivative Cycle
 
 # ==============================================================================
 # 1. LIVE INGESTION (F&O Universe)
@@ -70,7 +70,7 @@ def get_past_trading_days(target_date_str, num_days=20):
     trading_days = []
     current_dt = target_dt
     while len(trading_days) < num_days:
-        if current_dt.weekday() < 5:  
+        if current_dt.weekday() < 5:  # Skip weekends (0=Mon, 4=Fri)
             trading_days.append(current_dt.strftime("%Y-%m-%d"))
         current_dt -= timedelta(days=1)
     trading_days.reverse()
@@ -124,6 +124,7 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
     merged['Mom_Delta'] = merged['Rec_Mom_Rank'] - merged['Cum_Mom_Rank']
     merged['Eff_Delta'] = merged['Rec_Eff_Rank'] - merged['Cum_Eff_Rank']
     
+    # Vector Alignment
     merged['Direction'] = np.where(merged['Rec_Pct_Move'] > 0, 1, -1)
     merged['V_Score'] = merged['Vol_Delta'] * merged['Direction']
     merged['M_Score'] = merged['Mom_Delta'] * merged['Direction']
@@ -136,7 +137,7 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
     return merged
 
 # ==============================================================================
-# 3. STATE-BASED MEMORY ENGINE (With 09:15 Gap Check & TTL Zombie Purge)
+# 3. STATE-BASED MEMORY ENGINE (Continuous Timestamping & Strict Routing)
 # ==============================================================================
 def scan_institutional_tape(target_date_str):
     print(f"\n📡 Initiating State-Based Tri-Delta Engine for {target_date_str}...")
@@ -177,7 +178,7 @@ def scan_institutional_tape(target_date_str):
         eval_time_current = current_now.replace(second=0, microsecond=0) - timedelta(minutes=1)
 
     # ----------------------------------------------------------------------
-    # CONTINUOUS REBUILD 
+    # CONTINUOUS HISTORICAL REBUILD 
     # ----------------------------------------------------------------------
     memory_bank = {} 
     
@@ -186,7 +187,7 @@ def scan_institutional_tape(target_date_str):
         day_master = rolling_master_df[(rolling_master_df['Datetime'] >= day_dt) & (rolling_master_df['Datetime'] < day_dt + pd.Timedelta(days=1))]
         if day_master.empty: continue
 
-        # 1. NEW: OVERNIGHT GAP DETECTION (09:15 AM OPEN PING)
+        # 1. OVERNIGHT GAP DETECTION (09:15 AM OPEN PING)
         morning_open = day_master.groupby('Symbol').first().reset_index()
         m_dict = morning_open.set_index('Symbol')['Open'].to_dict()
         
@@ -197,7 +198,7 @@ def scan_institutional_tape(target_date_str):
                     if (st['dir'] == 1 and op < st['origin']) or (st['dir'] == -1 and op > st['origin']):
                         st['state'] = 'BREACHED'
                         st['breach_time'] = f"{day} 09:15 (GAP)"
-                        st['breach_days'] = 0  # Reset TTL counter
+                        st['breach_days'] = 0  
 
         # 2. STANDARD INTRADAY 15-MIN LOOP
         day_start = day_dt + pd.Timedelta(hours=9, minutes=15)
@@ -226,10 +227,9 @@ def scan_institutional_tape(target_date_str):
                 price = row['Close']
                 direction = row['Direction']
                 if sym not in memory_bank:
-                    # Initialize with 0 breach_days
-                    memory_bank[sym] = {'state': 'ACTIVE', 'origin': price, 'date': day, 'dir': direction, 'breach_time': None, 'breach_days': 0}
+                    memory_bank[sym] = {'state': 'ACTIVE', 'origin': price, 'date': day, 'time': t.strftime('%H:%M'), 'dir': direction, 'breach_time': None, 'breach_days': 0}
                             
-        # 3. END OF DAY PURGE (Structural Kill & Time Decay TTL)
+        # 3. END OF DAY PURGE (Kill Switch & Zombie TTL)
         daily_agg = day_master.groupby('Symbol').agg({'Close': 'last'}).reset_index()
         daily_dict = daily_agg.set_index('Symbol').to_dict('index')
         
@@ -239,7 +239,6 @@ def scan_institutional_tape(target_date_str):
             d_close = daily_dict[sym]['Close']
             
             if st['state'] == 'BREACHED':
-                # Kill Switch A: Price fell > 1.5% below anchor
                 if st['dir'] == 1 and d_close < (st['origin'] * 0.985): 
                     to_delete.append(sym)
                     continue
@@ -247,7 +246,6 @@ def scan_institutional_tape(target_date_str):
                     to_delete.append(sym)
                     continue
                 
-                # Kill Switch B: Zombie Footprint TTL (Fails to reclaim after 2 daily closes)
                 st['breach_days'] += 1
                 if st['breach_days'] >= 2:
                     to_delete.append(sym)
@@ -276,7 +274,7 @@ def scan_institutional_tape(target_date_str):
                     st['state'] = 'BREACHED'
                     st['breach_time'] = f"{target_date_str} 09:15 (GAP)"
 
-    # FINAL MINUTE PING
+    # FINAL MINUTE PING (Pre-Gatekeeping)
     today_latest_ltp = today_master.groupby('Symbol')['Close'].last().to_dict()
     for sym, st in memory_bank.items():
         if sym in today_latest_ltp:
@@ -313,20 +311,25 @@ def scan_institutional_tape(target_date_str):
                         st['breach_time'] = None
                         reclaims.append(row)
 
+    # Gather True Breaches
     for sym, st in memory_bank.items():
         if st['state'] == 'BREACHED' and sym in today_latest_ltp:
             if not any(sym == r['Symbol'] for r in reclaims): 
                 breached.append({
                     'Symbol': sym, 'LTP': today_latest_ltp[sym], 'Origin': st['origin'], 
                     'Dir': "BULLISH" if st['dir']==1 else "BEARISH",
-                    'Time': st['breach_time']
+                    'Time': st['breach_time'],
+                    'First_Date': st['date'],
+                    'Anchor_Time': st.get('time', '09:15')
                 })
 
     # ----------------------------------------------------------------------
-    # TERMINAL OUTPUT
+    # TERMINAL OUTPUT (Timeline Tree UI)
     # ----------------------------------------------------------------------
+    current_hhmm = eval_time_current.strftime('%H:%M')
+    
     print(f"\n{COLOR_CYAN}================================================================================================{COLOR_RESET}")
-    print(f"{COLOR_BOLD}FULL UNIVERSE TRI-DELTA TAPE | TIME: {eval_time_current.strftime('%H:%M')} IST | DATE: {target_date_str}{COLOR_RESET}")
+    print(f"{COLOR_BOLD}FULL UNIVERSE TRI-DELTA TAPE | TIME: {current_hhmm} IST | DATE: {target_date_str}{COLOR_RESET}")
     print(f"{COLOR_CYAN}================================================================================================{COLOR_RESET}\n")
 
     if fresh_intrusions:
@@ -335,17 +338,25 @@ def scan_institutional_tape(target_date_str):
             sym, jump, ltp = row['Symbol'], row['Total_Score'], row['Close']
             color = COLOR_GREEN if jump > 0 else COLOR_RED
             d_str = "BULLISH" if jump > 0 else "BEARISH"
-            print(f"  {color}🚨 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str:<7}) | LTP: ₹{ltp:<8.2f}{COLOR_RESET}")
-        print("")
+            
+            print(f"  {color}🚨 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str}){COLOR_RESET}")
+            print(f"      └─ 📍 1st Wave (Birth): {target_date_str} @ {current_hhmm} | Price: ₹{ltp:.2f}\n")
 
     if reloads:
         print(f"{COLOR_BOLD}🔄 ALGORITHMIC RELOADS (Phase 2 - Second Waves){COLOR_RESET}")
         for row in reloads:
-            sym, jump, ltp, drift = row['Symbol'], row['Total_Score'], row['Close'], row['Net_Drift']
+            sym, jump, ltp = row['Symbol'], row['Total_Score'], row['Close']
+            raw_drift = row['Net_Drift']
+            true_drift = raw_drift if row['Direction'] == 1 else -raw_drift 
             color = COLOR_GREEN if jump > 0 else COLOR_RED
             d_str = "BULLISH" if jump > 0 else "BEARISH"
-            print(f"  {color}🔄 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str:<7}) | LTP: ₹{ltp:<8.2f} --> [Anchor: {row['First_Date']} @ ₹{row['Origin']:.2f} | Drift: {drift:+.2f}%]{COLOR_RESET}")
-        print("")
+            anchor_date = row['First_Date']
+            anchor_time = memory_bank[sym].get('time', "09:15") 
+            origin_price = row['Origin']
+            
+            print(f"  {color}🔄 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str}){COLOR_RESET}")
+            print(f"      └─ 🌊 1st Wave (Origin): {anchor_date} @ {anchor_time} | Price: ₹{origin_price:.2f}")
+            print(f"      └─ 🌊 2nd Wave (Reload): {target_date_str} @ {current_hhmm} | Price: ₹{ltp:.2f} | Trend Drift: {true_drift:+.2f}%\n")
 
     if reclaims:
         print(f"{COLOR_BOLD}🪤 INSTITUTIONAL RECLAIMS (Phase 4 - Liquidity Traps){COLOR_RESET}")
@@ -353,19 +364,26 @@ def scan_institutional_tape(target_date_str):
             sym, jump, ltp = row['Symbol'], row['Total_Score'], row['Close']
             color = COLOR_MAGENTA
             d_str = "BULLISH" if jump > 0 else "BEARISH"
-            print(f"  {color}🔥 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str:<7}) | RECLAIMED ANCHOR: ₹{row['Origin']:.2f}{COLOR_RESET}")
-        print("")
+            anchor_time = memory_bank[sym].get('time', "09:15")
+            
+            print(f"  {color}🔥 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str}){COLOR_RESET}")
+            print(f"      └─ ⚓ Original Anchor : {row['First_Date']} @ {anchor_time} | Price: ₹{row['Origin']:.2f}")
+            print(f"      └─ 🪤 Trap Reclaimed  : {target_date_str} @ {current_hhmm} | Price: ₹{ltp:.2f}\n")
 
     if breached:
         print(f"{COLOR_DIM}⚠️ BREACHED PIVOTS (Phase 3 - Under Observation){COLOR_RESET}")
         for b in breached:
-            b_time = b['Time'] if b['Time'] else 'Pending'
-            print(f"  {COLOR_YELLOW}⚠️ {b['Symbol']:<12} Anchor: ₹{b['Origin']:.2f} ({b['Dir']}) | LTP: ₹{b['LTP']:.2f} | 🕒 Breached At: {b_time}{COLOR_RESET}")
-        print("")
+            b_time = b['Time'] if b['Time'] else 'Pending Intraday Breakdown'
+            print(f"  {COLOR_YELLOW}⚠️ {b['Symbol']:<12} {b['Dir']} Anchor breached!{COLOR_RESET}")
+            print(f"      └─ ⚓ 1st Wave (Origin): {b['First_Date']} @ {b['Anchor_Time']} | Price: ₹{b['Origin']:.2f}")
+            print(f"      └─ 📉 Breached At      : {b_time} | Current Price: ₹{b['LTP']:.2f}\n")
 
     if not any([fresh_intrusions, reloads, reclaims, breached]):
         print(f"{COLOR_DIM}[Terminal Silent] No active institutional structure passing strict filters.{COLOR_RESET}\n")
 
+# ==============================================================================
+# 4. RUN EXECUTOR (With Weekend Rollover Defense)
+# ==============================================================================
 def run_production_sweep():
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--date", type=str, default="")
