@@ -24,7 +24,8 @@ COLOR_DIM = '\033[2m'
 COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 
-SCORE_THRESHOLD = 120    # Minimum absolute Tri-Delta score to trigger an anomaly
+SCORE_THRESHOLD = 160    # Quad-Delta max is 400
+MIN_VECTOR_FLOOR = 10    # Minimum percentile contribution per variable
 BACKTRACE_DAYS = 20      # 1 F&O Monthly Derivative Cycle
 
 # ==============================================================================
@@ -86,12 +87,15 @@ def get_past_trading_days(target_date_str, num_days=20):
         return []
 
 # ==============================================================================
-# 2. TRI-DELTA VELOCITY ENGINE (Safe Percentile Ranks)
+# 2. QUAD-DELTA VELOCITY ENGINE & TANDEM LOCK
 # ==============================================================================
 def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15):
     try:
         if master_df is None or master_df.empty or 'Datetime' not in master_df.columns:
             return pd.DataFrame()
+
+        df_calc = master_df.copy()
+        df_calc['candle_range'] = ((df_calc['High'] - df_calc['Low']) / (df_calc['Open'] + 1e-8)) * 100
 
         start_of_day = pd.to_datetime(current_eval_time.date()) + pd.Timedelta(hours=9, minutes=15)
         recent_start = current_eval_time - pd.Timedelta(minutes=window_mins)
@@ -99,52 +103,73 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
         if recent_start <= start_of_day:
             return pd.DataFrame()
             
-        cum_df = master_df[(master_df['Datetime'] >= start_of_day) & (master_df['Datetime'] < recent_start)]
-        rec_df = master_df[(master_df['Datetime'] >= recent_start) & (master_df['Datetime'] <= current_eval_time)]
+        cum_df = df_calc[(df_calc['Datetime'] >= start_of_day) & (df_calc['Datetime'] < recent_start)]
+        rec_df = df_calc[(df_calc['Datetime'] >= recent_start) & (df_calc['Datetime'] <= current_eval_time)]
         
         if cum_df.empty or rec_df.empty:
             return pd.DataFrame()
             
-        g_cum = cum_df.groupby('Symbol').agg({'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'}).reset_index()
+        g_cum = cum_df.groupby('Symbol').agg({'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum', 'candle_range': 'mean'}).reset_index()
         g_cum = g_cum[g_cum['Turnover'] > 0]
-        if g_cum.empty:
-            return pd.DataFrame()
+        if g_cum.empty: return pd.DataFrame()
         
         g_cum['Cum_Pct_Move'] = ((g_cum['Close'] - g_cum['Open']) / (g_cum['Open'] + 1e-8)) * 100
         g_cum['Cum_Efficiency'] = (g_cum['Close'] - g_cum['Open']).abs() / (g_cum['abs_move'] + 1e-8)
         
         g_cum['Cum_Vol_Rank'] = g_cum['Turnover'].rank(pct=True) * 100
+        g_cum['Cum_P_Rank'] = g_cum['candle_range'].rank(pct=True) * 100
         g_cum['Cum_Mom_Rank'] = g_cum['Cum_Pct_Move'].abs().rank(pct=True) * 100
         g_cum['Cum_Eff_Rank'] = g_cum['Cum_Efficiency'].rank(pct=True) * 100
 
-        g_rec = rec_df.groupby('Symbol').agg({'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'}).reset_index()
+        g_rec = rec_df.groupby('Symbol').agg({'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum', 'candle_range': 'mean'}).reset_index()
         g_rec = g_rec[g_rec['Turnover'] > 0]
-        if g_rec.empty:
-            return pd.DataFrame()
+        if g_rec.empty: return pd.DataFrame()
         
         g_rec['Rec_Pct_Move'] = ((g_rec['Close'] - g_rec['Open']) / (g_rec['Open'] + 1e-8)) * 100
         g_rec['Rec_Efficiency'] = (g_rec['Close'] - g_rec['Open']).abs() / (g_rec['abs_move'] + 1e-8)
         
         g_rec['Rec_Vol_Rank'] = g_rec['Turnover'].rank(pct=True) * 100
+        g_rec['Rec_P_Rank'] = g_rec['candle_range'].rank(pct=True) * 100
         g_rec['Rec_Mom_Rank'] = g_rec['Rec_Pct_Move'].abs().rank(pct=True) * 100
         g_rec['Rec_Eff_Rank'] = g_rec['Rec_Efficiency'].rank(pct=True) * 100
 
-        merged = pd.merge(g_rec[['Symbol', 'Rec_Pct_Move', 'Close', 'Rec_Vol_Rank', 'Rec_Mom_Rank', 'Rec_Eff_Rank']], 
-                          g_cum[['Symbol', 'Cum_Vol_Rank', 'Cum_Mom_Rank', 'Cum_Eff_Rank']], on='Symbol', how='inner')
+        merged = pd.merge(g_rec[['Symbol', 'Rec_Pct_Move', 'Close', 'Rec_Vol_Rank', 'Rec_P_Rank', 'Rec_Mom_Rank', 'Rec_Eff_Rank']], 
+                          g_cum[['Symbol', 'Cum_Vol_Rank', 'Cum_P_Rank', 'Cum_Mom_Rank', 'Cum_Eff_Rank']], on='Symbol', how='inner')
         
-        if merged.empty:
-            return pd.DataFrame()
+        if merged.empty: return pd.DataFrame()
 
         merged['Vol_Delta'] = merged['Rec_Vol_Rank'] - merged['Cum_Vol_Rank']
+        merged['P_Delta'] = merged['Rec_P_Rank'] - merged['Cum_P_Rank']
         merged['Mom_Delta'] = merged['Rec_Mom_Rank'] - merged['Cum_Mom_Rank']
         merged['Eff_Delta'] = merged['Rec_Eff_Rank'] - merged['Cum_Eff_Rank']
         
         merged['Direction'] = np.where(merged['Rec_Pct_Move'] > 0, 1, -1)
         merged['V_Score'] = merged['Vol_Delta'] * merged['Direction']
+        merged['P_Score'] = merged['P_Delta'] * merged['Direction']
         merged['M_Score'] = merged['Mom_Delta'] * merged['Direction']
         merged['E_Score'] = merged['Eff_Delta'] * merged['Direction']
         
-        merged['Total_Score'] = merged['V_Score'] + merged['M_Score'] + merged['E_Score']
+        # ------------------------------------------------------------------
+        # TANDEM LOCK (Vector Cohesion Filter)
+        # ------------------------------------------------------------------
+        # 1. Minimum Floor: No variable can be a freeloader
+        merged = merged[
+            (merged['V_Score'].abs() >= MIN_VECTOR_FLOOR) &
+            (merged['P_Score'].abs() >= MIN_VECTOR_FLOOR) &
+            (merged['M_Score'].abs() >= MIN_VECTOR_FLOOR) &
+            (merged['E_Score'].abs() >= MIN_VECTOR_FLOOR)
+        ]
+        
+        # 2. Sign Agreement: All vectors must align with the Direction
+        merged['Valid_Tandem'] = (
+            (np.sign(merged['V_Score']) == merged['Direction']) &
+            (np.sign(merged['P_Score']) == merged['Direction']) &
+            (np.sign(merged['M_Score']) == merged['Direction']) &
+            (np.sign(merged['E_Score']) == merged['Direction'])
+        )
+        merged = merged[merged['Valid_Tandem']]
+
+        merged['Total_Score'] = merged['V_Score'] + merged['P_Score'] + merged['M_Score'] + merged['E_Score']
         merged = merged[merged['Total_Score'].abs() >= SCORE_THRESHOLD]
         merged = merged.sort_values(by='Total_Score', key=abs, ascending=False)
         
@@ -156,7 +181,7 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
 # 3. STATE-BASED MEMORY ENGINE (Ironclad Gatekeeping & Universal Drift Math)
 # ==============================================================================
 def scan_institutional_tape(target_date_str):
-    print(f"\n📡 Initiating State-Based Tri-Delta Engine for {target_date_str}...")
+    print(f"\n📡 Initiating State-Based Quad-Delta Engine for {target_date_str}...")
     universe = get_dynamic_fno_universe()
     if not universe:
         print(f"⚠️ {COLOR_RED}No F&O universe found or API connection failed.{COLOR_RESET}")
@@ -392,24 +417,26 @@ def scan_institutional_tape(target_date_str):
                 })
 
     # ----------------------------------------------------------------------
-    # TERMINAL OUTPUT (Timeline Tree UI)
+    # TERMINAL OUTPUT (4D Temporal UI Matrix)
     # ----------------------------------------------------------------------
     print(f"\n{COLOR_CYAN}================================================================================================{COLOR_RESET}")
-    print(f"{COLOR_BOLD}FULL UNIVERSE TRI-DELTA SESSION TAPE | DATE: {target_date_str}{COLOR_RESET}")
+    print(f"{COLOR_BOLD}FULL UNIVERSE QUAD-DELTA SESSION TAPE | DATE: {target_date_str}{COLOR_RESET}")
     print(f"{COLOR_CYAN}================================================================================================{COLOR_RESET}\n")
 
     if valid_fresh:
-        print(f"{COLOR_BOLD}⚡ FRESH INTRUSIONS (Phase 1 - Day-1 Births){COLOR_RESET}")
+        print(f"{COLOR_BOLD}⚡ BASKET 1: FRESH INTRUSIONS (Phase 1 - Day-1 Births){COLOR_RESET}")
         for sym, row in valid_fresh.items():
             jump, ltp = row['Total_Score'], row['Close']
             color = COLOR_GREEN if jump > 0 else COLOR_RED
             d_str = "BULLISH" if jump > 0 else "BEARISH"
             eval_t = row.get('Eval_Time', '15:15')
-            print(f"  {color}🚨 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str}){COLOR_RESET}")
-            print(f"      └─ 📍 1st Wave (Birth): {target_date_str} @ {eval_t} | Price: ₹{ltp:.2f}\n")
+            
+            print(f"  {color}🚨 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} P:{row['P_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str}){COLOR_RESET}")
+            print(f"      └─ ⚓ Anchor : {target_date_str} @ {eval_t} | LTP: ₹{ltp:.2f}")
+            print(f"      └─ 🎯 Latest : {target_date_str} @ 15:30 EOD | LTP: ₹{final_ltp_dict.get(sym, ltp):.2f}\n")
 
     if all_reloads:
-        print(f"{COLOR_BOLD}🔄 ALGORITHMIC RELOADS (Phase 2 - Second Waves){COLOR_RESET}")
+        print(f"{COLOR_BOLD}🔄 BASKET 2: ALGORITHMIC RELOADS (Phase 2 - Institutional Continuations){COLOR_RESET}")
         for sym, row in all_reloads.items():
             jump, ltp = row['Total_Score'], row['Close']
             true_drift = row['Net_Drift']
@@ -419,29 +446,31 @@ def scan_institutional_tape(target_date_str):
             anchor_time = memory_bank[sym].get('time', "09:15") 
             origin_price = row['Origin']
             eval_t = row.get('Eval_Time', '15:15')
-            print(f"  {color}🔄 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str}){COLOR_RESET}")
-            print(f"      └─ 🌊 1st Wave (Origin): {anchor_date} @ {anchor_time} | Price: ₹{origin_price:.2f}")
-            print(f"      └─ 🌊 2nd Wave (Reload): {target_date_str} @ {eval_t} | Price: ₹{ltp:.2f} | Trend Profit Drift: {true_drift:+.2f}%\n")
+            
+            print(f"  {color}🔄 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} P:{row['P_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str}){COLOR_RESET}")
+            print(f"      └─ ⚓ Anchor : {anchor_date} @ {anchor_time} | LTP: ₹{origin_price:.2f}")
+            print(f"      └─ 🎯 Latest : {target_date_str} @ {eval_t} | LTP: ₹{ltp:.2f} (Trend Profit Drift: {true_drift:+.2f}%)\n")
+
+    if breached:
+        print(f"{COLOR_DIM}⚠️ BASKET 3: BREACHED PIVOTS (Phase 3 - Trapped Capital / Dead Trends){COLOR_RESET}")
+        for b in breached:
+            b_time = b['Time'] if b['Time'] else 'Pending Intraday Breakdown'
+            print(f"  {COLOR_YELLOW}⚠️ {b['Symbol']:<12} {b['Dir']} Anchor shattered!{COLOR_RESET}")
+            print(f"      └─ ⚓ Anchor : {b['First_Date']} @ {b['Anchor_Time']} | LTP: ₹{b['Origin']:.2f}")
+            print(f"      └─ 🎯 Latest : Breached At {b_time} | Current LTP: ₹{b['LTP']:.2f}\n")
 
     if all_reclaims:
-        print(f"{COLOR_BOLD}🪤 INSTITUTIONAL RECLAIMS (Phase 4 - Liquidity Traps){COLOR_RESET}")
+        print(f"{COLOR_BOLD}🪤 BASKET 4: INSTITUTIONAL RECLAIMS (Phase 4 - Liquidity Traps){COLOR_RESET}")
         for sym, row in all_reclaims.items():
             jump, ltp = row['Total_Score'], row['Close']
             color = COLOR_MAGENTA
             d_str = "BULLISH" if jump > 0 else "BEARISH"
             anchor_time = memory_bank[sym].get('time', "09:15")
             eval_t = row.get('Eval_Time', '15:15')
-            print(f"  {color}🔥 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str}){COLOR_RESET}")
-            print(f"      └─ ⚓ Original Anchor : {row['First_Date']} @ {anchor_time} | Price: ₹{row['Origin']:.2f}")
-            print(f"      └─ 🪤 Trap Reclaimed  : {target_date_str} @ {eval_t} | Price: ₹{ltp:.2f}\n")
-
-    if breached:
-        print(f"{COLOR_DIM}⚠️ BREACHED PIVOTS (Phase 3 - Under Observation){COLOR_RESET}")
-        for b in breached:
-            b_time = b['Time'] if b['Time'] else 'Pending Intraday Breakdown'
-            print(f"  {COLOR_YELLOW}⚠️ {b['Symbol']:<12} {b['Dir']} Anchor breached!{COLOR_RESET}")
-            print(f"      └─ ⚓ 1st Wave (Origin): {b['First_Date']} @ {b['Anchor_Time']} | Price: ₹{b['Origin']:.2f}")
-            print(f"      └─ 📉 Breached At      : {b_time} | Current Price: ₹{b['LTP']:.2f}\n")
+            
+            print(f"  {color}🔥 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} P:{row['P_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str}){COLOR_RESET}")
+            print(f"      └─ ⚓ Anchor : {row['First_Date']} @ {anchor_time} | LTP: ₹{row['Origin']:.2f}")
+            print(f"      └─ 🎯 Latest : Reclaimed At {target_date_str} @ {eval_t} | LTP: ₹{ltp:.2f}\n")
 
     if not any([valid_fresh, all_reloads, all_reclaims, breached]):
         print(f"{COLOR_DIM}[Terminal Silent] No active institutional structure passing strict filters.{COLOR_RESET}\n")
@@ -479,3 +508,4 @@ if __name__ == "__main__":
     import warnings
     warnings.filterwarnings("ignore")
     run_production_sweep()
+
