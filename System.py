@@ -306,7 +306,7 @@ def scan_institutional_tape(target_date_str):
                         continue
                     
                     st['breach_days'] += 1
-                    if st['breach_days'] >= 2:
+                    if st['breach_days'] >= MAX_BREACH_DAYS:
                         to_delete.append(sym)
                         
             for sym in to_delete: 
