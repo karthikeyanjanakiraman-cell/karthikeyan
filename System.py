@@ -34,7 +34,8 @@ def get_dynamic_fno_universe():
     nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
     try:
         response = requests.get(nse_url, timeout=5)
-        if response.status_code != 200: return []
+        if response.status_code != 200:
+            return []
         nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
         fno_underlying = {item.get("underlying_symbol") for item in nse_data if item.get("segment") == "NSE_FO" and item.get("underlying_symbol")}
         return [{"symbol": item.get("trading_symbol"), "key": item.get("instrument_key")} for item in nse_data if item.get("segment") in ("NSE_EQ", "NSE_INDEX") and item.get("trading_symbol") in fno_underlying]
@@ -44,7 +45,8 @@ def get_dynamic_fno_universe():
 
 def fetch_upstox_candles_for_date(instrument_key, date_str):
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
-    if not access_token: return None
+    if not access_token:
+        return None
     
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
     today_str = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
@@ -56,9 +58,11 @@ def fetch_upstox_candles_for_date(instrument_key, date_str):
     
     try:
         response = requests.get(url, headers=headers, timeout=5)
-        if response.status_code != 200: return None
+        if response.status_code != 200:
+            return None
         data = response.json().get('data', {}).get('candles', [])
-        if not data: return None
+        if not data:
+            return None
         c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
         c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).dt.tz_localize(None) 
         c_df = c_df.sort_values('Datetime').reset_index(drop=True)
@@ -92,16 +96,19 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
         start_of_day = pd.to_datetime(current_eval_time.date()) + pd.Timedelta(hours=9, minutes=15)
         recent_start = current_eval_time - pd.Timedelta(minutes=window_mins)
         
-        if recent_start <= start_of_day: return pd.DataFrame()
+        if recent_start <= start_of_day:
+            return pd.DataFrame()
             
         cum_df = master_df[(master_df['Datetime'] >= start_of_day) & (master_df['Datetime'] < recent_start)]
         rec_df = master_df[(master_df['Datetime'] >= recent_start) & (master_df['Datetime'] <= current_eval_time)]
         
-        if cum_df.empty or rec_df.empty: return pd.DataFrame()
+        if cum_df.empty or rec_df.empty:
+            return pd.DataFrame()
             
         g_cum = cum_df.groupby('Symbol').agg({'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'}).reset_index()
         g_cum = g_cum[g_cum['Turnover'] > 0]
-        if g_cum.empty: return pd.DataFrame()
+        if g_cum.empty:
+            return pd.DataFrame()
         
         g_cum['Cum_Pct_Move'] = ((g_cum['Close'] - g_cum['Open']) / (g_cum['Open'] + 1e-8)) * 100
         g_cum['Cum_Efficiency'] = (g_cum['Close'] - g_cum['Open']).abs() / (g_cum['abs_move'] + 1e-8)
@@ -112,7 +119,8 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
 
         g_rec = rec_df.groupby('Symbol').agg({'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'}).reset_index()
         g_rec = g_rec[g_rec['Turnover'] > 0]
-        if g_rec.empty: return pd.DataFrame()
+        if g_rec.empty:
+            return pd.DataFrame()
         
         g_rec['Rec_Pct_Move'] = ((g_rec['Close'] - g_rec['Open']) / (g_rec['Open'] + 1e-8)) * 100
         g_rec['Rec_Efficiency'] = (g_rec['Close'] - g_rec['Open']).abs() / (g_rec['abs_move'] + 1e-8)
@@ -124,7 +132,8 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
         merged = pd.merge(g_rec[['Symbol', 'Rec_Pct_Move', 'Close', 'Rec_Vol_Rank', 'Rec_Mom_Rank', 'Rec_Eff_Rank']], 
                           g_cum[['Symbol', 'Cum_Vol_Rank', 'Cum_Mom_Rank', 'Cum_Eff_Rank']], on='Symbol', how='inner')
         
-        if merged.empty: return pd.DataFrame()
+        if merged.empty:
+            return pd.DataFrame()
 
         merged['Vol_Delta'] = merged['Rec_Vol_Rank'] - merged['Cum_Vol_Rank']
         merged['Mom_Delta'] = merged['Rec_Mom_Rank'] - merged['Cum_Mom_Rank']
@@ -144,7 +153,7 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
         return pd.DataFrame()
 
 # ==============================================================================
-# 3. STATE-BASED MEMORY ENGINE (Exception Safe)
+# 3. STATE-BASED MEMORY ENGINE (Ironclad Gatekeeping & Universal Drift Math)
 # ==============================================================================
 def scan_institutional_tape(target_date_str):
     print(f"\n📡 Initiating State-Based Tri-Delta Engine for {target_date_str}...")
@@ -201,7 +210,8 @@ def scan_institutional_tape(target_date_str):
     for day in trading_days:
         day_dt = pd.to_datetime(day)
         day_master = rolling_master_df[(rolling_master_df['Datetime'] >= day_dt) & (rolling_master_df['Datetime'] < day_dt + pd.Timedelta(days=1))]
-        if day_master.empty: continue
+        if day_master.empty:
+            continue
 
         try:
             morning_open = day_master.groupby('Symbol').first().reset_index()
@@ -256,7 +266,8 @@ def scan_institutional_tape(target_date_str):
             
             to_delete = []
             for sym, st in memory_bank.items():
-                if sym not in daily_dict: continue
+                if sym not in daily_dict:
+                    continue
                 d_close = daily_dict[sym]['Close']
                 
                 if st['state'] == 'BREACHED':
@@ -277,7 +288,7 @@ def scan_institutional_tape(target_date_str):
             pass
 
     # ----------------------------------------------------------------------
-    # LIVE EVALUATION (Full-Day Sweep Loop)
+    # LIVE EVALUATION (Full-Day Sweep Loop with Strict Gatekeeping)
     # ----------------------------------------------------------------------
     today_master = rolling_master_df[
         (rolling_master_df['Datetime'] >= target_dt) & 
@@ -294,7 +305,8 @@ def scan_institutional_tape(target_date_str):
 
     for eval_time_current in eval_times:
         current_slice = today_master[today_master['Datetime'] <= eval_time_current]
-        if current_slice.empty: continue
+        if current_slice.empty:
+            continue
 
         try:
             today_latest_ltp = current_slice.groupby('Symbol')['Close'].last().to_dict()
@@ -316,6 +328,9 @@ def scan_institutional_tape(target_date_str):
             if not curr_anomalies.empty:
                 for _, row in curr_anomalies.iterrows():
                     sym = row['Symbol']
+                    price = row['Close']
+                    direction = row['Direction']
+                    
                     if sym not in memory_bank:
                         if sym not in all_fresh_intrusions:
                             row['Eval_Time'] = eval_time_current.strftime('%H:%M')
@@ -324,13 +339,22 @@ def scan_institutional_tape(target_date_str):
                         st = memory_bank[sym]
                         row['Origin'] = st['origin']
                         row['First_Date'] = st['date']
-                        row['Net_Drift'] = ((row['Close'] - st['origin']) / st['origin']) * 100
+                        
+                        if st['dir'] == 1:
+                            row['Net_Drift'] = ((price - st['origin']) / st['origin']) * 100
+                        else:
+                            row['Net_Drift'] = ((st['origin'] - price) / st['origin']) * 100
                         
                         if st['state'] == 'ACTIVE' and row['Direction'] == st['dir']:
-                            row['Eval_Time'] = eval_time_current.strftime('%H:%M')
-                            all_reloads[sym] = row
+                            if (st['dir'] == 1 and price >= st['origin']) or (st['dir'] == -1 and price <= st['origin']):
+                                row['Eval_Time'] = eval_time_current.strftime('%H:%M')
+                                all_reloads[sym] = row
+                            else:
+                                st['state'] = 'BREACHED'
+                                st['breach_time'] = eval_time_current.strftime('%Y-%m-%d %H:%M')
+                                
                         elif st['state'] == 'BREACHED' and row['Direction'] == st['dir']:
-                            if (st['dir'] == 1 and row['Close'] > st['origin']) or (st['dir'] == -1 and row['Close'] < st['origin']):
+                            if (st['dir'] == 1 and price > st['origin']) or (st['dir'] == -1 and price < st['origin']):
                                 st['state'] = 'ACTIVE' 
                                 st['breach_time'] = None
                                 row['Eval_Time'] = eval_time_current.strftime('%H:%M')
@@ -339,13 +363,29 @@ def scan_institutional_tape(target_date_str):
             continue
 
     final_ltp_dict = today_master.groupby('Symbol')['Close'].last().to_dict()
+    
+    valid_fresh = {}
+    for sym, row in all_fresh_intrusions.items():
+        ltp = final_ltp_dict.get(sym, row['Close'])
+        direction = row['Direction']
+        birth_price = row['Close']
+        
+        if (direction == 1 and ltp < birth_price) or (direction == -1 and ltp > birth_price):
+            memory_bank[sym] = {
+                'state': 'BREACHED', 'origin': birth_price, 'date': target_date_str, 
+                'time': row.get('Eval_Time', '15:15'), 'dir': direction, 
+                'breach_time': f"{target_date_str} EOD Violation", 'breach_days': 0
+            }
+        else:
+            valid_fresh[sym] = row
+
     breached = []
     for sym, st in memory_bank.items():
         if st['state'] == 'BREACHED' and sym in final_ltp_dict:
             if sym not in all_reclaims: 
                 breached.append({
                     'Symbol': sym, 'LTP': final_ltp_dict[sym], 'Origin': st['origin'], 
-                    'Dir': "BULLISH" if st['dir']==1 else "BEARISH",
+                    'Dir': "BULLISH" if st['dir'] == 1 else "BEARISH",
                     'Time': st['breach_time'],
                     'First_Date': st['date'],
                     'Anchor_Time': st.get('time', '09:15')
@@ -358,9 +398,9 @@ def scan_institutional_tape(target_date_str):
     print(f"{COLOR_BOLD}FULL UNIVERSE TRI-DELTA SESSION TAPE | DATE: {target_date_str}{COLOR_RESET}")
     print(f"{COLOR_CYAN}================================================================================================{COLOR_RESET}\n")
 
-    if all_fresh_intrusions:
+    if valid_fresh:
         print(f"{COLOR_BOLD}⚡ FRESH INTRUSIONS (Phase 1 - Day-1 Births){COLOR_RESET}")
-        for sym, row in all_fresh_intrusions.items():
+        for sym, row in valid_fresh.items():
             jump, ltp = row['Total_Score'], row['Close']
             color = COLOR_GREEN if jump > 0 else COLOR_RED
             d_str = "BULLISH" if jump > 0 else "BEARISH"
@@ -372,8 +412,7 @@ def scan_institutional_tape(target_date_str):
         print(f"{COLOR_BOLD}🔄 ALGORITHMIC RELOADS (Phase 2 - Second Waves){COLOR_RESET}")
         for sym, row in all_reloads.items():
             jump, ltp = row['Total_Score'], row['Close']
-            raw_drift = row['Net_Drift']
-            true_drift = raw_drift if row['Direction'] == 1 else -raw_drift 
+            true_drift = row['Net_Drift']
             color = COLOR_GREEN if jump > 0 else COLOR_RED
             d_str = "BULLISH" if jump > 0 else "BEARISH"
             anchor_date = row['First_Date']
@@ -382,7 +421,7 @@ def scan_institutional_tape(target_date_str):
             eval_t = row.get('Eval_Time', '15:15')
             print(f"  {color}🔄 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str}){COLOR_RESET}")
             print(f"      └─ 🌊 1st Wave (Origin): {anchor_date} @ {anchor_time} | Price: ₹{origin_price:.2f}")
-            print(f"      └─ 🌊 2nd Wave (Reload): {target_date_str} @ {eval_t} | Price: ₹{ltp:.2f} | Trend Drift: {true_drift:+.2f}%\n")
+            print(f"      └─ 🌊 2nd Wave (Reload): {target_date_str} @ {eval_t} | Price: ₹{ltp:.2f} | Trend Profit Drift: {true_drift:+.2f}%\n")
 
     if all_reclaims:
         print(f"{COLOR_BOLD}🪤 INSTITUTIONAL RECLAIMS (Phase 4 - Liquidity Traps){COLOR_RESET}")
@@ -404,7 +443,7 @@ def scan_institutional_tape(target_date_str):
             print(f"      └─ ⚓ 1st Wave (Origin): {b['First_Date']} @ {b['Anchor_Time']} | Price: ₹{b['Origin']:.2f}")
             print(f"      └─ 📉 Breached At      : {b_time} | Current Price: ₹{b['LTP']:.2f}\n")
 
-    if not any([all_fresh_intrusions, all_reloads, all_reclaims, breached]):
+    if not any([valid_fresh, all_reloads, all_reclaims, breached]):
         print(f"{COLOR_DIM}[Terminal Silent] No active institutional structure passing strict filters.{COLOR_RESET}\n")
 
 # ==============================================================================
