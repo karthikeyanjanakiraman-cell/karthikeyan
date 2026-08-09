@@ -26,7 +26,7 @@ COLOR_BOLD = '\033[1m'
 
 SCORE_THRESHOLD = 50     # Original balanced hurdle rate
 MIN_VECTOR_FLOOR = 5     # Original minimum percentile contribution per variable
-BACKTRACE_DAYS = 20      # 1 F&O Monthly Derivative Cycle
+BACKTRACE_DAYS = 50      # 1 F&O Monthly Derivative Cycle
 MAX_BREACH_DAYS = 0      # Kill Switch: Intraday scalping memory purge
 
 # ==============================================================================
