@@ -24,10 +24,10 @@ COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 
 # 🎛️ GLOBAL TUNING DIALS
-LOOKBACK_DAYS = 20           # 1-Month F&O cycle memory
+LOOKBACK_DAYS = 2           # 1-Month F&O cycle memory
 TOP_N_STRIKES = 5            # Max apex trades to display per basket/index
-SCORE_THRESHOLD = 50         # Balanced cumulative hurdle rate
-MIN_VECTOR_FLOOR = 5         # Minimum percentile contribution per variable
+SCORE_THRESHOLD = 10         # Balanced cumulative hurdle rate
+MIN_VECTOR_FLOOR = 2         # Minimum percentile contribution per variable
 LIQUIDITY_MIN_PRICE = 35.0   # Purge illiquid, deep OTM noise
 MAX_BREACH_DAYS = 0          # Kill Switch: 0 for strict intraday scalping memory purge
 
