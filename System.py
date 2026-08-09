@@ -27,7 +27,7 @@ COLOR_BOLD = '\033[1m'
 SCORE_THRESHOLD = 160    # Quad-Delta max is 400
 MIN_VECTOR_FLOOR = 10    # Minimum percentile contribution per variable
 BACKTRACE_DAYS = 20      # 1 F&O Monthly Derivative Cycle
-MAX_BREACH_DAYS = 2      # Kill Switch: Days a stock can stay breached before memory purge (Set to 0 for Intraday Scalping)
+MAX_BREACH_DAYS = 0      # Kill Switch: Days a stock can stay breached before memory purge (Set to 0 for Intraday Scalping)
 
 # ==============================================================================
 # 1. LIVE INGESTION (F&O Universe with Error Shield)
