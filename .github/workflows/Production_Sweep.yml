@@ -30,10 +30,18 @@ jobs:
 
     - name: Execute Live Hybrid Engine Scan
       env:
+        # THE FIX: Added the exact Fyers credentials the script is demanding
+        FYERS_CLIENT_ID: ${{ secrets.FYERS_CLIENT_ID }}
+        FYERS_ACCESS_TOKEN: ${{ secrets.FYERS_ACCESS_TOKEN }}
+        
+        # THE FIX: Matched the exact Email variable names expected by Python
+        EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+        EMAIL_APP_PWD: ${{ secrets.EMAIL_APP_PWD }}
+        EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+        
+        # Kept your Upstox token intact for your other AI Engine
         UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
-        SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
-        SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
-        RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        
         PARAM_BACKTEST_DATE: ${{ github.event.inputs.backtest_date }}
       run: |
         python System1.py
@@ -41,10 +49,16 @@ jobs:
     - name: Execute System (AI Engine)
       if: always()
       env:
+        # Replicated the exact same bridge for the second script
+        FYERS_CLIENT_ID: ${{ secrets.FYERS_CLIENT_ID }}
+        FYERS_ACCESS_TOKEN: ${{ secrets.FYERS_ACCESS_TOKEN }}
+        
+        EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+        EMAIL_APP_PWD: ${{ secrets.EMAIL_APP_PWD }}
+        EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+        
         UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
-        SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
-        SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
-        RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        
         PARAM_BACKTEST_DATE: ${{ github.event.inputs.backtest_date }}
       run: |
         python System.py
