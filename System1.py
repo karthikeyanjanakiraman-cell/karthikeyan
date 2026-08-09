@@ -24,11 +24,11 @@ COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 
 # 🎛️ GLOBAL TUNING DIALS
-LOOKBACK_DAYS = 1           # Restored to full 1-month F&O cycle memory
+LOOKBACK_DAYS = 20           # 1-Month F&O cycle memory
 TOP_N_STRIKES = 5            # Max apex trades to display per basket/index
-SCORE_THRESHOLD = 50         # Restored original balanced cumulative hurdle rate
-MIN_VECTOR_FLOOR = 5         # Restored minimum percentile contribution per variable
-LIQUIDITY_MIN_PRICE = 35.0   # Matches your latest console output
+SCORE_THRESHOLD = 50         # Balanced cumulative hurdle rate
+MIN_VECTOR_FLOOR = 5         # Minimum percentile contribution per variable
+LIQUIDITY_MIN_PRICE = 35.0   # Purge illiquid, deep OTM noise
 MAX_BREACH_DAYS = 0          # Kill Switch: 0 for strict intraday scalping memory purge
 
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -201,6 +201,7 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
         merged['M_Score'] = merged['Mom_Delta'] * merged['Direction']
         merged['E_Score'] = merged['Eff_Delta'] * merged['Direction']
         
+        # TANDEM LOCK (Vector Cohesion Filter)
         merged = merged[
             (merged['V_Score'].abs() >= MIN_VECTOR_FLOOR) &
             (merged['P_Score'].abs() >= MIN_VECTOR_FLOOR) &
@@ -218,7 +219,7 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
 
         merged['Total_Score'] = merged['V_Score'] + merged['P_Score'] + merged['M_Score'] + merged['E_Score']
         
-        # Strict Positive Threshold Lock
+        # Strict Positive Score Filter
         merged = merged[merged['Total_Score'] >= SCORE_THRESHOLD]
         merged = merged.sort_values(by='Total_Score', ascending=False)
         return merged
@@ -252,7 +253,9 @@ def execute_options_matrix():
     rolling_master_df = pd.concat(historical_dfs, ignore_index=True)
     
     unique_dates = sorted(rolling_master_df['Datetime'].dt.date.unique())
-    trading_days = [d.strftime("%Y-%m-%d") for d in unique_dates]
+    
+    # 🛡️ THE TIME TRAVEL FIX: Forbid historical loop from touching today's data
+    trading_days = [d.strftime("%Y-%m-%d") for d in unique_dates if d.strftime("%Y-%m-%d") < target_date_str]
     
     current_now = datetime.now(IST).replace(tzinfo=None)
     is_live_today = (target_date_str == current_now.strftime("%Y-%m-%d"))
@@ -270,13 +273,16 @@ def execute_options_matrix():
 
     memory_bank = {} 
     
+    # ======================================================================
+    # PRE-POPULATING HISTORY (Memory Building)
+    # ======================================================================
     for day in trading_days:
         day_dt = pd.to_datetime(day)
         day_master = rolling_master_df[(rolling_master_df['Datetime'] >= day_dt) & (rolling_master_df['Datetime'] < day_dt + pd.Timedelta(days=1))]
         if day_master.empty: continue
 
         day_start = day_dt + pd.Timedelta(hours=9, minutes=15)
-        day_end = day_dt + pd.Timedelta(hours=15, minutes=15) if day != target_date_str else eval_times[-1]
+        day_end = day_dt + pd.Timedelta(hours=15, minutes=15)
         
         try:
             time_steps = pd.date_range(start=day_start + pd.Timedelta(minutes=15), end=day_end, freq='15min')
@@ -308,8 +314,28 @@ def execute_options_matrix():
                             }
         except: pass
 
+        # End of historical day state cleanup
+        try:
+            daily_agg = day_master.groupby('Symbol').agg({'Close': 'last'}).reset_index()
+            daily_dict = daily_agg.set_index('Symbol').to_dict('index')
+            
+            to_delete = []
+            for sym, st in memory_bank.items():
+                if sym not in daily_dict: continue
+                d_close = daily_dict[sym]['Close']
+                
+                if st['state'] == 'BREACHED':
+                    if st['dir'] == 1 and d_close < (st['origin'] * 0.985): to_delete.append(sym); continue
+                    elif st['dir'] == -1 and d_close > (st['origin'] * 1.015): to_delete.append(sym); continue
+                    
+                    st['breach_days'] += 1
+                    if st['breach_days'] >= MAX_BREACH_DAYS: to_delete.append(sym)
+                        
+            for sym in to_delete: del memory_bank[sym]
+        except: pass
+
     # ======================================================================
-    # LIVE EVALUATION LOOP (Strict Gatekeeping & Lifecycle Bridges)
+    # LIVE EVALUATION LOOP (Target Day Segregation & Execution)
     # ======================================================================
     today_master = rolling_master_df[(rolling_master_df['Datetime'] >= target_dt) & (rolling_master_df['Datetime'] <= target_dt + pd.Timedelta(days=1))].copy()
 
@@ -343,7 +369,7 @@ def execute_options_matrix():
                 for _, row in curr_anomalies.iterrows():
                     sym, price, direction = row['Symbol'], row['Close'], row['Direction']
                     
-                    # 🛡️ FIX: Valid syntax `)` and true day-1 birth isolation
+                    # 🛡️ BASKET 1: Valid parenthesis & isolated today births
                     is_truly_fresh_today = (sym not in memory_bank) or (memory_bank[sym].get('date') == target_date_str and memory_bank[sym].get('state') == 'BREACHED')
 
                     if is_truly_fresh_today and sym not in all_fresh_intrusions:
@@ -357,7 +383,7 @@ def execute_options_matrix():
                         row['Launchpad'] = launchpad_price
                         all_fresh_intrusions[sym] = row
                         
-                        # 🛡️ BRIDGE FIX: Add live Basket 1 births to memory bank
+                        # Bridge: Feed Live Basket 1 entries back into Memory Bank for intraday tracking
                         memory_bank[sym] = {
                             'state': 'ACTIVE', 
                             'origin': price, 
@@ -389,6 +415,7 @@ def execute_options_matrix():
                                     all_reclaims[sym] = row
         except: continue
 
+    # Process End Of Day Breaches for Basket 1 & 2
     final_ltp_dict = today_master.groupby('Symbol')['Close'].last().to_dict()
     valid_fresh = {}
     
