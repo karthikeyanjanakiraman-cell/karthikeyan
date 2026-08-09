@@ -24,11 +24,11 @@ COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 
 # 🎛️ GLOBAL TUNING DIALS
-LOOKBACK_DAYS = 50            # Configurable: Set to any window (3 to 300+ days)
+LOOKBACK_DAYS = 5            # Configurable: Set to any window (3 to 300+ days)
 TOP_N_STRIKES = 5            # Max apex trades to display per basket/index
-SCORE_THRESHOLD = 50        # Quad-Delta minimum score threshold
-MIN_VECTOR_FLOOR = 3        # Minimum percentile contribution per variable
-LIQUIDITY_MIN_PRICE = 95.0   # Global variable: Purges options trading below this price
+SCORE_THRESHOLD = 130        # Quad-Delta minimum score threshold
+MIN_VECTOR_FLOOR = 10        # Minimum percentile contribution per variable
+LIQUIDITY_MIN_PRICE = 15.0   # Global variable: Purges options trading below this price
 MAX_BREACH_DAYS = 0          # Kill Switch: 0 for strict intraday scalping memory purge
 
 GLOBAL_START_TIME = "09:30"  # Anchors trading day start, bypassing 09:15 auction noise
@@ -220,8 +220,10 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15,
         merged = merged[merged['Valid_Tandem']]
 
         merged['Total_Score'] = merged['V_Score'] + merged['P_Score'] + merged['M_Score'] + merged['E_Score']
-        merged = merged[merged['Total_Score'].abs() >= SCORE_THRESHOLD]
-        merged = merged.sort_values(by='Total_Score', key=abs, ascending=False)
+        
+        # 🛡️ FIX: Enforce strictly positive score threshold for valid institutional momentum
+        merged = merged[merged['Total_Score'] >= SCORE_THRESHOLD]
+        merged = merged.sort_values(by='Total_Score', ascending=False)
         return merged
     except: return pd.DataFrame()
 
@@ -345,47 +347,50 @@ def execute_options_matrix():
                 for _, row in curr_anomalies.iterrows():
                     sym, price, direction = row['Symbol'], row['Close'], row['Direction']
                     
-                    if sym not in memory_bank:
-                        if sym not in all_fresh_intrusions:
-                            row['Eval_Time'] = eval_time_current.strftime('%H:%M')
-                            launchpad_price = price
-                            try:
-                                launch_slice = rolling_master_df[(rolling_master_df['Symbol'] == sym) & (rolling_master_df['Datetime'] < eval_time_current) & (rolling_master_df['Datetime'] >= eval_time_current - pd.Timedelta(days=5))]
-                                if not launch_slice.empty:
-                                    launchpad_price = launch_slice['Low'].min() if direction == 1 else launch_slice['High'].max()
-                            except: pass
-                            row['Launchpad'] = launchpad_price
-                            all_fresh_intrusions[sym] = row
-                            
-                            # 🛡️ BRIDGE FIX: Register live Basket 1 entries into memory bank so they can transition to Basket 3 (Breached)
-                            memory_bank[sym] = {
-                                'state': 'ACTIVE', 
-                                'origin': price, 
-                                'date': target_date_str, 
-                                'time': eval_time_current.strftime('%H:%M'), 
-                                'datetime': eval_time_current, 
-                                'dir': direction, 
-                                'breach_time': None, 
-                                'breach_days': 0
-                            }
-                    else:
-                        st = memory_bank[sym]
-                        row['Net_Drift'] = ((price - st['origin']) / st['origin']) * 100 if st['dir'] == 1 else ((st['origin'] - price) / st['origin']) * 100
-                        
-                        is_subsequent_bar = eval_time_current > st.get('datetime', target_dt)
+                    # 🛡️ FIX: A strike is truly a "Fresh Intrusion" (Basket 1) ONLY if it had NO active memory prior to today
+                    is_truly_fresh_today = (sym not in memory_bank) or (memory_bank[sym].get('date') == target_date_str and memory_bank[sym].get('state') == 'BREACHED')
 
-                        if st['state'] == 'ACTIVE' and row['Direction'] == st['dir'] and is_subsequent_bar:
-                            if (st['dir'] == 1 and price >= st['origin']) or (st['dir'] == -1 and price <= st['origin']):
-                                row['Eval_Time'] = eval_time_current.strftime('%H:%M')
-                                row['Macro_Price'], row['Macro_Date'], row['Micro_Price'] = st['origin'], st['date'], price
-                                all_reloads[sym] = row
-                        elif st['state'] == 'BREACHED' and row['Direction'] == st['dir']:
-                            if (st['dir'] == 1 and price > st['origin']) or (st['dir'] == -1 and price < st['origin']):
-                                st['state'] = 'ACTIVE' 
-                                st['breach_time'] = None
-                                row['Eval_Time'] = eval_time_current.strftime('%H:%M')
-                                row['Origin'], row['First_Date'] = st['origin'], st['date']
-                                all_reclaims[sym] = row
+                    if is_truly_fresh_today and sym not in all_fresh_intrusions:
+                        row['Eval_Time'] = eval_time_current.strftime('%H:%M')
+                        launchpad_price = price
+                        try:
+                            launch_slice = rolling_master_df[(rolling_master_df['Symbol'] == sym) & (rolling_master_df['Datetime'] < eval_time_current) & (rolling_master_df['Datetime'] >= eval_time_current - pd.Timedelta(days=5))]
+                            if not launch_slice.empty:
+                                launchpad_price = launch_slice['Low'].min() if direction == 1 else launch_slice['High'].max()
+                        except: pass
+                        row['Launchpad'] = launchpad_price
+                        all_fresh_intrusions[sym] = row
+                        
+                        memory_bank[sym] = {
+                            'state': 'ACTIVE', 
+                            'origin': price, 
+                            'date': target_date_str, 
+                            'time': eval_time_current.strftime('%H:%M'), 
+                            'datetime': eval_time_current, 
+                            'dir': direction, 
+                            'breach_time': None, 
+                            'breach_days': 0
+                        }
+                    elif sym in memory_bank:
+                        st = memory_bank[sym]
+                        # Only consider reloads if the symbol was born on a prior day (or earlier today)
+                        if st.get('date') != target_date_str or st.get('time') != eval_time_current.strftime('%H:%M'):
+                            row['Net_Drift'] = ((price - st['origin']) / st['origin']) * 100 if st['dir'] == 1 else ((st['origin'] - price) / st['origin']) * 100
+                            
+                            is_subsequent_bar = eval_time_current > st.get('datetime', target_dt)
+
+                            if st['state'] == 'ACTIVE' and row['Direction'] == st['dir'] and is_subsequent_bar:
+                                if (st['dir'] == 1 and price >= st['origin']) or (st['dir'] == -1 and price <= st['origin']):
+                                    row['Eval_Time'] = eval_time_current.strftime('%H:%M')
+                                    row['Macro_Price'], row['Macro_Date'], row['Micro_Price'] = st['origin'], st['date'], price
+                                    all_reloads[sym] = row
+                            elif st['state'] == 'BREACHED' and row['Direction'] == st['dir']:
+                                if (st['dir'] == 1 and price > st['origin']) or (st['dir'] == -1 and price < st['origin']):
+                                    st['state'] = 'ACTIVE' 
+                                    st['breach_time'] = None
+                                    row['Eval_Time'] = eval_time_current.strftime('%H:%M')
+                                    row['Origin'], row['First_Date'] = st['origin'], st['date']
+                                    all_reclaims[sym] = row
         except: continue
 
     final_ltp_dict = today_master.groupby('Symbol')['Close'].last().to_dict()
