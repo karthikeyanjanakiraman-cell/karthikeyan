@@ -24,7 +24,7 @@ COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 
 # 🎛️ GLOBAL TUNING DIALS
-LOOKBACK_DAYS = 20           # Restored to full 1-month F&O cycle memory
+LOOKBACK_DAYS = 0           # Restored to full 1-month F&O cycle memory
 TOP_N_STRIKES = 5            # Max apex trades to display per basket/index
 SCORE_THRESHOLD = 50         # Restored original balanced cumulative hurdle rate
 MIN_VECTOR_FLOOR = 5         # Restored minimum percentile contribution per variable
