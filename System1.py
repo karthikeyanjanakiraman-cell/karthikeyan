@@ -24,11 +24,11 @@ COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 
 # 🎛️ GLOBAL TUNING DIALS
-LOOKBACK_DAYS = 5            # Configurable: Set to any window (3 to 300+ days)
+LOOKBACK_DAYS = 50            # Configurable: Set to any window (3 to 300+ days)
 TOP_N_STRIKES = 5            # Max apex trades to display per basket/index
-SCORE_THRESHOLD = 130        # Quad-Delta minimum score threshold
-MIN_VECTOR_FLOOR = 10        # Minimum percentile contribution per variable
-LIQUIDITY_MIN_PRICE = 15.0   # Global variable: Purges options trading below this price
+SCORE_THRESHOLD = 50        # Quad-Delta minimum score threshold
+MIN_VECTOR_FLOOR = 2        # Minimum percentile contribution per variable
+LIQUIDITY_MIN_PRICE = 35.0   # Global variable: Purges options trading below this price
 MAX_BREACH_DAYS = 0          # Kill Switch: 0 for strict intraday scalping memory purge
 
 GLOBAL_START_TIME = "09:30"  # Anchors trading day start, bypassing 09:15 auction noise
