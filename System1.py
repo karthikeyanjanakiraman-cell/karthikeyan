@@ -1,233 +1,224 @@
 import os
-import urllib.parse
-import json
-import gzip
-import io
-from datetime import datetime, timedelta
-import requests
-import pandas as pd
+import smtplib
+from email.mime.text import MIMEText
+from datetime import datetime, date, timedelta
+from fyers_apiv3 import fyersModel
 
-# ==============================================================================
-# 1. LIVE INGESTION & +/- 5 STRIKES OPTIONS PACK
-# ==============================================================================
-def fetch_live_intraday_candles(instrument_key):
-    """Fetches purely the live intraday candles for today."""
-    access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
-    if not access_token:
-        print("⚠️ CRITICAL: UPSTOX_ACCESS_TOKEN not found in environment!")
-        return None
-    
-    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
-    url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key)}/1minute"
-    
-    try:
-        response = requests.get(url, headers=headers, timeout=5)
-        if response.status_code != 200:
-            return None
-            
-        data = response.json().get('data', {}).get('candles', [])
-        if not data:
-            return None
-            
-        c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
-        c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).apply(lambda x: x.replace(tzinfo=None))
-        c_df = c_df.sort_values('Datetime').reset_index(drop=True)
-        return c_df
-    except Exception:
-        return None
+# ==========================================
+# ⚙️ 1. GLOBAL COMMAND DIAL & CONFIG
+# ==========================================
+GLOBAL_START_TIME = "09:30"
+INDEX_NAME = "NIFTY"
+INDEX_SYMBOL = "NSE:NIFTY50-INDEX"
+STRIKE_STEP = 50  
+RADAR_RANGE = 5   
 
-def get_live_options_universe():
-    print(f"📡 Downloading Live Exchange Master Files from Broker...")
+# ==========================================
+# 🔐 2. GITHUB SECRETS (ENVIRONMENT VARIABLES)
+# ==========================================
+CLIENT_ID = os.getenv("FYERS_CLIENT_ID")
+ACCESS_TOKEN = os.getenv("FYERS_ACCESS_TOKEN")
+EMAIL_SENDER = os.getenv("EMAIL_SENDER")       
+EMAIL_APP_PWD = os.getenv("EMAIL_APP_PWD")     
+EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")   
+
+if not CLIENT_ID or not ACCESS_TOKEN:
+    raise ValueError("🚨 CRITICAL FAILURE: API credentials missing. Halting engine.")
+
+# ==========================================
+# 🛡️ 3. THE 0DTE SHIELD
+# ==========================================
+def get_fyers_instance():
+    return fyersModel.FyersModel(client_id=CLIENT_ID, is_async=False, token=ACCESS_TOKEN, log_path="")
+
+def get_dynamic_expiry():
+    """
+    Simulates fetching active expiries from Fyers Symbol Master.
+    Rolls to Next Expiry if Today == Closest Expiry.
+    """
+    days_to_thursday = (3 - date.today().weekday()) % 7
+    closest_expiry = date.today() + timedelta(days=days_to_thursday)
+    next_expiry = closest_expiry + timedelta(days=7)
     
-    master_data = []
-    for url in ["https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz", 
-                "https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz"]:
-        try:
-            resp = requests.get(url, timeout=5)
-            if resp.status_code == 200:
-                master_data.extend(json.load(gzip.GzipFile(fileobj=io.BytesIO(resp.content))))
-        except Exception as e:
-            print(f"⚠️ Error fetching master JSON: {e}")
-            
-    df_inst = pd.DataFrame(master_data)
-    if df_inst.empty:
-        print("⚠️ Failed to load broker instrument list.")
-        return []
+    if date.today() == closest_expiry:
+        print("🚨 0DTE DETECTED: Shifting to Next Expiry to avoid Theta decay.")
+        return next_expiry
+    
+    return closest_expiry
+
+def format_fyers_date(dt):
+    # Fyers format example: 26813 (Year: 26, Month: 8, Day: 13)
+    return dt.strftime("%y%#m%d")
+
+# ==========================================
+# 🎯 4. TARGET ACQUISITION
+# ==========================================
+def generate_radar_strikes(spot_price, expiry_date):
+    atm_strike = round(spot_price / STRIKE_STEP) * STRIKE_STEP
+    exp_str = format_fyers_date(expiry_date)
+    
+    strikes = []
+    for i in range(-RADAR_RANGE, RADAR_RANGE + 1):
+        strike_val = atm_strike + (i * STRIKE_STEP)
+        strikes.append(f"NSE:{INDEX_NAME}{exp_str}{strike_val}CE")
+        strikes.append(f"NSE:{INDEX_NAME}{exp_str}{strike_val}PE")
+    return strikes
+
+# ==========================================
+# 🧠 5. PROPRIETARY QUAD-DELTA MATH
+# ==========================================
+def run_quad_delta_math(symbol_candles):
+    """
+    Analyzes the candle array up to the CURRENT simulated minute.
+    """
+    if not symbol_candles or len(symbol_candles) < 2:
+        return {"state": "DEAD", "price": 0, "floor": 0}
         
-    # Dynamically handle Upstox changing column names silently
-    strike_col = 'strike_price' if 'strike_price' in df_inst.columns else 'strike'
-    ts_col = 'trading_symbol' if 'trading_symbol' in df_inst.columns else 'tradingsymbol'
+    latest_close = symbol_candles[-1][4]  # Close price
+    micro_floor = symbol_candles[-2][3]   # Low of the previous candle (Proxy)
     
-    df_inst[strike_col] = pd.to_numeric(df_inst[strike_col], errors='coerce')
-    if 'expiry' in df_inst.columns:
-        df_inst['expiry_dt'] = pd.to_datetime(df_inst['expiry'], unit='ms', errors='coerce')
+    # PROXY ALGO: Replace with your actual Volume/Spread Quad-Delta formula
+    is_basket_1_birth = True 
     
-    indices_config = {
-        "NIFTY": {"key": "NSE_INDEX|Nifty 50", "step": 50},
-        "BANKNIFTY": {"key": "NSE_INDEX|Nifty Bank", "step": 100},
-        "SENSEX": {"key": "BSE_INDEX|SENSEX", "step": 100}
+    if latest_close < micro_floor:
+        return {"state": "BASKET_3", "price": latest_close, "floor": micro_floor}
+    elif is_basket_1_birth:
+        return {"state": "BASKET_1", "price": latest_close, "floor": micro_floor}
+    else:
+        return {"state": "TRACKING", "price": latest_close, "floor": micro_floor}
+
+# ==========================================
+# ✉️ 6. EMAIL DISPATCHER
+# ==========================================
+def send_email(subject, body):
+    if not EMAIL_SENDER or not EMAIL_APP_PWD:
+        print("🔇 No email credentials found. Outputting to console only.")
+        print(f"--- {subject} ---\n{body}")
+        return
+        
+    msg = MIMEText(body)
+    msg['Subject'] = subject
+    msg['From'] = EMAIL_SENDER
+    msg['To'] = EMAIL_RECEIVER
+
+    with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp_server:
+        smtp_server.login(EMAIL_SENDER, EMAIL_APP_PWD)
+        smtp_server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
+    print(f"📧 Alert Sent: {subject}")
+
+def format_email_body(added, removed, matrix=None):
+    body = ""
+    if matrix:
+        body += "🌅 MORNING BASELINE (Active Matrix):\n"
+        for sym, d in matrix.items():
+            body += f"   - {sym} | LTP: {d['price']} | Floor: {d['floor']}\n"
+        return body
+
+    body += "⚡ QUAD-DELTA INTRADAY SHIFT:\n\n"
+    if added:
+        body += "🟢 [+] ADDED TO BASKET 1 (New Momentum):\n"
+        for sym, d in added.items():
+            body += f"   - {sym} | LTP: {d['price']} | Floor: {d['floor']}\n"
+    if removed:
+        body += "\n🔴 [-] MOVED TO BASKET 3 (Floor Breached):\n"
+        for sym, d in removed.items():
+            body += f"   - {sym} | LTP: {d['price']} | Broken Floor: {d['floor']}\n"
+    return body
+
+# ==========================================
+# ⏱️ 7. THE STATELESS SIMULATOR (CORE ENGINE)
+# ==========================================
+def fetch_day_history(fyers, symbol):
+    """Fetches today's 5-minute history for a given symbol."""
+    data = {
+        "symbol": symbol,
+        "resolution": "5",
+        "date_format": "1",
+        "range_from": date.today().strftime("%Y-%m-%d"),
+        "range_to": date.today().strftime("%Y-%m-%d"),
+        "cont_flag": "1"
     }
-    
-    final_universe = []
-    
-    for idx_name, info in indices_config.items():
-        # Step 1: Get LIVE Spot Price
-        spot_df = fetch_live_intraday_candles(info["key"])
-        if spot_df is None or spot_df.empty:
-            print(f"⚠️ Warning: Could not fetch LIVE Spot price for {idx_name}. Market may not be open yet.")
-            continue
-            
-        latest_spot = spot_df['Close'].iloc[-1]
-        step = info["step"]
-        
-        # Step 2: ATM Calculation
-        atm_strike = round(latest_spot / step) * step
-        target_strikes = [atm_strike + (i * step) for i in range(-5, 6)]
-        
-        # Step 3: Parse Expiries & Build Universe
-        # We strictly rely on the ticker string prefix and math (strike > 0) to avoid broker tags
-        match_condition = df_inst[ts_col].astype(str).str.upper().str.startswith(idx_name)
-        idx_opts = df_inst[match_condition & (df_inst[strike_col] > 0)].copy()
-        
-        if idx_opts.empty:
-            continue
-            
-        # The broker automatically deletes expired contracts, so the absolute minimum date is the current active weekly
-        valid_expiries = idx_opts['expiry_dt'].dropna().unique()
-        if not len(valid_expiries): 
-            continue
-            
-        closest_expiry = min(valid_expiries)
-        
-        filtered_opts = idx_opts[(idx_opts['expiry_dt'] == closest_expiry) & (idx_opts[strike_col].isin(target_strikes))]
-        print(f"✅ {idx_name:<10} | Spot: {latest_spot:<8.2f} | ATM Locked: {atm_strike:<6} | Mapped {len(filtered_opts)} LIVE Contracts.")
-        
-        for _, row in filtered_opts.iterrows():
-            final_universe.append({"symbol": row[ts_col], "key": row['instrument_key']})
-            
-    return final_universe
+    res = fyers.history(data=data)
+    return res.get('candles', [])
 
-# ==============================================================================
-# 2. CONFLUENCE LEADERS SCANNER (Cumulative × Discrete)
-# ==============================================================================
-def run_live_scanner():
-    current_now_ist = datetime.utcnow() + timedelta(hours=5, minutes=30)
+def simulate_day_and_dispatch():
+    fyers = get_fyers_instance()
+    active_expiry = get_dynamic_expiry()
     
-    print("\n" + "="*80)
-    print(f"🚀 INITIATING LIVE MARKET SCANNER | TIME: {current_now_ist.strftime('%I:%M %p IST')}")
-    print("="*80)
-
-    if current_now_ist.hour < 9 or (current_now_ist.hour == 9 and current_now_ist.minute < 15):
-        print("\n⏳ MARKET IS CLOSED/PRE-OPEN. Please run this script after 09:15 AM IST.")
+    # 1. Fetch entire day's 5-min Spot Index history
+    spot_candles = fetch_day_history(fyers, INDEX_SYMBOL)
+    if not spot_candles:
+        print("Market data unavailable or market is closed.")
         return
 
-    universe = get_live_options_universe()
-    if not universe:
-        print("\n⚠️ SYSTEM HALT: No options mapped. Exiting scanner.")
+    # Convert GLOBAL_START_TIME to a comparable timestamp
+    start_time_obj = datetime.strptime(GLOBAL_START_TIME, "%H:%M").time()
+    
+    # Filter out candles before the Command Dial start time
+    valid_spot_candles = []
+    for c in spot_candles:
+        candle_dt = datetime.fromtimestamp(c[0])
+        if candle_dt.time() >= start_time_obj:
+            valid_spot_candles.append(c)
+            
+    if not valid_spot_candles:
+        print(f"⏳ Engine on Standby. Time has not reached {GLOBAL_START_TIME}.")
         return
-        
-    print(f"\n⚡ Downloading live volume flow for {len(universe)} contracts...")
-    
-    master_intraday_list = []
-    for item in universe:
-        df = fetch_live_intraday_candles(item['key'])
-        if df is not None and not df.empty:
-            df['Symbol'] = item['symbol']
-            df['Turnover'] = df['Volume'] * df['Close']
-            df['abs_move'] = (df['Close'] - df['Open']).abs()
-            master_intraday_list.append(df)
-            
-    if not master_intraday_list:
-        print("⚠️ Waiting on broker volume... Try again in 1 minute.")
-        return
-        
-    master_df = pd.concat(master_intraday_list, ignore_index=True)
-    real_market_date = master_df['Datetime'].max().normalize()
-    start_of_day = real_market_date + pd.Timedelta(hours=9, minutes=15)
-    
-    windows = [
-        (real_market_date + pd.Timedelta(hours=9, minutes=15), real_market_date + pd.Timedelta(hours=10, minutes=15), "09:15 - 10:15"),
-        (real_market_date + pd.Timedelta(hours=10, minutes=15), real_market_date + pd.Timedelta(hours=11, minutes=15), "10:15 - 11:15"),
-        (real_market_date + pd.Timedelta(hours=11, minutes=15), real_market_date + pd.Timedelta(hours=12, minutes=15), "11:15 - 12:15"),
-        (real_market_date + pd.Timedelta(hours=12, minutes=15), real_market_date + pd.Timedelta(hours=13, minutes=15), "12:15 - 13:15"),
-        (real_market_date + pd.Timedelta(hours=13, minutes=15), real_market_date + pd.Timedelta(hours=14, minutes=15), "13:15 - 14:15"),
-        (real_market_date + pd.Timedelta(hours=14, minutes=15), real_market_date + pd.Timedelta(hours=15, minutes=15), "14:15 - 15:15"),
-        (real_market_date + pd.Timedelta(hours=15, minutes=15), real_market_date + pd.Timedelta(hours=15, minutes=30), "15:15 - 15:30")
-    ]
-    
-    print("\n" + "="*155)
-    print(f"🔥 TOP 5 INSTITUTIONAL OPTION STRIKES (Cumulative × Discrete) | DATE: {real_market_date.strftime('%Y-%m-%d')}")
-    print("="*155)
-    
-    for start_time, end_time, base_label in windows:
-        if current_now_ist < start_time:
-            break
-            
-        is_active_live = False
-        label = base_label
-        
-        if start_time <= current_now_ist < end_time:
-            is_active_live = True
-            end_time = current_now_ist
-            label = f"{start_time.strftime('%H:%M')} - {current_now_ist.strftime('%H:%M')} (LIVE ONGOING)"
-            
-        df_discrete = master_df[(master_df['Datetime'] >= start_time) & (master_df['Datetime'] < end_time)]
-        df_cumulative = master_df[(master_df['Datetime'] >= start_of_day) & (master_df['Datetime'] < end_time)]
-        
-        if df_discrete.empty or df_cumulative.empty: 
-            if is_active_live: break
-            continue
-            
-        grouped_disc = df_discrete.groupby('Symbol').agg({
-            'Turnover': 'sum', 'Volume': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'
-        }).reset_index()
-        grouped_disc = grouped_disc[grouped_disc['Turnover'] > 0]
-        if grouped_disc.empty: 
-            if is_active_live: break
-            continue
-            
-        grouped_disc['Turnover_PR'] = grouped_disc['Turnover'].rank(pct=True) * 100
-        grouped_disc['Pct_Move'] = ((grouped_disc['Close'] - grouped_disc['Open']) / grouped_disc['Open']) * 100
-        grouped_disc['Momentum_PR'] = grouped_disc['Pct_Move'].abs().rank(pct=True) * 100
-        grouped_disc['Net_Disp'] = (grouped_disc['Close'] - grouped_disc['Open']).abs()
-        grouped_disc['Efficiency'] = grouped_disc['Net_Disp'] / (grouped_disc['abs_move'] + 1e-8)
-        grouped_disc['Hurst_PR'] = grouped_disc['Efficiency'].rank(pct=True) * 100
-        grouped_disc['Discrete_Power'] = (grouped_disc['Turnover_PR'] * grouped_disc['Momentum_PR'] * grouped_disc['Hurst_PR']) / 100.0
 
-        grouped_cum = df_cumulative.groupby('Symbol').agg({
-            'Turnover': 'sum', 'Volume': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'
-        }).reset_index()
-        grouped_cum = grouped_cum[grouped_cum['Turnover'] > 0]
+    # 2. Historical Reconstruction Loop
+    # We maintain memory ONLY during this fraction-of-a-second simulation
+    anchored_strikes = {}
+    previous_matrix = {}
+    options_data_cache = {}
+    
+    for idx, spot_candle in enumerate(valid_spot_candles):
+        timestamp = spot_candle[0]
+        spot_close = spot_candle[4]
+        is_last_candle = (idx == len(valid_spot_candles) - 1)
         
-        if grouped_cum.empty: continue
+        # Determine the battlefield radar at THIS exact historical minute
+        radar_strikes = generate_radar_strikes(spot_close, active_expiry)
+        active_targets = set(radar_strikes + list(anchored_strikes.keys()))
+        
+        current_matrix = {}
+        
+        for strike in active_targets:
+            # Lazy load option history into cache to minimize API calls
+            if strike not in options_data_cache:
+                options_data_cache[strike] = fetch_day_history(fyers, strike)
             
-        grouped_cum['Cum_Turnover_PR'] = grouped_cum['Turnover'].rank(pct=True) * 100
-        grouped_cum['Cum_Pct_Move'] = ((grouped_cum['Close'] - grouped_cum['Open']) / grouped_cum['Open']) * 100
-        grouped_cum['Cum_Momentum_PR'] = grouped_cum['Cum_Pct_Move'].abs().rank(pct=True) * 100
-        grouped_cum['Cum_Net_Disp'] = (grouped_cum['Close'] - grouped_cum['Open']).abs()
-        grouped_cum['Cum_Efficiency'] = grouped_cum['Cum_Net_Disp'] / (grouped_cum['abs_move'] + 1e-8)
-        grouped_cum['Cum_Hurst_PR'] = grouped_cum['Cum_Efficiency'].rank(pct=True) * 100
-        grouped_cum['Cumulative_Power'] = (grouped_cum['Cum_Turnover_PR'] * grouped_cum['Cum_Momentum_PR'] * grouped_cum['Cum_Hurst_PR']) / 100.0
-
-        merged = pd.merge(grouped_disc[['Symbol', 'Discrete_Power', 'Turnover_PR', 'Momentum_PR', 'Hurst_PR', 'Pct_Move', 'Close']], 
-                          grouped_cum[['Symbol', 'Cumulative_Power']], 
-                          on='Symbol', how='inner')
-        
-        if merged.empty: continue
+            # Slice the data so the math doesn't look into the future
+            sliced_candles = [c for c in options_data_cache[strike] if c[0] <= timestamp]
             
-        merged['Combined_Power'] = (merged['Discrete_Power'] * merged['Cumulative_Power']) / 10000.0
-        top5 = merged.nlargest(5, 'Combined_Power')
-        
-        print(f"\n⏰ {label} IST")
-        print(f"{'Rank':<5} {'Symbol':<26} {'Score':<10} | {'Disc Pwr':<9} | {'Cum Pwr':<8} | {'Turnover':<11} | {'Momentum':<11} | {'Hurst':<9} | {'% Move':<8} {'LTP (₹)':<10}")
-        print("-" * 150)
-        
-        for rank, (_, row) in enumerate(top5.iterrows(), 1):
-            move_sign = "+" if row['Pct_Move'] > 0 else ""
-            print(f"{rank:<5} {row['Symbol']:<26} {row['Combined_Power']:<10.1f} | {row['Discrete_Power']:>7.1f}   | {row['Cumulative_Power']:>6.1f}   | {row['Turnover_PR']:>7.2f} PR | {row['Momentum_PR']:>7.2f} PR | {row['Hurst_PR']:>5.2f} PR | {move_sign}{row['Pct_Move']:<6.2f}%   ₹{row['Close']:<10.2f}")
+            result = run_quad_delta_math(sliced_candles)
+            
+            # State Machine rules
+            if result['state'] == "BASKET_1" or (strike in anchored_strikes and result['state'] != "BASKET_3"):
+                current_matrix[strike] = result
+                anchored_strikes[strike] = True # Pin it
+            elif result['state'] == "BASKET_3":
+                anchored_strikes.pop(strike, None) # Unpin it
 
-        if is_active_live:
-            break
+        # 3. Delta Detection on the Final Candle
+        if is_last_candle:
+            # If this is the very first candle of the allowed day, send the Morning Baseline
+            if idx == 0:
+                subject = f"🌅 MORNING ANCHOR SET: {len(current_matrix)} Active Trades"
+                send_email(subject, format_email_body(None, None, current_matrix))
+            else:
+                # Compare current vs previous to find what JUST happened
+                added = {sym: data for sym, data in current_matrix.items() if sym not in previous_matrix}
+                removed = {sym: data for sym, data in previous_matrix.items() if sym not in current_matrix}
+                
+                if added or removed:
+                    subject = f"⚡ INTRADAY DELTA (+{len(added)}/-{len(removed)})"
+                    send_email(subject, format_email_body(added, removed))
+                else:
+                    print("🔇 Tape is quiet on the latest candle. Matrix remains silent.")
+
+        # Move forward in time
+        previous_matrix = current_matrix
 
 if __name__ == "__main__":
-    run_live_scanner()
+    print("🟢 Initializing Stateless Quad-Delta Reconstruction...")
+    simulate_day_and_dispatch()
