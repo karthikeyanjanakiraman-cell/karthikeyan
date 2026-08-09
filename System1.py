@@ -26,7 +26,7 @@ COLOR_BOLD = '\033[1m'
 
 SCORE_THRESHOLD = 50     # Original balanced hurdle rate
 MIN_VECTOR_FLOOR = 5     # Original minimum percentile contribution per variable
-BACKTRACE_DAYS = 50      # 1 F&O Monthly Derivative Cycle
+BACKTRACE_DAYS = 20      # 1 F&O Monthly Derivative Cycle
 MAX_BREACH_DAYS = 0      # Kill Switch: Intraday scalping memory purge
 
 # ==============================================================================
@@ -360,8 +360,9 @@ def scan_institutional_tape(target_date_str):
                     price = row['Close']
                     direction = row['Direction']
                     
+                    # 🛡️ SYNTAX FIX: Using correct parentheses for .get()
                     # Basket 1 Isolation: True Day-1 Births only (not carried over as active from prior days)
-                    is_truly_fresh_today = (sym not in memory_bank) or (memory_bank[sym].get('date'] == target_date_str and memory_bank[sym].get('state'] == 'BREACHED')
+                    is_truly_fresh_today = (sym not in memory_bank) or (memory_bank[sym].get('date') == target_date_str and memory_bank[sym].get('state') == 'BREACHED')
 
                     if is_truly_fresh_today and sym not in all_fresh_intrusions:
                         row['Eval_Time'] = eval_time_current.strftime('%H:%M')
@@ -506,8 +507,9 @@ def scan_institutional_tape(target_date_str):
             anchor_time = memory_bank[sym].get('time', "09:15")
             eval_t = row.get('Eval_Time', '15:15')
             
+            # 🛡️ PRINT VAR FIX: Uses `row` instead of `b`
             print(f"  {color}🔥 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} P:{row['P_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str}){COLOR_RESET}")
-            print(f"      └─ ⚓ Anchor : {b['First_Date']} @ {anchor_time} | LTP: ₹{b['Origin']:.2f}")
+            print(f"      └─ ⚓ Anchor : {row['First_Date']} @ {anchor_time} | LTP: ₹{row['Origin']:.2f}")
             print(f"      └─ 🎯 Latest : Reclaimed At {target_date_str} @ {eval_t} | LTP: ₹{ltp:.2f}\n")
 
     if not any([valid_fresh, all_reloads, all_reclaims, breached]):
