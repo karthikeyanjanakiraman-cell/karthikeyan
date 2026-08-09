@@ -24,10 +24,10 @@ COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 
 # 🎛️ GLOBAL TUNING DIALS
-LOOKBACK_DAYS = 2           # 1-Month F&O cycle memory
+LOOKBACK_DAYS = 20           # 1-Month F&O cycle memory
 TOP_N_STRIKES = 5            # Max apex trades to display per basket/index
-SCORE_THRESHOLD = 20         # Balanced cumulative hurdle rate
-MIN_VECTOR_FLOOR = 2         # Minimum percentile contribution per variable
+SCORE_THRESHOLD = 50         # Balanced cumulative hurdle rate
+MIN_VECTOR_FLOOR = 5         # Minimum percentile contribution per variable
 LIQUIDITY_MIN_PRICE = 35.0   # Purge illiquid, deep OTM noise
 MAX_BREACH_DAYS = 0          # Kill Switch: 0 for strict intraday scalping memory purge
 
@@ -152,7 +152,6 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
         df_calc = master_df.copy()
         df_calc['candle_range'] = ((df_calc['High'] - df_calc['Low']) / (df_calc['Open'] + 1e-8)) * 100
 
-        # NATIVE CUMULATIVE ANCHOR: 09:15 AM
         start_of_day = pd.to_datetime(current_eval_time.date()) + pd.Timedelta(hours=9, minutes=15)
         recent_start = current_eval_time - pd.Timedelta(minutes=window_mins)
         
@@ -201,7 +200,6 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
         merged['M_Score'] = merged['Mom_Delta'] * merged['Direction']
         merged['E_Score'] = merged['Eff_Delta'] * merged['Direction']
         
-        # TANDEM LOCK (Vector Cohesion Filter)
         merged = merged[
             (merged['V_Score'].abs() >= MIN_VECTOR_FLOOR) &
             (merged['P_Score'].abs() >= MIN_VECTOR_FLOOR) &
@@ -219,7 +217,6 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
 
         merged['Total_Score'] = merged['V_Score'] + merged['P_Score'] + merged['M_Score'] + merged['E_Score']
         
-        # Strict Positive Score Filter
         merged = merged[merged['Total_Score'] >= SCORE_THRESHOLD]
         merged = merged.sort_values(by='Total_Score', ascending=False)
         return merged
@@ -251,10 +248,9 @@ def execute_options_matrix():
         return
 
     rolling_master_df = pd.concat(historical_dfs, ignore_index=True)
-    
     unique_dates = sorted(rolling_master_df['Datetime'].dt.date.unique())
     
-    # 🛡️ THE TIME TRAVEL FIX: Forbid historical loop from touching today's data
+    # 🛡️ THE TIME TRAVEL FIX: Past History Only
     trading_days = [d.strftime("%Y-%m-%d") for d in unique_dates if d.strftime("%Y-%m-%d") < target_date_str]
     
     current_now = datetime.now(IST).replace(tzinfo=None)
@@ -314,26 +310,6 @@ def execute_options_matrix():
                             }
         except: pass
 
-        # End of historical day state cleanup
-        try:
-            daily_agg = day_master.groupby('Symbol').agg({'Close': 'last'}).reset_index()
-            daily_dict = daily_agg.set_index('Symbol').to_dict('index')
-            
-            to_delete = []
-            for sym, st in memory_bank.items():
-                if sym not in daily_dict: continue
-                d_close = daily_dict[sym]['Close']
-                
-                if st['state'] == 'BREACHED':
-                    if st['dir'] == 1 and d_close < (st['origin'] * 0.985): to_delete.append(sym); continue
-                    elif st['dir'] == -1 and d_close > (st['origin'] * 1.015): to_delete.append(sym); continue
-                    
-                    st['breach_days'] += 1
-                    if st['breach_days'] >= MAX_BREACH_DAYS: to_delete.append(sym)
-                        
-            for sym in to_delete: del memory_bank[sym]
-        except: pass
-
     # ======================================================================
     # LIVE EVALUATION LOOP (Target Day Segregation & Execution)
     # ======================================================================
@@ -369,7 +345,6 @@ def execute_options_matrix():
                 for _, row in curr_anomalies.iterrows():
                     sym, price, direction = row['Symbol'], row['Close'], row['Direction']
                     
-                    # 🛡️ BASKET 1: Valid parenthesis & isolated today births
                     is_truly_fresh_today = (sym not in memory_bank) or (memory_bank[sym].get('date') == target_date_str and memory_bank[sym].get('state') == 'BREACHED')
 
                     if is_truly_fresh_today and sym not in all_fresh_intrusions:
@@ -383,7 +358,6 @@ def execute_options_matrix():
                         row['Launchpad'] = launchpad_price
                         all_fresh_intrusions[sym] = row
                         
-                        # Bridge: Feed Live Basket 1 entries back into Memory Bank for intraday tracking
                         memory_bank[sym] = {
                             'state': 'ACTIVE', 
                             'origin': price, 
@@ -415,20 +389,44 @@ def execute_options_matrix():
                                     all_reclaims[sym] = row
         except: continue
 
-    # Process End Of Day Breaches for Basket 1 & 2
+    # ======================================================================
+    # THE EOD GUILLOTINE (Final Reconciliation)
+    # ======================================================================
     final_ltp_dict = today_master.groupby('Symbol')['Close'].last().to_dict()
-    valid_fresh = {}
+    valid_fresh, valid_reloads, valid_reclaims = {}, {}, {}
     
+    # 1. Reconcile Fresh Intrusions
     for sym, row in all_fresh_intrusions.items():
-        ltp, direction, birth_price = final_ltp_dict.get(sym, row['Close']), row['Direction'], row['Close']
-        if (direction == 1 and ltp < birth_price) or (direction == -1 and ltp > birth_price):
-            memory_bank[sym] = {'state': 'BREACHED', 'origin': birth_price, 'date': target_date_str, 'time': row.get('Eval_Time', '15:15'), 'dir': direction, 'breach_time': f"{target_date_str} EOD Violation", 'breach_days': 0}
+        ltp, direction, origin = final_ltp_dict.get(sym, row['Close']), row['Direction'], row['Close']
+        if (direction == 1 and ltp < origin) or (direction == -1 and ltp > origin):
+            memory_bank[sym] = {'state': 'BREACHED', 'origin': origin, 'date': target_date_str, 'time': row.get('Eval_Time', '15:15'), 'dir': direction, 'breach_time': f"{target_date_str} EOD Breakdown", 'breach_days': 0}
         else:
             valid_fresh[sym] = row
 
+    # 2. Reconcile Basket 2 Reloads (Fixes Dead Reload UI Bug)
+    for sym, row in all_reloads.items():
+        if sym in memory_bank:
+            ltp, direction, origin = final_ltp_dict.get(sym, row['Close']), memory_bank[sym]['dir'], memory_bank[sym]['origin']
+            if (direction == 1 and ltp < origin) or (direction == -1 and ltp > origin):
+                memory_bank[sym]['state'] = 'BREACHED'
+                memory_bank[sym]['breach_time'] = f"{target_date_str} EOD Breakdown"
+            else:
+                valid_reloads[sym] = row
+
+    # 3. Reconcile Basket 4 Reclaims
+    for sym, row in all_reclaims.items():
+        if sym in memory_bank:
+            ltp, direction, origin = final_ltp_dict.get(sym, row['Close']), memory_bank[sym]['dir'], memory_bank[sym]['origin']
+            if (direction == 1 and ltp < origin) or (direction == -1 and ltp > origin):
+                memory_bank[sym]['state'] = 'BREACHED'
+                memory_bank[sym]['breach_time'] = f"{target_date_str} EOD Breakdown"
+            else:
+                valid_reclaims[sym] = row
+
+    # Populate Basket 3 (The Graveyard) after the Guillotine has executed
     breached = []
     for sym, st in memory_bank.items():
-        if st['state'] == 'BREACHED' and sym in final_ltp_dict and sym not in all_reclaims: 
+        if st['state'] == 'BREACHED' and sym in final_ltp_dict and sym not in valid_reclaims: 
             sentiment_tag = "BULLISH" if ("CE" in sym and st['dir'] == 1) or ("PE" in sym and st['dir'] == -1) else "BEARISH"
             breached.append({'Symbol': sym, 'LTP': final_ltp_dict[sym], 'Origin': st['origin'], 'Dir': sentiment_tag, 'Time': st['breach_time'], 'First_Date': st['date'], 'Anchor_Time': st.get('time', '09:15')})
 
@@ -452,9 +450,9 @@ def execute_options_matrix():
             output_lines.append(f"      └─ ⚓ Breakout Anchor (Birth)  : {target_date_str} @ {row.get('Eval_Time', '15:15')} | Price: ₹{ltp:.2f}")
             output_lines.append(f"      └─ 🎯 Latest LTP               : {target_date_str} @ EOD   | Price: ₹{final_ltp_dict.get(sym, ltp):.2f}\n")
 
-    if all_reloads:
+    if valid_reloads:
         output_lines.append(f"{COLOR_BOLD}🔄 BASKET 2: ALGORITHMIC RELOADS (Phase 2 - Institutional Continuations){COLOR_RESET}")
-        for sym, row in list(all_reloads.items())[:TOP_N_STRIKES]:
+        for sym, row in list(valid_reloads.items())[:TOP_N_STRIKES]:
             jump, ltp, true_drift = row['Total_Score'], row['Close'], row['Net_Drift']
             color = COLOR_GREEN if jump > 0 else COLOR_RED
             sent_str = "BULLISH" if ("CE" in sym and row['Direction'] == 1) or ("PE" in sym and row['Direction'] == -1) else "BEARISH"
@@ -473,9 +471,9 @@ def execute_options_matrix():
             output_lines.append(f"      └─ ⚓ Anchor : {b['First_Date']} @ {b['Anchor_Time']} | LTP: ₹{b['Origin']:.2f}")
             output_lines.append(f"      └─ 🎯 Latest : Breached At {b_time} | Current LTP: ₹{b['LTP']:.2f}\n")
 
-    if all_reclaims:
+    if valid_reclaims:
         output_lines.append(f"{COLOR_BOLD}🪤 BASKET 4: INSTITUTIONAL RECLAIMS (Phase 4 - Liquidity Traps){COLOR_RESET}")
-        for sym, row in list(all_reclaims.items())[:TOP_N_STRIKES]:
+        for sym, row in list(valid_reclaims.items())[:TOP_N_STRIKES]:
             jump, ltp, anchor_time = row['Total_Score'], row['Close'], memory_bank[sym].get('time', "09:15")
             color, sent_str = COLOR_MAGENTA, "BULLISH" if ("CE" in sym and row['Direction'] == 1) or ("PE" in sym and row['Direction'] == -1) else "BEARISH"
             
@@ -483,13 +481,13 @@ def execute_options_matrix():
             output_lines.append(f"      └─ ⚓ Anchor : {row['First_Date']} @ {anchor_time} | LTP: ₹{row['Origin']:.2f}")
             output_lines.append(f"      └─ 🎯 Latest : Reclaimed At {target_date_str} @ {row.get('Eval_Time', '15:15')} | LTP: ₹{ltp:.2f}\n")
 
-    if not any([valid_fresh, all_reloads, all_reclaims, breached]):
+    if not any([valid_fresh, valid_reloads, valid_reclaims, breached]):
         output_lines.append(f"{COLOR_DIM}[Terminal Silent] No active institutional structure passing strict filters.{COLOR_RESET}\n")
 
     for line in output_lines: print(line)
 
     if not EMAIL_SENDER or not EMAIL_APP_PWD or not EMAIL_RECEIVER: return
-    if not any([valid_fresh, all_reloads, all_reclaims, breached]): return
+    if not any([valid_fresh, valid_reloads, valid_reclaims, breached]): return
 
     import re
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
