@@ -9,6 +9,8 @@ from fyers_apiv3 import fyersModel
 # ⚙️ 1. GLOBAL COMMAND DIAL & MULTI-INDEX LEDGER
 # ==========================================
 GLOBAL_START_TIME = "09:30"
+LOOKBACK_DAYS = 3       # How many days back to reconstruct the Baskets
+TOP_N_STRIKES = 5       # Max apex trades to display per Basket
 
 ACTIVE_INDICES = {
     "NIFTY": {"symbol": "NSE:NIFTY50-INDEX", "step": 50},
@@ -16,7 +18,6 @@ ACTIVE_INDICES = {
     "FINNIFTY": {"symbol": "NSE:NIFTY FIN SERVICE-INDEX", "step": 50},
     "SENSEX": {"symbol": "BSE:SENSEX-INDEX", "step": 100}
 }
-RADAR_RANGE = 5   # ATM +/- 5 Strikes
 
 # ==========================================
 # 🔐 2. GITHUB SECRETS (ENVIRONMENT VARIABLES)
@@ -27,11 +28,6 @@ EMAIL_SENDER = os.getenv("EMAIL_SENDER")
 EMAIL_APP_PWD = os.getenv("EMAIL_APP_PWD")     
 EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")   
 
-print("🔍 SYSTEM DIAGNOSTIC: Checking Environment Variables...")
-print(f"FYERS_CLIENT_ID Loaded: {'YES' if CLIENT_ID else 'NO (Empty)'}")
-print(f"FYERS_ACCESS_TOKEN Loaded: {'YES' if ACCESS_TOKEN else 'NO (Empty)'}")
-print("-" * 50)
-
 if not CLIENT_ID or not ACCESS_TOKEN:
     raise ValueError("🚨 CRITICAL FAILURE: API credentials missing. Halting engine.")
 
@@ -39,320 +35,245 @@ def get_fyers_instance():
     return fyersModel.FyersModel(client_id=CLIENT_ID, is_async=False, token=ACCESS_TOKEN, log_path="")
 
 # ==========================================
-# 🛡️ 3. TIMEZONE LOCK & WEEKEND OVERRIDE
+# 🛡️ 3. TIMEZONE LOCK & EPOCH GENERATOR
 # ==========================================
 IST = timezone(timedelta(hours=5, minutes=30))
 
-def get_target_date():
-    """Forces IST time and shifts internal clock to Friday if on the weekend."""
+def get_target_dates():
+    """Calculates the end date (Today) and the start date (Lookback) avoiding weekends."""
     ist_now = datetime.now(IST)
-    target_date = ist_now.date()
-    if target_date.weekday() == 5: # Saturday
-        target_date -= timedelta(days=1)
-    elif target_date.weekday() == 6: # Sunday
-        target_date -= timedelta(days=2)
-    return target_date
+    end_date = ist_now.date()
+    
+    # Weekend override for the End Date
+    if end_date.weekday() == 5: end_date -= timedelta(days=1)
+    elif end_date.weekday() == 6: end_date -= timedelta(days=2)
+        
+    # Calculate Epoch Start Date (Skipping weekends)
+    start_date = end_date
+    days_subtracted = 0
+    while days_subtracted < LOOKBACK_DAYS:
+        start_date -= timedelta(days=1)
+        if start_date.weekday() < 5: # Monday to Friday
+            days_subtracted += 1
+            
+    return start_date, end_date
 
-TARGET_DATE = get_target_date()
-TARGET_DATE_STR = TARGET_DATE.strftime("%Y-%m-%d")
+EPOCH_START, TARGET_END = get_target_dates()
 
 # ==========================================
-# 📜 4. THE MASTER FILE LOADER (THE FIX)
+# 📜 4. THE MASTER FILE LOADER
 # ==========================================
 MASTER_SYMBOLS = {}
 INDEX_EXPIRIES = {"NIFTY": set(), "BANKNIFTY": set(), "FINNIFTY": set(), "SENSEX": set()}
 
 def load_symbol_master():
-    """Downloads Fyers global CSVs. Guarantees 100% accurate symbols and expiries."""
-    print("📡 Downloading Exchange Symbol Master. Bypassing SDK limitations...")
-    urls = [
-        "https://public.fyers.in/sym_details/NSE_FO.csv",
-        "https://public.fyers.in/sym_details/BSE_FO.csv"
-    ]
+    """Downloads Fyers global CSVs for 100% accurate symbol generation."""
+    print("📡 Downloading Exchange Symbol Master...")
+    urls = ["https://public.fyers.in/sym_details/NSE_FO.csv", "https://public.fyers.in/sym_details/BSE_FO.csv"]
     
     for url in urls:
         try:
             res = requests.get(url, timeout=15)
             for line in res.text.split('\n'):
                 parts = line.split(',')
-                if len(parts) < 17:
-                    continue
+                if len(parts) < 17: continue
+                sym_ticker, opt_type, strike_str, expiry_val = parts[9], parts[16], parts[15], parts[8]
                 
-                sym_ticker = parts[9]
-                opt_type = parts[16]
-                
-                if opt_type not in ["CE", "PE"]:
-                    continue
+                if opt_type not in ["CE", "PE"]: continue
                     
-                try:
-                    strike = float(parts[15])
-                except ValueError:
-                    continue
+                idx = next((i for i in ACTIVE_INDICES if sym_ticker.startswith(ACTIVE_INDICES[i]["symbol"].split("-")[0])), None)
+                if not idx: continue
                 
-                # Determine Index
-                idx = None
-                if sym_ticker.startswith("NSE:NIFTY") and sym_ticker[9].isdigit():
-                    idx = "NIFTY"
-                elif sym_ticker.startswith("NSE:BANKNIFTY"):
-                    idx = "BANKNIFTY"
-                elif sym_ticker.startswith("NSE:FINNIFTY"):
-                    idx = "FINNIFTY"
-                elif sym_ticker.startswith("BSE:SENSEX"):
-                    idx = "SENSEX"
-                
-                if not idx:
-                    continue
-                
-                # Extract Absolute Expiry Date
-                expiry_val = parts[8]
                 try:
                     if expiry_val.isdigit():
-                        dt_utc = datetime.fromtimestamp(int(expiry_val), tz=timezone.utc)
-                        expiry_date = dt_utc.astimezone(IST).date()
-                    elif '-' in expiry_val:
-                        expiry_date = datetime.strptime(expiry_val, "%Y-%m-%d").date()
+                        expiry_date = datetime.fromtimestamp(int(expiry_val), tz=timezone.utc).astimezone(IST).date()
                     else:
-                        continue
-                except Exception:
+                        expiry_date = datetime.strptime(expiry_val, "%Y-%m-%d").date()
+                    
+                    INDEX_EXPIRIES[idx].add(expiry_date)
+                    MASTER_SYMBOLS[(idx, expiry_date, int(float(strike_str)), opt_type)] = sym_ticker
+                except:
                     continue
-                
-                INDEX_EXPIRIES[idx].add(expiry_date)
-                MASTER_SYMBOLS[(idx, expiry_date, int(strike), opt_type)] = sym_ticker
         except Exception as e:
-            print(f"⚠️ Master file download failed for {url}: {e}")
+            print(f"⚠️ Master file download failed: {e}")
 
-    # Sort expiries chronologically
     for k in INDEX_EXPIRIES:
         INDEX_EXPIRIES[k] = sorted(list(INDEX_EXPIRIES[k]))
 
 # ==========================================
-# 🎯 5. TARGET ACQUISITION & 0DTE SHIELD
+# 🎯 5. THE LIQUIDITY FILTER (API SHIELD)
 # ==========================================
-def get_active_expiry(index_name):
-    # Only look at contracts expiring ON or AFTER our simulation date
-    valid_dates = [d for d in INDEX_EXPIRIES.get(index_name, []) if d >= TARGET_DATE]
-    if not valid_dates:
-        raise ValueError(f"No future expiries found for {index_name} in Master File.")
-        
-    closest_expiry = valid_dates[0]
+def get_liquid_strikes(fyers, index_name, expiry_date):
+    """Gathers all chain strikes, checks live quotes, and purges illiquid junk."""
+    # 1. Grab all possible symbols for this index & expiry
+    all_symbols = [sym for (idx, exp, strike, opt), sym in MASTER_SYMBOLS.items() if idx == index_name and exp == expiry_date]
     
-    if TARGET_DATE == closest_expiry:
-        next_expiry = valid_dates[1] if len(valid_dates) > 1 else closest_expiry
-        print(f"🚨 0DTE DETECTED for {index_name}. Shifting from {closest_expiry} to {next_expiry}")
-        return next_expiry
-    return closest_expiry
-
-def generate_radar_strikes(index_name, spot_price, expiry_date, strike_step):
-    atm_strike = round(spot_price / strike_step) * strike_step
-    strikes = []
-    
-    for i in range(-RADAR_RANGE, RADAR_RANGE + 1):
-        strike_val = atm_strike + (i * strike_step)
-        ce_key = (index_name, expiry_date, strike_val, "CE")
-        pe_key = (index_name, expiry_date, strike_val, "PE")
-        
-        # Plucks the exact exchange-formatted symbol from our downloaded Master Dictionary
-        if ce_key in MASTER_SYMBOLS: strikes.append(MASTER_SYMBOLS[ce_key])
-        if pe_key in MASTER_SYMBOLS: strikes.append(MASTER_SYMBOLS[pe_key])
+    liquid_symbols = []
+    # 2. Batch API calls to 'quotes' (Max 50 per call)
+    for i in range(0, len(all_symbols), 50):
+        batch = all_symbols[i:i+50]
+        try:
+            res = fyers.quotes({"symbols": ",".join(batch)})
+            if 'd' in res:
+                for data in res['d']:
+                    sym = data['n']
+                    lp = data['v'].get('lp', 0)
+                    vol = data['v'].get('volume', 0)
+                    
+                    # 3. THE GUILLOTINE: Discard dead strikes
+                    if lp > 15.0 and vol > 0:
+                        liquid_symbols.append(sym)
+        except Exception as e:
+            pass
             
-    return strikes
+    print(f"   🛡️ Liquidity Filter: Purged dead strikes. Tracking {len(liquid_symbols)} high-probability targets.")
+    return liquid_symbols
 
 # ==========================================
-# 🧠 6. PROPRIETARY QUAD-DELTA MATH
+# 🧠 6. PROPRIETARY QUAD-DELTA MATH (MOCKED)
 # ==========================================
-def run_quad_delta_math(symbol_candles):
-    """Analyzes sliced candle array up to the current simulated minute."""
+def run_quad_delta_math(symbol, symbol_candles):
+    """
+    Analyzes historical array.
+    Returns structured data for the UI scoreboard.
+    """
     if not symbol_candles or len(symbol_candles) < 2:
-        return {"state": "DEAD", "price": 0, "floor": 0}
+        return None
         
-    latest_close = symbol_candles[-1][4]  
-    micro_floor = symbol_candles[-2][3]   
+    latest_close = symbol_candles[-1][4]
     
     # -----------------------------------------------------
-    # 🧠 PROPRIETARY QUAD-DELTA MATH INJECTION POINT
+    # 🧠 PROPRIETARY MATH INJECTION POINT
+    # Replace this dummy logic with your actual V, P, M, E formulas
     # -----------------------------------------------------
-    is_basket_1_birth = True  # Proxy for testing
+    # MOCK DATA FOR THE UI:
+    is_basket_1 = True
+    is_basket_2 = False # Toggle this in your math to route to Reloads
     
-    if latest_close < micro_floor:
-        return {"state": "BASKET_3", "price": latest_close, "floor": micro_floor}
-    elif is_basket_1_birth:
-        return {"state": "BASKET_1", "price": latest_close, "floor": micro_floor}
-    else:
-        return {"state": "TRACKING", "price": latest_close, "floor": micro_floor}
+    base_points = 150
+    sentiment_mult = 1 if symbol.endswith("CE") else -1
+    
+    if is_basket_1:
+        return {
+            "state": "BASKET_1",
+            "points": (base_points + 17) * sentiment_mult,
+            "v": 26 * sentiment_mult, "p": 22 * sentiment_mult, "m": 57 * sentiment_mult, "e": 62 * sentiment_mult,
+            "launchpad": latest_close * 0.95,
+            "birth_time": "2026-08-07 @ 14:30",
+            "micro_floor": latest_close * 0.90,
+            "price": latest_close
+        }
+    elif is_basket_2:
+        return {
+            "state": "BASKET_2",
+            "points": (base_points + 118) * sentiment_mult,
+            "v": 23 * sentiment_mult, "p": 54 * sentiment_mult, "m": 96 * sentiment_mult, "e": 96 * sentiment_mult,
+            "macro_floor": latest_close * 0.80,
+            "macro_time": "2026-07-13 @ 11:45",
+            "micro_floor": latest_close * 0.95,
+            "micro_time": "2026-08-07 @ 09:45",
+            "price": latest_close,
+            "drift": 5.44
+        }
+    return None
 
 # ==========================================
-# ⏱️ 7. THE STATELESS SIMULATOR
+# ⏱️ 7. THE ENGINE CORE
 # ==========================================
-def fetch_history(fyers, symbol):
-    data = {
-        "symbol": symbol, "resolution": "5", "date_format": "1",
-        "range_from": TARGET_DATE_STR, "range_to": TARGET_DATE_STR, "cont_flag": "1"
-    }
-    res = fyers.history(data=data)
-    return res.get('candles', [])
-
 def simulate_engine():
     fyers = get_fyers_instance()
-    load_symbol_master() # Initialize Truth Layer
+    load_symbol_master()
     
-    start_time_obj = datetime.strptime(GLOBAL_START_TIME, "%H:%M").time()
-    options_cache = {}
-    
-    master_added, master_removed, master_current = {}, {}, {}
-    print(f"\n🟢 Initiating Stateless Reconstruction for {TARGET_DATE_STR}...")
+    print(f"\n🟢 Initiating Deep Matrix Scan (Epoch: {EPOCH_START} to {TARGET_END})...")
+    master_basket_1 = {}
+    master_basket_2 = {}
 
     for index_name, config in ACTIVE_INDICES.items():
-        index_symbol = config['symbol']
-        strike_step = config['step']
+        print(f"\n🔍 Scanning {index_name} Ecosystem...")
         
-        try:
-            active_expiry = get_active_expiry(index_name)
-        except Exception as e:
-            print(f"⚠️ {e} Skipping {index_name}.")
+        valid_dates = [d for d in INDEX_EXPIRIES.get(index_name, []) if d >= TARGET_END]
+        if not valid_dates:
             continue
             
-        spot_candles = fetch_history(fyers, index_symbol)
+        active_expiry = valid_dates[1] if TARGET_END == valid_dates[0] and len(valid_dates) > 1 else valid_dates[0]
         
-        # Enforce IST on candle timestamps to respect GLOBAL_START_TIME
-        valid_spot_candles = []
-        for c in spot_candles:
-            c_time = datetime.fromtimestamp(c[0], tz=timezone.utc).astimezone(IST).time()
-            if c_time >= start_time_obj:
-                valid_spot_candles.append(c)
-                
-        if not valid_spot_candles:
+        # 1. Engage API Shield
+        liquid_targets = get_liquid_strikes(fyers, index_name, active_expiry)
+        
+        b1_trades = []
+        b2_trades = []
+        
+        # 2. Evaluate Surviving Targets
+        for sym in liquid_targets:
+            res = fyers.history({
+                "symbol": sym, "resolution": "5", "date_format": "1",
+                "range_from": EPOCH_START.strftime("%Y-%m-%d"), 
+                "range_to": TARGET_END.strftime("%Y-%m-%d"), "cont_flag": "1"
+            })
+            candles = res.get('candles', [])
+            
+            math_result = run_quad_delta_math(sym, candles)
+            if math_result:
+                if math_result["state"] == "BASKET_1":
+                    b1_trades.append((sym, math_result))
+                elif math_result["state"] == "BASKET_2":
+                    b2_trades.append((sym, math_result))
+
+        # 3. Sort & Truncate (The Guillotine)
+        # Sort by absolute points (highest momentum)
+        b1_trades.sort(key=lambda x: abs(x[1]['points']), reverse=True)
+        b2_trades.sort(key=lambda x: abs(x[1]['points']), reverse=True)
+        
+        master_basket_1[index_name] = b1_trades[:TOP_N_STRIKES]
+        master_basket_2[index_name] = b2_trades[:TOP_N_STRIKES]
+
+    return master_basket_1, master_basket_2
+
+# ==========================================
+# ✉️ 8. INSTITUTIONAL TERMINAL UI
+# ==========================================
+def render_terminal(b1_master, b2_master):
+    print("\n" + "="*80)
+    print(" 🦅 INSTITUTIONAL QUAD-DELTA SCOREBOARD ".center(80, "="))
+    print(f" [ EPOCH WINDOW: {EPOCH_START} to {TARGET_END} ] ".center(80, " "))
+    print("="*80)
+
+    for index_name in ACTIVE_INDICES.keys():
+        b1_trades = b1_master.get(index_name, [])
+        b2_trades = b2_master.get(index_name, [])
+        
+        if not b1_trades and not b2_trades:
             continue
-
-        anchored_strikes = {}
-        previous_matrix = {}
+            
+        print(f"\n🌐 {index_name} APEX TARGETS")
+        print("-" * 80)
         
-        for idx, spot_candle in enumerate(valid_spot_candles):
-            timestamp = spot_candle[0]
-            spot_close = spot_candle[4]
-            is_last_candle = (idx == len(valid_spot_candles) - 1)
-            
-            radar_strikes = generate_radar_strikes(index_name, spot_close, active_expiry, strike_step)
-            active_targets = set(radar_strikes + list(anchored_strikes.keys()))
-            
-            current_matrix = {}
-            new_anchors = {}
-            
-            for strike in active_targets:
-                if strike not in options_cache:
-                    options_cache[strike] = fetch_history(fyers, strike)
-                    
-                sliced_candles = [c for c in options_cache[strike] if c[0] <= timestamp]
-                result = run_quad_delta_math(sliced_candles)
-                
-                if result['state'] == "BASKET_1" or (strike in anchored_strikes and result['state'] != "BASKET_3"):
-                    current_matrix[strike] = result
-                    new_anchors[strike] = True 
-                    
-            anchored_strikes = new_anchors
-            
-            if is_last_candle:
-                added = {s: d for s, d in current_matrix.items() if s not in previous_matrix}
-                removed = {s: d for s, d in previous_matrix.items() if s not in current_matrix}
-                
-                master_added.update(added)
-                master_removed.update(removed)
-                master_current.update(current_matrix)
-                
-            previous_matrix = current_matrix
-
-    return master_added, master_removed, master_current
-
-# ==========================================
-# ✉️ 8. EMAIL DISPATCH & CONSOLE TRANSPARENCY
-# ==========================================
-# ==========================================
-# ✉️ 8. EMAIL DISPATCH & CONSOLE TRANSPARENCY
-# ==========================================
-def dispatch_results(added, removed, current):
-    print("\n" + "="*65)
-    print(" 🦅 INSTITUTIONAL QUAD-DELTA TERMINAL ".center(65, "="))
-    print("="*65)
-
-    if not current:
-        print("\n🛒 ACTIVE MASTER BASKET: [EMPTY]")
-        print("   No trades are currently holding the structural floor.\n")
-    else:
-        # Group surviving trades by Index
-        grouped_trades = {"NIFTY": {}, "BANKNIFTY": {}, "FINNIFTY": {}, "SENSEX": {}}
-        
-        for sym, d in current.items():
-            if "NIFTY" in sym and "BANK" not in sym and "FIN" not in sym:
-                grouped_trades["NIFTY"][sym] = d
-            elif "BANKNIFTY" in sym:
-                grouped_trades["BANKNIFTY"][sym] = d
-            elif "FINNIFTY" in sym:
-                grouped_trades["FINNIFTY"][sym] = d
-            elif "SENSEX" in sym:
-                grouped_trades["SENSEX"][sym] = d
-
-        # Print the Hierarchical Tree for each Index
-        for index_name, trades in grouped_trades.items():
-            if not trades:
-                continue
-
-            print(f"\n🌐 {index_name} ECOSYSTEM ({len(trades)} Surviving Contracts)")
-            print("-" * 65)
+        # --- BASKET 1 RENDER ---
+        if b1_trades:
             print("🔥 BASKET 1: FRESH INTRUSIONS (Phase 1 - Day-1 Births)")
-            
-            for sym, d in trades.items():
-                sentiment = "BULLISH" if sym.endswith("CE") else "BEARISH"
-                icon = "🟢" if sentiment == "BULLISH" else "🔴"
+            for sym, d in b1_trades:
+                sent = "BULLISH" if sym.endswith("CE") else "BEARISH"
+                icon = "🚨" if sent == "BULLISH" else "⚠️" # Differentiator
+                sign = "+" if d['points'] > 0 else ""
                 
-                # ASCII Node Tree Formatting
-                print(f"  {icon} {sym:<25} ({sentiment})")
-                print(f"      └─ 🧱 Micro Floor (Trail)  : Price: ₹{d['floor']}")
-                print(f"      └─ 🎯 Latest LTP           : Price: ₹{d['price']}")
-                print("")
+                print(f"  {icon} {sym:<20} {sign}{d['points']} pts [V:{d['v']:+d} P:{d['p']:+d} M:{d['m']:+d} E:{d['e']:+d}] ({sent})")
+                print(f"      └─ 🧱 Launchpad (Kinetic Base) : Price: ₹{d.get('launchpad', 0):.2f}")
+                print(f"      └─ ⚓ Breakout Anchor (Birth)  : {d.get('birth_time', '')} | Price: ₹{d.get('micro_floor', 0):.2f}")
+                print(f"      └─ 🎯 Latest LTP               : {TARGET_END} @ EOD   | Price: ₹{d['price']:.2f}\n")
 
-    # ---------------------------------------------------------
-    # EMAIL DISPATCH LOGIC (Mirrors the Console UI)
-    # ---------------------------------------------------------
-    if not EMAIL_SENDER or not EMAIL_APP_PWD:
-        return
-        
-    if not added and not removed:
-        print("🔇 No structural changes on the last candle. Tape remains silent.")
-        return
-
-    subject = f"⚡ MASTER INTRADAY DELTA (+{len(added)}/-{len(removed)})"
-    body = "QUAD-DELTA INTRADAY SHIFT:\n\n"
-    
-    if added:
-        body += "🔥 BASKET 1: FRESH INTRUSIONS (New Momentum)\n"
-        for sym, d in added.items():
-            sent = "BULLISH" if sym.endswith("CE") else "BEARISH"
-            body += f"  🚨 {sym} ({sent})\n"
-            body += f"      └─ 🧱 Entry Floor : ₹{d['floor']}\n"
-            body += f"      └─ 🎯 Latest LTP  : ₹{d['price']}\n\n"
-            
-    if removed:
-        body += "☠️ PURGED: MOVED TO BASKET 3 (Floor Breached)\n"
-        for sym, d in removed.items():
-            sent = "BULLISH" if sym.endswith("CE") else "BEARISH"
-            body += f"  ❌ {sym} ({sent})\n"
-            body += f"      └─ 💔 Broken Floor: ₹{d['floor']}\n"
-            body += f"      └─ 📉 Exit LTP    : ₹{d['price']}\n\n"
-
-    msg = MIMEText(body)
-    msg['Subject'] = subject
-    msg['From'] = EMAIL_SENDER
-    msg['To'] = EMAIL_RECEIVER
-
-    try:
-        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp_server:
-            smtp_server.login(EMAIL_SENDER, EMAIL_APP_PWD)
-            smtp_server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
-        print("📧 Alert Successfully Dispatched to Inbox.")
-    except Exception as e:
-        print(f"⚠️ Email failed to send: {e}")
-
+        # --- BASKET 2 RENDER ---
+        if b2_trades:
+            print("🔄 BASKET 2: ALGORITHMIC RELOADS (Phase 2 - Institutional Continuations)")
+            for sym, d in b2_trades:
+                sent = "BULLISH" if sym.endswith("CE") else "BEARISH"
+                sign = "+" if d['points'] > 0 else ""
+                
+                print(f"  🔄 {sym:<20} {sign}{d['points']} pts [V:{d['v']:+d} P:{d['p']:+d} M:{d['m']:+d} E:{d['e']:+d}] ({sent})")
+                print(f"      └─ ⚓ Macro Floor (Origin) : {d.get('macro_time', '')} | Price: ₹{d.get('macro_floor', 0):.2f}")
+                print(f"      └─ ⚡ Micro Floor (Reload) : {d.get('micro_time', '')} | Price: ₹{d.get('micro_floor', 0):.2f}")
+                print(f"      └─ 🎯 Latest LTP           : {TARGET_END} @ EOD   | Price: ₹{d['price']:.2f} (Trend Drift: {d.get('drift', 0):+.2f}%)\n")
 
 if __name__ == "__main__":
-    added, removed, current = simulate_engine()
-    dispatch_results(added, removed, current)
-    print("\n✅ Simulation Complete. Server Self-Destructing.")
+    b1, b2 = simulate_engine()
+    render_terminal(b1, b2)
+    print("✅ System Core Shutting Down.")
