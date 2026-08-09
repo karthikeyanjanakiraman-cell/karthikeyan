@@ -153,14 +153,12 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15,
         df_calc = master_df.copy()
         df_calc['candle_range'] = ((df_calc['High'] - df_calc['Low']) / (df_calc['Open'] + 1e-8)) * 100
 
-        # Enforce GLOBAL_START_TIME anchor
         h, m = map(int, GLOBAL_START_TIME.split(':'))
         start_of_day = pd.to_datetime(current_eval_time.date()) + pd.Timedelta(hours=h, minutes=m)
         
         recent_start = current_eval_time - pd.Timedelta(minutes=window_mins)
         if recent_start <= start_of_day: return pd.DataFrame()
             
-        # Uniform Rolling Baseline Window (e.g., 45-min lookback prior to recent window)
         baseline_start = max(start_of_day, recent_start - pd.Timedelta(minutes=baseline_mins))
         
         base_df = df_calc[(df_calc['Datetime'] >= baseline_start) & (df_calc['Datetime'] < recent_start)]
@@ -174,7 +172,6 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15,
         g_base['Base_Pct_Move'] = ((g_base['Close'] - g_base['Open']) / (g_base['Open'] + 1e-8)) * 100
         g_base['Base_Efficiency'] = (g_base['Close'] - g_base['Open']).abs() / (g_base['abs_move'] + 1e-8)
         
-        # Index-Isolated Normalization (Rolling Baseline)
         g_base['Base_Vol_Rank'] = g_base.groupby('Index_Name')['Turnover'].transform(lambda x: x.rank(pct=True) * 100)
         g_base['Base_P_Rank'] = g_base.groupby('Index_Name')['candle_range'].transform(lambda x: x.rank(pct=True) * 100)
         g_base['Base_Mom_Rank'] = g_base.groupby('Index_Name')['Base_Pct_Move'].transform(lambda x: x.abs().rank(pct=True) * 100)
@@ -187,7 +184,6 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15,
         g_rec['Rec_Pct_Move'] = ((g_rec['Close'] - g_rec['Open']) / (g_rec['Open'] + 1e-8)) * 100
         g_rec['Rec_Efficiency'] = (g_rec['Close'] - g_rec['Open']).abs() / (g_rec['abs_move'] + 1e-8)
         
-        # Index-Isolated Normalization (Recent Window)
         g_rec['Rec_Vol_Rank'] = g_rec.groupby('Index_Name')['Turnover'].transform(lambda x: x.rank(pct=True) * 100)
         g_rec['Rec_P_Rank'] = g_rec.groupby('Index_Name')['candle_range'].transform(lambda x: x.rank(pct=True) * 100)
         g_rec['Rec_Mom_Rank'] = g_rec.groupby('Index_Name')['Rec_Pct_Move'].transform(lambda x: x.abs().rank(pct=True) * 100)
@@ -208,7 +204,6 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15,
         merged['M_Score'] = merged['Mom_Delta'] * merged['Direction']
         merged['E_Score'] = merged['Eff_Delta'] * merged['Direction']
         
-        # TANDEM LOCK (Vector Cohesion Filter)
         merged = merged[
             (merged['V_Score'].abs() >= MIN_VECTOR_FLOOR) &
             (merged['P_Score'].abs() >= MIN_VECTOR_FLOOR) &
@@ -281,19 +276,6 @@ def execute_options_matrix():
         day_master = rolling_master_df[(rolling_master_df['Datetime'] >= day_dt) & (rolling_master_df['Datetime'] < day_dt + pd.Timedelta(days=1))]
         if day_master.empty: continue
 
-        try:
-            morning_open = day_master.groupby('Symbol').first().reset_index()
-            m_dict = morning_open.set_index('Symbol')['Open'].to_dict()
-            for sym, st in memory_bank.items():
-                if sym in m_dict:
-                    op = m_dict[sym]
-                    if st['state'] == 'ACTIVE':
-                        if (st['dir'] == 1 and op < st['origin']) or (st['dir'] == -1 and op > st['origin']):
-                            st['state'] = 'BREACHED'
-                            st['breach_time'] = f"{day} 09:15 (GAP)"
-                            st['breach_days'] = 0  
-        except: pass
-
         h, m = map(int, GLOBAL_START_TIME.split(':'))
         day_start = day_dt + pd.Timedelta(hours=h, minutes=m)
         day_end = day_dt + pd.Timedelta(hours=15, minutes=15) if day != target_date_str else eval_times[-1]
@@ -321,21 +303,11 @@ def execute_options_matrix():
                     for _, row in anomalies.iterrows():
                         sym, price, direction = row['Symbol'], row['Close'], row['Direction']
                         if sym not in memory_bank:
-                            memory_bank[sym] = {'state': 'ACTIVE', 'origin': price, 'date': day, 'time': t.strftime('%H:%M'), 'dir': direction, 'breach_time': None, 'breach_days': 0}
-        except: pass
-                            
-        try:
-            daily_dict = day_master.groupby('Symbol').agg({'Close': 'last'}).reset_index().set_index('Symbol').to_dict('index')
-            to_delete = []
-            for sym, st in memory_bank.items():
-                if sym not in daily_dict: continue
-                d_close = daily_dict[sym]['Close']
-                if st['state'] == 'BREACHED':
-                    if st['dir'] == 1 and d_close < (st['origin'] * 0.985): to_delete.append(sym); continue
-                    elif st['dir'] == -1 and d_close > (st['origin'] * 1.015): to_delete.append(sym); continue
-                    st['breach_days'] += 1
-                    if st['breach_days'] >= MAX_BREACH_DAYS: to_delete.append(sym)
-            for sym in to_delete: del memory_bank[sym]
+                            memory_bank[sym] = {
+                                'state': 'ACTIVE', 'origin': price, 'date': day, 
+                                'time': t.strftime('%H:%M'), 'datetime': t, 'dir': direction, 
+                                'breach_time': None, 'breach_days': 0
+                            }
         except: pass
 
     # ======================================================================
@@ -384,18 +356,29 @@ def execute_options_matrix():
                             except: pass
                             row['Launchpad'] = launchpad_price
                             all_fresh_intrusions[sym] = row
+                            
+                            # 🛡️ BRIDGE FIX: Register live Basket 1 entries into memory bank so they can transition to Basket 3 (Breached)
+                            memory_bank[sym] = {
+                                'state': 'ACTIVE', 
+                                'origin': price, 
+                                'date': target_date_str, 
+                                'time': eval_time_current.strftime('%H:%M'), 
+                                'datetime': eval_time_current, 
+                                'dir': direction, 
+                                'breach_time': None, 
+                                'breach_days': 0
+                            }
                     else:
                         st = memory_bank[sym]
                         row['Net_Drift'] = ((price - st['origin']) / st['origin']) * 100 if st['dir'] == 1 else ((st['origin'] - price) / st['origin']) * 100
                         
-                        if st['state'] == 'ACTIVE' and row['Direction'] == st['dir']:
+                        is_subsequent_bar = eval_time_current > st.get('datetime', target_dt)
+
+                        if st['state'] == 'ACTIVE' and row['Direction'] == st['dir'] and is_subsequent_bar:
                             if (st['dir'] == 1 and price >= st['origin']) or (st['dir'] == -1 and price <= st['origin']):
                                 row['Eval_Time'] = eval_time_current.strftime('%H:%M')
                                 row['Macro_Price'], row['Macro_Date'], row['Micro_Price'] = st['origin'], st['date'], price
                                 all_reloads[sym] = row
-                            else:
-                                st['state'] = 'BREACHED'
-                                st['breach_time'] = eval_time_current.strftime('%Y-%m-%d %H:%M')
                         elif st['state'] == 'BREACHED' and row['Direction'] == st['dir']:
                             if (st['dir'] == 1 and price > st['origin']) or (st['dir'] == -1 and price < st['origin']):
                                 st['state'] = 'ACTIVE' 
@@ -418,7 +401,7 @@ def execute_options_matrix():
     breached = []
     for sym, st in memory_bank.items():
         if st['state'] == 'BREACHED' and sym in final_ltp_dict and sym not in all_reclaims: 
-            sentiment_tag = "BULLISH" if "CE" in sym else "BEARISH"
+            sentiment_tag = "BULLISH" if st['dir'] == 1 else "BEARISH"
             breached.append({'Symbol': sym, 'LTP': final_ltp_dict[sym], 'Origin': st['origin'], 'Dir': sentiment_tag, 'Time': st['breach_time'], 'First_Date': st['date'], 'Anchor_Time': st.get('time', '09:15')})
 
     # ======================================================================
@@ -434,7 +417,7 @@ def execute_options_matrix():
         for sym, row in list(valid_fresh.items())[:TOP_N_STRIKES]:
             jump, ltp, launchpad = row['Total_Score'], row['Close'], row.get('Launchpad', row['Close'])
             color = COLOR_GREEN if jump > 0 else COLOR_RED
-            sent_str = "BULLISH" if "CE" in sym else "BEARISH"
+            sent_str = "BULLISH" if row['Direction'] == 1 else "BEARISH"
             
             output_lines.append(f"  {color}🚨 {sym:<22} {jump:+.0f} pts [V:{row['V_Score']:+.0f} P:{row['P_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({sent_str}){COLOR_RESET}")
             output_lines.append(f"      └─ 🧱 Launchpad (Kinetic Base) : Price: ₹{launchpad:.2f}")
@@ -446,7 +429,7 @@ def execute_options_matrix():
         for sym, row in list(all_reloads.items())[:TOP_N_STRIKES]:
             jump, ltp, true_drift = row['Total_Score'], row['Close'], row['Net_Drift']
             color = COLOR_GREEN if jump > 0 else COLOR_RED
-            sent_str = "BULLISH" if "CE" in sym else "BEARISH"
+            sent_str = "BULLISH" if row['Direction'] == 1 else "BEARISH"
             macro_time = memory_bank[sym].get('time', "09:15")
             
             output_lines.append(f"  {color}🔄 {sym:<22} {jump:+.0f} pts [V:{row['V_Score']:+.0f} P:{row['P_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({sent_str}){COLOR_RESET}")
@@ -466,7 +449,7 @@ def execute_options_matrix():
         output_lines.append(f"{COLOR_BOLD}🪤 BASKET 4: INSTITUTIONAL RECLAIMS (Phase 4 - Liquidity Traps){COLOR_RESET}")
         for sym, row in list(all_reclaims.items())[:TOP_N_STRIKES]:
             jump, ltp, anchor_time = row['Total_Score'], row['Close'], memory_bank[sym].get('time', "09:15")
-            color, sent_str = COLOR_MAGENTA, "BULLISH" if "CE" in sym else "BEARISH"
+            color, sent_str = COLOR_MAGENTA, "BULLISH" if row['Direction'] == 1 else "BEARISH"
             
             output_lines.append(f"  {color}🔥 {sym:<22} {jump:+.0f} pts [V:{row['V_Score']:+.0f} P:{row['P_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({sent_str}){COLOR_RESET}")
             output_lines.append(f"      └─ ⚓ Anchor : {row['First_Date']} @ {anchor_time} | LTP: ₹{row['Origin']:.2f}")
@@ -475,14 +458,11 @@ def execute_options_matrix():
     if not any([valid_fresh, all_reloads, all_reclaims, breached]):
         output_lines.append(f"{COLOR_DIM}[Terminal Silent] No active institutional structure passing strict filters.{COLOR_RESET}\n")
 
-    # Print to Terminal
     for line in output_lines: print(line)
 
-    # Email Dispatcher
     if not EMAIL_SENDER or not EMAIL_APP_PWD or not EMAIL_RECEIVER: return
     if not any([valid_fresh, all_reloads, all_reclaims, breached]): return
 
-    # Strip ANSI colors for email body
     import re
     ansi_escape = re.compile(r'\x1B(?:[@-Z\\-_]|\[[0-?]*[ -/]*[@-~])')
     clean_body = "\n".join([ansi_escape.sub('', line) for line in output_lines])
