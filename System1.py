@@ -129,13 +129,23 @@ def format_email_body(added, removed, matrix=None):
 # ⏱️ 7. THE STATELESS SIMULATOR (CORE ENGINE)
 # ==========================================
 def fetch_day_history(fyers, symbol):
-    """Fetches today's 5-minute history for a given symbol."""
+    """Fetches 5-minute history, automatically routing to Friday if it's the weekend."""
+    
+    # --- WEEKEND OVERRIDE ---
+    target_date = date.today()
+    if target_date.weekday() == 5: # Saturday
+        target_date -= timedelta(days=1)
+    elif target_date.weekday() == 6: # Sunday
+        target_date -= timedelta(days=2)
+        
+    date_str = target_date.strftime("%Y-%m-%d")
+    
     data = {
         "symbol": symbol,
         "resolution": "5",
         "date_format": "1",
-        "range_from": date.today().strftime("%Y-%m-%d"),
-        "range_to": date.today().strftime("%Y-%m-%d"),
+        "range_from": date_str,
+        "range_to": date_str,
         "cont_flag": "1"
     }
     res = fyers.history(data=data)
