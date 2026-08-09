@@ -265,34 +265,78 @@ def simulate_engine():
 # ==========================================
 # ✉️ 8. EMAIL DISPATCH & CONSOLE TRANSPARENCY
 # ==========================================
+# ==========================================
+# ✉️ 8. EMAIL DISPATCH & CONSOLE TRANSPARENCY
+# ==========================================
 def dispatch_results(added, removed, current):
-    print(f"\n🛒 ACTIVE MASTER BASKET (Tracking {len(current)} Surviving Trades):")
-    if not current:
-        print("   [Empty] No trades are currently holding the structural floor.")
-    else:
-        for sym, d in current.items():
-            print(f"   - {sym} | Status: {d['state']} | LTP: {d['price']} | Floor: {d['floor']}")
-    print("-" * 50)
+    print("\n" + "="*65)
+    print(" 🦅 INSTITUTIONAL QUAD-DELTA TERMINAL ".center(65, "="))
+    print("="*65)
 
+    if not current:
+        print("\n🛒 ACTIVE MASTER BASKET: [EMPTY]")
+        print("   No trades are currently holding the structural floor.\n")
+    else:
+        # Group surviving trades by Index
+        grouped_trades = {"NIFTY": {}, "BANKNIFTY": {}, "FINNIFTY": {}, "SENSEX": {}}
+        
+        for sym, d in current.items():
+            if "NIFTY" in sym and "BANK" not in sym and "FIN" not in sym:
+                grouped_trades["NIFTY"][sym] = d
+            elif "BANKNIFTY" in sym:
+                grouped_trades["BANKNIFTY"][sym] = d
+            elif "FINNIFTY" in sym:
+                grouped_trades["FINNIFTY"][sym] = d
+            elif "SENSEX" in sym:
+                grouped_trades["SENSEX"][sym] = d
+
+        # Print the Hierarchical Tree for each Index
+        for index_name, trades in grouped_trades.items():
+            if not trades:
+                continue
+
+            print(f"\n🌐 {index_name} ECOSYSTEM ({len(trades)} Surviving Contracts)")
+            print("-" * 65)
+            print("🔥 BASKET 1: FRESH INTRUSIONS (Phase 1 - Day-1 Births)")
+            
+            for sym, d in trades.items():
+                sentiment = "BULLISH" if sym.endswith("CE") else "BEARISH"
+                icon = "🟢" if sentiment == "BULLISH" else "🔴"
+                
+                # ASCII Node Tree Formatting
+                print(f"  {icon} {sym:<25} ({sentiment})")
+                print(f"      └─ 🧱 Micro Floor (Trail)  : Price: ₹{d['floor']}")
+                print(f"      └─ 🎯 Latest LTP           : Price: ₹{d['price']}")
+                print("")
+
+    # ---------------------------------------------------------
+    # EMAIL DISPATCH LOGIC (Mirrors the Console UI)
+    # ---------------------------------------------------------
     if not EMAIL_SENDER or not EMAIL_APP_PWD:
         return
         
     if not added and not removed:
-        print("🔇 No structural changes on the last candle. Matrix remains silent.")
+        print("🔇 No structural changes on the last candle. Tape remains silent.")
         return
 
     subject = f"⚡ MASTER INTRADAY DELTA (+{len(added)}/-{len(removed)})"
     body = "QUAD-DELTA INTRADAY SHIFT:\n\n"
     
     if added:
-        body += "🟢 [+] ADDED TO BASKET 1 (New Momentum):\n"
+        body += "🔥 BASKET 1: FRESH INTRUSIONS (New Momentum)\n"
         for sym, d in added.items():
-            body += f"   - {sym} | LTP: {d['price']} | Floor: {d['floor']}\n"
+            sent = "BULLISH" if sym.endswith("CE") else "BEARISH"
+            body += f"  🚨 {sym} ({sent})\n"
+            body += f"      └─ 🧱 Entry Floor : ₹{d['floor']}\n"
+            body += f"      └─ 🎯 Latest LTP  : ₹{d['price']}\n\n"
             
     if removed:
-        body += "\n🔴 [-] MOVED TO BASKET 3 (Floor Breached):\n"
+        body += "☠️ PURGED: MOVED TO BASKET 3 (Floor Breached)\n"
         for sym, d in removed.items():
-            body += f"   - {sym} | LTP: {d['price']} | Broken Floor: {d['floor']}\n"
+            sent = "BULLISH" if sym.endswith("CE") else "BEARISH"
+            body += f"  ❌ {sym} ({sent})\n"
+            body += f"      └─ 💔 Broken Floor: ₹{d['floor']}\n"
+            body += f"      └─ 📉 Exit LTP    : ₹{d['price']}\n\n"
 
     msg = MIMEText(body)
     msg['Subject'] = subject
@@ -303,9 +347,10 @@ def dispatch_results(added, removed, current):
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp_server:
             smtp_server.login(EMAIL_SENDER, EMAIL_APP_PWD)
             smtp_server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
-        print("📧 Alert Successfully Dispatched.")
+        print("📧 Alert Successfully Dispatched to Inbox.")
     except Exception as e:
         print(f"⚠️ Email failed to send: {e}")
+
 
 if __name__ == "__main__":
     added, removed, current = simulate_engine()
