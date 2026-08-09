@@ -390,7 +390,7 @@ def execute_options_matrix():
         except: continue
 
     # ======================================================================
-    # THE EOD GUILLOTINE (Final Reconciliation)
+    # THE TACTICAL EOD GUILLOTINE (Final Reconciliation)
     # ======================================================================
     final_ltp_dict = today_master.groupby('Symbol')['Close'].last().to_dict()
     valid_fresh, valid_reloads, valid_reclaims = {}, {}, {}
@@ -403,13 +403,18 @@ def execute_options_matrix():
         else:
             valid_fresh[sym] = row
 
-    # 2. Reconcile Basket 2 Reloads (Fixes Dead Reload UI Bug)
+    # 2. Reconcile Basket 2 Reloads (STRICT MICRO-FLOOR TRAILING STOP)
     for sym, row in all_reloads.items():
         if sym in memory_bank:
-            ltp, direction, origin = final_ltp_dict.get(sym, row['Close']), memory_bank[sym]['dir'], memory_bank[sym]['origin']
-            if (direction == 1 and ltp < origin) or (direction == -1 and ltp > origin):
+            ltp = final_ltp_dict.get(sym, row['Close'])
+            direction = memory_bank[sym]['dir']
+            micro_floor = row['Micro_Price']
+            
+            if (direction == 1 and ltp < micro_floor) or (direction == -1 and ltp > micro_floor):
                 memory_bank[sym]['state'] = 'BREACHED'
-                memory_bank[sym]['breach_time'] = f"{target_date_str} EOD Breakdown"
+                memory_bank[sym]['breach_time'] = f"{target_date_str} EOD Micro-Floor Breakdown"
+                # Update origin to the Micro-Floor so Basket 3 shows the tactical failure level
+                memory_bank[sym]['origin'] = micro_floor 
             else:
                 valid_reloads[sym] = row
 
