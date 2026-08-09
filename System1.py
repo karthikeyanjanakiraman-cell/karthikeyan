@@ -9,14 +9,16 @@ from fyers_apiv3 import fyersModel
 # ⚙️ 1. GLOBAL COMMAND DIAL & MULTI-INDEX LEDGER
 # ==========================================
 GLOBAL_START_TIME = "09:30"
-LOOKBACK_DAYS = 30       # How many days back to reconstruct the Baskets
-TOP_N_STRIKES = 5       # Max apex trades to display per Basket
+LOOKBACK_DAYS = 3            # How many days back to reconstruct the Baskets
+TOP_N_STRIKES = 5            # Max apex trades to display per Basket
+MIN_SCORE_THRESHOLD = 150    # Minimum absolute points required to trigger an alert
 
+# opt_prefix guarantees perfect matching with the Exchange CSV file
 ACTIVE_INDICES = {
-    "NIFTY": {"symbol": "NSE:NIFTY50-INDEX", "step": 50},
-    "BANKNIFTY": {"symbol": "NSE:NIFTYBANK-INDEX", "step": 100},
-    "FINNIFTY": {"symbol": "NSE:NIFTY FIN SERVICE-INDEX", "step": 50},
-    "SENSEX": {"symbol": "BSE:SENSEX-INDEX", "step": 100}
+    "NIFTY": {"symbol": "NSE:NIFTY50-INDEX", "step": 50, "opt_prefix": "NSE:NIFTY"},
+    "BANKNIFTY": {"symbol": "NSE:NIFTYBANK-INDEX", "step": 100, "opt_prefix": "NSE:BANKNIFTY"},
+    "FINNIFTY": {"symbol": "NSE:NIFTY FIN SERVICE-INDEX", "step": 50, "opt_prefix": "NSE:FINNIFTY"},
+    "SENSEX": {"symbol": "BSE:SENSEX-INDEX", "step": 100, "opt_prefix": "BSE:SENSEX"}
 }
 
 # ==========================================
@@ -40,15 +42,21 @@ def get_fyers_instance():
 IST = timezone(timedelta(hours=5, minutes=30))
 
 def get_target_dates():
-    """Calculates the end date (Today) and the start date (Lookback) avoiding weekends."""
-    ist_now = datetime.now(IST)
-    end_date = ist_now.date()
+    """Calculates Epoch and Target dates, listening to GitHub Actions overrides."""
+    param_date = os.getenv("PARAM_BACKTEST_DATE")
     
-    # Weekend override for the End Date
-    if end_date.weekday() == 5: end_date -= timedelta(days=1)
-    elif end_date.weekday() == 6: end_date -= timedelta(days=2)
+    if param_date and param_date.strip():
+        # 🧪 MANUAL OVERRIDE: User typed a date in GitHub Actions UI
+        end_date = datetime.strptime(param_date.strip(), "%Y-%m-%d").date()
+        print(f"⚙️ GITHUB UI OVERRIDE DETECTED: Anchoring Target Date to {end_date}")
+    else:
+        # 🔴 LIVE MARKET MODE
+        ist_now = datetime.now(IST)
+        end_date = ist_now.date()
+        if end_date.weekday() == 5: end_date -= timedelta(days=1)
+        elif end_date.weekday() == 6: end_date -= timedelta(days=2)
         
-    # Calculate Epoch Start Date (Skipping weekends)
+    # Calculate Epoch Start Date (Skipping weekends in the lookback)
     start_date = end_date
     days_subtracted = 0
     while days_subtracted < LOOKBACK_DAYS:
@@ -80,8 +88,16 @@ def load_symbol_master():
                 sym_ticker, opt_type, strike_str, expiry_val = parts[9], parts[16], parts[15], parts[8]
                 
                 if opt_type not in ["CE", "PE"]: continue
-                    
-                idx = next((i for i in ACTIVE_INDICES if sym_ticker.startswith(ACTIVE_INDICES[i]["symbol"].split("-")[0])), None)
+                
+                # Determine Index using the precise opt_prefix to prevent mismatches
+                idx = None
+                for i_name, i_conf in ACTIVE_INDICES.items():
+                    prefix = i_conf["opt_prefix"]
+                    # Ensure the prefix matches AND the very next character is a number (Year)
+                    if sym_ticker.startswith(prefix) and len(sym_ticker) > len(prefix) and sym_ticker[len(prefix)].isdigit():
+                        idx = i_name
+                        break
+                
                 if not idx: continue
                 
                 try:
@@ -105,11 +121,10 @@ def load_symbol_master():
 # ==========================================
 def get_liquid_strikes(fyers, index_name, expiry_date):
     """Gathers all chain strikes, checks live quotes, and purges illiquid junk."""
-    # 1. Grab all possible symbols for this index & expiry
     all_symbols = [sym for (idx, exp, strike, opt), sym in MASTER_SYMBOLS.items() if idx == index_name and exp == expiry_date]
-    
     liquid_symbols = []
-    # 2. Batch API calls to 'quotes' (Max 50 per call)
+    
+    # Batch API calls to 'quotes' (Max 50 per call) to protect rate limits
     for i in range(0, len(all_symbols), 50):
         batch = all_symbols[i:i+50]
         try:
@@ -120,17 +135,17 @@ def get_liquid_strikes(fyers, index_name, expiry_date):
                     lp = data['v'].get('lp', 0)
                     vol = data['v'].get('volume', 0)
                     
-                    # 3. THE GUILLOTINE: Discard dead strikes
+                    # THE GUILLOTINE: Discard dead strikes
                     if lp > 15.0 and vol > 0:
                         liquid_symbols.append(sym)
-        except Exception as e:
+        except Exception:
             pass
             
     print(f"   🛡️ Liquidity Filter: Purged dead strikes. Tracking {len(liquid_symbols)} high-probability targets.")
     return liquid_symbols
 
 # ==========================================
-# 🧠 6. PROPRIETARY QUAD-DELTA MATH (MOCKED)
+# 🧠 6. PROPRIETARY QUAD-DELTA MATH
 # ==========================================
 def run_quad_delta_math(symbol, symbol_candles):
     """
@@ -146,11 +161,10 @@ def run_quad_delta_math(symbol, symbol_candles):
     # 🧠 PROPRIETARY MATH INJECTION POINT
     # Replace this dummy logic with your actual V, P, M, E formulas
     # -----------------------------------------------------
-    # MOCK DATA FOR THE UI:
     is_basket_1 = True
     is_basket_2 = False # Toggle this in your math to route to Reloads
     
-    base_points = 150
+    base_points = 150 # Mock points
     sentiment_mult = 1 if symbol.endswith("CE") else -1
     
     if is_basket_1:
@@ -193,17 +207,16 @@ def simulate_engine():
         
         valid_dates = [d for d in INDEX_EXPIRIES.get(index_name, []) if d >= TARGET_END]
         if not valid_dates:
+            print(f"   ⚠️ No valid expiries found for {index_name}. Skipping.")
             continue
             
         active_expiry = valid_dates[1] if TARGET_END == valid_dates[0] and len(valid_dates) > 1 else valid_dates[0]
         
-        # 1. Engage API Shield
         liquid_targets = get_liquid_strikes(fyers, index_name, active_expiry)
         
         b1_trades = []
         b2_trades = []
         
-        # 2. Evaluate Surviving Targets
         for sym in liquid_targets:
             res = fyers.history({
                 "symbol": sym, "resolution": "5", "date_format": "1",
@@ -214,13 +227,14 @@ def simulate_engine():
             
             math_result = run_quad_delta_math(sym, candles)
             if math_result:
-                if math_result["state"] == "BASKET_1":
-                    b1_trades.append((sym, math_result))
-                elif math_result["state"] == "BASKET_2":
-                    b2_trades.append((sym, math_result))
+                # 🎯 QUALITY CONTROL: The Threshold Gate
+                if abs(math_result["points"]) >= MIN_SCORE_THRESHOLD:
+                    if math_result["state"] == "BASKET_1":
+                        b1_trades.append((sym, math_result))
+                    elif math_result["state"] == "BASKET_2":
+                        b2_trades.append((sym, math_result))
 
-        # 3. Sort & Truncate (The Guillotine)
-        # Sort by absolute points (highest momentum)
+        # 🔪 THE GUILLOTINE: Sort by absolute momentum and enforce Top N Limit
         b1_trades.sort(key=lambda x: abs(x[1]['points']), reverse=True)
         b2_trades.sort(key=lambda x: abs(x[1]['points']), reverse=True)
         
@@ -230,13 +244,17 @@ def simulate_engine():
     return master_basket_1, master_basket_2
 
 # ==========================================
-# ✉️ 8. INSTITUTIONAL TERMINAL UI
+# ✉️ 8. INSTITUTIONAL TERMINAL UI & EMAIL
 # ==========================================
-def render_terminal(b1_master, b2_master):
-    print("\n" + "="*80)
-    print(" 🦅 INSTITUTIONAL QUAD-DELTA SCOREBOARD ".center(80, "="))
-    print(f" [ EPOCH WINDOW: {EPOCH_START} to {TARGET_END} ] ".center(80, " "))
-    print("="*80)
+def dispatch_results(b1_master, b2_master):
+    # 1. Build the String Payload
+    output = []
+    output.append("\n" + "="*80)
+    output.append(" 🦅 INSTITUTIONAL QUAD-DELTA SCOREBOARD ".center(80, "="))
+    output.append(f" [ EPOCH WINDOW: {EPOCH_START} to {TARGET_END} ] ".center(80, " "))
+    output.append("="*80)
+
+    has_trades = False
 
     for index_name in ACTIVE_INDICES.keys():
         b1_trades = b1_master.get(index_name, [])
@@ -245,35 +263,65 @@ def render_terminal(b1_master, b2_master):
         if not b1_trades and not b2_trades:
             continue
             
-        print(f"\n🌐 {index_name} APEX TARGETS")
-        print("-" * 80)
+        has_trades = True
+        output.append(f"\n🌐 {index_name} APEX TARGETS")
+        output.append("-" * 80)
         
-        # --- BASKET 1 RENDER ---
         if b1_trades:
-            print("🔥 BASKET 1: FRESH INTRUSIONS (Phase 1 - Day-1 Births)")
+            output.append("🔥 BASKET 1: FRESH INTRUSIONS (Phase 1 - Day-1 Births)")
             for sym, d in b1_trades:
                 sent = "BULLISH" if sym.endswith("CE") else "BEARISH"
-                icon = "🚨" if sent == "BULLISH" else "⚠️" # Differentiator
+                icon = "🚨" if sent == "BULLISH" else "⚠️"
                 sign = "+" if d['points'] > 0 else ""
                 
-                print(f"  {icon} {sym:<20} {sign}{d['points']} pts [V:{d['v']:+d} P:{d['p']:+d} M:{d['m']:+d} E:{d['e']:+d}] ({sent})")
-                print(f"      └─ 🧱 Launchpad (Kinetic Base) : Price: ₹{d.get('launchpad', 0):.2f}")
-                print(f"      └─ ⚓ Breakout Anchor (Birth)  : {d.get('birth_time', '')} | Price: ₹{d.get('micro_floor', 0):.2f}")
-                print(f"      └─ 🎯 Latest LTP               : {TARGET_END} @ EOD   | Price: ₹{d['price']:.2f}\n")
+                output.append(f"  {icon} {sym:<25} {sign}{d['points']} pts [V:{d['v']:+d} P:{d['p']:+d} M:{d['m']:+d} E:{d['e']:+d}] ({sent})")
+                output.append(f"      └─ 🧱 Launchpad (Kinetic Base) : Price: ₹{d.get('launchpad', 0):.2f}")
+                output.append(f"      └─ ⚓ Breakout Anchor (Birth)  : {d.get('birth_time', '')} | Price: ₹{d.get('micro_floor', 0):.2f}")
+                output.append(f"      └─ 🎯 Latest LTP               : {TARGET_END} @ EOD   | Price: ₹{d['price']:.2f}\n")
 
-        # --- BASKET 2 RENDER ---
         if b2_trades:
-            print("🔄 BASKET 2: ALGORITHMIC RELOADS (Phase 2 - Institutional Continuations)")
+            output.append("🔄 BASKET 2: ALGORITHMIC RELOADS (Phase 2 - Institutional Continuations)")
             for sym, d in b2_trades:
                 sent = "BULLISH" if sym.endswith("CE") else "BEARISH"
                 sign = "+" if d['points'] > 0 else ""
                 
-                print(f"  🔄 {sym:<20} {sign}{d['points']} pts [V:{d['v']:+d} P:{d['p']:+d} M:{d['m']:+d} E:{d['e']:+d}] ({sent})")
-                print(f"      └─ ⚓ Macro Floor (Origin) : {d.get('macro_time', '')} | Price: ₹{d.get('macro_floor', 0):.2f}")
-                print(f"      └─ ⚡ Micro Floor (Reload) : {d.get('micro_time', '')} | Price: ₹{d.get('micro_floor', 0):.2f}")
-                print(f"      └─ 🎯 Latest LTP           : {TARGET_END} @ EOD   | Price: ₹{d['price']:.2f} (Trend Drift: {d.get('drift', 0):+.2f}%)\n")
+                output.append(f"  🔄 {sym:<25} {sign}{d['points']} pts [V:{d['v']:+d} P:{d['p']:+d} M:{d['m']:+d} E:{d['e']:+d}] ({sent})")
+                output.append(f"      └─ ⚓ Macro Floor (Origin) : {d.get('macro_time', '')} | Price: ₹{d.get('macro_floor', 0):.2f}")
+                output.append(f"      └─ ⚡ Micro Floor (Reload) : {d.get('micro_time', '')} | Price: ₹{d.get('micro_floor', 0):.2f}")
+                output.append(f"      └─ 🎯 Latest LTP           : {TARGET_END} @ EOD   | Price: ₹{d['price']:.2f} (Trend Drift: {d.get('drift', 0):+.2f}%)\n")
+
+    if not has_trades:
+        output.append("\n🛒 ACTIVE MASTER BASKET: [EMPTY]")
+        output.append("   No trades met the momentum threshold requirements.")
+
+    body_text = "\n".join(output)
+    
+    # 2. Print to Console (Transparency)
+    print(body_text)
+
+    # 3. Send Email Dispatch
+    if not EMAIL_SENDER or not EMAIL_APP_PWD or not EMAIL_RECEIVER:
+        return
+        
+    if not has_trades:
+        print("🔇 No targets acquired. Matrix remains silent (No Email).")
+        return
+
+    subject = f"⚡ QUAD-DELTA ALERTS: {TARGET_END}"
+    msg = MIMEText(body_text)
+    msg['Subject'] = subject
+    msg['From'] = EMAIL_SENDER
+    msg['To'] = EMAIL_RECEIVER
+
+    try:
+        with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp_server:
+            smtp_server.login(EMAIL_SENDER, EMAIL_APP_PWD)
+            smtp_server.sendmail(EMAIL_SENDER, EMAIL_RECEIVER, msg.as_string())
+        print("📧 Alert Successfully Dispatched to Inbox.")
+    except Exception as e:
+        print(f"⚠️ Email failed to send: {e}")
 
 if __name__ == "__main__":
     b1, b2 = simulate_engine()
-    render_terminal(b1, b2)
+    dispatch_results(b1, b2)
     print("✅ System Core Shutting Down.")
