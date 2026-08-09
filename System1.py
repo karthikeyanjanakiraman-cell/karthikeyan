@@ -31,7 +31,7 @@ MIN_VECTOR_FLOOR = 10        # Minimum percentile contribution per variable
 LIQUIDITY_MIN_PRICE = 15.0   # Global variable: Purges options trading below this price
 MAX_BREACH_DAYS = 0          # Kill Switch: 0 for strict intraday scalping memory purge
 
-GLOBAL_START_TIME = "09:30"
+GLOBAL_START_TIME = "09:30"  # Anchors trading day start, bypassing 09:15 auction noise
 IST = timezone(timedelta(hours=5, minutes=30))
 
 ACTIVE_INDICES = {
@@ -139,41 +139,46 @@ def fetch_fyers_historical_df(fyers, symbol, index_name):
     df = pd.DataFrame(candles, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
     df['Datetime'] = pd.to_datetime(df['Timestamp'], unit='s', utc=True).dt.tz_convert('Asia/Kolkata').dt.tz_localize(None)
     df['Symbol'] = symbol
-    df['Index_Name'] = index_name  # Tagging for index-isolated normalization
+    df['Index_Name'] = index_name
     df['Turnover'] = df['Volume'] * df['Close']
     df['abs_move'] = (df['Close'] - df['Open']).abs()
     return df
 
 # ==============================================================================
-# 3. INDEX-ISOLATED QUAD-DELTA VELOCITY ENGINE & TANDEM LOCK
+# 3. INDEX-ISOLATED UNIFORM ROLLING BASELINE QUAD-DELTA ENGINE
 # ==============================================================================
-def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15):
+def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15, baseline_mins=45):
     try:
         if master_df is None or master_df.empty or 'Datetime' not in master_df.columns: return pd.DataFrame()
         df_calc = master_df.copy()
         df_calc['candle_range'] = ((df_calc['High'] - df_calc['Low']) / (df_calc['Open'] + 1e-8)) * 100
 
-        start_of_day = pd.to_datetime(current_eval_time.date()) + pd.Timedelta(hours=9, minutes=15)
-        recent_start = current_eval_time - pd.Timedelta(minutes=window_mins)
+        # Enforce GLOBAL_START_TIME anchor
+        h, m = map(int, GLOBAL_START_TIME.split(':'))
+        start_of_day = pd.to_datetime(current_eval_time.date()) + pd.Timedelta(hours=h, minutes=m)
         
+        recent_start = current_eval_time - pd.Timedelta(minutes=window_mins)
         if recent_start <= start_of_day: return pd.DataFrame()
             
-        cum_df = df_calc[(df_calc['Datetime'] >= start_of_day) & (df_calc['Datetime'] < recent_start)]
+        # Uniform Rolling Baseline Window (e.g., 45-min lookback prior to recent window)
+        baseline_start = max(start_of_day, recent_start - pd.Timedelta(minutes=baseline_mins))
+        
+        base_df = df_calc[(df_calc['Datetime'] >= baseline_start) & (df_calc['Datetime'] < recent_start)]
         rec_df = df_calc[(df_calc['Datetime'] >= recent_start) & (df_calc['Datetime'] <= current_eval_time)]
-        if cum_df.empty or rec_df.empty: return pd.DataFrame()
+        if base_df.empty or rec_df.empty: return pd.DataFrame()
             
-        g_cum = cum_df.groupby(['Symbol', 'Index_Name']).agg({'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum', 'candle_range': 'mean'}).reset_index()
-        g_cum = g_cum[g_cum['Turnover'] > 0]
-        if g_cum.empty: return pd.DataFrame()
+        g_base = base_df.groupby(['Symbol', 'Index_Name']).agg({'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum', 'candle_range': 'mean'}).reset_index()
+        g_base = g_base[g_base['Turnover'] > 0]
+        if g_base.empty: return pd.DataFrame()
         
-        g_cum['Cum_Pct_Move'] = ((g_cum['Close'] - g_cum['Open']) / (g_cum['Open'] + 1e-8)) * 100
-        g_cum['Cum_Efficiency'] = (g_cum['Close'] - g_cum['Open']).abs() / (g_cum['abs_move'] + 1e-8)
+        g_base['Base_Pct_Move'] = ((g_base['Close'] - g_base['Open']) / (g_base['Open'] + 1e-8)) * 100
+        g_base['Base_Efficiency'] = (g_base['Close'] - g_base['Open']).abs() / (g_base['abs_move'] + 1e-8)
         
-        # 🛡️ INDEX-ISOLATED NORMALIZATION: Percentiles ranked separately per index ecosystem
-        g_cum['Cum_Vol_Rank'] = g_cum.groupby('Index_Name')['Turnover'].transform(lambda x: x.rank(pct=True) * 100)
-        g_cum['Cum_P_Rank'] = g_cum.groupby('Index_Name')['candle_range'].transform(lambda x: x.rank(pct=True) * 100)
-        g_cum['Cum_Mom_Rank'] = g_cum.groupby('Index_Name')['Cum_Pct_Move'].transform(lambda x: x.abs().rank(pct=True) * 100)
-        g_cum['Cum_Eff_Rank'] = g_cum.groupby('Index_Name')['Cum_Efficiency'].transform(lambda x: x.rank(pct=True) * 100)
+        # Index-Isolated Normalization (Rolling Baseline)
+        g_base['Base_Vol_Rank'] = g_base.groupby('Index_Name')['Turnover'].transform(lambda x: x.rank(pct=True) * 100)
+        g_base['Base_P_Rank'] = g_base.groupby('Index_Name')['candle_range'].transform(lambda x: x.rank(pct=True) * 100)
+        g_base['Base_Mom_Rank'] = g_base.groupby('Index_Name')['Base_Pct_Move'].transform(lambda x: x.abs().rank(pct=True) * 100)
+        g_base['Base_Eff_Rank'] = g_base.groupby('Index_Name')['Base_Efficiency'].transform(lambda x: x.rank(pct=True) * 100)
 
         g_rec = rec_df.groupby(['Symbol', 'Index_Name']).agg({'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum', 'candle_range': 'mean'}).reset_index()
         g_rec = g_rec[g_rec['Turnover'] > 0]
@@ -182,20 +187,20 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
         g_rec['Rec_Pct_Move'] = ((g_rec['Close'] - g_rec['Open']) / (g_rec['Open'] + 1e-8)) * 100
         g_rec['Rec_Efficiency'] = (g_rec['Close'] - g_rec['Open']).abs() / (g_rec['abs_move'] + 1e-8)
         
-        # 🛡️ INDEX-ISOLATED NORMALIZATION (Recent Window)
+        # Index-Isolated Normalization (Recent Window)
         g_rec['Rec_Vol_Rank'] = g_rec.groupby('Index_Name')['Turnover'].transform(lambda x: x.rank(pct=True) * 100)
         g_rec['Rec_P_Rank'] = g_rec.groupby('Index_Name')['candle_range'].transform(lambda x: x.rank(pct=True) * 100)
         g_rec['Rec_Mom_Rank'] = g_rec.groupby('Index_Name')['Rec_Pct_Move'].transform(lambda x: x.abs().rank(pct=True) * 100)
         g_rec['Rec_Eff_Rank'] = g_rec.groupby('Index_Name')['Rec_Efficiency'].transform(lambda x: x.rank(pct=True) * 100)
 
         merged = pd.merge(g_rec[['Symbol', 'Index_Name', 'Rec_Pct_Move', 'Close', 'Rec_Vol_Rank', 'Rec_P_Rank', 'Rec_Mom_Rank', 'Rec_Eff_Rank']], 
-                          g_cum[['Symbol', 'Cum_Vol_Rank', 'Cum_P_Rank', 'Cum_Mom_Rank', 'Cum_Eff_Rank']], on=['Symbol', 'Index_Name'], how='inner')
+                          g_base[['Symbol', 'Index_Name', 'Base_Vol_Rank', 'Base_P_Rank', 'Base_Mom_Rank', 'Base_Eff_Rank']], on=['Symbol', 'Index_Name'], how='inner')
         if merged.empty: return pd.DataFrame()
 
-        merged['Vol_Delta'] = merged['Rec_Vol_Rank'] - merged['Cum_Vol_Rank']
-        merged['P_Delta'] = merged['Rec_P_Rank'] - merged['Cum_P_Rank']
-        merged['Mom_Delta'] = merged['Rec_Mom_Rank'] - merged['Cum_Mom_Rank']
-        merged['Eff_Delta'] = merged['Rec_Eff_Rank'] - merged['Cum_Eff_Rank']
+        merged['Vol_Delta'] = merged['Rec_Vol_Rank'] - merged['Base_Vol_Rank']
+        merged['P_Delta'] = merged['Rec_P_Rank'] - merged['Base_P_Rank']
+        merged['Mom_Delta'] = merged['Rec_Mom_Rank'] - merged['Base_Mom_Rank']
+        merged['Eff_Delta'] = merged['Rec_Eff_Rank'] - merged['Base_Eff_Rank']
         
         merged['Direction'] = np.where(merged['Rec_Pct_Move'] > 0, 1, -1)
         merged['V_Score'] = merged['Vol_Delta'] * merged['Direction']
@@ -289,7 +294,8 @@ def execute_options_matrix():
                             st['breach_days'] = 0  
         except: pass
 
-        day_start = day_dt + pd.Timedelta(hours=9, minutes=15)
+        h, m = map(int, GLOBAL_START_TIME.split(':'))
+        day_start = day_dt + pd.Timedelta(hours=h, minutes=m)
         day_end = day_dt + pd.Timedelta(hours=15, minutes=15) if day != target_date_str else eval_times[-1]
         
         try:
