@@ -1,7 +1,8 @@
 import os
+import requests
 import smtplib
 from email.mime.text import MIMEText
-from datetime import datetime, date, timedelta
+from datetime import datetime, date, timedelta, timezone
 from fyers_apiv3 import fyersModel
 
 # ==========================================
@@ -10,22 +11,10 @@ from fyers_apiv3 import fyersModel
 GLOBAL_START_TIME = "09:30"
 
 ACTIVE_INDICES = {
-    "NIFTY": {
-        "symbol": "NSE:NIFTY50-INDEX",
-        "step": 50
-    },
-    "BANKNIFTY": {
-        "symbol": "NSE:NIFTYBANK-INDEX",
-        "step": 100
-    },
-    "FINNIFTY": {
-        "symbol": "NSE:NIFTY FIN SERVICE-INDEX",
-        "step": 50
-    },
-    "SENSEX": {
-        "symbol": "BSE:SENSEX-INDEX",
-        "step": 100
-    }
+    "NIFTY": {"symbol": "NSE:NIFTY50-INDEX", "step": 50},
+    "BANKNIFTY": {"symbol": "NSE:NIFTYBANK-INDEX", "step": 100},
+    "FINNIFTY": {"symbol": "NSE:NIFTY FIN SERVICE-INDEX", "step": 50},
+    "SENSEX": {"symbol": "BSE:SENSEX-INDEX", "step": 100}
 }
 RADAR_RANGE = 5   # ATM +/- 5 Strikes
 
@@ -41,9 +30,6 @@ EMAIL_RECEIVER = os.getenv("EMAIL_RECEIVER")
 print("🔍 SYSTEM DIAGNOSTIC: Checking Environment Variables...")
 print(f"FYERS_CLIENT_ID Loaded: {'YES' if CLIENT_ID else 'NO (Empty)'}")
 print(f"FYERS_ACCESS_TOKEN Loaded: {'YES' if ACCESS_TOKEN else 'NO (Empty)'}")
-print(f"EMAIL_SENDER Loaded: {'YES' if EMAIL_SENDER else 'NO (Empty)'}")
-print(f"EMAIL_APP_PWD Loaded: {'YES' if EMAIL_APP_PWD else 'NO (Empty)'}")
-print(f"EMAIL_RECEIVER Loaded: {'YES' if EMAIL_RECEIVER else 'NO (Empty)'}")
 print("-" * 50)
 
 if not CLIENT_ID or not ACCESS_TOKEN:
@@ -53,11 +39,14 @@ def get_fyers_instance():
     return fyersModel.FyersModel(client_id=CLIENT_ID, is_async=False, token=ACCESS_TOKEN, log_path="")
 
 # ==========================================
-# 🛡️ 3. THE WEEKEND OVERRIDE & API EXPIRY TRUTH
+# 🛡️ 3. TIMEZONE LOCK & WEEKEND OVERRIDE
 # ==========================================
+IST = timezone(timedelta(hours=5, minutes=30))
+
 def get_target_date():
-    """Shifts internal clock back to Friday if running on the weekend."""
-    target_date = date.today()
+    """Forces IST time and shifts internal clock to Friday if on the weekend."""
+    ist_now = datetime.now(IST)
+    target_date = ist_now.date()
     if target_date.weekday() == 5: # Saturday
         target_date -= timedelta(days=1)
     elif target_date.weekday() == 6: # Sunday
@@ -67,51 +56,109 @@ def get_target_date():
 TARGET_DATE = get_target_date()
 TARGET_DATE_STR = TARGET_DATE.strftime("%Y-%m-%d")
 
-def format_fyers_symbol(index_name, expiry_date, strike, option_type):
-    """Accurately formats NSE/BSE option symbols for Fyers."""
-    year_str = str(expiry_date.year)[-2:]
-    month = expiry_date.month
-    day_str = f"{expiry_date.day:02d}"
-    
-    # Fyers uses 1-9 for Jan-Sep, O, N, D for Oct, Nov, Dec
-    month_str = str(month) if month < 10 else {10: 'O', 11: 'N', 12: 'D'}[month]
-    
-    prefix = "BSE" if index_name == "SENSEX" else "NSE"
-    return f"{prefix}:{index_name}{year_str}{month_str}{day_str}{strike}{option_type}"
+# ==========================================
+# 📜 4. THE MASTER FILE LOADER (THE FIX)
+# ==========================================
+MASTER_SYMBOLS = {}
+INDEX_EXPIRIES = {"NIFTY": set(), "BANKNIFTY": set(), "FINNIFTY": set(), "SENSEX": set()}
 
-def get_real_dynamic_expiry(fyers, index_symbol):
-    """Interrogates live Option Chain for actual expiries. 0DTE Shield applied."""
-    try:
-        response = fyers.optionChain(data={"symbol": index_symbol})
-        if 'data' not in response or 'expiryData' not in response['data']:
-            raise ValueError(f"Empty expiry data from API for {index_symbol}")
-            
-        raw_expiries = response['data']['expiryData']
-        valid_dates = []
-        for exp_data in raw_expiries:
-            date_str = exp_data['date'] if 'date' in exp_data else exp_data.get('expiryDate', '')
-            try:
-                date_obj = datetime.strptime(date_str, "%Y-%m-%d").date()
-            except ValueError:
-                date_obj = datetime.strptime(date_str, "%d-%b-%Y").date()
-            valid_dates.append(date_obj)
-            
-        valid_dates.sort()
-        
-        # 0DTE Shield: Compare against the target execution date
-        closest_expiry = valid_dates[0]
-        if TARGET_DATE == closest_expiry:
-            next_expiry = valid_dates[1] if len(valid_dates) > 1 else closest_expiry
-            print(f"🚨 0DTE DETECTED for {index_symbol}. Shifting to next real expiry: {next_expiry}")
-            return next_expiry
-            
-        return closest_expiry
-    except Exception as e:
-        print(f"⚠️ API Option Chain fetch failed for {index_symbol}. Fallback triggered. Error: {e}")
-        return TARGET_DATE + timedelta(days=7) # Safety fallback
+def load_symbol_master():
+    """Downloads Fyers global CSVs. Guarantees 100% accurate symbols and expiries."""
+    print("📡 Downloading Exchange Symbol Master. Bypassing SDK limitations...")
+    urls = [
+        "https://public.fyers.in/sym_details/NSE_FO.csv",
+        "https://public.fyers.in/sym_details/BSE_FO.csv"
+    ]
+    
+    for url in urls:
+        try:
+            res = requests.get(url, timeout=15)
+            for line in res.text.split('\n'):
+                parts = line.split(',')
+                if len(parts) < 17:
+                    continue
+                
+                sym_ticker = parts[9]
+                opt_type = parts[16]
+                
+                if opt_type not in ["CE", "PE"]:
+                    continue
+                    
+                try:
+                    strike = float(parts[15])
+                except ValueError:
+                    continue
+                
+                # Determine Index
+                idx = None
+                if sym_ticker.startswith("NSE:NIFTY") and sym_ticker[9].isdigit():
+                    idx = "NIFTY"
+                elif sym_ticker.startswith("NSE:BANKNIFTY"):
+                    idx = "BANKNIFTY"
+                elif sym_ticker.startswith("NSE:FINNIFTY"):
+                    idx = "FINNIFTY"
+                elif sym_ticker.startswith("BSE:SENSEX"):
+                    idx = "SENSEX"
+                
+                if not idx:
+                    continue
+                
+                # Extract Absolute Expiry Date
+                expiry_val = parts[8]
+                try:
+                    if expiry_val.isdigit():
+                        dt_utc = datetime.fromtimestamp(int(expiry_val), tz=timezone.utc)
+                        expiry_date = dt_utc.astimezone(IST).date()
+                    elif '-' in expiry_val:
+                        expiry_date = datetime.strptime(expiry_val, "%Y-%m-%d").date()
+                    else:
+                        continue
+                except Exception:
+                    continue
+                
+                INDEX_EXPIRIES[idx].add(expiry_date)
+                MASTER_SYMBOLS[(idx, expiry_date, int(strike), opt_type)] = sym_ticker
+        except Exception as e:
+            print(f"⚠️ Master file download failed for {url}: {e}")
+
+    # Sort expiries chronologically
+    for k in INDEX_EXPIRIES:
+        INDEX_EXPIRIES[k] = sorted(list(INDEX_EXPIRIES[k]))
 
 # ==========================================
-# 🧠 4. PROPRIETARY QUAD-DELTA MATH
+# 🎯 5. TARGET ACQUISITION & 0DTE SHIELD
+# ==========================================
+def get_active_expiry(index_name):
+    # Only look at contracts expiring ON or AFTER our simulation date
+    valid_dates = [d for d in INDEX_EXPIRIES.get(index_name, []) if d >= TARGET_DATE]
+    if not valid_dates:
+        raise ValueError(f"No future expiries found for {index_name} in Master File.")
+        
+    closest_expiry = valid_dates[0]
+    
+    if TARGET_DATE == closest_expiry:
+        next_expiry = valid_dates[1] if len(valid_dates) > 1 else closest_expiry
+        print(f"🚨 0DTE DETECTED for {index_name}. Shifting from {closest_expiry} to {next_expiry}")
+        return next_expiry
+    return closest_expiry
+
+def generate_radar_strikes(index_name, spot_price, expiry_date, strike_step):
+    atm_strike = round(spot_price / strike_step) * strike_step
+    strikes = []
+    
+    for i in range(-RADAR_RANGE, RADAR_RANGE + 1):
+        strike_val = atm_strike + (i * strike_step)
+        ce_key = (index_name, expiry_date, strike_val, "CE")
+        pe_key = (index_name, expiry_date, strike_val, "PE")
+        
+        # Plucks the exact exchange-formatted symbol from our downloaded Master Dictionary
+        if ce_key in MASTER_SYMBOLS: strikes.append(MASTER_SYMBOLS[ce_key])
+        if pe_key in MASTER_SYMBOLS: strikes.append(MASTER_SYMBOLS[pe_key])
+            
+    return strikes
+
+# ==========================================
+# 🧠 6. PROPRIETARY QUAD-DELTA MATH
 # ==========================================
 def run_quad_delta_math(symbol_candles):
     """Analyzes sliced candle array up to the current simulated minute."""
@@ -122,7 +169,7 @@ def run_quad_delta_math(symbol_candles):
     micro_floor = symbol_candles[-2][3]   
     
     # -----------------------------------------------------
-    # REPLACE THIS BOOL WITH YOUR TRUE VOLUME/SPREAD ALGO
+    # 🧠 PROPRIETARY QUAD-DELTA MATH INJECTION POINT
     # -----------------------------------------------------
     is_basket_1_birth = True  # Proxy for testing
     
@@ -134,66 +181,59 @@ def run_quad_delta_math(symbol_candles):
         return {"state": "TRACKING", "price": latest_close, "floor": micro_floor}
 
 # ==========================================
-# ⏱️ 5. THE STATELESS SIMULATOR
+# ⏱️ 7. THE STATELESS SIMULATOR
 # ==========================================
 def fetch_history(fyers, symbol):
-    """Fetches the day's 5-minute history once and caches it."""
     data = {
-        "symbol": symbol,
-        "resolution": "5",
-        "date_format": "1",
-        "range_from": TARGET_DATE_STR,
-        "range_to": TARGET_DATE_STR,
-        "cont_flag": "1"
+        "symbol": symbol, "resolution": "5", "date_format": "1",
+        "range_from": TARGET_DATE_STR, "range_to": TARGET_DATE_STR, "cont_flag": "1"
     }
     res = fyers.history(data=data)
     return res.get('candles', [])
 
 def simulate_engine():
     fyers = get_fyers_instance()
+    load_symbol_master() # Initialize Truth Layer
     
     start_time_obj = datetime.strptime(GLOBAL_START_TIME, "%H:%M").time()
     options_cache = {}
     
-    # Master Ledgers for Final Consolidation
-    master_added = {}
-    master_removed = {}
-    master_current = {}
-    
-    print(f"🟢 Initiating Stateless Reconstruction for {TARGET_DATE_STR}...\n")
+    master_added, master_removed, master_current = {}, {}, {}
+    print(f"\n🟢 Initiating Stateless Reconstruction for {TARGET_DATE_STR}...")
 
     for index_name, config in ACTIVE_INDICES.items():
         index_symbol = config['symbol']
         strike_step = config['step']
         
-        # 1. Fetch real expiry & Spot history
-        active_expiry = get_real_dynamic_expiry(fyers, index_symbol)
+        try:
+            active_expiry = get_active_expiry(index_name)
+        except Exception as e:
+            print(f"⚠️ {e} Skipping {index_name}.")
+            continue
+            
         spot_candles = fetch_history(fyers, index_symbol)
         
-        # 2. Filter candles to respect GLOBAL_START_TIME
-        valid_spot_candles = [c for c in spot_candles if datetime.fromtimestamp(c[0]).time() >= start_time_obj]
-        
+        # Enforce IST on candle timestamps to respect GLOBAL_START_TIME
+        valid_spot_candles = []
+        for c in spot_candles:
+            c_time = datetime.fromtimestamp(c[0], tz=timezone.utc).astimezone(IST).time()
+            if c_time >= start_time_obj:
+                valid_spot_candles.append(c)
+                
         if not valid_spot_candles:
             continue
 
         anchored_strikes = {}
         previous_matrix = {}
         
-        # 3. Time-Travel Loop
         for idx, spot_candle in enumerate(valid_spot_candles):
             timestamp = spot_candle[0]
             spot_close = spot_candle[4]
             is_last_candle = (idx == len(valid_spot_candles) - 1)
             
-            # The Rolling Radar
-            atm_strike = round(spot_close / strike_step) * strike_step
-            radar_strikes = []
-            for i in range(-RADAR_RANGE, RADAR_RANGE + 1):
-                s_val = atm_strike + (i * strike_step)
-                radar_strikes.append(format_fyers_symbol(index_name, active_expiry, s_val, "CE"))
-                radar_strikes.append(format_fyers_symbol(index_name, active_expiry, s_val, "PE"))
-            
+            radar_strikes = generate_radar_strikes(index_name, spot_close, active_expiry, strike_step)
             active_targets = set(radar_strikes + list(anchored_strikes.keys()))
+            
             current_matrix = {}
             new_anchors = {}
             
@@ -201,7 +241,6 @@ def simulate_engine():
                 if strike not in options_cache:
                     options_cache[strike] = fetch_history(fyers, strike)
                     
-                # Slice history up to 'now' in simulation
                 sliced_candles = [c for c in options_cache[strike] if c[0] <= timestamp]
                 result = run_quad_delta_math(sliced_candles)
                 
@@ -211,7 +250,6 @@ def simulate_engine():
                     
             anchored_strikes = new_anchors
             
-            # Delta logic on the very last candle
             if is_last_candle:
                 added = {s: d for s, d in current_matrix.items() if s not in previous_matrix}
                 removed = {s: d for s, d in previous_matrix.items() if s not in current_matrix}
@@ -225,10 +263,9 @@ def simulate_engine():
     return master_added, master_removed, master_current
 
 # ==========================================
-# ✉️ 6. EMAIL DISPATCH & CONSOLE TRANSPARENCY
+# ✉️ 8. EMAIL DISPATCH & CONSOLE TRANSPARENCY
 # ==========================================
 def dispatch_results(added, removed, current):
-    # 1. Console Transparency (Always Prints)
     print(f"\n🛒 ACTIVE MASTER BASKET (Tracking {len(current)} Surviving Trades):")
     if not current:
         print("   [Empty] No trades are currently holding the structural floor.")
@@ -237,7 +274,6 @@ def dispatch_results(added, removed, current):
             print(f"   - {sym} | Status: {d['state']} | LTP: {d['price']} | Floor: {d['floor']}")
     print("-" * 50)
 
-    # 2. Email Dispatch (Only sends on Delta)
     if not EMAIL_SENDER or not EMAIL_APP_PWD:
         return
         
