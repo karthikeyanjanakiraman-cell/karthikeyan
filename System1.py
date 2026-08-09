@@ -9,7 +9,7 @@ from fyers_apiv3 import fyersModel
 # ⚙️ 1. GLOBAL COMMAND DIAL & MULTI-INDEX LEDGER
 # ==========================================
 GLOBAL_START_TIME = "09:30"
-LOOKBACK_DAYS = 3       # How many days back to reconstruct the Baskets
+LOOKBACK_DAYS = 30       # How many days back to reconstruct the Baskets
 TOP_N_STRIKES = 5       # Max apex trades to display per Basket
 
 ACTIVE_INDICES = {
