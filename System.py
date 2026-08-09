@@ -27,8 +27,7 @@ COLOR_BOLD = '\033[1m'
 SCORE_THRESHOLD = 160    # Quad-Delta max is 400
 MIN_VECTOR_FLOOR = 10    # Minimum percentile contribution per variable
 BACKTRACE_DAYS = 20      # 1 F&O Monthly Derivative Cycle
-MAX_BREACH_DAYS = 0      # Kill Switch: Days a stock can stay breached before memory purge
-
+MAX_BREACH_DAYS = 2      # Kill Switch: Days a stock can stay breached before memory purge (Set to 0 for Intraday Scalping)
 
 # ==============================================================================
 # 1. LIVE INGESTION (F&O Universe with Error Shield)
@@ -154,7 +153,6 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
         # ------------------------------------------------------------------
         # TANDEM LOCK (Vector Cohesion Filter)
         # ------------------------------------------------------------------
-        # 1. Minimum Floor: No variable can be a freeloader
         merged = merged[
             (merged['V_Score'].abs() >= MIN_VECTOR_FLOOR) &
             (merged['P_Score'].abs() >= MIN_VECTOR_FLOOR) &
@@ -162,7 +160,6 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
             (merged['E_Score'].abs() >= MIN_VECTOR_FLOOR)
         ]
         
-        # 2. Sign Agreement: All vectors must align with the Direction
         merged['Valid_Tandem'] = (
             (np.sign(merged['V_Score']) == merged['Direction']) &
             (np.sign(merged['P_Score']) == merged['Direction']) &
@@ -298,6 +295,7 @@ def scan_institutional_tape(target_date_str):
                 d_close = daily_dict[sym]['Close']
                 
                 if st['state'] == 'BREACHED':
+                    # The Hard Ceiling Limit (-1.5%)
                     if st['dir'] == 1 and d_close < (st['origin'] * 0.985): 
                         to_delete.append(sym)
                         continue
@@ -306,6 +304,7 @@ def scan_institutional_tape(target_date_str):
                         continue
                     
                     st['breach_days'] += 1
+                    # 🔴 THE GLOBAL TIME HORIZON TOGGLE IS APPLIED HERE
                     if st['breach_days'] >= MAX_BREACH_DAYS:
                         to_delete.append(sym)
                         
@@ -361,11 +360,27 @@ def scan_institutional_tape(target_date_str):
                     if sym not in memory_bank:
                         if sym not in all_fresh_intrusions:
                             row['Eval_Time'] = eval_time_current.strftime('%H:%M')
+                            
+                            # --- 🚀 THE KINETIC BASE (LAUNCHPAD) LOGIC ---
+                            launchpad_price = price
+                            try:
+                                launch_slice = rolling_master_df[
+                                    (rolling_master_df['Symbol'] == sym) & 
+                                    (rolling_master_df['Datetime'] < eval_time_current) & 
+                                    (rolling_master_df['Datetime'] >= eval_time_current - pd.Timedelta(days=5))
+                                ]
+                                if not launch_slice.empty:
+                                    if direction == 1:
+                                        launchpad_price = launch_slice['Low'].min()
+                                    else:
+                                        launchpad_price = launch_slice['High'].max()
+                            except:
+                                pass
+                            row['Launchpad'] = launchpad_price
+                            
                             all_fresh_intrusions[sym] = row
                     else:
                         st = memory_bank[sym]
-                        row['Origin'] = st['origin']
-                        row['First_Date'] = st['date']
                         
                         if st['dir'] == 1:
                             row['Net_Drift'] = ((price - st['origin']) / st['origin']) * 100
@@ -375,6 +390,12 @@ def scan_institutional_tape(target_date_str):
                         if st['state'] == 'ACTIVE' and row['Direction'] == st['dir']:
                             if (st['dir'] == 1 and price >= st['origin']) or (st['dir'] == -1 and price <= st['origin']):
                                 row['Eval_Time'] = eval_time_current.strftime('%H:%M')
+                                
+                                # --- 🪜 THE MULTI-NODE STAIRCASE LOGIC ---
+                                row['Macro_Price'] = st['origin']
+                                row['Macro_Date'] = st['date']
+                                row['Micro_Price'] = price
+                                
                                 all_reloads[sym] = row
                             else:
                                 st['state'] = 'BREACHED'
@@ -385,6 +406,8 @@ def scan_institutional_tape(target_date_str):
                                 st['state'] = 'ACTIVE' 
                                 st['breach_time'] = None
                                 row['Eval_Time'] = eval_time_current.strftime('%H:%M')
+                                row['Origin'] = st['origin']
+                                row['First_Date'] = st['date']
                                 all_reclaims[sym] = row
         except:
             continue
@@ -432,10 +455,12 @@ def scan_institutional_tape(target_date_str):
             color = COLOR_GREEN if jump > 0 else COLOR_RED
             d_str = "BULLISH" if jump > 0 else "BEARISH"
             eval_t = row.get('Eval_Time', '15:15')
+            launchpad = row.get('Launchpad', ltp)
             
             print(f"  {color}🚨 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} P:{row['P_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str}){COLOR_RESET}")
-            print(f"      └─ ⚓ Anchor : {target_date_str} @ {eval_t} | LTP: ₹{ltp:.2f}")
-            print(f"      └─ 🎯 Latest : {target_date_str} @ 15:30 EOD | LTP: ₹{final_ltp_dict.get(sym, ltp):.2f}\n")
+            print(f"      └─ 🧱 Launchpad (Kinetic Base) : Price: ₹{launchpad:.2f}")
+            print(f"      └─ ⚓ Breakout Anchor (Birth)  : {target_date_str} @ {eval_t} | Price: ₹{ltp:.2f}")
+            print(f"      └─ 🎯 Latest LTP               : {target_date_str} @ EOD   | Price: ₹{final_ltp_dict.get(sym, ltp):.2f}\n")
 
     if all_reloads:
         print(f"{COLOR_BOLD}🔄 BASKET 2: ALGORITHMIC RELOADS (Phase 2 - Institutional Continuations){COLOR_RESET}")
@@ -444,14 +469,17 @@ def scan_institutional_tape(target_date_str):
             true_drift = row['Net_Drift']
             color = COLOR_GREEN if jump > 0 else COLOR_RED
             d_str = "BULLISH" if jump > 0 else "BEARISH"
-            anchor_date = row['First_Date']
-            anchor_time = memory_bank[sym].get('time', "09:15") 
-            origin_price = row['Origin']
             eval_t = row.get('Eval_Time', '15:15')
             
+            macro_date = row['Macro_Date']
+            macro_time = memory_bank[sym].get('time', "09:15")
+            macro_price = row['Macro_Price']
+            micro_price = row['Micro_Price']
+            
             print(f"  {color}🔄 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} P:{row['P_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str}){COLOR_RESET}")
-            print(f"      └─ ⚓ Anchor : {anchor_date} @ {anchor_time} | LTP: ₹{origin_price:.2f}")
-            print(f"      └─ 🎯 Latest : {target_date_str} @ {eval_t} | LTP: ₹{ltp:.2f} (Trend Profit Drift: {true_drift:+.2f}%)\n")
+            print(f"      └─ ⚓ Macro Floor (Origin) : {macro_date} @ {macro_time} | Price: ₹{macro_price:.2f}")
+            print(f"      └─ ⚡ Micro Floor (Reload) : {target_date_str} @ {eval_t} | Price: ₹{micro_price:.2f}")
+            print(f"      └─ 🎯 Latest LTP           : {target_date_str} @ EOD   | Price: ₹{final_ltp_dict.get(sym, ltp):.2f} (Trend Drift: {true_drift:+.2f}%)\n")
 
     if breached:
         print(f"{COLOR_DIM}⚠️ BASKET 3: BREACHED PIVOTS (Phase 3 - Trapped Capital / Dead Trends){COLOR_RESET}")
@@ -510,4 +538,3 @@ if __name__ == "__main__":
     import warnings
     warnings.filterwarnings("ignore")
     run_production_sweep()
-
