@@ -1,0 +1,570 @@
+import os
+import sys
+import argparse
+import urllib.parse
+import json
+import gzip
+import io
+import time
+from datetime import datetime, timedelta
+
+import requests
+import pandas as pd
+import numpy as np
+
+# ==============================================================================
+# 0. ENGINE CONSTANTS & TERMINAL COLORS
+# ==============================================================================
+COLOR_GREEN = '\033[92m'
+COLOR_RED = '\033[91m'
+COLOR_CYAN = '\033[96m'
+COLOR_YELLOW = '\033[93m'
+COLOR_MAGENTA = '\033[95m'
+COLOR_DIM = '\033[2m'
+COLOR_RESET = '\033[0m'
+COLOR_BOLD = '\033[1m'
+
+# --- NEW GLOBAL VARIABLES FOR NON-F&O UNIVERSE FILTERING ---
+MIN_PRICE = 50              # Minimum stock price
+MAX_PRICE = 2000            # Maximum stock price
+MIN_DAILY_VOLUME = 500000   # Minimum daily volume (Checked against the previous trading day)
+# -----------------------------------------------------------
+
+SCORE_THRESHOLD = 160    # Quad-Delta max is 400
+MIN_VECTOR_FLOOR = 2     # Minimum percentile contribution per variable
+BACKTRACE_DAYS = 20      # 1 F&O Monthly Derivative Cycle (Kept at 20 for structural memory)
+MAX_BREACH_DAYS = 0      # Kill Switch: Days a stock can stay breached before memory purge (Set to 0 for Intraday Scalping)
+
+# ==============================================================================
+# 1. LIVE INGESTION (Non-F&O Universe with Error Shield)
+# ==============================================================================
+def get_dynamic_non_fno_universe():
+    nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+    try:
+        response = requests.get(nse_url, timeout=5)
+        if response.status_code != 200:
+            return []
+        nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
+        
+        # Identify F&O underlying symbols to EXCLUDE them
+        fno_underlying = {item.get("underlying_symbol") for item in nse_data if item.get("segment") == "NSE_FO" and item.get("underlying_symbol")}
+        
+        # Fetch strictly Equity segment (NSE_EQ) NOT present in the F&O list
+        return [{"symbol": item.get("trading_symbol"), "key": item.get("instrument_key")} 
+                for item in nse_data 
+                if item.get("segment") == "NSE_EQ" 
+                and item.get("trading_symbol") not in fno_underlying]
+    except Exception as e:
+        print(f"{COLOR_RED}[API Error] Failed to fetch Non-F&O universe: {e}{COLOR_RESET}")
+        return []
+
+def fetch_upstox_candles_for_date(instrument_key, date_str):
+    access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
+    if not access_token:
+        return None
+    
+    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
+    today_str = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
+    
+    if date_str == today_str:
+        url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key)}/1minute"
+    else:
+        url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{date_str}/{date_str}"
+    
+    try:
+        response = requests.get(url, headers=headers, timeout=5)
+        if response.status_code != 200:
+            return None
+        data = response.json().get('data', {}).get('candles', [])
+        if not data:
+            return None
+        c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
+        c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).dt.tz_localize(None) 
+        c_df = c_df.sort_values('Datetime').reset_index(drop=True)
+        return c_df
+    except:
+        return None
+
+def get_past_trading_days(target_date_str, num_days=20):
+    try:
+        target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
+        trading_days = []
+        current_dt = target_dt
+        while len(trading_days) < num_days:
+            if current_dt.weekday() < 5:  
+                trading_days.append(current_dt.strftime("%Y-%m-%d"))
+            current_dt -= timedelta(days=1)
+        trading_days.reverse()
+        return trading_days
+    except Exception as e:
+        print(f"{COLOR_RED}[Date Error] {e}{COLOR_RESET}")
+        return []
+
+# ==============================================================================
+# 2. QUAD-DELTA VELOCITY ENGINE & TANDEM LOCK
+# ==============================================================================
+def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15):
+    try:
+        if master_df is None or master_df.empty or 'Datetime' not in master_df.columns:
+            return pd.DataFrame()
+
+        df_calc = master_df.copy()
+        df_calc['candle_range'] = ((df_calc['High'] - df_calc['Low']) / (df_calc['Open'] + 1e-8)) * 100
+
+        start_of_day = pd.to_datetime(current_eval_time.date()) + pd.Timedelta(hours=9, minutes=15)
+        recent_start = current_eval_time - pd.Timedelta(minutes=window_mins)
+        
+        if recent_start <= start_of_day:
+            return pd.DataFrame()
+            
+        cum_df = df_calc[(df_calc['Datetime'] >= start_of_day) & (df_calc['Datetime'] < recent_start)]
+        rec_df = df_calc[(df_calc['Datetime'] >= recent_start) & (df_calc['Datetime'] <= current_eval_time)]
+        
+        if cum_df.empty or rec_df.empty:
+            return pd.DataFrame()
+            
+        g_cum = cum_df.groupby('Symbol').agg({'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum', 'candle_range': 'mean'}).reset_index()
+        g_cum = g_cum[g_cum['Turnover'] > 0]
+        if g_cum.empty: return pd.DataFrame()
+        
+        g_cum['Cum_Pct_Move'] = ((g_cum['Close'] - g_cum['Open']) / (g_cum['Open'] + 1e-8)) * 100
+        g_cum['Cum_Efficiency'] = (g_cum['Close'] - g_cum['Open']).abs() / (g_cum['abs_move'] + 1e-8)
+        
+        g_cum['Cum_Vol_Rank'] = g_cum['Turnover'].rank(pct=True) * 100
+        g_cum['Cum_P_Rank'] = g_cum['candle_range'].rank(pct=True) * 100
+        g_cum['Cum_Mom_Rank'] = g_cum['Cum_Pct_Move'].abs().rank(pct=True) * 100
+        g_cum['Cum_Eff_Rank'] = g_cum['Cum_Efficiency'].rank(pct=True) * 100
+
+        g_rec = rec_df.groupby('Symbol').agg({'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum', 'candle_range': 'mean'}).reset_index()
+        g_rec = g_rec[g_rec['Turnover'] > 0]
+        if g_rec.empty: return pd.DataFrame()
+        
+        g_rec['Rec_Pct_Move'] = ((g_rec['Close'] - g_rec['Open']) / (g_rec['Open'] + 1e-8)) * 100
+        g_rec['Rec_Efficiency'] = (g_rec['Close'] - g_rec['Open']).abs() / (g_rec['abs_move'] + 1e-8)
+        
+        g_rec['Rec_Vol_Rank'] = g_rec['Turnover'].rank(pct=True) * 100
+        g_rec['Rec_P_Rank'] = g_rec['candle_range'].rank(pct=True) * 100
+        g_rec['Rec_Mom_Rank'] = g_rec['Rec_Pct_Move'].abs().rank(pct=True) * 100
+        g_rec['Rec_Eff_Rank'] = g_rec['Rec_Efficiency'].rank(pct=True) * 100
+
+        merged = pd.merge(g_rec[['Symbol', 'Rec_Pct_Move', 'Close', 'Rec_Vol_Rank', 'Rec_P_Rank', 'Rec_Mom_Rank', 'Rec_Eff_Rank']], 
+                          g_cum[['Symbol', 'Cum_Vol_Rank', 'Cum_P_Rank', 'Cum_Mom_Rank', 'Cum_Eff_Rank']], on='Symbol', how='inner')
+        
+        if merged.empty: return pd.DataFrame()
+
+        merged['Vol_Delta'] = merged['Rec_Vol_Rank'] - merged['Cum_Vol_Rank']
+        merged['P_Delta'] = merged['Rec_P_Rank'] - merged['Cum_P_Rank']
+        merged['Mom_Delta'] = merged['Rec_Mom_Rank'] - merged['Cum_Mom_Rank']
+        merged['Eff_Delta'] = merged['Rec_Eff_Rank'] - merged['Cum_Eff_Rank']
+        
+        merged['Direction'] = np.where(merged['Rec_Pct_Move'] > 0, 1, -1)
+        merged['V_Score'] = merged['Vol_Delta'] * merged['Direction']
+        merged['P_Score'] = merged['P_Delta'] * merged['Direction']
+        merged['M_Score'] = merged['Mom_Delta'] * merged['Direction']
+        merged['E_Score'] = merged['Eff_Delta'] * merged['Direction']
+        
+        # ------------------------------------------------------------------
+        # TANDEM LOCK (Vector Cohesion Filter)
+        # ------------------------------------------------------------------
+        merged = merged[
+            (merged['V_Score'].abs() >= MIN_VECTOR_FLOOR) &
+            (merged['P_Score'].abs() >= MIN_VECTOR_FLOOR) &
+            (merged['M_Score'].abs() >= MIN_VECTOR_FLOOR) &
+            (merged['E_Score'].abs() >= MIN_VECTOR_FLOOR)
+        ]
+        
+        merged['Valid_Tandem'] = (
+            (np.sign(merged['V_Score']) == merged['Direction']) &
+            (np.sign(merged['P_Score']) == merged['Direction']) &
+            (np.sign(merged['M_Score']) == merged['Direction']) &
+            (np.sign(merged['E_Score']) == merged['Direction'])
+        )
+        merged = merged[merged['Valid_Tandem']]
+
+        merged['Total_Score'] = merged['V_Score'] + merged['P_Score'] + merged['M_Score'] + merged['E_Score']
+        merged = merged[merged['Total_Score'].abs() >= SCORE_THRESHOLD]
+        merged = merged.sort_values(by='Total_Score', key=abs, ascending=False)
+        
+        return merged
+    except Exception as e:
+        return pd.DataFrame()
+
+# ==============================================================================
+# 3. STATE-BASED MEMORY ENGINE (Ironclad Gatekeeping & Universal Drift Math)
+# ==============================================================================
+def scan_institutional_tape(target_date_str):
+    print(f"\n📡 Initiating State-Based Quad-Delta Engine for {target_date_str}...")
+    universe_raw = get_dynamic_non_fno_universe()
+    if not universe_raw:
+        print(f"⚠️ {COLOR_RED}No Non-F&O universe found or API connection failed.{COLOR_RESET}")
+        return
+        
+    trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
+    if not trading_days:
+        print(f"⚠️ {COLOR_RED}Failed to generate trading days sequence.{COLOR_RESET}")
+        return
+
+    # --- PRE-FILTERING ENGINE ---
+    # We use the most recently closed trading day (T-1) to evaluate the volume and price criteria. 
+    # If we run this intraday, volume hasn't built up yet, so T-1 is the safest metric.
+    filter_date = trading_days[-2] if len(trading_days) > 1 else trading_days[0]
+    print(f"🔄 Pre-filtering ~{len(universe_raw)} Non-F&O stocks...")
+    print(f"   [Parameters] Price: ₹{MIN_PRICE}-₹{MAX_PRICE} | Min Vol: {MIN_DAILY_VOLUME} | Anchor Day: {filter_date}")
+    
+    universe = []
+    for item in universe_raw:
+        df = fetch_upstox_candles_for_date(item['key'], filter_date)
+        if df is not None and not df.empty:
+            daily_vol = df['Volume'].sum()
+            close_px = df['Close'].iloc[-1]
+            if MIN_PRICE <= close_px <= MAX_PRICE and daily_vol >= MIN_DAILY_VOLUME:
+                universe.append(item)
+        time.sleep(0.01) # Very slight delay to prevent API 429 Too Many Requests errors
+
+    print(f"✅ Filter Complete: Tracked universe narrowed down to {COLOR_GREEN}{len(universe)} qualified stocks{COLOR_RESET}.")
+    print(f"🔄 Backtracing structural memory across {len(trading_days)} trading days for qualified universe...")
+
+    historical_dfs = []
+    for day in trading_days:
+        day_list = []
+        for item in universe:
+            df = fetch_upstox_candles_for_date(item['key'], day)
+            if df is not None and not df.empty:
+                df['Symbol'] = item['symbol']
+                df['Turnover'] = df['Volume'] * df['Close']
+                df['abs_move'] = (df['Close'] - df['Open']).abs()
+                day_list.append(df)
+        if day_list:
+            historical_dfs.append(pd.concat(day_list, ignore_index=True))
+
+    if not historical_dfs:
+        print(f"⚠️ {COLOR_RED}Fatal Error: No valid market data fetched across the window.{COLOR_RESET}")
+        return
+
+    rolling_master_df = pd.concat(historical_dfs, ignore_index=True)
+    
+    current_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    is_live_today = (target_date_str == current_now.strftime("%Y-%m-%d"))
+    
+    target_dt = pd.to_datetime(target_date_str)
+    if not is_live_today or current_now.hour >= 16:
+        eval_times = [
+            target_dt + pd.Timedelta(hours=9, minutes=45),
+            target_dt + pd.Timedelta(hours=10, minutes=30),
+            target_dt + pd.Timedelta(hours=11, minutes=30),
+            target_dt + pd.Timedelta(hours=12, minutes=30),
+            target_dt + pd.Timedelta(hours=13, minutes=30),
+            target_dt + pd.Timedelta(hours=14, minutes=30),
+            target_dt + pd.Timedelta(hours=15, minutes=15)
+        ]
+    else:
+        eval_times = [current_now.replace(second=0, microsecond=0) - timedelta(minutes=1)]
+
+    memory_bank = {} 
+    
+    for day in trading_days:
+        day_dt = pd.to_datetime(day)
+        day_master = rolling_master_df[(rolling_master_df['Datetime'] >= day_dt) & (rolling_master_df['Datetime'] < day_dt + pd.Timedelta(days=1))]
+        if day_master.empty:
+            continue
+
+        try:
+            morning_open = day_master.groupby('Symbol').first().reset_index()
+            m_dict = morning_open.set_index('Symbol')['Open'].to_dict()
+            
+            for sym, st in memory_bank.items():
+                if sym in m_dict:
+                    op = m_dict[sym]
+                    if st['state'] == 'ACTIVE':
+                        if (st['dir'] == 1 and op < st['origin']) or (st['dir'] == -1 and op > st['origin']):
+                            st['state'] = 'BREACHED'
+                            st['breach_time'] = f"{day} 09:15 (GAP)"
+                            st['breach_days'] = 0  
+        except:
+            pass
+
+        day_start = day_dt + pd.Timedelta(hours=9, minutes=15)
+        day_end = day_dt + pd.Timedelta(hours=15, minutes=15) if day != target_date_str else eval_times[-1]
+        
+        try:
+            time_steps = pd.date_range(start=day_start + pd.Timedelta(minutes=15), end=day_end, freq='15min')
+            for t in time_steps:
+                t_candles = day_master[day_master['Datetime'] == t].set_index('Symbol')['Close'].to_dict()
+                for sym, st in memory_bank.items():
+                    if sym in t_candles:
+                        ltp = t_candles[sym]
+                        if st['state'] == 'ACTIVE':
+                            if (st['dir'] == 1 and ltp < st['origin']) or (st['dir'] == -1 and ltp > st['origin']):
+                                st['state'] = 'BREACHED'
+                                st['breach_time'] = t.strftime('%Y-%m-%d %H:%M')
+                                st['breach_days'] = 0
+                        elif st['state'] == 'BREACHED':
+                            if (st['dir'] == 1 and ltp >= st['origin']) or (st['dir'] == -1 and ltp <= st['origin']):
+                                st['state'] = 'ACTIVE'
+                                st['breach_time'] = None
+                                st['breach_days'] = 0
+
+                anomalies = calculate_velocity_leaderboard(day_master, t, window_mins=15)
+                if not anomalies.empty:
+                    for _, row in anomalies.iterrows():
+                        sym = row['Symbol']
+                        price = row['Close']
+                        direction = row['Direction']
+                        if sym not in memory_bank:
+                            memory_bank[sym] = {'state': 'ACTIVE', 'origin': price, 'date': day, 'time': t.strftime('%H:%M'), 'dir': direction, 'breach_time': None, 'breach_days': 0}
+        except:
+            pass
+                            
+        try:
+            daily_agg = day_master.groupby('Symbol').agg({'Close': 'last'}).reset_index()
+            daily_dict = daily_agg.set_index('Symbol').to_dict('index')
+            
+            to_delete = []
+            for sym, st in memory_bank.items():
+                if sym not in daily_dict:
+                    continue
+                d_close = daily_dict[sym]['Close']
+                
+                if st['state'] == 'BREACHED':
+                    # The Hard Ceiling Limit (-1.5%)
+                    if st['dir'] == 1 and d_close < (st['origin'] * 0.985): 
+                        to_delete.append(sym)
+                        continue
+                    elif st['dir'] == -1 and d_close > (st['origin'] * 1.015): 
+                        to_delete.append(sym)
+                        continue
+                    
+                    st['breach_days'] += 1
+                    if st['breach_days'] >= MAX_BREACH_DAYS:
+                        to_delete.append(sym)
+                        
+            for sym in to_delete: 
+                del memory_bank[sym]
+        except:
+            pass
+
+    # ----------------------------------------------------------------------
+    # LIVE EVALUATION (Full-Day Sweep Loop with Strict Gatekeeping)
+    # ----------------------------------------------------------------------
+    today_master = rolling_master_df[
+        (rolling_master_df['Datetime'] >= target_dt) & 
+        (rolling_master_df['Datetime'] <= target_dt + pd.Timedelta(days=1))
+    ].copy()
+
+    if today_master.empty: 
+        print(f"\n{COLOR_YELLOW}[Terminal Standby] Market data for {target_date_str} is empty or not available yet.{COLOR_RESET}\n")
+        return
+
+    all_fresh_intrusions = {}
+    all_reloads = {}
+    all_reclaims = {}
+
+    for eval_time_current in eval_times:
+        current_slice = today_master[today_master['Datetime'] <= eval_time_current]
+        if current_slice.empty:
+            continue
+
+        try:
+            today_latest_ltp = current_slice.groupby('Symbol')['Close'].last().to_dict()
+            
+            for sym, st in memory_bank.items():
+                if sym in today_latest_ltp:
+                    ltp = today_latest_ltp[sym]
+                    if st['state'] == 'ACTIVE':
+                        if (st['dir'] == 1 and ltp < st['origin']) or (st['dir'] == -1 and ltp > st['origin']):
+                            st['state'] = 'BREACHED'
+                            st['breach_time'] = eval_time_current.strftime('%Y-%m-%d %H:%M')
+                    elif st['state'] == 'BREACHED':
+                        if (st['dir'] == 1 and ltp >= st['origin']) or (st['dir'] == -1 and ltp <= st['origin']):
+                            st['state'] = 'ACTIVE'
+                            st['breach_time'] = None
+
+            curr_anomalies = calculate_velocity_leaderboard(current_slice, eval_time_current, window_mins=15)
+
+            if not curr_anomalies.empty:
+                for _, row in curr_anomalies.iterrows():
+                    sym = row['Symbol']
+                    price = row['Close']
+                    direction = row['Direction']
+                    
+                    if sym not in memory_bank:
+                        if sym not in all_fresh_intrusions:
+                            row['Eval_Time'] = eval_time_current.strftime('%H:%M')
+                            
+                            # --- 🚀 THE KINETIC BASE (LAUNCHPAD) LOGIC ---
+                            launchpad_price = price
+                            try:
+                                launch_slice = rolling_master_df[
+                                    (rolling_master_df['Symbol'] == sym) & 
+                                    (rolling_master_df['Datetime'] < eval_time_current) & 
+                                    (rolling_master_df['Datetime'] >= eval_time_current - pd.Timedelta(days=5))
+                                ]
+                                if not launch_slice.empty:
+                                    if direction == 1:
+                                        launchpad_price = launch_slice['Low'].min()
+                                    else:
+                                        launchpad_price = launch_slice['High'].max()
+                            except:
+                                pass
+                            row['Launchpad'] = launchpad_price
+                            
+                            all_fresh_intrusions[sym] = row
+                    else:
+                        st = memory_bank[sym]
+                        
+                        if st['dir'] == 1:
+                            row['Net_Drift'] = ((price - st['origin']) / st['origin']) * 100
+                        else:
+                            row['Net_Drift'] = ((st['origin'] - price) / st['origin']) * 100
+                        
+                        if st['state'] == 'ACTIVE' and row['Direction'] == st['dir']:
+                            if (st['dir'] == 1 and price >= st['origin']) or (st['dir'] == -1 and price <= st['origin']):
+                                row['Eval_Time'] = eval_time_current.strftime('%H:%M')
+                                
+                                row['Macro_Price'] = st['origin']
+                                row['Macro_Date'] = st['date']
+                                row['Micro_Price'] = price
+                                
+                                all_reloads[sym] = row
+                            else:
+                                st['state'] = 'BREACHED'
+                                st['breach_time'] = eval_time_current.strftime('%Y-%m-%d %H:%M')
+                                
+                        elif st['state'] == 'BREACHED' and row['Direction'] == st['dir']:
+                            if (st['dir'] == 1 and price > st['origin']) or (st['dir'] == -1 and price < st['origin']):
+                                st['state'] = 'ACTIVE' 
+                                st['breach_time'] = None
+                                row['Eval_Time'] = eval_time_current.strftime('%H:%M')
+                                row['Origin'] = st['origin']
+                                row['First_Date'] = st['date']
+                                all_reclaims[sym] = row
+        except:
+            continue
+
+    final_ltp_dict = today_master.groupby('Symbol')['Close'].last().to_dict()
+    
+    valid_fresh = {}
+    for sym, row in all_fresh_intrusions.items():
+        ltp = final_ltp_dict.get(sym, row['Close'])
+        direction = row['Direction']
+        birth_price = row['Close']
+        
+        if (direction == 1 and ltp < birth_price) or (direction == -1 and ltp > birth_price):
+            memory_bank[sym] = {
+                'state': 'BREACHED', 'origin': birth_price, 'date': target_date_str, 
+                'time': row.get('Eval_Time', '15:15'), 'dir': direction, 
+                'breach_time': f"{target_date_str} EOD Violation", 'breach_days': 0
+            }
+        else:
+            valid_fresh[sym] = row
+
+    breached = []
+    for sym, st in memory_bank.items():
+        if st['state'] == 'BREACHED' and sym in final_ltp_dict:
+            if sym not in all_reclaims: 
+                breached.append({
+                    'Symbol': sym, 'LTP': final_ltp_dict[sym], 'Origin': st['origin'], 
+                    'Dir': "BULLISH" if st['dir'] == 1 else "BEARISH",
+                    'Time': st['breach_time'],
+                    'First_Date': st['date'],
+                    'Anchor_Time': st.get('time', '09:15')
+                })
+
+    # ----------------------------------------------------------------------
+    # TERMINAL OUTPUT (4D Temporal UI Matrix)
+    # ----------------------------------------------------------------------
+    print(f"\n{COLOR_CYAN}================================================================================================{COLOR_RESET}")
+    print(f"{COLOR_BOLD}NON-F&O UNIVERSE QUAD-DELTA SESSION TAPE | DATE: {target_date_str}{COLOR_RESET}")
+    print(f"{COLOR_CYAN}================================================================================================{COLOR_RESET}\n")
+
+    if valid_fresh:
+        print(f"{COLOR_BOLD}⚡ BASKET 1: FRESH INTRUSIONS (Phase 1 - Day-1 Births){COLOR_RESET}")
+        for sym, row in valid_fresh.items():
+            jump, ltp = row['Total_Score'], row['Close']
+            color = COLOR_GREEN if jump > 0 else COLOR_RED
+            d_str = "BULLISH" if jump > 0 else "BEARISH"
+            eval_t = row.get('Eval_Time', '15:15')
+            launchpad = row.get('Launchpad', ltp)
+            
+            print(f"  {color}🚨 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} P:{row['P_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str}){COLOR_RESET}")
+            print(f"      └─ 🧱 Launchpad (Kinetic Base) : Price: ₹{launchpad:.2f}")
+            print(f"      └─ ⚓ Breakout Anchor (Birth)  : {target_date_str} @ {eval_t} | Price: ₹{ltp:.2f}")
+            print(f"      └─ 🎯 Latest LTP               : {target_date_str} @ EOD   | Price: ₹{final_ltp_dict.get(sym, ltp):.2f}\n")
+
+    if all_reloads:
+        print(f"{COLOR_BOLD}🔄 BASKET 2: ALGORITHMIC RELOADS (Phase 2 - Institutional Continuations){COLOR_RESET}")
+        for sym, row in all_reloads.items():
+            jump, ltp = row['Total_Score'], row['Close']
+            true_drift = row['Net_Drift']
+            color = COLOR_GREEN if jump > 0 else COLOR_RED
+            d_str = "BULLISH" if jump > 0 else "BEARISH"
+            eval_t = row.get('Eval_Time', '15:15')
+            
+            macro_date = row['Macro_Date']
+            macro_time = memory_bank[sym].get('time', "09:15")
+            macro_price = row['Macro_Price']
+            micro_price = row['Micro_Price']
+            
+            print(f"  {color}🔄 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} P:{row['P_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str}){COLOR_RESET}")
+            print(f"      └─ ⚓ Macro Floor (Origin) : {macro_date} @ {macro_time} | Price: ₹{macro_price:.2f}")
+            print(f"      └─ ⚡ Micro Floor (Reload) : {target_date_str} @ {eval_t} | Price: ₹{micro_price:.2f}")
+            print(f"      └─ 🎯 Latest LTP           : {target_date_str} @ EOD   | Price: ₹{final_ltp_dict.get(sym, ltp):.2f} (Trend Drift: {true_drift:+.2f}%)\n")
+
+    if breached:
+        print(f"{COLOR_DIM}⚠️ BASKET 3: BREACHED PIVOTS (Phase 3 - Trapped Capital / Dead Trends){COLOR_RESET}")
+        for b in breached:
+            b_time = b['Time'] if b['Time'] else 'Pending Intraday Breakdown'
+            print(f"  {COLOR_YELLOW}⚠️ {b['Symbol']:<12} {b['Dir']} Anchor shattered!{COLOR_RESET}")
+            print(f"      └─ ⚓ Anchor : {b['First_Date']} @ {b['Anchor_Time']} | LTP: ₹{b['Origin']:.2f}")
+            print(f"      └─ 🎯 Latest : Breached At {b_time} | Current LTP: ₹{b['LTP']:.2f}\n")
+
+    if all_reclaims:
+        print(f"{COLOR_BOLD}🪤 BASKET 4: INSTITUTIONAL RECLAIMS (Phase 4 - Liquidity Traps){COLOR_RESET}")
+        for sym, row in all_reclaims.items():
+            jump, ltp = row['Total_Score'], row['Close']
+            color = COLOR_MAGENTA
+            d_str = "BULLISH" if jump > 0 else "BEARISH"
+            anchor_time = memory_bank[sym].get('time', "09:15")
+            eval_t = row.get('Eval_Time', '15:15')
+            
+            print(f"  {color}🔥 {sym:<12} {jump:+.0f} pts [V:{row['V_Score']:+.0f} P:{row['P_Score']:+.0f} M:{row['M_Score']:+.0f} E:{row['E_Score']:+.0f}] ({d_str}){COLOR_RESET}")
+            print(f"      └─ ⚓ Anchor : {row['First_Date']} @ {anchor_time} | LTP: ₹{row['Origin']:.2f}")
+            print(f"      └─ 🎯 Latest : Reclaimed At {target_date_str} @ {eval_t} | LTP: ₹{ltp:.2f}\n")
+
+    if not any([valid_fresh, all_reloads, all_reclaims, breached]):
+        print(f"{COLOR_DIM}[Terminal Silent] No active institutional structure passing strict filters.{COLOR_RESET}\n")
+
+# ==============================================================================
+# 4. RUN EXECUTOR
+# ==============================================================================
+def run_production_sweep():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("-d", "--date", type=str, default="")
+    parser.add_argument("positional_date", nargs="?", default="")
+    args, _ = parser.parse_known_args()
+
+    raw_date_str = args.date or args.positional_date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
+    is_backtest = bool(raw_date_str)
+
+    if not is_backtest:
+        target_dt = datetime.utcnow() + timedelta(hours=5, minutes=30)
+        if target_dt.weekday() == 5: 
+            print(f"{COLOR_YELLOW}[System Notice] Market closed (Saturday). Auto-rolling back to Friday's tape.{COLOR_RESET}")
+            target_dt -= timedelta(days=1)
+        elif target_dt.weekday() == 6: 
+            print(f"{COLOR_YELLOW}[System Notice] Market closed (Sunday). Auto-rolling back to Friday's tape.{COLOR_RESET}")
+            target_dt -= timedelta(days=2)
+        target_date_str = target_dt.strftime("%Y-%m-%d")
+    else:
+        target_date_str = datetime.strptime(raw_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
+    
+    if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
+        print(f"❌ {COLOR_RED}Error: UPSTOX_ACCESS_TOKEN environment variable not found.{COLOR_RESET}")
+        return
+    scan_institutional_tape(target_date_str)
+
+if __name__ == "__main__":
+    import warnings
+    warnings.filterwarnings("ignore")
+    run_production_sweep()
+
