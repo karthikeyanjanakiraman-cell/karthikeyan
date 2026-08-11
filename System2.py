@@ -27,12 +27,12 @@ COLOR_BOLD = '\033[1m'
 # --- NEW GLOBAL VARIABLES FOR NON-F&O UNIVERSE FILTERING ---
 MIN_PRICE = 50              # Minimum stock price
 MAX_PRICE = 80            # Maximum stock price
-MIN_DAILY_VOLUME = 500000   # Minimum daily volume (Checked against the previous trading day)
+MIN_DAILY_VOLUME = 5000000   # Minimum daily volume (Checked against the previous trading day)
 # -----------------------------------------------------------
 
-SCORE_THRESHOLD = 160    # Quad-Delta max is 400
+SCORE_THRESHOLD = 200    # Quad-Delta max is 400
 MIN_VECTOR_FLOOR = 2     # Minimum percentile contribution per variable
-BACKTRACE_DAYS = 20      # 1 F&O Monthly Derivative Cycle (Kept at 20 for structural memory)
+BACKTRACE_DAYS = 1      # 1 F&O Monthly Derivative Cycle (Kept at 20 for structural memory)
 MAX_BREACH_DAYS = 0      # Kill Switch: Days a stock can stay breached before memory purge (Set to 0 for Intraday Scalping)
 
 # ==============================================================================
