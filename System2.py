@@ -26,7 +26,7 @@ COLOR_BOLD = '\033[1m'
 
 # --- NEW GLOBAL VARIABLES FOR NON-F&O UNIVERSE FILTERING ---
 MIN_PRICE = 50              # Minimum stock price
-MAX_PRICE = 2000            # Maximum stock price
+MAX_PRICE = 80            # Maximum stock price
 MIN_DAILY_VOLUME = 500000   # Minimum daily volume (Checked against the previous trading day)
 # -----------------------------------------------------------
 
