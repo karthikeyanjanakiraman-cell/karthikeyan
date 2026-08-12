@@ -90,7 +90,7 @@ def get_past_trading_days(target_date_str, num_days=20):
 # ==============================================================================
 # 2. QUAD-DELTA VELOCITY ENGINE & TANDEM LOCK
 # ==============================================================================
-def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15):
+def calculate_velocity_leaderboard(master_df, current_eval_time, rolling_master_df=None, window_mins=15):
     try:
         if master_df is None or master_df.empty or 'Datetime' not in master_df.columns:
             return pd.DataFrame()
@@ -133,6 +133,40 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, window_mins=15)
         g_rec['Rec_P_Rank'] = g_rec['candle_range'].rank(pct=True) * 100
         g_rec['Rec_Mom_Rank'] = g_rec['Rec_Pct_Move'].abs().rank(pct=True) * 100
         g_rec['Rec_Eff_Rank'] = g_rec['Rec_Efficiency'].rank(pct=True) * 100
+
+        # ------------------------------------------------------------------
+        # NEW CONDITION: CURRENT 15-MIN V, M, E MUST BE MAX OF LOOKBACK DAYS
+        # ------------------------------------------------------------------
+        if rolling_master_df is not None and not rolling_master_df.empty:
+            history_slice = rolling_master_df[rolling_master_df['Datetime'] < recent_start]
+            
+            if not history_slice.empty:
+                # Group 20-day historical data into 15-min bins
+                hist_15m = history_slice.groupby(['Symbol', pd.Grouper(key='Datetime', freq='15min')]).agg(
+                    {'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'}
+                ).reset_index()
+                
+                hist_15m = hist_15m[hist_15m['Turnover'] > 0]
+                hist_15m['Pct_Move'] = ((hist_15m['Close'] - hist_15m['Open']) / (hist_15m['Open'] + 1e-8)) * 100
+                hist_15m['Efficiency'] = (hist_15m['Close'] - hist_15m['Open']).abs() / (hist_15m['abs_move'] + 1e-8)
+                
+                # Find the absolute highest 15m values per symbol over the 20 days
+                hist_max = hist_15m.groupby('Symbol').agg(
+                    Max_Turnover=('Turnover', 'max'),
+                    Max_Mom=('Pct_Move', lambda x: x.abs().max()),
+                    Max_Eff=('Efficiency', 'max')
+                ).reset_index()
+                
+                # Filter current 15m block against historical maxes
+                g_rec = pd.merge(g_rec, hist_max, on='Symbol', how='left')
+                g_rec = g_rec[
+                    (g_rec['Turnover'] >= g_rec['Max_Turnover'].fillna(0)) &
+                    (g_rec['Rec_Pct_Move'].abs() >= g_rec['Max_Mom'].fillna(0)) &
+                    (g_rec['Rec_Efficiency'] >= g_rec['Max_Eff'].fillna(0))
+                ]
+                
+                if g_rec.empty: return pd.DataFrame()
+        # ------------------------------------------------------------------
 
         merged = pd.merge(g_rec[['Symbol', 'Rec_Pct_Move', 'Close', 'Rec_Vol_Rank', 'Rec_P_Rank', 'Rec_Mom_Rank', 'Rec_Eff_Rank']], 
                           g_cum[['Symbol', 'Cum_Vol_Rank', 'Cum_P_Rank', 'Cum_Mom_Rank', 'Cum_Eff_Rank']], on='Symbol', how='inner')
@@ -273,7 +307,7 @@ def scan_institutional_tape(target_date_str):
                                 st['breach_time'] = None
                                 st['breach_days'] = 0
 
-                anomalies = calculate_velocity_leaderboard(day_master, t, window_mins=15)
+                anomalies = calculate_velocity_leaderboard(day_master, t, rolling_master_df=rolling_master_df, window_mins=15)
                 if not anomalies.empty:
                     for _, row in anomalies.iterrows():
                         sym = row['Symbol']
@@ -349,7 +383,7 @@ def scan_institutional_tape(target_date_str):
                             st['state'] = 'ACTIVE'
                             st['breach_time'] = None
 
-            curr_anomalies = calculate_velocity_leaderboard(current_slice, eval_time_current, window_mins=15)
+            curr_anomalies = calculate_velocity_leaderboard(current_slice, eval_time_current, rolling_master_df=rolling_master_df, window_mins=15)
 
             if not curr_anomalies.empty:
                 for _, row in curr_anomalies.iterrows():
