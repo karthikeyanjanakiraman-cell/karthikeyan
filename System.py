@@ -24,8 +24,8 @@ COLOR_DIM = '\033[2m'
 COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 
-SCORE_THRESHOLD = 00    # Quad-Delta max is 400
-MIN_VECTOR_FLOOR = 0    # Minimum percentile contribution per variable
+SCORE_THRESHOLD = 160    # Quad-Delta max is 400
+MIN_VECTOR_FLOOR = 2     # Minimum percentile contribution per variable
 BACKTRACE_DAYS = 20      # 1 F&O Monthly Derivative Cycle
 MAX_BREACH_DAYS = 0      # Kill Switch: Days a stock can stay breached before memory purge (Set to 0 for Intraday Scalping)
 
@@ -122,12 +122,13 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, rolling_master_
         g_cum['Cum_Mom_Rank'] = g_cum['Cum_Pct_Move'].abs().rank(pct=True) * 100
         g_cum['Cum_Eff_Rank'] = g_cum['Cum_Efficiency'].rank(pct=True) * 100
 
-        g_rec = rec_df.groupby('Symbol').agg({'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum', 'candle_range': 'mean'}).reset_index()
+        g_rec = rec_df.groupby('Symbol').agg({'Turnover': 'sum', 'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'abs_move': 'sum'}).reset_index()
         g_rec = g_rec[g_rec['Turnover'] > 0]
         if g_rec.empty: return pd.DataFrame()
         
         g_rec['Rec_Pct_Move'] = ((g_rec['Close'] - g_rec['Open']) / (g_rec['Open'] + 1e-8)) * 100
         g_rec['Rec_Efficiency'] = (g_rec['Close'] - g_rec['Open']).abs() / (g_rec['abs_move'] + 1e-8)
+        g_rec['candle_range'] = ((g_rec['High'] - g_rec['Low']) / (g_rec['Open'] + 1e-8)) * 100
         
         g_rec['Rec_Vol_Rank'] = g_rec['Turnover'].rank(pct=True) * 100
         g_rec['Rec_P_Rank'] = g_rec['candle_range'].rank(pct=True) * 100
@@ -135,7 +136,8 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, rolling_master_
         g_rec['Rec_Eff_Rank'] = g_rec['Rec_Efficiency'].rank(pct=True) * 100
 
         # ------------------------------------------------------------------
-        # NEW CONDITION: CURRENT 15-MIN V, M, E MUST BE MAX OF LOOKBACK DAYS
+        # NEW CONDITION: CURRENT 15-MIN BLOCK MUST BE THE ALL-TIME HIGH 
+        # IN AT LEAST ONE METRIC OVER THE LAST 20 DAYS
         # ------------------------------------------------------------------
         if rolling_master_df is not None and not rolling_master_df.empty:
             history_slice = rolling_master_df[rolling_master_df['Datetime'] < recent_start]
@@ -143,26 +145,29 @@ def calculate_velocity_leaderboard(master_df, current_eval_time, rolling_master_
             if not history_slice.empty:
                 # Group 20-day historical data into 15-min bins
                 hist_15m = history_slice.groupby(['Symbol', pd.Grouper(key='Datetime', freq='15min')]).agg(
-                    {'Turnover': 'sum', 'Open': 'first', 'Close': 'last', 'abs_move': 'sum'}
+                    {'Turnover': 'sum', 'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'abs_move': 'sum'}
                 ).reset_index()
                 
                 hist_15m = hist_15m[hist_15m['Turnover'] > 0]
                 hist_15m['Pct_Move'] = ((hist_15m['Close'] - hist_15m['Open']) / (hist_15m['Open'] + 1e-8)) * 100
                 hist_15m['Efficiency'] = (hist_15m['Close'] - hist_15m['Open']).abs() / (hist_15m['abs_move'] + 1e-8)
+                hist_15m['candle_range'] = ((hist_15m['High'] - hist_15m['Low']) / (hist_15m['Open'] + 1e-8)) * 100
                 
                 # Find the absolute highest 15m values per symbol over the 20 days
                 hist_max = hist_15m.groupby('Symbol').agg(
                     Max_Turnover=('Turnover', 'max'),
                     Max_Mom=('Pct_Move', lambda x: x.abs().max()),
-                    Max_Eff=('Efficiency', 'max')
+                    Max_Eff=('Efficiency', 'max'),
+                    Max_Range=('candle_range', 'max')
                 ).reset_index()
                 
-                # Filter current 15m block against historical maxes
+                # Filter current 15m block against historical maxes (Must beat the max in at least ONE category)
                 g_rec = pd.merge(g_rec, hist_max, on='Symbol', how='left')
                 g_rec = g_rec[
-                    (g_rec['Turnover'] >= g_rec['Max_Turnover'].fillna(0)) &
-                    (g_rec['Rec_Pct_Move'].abs() >= g_rec['Max_Mom'].fillna(0)) &
-                    (g_rec['Rec_Efficiency'] >= g_rec['Max_Eff'].fillna(0))
+                    (g_rec['Turnover'] >= g_rec['Max_Turnover'].fillna(0)) |
+                    (g_rec['Rec_Pct_Move'].abs() >= g_rec['Max_Mom'].fillna(0)) |
+                    (g_rec['Rec_Efficiency'] >= g_rec['Max_Eff'].fillna(0)) |
+                    (g_rec['candle_range'] >= g_rec['Max_Range'].fillna(0))
                 ]
                 
                 if g_rec.empty: return pd.DataFrame()
