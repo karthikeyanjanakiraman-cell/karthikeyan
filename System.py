@@ -6,7 +6,7 @@ import json
 import gzip
 import io
 import time
-from datetime import datetime, timedelta8
+from datetime import datetime, timedelta
 
 import requests
 import pandas as pd
