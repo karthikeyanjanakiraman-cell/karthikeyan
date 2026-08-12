@@ -44,7 +44,7 @@ jobs:
         
         PARAM_BACKTEST_DATE: ${{ github.event.inputs.backtest_date }}
       run: |
-        python System1.py
+        python System.py
 
     - name: Execute System (AI Engine)
       if: always()
@@ -61,4 +61,4 @@ jobs:
         
         PARAM_BACKTEST_DATE: ${{ github.event.inputs.backtest_date }}
       run: |
-        python System2.py
+        python System1.py
