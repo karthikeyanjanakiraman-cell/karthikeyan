@@ -6,7 +6,7 @@ import json
 import gzip
 import io
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta8
 
 import requests
 import pandas as pd
@@ -24,8 +24,8 @@ COLOR_DIM = '\033[2m'
 COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 
-SCORE_THRESHOLD = 30    # Quad-Delta max is 400
-MIN_VECTOR_FLOOR = 2    # Minimum percentile contribution per variable
+SCORE_THRESHOLD = 00    # Quad-Delta max is 400
+MIN_VECTOR_FLOOR = 0    # Minimum percentile contribution per variable
 BACKTRACE_DAYS = 20      # 1 F&O Monthly Derivative Cycle
 MAX_BREACH_DAYS = 0      # Kill Switch: Days a stock can stay breached before memory purge (Set to 0 for Intraday Scalping)
 
