@@ -24,8 +24,8 @@ COLOR_DIM = '\033[2m'
 COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 
-SCORE_THRESHOLD = 100    # Quad-Delta max is 400
-MIN_VECTOR_FLOOR = 5     # Minimum percentile contribution per variable
+SCORE_THRESHOLD = 50    # Quad-Delta max is 400
+MIN_VECTOR_FLOOR = 3     # Minimum percentile contribution per variable
 BACKTRACE_DAYS = 20      # 1 F&O Monthly Derivative Cycle
 MAX_BREACH_DAYS = 0      # Kill Switch: Days a stock can stay breached before memory purge (Set to 0 for Intraday Scalping)
 
