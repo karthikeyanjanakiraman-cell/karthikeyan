@@ -44,21 +44,4 @@ jobs:
         
         PARAM_BACKTEST_DATE: ${{ github.event.inputs.backtest_date }}
       run: |
-        python System.py
-
-    - name: Execute System (AI Engine)
-      if: always()
-      env:
-        # Replicated the exact same bridge for the second script
-        FYERS_CLIENT_ID: ${{ secrets.CLIENT_ID }}
-        FYERS_ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-        
-        EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
-        EMAIL_APP_PWD: ${{ secrets.EMAIL_APP_PWD }}
-        EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
-        
-        UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
-        
-        PARAM_BACKTEST_DATE: ${{ github.event.inputs.backtest_date }}
-      run: |
-        python System1.py
+        python System3.py  
