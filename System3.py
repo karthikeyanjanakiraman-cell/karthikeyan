@@ -518,18 +518,18 @@ def scan_institutional_tape(target_date_str):
                                 row['Macro_Date'] = st['date']
                                 row['Micro_Price'] = price
                                 all_reloads[sym] = row
-                    else:
-                            st['state'] = 'BREACHED'
-                            st['breach_time'] = eval_time_current.strftime('%Y-%m-%d %H:%M')
+                            else:
+                                st['state'] = 'BREACHED'
+                                st['breach_time'] = eval_time_current.strftime('%Y-%m-%d %H:%M')
 
-                    elif st['state'] == 'BREACHED' and row['Direction'] == st['dir']:
-                        if (st['dir'] == 1 and price > st['origin']) or (st['dir'] == -1 and price < st['origin']):
-                            st['state'] = 'ACTIVE' 
-                            st['breach_time'] = None
-                            row['Eval_Time'] = eval_time_current.strftime('%H:%M')
-                            row['Origin'] = st['origin']
-                            row['First_Date'] = st['date']
-                            all_reclaims[sym] = row
+                        elif st['state'] == 'BREACHED' and row['Direction'] == st['dir']:
+                            if (st['dir'] == 1 and price > st['origin']) or (st['dir'] == -1 and price < st['origin']):
+                                st['state'] = 'ACTIVE' 
+                                st['breach_time'] = None
+                                row['Eval_Time'] = eval_time_current.strftime('%H:%M')
+                                row['Origin'] = st['origin']
+                                row['First_Date'] = st['date']
+                                all_reclaims[sym] = row
         except:
             continue
 
