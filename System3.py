@@ -44,7 +44,7 @@ def get_dynamic_fno_universe():
         print(f"{COLOR_RED}[API Error] Failed to fetch F&O universe: {e}{COLOR_RESET}")
         return []
 
-def fetch_upstox_candles_for_date(instrument_key, date_str):
+def fetch_upstox_candles_for_date(instrument_key, date_str, retries=4):
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
     if not access_token:
         return None
@@ -57,19 +57,33 @@ def fetch_upstox_candles_for_date(instrument_key, date_str):
     else:
         url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{date_str}/{date_str}"
 
-    try:
-        response = requests.get(url, headers=headers, timeout=5)
-        if response.status_code != 200:
-            return None
-        data = response.json().get('data', {}).get('candles', [])
-        if not data:
-            return None
-        c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
-        c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).dt.tz_localize(None) 
-        c_df = c_df.sort_values('Datetime').reset_index(drop=True)
-        return c_df
-    except:
-        return None
+    for attempt in range(retries):
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            
+            # If Upstox Rate-Limits us, sleep for 2 seconds and try again
+            if response.status_code == 429:
+                time.sleep(2)
+                continue
+                
+            if response.status_code != 200:
+                return None
+                
+            data = response.json().get('data', {}).get('candles', [])
+            if not data:
+                return None
+                
+            c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
+            c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).dt.tz_localize(None) 
+            c_df = c_df.sort_values('Datetime').reset_index(drop=True)
+            return c_df
+            
+        except Exception:
+            # If there is a connection timeout, pause and retry
+            time.sleep(1)
+            continue
+            
+    return None
 
 def get_past_trading_days(target_date_str, num_days=20):
     try:
@@ -227,7 +241,7 @@ def scan_institutional_tape(target_date_str):
 
     print(f"🔄 Backtracing structural memory across {len(trading_days)} trading days using Multithreading...")
 
-    # MULTITHREADED API FETCHING
+    # MULTITHREADED API FETCHING WITH 5 WORKERS TO PREVENT RATE LIMITING
     fetch_tasks = [(item, day) for day in trading_days for item in universe]
     historical_dfs = []
 
@@ -241,7 +255,7 @@ def scan_institutional_tape(target_date_str):
             return df
         return None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         results = list(executor.map(fetch_worker, fetch_tasks))
         for res in results:
             if res is not None:
