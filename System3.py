@@ -518,7 +518,7 @@ def scan_institutional_tape(target_date_str):
                                 row['Macro_Date'] = st['date']
                                 row['Micro_Price'] = price
                                 all_reloads[sym] = row
-                        else:
+                    else:
                             st['state'] = 'BREACHED'
                             st['breach_time'] = eval_time_current.strftime('%Y-%m-%d %H:%M')
 
