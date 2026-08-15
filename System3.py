@@ -412,6 +412,7 @@ def scan_institutional_tape(target_date_str):
                                 all_reclaims[sym] = row
         except:
             continue
+
     final_ltp_dict = today_master.groupby('Symbol')['Close'].last().to_dict()
     valid_fresh = {}
     for sym, row in all_fresh_intrusions.items():
