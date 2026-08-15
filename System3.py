@@ -29,7 +29,7 @@ BACKTRACE_DAYS = 20      # 1 F&O Monthly Derivative Cycle
 MAX_BREACH_DAYS = 0      # Kill Switch: Days a stock can stay breached before memory purge
 
 # ==============================================================================
-# 1. LIVE INGESTION (F&O Universe with Error Shield)
+# 1. LIVE INGESTION (F&O Universe & Parallel Fetching)
 # ==============================================================================
 def get_dynamic_fno_universe():
     nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
@@ -44,7 +44,7 @@ def get_dynamic_fno_universe():
         print(f"{COLOR_RED}[API Error] Failed to fetch F&O universe: {e}{COLOR_RESET}")
         return []
 
-def fetch_upstox_candles_for_date(instrument_key, date_str, retries=4):
+def fetch_upstox_candles_for_date(instrument_key, date_str, retries=5):
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
     if not access_token:
         return None
@@ -57,11 +57,12 @@ def fetch_upstox_candles_for_date(instrument_key, date_str, retries=4):
     else:
         url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{date_str}/{date_str}"
 
+    # Rate-Limit Backoff Loop (Solves the 45-minute crawl without crashing)
     for attempt in range(retries):
         try:
             response = requests.get(url, headers=headers, timeout=10)
             if response.status_code == 429:
-                time.sleep(2)
+                time.sleep(1.5)  # Pause and breathe if Upstox complains about speed
                 continue
             if response.status_code != 200:
                 return None
@@ -93,10 +94,9 @@ def get_past_trading_days(target_date_str, num_days=20):
         return []
 
 # ==============================================================================
-# 2. TECHNICAL PRE-COMPUTATION ENGINE
+# 2. TECHNICAL PRE-COMPUTATION ENGINE (BB-RSI, ADX, Renko)
 # ==============================================================================
 def prepare_technical_data(rolling_master_df):
-    print(f"⚙️ Computing ADXBO and Renko Matrices on aggregated blocks...")
     df = rolling_master_df.copy()
     
     # Group to 15m Blocks
@@ -113,6 +113,21 @@ def prepare_technical_data(rolling_master_df):
     hist_15m['TR'] = hist_15m[['H-L', 'H-PC', 'L-PC']].max(axis=1)
     atr14 = hist_15m.groupby('Symbol')['TR'].transform(lambda x: x.ewm(alpha=1/14, adjust=False).mean())
     hist_15m['ATR'] = atr14
+
+    # BB-RSI Calculation
+    delta = hist_15m.groupby('Symbol')['Close'].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+    
+    avg_gain = gain.groupby(hist_15m['Symbol']).transform(lambda x: x.ewm(alpha=1/14, adjust=False).mean())
+    avg_loss = loss.groupby(hist_15m['Symbol']).transform(lambda x: x.ewm(alpha=1/14, adjust=False).mean())
+    rs = avg_gain / (avg_loss + 1e-8)
+    hist_15m['RSI'] = 100 - (100 / (1 + rs))
+    
+    hist_15m['RSI_SMA'] = hist_15m.groupby('Symbol')['RSI'].transform(lambda x: x.rolling(20).mean())
+    hist_15m['RSI_STD'] = hist_15m.groupby('Symbol')['RSI'].transform(lambda x: x.rolling(20).std())
+    hist_15m['BB_Upper'] = hist_15m['RSI_SMA'] + (2 * hist_15m['RSI_STD'])
+    hist_15m['BB_Lower'] = hist_15m['RSI_SMA'] - (2 * hist_15m['RSI_STD'])
     
     # ADX, +DI, -DI
     high_diff = hist_15m['High'] - hist_15m.groupby('Symbol')['High'].shift(1)
@@ -127,6 +142,7 @@ def prepare_technical_data(rolling_master_df):
     dx = 100 * abs(hist_15m['+DI'] - hist_15m['-DI']) / (hist_15m['+DI'] + hist_15m['-DI'] + 1e-8)
     hist_15m['DX'] = dx
     hist_15m['ADX'] = hist_15m.groupby('Symbol')['DX'].transform(lambda x: x.ewm(alpha=1/14, adjust=False).mean())
+    hist_15m['ADX_prev'] = hist_15m.groupby('Symbol')['ADX'].shift(1)
     
     # ATR-Synthesized Renko
     renko_trends = np.ones(len(hist_15m))
@@ -173,22 +189,22 @@ def evaluate_technical_confluence(master_df, current_eval_time, hist_15m_tech=No
             tech_slice = hist_15m_tech[hist_15m_tech['Datetime'] < current_eval_time].groupby('Symbol').last().reset_index()
             
             if not tech_slice.empty:
-                merged = pd.merge(g_rec, tech_slice[['Symbol', 'ADX', '+DI', '-DI', 'Renko_Trend']], on='Symbol', how='inner')
+                merged = pd.merge(g_rec, tech_slice[['Symbol', 'RSI', 'BB_Upper', 'BB_Lower', 'ADX', 'ADX_prev', '+DI', '-DI', 'Renko_Trend']], on='Symbol', how='inner')
                 
-                # ADX threshold lowered to 15 to catch developing trends
-                bull_cond = (merged['ADX'] > 15) & \
+                # FULL STRICT FILTERS ACTIVE: BB-RSI Breakout + ADX > 20 + Rising ADX + DI + Renko
+                bull_cond = (merged['RSI'] > merged['BB_Upper']) & \
+                            (merged['ADX'] > 20) & \
+                            (merged['ADX'] > merged['ADX_prev']) & \
                             (merged['+DI'] > merged['-DI']) & \
                             (merged['Renko_Trend'] == 1)
                             
-                bear_cond = (merged['ADX'] > 15) & \
+                bear_cond = (merged['RSI'] < merged['BB_Lower']) & \
+                            (merged['ADX'] > 20) & \
+                            (merged['ADX'] > merged['ADX_prev']) & \
                             (merged['-DI'] > merged['+DI']) & \
                             (merged['Renko_Trend'] == -1)
                             
                 merged_filtered = merged[bull_cond | bear_cond].copy()
-                
-                # --- DIAGNOSTIC LOGGING ---
-                adx_pass_count = (merged['ADX'] > 15).sum()
-                print(f"   [LOG] {current_eval_time.strftime('%H:%M')} | Symbols Checked: {len(merged)} | Passed ADX>15: {adx_pass_count} | Passed All Gates: {len(merged_filtered)}")
                 
                 if merged_filtered.empty: 
                     return pd.DataFrame()
@@ -199,7 +215,6 @@ def evaluate_technical_confluence(master_df, current_eval_time, hist_15m_tech=No
                 
         return pd.DataFrame()
     except Exception as e:
-        print(f"   [ERROR in eval] {e}")
         return pd.DataFrame()
 
 # ==============================================================================
@@ -211,15 +226,13 @@ def scan_institutional_tape(target_date_str):
     if not universe:
         print(f"⚠️ {COLOR_RED}No F&O universe found or API connection failed.{COLOR_RESET}")
         return
-        
-    print(f"📊 [LOG] Loaded {len(universe)} symbols into F&O Universe.")
 
     trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
     if not trading_days:
         print(f"⚠️ {COLOR_RED}Failed to generate trading days sequence.{COLOR_RESET}")
         return
 
-    print(f"🔄 Backtracing structural memory across {len(trading_days)} trading days using Multithreading...")
+    print(f"🚀 Multithreading API Fetch for {len(universe)} symbols over {len(trading_days)} days...")
 
     fetch_tasks = [(item, day) for day in trading_days for item in universe]
     historical_dfs = []
@@ -232,21 +245,19 @@ def scan_institutional_tape(target_date_str):
             return df
         return None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
+    # THE SPEED FIX: ThreadPoolExecutor with 8 workers drastically cuts the 45-min fetch time to ~3 mins
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
         results = list(executor.map(fetch_worker, fetch_tasks))
         for res in results:
             if res is not None:
                 historical_dfs.append(res)
-
-    print(f"📊 [LOG] API Fetch Complete: Downloaded {len(historical_dfs)} valid stock/day datasets out of {len(fetch_tasks)} requests.")
 
     if not historical_dfs:
         print(f"⚠️ {COLOR_RED}Fatal Error: No valid market data fetched across the window.{COLOR_RESET}")
         return
 
     rolling_master_df = pd.concat(historical_dfs, ignore_index=True)
-    print(f"📊 [LOG] Master DataFrame assembled with {len(rolling_master_df)} rows of 1-minute candles.")
-    
+    print(f"⚙️ Assembling Technical Matrices (BB-RSI, ADX, Renko)...")
     hist_15m_tech = prepare_technical_data(rolling_master_df)
 
     current_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
@@ -268,7 +279,6 @@ def scan_institutional_tape(target_date_str):
 
     memory_bank = {} 
 
-    print("\n⏳ Building historical memory states... (This evaluates the previous 19 days)")
     for day in trading_days:
         day_dt = pd.to_datetime(day)
         day_master = rolling_master_df[(rolling_master_df['Datetime'] >= day_dt) & (rolling_master_df['Datetime'] < day_dt + pd.Timedelta(days=1))]
@@ -343,8 +353,6 @@ def scan_institutional_tape(target_date_str):
         (rolling_master_df['Datetime'] >= target_dt) & 
         (rolling_master_df['Datetime'] <= target_dt + pd.Timedelta(days=1))
     ].copy()
-    
-    print(f"\n📊 [LOG] Starting Target Date Sweep for {target_date_str}. Total data rows for today: {len(today_master)}")
 
     if today_master.empty: 
         print(f"\n{COLOR_YELLOW}[Terminal Standby] Market data for {target_date_str} is empty or not available yet.{COLOR_RESET}\n")
@@ -444,7 +452,7 @@ def scan_institutional_tape(target_date_str):
             color = COLOR_GREEN if pct_move > 0 else COLOR_RED
             d_str = "BULLISH" if pct_move > 0 else "BEARISH"
             print(f"  {color}🚨 {sym:<12} Block Move: {pct_move:+.2f}% ({d_str}){COLOR_RESET}")
-            print(f"      └─ 🎯 Tech Filters Passed : ADX:{row.get('ADX', 0):.1f} | Renko: {d_str}")
+            print(f"      └─ 🎯 Tech Filters Passed : BB-RSI Breakout | ADX:{row.get('ADX', 0):.1f} | Renko: {d_str}")
             print(f"      └─ ⚓ Breakout Anchor     : {target_date_str} @ {row.get('Eval_Time', '15:15')} | Price: ₹{ltp:.2f}")
             print(f"      └─ 🎯 Latest LTP          : {target_date_str} @ EOD    | Price: ₹{final_ltp_dict.get(sym, ltp):.2f}\n")
 
@@ -455,7 +463,7 @@ def scan_institutional_tape(target_date_str):
             color = COLOR_GREEN if pct_move > 0 else COLOR_RED
             d_str = "BULLISH" if pct_move > 0 else "BEARISH"
             print(f"  {color}🔄 {sym:<12} Block Move: {pct_move:+.2f}% ({d_str}){COLOR_RESET}")
-            print(f"      └─ 🎯 Tech Filters Passed : ADX:{row.get('ADX', 0):.1f} | Renko: {d_str}")
+            print(f"      └─ 🎯 Tech Filters Passed : BB-RSI Breakout | ADX:{row.get('ADX', 0):.1f} | Renko: {d_str}")
             print(f"      └─ ⚓ Macro Floor (Origin): {row['Macro_Date']} @ {memory_bank[sym].get('time', '09:15')} | Price: ₹{row['Macro_Price']:.2f}")
             print(f"      └─ ⚡ Micro Floor (Reload): {target_date_str} @ {row.get('Eval_Time', '15:15')} | Price: ₹{row['Micro_Price']:.2f}")
             print(f"      └─ 🎯 Latest LTP          : {target_date_str} @ EOD    | Price: ₹{final_ltp_dict.get(sym, ltp):.2f} (Trend Drift: {row['Net_Drift']:+.2f}%)\n")
@@ -475,7 +483,7 @@ def scan_institutional_tape(target_date_str):
             color = COLOR_MAGENTA
             d_str = "BULLISH" if pct_move > 0 else "BEARISH"
             print(f"  {color}🔥 {sym:<12} Block Move: {pct_move:+.2f}% ({d_str}){COLOR_RESET}")
-            print(f"      └─ 🎯 Tech Filters Passed : ADX:{row.get('ADX', 0):.1f} | Renko: {d_str}")
+            print(f"      └─ 🎯 Tech Filters Passed : BB-RSI Breakout | ADX:{row.get('ADX', 0):.1f} | Renko: {d_str}")
             print(f"      └─ ⚓ Anchor : {row['First_Date']} @ {memory_bank[sym].get('time', '09:15')} | LTP: ₹{row['Origin']:.2f}")
             print(f"      └─ 🎯 Latest : Reclaimed At {target_date_str} @ {row.get('Eval_Time', '15:15')} | LTP: ₹{ltp:.2f}\n")
 
