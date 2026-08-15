@@ -60,29 +60,21 @@ def fetch_upstox_candles_for_date(instrument_key, date_str, retries=4):
     for attempt in range(retries):
         try:
             response = requests.get(url, headers=headers, timeout=10)
-            
-            # If Upstox Rate-Limits us, sleep for 2 seconds and try again
             if response.status_code == 429:
                 time.sleep(2)
                 continue
-                
             if response.status_code != 200:
                 return None
-                
             data = response.json().get('data', {}).get('candles', [])
             if not data:
                 return None
-                
             c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
             c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).dt.tz_localize(None) 
             c_df = c_df.sort_values('Datetime').reset_index(drop=True)
             return c_df
-            
         except Exception:
-            # If there is a connection timeout, pause and retry
             time.sleep(1)
             continue
-            
     return None
 
 def get_past_trading_days(target_date_str, num_days=20):
@@ -101,20 +93,20 @@ def get_past_trading_days(target_date_str, num_days=20):
         return []
 
 # ==============================================================================
-# 2. TECHNICAL PRE-COMPUTATION ENGINE (BB-RSI, ADXBO, Renko)
+# 2. TECHNICAL PRE-COMPUTATION ENGINE
 # ==============================================================================
 def prepare_technical_data(rolling_master_df):
-    print(f"⚙️ Computing BB-RSI, ADXBO, and Renko Matrices on aggregated blocks...")
+    print(f"⚙️ Computing ADXBO and Renko Matrices on aggregated blocks...")
     df = rolling_master_df.copy()
     
-    # 1. Group to 15m Blocks
+    # Group to 15m Blocks
     hist_15m = df.groupby(['Symbol', pd.Grouper(key='Datetime', freq='15min', closed='left', label='left')]).agg({
         'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum', 'Turnover': 'sum', 'abs_move': 'sum'
     }).reset_index()
     
     hist_15m = hist_15m.dropna(subset=['Close']).sort_values(['Symbol', 'Datetime'])
     
-    # 2. True Range & ATR
+    # ATR Calculation
     hist_15m['H-L'] = hist_15m['High'] - hist_15m['Low']
     hist_15m['H-PC'] = (hist_15m['High'] - hist_15m.groupby('Symbol')['Close'].shift(1)).abs()
     hist_15m['L-PC'] = (hist_15m['Low'] - hist_15m.groupby('Symbol')['Close'].shift(1)).abs()
@@ -122,22 +114,7 @@ def prepare_technical_data(rolling_master_df):
     atr14 = hist_15m.groupby('Symbol')['TR'].transform(lambda x: x.ewm(alpha=1/14, adjust=False).mean())
     hist_15m['ATR'] = atr14
     
-    # 3. RSI & BB-RSI
-    delta = hist_15m.groupby('Symbol')['Close'].diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    
-    avg_gain = gain.groupby(hist_15m['Symbol']).transform(lambda x: x.ewm(alpha=1/14, adjust=False).mean())
-    avg_loss = loss.groupby(hist_15m['Symbol']).transform(lambda x: x.ewm(alpha=1/14, adjust=False).mean())
-    rs = avg_gain / (avg_loss + 1e-8)
-    hist_15m['RSI'] = 100 - (100 / (1 + rs))
-    
-    hist_15m['RSI_SMA'] = hist_15m.groupby('Symbol')['RSI'].transform(lambda x: x.rolling(20).mean())
-    hist_15m['RSI_STD'] = hist_15m.groupby('Symbol')['RSI'].transform(lambda x: x.rolling(20).std())
-    hist_15m['BB_Upper'] = hist_15m['RSI_SMA'] + (2 * hist_15m['RSI_STD'])
-    hist_15m['BB_Lower'] = hist_15m['RSI_SMA'] - (2 * hist_15m['RSI_STD'])
-    
-    # 4. ADX, +DI, -DI (ADXBO Trigger)
+    # ADX, +DI, -DI
     high_diff = hist_15m['High'] - hist_15m.groupby('Symbol')['High'].shift(1)
     low_diff = hist_15m.groupby('Symbol')['Low'].shift(1) - hist_15m['Low']
     
@@ -150,9 +127,8 @@ def prepare_technical_data(rolling_master_df):
     dx = 100 * abs(hist_15m['+DI'] - hist_15m['-DI']) / (hist_15m['+DI'] + hist_15m['-DI'] + 1e-8)
     hist_15m['DX'] = dx
     hist_15m['ADX'] = hist_15m.groupby('Symbol')['DX'].transform(lambda x: x.ewm(alpha=1/14, adjust=False).mean())
-    hist_15m['ADX_prev'] = hist_15m.groupby('Symbol')['ADX'].shift(1)
     
-    # 5. ATR-Synthesized Renko Trend Filter
+    # ATR-Synthesized Renko
     renko_trends = np.ones(len(hist_15m))
     for sym, indices in hist_15m.groupby('Symbol').indices.items():
         sub_closes = hist_15m['Close'].values[indices]
@@ -181,7 +157,7 @@ def prepare_technical_data(rolling_master_df):
 # ==============================================================================
 def evaluate_technical_confluence(master_df, current_eval_time, hist_15m_tech=None, window_mins=15):
     try:
-        if master_df is None or master_df.empty or 'Datetime' not in master_df.columns:
+        if master_df is None or master_df.empty:
             return pd.DataFrame()
 
         recent_start = current_eval_time - pd.Timedelta(minutes=window_mins)
@@ -194,26 +170,36 @@ def evaluate_technical_confluence(master_df, current_eval_time, hist_15m_tech=No
         g_rec['Rec_Pct_Move'] = ((g_rec['Close'] - g_rec['Open']) / (g_rec['Open'] + 1e-8)) * 100
 
         if hist_15m_tech is not None and not hist_15m_tech.empty:
-            tech_slice = hist_15m_tech[hist_15m_tech['Datetime'] <= current_eval_time].groupby('Symbol').last().reset_index()
+            tech_slice = hist_15m_tech[hist_15m_tech['Datetime'] < current_eval_time].groupby('Symbol').last().reset_index()
             
             if not tech_slice.empty:
-                merged = pd.merge(g_rec, tech_slice[['Symbol', 'RSI', 'BB_Upper', 'BB_Lower', 'ADX', 'ADX_prev', '+DI', '-DI', 'Renko_Trend']], on='Symbol', how='inner')
+                merged = pd.merge(g_rec, tech_slice[['Symbol', 'ADX', '+DI', '-DI', 'Renko_Trend']], on='Symbol', how='inner')
                 
-                bull_cond = (merged['RSI'] > merged['BB_Upper']) 
+                # ADX threshold lowered to 15 to catch developing trends
+                bull_cond = (merged['ADX'] > 15) & \
+                            (merged['+DI'] > merged['-DI']) & \
+                            (merged['Renko_Trend'] == 1)
                             
-                bear_cond = (merged['RSI'] < merged['BB_Lower']) 
+                bear_cond = (merged['ADX'] > 15) & \
+                            (merged['-DI'] > merged['+DI']) & \
+                            (merged['Renko_Trend'] == -1)
                             
-                merged = merged[bull_cond | bear_cond].copy()
+                merged_filtered = merged[bull_cond | bear_cond].copy()
                 
-                if merged.empty: 
+                # --- DIAGNOSTIC LOGGING ---
+                adx_pass_count = (merged['ADX'] > 15).sum()
+                print(f"   [LOG] {current_eval_time.strftime('%H:%M')} | Symbols Checked: {len(merged)} | Passed ADX>15: {adx_pass_count} | Passed All Gates: {len(merged_filtered)}")
+                
+                if merged_filtered.empty: 
                     return pd.DataFrame()
 
-                merged['Direction'] = np.where(bull_cond, 1, -1)
-                merged = merged.sort_values(by='Rec_Pct_Move', key=abs, ascending=False)
-                return merged
+                merged_filtered['Direction'] = np.where(bull_cond, 1, -1)
+                merged_filtered = merged_filtered.sort_values(by='Rec_Pct_Move', key=abs, ascending=False)
+                return merged_filtered
                 
         return pd.DataFrame()
     except Exception as e:
+        print(f"   [ERROR in eval] {e}")
         return pd.DataFrame()
 
 # ==============================================================================
@@ -225,6 +211,8 @@ def scan_institutional_tape(target_date_str):
     if not universe:
         print(f"⚠️ {COLOR_RED}No F&O universe found or API connection failed.{COLOR_RESET}")
         return
+        
+    print(f"📊 [LOG] Loaded {len(universe)} symbols into F&O Universe.")
 
     trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
     if not trading_days:
@@ -233,7 +221,6 @@ def scan_institutional_tape(target_date_str):
 
     print(f"🔄 Backtracing structural memory across {len(trading_days)} trading days using Multithreading...")
 
-    # MULTITHREADED API FETCHING WITH 5 WORKERS TO PREVENT RATE LIMITING
     fetch_tasks = [(item, day) for day in trading_days for item in universe]
     historical_dfs = []
 
@@ -242,8 +229,6 @@ def scan_institutional_tape(target_date_str):
         df = fetch_upstox_candles_for_date(item['key'], day)
         if df is not None and not df.empty:
             df['Symbol'] = item['symbol']
-            df['Turnover'] = df['Volume'] * df['Close']
-            df['abs_move'] = (df['Close'] - df['Open']).abs()
             return df
         return None
 
@@ -253,13 +238,15 @@ def scan_institutional_tape(target_date_str):
             if res is not None:
                 historical_dfs.append(res)
 
+    print(f"📊 [LOG] API Fetch Complete: Downloaded {len(historical_dfs)} valid stock/day datasets out of {len(fetch_tasks)} requests.")
+
     if not historical_dfs:
         print(f"⚠️ {COLOR_RED}Fatal Error: No valid market data fetched across the window.{COLOR_RESET}")
         return
 
     rolling_master_df = pd.concat(historical_dfs, ignore_index=True)
+    print(f"📊 [LOG] Master DataFrame assembled with {len(rolling_master_df)} rows of 1-minute candles.")
     
-    # ✅ Initialize Technical Matrix Data
     hist_15m_tech = prepare_technical_data(rolling_master_df)
 
     current_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
@@ -281,6 +268,7 @@ def scan_institutional_tape(target_date_str):
 
     memory_bank = {} 
 
+    print("\n⏳ Building historical memory states... (This evaluates the previous 19 days)")
     for day in trading_days:
         day_dt = pd.to_datetime(day)
         day_master = rolling_master_df[(rolling_master_df['Datetime'] >= day_dt) & (rolling_master_df['Datetime'] < day_dt + pd.Timedelta(days=1))]
@@ -298,7 +286,6 @@ def scan_institutional_tape(target_date_str):
                         if (st['dir'] == 1 and op < st['origin']) or (st['dir'] == -1 and op > st['origin']):
                             st['state'] = 'BREACHED'
                             st['breach_time'] = f"{day} 09:15 (GAP)"
-                            st['breach_days'] = 0  
         except:
             pass
 
@@ -316,12 +303,10 @@ def scan_institutional_tape(target_date_str):
                             if (st['dir'] == 1 and ltp < st['origin']) or (st['dir'] == -1 and ltp > st['origin']):
                                 st['state'] = 'BREACHED'
                                 st['breach_time'] = t.strftime('%Y-%m-%d %H:%M')
-                                st['breach_days'] = 0
                         elif st['state'] == 'BREACHED':
                             if (st['dir'] == 1 and ltp >= st['origin']) or (st['dir'] == -1 and ltp <= st['origin']):
                                 st['state'] = 'ACTIVE'
                                 st['breach_time'] = None
-                                st['breach_days'] = 0
 
                 anomalies = evaluate_technical_confluence(day_master, t, hist_15m_tech=hist_15m_tech, window_mins=15)
                 if not anomalies.empty:
@@ -330,43 +315,36 @@ def scan_institutional_tape(target_date_str):
                         price = row['Close']
                         direction = row['Direction']
                         if sym not in memory_bank:
-                            memory_bank[sym] = {'state': 'ACTIVE', 'origin': price, 'date': day, 'time': t.strftime('%H:%M'), 'dir': direction, 'breach_time': None, 'breach_days': 0}
+                            memory_bank[sym] = {'state': 'ACTIVE', 'origin': price, 'date': day, 'time': t.strftime('%H:%M'), 'dir': direction, 'breach_time': None}
         except:
             pass
 
         try:
             daily_agg = day_master.groupby('Symbol').agg({'Close': 'last'}).reset_index()
             daily_dict = daily_agg.set_index('Symbol').to_dict('index')
-
             to_delete = []
             for sym, st in memory_bank.items():
                 if sym not in daily_dict: continue
                 d_close = daily_dict[sym]['Close']
-
                 if st['state'] == 'BREACHED':
                     if st['dir'] == 1 and d_close < (st['origin'] * 0.985): 
                         to_delete.append(sym)
-                        continue
                     elif st['dir'] == -1 and d_close > (st['origin'] * 1.015): 
                         to_delete.append(sym)
-                        continue
-
-                    st['breach_days'] += 1
-                    if st['breach_days'] >= MAX_BREACH_DAYS:
-                        to_delete.append(sym)
-
             for sym in to_delete: 
                 del memory_bank[sym]
         except:
             pass
 
     # ----------------------------------------------------------------------
-    # LIVE EVALUATION (Full-Day Sweep Loop)
+    # LIVE EVALUATION
     # ----------------------------------------------------------------------
     today_master = rolling_master_df[
         (rolling_master_df['Datetime'] >= target_dt) & 
         (rolling_master_df['Datetime'] <= target_dt + pd.Timedelta(days=1))
     ].copy()
+    
+    print(f"\n📊 [LOG] Starting Target Date Sweep for {target_date_str}. Total data rows for today: {len(today_master)}")
 
     if today_master.empty: 
         print(f"\n{COLOR_YELLOW}[Terminal Standby] Market data for {target_date_str} is empty or not available yet.{COLOR_RESET}\n")
@@ -405,18 +383,6 @@ def scan_institutional_tape(target_date_str):
                     if sym not in memory_bank:
                         if sym not in all_fresh_intrusions:
                             row['Eval_Time'] = eval_time_current.strftime('%H:%M')
-                            launchpad_price = price
-                            try:
-                                launch_slice = rolling_master_df[
-                                    (rolling_master_df['Symbol'] == sym) & 
-                                    (rolling_master_df['Datetime'] < eval_time_current) & 
-                                    (rolling_master_df['Datetime'] >= eval_time_current - pd.Timedelta(days=5))
-                                ]
-                                if not launch_slice.empty:
-                                    if direction == 1: launchpad_price = launch_slice['Low'].min()
-                                    else: launchpad_price = launch_slice['High'].max()
-                            except: pass
-                            row['Launchpad'] = launchpad_price
                             all_fresh_intrusions[sym] = row
                     else:
                         st = memory_bank[sym]
@@ -446,21 +412,14 @@ def scan_institutional_tape(target_date_str):
                                 all_reclaims[sym] = row
         except:
             continue
-
-    final_ltp_dict = today_master.groupby('Symbol')['Close'].last().to_dict()
+final_ltp_dict = today_master.groupby('Symbol')['Close'].last().to_dict()
     valid_fresh = {}
-    
     for sym, row in all_fresh_intrusions.items():
         ltp = final_ltp_dict.get(sym, row['Close'])
         direction = row['Direction']
         birth_price = row['Close']
-
         if (direction == 1 and ltp < birth_price) or (direction == -1 and ltp > birth_price):
-            memory_bank[sym] = {
-                'state': 'BREACHED', 'origin': birth_price, 'date': target_date_str, 
-                'time': row.get('Eval_Time', '15:15'), 'dir': direction, 
-                'breach_time': f"{target_date_str} EOD Violation", 'breach_days': 0
-            }
+            memory_bank[sym] = {'state': 'BREACHED', 'origin': birth_price, 'date': target_date_str, 'time': row.get('Eval_Time', '15:15'), 'dir': direction, 'breach_time': f"{target_date_str} EOD Violation"}
         else:
             valid_fresh[sym] = row
 
@@ -468,15 +427,10 @@ def scan_institutional_tape(target_date_str):
     for sym, st in memory_bank.items():
         if st['state'] == 'BREACHED' and sym in final_ltp_dict:
             if sym not in all_reclaims: 
-                breached.append({
-                    'Symbol': sym, 'LTP': final_ltp_dict[sym], 'Origin': st['origin'], 
-                    'Dir': "BULLISH" if st['dir'] == 1 else "BEARISH",
-                    'Time': st['breach_time'], 'First_Date': st['date'],
-                    'Anchor_Time': st.get('time', '09:15')
-                })
+                breached.append({'Symbol': sym, 'LTP': final_ltp_dict[sym], 'Origin': st['origin'], 'Dir': "BULLISH" if st['dir'] == 1 else "BEARISH", 'Time': st['breach_time'], 'First_Date': st['date'], 'Anchor_Time': st.get('time', '09:15')})
 
     # ----------------------------------------------------------------------
-    # TERMINAL OUTPUT (4D Temporal UI Matrix with Tech Filtering)
+    # TERMINAL OUTPUT
     # ----------------------------------------------------------------------
     print(f"\n{COLOR_CYAN}================================================================================================{COLOR_RESET}")
     print(f"{COLOR_BOLD}FULL UNIVERSE TECHNICAL CONFLUENCE TAPE | DATE: {target_date_str}{COLOR_RESET}")
@@ -488,34 +442,22 @@ def scan_institutional_tape(target_date_str):
             pct_move, ltp = row['Rec_Pct_Move'], row['Close']
             color = COLOR_GREEN if pct_move > 0 else COLOR_RED
             d_str = "BULLISH" if pct_move > 0 else "BEARISH"
-            eval_t = row.get('Eval_Time', '15:15')
-            launchpad = row.get('Launchpad', ltp)
-
             print(f"  {color}🚨 {sym:<12} Block Move: {pct_move:+.2f}% ({d_str}){COLOR_RESET}")
-            print(f"      └─ 🎯 Tech Filters Passed : BB-RSI Breakout | ADX:{row.get('ADX', 0):.1f} | Renko: {d_str}")
-            print(f"      └─ 🧱 Launchpad (Base)    : Price: ₹{launchpad:.2f}")
-            print(f"      └─ ⚓ Breakout Anchor     : {target_date_str} @ {eval_t} | Price: ₹{ltp:.2f}")
+            print(f"      └─ 🎯 Tech Filters Passed : ADX:{row.get('ADX', 0):.1f} | Renko: {d_str}")
+            print(f"      └─ ⚓ Breakout Anchor     : {target_date_str} @ {row.get('Eval_Time', '15:15')} | Price: ₹{ltp:.2f}")
             print(f"      └─ 🎯 Latest LTP          : {target_date_str} @ EOD    | Price: ₹{final_ltp_dict.get(sym, ltp):.2f}\n")
 
     if all_reloads:
         print(f"{COLOR_BOLD}🔄 BASKET 2: ALGORITHMIC RELOADS (Phase 2 - Institutional Continuations){COLOR_RESET}")
         for sym, row in all_reloads.items():
             pct_move, ltp = row['Rec_Pct_Move'], row['Close']
-            true_drift = row['Net_Drift']
             color = COLOR_GREEN if pct_move > 0 else COLOR_RED
             d_str = "BULLISH" if pct_move > 0 else "BEARISH"
-            eval_t = row.get('Eval_Time', '15:15')
-
-            macro_date = row['Macro_Date']
-            macro_time = memory_bank[sym].get('time', "09:15")
-            macro_price = row['Macro_Price']
-            micro_price = row['Micro_Price']
-
             print(f"  {color}🔄 {sym:<12} Block Move: {pct_move:+.2f}% ({d_str}){COLOR_RESET}")
-            print(f"      └─ 🎯 Tech Filters Passed : BB-RSI Breakout | ADX:{row.get('ADX', 0):.1f} | Renko: {d_str}")
-            print(f"      └─ ⚓ Macro Floor (Origin): {macro_date} @ {macro_time} | Price: ₹{macro_price:.2f}")
-            print(f"      └─ ⚡ Micro Floor (Reload): {target_date_str} @ {eval_t} | Price: ₹{micro_price:.2f}")
-            print(f"      └─ 🎯 Latest LTP          : {target_date_str} @ EOD    | Price: ₹{final_ltp_dict.get(sym, ltp):.2f} (Trend Drift: {true_drift:+.2f}%)\n")
+            print(f"      └─ 🎯 Tech Filters Passed : ADX:{row.get('ADX', 0):.1f} | Renko: {d_str}")
+            print(f"      └─ ⚓ Macro Floor (Origin): {row['Macro_Date']} @ {memory_bank[sym].get('time', '09:15')} | Price: ₹{row['Macro_Price']:.2f}")
+            print(f"      └─ ⚡ Micro Floor (Reload): {target_date_str} @ {row.get('Eval_Time', '15:15')} | Price: ₹{row['Micro_Price']:.2f}")
+            print(f"      └─ 🎯 Latest LTP          : {target_date_str} @ EOD    | Price: ₹{final_ltp_dict.get(sym, ltp):.2f} (Trend Drift: {row['Net_Drift']:+.2f}%)\n")
 
     if breached:
         print(f"{COLOR_DIM}⚠️ BASKET 3: BREACHED PIVOTS (Phase 3 - Trapped Capital / Dead Trends){COLOR_RESET}")
@@ -531,13 +473,10 @@ def scan_institutional_tape(target_date_str):
             pct_move, ltp = row['Rec_Pct_Move'], row['Close']
             color = COLOR_MAGENTA
             d_str = "BULLISH" if pct_move > 0 else "BEARISH"
-            anchor_time = memory_bank[sym].get('time', "09:15")
-            eval_t = row.get('Eval_Time', '15:15')
-
             print(f"  {color}🔥 {sym:<12} Block Move: {pct_move:+.2f}% ({d_str}){COLOR_RESET}")
-            print(f"      └─ 🎯 Tech Filters Passed : BB-RSI Breakout | ADX:{row.get('ADX', 0):.1f} | Renko: {d_str}")
-            print(f"      └─ ⚓ Anchor : {row['First_Date']} @ {anchor_time} | LTP: ₹{row['Origin']:.2f}")
-            print(f"      └─ 🎯 Latest : Reclaimed At {target_date_str} @ {eval_t} | LTP: ₹{ltp:.2f}\n")
+            print(f"      └─ 🎯 Tech Filters Passed : ADX:{row.get('ADX', 0):.1f} | Renko: {d_str}")
+            print(f"      └─ ⚓ Anchor : {row['First_Date']} @ {memory_bank[sym].get('time', '09:15')} | LTP: ₹{row['Origin']:.2f}")
+            print(f"      └─ 🎯 Latest : Reclaimed At {target_date_str} @ {row.get('Eval_Time', '15:15')} | LTP: ₹{ltp:.2f}\n")
 
     if not any([valid_fresh, all_reloads, all_reclaims, breached]):
         print(f"{COLOR_DIM}[Terminal Silent] No active institutional structure passing strict filters.{COLOR_RESET}\n")
@@ -557,10 +496,8 @@ def run_production_sweep():
     if not is_backtest:
         target_dt = datetime.utcnow() + timedelta(hours=5, minutes=30)
         if target_dt.weekday() == 5: 
-            print(f"{COLOR_YELLOW}[System Notice] Market closed (Saturday). Auto-rolling back to Friday's tape.{COLOR_RESET}")
             target_dt -= timedelta(days=1)
         elif target_dt.weekday() == 6: 
-            print(f"{COLOR_YELLOW}[System Notice] Market closed (Sunday). Auto-rolling back to Friday's tape.{COLOR_RESET}")
             target_dt -= timedelta(days=2)
         target_date_str = target_dt.strftime("%Y-%m-%d")
     else:
