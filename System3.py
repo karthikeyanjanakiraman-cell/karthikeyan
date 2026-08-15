@@ -199,17 +199,9 @@ def evaluate_technical_confluence(master_df, current_eval_time, hist_15m_tech=No
             if not tech_slice.empty:
                 merged = pd.merge(g_rec, tech_slice[['Symbol', 'RSI', 'BB_Upper', 'BB_Lower', 'ADX', 'ADX_prev', '+DI', '-DI', 'Renko_Trend']], on='Symbol', how='inner')
                 
-                bull_cond = (merged['RSI'] > merged['BB_Upper']) & \
-                            (merged['ADX'] > 0) & \
-                            (merged['ADX'] > merged['ADX_prev']) & \
-                            (merged['+DI'] > merged['-DI']) & \
-                            (merged['Renko_Trend'] == 1)
+                bull_cond = (merged['RSI'] > merged['BB_Upper']) 
                             
-                bear_cond = (merged['RSI'] < merged['BB_Lower']) & \
-                            (merged['ADX'] > 0) & \
-                            (merged['ADX'] > merged['ADX_prev']) & \
-                            (merged['-DI'] > merged['+DI']) & \
-                            (merged['Renko_Trend'] == -1)
+                bear_cond = (merged['RSI'] < merged['BB_Lower']) 
                             
                 merged = merged[bull_cond | bear_cond].copy()
                 
