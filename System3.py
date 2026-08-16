@@ -50,8 +50,8 @@ API_ERROR_LOGGED = False
 # ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
 # 1. Configurable Timeframe Hierarchy
-MICRO_TIMEFRAME = "5min"  # Micro Execution & Tactical Trigger
-MACRO_TIMEFRAMES = ["15min"]  # Strategic Structural & Pilot Tiers
+MICRO_TIMEFRAME = "15min"  # Micro Execution & Tactical Trigger
+MACRO_TIMEFRAMES = ["60min"]  # Strategic Structural & Pilot Tiers
 MACRO_STRATEGIC_WINDOW = "2D"
 
 # 2. Indicator Parameters
