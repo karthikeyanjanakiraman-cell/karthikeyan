@@ -96,8 +96,8 @@ MICRO_MINIMUM_SCORE         = 2      # Out of 6
 # (Set to 99 to disable a specific layer)
 
 # MICRO TAPE (Fast execution exits)
-MICRO_EXIT_PRICE_BRICKS = 4  
-MICRO_EXIT_VOL_BRICKS   = 4  
+MICRO_EXIT_PRICE_BRICKS = 10  
+MICRO_EXIT_VOL_BRICKS   = 10  
 
 # MACRO TAPE (Structural hold exits)
 MACRO_EXIT_PRICE_BRICKS = 2  
