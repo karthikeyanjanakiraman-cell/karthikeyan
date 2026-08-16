@@ -50,8 +50,8 @@ API_ERROR_LOGGED = False
 # ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
 # 1. Configurable Timeframe Hierarchy
-MICRO_TIMEFRAME = "1min"  # Micro Execution & Tactical Trigger
-MACRO_TIMEFRAMES = ["5min"]  # Strategic Structural & Pilot Tiers
+MICRO_TIMEFRAME = "5min"  # Micro Execution & Tactical Trigger
+MACRO_TIMEFRAMES = ["15min"]  # Strategic Structural & Pilot Tiers
 MACRO_STRATEGIC_WINDOW = "2D"
 
 # 2. Indicator Parameters
@@ -91,11 +91,11 @@ SYNC_MICRO_WITH_MACRO       = False  # If True, Micro overrides to match Macro
 
 MICRO_MANDATORY_PRICE_RENKO = True
 MICRO_MANDATORY_VOL_RENKO   = True
-MICRO_MANDATORY_RSI_BB      = False
-MICRO_MANDATORY_ADX_DMI     = False
+MICRO_MANDATORY_RSI_BB      = True
+MICRO_MANDATORY_ADX_DMI     = True
 MICRO_MANDATORY_EMA_SPREAD  = False
 MICRO_MANDATORY_STOCHASTIC  = False
-MICRO_MINIMUM_SCORE         = 2      # Out of 6
+MICRO_MINIMUM_SCORE         = 4      # Out of 6
 
 
 # ==============================================================================
