@@ -46,8 +46,8 @@ API_ERROR_LOGGED = False
 # ★ GLOBAL CONFIGURATION: TIMEFRAMES & INDICATORS ★
 # ==============================================================================
 # 1. Multi-Timeframe Architecture Tiers
-PILOT_TIMEFRAME = "5min"
-EXECUTION_TIMEFRAME = "15min"  # Primary 60-Min Operational Window for Core Gates
+PILOT_TIMEFRAME = "1min"
+EXECUTION_TIMEFRAME = "5min"  # Primary 60-Min Operational Window for Core Gates
 MACRO_TIMEFRAME = "2D"         # Strategic Macro Window
 
 # 2. Indicator Parameters
