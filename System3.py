@@ -40,7 +40,7 @@ COLOR_DIM = "\033[2m"
 COLOR_RESET = "\033[0m"
 COLOR_BOLD = "\033[1m"
 
-BACKTRACE_DAYS = 1
+BACKTRACE_DAYS = 20
 API_ERROR_LOGGED = False
 
 # ==============================================================================
@@ -58,7 +58,7 @@ ADX_THRESHOLD = 20
 STOCH_PERIOD = 14
 
 MICRO_RENKO_CONFIRM_BRICKS = 2  # Micro Tactical Trigger (2-Brick Rule)
-MACRO_RENKO_CONFIRM_BRICKS = 0  # Macro Structural Trend Confirmation
+MACRO_RENKO_CONFIRM_BRICKS = 1  # Macro Structural Trend Confirmation
 RENKO_MIN_BRICK = 0.05
 RENKO_DEFAULT_PCT = 0.005
 
