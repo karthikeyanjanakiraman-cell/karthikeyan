@@ -1,4 +1,3 @@
-
 """system3.py - Asit Baran Pati Multi-Timeframe Trading System Implementation
 
 Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
@@ -6,8 +5,8 @@ Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
 - Configurable Macro Hierarchy Array (e.g., ["15min", "60min", "1D"])
 - Phase 1 Blueprint: Dual-Tier Scorecard & Global Mandatory Veto Switches
 - Phase 1 Blueprint: Order Flow / Cumulative Volume Delta 45-Degree Renko
-- EXIT STRATEGY: Dual-Layered (Macro [ANY OR] + Micro) Asymmetric OR-Condition Renko Trailing Stop
-- TRUE BIRTH TIME TRACKING: Locks in the original structural ignition timestamp and price
+- EXIT STRATEGY: Dual-Layered (Triggering Macro + Micro) Asymmetric OR-Condition Renko Trailing Stop
+- TRUE BIRTH TIME TRACKING: Locks in the original structural ignition timestamp, price, and qualifying macro TFs
 """
 
 import argparse
@@ -48,7 +47,7 @@ API_ERROR_LOGGED = False
 # ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
 MICRO_TIMEFRAME = "1min"  # Micro Execution & Tactical Trigger
-MACRO_TIMEFRAMES = ["5min", "15min", "60min","240min", "1D"]  # Multiple Macro Structural Tiers
+MACRO_TIMEFRAMES = ["15min", "60min", "1D"]  # Multiple Macro Structural Tiers
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -59,7 +58,7 @@ ADX_THRESHOLD = 20
 STOCH_PERIOD = 14
 
 MICRO_RENKO_CONFIRM_BRICKS = 1  # Micro Tactical Trigger (2-Brick Rule)
-MACRO_RENKO_CONFIRM_BRICKS = 0  # Macro Structural Trend Confirmation
+MACRO_RENKO_CONFIRM_BRICKS = 1  # Macro Structural Trend Confirmation
 RENKO_MIN_BRICK = 0.05
 RENKO_DEFAULT_PCT = 0.005
 
@@ -335,7 +334,7 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
 
 
 # ==============================================================================
-# 4. MICRO EXECUTION TAPE & CONFLUENCE MATCHER (ANY MACRO OR-CONDITION)
+# 4. MICRO EXECUTION TAPE & CONFLUENCE MATCHER
 # ==============================================================================
 def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes):
     if micro_tf != "1min":
@@ -370,7 +369,7 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
         df_micro[f"Renko_Count_{tf}"] = df_micro[f"Renko_Count_{tf}"].fillna(0).astype(int)
         df_micro[f"Vol_Renko_Count_{tf}"] = df_micro[f"Vol_Renko_Count_{tf}"].fillna(0).astype(int)
 
-    # 🌟 MULTI-TIMEFRAME MACRO "ANY" LOGIC: Trigger if ANY macro timeframe aligns
+    # 🌟 MULTI-TIMEFRAME MACRO "ANY" LOGIC
     df_micro["Master_Armed_Bull"] = df_micro[bull_gate_cols].any(axis=1)
     df_micro["Master_Armed_Bear"] = df_micro[bear_gate_cols].any(axis=1)
     df_micro = df_micro.sort_values(["Symbol", "Datetime"]).reset_index(drop=True)
@@ -389,7 +388,7 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
 
 
 # ==============================================================================
-# 5. TRADE MANAGEMENT: TRUE BIRTH TIME & ANY-MACRO BREAK EXIT LOGIC
+# 5. TRADE MANAGEMENT: QUALIFYING MACRO TIMEFRAME EXIT TRACKING
 # ==============================================================================
 def scan_institutional_tape(target_date_str):
     global API_ERROR_LOGGED
@@ -471,7 +470,7 @@ def scan_institutional_tape(target_date_str):
     micro_price_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Renko_Count_{MICRO_TIMEFRAME}"].to_dict()
     micro_vol_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{MICRO_TIMEFRAME}"].to_dict()
     
-    # Cache all macro timeframes for exit checks
+    # Caches for all macro timeframes
     macro_price_renkos = {tf: tape_exec.set_index(["Datetime", "Symbol"])[f"Renko_Count_{tf}"].to_dict() for tf in MACRO_TIMEFRAMES}
     macro_vol_renkos = {tf: tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{tf}"].to_dict() for tf in MACRO_TIMEFRAMES}
     
@@ -482,7 +481,7 @@ def scan_institutional_tape(target_date_str):
     for t in all_times:
         t_dt = pd.to_datetime(t)
         
-        # 1. Manage Active Trades (Exit if ANY macro timeframe or micro timeframe breaks)
+        # 1. Manage Active Trades (Exit ONLY on Micro or the SPECIFIC Macro TFs that qualified the entry)
         for sym, st in memory_bank.items():
             if st["state"] == "ACTIVE":
                 ltp = closes_dict.get((t_dt, sym))
@@ -492,12 +491,11 @@ def scan_institutional_tape(target_date_str):
                 if ltp is not None:
                     exit_reason = None
                     if st["dir"] == 1:
-                        # Micro break checks
                         if mi_p_count <= -MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
                         elif mi_v_count <= -MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
                         else:
-                            # 🌟 ANY MACRO TIMEFRAME BREAK CHECK (OR Condition)
-                            for tf in MACRO_TIMEFRAMES:
+                            # 🌟 Check ONLY the macro timeframes that actually qualified/triggered this trade
+                            for tf in st["triggering_macro_tfs"]:
                                 ma_p = macro_price_renkos[tf].get((t_dt, sym), 0)
                                 ma_v = macro_vol_renkos[tf].get((t_dt, sym), 0)
                                 if ma_p <= -MACRO_EXIT_PRICE_BRICKS:
@@ -507,12 +505,11 @@ def scan_institutional_tape(target_date_str):
                                     exit_reason = f"Macro [{tf}] Volume Break"
                                     break
                     elif st["dir"] == -1:
-                        # Micro break checks
                         if mi_p_count >= MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
                         elif mi_v_count >= MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
                         else:
-                            # 🌟 ANY MACRO TIMEFRAME BREAK CHECK (OR Condition)
-                            for tf in MACRO_TIMEFRAMES:
+                            # 🌟 Check ONLY the macro timeframes that actually qualified/triggered this trade
+                            for tf in st["triggering_macro_tfs"]:
                                 ma_p = macro_price_renkos[tf].get((t_dt, sym), 0)
                                 ma_v = macro_vol_renkos[tf].get((t_dt, sym), 0)
                                 if ma_p >= MACRO_EXIT_PRICE_BRICKS:
@@ -528,11 +525,19 @@ def scan_institutional_tape(target_date_str):
                         st["exit_price"] = ltp
                         st["exit_reason"] = exit_reason
 
-        # 2. Process New Entrances (Entries WITH Temporal Cutoff Guard)
+        # 2. Process New Entrances & Capture Qualifying Macro TFs
         if t_dt in anomalies_by_time.groups and t_dt.time() <= cutoff_time_obj:
             for _, row in anomalies_by_time.get_group(t_dt).iterrows():
                 sym = row["Symbol"]
                 direction = row["Direction"]
+                
+                # Identify which exact macro timeframe(s) approved this entry at birth time
+                triggered_m_tfs = []
+                for tf in MACRO_TIMEFRAMES:
+                    armed_col = f"Armed_Bull_{tf}" if direction == 1 else f"Armed_Bear_{tf}"
+                    if row.get(armed_col, False):
+                        triggered_m_tfs.append(tf)
+
                 if sym not in memory_bank or memory_bank[sym]["state"] == "EXITED":
                     memory_bank[sym] = {
                         "state": "ACTIVE",
@@ -543,6 +548,7 @@ def scan_institutional_tape(target_date_str):
                         "exit_time": None,
                         "exit_price": None,
                         "exit_reason": None,
+                        "triggering_macro_tfs": triggered_m_tfs, # ⚓ Locked Qualifying TFs
                         "macro_scores": {tf: row.get(f"Score_Bull_{tf}" if direction == 1 else f"Score_Bear_{tf}", 0) for tf in MACRO_TIMEFRAMES},
                         "micro_score": row.get(f"Score_Bull_{MICRO_TIMEFRAME}" if direction == 1 else f"Score_Bear_{MICRO_TIMEFRAME}", 0)
                     }
@@ -564,14 +570,14 @@ def scan_institutional_tape(target_date_str):
     final_ltp_dict = today_master.groupby("Symbol")["Close"].last().to_dict()
 
     # ==============================================================================
-    # 6. TERMINAL OUTPUT (TRADE DASHBOARD WITH MULTI-TIMEFRAME SCORES)
+    # 6. TERMINAL OUTPUT
     # ==============================================================================
     active_runners = {sym: st for sym, st in memory_bank.items() if st["state"] == "ACTIVE"}
     closed_trades = [{**st, "sym": sym} for sym, st in memory_bank.items() if st["state"] == "EXITED" and st["date"] == target_date_str]
 
     tf_display_str = " | ".join(MACRO_TIMEFRAMES)
     print(f"\n{COLOR_CYAN}================================================================================================{COLOR_RESET}")
-    print(f"{COLOR_BOLD}DUAL-TIER MULTI-MACRO OR-CONDITION ENGINE [{MICRO_TIMEFRAME} Micro ⚡ Macro: {tf_display_str}]{COLOR_RESET}")
+    print(f"{COLOR_BOLD}DUAL-TIER QUALIFYING-TF EXIT ENGINE [{MICRO_TIMEFRAME} Micro ⚡ Macro: {tf_display_str}]{COLOR_RESET}")
     print(f"{COLOR_CYAN}================================================================================================{COLOR_RESET}\n")
 
     if active_runners:
@@ -583,8 +589,7 @@ def scan_institutional_tape(target_date_str):
             d_str = "BULLISH" if st["dir"] == 1 else "BEARISH"
             
             print(f"  {color}⚡ {sym:<12} Open P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
-            for tf, score in st["macro_scores"].items():
-                print(f"      └─ 🎯 Macro Alignment [{tf:<6}] : Score >= {MACRO_MINIMUM_SCORE}/6 (Score={score})")
+            print(f"      └─ ⚓ Qualifying Macro TFs        : {', '.join(st['triggering_macro_tfs'])}")
             print(f"      └─ 🔫 Micro Execution [{MICRO_TIMEFRAME}] : Score >= {MICRO_MINIMUM_SCORE}/6 (Score={st['micro_score']})")
             print(f"      └─ ⚓ True Birth Anchor           : {st['date']} @ {st['time']} | Price: ₹{st['origin']:.2f}")
             print(f"      └─ 🎯 Latest LTP                 : {target_date_str} @ EOD   | Price: ₹{ltp:.2f}\n")
@@ -597,8 +602,7 @@ def scan_institutional_tape(target_date_str):
             d_str = "BULLISH" if st["dir"] == 1 else "BEARISH"
 
             print(f"  {color}🛑 {st['sym']:<12} Final P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
-            for tf, score in st["macro_scores"].items():
-                print(f"      └─ 🎯 Macro Alignment [{tf:<6}] : Score >= {MACRO_MINIMUM_SCORE}/6 (Score={score})")
+            print(f"      └─ ⚓ Qualifying Macro TFs        : {', '.join(st['triggering_macro_tfs'])}")
             print(f"      └─ 🔫 Micro Execution [{MICRO_TIMEFRAME}] : Score >= {MICRO_MINIMUM_SCORE}/6 (Score={st['micro_score']})")
             print(f"      └─ ⚓ True Birth Anchor           : {st['date']} @ {st['time']} | Price: ₹{st['origin']:.2f}")
             print(f"      └─ 🎯 Exit Time & Price           : {st['exit_time']} | Price: ₹{st['exit_price']:.2f}")
