@@ -34,14 +34,14 @@ API_ERROR_LOGGED = False
 # ==============================================================================
 # ★ GLOBAL CONFIGURATION: TIMEFRAMES & INDICATORS ★
 # ==============================================================================
-TIMEFRAME = '60min'              
-TIMEFRAME_MINS = 60              
+TIMEFRAME = '5min'              
+TIMEFRAME_MINS = 50              
 ATR_PERIOD = 14
 RSI_PERIOD = 14
 BB_SMA_PERIOD = 20
 BB_STD_DEV = 2.0               
 ADX_PERIOD = 14
-ADX_THRESHOLD = 20             
+ADX_THRESHOLD = 30             
 RENKO_MIN_BRICK = 0.05         
 RENKO_DEFAULT_PCT = 0.005      
 BREACH_PURGE_PCT = 0.015       
