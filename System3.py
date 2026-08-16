@@ -34,8 +34,8 @@ API_ERROR_LOGGED = False
 # ==============================================================================
 # ★ GLOBAL CONFIGURATION: TIMEFRAMES & INDICATORS ★
 # ==============================================================================
-TIMEFRAME = '15min'              
-TIMEFRAME_MINS = 15              
+TIMEFRAME = '60min'              
+TIMEFRAME_MINS = 60              
 ATR_PERIOD = 14
 RSI_PERIOD = 14
 BB_SMA_PERIOD = 20
