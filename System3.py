@@ -126,7 +126,7 @@ def prepare_technical_data(df):
     return hist_15m
 
 # ==============================================================================
-# 3. VECTORIZED ANOMALY DETECTION 
+# 3. VECTORIZED ANOMALY DETECTION (FIXED SLICING BUG)
 # ==============================================================================
 def extract_all_anomalies(hist_15m):
     df = hist_15m.copy()
@@ -134,14 +134,17 @@ def extract_all_anomalies(hist_15m):
     
     bull_cond = (df['RSI'] > df['BB_Upper']) & (df['ADX'] > 20) & (df['ADX'] > df['ADX_prev']) & (df['+DI'] > df['-DI']) & (df['Renko_Trend'] == 1)
     bear_cond = (df['RSI'] < df['BB_Lower']) & (df['ADX'] > 20) & (df['ADX'] > df['ADX_prev']) & (df['-DI'] > df['+DI']) & (df['Renko_Trend'] == -1)
-                
-    anomalies = df[bull_cond | bear_cond].copy()
+    
+    # Calculate Direction on the entire DataFrame before filtering
+    df['Direction'] = np.where(bull_cond, 1, np.where(bear_cond, -1, 0))
+    
+    # Filter anomalies safely
+    anomalies = df[df['Direction'] != 0].copy()
+    
     if anomalies.empty:
-        anomalies['Direction'] = []
-        anomalies['Eval_Time'] = []
+        anomalies['Eval_Time'] = pd.Series(dtype='datetime64[ns]')
         return anomalies
     
-    anomalies['Direction'] = np.where(bull_cond, 1, -1)
     anomalies['Eval_Time'] = anomalies['Datetime'] + pd.Timedelta(minutes=15)
     return anomalies
 
@@ -178,7 +181,6 @@ def scan_institutional_tape(target_date_str):
         # Historical chunk
         for attempt in range(4):
             try:
-                # Independent requests.get bypasses TCP deadlocks completely. strict timeout=15 forces hang-recovery.
                 res = requests.get(f"https://api.upstox.com/v2/historical-candle/{key}/1minute/{hist_end}/{start_date}", headers=headers, timeout=15)
                 if res.status_code == 429: time.sleep(1.5); continue
                 if res.status_code == 200 and res.json().get('data', {}).get('candles'):
