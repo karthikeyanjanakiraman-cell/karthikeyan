@@ -70,10 +70,10 @@ GLOBAL_MACRO_STRATEGY_2D = "BOTH"  # "BULLISH", "BEARISH", or "BOTH"
 MACRO_MANDATORY_PRICE_RENKO = True
 MACRO_MANDATORY_VOL_RENKO   = True
 MACRO_MANDATORY_RSI_BB      = False
-MACRO_MANDATORY_ADX_DMI     = True
+MACRO_MANDATORY_ADX_DMI     = False
 MACRO_MANDATORY_EMA_SPREAD  = False
 MACRO_MANDATORY_STOCHASTIC  = False
-MACRO_MINIMUM_SCORE         = 3      # Out of 6
+MACRO_MINIMUM_SCORE         = 2      # Out of 6
 
 # ==============================================================================
 # 🎛️ TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER)
