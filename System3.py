@@ -1,3 +1,4 @@
+
 """system3.py - Asit Baran Pati Multi-Timeframe Trading System Implementation
 
 Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
@@ -5,7 +6,7 @@ Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
 - Configurable Macro Hierarchy Array (e.g., ["15min", "60min", "1D"])
 - Phase 1 Blueprint: Dual-Tier Scorecard & Global Mandatory Veto Switches
 - Phase 1 Blueprint: Order Flow / Cumulative Volume Delta 45-Degree Renko
-- EXIT STRATEGY: Dual-Layered (Macro + Micro) Asymmetric OR-Condition Renko Trailing Stop
+- EXIT STRATEGY: Dual-Layered (Macro [ANY OR] + Micro) Asymmetric OR-Condition Renko Trailing Stop
 - TRUE BIRTH TIME TRACKING: Locks in the original structural ignition timestamp and price
 """
 
@@ -47,7 +48,7 @@ API_ERROR_LOGGED = False
 # ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
 MICRO_TIMEFRAME = "1min"  # Micro Execution & Tactical Trigger
-MACRO_TIMEFRAMES = ["15min"]  # Strategic Structural & Pilot Tiers
+MACRO_TIMEFRAMES = ["15min", "60min", "1D"]  # Multiple Macro Structural Tiers
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -156,7 +157,6 @@ def calculate_core_technicals(df_tf):
     df_tf["RSI"] = 100 - (100 / (1 + (avg_gain / (avg_loss + 1e-8))))
     df_tf["RSI_SMA"] = df_tf.groupby("Symbol")["RSI"].transform(lambda x: x.rolling(BB_SMA_PERIOD, min_periods=1).mean())
 
-    # Corrected Directional Movement calculation
     high_d = df_tf["High"] - df_tf.groupby("Symbol")["High"].shift(1)
     low_d = df_tf.groupby("Symbol")["Low"].shift(1) - df_tf["Low"]
     df_tf["+DM"] = np.where((high_d > low_d) & (high_d > 0), high_d, 0)
@@ -184,8 +184,6 @@ def calculate_core_technicals(df_tf):
 
     return df_tf
 
-
-    
 
 def construct_45deg_renko_matrix(df, tf_name, confirm_bricks):
     renko_counts = np.zeros(len(df))
@@ -337,7 +335,7 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
 
 
 # ==============================================================================
-# 4. MICRO EXECUTION TAPE & CONFLUENCE MATCHER
+# 4. MICRO EXECUTION TAPE & CONFLUENCE MATCHER (ANY MACRO OR-CONDITION)
 # ==============================================================================
 def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes):
     if micro_tf != "1min":
@@ -372,8 +370,9 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
         df_micro[f"Renko_Count_{tf}"] = df_micro[f"Renko_Count_{tf}"].fillna(0).astype(int)
         df_micro[f"Vol_Renko_Count_{tf}"] = df_micro[f"Vol_Renko_Count_{tf}"].fillna(0).astype(int)
 
-    df_micro["Master_Armed_Bull"] = df_micro[bull_gate_cols].all(axis=1)
-    df_micro["Master_Armed_Bear"] = df_micro[bear_gate_cols].all(axis=1)
+    # 🌟 MULTI-TIMEFRAME MACRO "ANY" LOGIC: Trigger if ANY macro timeframe aligns
+    df_micro["Master_Armed_Bull"] = df_micro[bull_gate_cols].any(axis=1)
+    df_micro["Master_Armed_Bear"] = df_micro[bear_gate_cols].any(axis=1)
     df_micro = df_micro.sort_values(["Symbol", "Datetime"]).reset_index(drop=True)
 
     df_micro["Trigger_Bull"] = df_micro["Master_Armed_Bull"] & df_micro[f"Armed_Bull_{micro_tf}"]
@@ -390,7 +389,7 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
 
 
 # ==============================================================================
-# 5. TRADE MANAGEMENT: TRUE BIRTH TIME & DUAL-LAYERED EXITS
+# 5. TRADE MANAGEMENT: TRUE BIRTH TIME & ANY-MACRO BREAK EXIT LOGIC
 # ==============================================================================
 def scan_institutional_tape(target_date_str):
     global API_ERROR_LOGGED
@@ -472,9 +471,9 @@ def scan_institutional_tape(target_date_str):
     micro_price_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Renko_Count_{MICRO_TIMEFRAME}"].to_dict()
     micro_vol_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{MICRO_TIMEFRAME}"].to_dict()
     
-    primary_macro = MACRO_TIMEFRAMES[-1]
-    macro_price_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Renko_Count_{primary_macro}"].to_dict()
-    macro_vol_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{primary_macro}"].to_dict()
+    # Cache all macro timeframes for exit checks
+    macro_price_renkos = {tf: tape_exec.set_index(["Datetime", "Symbol"])[f"Renko_Count_{tf}"].to_dict() for tf in MACRO_TIMEFRAMES}
+    macro_vol_renkos = {tf: tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{tf}"].to_dict() for tf in MACRO_TIMEFRAMES}
     
     all_times = np.sort(tape_exec["Datetime"].unique())
     memory_bank = {}
@@ -483,27 +482,45 @@ def scan_institutional_tape(target_date_str):
     for t in all_times:
         t_dt = pd.to_datetime(t)
         
-        # 1. Manage Active Trades (The Dual-Layered OR-Condition Exit Logic)
+        # 1. Manage Active Trades (Exit if ANY macro timeframe or micro timeframe breaks)
         for sym, st in memory_bank.items():
             if st["state"] == "ACTIVE":
                 ltp = closes_dict.get((t_dt, sym))
                 mi_p_count = micro_price_renko.get((t_dt, sym), 0)
                 mi_v_count = micro_vol_renko.get((t_dt, sym), 0)
-                ma_p_count = macro_price_renko.get((t_dt, sym), 0)
-                ma_v_count = macro_vol_renko.get((t_dt, sym), 0)
 
                 if ltp is not None:
                     exit_reason = None
                     if st["dir"] == 1:
+                        # Micro break checks
                         if mi_p_count <= -MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
                         elif mi_v_count <= -MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
-                        elif ma_p_count <= -MACRO_EXIT_PRICE_BRICKS: exit_reason = "Macro Price Break"
-                        elif ma_v_count <= -MACRO_EXIT_VOL_BRICKS: exit_reason = "Macro Volume Break"
+                        else:
+                            # 🌟 ANY MACRO TIMEFRAME BREAK CHECK (OR Condition)
+                            for tf in MACRO_TIMEFRAMES:
+                                ma_p = macro_price_renkos[tf].get((t_dt, sym), 0)
+                                ma_v = macro_vol_renkos[tf].get((t_dt, sym), 0)
+                                if ma_p <= -MACRO_EXIT_PRICE_BRICKS:
+                                    exit_reason = f"Macro [{tf}] Price Break"
+                                    break
+                                if ma_v <= -MACRO_EXIT_VOL_BRICKS:
+                                    exit_reason = f"Macro [{tf}] Volume Break"
+                                    break
                     elif st["dir"] == -1:
+                        # Micro break checks
                         if mi_p_count >= MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
                         elif mi_v_count >= MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
-                        elif ma_p_count >= MACRO_EXIT_PRICE_BRICKS: exit_reason = "Macro Price Break"
-                        elif ma_v_count >= MACRO_EXIT_VOL_BRICKS: exit_reason = "Macro Volume Break"
+                        else:
+                            # 🌟 ANY MACRO TIMEFRAME BREAK CHECK (OR Condition)
+                            for tf in MACRO_TIMEFRAMES:
+                                ma_p = macro_price_renkos[tf].get((t_dt, sym), 0)
+                                ma_v = macro_vol_renkos[tf].get((t_dt, sym), 0)
+                                if ma_p >= MACRO_EXIT_PRICE_BRICKS:
+                                    exit_reason = f"Macro [{tf}] Price Break"
+                                    break
+                                if ma_v >= MACRO_EXIT_VOL_BRICKS:
+                                    exit_reason = f"Macro [{tf}] Volume Break"
+                                    break
                     
                     if exit_reason:
                         st["state"] = "EXITED"
@@ -526,7 +543,7 @@ def scan_institutional_tape(target_date_str):
                         "exit_time": None,
                         "exit_price": None,
                         "exit_reason": None,
-                        "macro_score": row.get(f"Score_Bull_{primary_macro}" if direction == 1 else f"Score_Bear_{primary_macro}", 0),
+                        "macro_scores": {tf: row.get(f"Score_Bull_{tf}" if direction == 1 else f"Score_Bear_{tf}", 0) for tf in MACRO_TIMEFRAMES},
                         "micro_score": row.get(f"Score_Bull_{MICRO_TIMEFRAME}" if direction == 1 else f"Score_Bear_{MICRO_TIMEFRAME}", 0)
                     }
 
@@ -547,14 +564,14 @@ def scan_institutional_tape(target_date_str):
     final_ltp_dict = today_master.groupby("Symbol")["Close"].last().to_dict()
 
     # ==============================================================================
-    # 6. TERMINAL OUTPUT (TRADE DASHBOARD WITH TRUE BIRTH TRACKING)
+    # 6. TERMINAL OUTPUT (TRADE DASHBOARD WITH MULTI-TIMEFRAME SCORES)
     # ==============================================================================
     active_runners = {sym: st for sym, st in memory_bank.items() if st["state"] == "ACTIVE"}
     closed_trades = [{**st, "sym": sym} for sym, st in memory_bank.items() if st["state"] == "EXITED" and st["date"] == target_date_str]
 
-    tf_display_str = " + ".join(MACRO_TIMEFRAMES)
+    tf_display_str = " | ".join(MACRO_TIMEFRAMES)
     print(f"\n{COLOR_CYAN}================================================================================================{COLOR_RESET}")
-    print(f"{COLOR_BOLD}DUAL-TIER SCORECARD + TRUE BIRTH ENGINE [{MICRO_TIMEFRAME} Micro ⚡ {tf_display_str} Macro]{COLOR_RESET}")
+    print(f"{COLOR_BOLD}DUAL-TIER MULTI-MACRO OR-CONDITION ENGINE [{MICRO_TIMEFRAME} Micro ⚡ Macro: {tf_display_str}]{COLOR_RESET}")
     print(f"{COLOR_CYAN}================================================================================================{COLOR_RESET}\n")
 
     if active_runners:
@@ -566,8 +583,9 @@ def scan_institutional_tape(target_date_str):
             d_str = "BULLISH" if st["dir"] == 1 else "BEARISH"
             
             print(f"  {color}⚡ {sym:<12} Open P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
-            print(f"      └─ 🎯 Macro Alignment [{primary_macro}] : Score >= {MACRO_MINIMUM_SCORE}/6 (Score={st['macro_score']}) [Mandatory Gates Clear]")
-            print(f"      └─ 🔫 Micro Execution [{MICRO_TIMEFRAME}] : Score >= {MICRO_MINIMUM_SCORE}/6 (Score={st['micro_score']}) [Mandatory Gates Clear]")
+            for tf, score in st["macro_scores"].items():
+                print(f"      └─ 🎯 Macro Alignment [{tf:<6}] : Score >= {MACRO_MINIMUM_SCORE}/6 (Score={score})")
+            print(f"      └─ 🔫 Micro Execution [{MICRO_TIMEFRAME}] : Score >= {MICRO_MINIMUM_SCORE}/6 (Score={st['micro_score']})")
             print(f"      └─ ⚓ True Birth Anchor           : {st['date']} @ {st['time']} | Price: ₹{st['origin']:.2f}")
             print(f"      └─ 🎯 Latest LTP                 : {target_date_str} @ EOD   | Price: ₹{ltp:.2f}\n")
 
@@ -579,8 +597,9 @@ def scan_institutional_tape(target_date_str):
             d_str = "BULLISH" if st["dir"] == 1 else "BEARISH"
 
             print(f"  {color}🛑 {st['sym']:<12} Final P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
-            print(f"      └─ 🎯 Macro Alignment [{primary_macro}] : Score >= {MACRO_MINIMUM_SCORE}/6 (Score={st['macro_score']}) [Mandatory Gates Clear]")
-            print(f"      └─ 🔫 Micro Execution [{MICRO_TIMEFRAME}] : Score >= {MICRO_MINIMUM_SCORE}/6 (Score={st['micro_score']}) [Mandatory Gates Clear]")
+            for tf, score in st["macro_scores"].items():
+                print(f"      └─ 🎯 Macro Alignment [{tf:<6}] : Score >= {MACRO_MINIMUM_SCORE}/6 (Score={score})")
+            print(f"      └─ 🔫 Micro Execution [{MICRO_TIMEFRAME}] : Score >= {MICRO_MINIMUM_SCORE}/6 (Score={st['micro_score']})")
             print(f"      └─ ⚓ True Birth Anchor           : {st['date']} @ {st['time']} | Price: ₹{st['origin']:.2f}")
             print(f"      └─ 🎯 Exit Time & Price           : {st['exit_time']} | Price: ₹{st['exit_price']:.2f}")
             print(f"      └─ 📉 Reason                      : {st['exit_reason']}\n")
