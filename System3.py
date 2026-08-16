@@ -74,7 +74,7 @@ MACRO_MANDATORY_RSI_BB      = False
 MACRO_MANDATORY_ADX_DMI     = False
 MACRO_MANDATORY_EMA_SPREAD  = False
 MACRO_MANDATORY_STOCHASTIC  = False
-MACRO_MINIMUM_SCORE         = 4      # Out of 6
+MACRO_MINIMUM_SCORE         = 2      # Out of 6
 
 # ==============================================================================
 # 🎛️ TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER)
@@ -87,13 +87,13 @@ MICRO_MANDATORY_RSI_BB      = False
 MICRO_MANDATORY_ADX_DMI     = False
 MICRO_MANDATORY_EMA_SPREAD  = False
 MICRO_MANDATORY_STOCHASTIC  = False
-MICRO_MINIMUM_SCORE         = 6      # Out of 6
+MICRO_MINIMUM_SCORE         = 2      # Out of 6
 
 # ==============================================================================
 # 🎛️ TIER 3: TRADE MANAGEMENT (EXIT STRATEGY)
 # ==============================================================================
 # The "OR" Gate: Trade closes if Price OR Volume structurally breaks.
-EXIT_PRICE_BRICKS = 2  # Continuous reversal price bricks to exit
+EXIT_PRICE_BRICKS = 1  # Continuous reversal price bricks to exit
 EXIT_VOL_BRICKS   = 1  # Continuous reversal volume bricks to exit
 
 
