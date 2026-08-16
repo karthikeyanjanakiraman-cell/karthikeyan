@@ -5,7 +5,7 @@ Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
 - Configurable Macro Hierarchy Array (e.g., ["15min", "60min", "1D"])
 - Phase 1 Blueprint: Dual-Tier Scorecard & Global Mandatory Veto Switches
 - Phase 1 Blueprint: Order Flow / Cumulative Volume Delta 45-Degree Renko
-- EXIT STRATEGY: Asymmetric OR-Condition Renko Trailing Stop Engine
+- EXIT STRATEGY: Dual-Layered (Macro + Micro) Asymmetric OR-Condition Renko Trailing Stop
 - Persistent Momentum State Gates (Fixes single-bar Stochastic/EMA bottleneck)
 - Zero-Lookahead Vectorized Alignment via pd.merge_asof (Strict Timestamp Sorting Fixed)
 """
@@ -74,7 +74,7 @@ MACRO_MANDATORY_RSI_BB      = False
 MACRO_MANDATORY_ADX_DMI     = False
 MACRO_MANDATORY_EMA_SPREAD  = False
 MACRO_MANDATORY_STOCHASTIC  = False
-MACRO_MINIMUM_SCORE         = 2      # Out of 6
+MACRO_MINIMUM_SCORE         = 4      # Out of 6
 
 # ==============================================================================
 # 🎛️ TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER)
@@ -90,11 +90,18 @@ MICRO_MANDATORY_STOCHASTIC  = False
 MICRO_MINIMUM_SCORE         = 2      # Out of 6
 
 # ==============================================================================
-# 🎛️ TIER 3: TRADE MANAGEMENT (EXIT STRATEGY)
+# 🎛️ TIER 3: TRADE MANAGEMENT (DUAL-LAYERED EXIT STRATEGY)
 # ==============================================================================
-# The "OR" Gate: Trade closes if Price OR Volume structurally breaks.
-EXIT_PRICE_BRICKS = 1  # Continuous reversal price bricks to exit
-EXIT_VOL_BRICKS   = 1  # Continuous reversal volume bricks to exit
+# The "OR" Gate: Trade closes if ANY of these thresholds are hit. 
+# (Set to 99 to disable a specific layer)
+
+# MICRO TAPE (Fast execution exits)
+MICRO_EXIT_PRICE_BRICKS = 4  
+MICRO_EXIT_VOL_BRICKS   = 4  
+
+# MACRO TAPE (Structural hold exits)
+MACRO_EXIT_PRICE_BRICKS = 2  
+MACRO_EXIT_VOL_BRICKS   = 2  
 
 
 # ==============================================================================
@@ -317,7 +324,14 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
 
     df_tf["Eval_Time"] = df_tf["Datetime"] + pd.to_timedelta(tf_str)
     
-    export_cols = ["Symbol", "Eval_Time", f"Armed_Bull_{tf_str}", f"Armed_Bear_{tf_str}", f"Score_Bull_{tf_str}", f"Score_Bear_{tf_str}", "ATR", "ADX"]
+    # Exporting Macro Renko Counts specifically for the Exit Engine
+    export_cols = [
+        "Symbol", "Eval_Time", 
+        f"Armed_Bull_{tf_str}", f"Armed_Bear_{tf_str}", 
+        f"Score_Bull_{tf_str}", f"Score_Bear_{tf_str}", 
+        f"Renko_Count_{tf_str}", f"Vol_Renko_Count_{tf_str}",
+        "ATR", "ADX"
+    ]
     env_df = df_tf[export_cols].copy().rename(columns={"Eval_Time": "Datetime", "ATR": f"ATR_{tf_str}", "ADX": f"ADX_{tf_str}"})
     return env_df.sort_values("Datetime").reset_index(drop=True)
 
@@ -355,6 +369,8 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
         df_micro[bear_col] = df_micro[bear_col].fillna(False)
         df_micro[f"Score_Bull_{tf}"] = df_micro[f"Score_Bull_{tf}"].fillna(0).astype(int)
         df_micro[f"Score_Bear_{tf}"] = df_micro[f"Score_Bear_{tf}"].fillna(0).astype(int)
+        df_micro[f"Renko_Count_{tf}"] = df_micro[f"Renko_Count_{tf}"].fillna(0).astype(int)
+        df_micro[f"Vol_Renko_Count_{tf}"] = df_micro[f"Vol_Renko_Count_{tf}"].fillna(0).astype(int)
 
     df_micro["Master_Armed_Bull"] = df_micro[bull_gate_cols].all(axis=1)
     df_micro["Master_Armed_Bear"] = df_micro[bear_gate_cols].all(axis=1)
@@ -449,13 +465,20 @@ def scan_institutional_tape(target_date_str):
     if GLOBAL_MACRO_STRATEGY_2D == "BULLISH": tape_exec["Master_Armed_Bear"] = False
     elif GLOBAL_MACRO_STRATEGY_2D == "BEARISH": tape_exec["Master_Armed_Bull"] = False
 
-    # Extract Data Dictionaries for O(1) State Lookups
+    # Extract Data Dictionaries for O(1) State Lookups (Both Micro and Macro layers)
     all_anomalies = tape_exec[tape_exec["Direction"] != 0].copy()
     anomalies_by_time = all_anomalies.groupby("Datetime")
 
     closes_dict = tape_exec.set_index(["Datetime", "Symbol"])["Close"].to_dict()
-    price_renko_dict = tape_exec.set_index(["Datetime", "Symbol"])[f"Renko_Count_{MICRO_TIMEFRAME}"].to_dict()
-    vol_renko_dict = tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{MICRO_TIMEFRAME}"].to_dict()
+    
+    # Micro Renko Dicts
+    micro_price_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Renko_Count_{MICRO_TIMEFRAME}"].to_dict()
+    micro_vol_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{MICRO_TIMEFRAME}"].to_dict()
+    
+    # Macro Renko Dicts (using the primary structural timeframe)
+    primary_macro = MACRO_TIMEFRAMES[-1]
+    macro_price_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Renko_Count_{primary_macro}"].to_dict()
+    macro_vol_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{primary_macro}"].to_dict()
     
     all_times = np.sort(tape_exec["Datetime"].unique())
     memory_bank = {}
@@ -463,24 +486,36 @@ def scan_institutional_tape(target_date_str):
     for t in all_times:
         t_dt = pd.to_datetime(t)
         
-        # 1. Manage Active Trades (The OR-Condition Exit Logic)
+        # 1. Manage Active Trades (The Dual-Layered OR-Condition Exit Logic)
         for sym, st in memory_bank.items():
             if st["state"] == "ACTIVE":
                 ltp = closes_dict.get((t_dt, sym))
-                p_count = price_renko_dict.get((t_dt, sym), 0)
-                v_count = vol_renko_dict.get((t_dt, sym), 0)
+                
+                # Fetch counts for both layers
+                mi_p_count = micro_price_renko.get((t_dt, sym), 0)
+                mi_v_count = micro_vol_renko.get((t_dt, sym), 0)
+                ma_p_count = macro_price_renko.get((t_dt, sym), 0)
+                ma_v_count = macro_vol_renko.get((t_dt, sym), 0)
 
                 if ltp is not None:
-                    if st["dir"] == 1: # LONG EXIT
-                        if p_count <= -EXIT_PRICE_BRICKS or v_count <= -EXIT_VOL_BRICKS:
-                            st["state"] = "EXITED"
-                            st["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M")
-                            st["exit_price"] = ltp
-                    elif st["dir"] == -1: # SHORT EXIT
-                        if p_count >= EXIT_PRICE_BRICKS or v_count >= EXIT_VOL_BRICKS:
-                            st["state"] = "EXITED"
-                            st["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M")
-                            st["exit_price"] = ltp
+                    exit_reason = None
+                    if st["dir"] == 1: # LONG EXIT LOGIC
+                        if mi_p_count <= -MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
+                        elif mi_v_count <= -MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
+                        elif ma_p_count <= -MACRO_EXIT_PRICE_BRICKS: exit_reason = "Macro Price Break"
+                        elif ma_v_count <= -MACRO_EXIT_VOL_BRICKS: exit_reason = "Macro Volume Break"
+                        
+                    elif st["dir"] == -1: # SHORT EXIT LOGIC
+                        if mi_p_count >= MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
+                        elif mi_v_count >= MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
+                        elif ma_p_count >= MACRO_EXIT_PRICE_BRICKS: exit_reason = "Macro Price Break"
+                        elif ma_v_count >= MACRO_EXIT_VOL_BRICKS: exit_reason = "Macro Volume Break"
+                    
+                    if exit_reason:
+                        st["state"] = "EXITED"
+                        st["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M")
+                        st["exit_price"] = ltp
+                        st["exit_reason"] = exit_reason
 
         # 2. Process New Entrances (Entries)
         if t_dt in anomalies_by_time.groups:
@@ -497,7 +532,8 @@ def scan_institutional_tape(target_date_str):
                         "dir": direction,
                         "exit_time": None,
                         "exit_price": None,
-                        "macro_score": row.get(f"Score_Bull_{MACRO_TIMEFRAMES[-1]}" if direction == 1 else f"Score_Bear_{MACRO_TIMEFRAMES[-1]}", 0),
+                        "exit_reason": None,
+                        "macro_score": row.get(f"Score_Bull_{primary_macro}" if direction == 1 else f"Score_Bear_{primary_macro}", 0),
                         "micro_score": row.get(f"Score_Bull_{MICRO_TIMEFRAME}" if direction == 1 else f"Score_Bear_{MICRO_TIMEFRAME}", 0)
                     }
 
@@ -508,6 +544,7 @@ def scan_institutional_tape(target_date_str):
                     st["state"] = "EXITED"
                     st["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M") + " (EOD)"
                     st["exit_price"] = closes_dict.get((t_dt, sym), st["origin"])
+                    st["exit_reason"] = "End of Day Market Close"
 
     today_master = tape_exec[tape_exec["Datetime"].dt.date == target_dt.date()]
     if today_master.empty:
@@ -524,7 +561,7 @@ def scan_institutional_tape(target_date_str):
 
     tf_display_str = " + ".join(MACRO_TIMEFRAMES)
     print(f"\n{COLOR_CYAN}================================================================================================{COLOR_RESET}")
-    print(f"{COLOR_BOLD}DUAL-TIER SCORECARD + RENKO TRAILING EXIT [{MICRO_TIMEFRAME} Micro ⚡ {tf_display_str} Macro]{COLOR_RESET}")
+    print(f"{COLOR_BOLD}DUAL-TIER SCORECARD + DUAL-LAYER RENKO TRAILING EXIT [{MICRO_TIMEFRAME} Micro ⚡ {tf_display_str} Macro]{COLOR_RESET}")
     print(f"{COLOR_CYAN}================================================================================================{COLOR_RESET}\n")
 
     if active_runners:
@@ -538,7 +575,7 @@ def scan_institutional_tape(target_date_str):
             print(f"  {color}⚡ {sym:<12} Open P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
             print(f"      └─ 🎯 Macro Score : {st['macro_score']}/{MACRO_MINIMUM_SCORE} | Micro Score : {st['micro_score']}/{MICRO_MINIMUM_SCORE}")
             print(f"      └─ ⚓ Entry        : {st['date']} @ {st['time']} | Price: ₹{st['origin']:.2f}")
-            print(f"      └─ 📈 Current LTP  : ₹{ltp:.2f} (Trailing via Renko OR Condition)\n")
+            print(f"      └─ 📈 Current LTP  : ₹{ltp:.2f} (Trailing via Dual-Layer OR Condition)\n")
 
     if closed_trades:
         print(f"{COLOR_BOLD}🛑 BASKET 2: CLOSED TRADES (Renko Structure Broken){COLOR_RESET}")
@@ -550,7 +587,7 @@ def scan_institutional_tape(target_date_str):
             print(f"  {color}🛑 {st['sym']:<12} Final P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
             print(f"      └─ ⚓ Entry        : {st['date']} @ {st['time']} | Price: ₹{st['origin']:.2f}")
             print(f"      └─ 🎯 Exit         : {st['exit_time']} | Price: ₹{st['exit_price']:.2f}")
-            print(f"      └─ 📉 Reason       : Micro Price Reversal >= {EXIT_PRICE_BRICKS} OR Micro Vol Reversal >= {EXIT_VOL_BRICKS}\n")
+            print(f"      └─ 📉 Reason       : {st['exit_reason']}\n")
 
     if not active_runners and not closed_trades:
         print(f"{COLOR_DIM}[Terminal Silent] No trades triggered today.{COLOR_RESET}\n")
