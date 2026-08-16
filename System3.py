@@ -1,13 +1,13 @@
 """
 system3.py - Asit Baran Pati Multi-Timeframe Trading System Implementation
-Incorporates:
+Fully Integrated Pipeline:
 - Global Configurable Timeframes (Pilot, Execution 60min, Macro 2D)
 - Configurable Global 2D Strategy Bias ("BULLISH", "BEARISH", or "BOTH")
 - ATR-14 Dynamic Brick Reset Matrix
-- 45-Degree Geometric Angle Renko Construction
-- 8/21 EMA Fast-Line Compression/Expansion Gate
-- ATR-Stochastic Hybrid Crossover Gate
-- Multi-Timeframe RSI, Bollinger Bands, and ADXBO Filters
+- 45-Degree Geometric Angle Renko Construction (1-Min Micro Execution)
+- 8/21 EMA Fast-Line Compression/Expansion Gate (60-Min Macro Execution)
+- ATR-Stochastic Hybrid Crossover Gate (60-Min Macro Execution)
+- Multi-Timeframe BB-RSI & ADXBO Filters (60-Min Macro Execution)
 """
 
 import argparse
@@ -40,7 +40,6 @@ COLOR_BOLD = "\033[1m"
 BACKTRACE_DAYS = 20
 MAX_BREACH_DAYS = 0
 
-# Global flag to stop spamming the console with the same API error
 API_ERROR_LOGGED = False
 
 # ==============================================================================
@@ -58,9 +57,10 @@ BB_SMA_PERIOD = 20
 BB_STD_DEV = 2.0
 ADX_PERIOD = 14
 ADX_THRESHOLD = 20
+STOCH_PERIOD = 14
 
-# 3. 1-Minute Micro Execution & Renko Trigger
-RENKO_CONFIRM_BRICKS = 2  # The Asit Baran Pati 2-Brick Confirmation Rule
+# 3. Micro Execution & Renko Trigger Parameters
+RENKO_CONFIRM_BRICKS = 10  # The Asit Baran Pati Confluence Rule
 RENKO_MIN_BRICK = 0.05
 RENKO_DEFAULT_PCT = 0.005
 
@@ -69,7 +69,7 @@ BREACH_PURGE_PCT = 0.015
 
 # ==============================================================================
 # ★ CONFIGURABLE GLOBAL 2D STRATEGY BIAS ★
-# Options: "BULLISH", "BEARISH", or "BOTH" (allows bi-directional macro scans)
+# Options: "BULLISH", "BEARISH", or "BOTH"
 # ==============================================================================
 GLOBAL_MACRO_STRATEGY_2D = "BOTH"
 
@@ -124,10 +124,64 @@ def get_past_trading_days(target_date_str, num_days=20):
 
 
 # ==============================================================================
-# 2. ZERO-LAG DECOUPLED PRE-COMPUTATION & MULTI-TIMEFRAME ENGINE
+# 2. TECHNICAL GATES & 45-DEGREE RENKO CONSTRUCTION
 # ==============================================================================
+def calculate_atr_14_brick_size(df_daily):
+  """ATR-14 Dynamic Brick Reset Matrix computed fresh from daily baseline."""
+  high = df_daily["High"]
+  low = df_daily["Low"]
+  close = df_daily["Close"]
+
+  tr1 = high - low
+  tr2 = abs(high - close.shift(1))
+  tr3 = abs(low - close.shift(1))
+  tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+  atr_14 = tr.rolling(window=ATR_PERIOD).mean()
+  return (
+      atr_14.iloc[-1]
+      if not atr_14.empty and not pd.isna(atr_14.iloc[-1])
+      else 0.05
+  )
+
+
+def check_ema_compression_expansion(df_exec):
+  """8/21 EMA Fast-Line Compression Zone & Expansion Gate."""
+  df = df_exec.copy()
+  df["EMA_8"] = df["Close"].ewm(span=8, adjust=False).mean()
+  df["EMA_21"] = df["Close"].ewm(span=21, adjust=False).mean()
+  df["EMA_Spread"] = abs(df["EMA_8"] - df["EMA_21"])
+  spread_threshold = df["EMA_Spread"].rolling(window=20).mean() * 0.25
+
+  df["EMA_Expanded"] = (df["EMA_Spread"] > spread_threshold) & (
+      df["EMA_8"].diff().abs() > df["EMA_21"].diff().abs()
+  )
+  return df
+
+
+def check_atr_stochastic_hybrid(df_exec):
+  """ATR-Stochastic Hybrid Crossover Gate."""
+  df = df_exec.copy()
+  high = df["High"]
+  low = df["Low"]
+  close = df["Close"]
+
+  lowest_low = low.rolling(window=STOCH_PERIOD).min()
+  highest_high = high.rolling(window=STOCH_PERIOD).max()
+  df["Stoch_K"] = (
+      (close - lowest_low) / (highest_high - lowest_low + 1e-9)
+  ) * 100
+
+  atr_median = df["ATR"].rolling(window=50).median()
+  df["Volatility_Gate_Passed"] = df["ATR"] >= atr_median
+  df["Stoch_Crossover"] = (df["Stoch_K"] > 50) & (
+      df["Stoch_K"].shift(1) <= 50
+  )
+  df["ATR_Stoch_Pass"] = df["Stoch_Crossover"] & df["Volatility_Gate_Passed"]
+  return df
+
+
 def apply_1m_renko_and_signals(df_1m):
-  """Executes the pure time-independent 45-degree Renko math on the 1-minute data feed."""
+  """45-Degree Geometric Angle Renko Construction & Confluence Trigger."""
   renko_trends = np.zeros(len(df_1m))
   renko_counts = np.zeros(len(df_1m))
 
@@ -152,7 +206,7 @@ def apply_1m_renko_and_signals(df_1m):
             curr_count += bricks
           else:
             curr_trend = 1
-            curr_count = bricks  # Reset counter on trend flip
+            curr_count = bricks
           curr_price += bricks * bs
         elif move <= -bs:
           bricks = int(abs(move) // bs)
@@ -172,9 +226,7 @@ def apply_1m_renko_and_signals(df_1m):
   df_1m["Renko_Trend"] = renko_trends
   df_1m["Renko_Brick_Count"] = renko_counts
 
-  # -------------------------------------------------------------
-  # THE ZERO-LAG EXECUTION TRIGGER
-  # -------------------------------------------------------------
+  # Zero-Lag Execution Trigger matching Macro Permission AND Renko threshold
   df_1m["Trigger_Bull"] = df_1m["Armed_Bull"] & (
       df_1m["Renko_Brick_Count"] >= RENKO_CONFIRM_BRICKS
   )
@@ -199,8 +251,7 @@ def apply_1m_renko_and_signals(df_1m):
 
 
 def prepare_technical_data(rolling_master_df):
-  """Evaluates core technical gates on the global EXECUTION_TIMEFRAME (60min)."""
-  # 1. Build Core Execution Timeframe Environment (60-Minute Aggregation)
+  """Unifies all 60-min execution gates into the master permission structure."""
   tech_exec = (
       rolling_master_df.groupby([
           "Symbol",
@@ -220,7 +271,7 @@ def prepare_technical_data(rolling_master_df):
 
   tech_exec = tech_exec.dropna(subset=["Close"]).sort_values(["Symbol", "Datetime"])
 
-  # ATR & Technicals on 60-Min Chart
+  # ATR & Technicals
   tech_exec["H-L"] = tech_exec["High"] - tech_exec["Low"]
   tech_exec["H-PC"] = (
       tech_exec["High"] - tech_exec.groupby("Symbol")["Close"].shift(1)
@@ -234,7 +285,7 @@ def prepare_technical_data(rolling_master_df):
   )
   tech_exec["ATR"] = atr_series
 
-  # RSI (14)
+  # RSI & Bollinger Bands on RSI
   delta = tech_exec.groupby("Symbol")["Close"].diff()
   gain = delta.where(delta > 0, 0)
   loss = -delta.where(delta < 0, 0)
@@ -246,7 +297,6 @@ def prepare_technical_data(rolling_master_df):
   )
   tech_exec["RSI"] = 100 - (100 / (1 + (avg_gain / (avg_loss + 1e-8))))
 
-  # Bollinger Bands on RSI (20, 2)
   tech_exec["RSI_SMA"] = tech_exec.groupby("Symbol")["RSI"].transform(
       lambda x: x.rolling(BB_SMA_PERIOD).mean()
   )
@@ -298,30 +348,43 @@ def prepare_technical_data(rolling_master_df):
   )
   tech_exec["ADX_prev"] = tech_exec.groupby("Symbol")["ADX"].shift(1)
 
-  # 2. Gatekeeper Logic on 60-Min Execution Tier
+  # Integrate EMA Expansion & ATR-Stochastic Hybrid Gates
+  tech_exec = check_ema_compression_expansion(tech_exec)
+  tech_exec = check_atr_stochastic_hybrid(tech_exec)
+
+  # Master Permission Gauntlet
   tech_exec["Armed_Bull"] = (
       (tech_exec["RSI"] > tech_exec["BB_Upper"])
       & (tech_exec["ADX"] > ADX_THRESHOLD)
       & (tech_exec["ADX"] > tech_exec["ADX_prev"])
       & (tech_exec["+DI"] > tech_exec["-DI"])
+      & tech_exec["EMA_Expanded"]
+      & tech_exec["ATR_Stoch_Pass"]
   )
+
   tech_exec["Armed_Bear"] = (
       (tech_exec["RSI"] < tech_exec["BB_Lower"])
       & (tech_exec["ADX"] > ADX_THRESHOLD)
       & (tech_exec["ADX"] > tech_exec["ADX_prev"])
       & (tech_exec["-DI"] > tech_exec["+DI"])
+      & tech_exec["EMA_Expanded"]
+      & tech_exec["ATR_Stoch_Pass"]
   )
 
-  # Forward-shift evaluation time by 60 mins to prevent lookahead bias
-  exec_mins = int(EXECUTION_TIMEFRAME.replace("min", "")) if "min" in EXECUTION_TIMEFRAME else 60
-  tech_exec["Eval_Time"] = tech_exec["Datetime"] + pd.Timedelta(minutes=exec_mins)
+  exec_mins = (
+      int(EXECUTION_TIMEFRAME.replace("min", ""))
+      if "min" in EXECUTION_TIMEFRAME
+      else 60
+  )
+  tech_exec["Eval_Time"] = tech_exec["Datetime"] + pd.Timedelta(
+      minutes=exec_mins
+  )
 
   env_df = tech_exec[
       ["Symbol", "Eval_Time", "ATR", "Armed_Bull", "Armed_Bear", "ADX"]
   ].copy()
   env_df = env_df.sort_values("Eval_Time").rename(columns={"Eval_Time": "Datetime"})
 
-  # 3. Map Execution Signals down to 1-Minute Ticks
   df_1m = rolling_master_df.sort_values("Datetime").copy()
   df_1m_merged = pd.merge_asof(
       df_1m, env_df, on="Datetime", by="Symbol", direction="backward"
@@ -341,43 +404,7 @@ def prepare_technical_data(rolling_master_df):
 
 
 # ==============================================================================
-# 3. ATR-14 DYNAMIC BRICK RESET & 45-DEGREE RENKO CONSTRUCTION
-# ==============================================================================
-def calculate_atr_14_brick_size(df_daily):
-  """Calculates dynamic brick size fresh daily based on prior day's ATR-14."""
-  high = df_daily["High"]
-  low = df_daily["Low"]
-  close = df_daily["Close"]
-
-  tr1 = high - low
-  tr2 = abs(high - close.shift(1))
-  tr3 = abs(low - close.shift(1))
-
-  tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-  atr_14 = tr.rolling(window=14).mean()
-
-  return atr_14.iloc[-1] if not atr_14.empty and not pd.isna(atr_14.iloc[-1]) else 0.05
-
-
-def check_ema_compression_expansion(df_execution):
-  """Detects compression coil and subsequent explosive fanning expansion of 8 & 21 EMAs on Execution TF."""
-  df = df_execution.copy()
-  df["EMA_8"] = df["Close"].ewm(span=8, adjust=False).mean()
-  df["EMA_21"] = df["Close"].ewm(span=21, adjust=False).mean()
-
-  df["EMA_Spread"] = abs(df["EMA_8"] - df["EMA_21"])
-  spread_threshold = df["EMA_Spread"].rolling(window=20).mean() * 0.25
-
-  df["Is_Compressed"] = df["EMA_Spread"] <= spread_threshold
-  df["Is_Expanded"] = (df["EMA_Spread"] > spread_threshold) & (
-      df["EMA_8"].diff().abs() > df["EMA_21"].diff().abs()
-  )
-
-  return df
-
-
-# ==============================================================================
-# 4. LIGHTNING STATE-BASED MEMORY ENGINE
+# 3. LIGHTNING STATE-BASED MEMORY ENGINE
 # ==============================================================================
 def scan_institutional_tape(target_date_str):
   global API_ERROR_LOGGED
@@ -548,10 +575,12 @@ def scan_institutional_tape(target_date_str):
         f" Active){COLOR_RESET}"
     )
 
-  print(f"⚙️ Computing Execution TF ({EXECUTION_TIMEFRAME}) & 1-Minute Micro Triggers...")
+  print(
+      f"⚙️ Computing Execution TF ({EXECUTION_TIMEFRAME}) & Full Technical"
+      " Gates..."
+  )
   tape_1m = prepare_technical_data(rolling_master_df)
 
-  # Filter based on Global Strategy Bias
   if GLOBAL_MACRO_STRATEGY_2D == "BULLISH":
     tape_1m["Armed_Bear"] = False
   elif GLOBAL_MACRO_STRATEGY_2D == "BEARISH":
@@ -568,11 +597,8 @@ def scan_institutional_tape(target_date_str):
       t for t in all_times if pd.to_datetime(t).date() < target_dt.date()
   ]
 
-  # FAST HISTORICAL STATE BUILD (1-Minute Precision)
   for t in historical_times:
     t_dt = pd.to_datetime(t)
-
-    # 09:15 Gap Checks
     if t_dt.hour == 9 and t_dt.minute == 15:
       day_str = t_dt.strftime("%Y-%m-%d")
       for sym, st in memory_bank.items():
@@ -586,7 +612,6 @@ def scan_institutional_tape(target_date_str):
                 f"{day_str} 09:15 (GAP)",
             )
 
-    # 1-Minute Continuous Breach Detection
     for sym, st in memory_bank.items():
       ltp = closes_dict.get((t_dt, sym))
       if ltp:
@@ -603,7 +628,6 @@ def scan_institutional_tape(target_date_str):
         ):
           st["state"], st["breach_time"] = "ACTIVE", None
 
-    # Lock in exact 1-minute Triggers
     if t_dt in anomalies_by_time.groups:
       for _, row in anomalies_by_time.get_group(t_dt).iterrows():
         sym = row["Symbol"]
@@ -617,7 +641,6 @@ def scan_institutional_tape(target_date_str):
               "breach_time": None,
           }
 
-    # 15:15 EOD Purge check
     if t_dt.hour == 15 and t_dt.minute == 15:
       for sym in list(memory_bank.keys()):
         ltp = closes_dict.get((t_dt, sym))
@@ -633,9 +656,6 @@ def scan_institutional_tape(target_date_str):
           ):
             del memory_bank[sym]
 
-  # ----------------------------------------------------------------------
-  # LIVE TARGET EVALUATION (1-Minute Precision)
-  # ----------------------------------------------------------------------
   today_times = [
       t for t in all_times if pd.to_datetime(t).date() == target_dt.date()
   ]
@@ -660,8 +680,6 @@ def scan_institutional_tape(target_date_str):
 
   for t in today_times:
     t_dt = pd.to_datetime(t)
-
-    # Real-time intraday breaches
     for sym, st in memory_bank.items():
       ltp = closes_dict.get((t_dt, sym))
       if ltp:
@@ -678,7 +696,6 @@ def scan_institutional_tape(target_date_str):
         ):
           st["state"], st["breach_time"] = "ACTIVE", None
 
-    # Real-time zero-lag triggers
     if t_dt in anomalies_by_time.groups:
       for _, row in anomalies_by_time.get_group(t_dt).iterrows():
         sym, price, direction = row["Symbol"], row["Close"], row["Direction"]
@@ -701,7 +718,6 @@ def scan_institutional_tape(target_date_str):
               if st["dir"] == 1
               else ((st["origin"] - price) / st["origin"] * 100)
           )
-
           if st["state"] == "ACTIVE" and direction == st["dir"]:
             row["Eval_Time_Str"] = t_dt.strftime("%H:%M")
             row["Macro_Price"], row["Macro_Date"], row["Micro_Price"] = (
@@ -735,9 +751,9 @@ def scan_institutional_tape(target_date_str):
           "Anchor_Time": st.get("time", "09:15"),
       })
 
-  # ----------------------------------------------------------------------
-  # TERMINAL OUTPUT
-  # ----------------------------------------------------------------------
+  # ==============================================================================
+  # 4. TERMINAL OUTPUT
+  # ==============================================================================
   print(
       f"\n{COLOR_CYAN}================================================================================================{COLOR_RESET}"
   )
@@ -766,11 +782,11 @@ def scan_institutional_tape(target_date_str):
       )
       print(f"  {color}🚨 {sym:<12} Day Move: {pct_move:+.2f}% ({d_str}){COLOR_RESET}")
       print(
-          f"      └─ 🎯 Macro Permission Passed : {EXECUTION_TIMEFRAME} BB-RSI |"
-          f" ADX:{row.get('ADX', 0):.1f}"
+          f"      └─ 🎯 Macro Permission Passed : {EXECUTION_TIMEFRAME} [BB-RSI +"
+          f" ADX + EMA Exp + Stoch] | ADX:{row.get('ADX', 0):.1f}"
       )
       print(
-          "      └─ 🔫 1-Min Execution Trigger : Renko >="
+          "      └─ 🔫 1-Min 45° Renko Trigger : >="
           f" {RENKO_CONFIRM_BRICKS} Bricks"
       )
       print(
@@ -800,11 +816,11 @@ def scan_institutional_tape(target_date_str):
       )
       print(f"  {color}🔄 {sym:<12} Day Move: {pct_move:+.2f}% ({d_str}){COLOR_RESET}")
       print(
-          f"      └─ 🎯 Macro Permission Passed : {EXECUTION_TIMEFRAME} BB-RSI |"
-          f" ADX:{row.get('ADX', 0):.1f}"
+          f"      └─ 🎯 Macro Permission Passed : {EXECUTION_TIMEFRAME} [BB-RSI +"
+          f" ADX + EMA Exp + Stoch] | ADX:{row.get('ADX', 0):.1f}"
       )
       print(
-          "      └─ 🔫 1-Min Execution Trigger : Renko >="
+          "      └─ 🔫 1-Min 45° Renko Trigger : >="
           f" {RENKO_CONFIRM_BRICKS} Bricks"
       )
       print(
@@ -856,11 +872,11 @@ def scan_institutional_tape(target_date_str):
       d_str = "BULLISH" if row["Direction"] == 1 else "BEARISH"
       print(f"  {COLOR_MAGENTA}🔥 {sym:<12} Day Move: {pct_move:+.2f}% ({d_str}){COLOR_RESET}")
       print(
-          f"      └─ 🎯 Macro Permission Passed : {EXECUTION_TIMEFRAME} BB-RSI |"
-          f" ADX:{row.get('ADX', 0):.1f}"
+          f"      └─ 🎯 Macro Permission Passed : {EXECUTION_TIMEFRAME} [BB-RSI +"
+          f" ADX + EMA Exp + Stoch] | ADX:{row.get('ADX', 0):.1f}"
       )
       print(
-          "      └─ 🔫 1-Min Execution Trigger : Renko >="
+          "      └─ 🔫 1-Min 45° Renko Trigger : >="
           f" {RENKO_CONFIRM_BRICKS} Bricks"
       )
       print(
@@ -919,3 +935,4 @@ if __name__ == "__main__":
 
   warnings.filterwarnings("ignore")
   run_production_sweep()
+
