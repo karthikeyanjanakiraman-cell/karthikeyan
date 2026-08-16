@@ -6,8 +6,6 @@ Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
 - Phase 1 Blueprint: Dual-Tier Scorecard & Global Mandatory Veto Switches
 - Phase 1 Blueprint: Order Flow / Cumulative Volume Delta 45-Degree Renko
 - EXIT STRATEGY: Dual-Layered (Macro + Micro) Asymmetric OR-Condition Renko Trailing Stop
-- Persistent Momentum State Gates (Fixes single-bar Stochastic/EMA bottleneck)
-- Zero-Lookahead Vectorized Alignment via pd.merge_asof (Strict Timestamp Sorting Fixed)
 """
 
 import argparse
@@ -47,8 +45,8 @@ API_ERROR_LOGGED = False
 # ==============================================================================
 # ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
-MICRO_TIMEFRAME = "1min"  # Micro Execution & Tactical Trigger
-MACRO_TIMEFRAMES = ["5min"]  # Strategic Structural & Pilot Tiers
+MICRO_TIMEFRAME = "5min"  # Micro Execution & Tactical Trigger
+MACRO_TIMEFRAMES = ["15min"]  # Strategic Structural & Pilot Tiers
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -87,21 +85,15 @@ MICRO_MANDATORY_RSI_BB      = False
 MICRO_MANDATORY_ADX_DMI     = False
 MICRO_MANDATORY_EMA_SPREAD  = False
 MICRO_MANDATORY_STOCHASTIC  = False
-MICRO_MINIMUM_SCORE         = 2      # Out of 6
+MICRO_MINIMUM_SCORE         = 4      # Out of 6
 
 # ==============================================================================
 # 🎛️ TIER 3: TRADE MANAGEMENT (DUAL-LAYERED EXIT STRATEGY)
 # ==============================================================================
-# The "OR" Gate: Trade closes if ANY of these thresholds are hit. 
-# (Set to 99 to disable a specific layer)
-
-# MICRO TAPE (Fast execution exits)
-MICRO_EXIT_PRICE_BRICKS = 10  
+MICRO_EXIT_PRICE_BRICKS = 20  
 MICRO_EXIT_VOL_BRICKS   = 10  
-
-# MACRO TAPE (Structural hold exits)
 MACRO_EXIT_PRICE_BRICKS = 2  
-MACRO_EXIT_VOL_BRICKS   = 2  
+MACRO_EXIT_VOL_BRICKS   = 1  
 
 
 # ==============================================================================
@@ -324,7 +316,6 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
 
     df_tf["Eval_Time"] = df_tf["Datetime"] + pd.to_timedelta(tf_str)
     
-    # Exporting Macro Renko Counts specifically for the Exit Engine
     export_cols = [
         "Symbol", "Eval_Time", 
         f"Armed_Bull_{tf_str}", f"Armed_Bear_{tf_str}", 
@@ -465,17 +456,13 @@ def scan_institutional_tape(target_date_str):
     if GLOBAL_MACRO_STRATEGY_2D == "BULLISH": tape_exec["Master_Armed_Bear"] = False
     elif GLOBAL_MACRO_STRATEGY_2D == "BEARISH": tape_exec["Master_Armed_Bull"] = False
 
-    # Extract Data Dictionaries for O(1) State Lookups (Both Micro and Macro layers)
     all_anomalies = tape_exec[tape_exec["Direction"] != 0].copy()
     anomalies_by_time = all_anomalies.groupby("Datetime")
 
     closes_dict = tape_exec.set_index(["Datetime", "Symbol"])["Close"].to_dict()
-    
-    # Micro Renko Dicts
     micro_price_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Renko_Count_{MICRO_TIMEFRAME}"].to_dict()
     micro_vol_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{MICRO_TIMEFRAME}"].to_dict()
     
-    # Macro Renko Dicts (using the primary structural timeframe)
     primary_macro = MACRO_TIMEFRAMES[-1]
     macro_price_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Renko_Count_{primary_macro}"].to_dict()
     macro_vol_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{primary_macro}"].to_dict()
@@ -490,8 +477,6 @@ def scan_institutional_tape(target_date_str):
         for sym, st in memory_bank.items():
             if st["state"] == "ACTIVE":
                 ltp = closes_dict.get((t_dt, sym))
-                
-                # Fetch counts for both layers
                 mi_p_count = micro_price_renko.get((t_dt, sym), 0)
                 mi_v_count = micro_vol_renko.get((t_dt, sym), 0)
                 ma_p_count = macro_price_renko.get((t_dt, sym), 0)
@@ -499,13 +484,12 @@ def scan_institutional_tape(target_date_str):
 
                 if ltp is not None:
                     exit_reason = None
-                    if st["dir"] == 1: # LONG EXIT LOGIC
+                    if st["dir"] == 1:
                         if mi_p_count <= -MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
                         elif mi_v_count <= -MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
                         elif ma_p_count <= -MACRO_EXIT_PRICE_BRICKS: exit_reason = "Macro Price Break"
                         elif ma_v_count <= -MACRO_EXIT_VOL_BRICKS: exit_reason = "Macro Volume Break"
-                        
-                    elif st["dir"] == -1: # SHORT EXIT LOGIC
+                    elif st["dir"] == -1:
                         if mi_p_count >= MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
                         elif mi_v_count >= MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
                         elif ma_p_count >= MACRO_EXIT_PRICE_BRICKS: exit_reason = "Macro Price Break"
@@ -517,12 +501,11 @@ def scan_institutional_tape(target_date_str):
                         st["exit_price"] = ltp
                         st["exit_reason"] = exit_reason
 
-        # 2. Process New Entrances (Entries)
+        # 2. Process New Entrances (Entries allowed anytime)
         if t_dt in anomalies_by_time.groups:
             for _, row in anomalies_by_time.get_group(t_dt).iterrows():
                 sym = row["Symbol"]
                 direction = row["Direction"]
-                # Enter if no active trade exists (allows re-entry after exit)
                 if sym not in memory_bank or memory_bank[sym]["state"] == "EXITED":
                     memory_bank[sym] = {
                         "state": "ACTIVE",
@@ -554,7 +537,7 @@ def scan_institutional_tape(target_date_str):
     final_ltp_dict = today_master.groupby("Symbol")["Close"].last().to_dict()
 
     # ==============================================================================
-    # 6. TERMINAL OUTPUT (TRADE DASHBOARD)
+    # 6. TERMINAL OUTPUT (TRADE DASHBOARD WITH FIXED SCORE REPORTING)
     # ==============================================================================
     active_runners = {sym: st for sym, st in memory_bank.items() if st["state"] == "ACTIVE"}
     closed_trades = [{**st, "sym": sym} for sym, st in memory_bank.items() if st["state"] == "EXITED" and st["date"] == target_date_str]
@@ -573,9 +556,10 @@ def scan_institutional_tape(target_date_str):
             d_str = "BULLISH" if st["dir"] == 1 else "BEARISH"
             
             print(f"  {color}⚡ {sym:<12} Open P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
-            print(f"      └─ 🎯 Macro Score : {st['macro_score']}/{MACRO_MINIMUM_SCORE} | Micro Score : {st['micro_score']}/{MICRO_MINIMUM_SCORE}")
-            print(f"      └─ ⚓ Entry        : {st['date']} @ {st['time']} | Price: ₹{st['origin']:.2f}")
-            print(f"      └─ 📈 Current LTP  : ₹{ltp:.2f} (Trailing via Dual-Layer OR Condition)\n")
+            print(f"      └─ 🎯 Macro Alignment [{primary_macro}] : Score >= {MACRO_MINIMUM_SCORE}/6 (Score={st['macro_score']}) [Mandatory Gates Clear]")
+            print(f"      └─ 🔫 Micro Execution [{MICRO_TIMEFRAME}] : Score >= {MICRO_MINIMUM_SCORE}/6 (Score={st['micro_score']}) [Mandatory Gates Clear]")
+            print(f"      └─ ⚓ Zero-Lag Anchor              : {st['date']} @ {st['time']} | Price: ₹{st['origin']:.2f}")
+            print(f"      └─ 🎯 Latest LTP                 : {target_date_str} @ EOD   | Price: ₹{ltp:.2f}\n")
 
     if closed_trades:
         print(f"{COLOR_BOLD}🛑 BASKET 2: CLOSED TRADES (Renko Structure Broken){COLOR_RESET}")
@@ -585,6 +569,8 @@ def scan_institutional_tape(target_date_str):
             d_str = "BULLISH" if st["dir"] == 1 else "BEARISH"
 
             print(f"  {color}🛑 {st['sym']:<12} Final P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
+            print(f"      └─ 🎯 Macro Alignment [{primary_macro}] : Score >= {MACRO_MINIMUM_SCORE}/6 (Score={st['macro_score']}) [Mandatory Gates Clear]")
+            print(f"      └─ 🔫 Micro Execution [{MICRO_TIMEFRAME}] : Score >= {MICRO_MINIMUM_SCORE}/6 (Score={st['micro_score']}) [Mandatory Gates Clear]")
             print(f"      └─ ⚓ Entry        : {st['date']} @ {st['time']} | Price: ₹{st['origin']:.2f}")
             print(f"      └─ 🎯 Exit         : {st['exit_time']} | Price: ₹{st['exit_price']:.2f}")
             print(f"      └─ 📉 Reason       : {st['exit_reason']}\n")
