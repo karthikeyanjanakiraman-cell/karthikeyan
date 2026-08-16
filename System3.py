@@ -54,9 +54,9 @@ API_ERROR_LOGGED = False
 MICRO_TIMEFRAME = "5min"  # Micro Execution & Tactical Trigger
 MACRO_TIMEFRAMES = [
     "15min",
-    "30min",
-    "45min",
-    "60min",
+    # "30min",
+    # "45min",
+    # "60min",
 ]  # Strategic Structural & Pilot Tiers (N-Timeframe Array)
 MACRO_STRATEGIC_WINDOW = "2D"  # Multi-Day Trend Horizon
 
