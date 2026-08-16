@@ -7,7 +7,7 @@ Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
 - Solves 09:15-10:15 AM Opening Gap via Pilot Timeframe & Prior-Day Macro Carryover
 - Persistent Momentum State Gates (Fixes single-bar Stochastic/EMA bottleneck)
 - Complete Indicator Gauntlet (BB-RSI, ADXBO, 8/21 EMA Expansion, ATR-Stochastic)
-- Zero-Lookahead Vectorized Alignment via pd.merge_asof
+- Zero-Lookahead Vectorized Alignment via pd.merge_asof (Strict Timestamp Sorting Fixed)
 - State-Based 4-Phase Memory Bank (Intrusions, Reloads, Breaches, Reclaims)
 """
 
@@ -54,7 +54,6 @@ API_ERROR_LOGGED = False
 MICRO_TIMEFRAME = "1min"  # Micro Execution & Tactical Trigger
 MACRO_TIMEFRAMES = [
     "15min",
-    "30min",
     "60min",
 ]  # Strategic Structural & Pilot Tiers (N-Timeframe Array)
 MACRO_STRATEGIC_WINDOW = "2D"  # Multi-Day Trend Horizon
@@ -377,13 +376,15 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
 
   export_cols = ["Symbol", "Eval_Time", bull_col, bear_col, "ATR", "ADX"]
   env_df = df_tf[export_cols].copy()
-  env_df = env_df.sort_values("Eval_Time").rename(
+  env_df = env_df.rename(
       columns={
           "Eval_Time": "Datetime",
           "ATR": f"ATR_{tf_str}",
           "ADX": f"ADX_{tf_str}",
       }
   )
+  # Strict monotonic time sort required for pd.merge_asof
+  env_df = env_df.sort_values("Datetime").reset_index(drop=True)
   return env_df
 
 
@@ -440,6 +441,9 @@ def prepare_unified_execution_tape(
   bull_gate_cols = []
   bear_gate_cols = []
 
+  # CRITICAL: pd.merge_asof requires DataFrame sorted purely by the 'on' time key
+  df_micro = df_micro.sort_values("Datetime").reset_index(drop=True)
+
   # 2. Resample and Merge Each Configured Macro Timeframe
   for tf in macro_timeframes:
     print(f"   ├─ Evaluating Confluence Gates + 45° Renko for [{tf}]...")
@@ -462,6 +466,9 @@ def prepare_unified_execution_tape(
   df_micro["Master_Armed_Bear"] = df_micro[bear_gate_cols].all(axis=1)
 
   # 4. Construct Micro 45-Degree Renko Tactical Trigger
+  # Re-sort by Symbol and Datetime for contiguous sequential Renko processing
+  df_micro = df_micro.sort_values(["Symbol", "Datetime"]).reset_index(drop=True)
+
   df_micro = construct_45deg_renko_matrix(
       df_micro, tf_name=micro_tf, confirm_bricks=MICRO_RENKO_CONFIRM_BRICKS
   )
@@ -490,7 +497,9 @@ def prepare_unified_execution_tape(
   df_micro["Direction"] = np.where(
       df_micro["New_Bull"], 1, np.where(df_micro["New_Bear"], -1, 0)
   )
-  return df_micro
+
+  # Final chronological sort for live tape simulation
+  return df_micro.sort_values("Datetime").reset_index(drop=True)
 
 
 # ==============================================================================
