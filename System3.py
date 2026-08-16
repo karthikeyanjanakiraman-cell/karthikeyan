@@ -51,9 +51,11 @@ API_ERROR_LOGGED = False
 # ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
 # 1. Configurable Timeframe Hierarchy
-MICRO_TIMEFRAME = "1min"  # Micro Execution & Tactical Trigger
+MICRO_TIMEFRAME = "5min"  # Micro Execution & Tactical Trigger
 MACRO_TIMEFRAMES = [
     "15min",
+    "30min",
+    "45min",
     "60min",
 ]  # Strategic Structural & Pilot Tiers (N-Timeframe Array)
 MACRO_STRATEGIC_WINDOW = "2D"  # Multi-Day Trend Horizon
@@ -69,7 +71,7 @@ STOCH_PERIOD = 14
 
 # 3. 45-Degree Renko Parameters (Dual-Tier Calibration)
 MICRO_RENKO_CONFIRM_BRICKS = 2  # Micro Tactical Trigger (2-Brick Rule)
-MACRO_RENKO_CONFIRM_BRICKS = 2  # Macro Structural Trend Confirmation
+MACRO_RENKO_CONFIRM_BRICKS = 1  # Macro Structural Trend Confirmation
 RENKO_MIN_BRICK = 0.05
 RENKO_DEFAULT_PCT = 0.005
 
