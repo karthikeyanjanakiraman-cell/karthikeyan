@@ -10,7 +10,6 @@ from datetime import datetime, timedelta
 import concurrent.futures
 
 import requests
-from requests.adapters import HTTPAdapter
 import pandas as pd
 import numpy as np
 
@@ -26,62 +25,23 @@ COLOR_DIM = '\033[2m'
 COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 
-BACKTRACE_DAYS = 20      # 1 F&O Monthly Derivative Cycle
-MAX_BREACH_DAYS = 0      # Kill Switch: Days a stock can stay breached before memory purge
-
-# Set up global session for connection pooling (Speed Fix)
-GLOBAL_SESSION = requests.Session()
-adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50)
-GLOBAL_SESSION.mount('https://', adapter)
+BACKTRACE_DAYS = 20      
+MAX_BREACH_DAYS = 0      
 
 # ==============================================================================
-# 1. LIVE INGESTION (F&O Universe & Parallel Fetching)
+# 1. LIVE INGESTION (F&O Universe & Parallel Bulk Fetching)
 # ==============================================================================
 def get_dynamic_fno_universe():
     nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
     try:
-        response = GLOBAL_SESSION.get(nse_url, timeout=10)
-        if response.status_code != 200:
-            return []
+        response = requests.get(nse_url, timeout=15)
+        if response.status_code != 200: return []
         nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
         fno_underlying = {item.get("underlying_symbol") for item in nse_data if item.get("segment") == "NSE_FO" and item.get("underlying_symbol")}
         return [{"symbol": item.get("trading_symbol"), "key": item.get("instrument_key")} for item in nse_data if item.get("segment") in ("NSE_EQ", "NSE_INDEX") and item.get("trading_symbol") in fno_underlying]
     except Exception as e:
         print(f"{COLOR_RED}[API Error] Failed to fetch F&O universe: {e}{COLOR_RESET}")
         return []
-
-def fetch_upstox_candles_for_date(instrument_key, date_str, retries=5):
-    access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
-    if not access_token:
-        return None
-
-    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
-    today_str = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
-
-    if date_str == today_str:
-        url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key)}/1minute"
-    else:
-        url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{date_str}/{date_str}"
-
-    for attempt in range(retries):
-        try:
-            response = GLOBAL_SESSION.get(url, headers=headers, timeout=10)
-            if response.status_code == 429:
-                time.sleep(1.5)
-                continue
-            if response.status_code != 200:
-                return None
-            data = response.json().get('data', {}).get('candles', [])
-            if not data:
-                return None
-            c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
-            c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).dt.tz_localize(None) 
-            c_df = c_df.sort_values('Datetime').reset_index(drop=True)
-            return c_df
-        except Exception:
-            time.sleep(1)
-            continue
-    return None
 
 def get_past_trading_days(target_date_str, num_days=20):
     try:
@@ -94,24 +54,19 @@ def get_past_trading_days(target_date_str, num_days=20):
             current_dt -= timedelta(days=1)
         trading_days.reverse()
         return trading_days
-    except Exception as e:
-        print(f"{COLOR_RED}[Date Error] {e}{COLOR_RESET}")
+    except:
         return []
 
 # ==============================================================================
 # 2. TECHNICAL PRE-COMPUTATION ENGINE (BB-RSI, ADX, Renko)
 # ==============================================================================
-def prepare_technical_data(rolling_master_df):
-    df = rolling_master_df.copy()
-    
-    # FIXED: Removed 'Turnover' and 'abs_move' that caused the KeyError
+def prepare_technical_data(df):
     hist_15m = df.groupby(['Symbol', pd.Grouper(key='Datetime', freq='15min', closed='left', label='left')]).agg({
         'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
     }).reset_index()
     
     hist_15m = hist_15m.dropna(subset=['Close']).sort_values(['Symbol', 'Datetime'])
     
-    # ATR Calculation
     hist_15m['H-L'] = hist_15m['High'] - hist_15m['Low']
     hist_15m['H-PC'] = (hist_15m['High'] - hist_15m.groupby('Symbol')['Close'].shift(1)).abs()
     hist_15m['L-PC'] = (hist_15m['Low'] - hist_15m.groupby('Symbol')['Close'].shift(1)).abs()
@@ -119,7 +74,6 @@ def prepare_technical_data(rolling_master_df):
     atr14 = hist_15m.groupby('Symbol')['TR'].transform(lambda x: x.ewm(alpha=1/14, adjust=False).mean())
     hist_15m['ATR'] = atr14
 
-    # BB-RSI Calculation
     delta = hist_15m.groupby('Symbol')['Close'].diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
@@ -134,7 +88,6 @@ def prepare_technical_data(rolling_master_df):
     hist_15m['BB_Upper'] = hist_15m['RSI_SMA'] + (2 * hist_15m['RSI_STD'])
     hist_15m['BB_Lower'] = hist_15m['RSI_SMA'] - (2 * hist_15m['RSI_STD'])
     
-    # ADX, +DI, -DI
     high_diff = hist_15m['High'] - hist_15m.groupby('Symbol')['High'].shift(1)
     low_diff = hist_15m.groupby('Symbol')['Low'].shift(1) - hist_15m['Low']
     
@@ -149,7 +102,6 @@ def prepare_technical_data(rolling_master_df):
     hist_15m['ADX'] = hist_15m.groupby('Symbol')['DX'].transform(lambda x: x.ewm(alpha=1/14, adjust=False).mean())
     hist_15m['ADX_prev'] = hist_15m.groupby('Symbol')['ADX'].shift(1)
     
-    # ATR-Synthesized Renko
     renko_trends = np.ones(len(hist_15m))
     for sym, indices in hist_15m.groupby('Symbol').indices.items():
         sub_closes = hist_15m['Close'].values[indices]
@@ -174,276 +126,222 @@ def prepare_technical_data(rolling_master_df):
     return hist_15m
 
 # ==============================================================================
-# 3. PURE TECHNICAL CONFLUENCE GATEKEEPER
+# 3. VECTORIZED ANOMALY DETECTION 
 # ==============================================================================
-def evaluate_technical_confluence(master_df, current_eval_time, hist_15m_tech=None, window_mins=15):
-    try:
-        if master_df is None or master_df.empty:
-            return pd.DataFrame()
-
-        recent_start = current_eval_time - pd.Timedelta(minutes=window_mins)
-        rec_df = master_df[(master_df['Datetime'] > recent_start) & (master_df['Datetime'] <= current_eval_time)]
-
-        if rec_df.empty:
-            return pd.DataFrame()
-
-        g_rec = rec_df.groupby('Symbol').agg({'Open': 'first', 'Close': 'last'}).reset_index()
-        g_rec['Rec_Pct_Move'] = ((g_rec['Close'] - g_rec['Open']) / (g_rec['Open'] + 1e-8)) * 100
-
-        if hist_15m_tech is not None and not hist_15m_tech.empty:
-            # OPTIMIZATION: drop_duplicates is orders of magnitude faster than groupby().last()
-            tech_slice = hist_15m_tech[hist_15m_tech['Datetime'] < current_eval_time].drop_duplicates(subset=['Symbol'], keep='last')
-            
-            if not tech_slice.empty:
-                merged = pd.merge(g_rec, tech_slice[['Symbol', 'RSI', 'BB_Upper', 'BB_Lower', 'ADX', 'ADX_prev', '+DI', '-DI', 'Renko_Trend']], on='Symbol', how='inner')
+def extract_all_anomalies(hist_15m):
+    df = hist_15m.copy()
+    df['Rec_Pct_Move'] = ((df['Close'] - df['Open']) / (df['Open'] + 1e-8)) * 100
+    
+    bull_cond = (df['RSI'] > df['BB_Upper']) & (df['ADX'] > 20) & (df['ADX'] > df['ADX_prev']) & (df['+DI'] > df['-DI']) & (df['Renko_Trend'] == 1)
+    bear_cond = (df['RSI'] < df['BB_Lower']) & (df['ADX'] > 20) & (df['ADX'] > df['ADX_prev']) & (df['-DI'] > df['+DI']) & (df['Renko_Trend'] == -1)
                 
-                bull_cond = (merged['RSI'] > merged['BB_Upper']) & \
-                            (merged['ADX'] > 20) & \
-                            (merged['ADX'] > merged['ADX_prev']) & \
-                            (merged['+DI'] > merged['-DI']) & \
-                            (merged['Renko_Trend'] == 1)
-                            
-                bear_cond = (merged['RSI'] < merged['BB_Lower']) & \
-                            (merged['ADX'] > 20) & \
-                            (merged['ADX'] > merged['ADX_prev']) & \
-                            (merged['-DI'] > merged['+DI']) & \
-                            (merged['Renko_Trend'] == -1)
-                            
-                merged_filtered = merged[bull_cond | bear_cond].copy()
-                
-                if merged_filtered.empty: 
-                    return pd.DataFrame()
-
-                merged_filtered['Direction'] = np.where(bull_cond, 1, -1)
-                merged_filtered = merged_filtered.sort_values(by='Rec_Pct_Move', key=abs, ascending=False)
-                return merged_filtered
-                
-        return pd.DataFrame()
-    except Exception as e:
-        return pd.DataFrame()
+    anomalies = df[bull_cond | bear_cond].copy()
+    if anomalies.empty:
+        anomalies['Direction'] = []
+        anomalies['Eval_Time'] = []
+        return anomalies
+    
+    anomalies['Direction'] = np.where(bull_cond, 1, -1)
+    anomalies['Eval_Time'] = anomalies['Datetime'] + pd.Timedelta(minutes=15)
+    return anomalies
 
 # ==============================================================================
-# 4. STATE-BASED MEMORY ENGINE
+# 4. LIGHTNING STATE-BASED MEMORY ENGINE
 # ==============================================================================
 def scan_institutional_tape(target_date_str):
-    print(f"\n📡 Initiating State-Based Confluence Engine for {target_date_str}...")
+    print(f"\n📡 Initiating Vectorized Engine for {target_date_str}...")
     universe = get_dynamic_fno_universe()
     if not universe:
-        print(f"⚠️ {COLOR_RED}No F&O universe found or API connection failed.{COLOR_RESET}")
+        print(f"⚠️ {COLOR_RED}No F&O universe found.{COLOR_RESET}")
         return
 
     trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
-    if not trading_days:
-        print(f"⚠️ {COLOR_RED}Failed to generate trading days sequence.{COLOR_RESET}")
-        return
+    if not trading_days: return
 
-    print(f"🚀 Multithreading API Fetch for {len(universe)} symbols over {len(trading_days)} days...")
+    target_dt = pd.to_datetime(target_date_str)
+    current_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
+    is_live_today = (target_date_str == current_now.strftime("%Y-%m-%d"))
 
-    fetch_tasks = [(item, day) for day in trading_days for item in universe]
+    print(f"🚀 Multithreading Bulk Fetch for {len(universe)} symbols (20 days at once)...")
+    fetch_tasks = [(item, trading_days[0], target_date_str, is_live_today) for item in universe]
     historical_dfs = []
 
     def fetch_worker(task):
-        item, day = task
-        df = fetch_upstox_candles_for_date(item['key'], day)
-        if df is not None and not df.empty:
+        item, start_date, end_date, live = task
+        key = urllib.parse.quote(item['key'])
+        access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
+        headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
+        
+        dfs = []
+        hist_end = end_date if not live else (current_now - timedelta(days=1)).strftime("%Y-%m-%d")
+        
+        # Historical chunk
+        for attempt in range(4):
+            try:
+                # Independent requests.get bypasses TCP deadlocks completely. strict timeout=15 forces hang-recovery.
+                res = requests.get(f"https://api.upstox.com/v2/historical-candle/{key}/1minute/{hist_end}/{start_date}", headers=headers, timeout=15)
+                if res.status_code == 429: time.sleep(1.5); continue
+                if res.status_code == 200 and res.json().get('data', {}).get('candles'):
+                    dfs.append(pd.DataFrame(res.json()['data']['candles'], columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI']))
+                break
+            except Exception:
+                time.sleep(1)
+            
+        # Live intraday chunk
+        if live:
+            for attempt in range(4):
+                try:
+                    res = requests.get(f"https://api.upstox.com/v2/historical-candle/intraday/{key}/1minute", headers=headers, timeout=15)
+                    if res.status_code == 429: time.sleep(1.5); continue
+                    if res.status_code == 200 and res.json().get('data', {}).get('candles'):
+                        dfs.append(pd.DataFrame(res.json()['data']['candles'], columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI']))
+                    break
+                except Exception:
+                    time.sleep(1)
+
+        if dfs:
+            df = pd.concat(dfs, ignore_index=True)
+            df['Datetime'] = pd.to_datetime(df['Timestamp']).dt.tz_localize(None)
+            df = df.drop_duplicates(subset=['Datetime']).sort_values('Datetime').reset_index(drop=True)
             df['Symbol'] = item['symbol']
             return df
         return None
 
-    # SPEED FIX: Pool Size up to 20 over a persistent Session
-    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
-        results = list(executor.map(fetch_worker, fetch_tasks))
-        for res in results:
+    # execution with progress tracker and reduced max_workers to avoid firewall DDOS triggers
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        futures = {executor.submit(fetch_worker, task): task for task in fetch_tasks}
+        completed = 0
+        for future in concurrent.futures.as_completed(futures):
+            completed += 1
+            sys.stdout.write(f"\r📡 Fetching Data... {completed}/{len(fetch_tasks)} symbols processed")
+            sys.stdout.flush()
+            res = future.result()
             if res is not None:
                 historical_dfs.append(res)
+    print() # Clear line
 
     if not historical_dfs:
-        print(f"⚠️ {COLOR_RED}Fatal Error: No valid market data fetched across the window.{COLOR_RESET}")
+        print(f"⚠️ {COLOR_RED}Fatal Error: No data retrieved. Check API token or network limits.{COLOR_RESET}")
         return
 
     rolling_master_df = pd.concat(historical_dfs, ignore_index=True)
-    print(f"⚙️ Assembling Technical Matrices (BB-RSI, ADX, Renko)...")
+    
+    print(f"⚙️ Computing Technical Matrices instantly...")
     hist_15m_tech = prepare_technical_data(rolling_master_df)
-
-    current_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
-    is_live_today = (target_date_str == current_now.strftime("%Y-%m-%d"))
-
-    target_dt = pd.to_datetime(target_date_str)
-    if not is_live_today or current_now.hour >= 16:
-        eval_times = [
-            target_dt + pd.Timedelta(hours=9, minutes=45),
-            target_dt + pd.Timedelta(hours=10, minutes=30),
-            target_dt + pd.Timedelta(hours=11, minutes=30),
-            target_dt + pd.Timedelta(hours=12, minutes=30),
-            target_dt + pd.Timedelta(hours=13, minutes=30),
-            target_dt + pd.Timedelta(hours=14, minutes=30),
-            target_dt + pd.Timedelta(hours=15, minutes=15)
-        ]
-    else:
-        eval_times = [current_now.replace(second=0, microsecond=0) - timedelta(minutes=1)]
+    
+    all_anomalies = extract_all_anomalies(hist_15m_tech)
+    anomalies_by_time = all_anomalies.groupby('Eval_Time')
+    
+    closes_15m = hist_15m_tech.copy()
+    closes_15m['Eval_Time'] = closes_15m['Datetime'] + pd.Timedelta(minutes=15)
+    closes_dict = closes_15m.set_index(['Eval_Time', 'Symbol'])['Close'].to_dict()
 
     memory_bank = {} 
+    unique_days = sorted(rolling_master_df['Datetime'].dt.date.unique())
+    historical_dates = [d for d in unique_days if d < target_dt.date()]
 
-    for day in trading_days:
-        day_dt = pd.to_datetime(day)
-        day_master = rolling_master_df[(rolling_master_df['Datetime'] >= day_dt) & (rolling_master_df['Datetime'] < day_dt + pd.Timedelta(days=1))]
-        if day_master.empty:
-            continue
+    for d in historical_dates:
+        day_str = d.strftime('%Y-%m-%d')
+        day_master = rolling_master_df[rolling_master_df['Datetime'].dt.date == d]
+        
+        morning_opens = day_master.groupby('Symbol')['Open'].first().to_dict()
+        for sym, st in memory_bank.items():
+            if sym in morning_opens and st['state'] == 'ACTIVE':
+                if (st['dir'] == 1 and morning_opens[sym] < st['origin']) or (st['dir'] == -1 and morning_opens[sym] > st['origin']):
+                    st['state'] = 'BREACHED'
+                    st['breach_time'] = f"{day_str} 09:15 (GAP)"
 
-        try:
-            morning_open = day_master.groupby('Symbol').first().reset_index()
-            m_dict = morning_open.set_index('Symbol')['Open'].to_dict()
-
+        day_times = sorted([t for t in closes_15m['Eval_Time'].unique() if t.date() == d])
+        
+        for t in day_times:
             for sym, st in memory_bank.items():
-                if sym in m_dict:
-                    op = m_dict[sym]
-                    if st['state'] == 'ACTIVE':
-                        if (st['dir'] == 1 and op < st['origin']) or (st['dir'] == -1 and op > st['origin']):
-                            st['state'] = 'BREACHED'
-                            st['breach_time'] = f"{day} 09:15 (GAP)"
-        except:
-            pass
+                ltp = closes_dict.get((t, sym))
+                if ltp:
+                    if st['state'] == 'ACTIVE' and ((st['dir'] == 1 and ltp < st['origin']) or (st['dir'] == -1 and ltp > st['origin'])):
+                        st['state'] = 'BREACHED'
+                        st['breach_time'] = t.strftime('%Y-%m-%d %H:%M')
+                    elif st['state'] == 'BREACHED' and ((st['dir'] == 1 and ltp >= st['origin']) or (st['dir'] == -1 and ltp <= st['origin'])):
+                        st['state'] = 'ACTIVE'
+                        st['breach_time'] = None
 
-        day_start = day_dt + pd.Timedelta(hours=9, minutes=15)
-        day_end = day_dt + pd.Timedelta(hours=15, minutes=15) if day != target_date_str else eval_times[-1]
-
-        try:
-            time_steps = pd.date_range(start=day_start + pd.Timedelta(minutes=15), end=day_end, freq='15min')
-            # SPEED FIX: O(1) Dictionary Lookup instead of filtering a dataframe 500 times
-            day_candle_dict = day_master.set_index(['Datetime', 'Symbol'])['Close'].to_dict()
-            
-            for t in time_steps:
-                for sym, st in memory_bank.items():
-                    ltp = day_candle_dict.get((t, sym))
-                    if ltp is not None:
-                        if st['state'] == 'ACTIVE':
-                            if (st['dir'] == 1 and ltp < st['origin']) or (st['dir'] == -1 and ltp > st['origin']):
-                                st['state'] = 'BREACHED'
-                                st['breach_time'] = t.strftime('%Y-%m-%d %H:%M')
-                        elif st['state'] == 'BREACHED':
-                            if (st['dir'] == 1 and ltp >= st['origin']) or (st['dir'] == -1 and ltp <= st['origin']):
-                                st['state'] = 'ACTIVE'
-                                st['breach_time'] = None
-
-                anomalies = evaluate_technical_confluence(day_master, t, hist_15m_tech=hist_15m_tech, window_mins=15)
-                if not anomalies.empty:
-                    for _, row in anomalies.iterrows():
-                        sym = row['Symbol']
-                        price = row['Close']
-                        direction = row['Direction']
-                        if sym not in memory_bank:
-                            memory_bank[sym] = {'state': 'ACTIVE', 'origin': price, 'date': day, 'time': t.strftime('%H:%M'), 'dir': direction, 'breach_time': None}
-        except:
-            pass
-
-        try:
-            daily_agg = day_master.groupby('Symbol').agg({'Close': 'last'}).reset_index()
-            daily_dict = daily_agg.set_index('Symbol').to_dict('index')
-            to_delete = []
-            for sym, st in memory_bank.items():
-                if sym not in daily_dict: continue
-                d_close = daily_dict[sym]['Close']
+            if t in anomalies_by_time.groups:
+                for _, row in anomalies_by_time.get_group(t).iterrows():
+                    sym = row['Symbol']
+                    if sym not in memory_bank:
+                        memory_bank[sym] = {'state': 'ACTIVE', 'origin': row['Close'], 'date': day_str, 'time': t.strftime('%H:%M'), 'dir': row['Direction'], 'breach_time': None}
+        
+        daily_closes = day_master.groupby('Symbol')['Close'].last().to_dict()
+        for sym in list(memory_bank.keys()):
+            if sym in daily_closes:
+                st = memory_bank[sym]
                 if st['state'] == 'BREACHED':
-                    if st['dir'] == 1 and d_close < (st['origin'] * 0.985): 
-                        to_delete.append(sym)
-                    elif st['dir'] == -1 and d_close > (st['origin'] * 1.015): 
-                        to_delete.append(sym)
-            for sym in to_delete: 
-                del memory_bank[sym]
-        except:
-            pass
+                    if (st['dir'] == 1 and daily_closes[sym] < st['origin'] * 0.985) or (st['dir'] == -1 and daily_closes[sym] > st['origin'] * 1.015):
+                        del memory_bank[sym]
 
     # ----------------------------------------------------------------------
-    # LIVE EVALUATION
+    # LIVE TARGET EVALUATION 
     # ----------------------------------------------------------------------
-    today_master = rolling_master_df[
-        (rolling_master_df['Datetime'] >= target_dt) & 
-        (rolling_master_df['Datetime'] <= target_dt + pd.Timedelta(days=1))
-    ].copy()
+    today_master = rolling_master_df[rolling_master_df['Datetime'].dt.date == target_dt.date()].copy()
 
     if today_master.empty: 
         print(f"\n{COLOR_YELLOW}[Terminal Standby] Market data for {target_date_str} is empty or not available yet.{COLOR_RESET}\n")
         return
 
-    all_fresh_intrusions = {}
-    all_reloads = {}
-    all_reclaims = {}
+    if not is_live_today or current_now.hour >= 16:
+        eval_times = [target_dt + pd.Timedelta(hours=h, minutes=m) for h, m in [(9,45), (10,30), (11,30), (12,30), (13,30), (14,30), (15,15)]]
+    else:
+        eval_times = [current_now.replace(second=0, microsecond=0) - timedelta(minutes=1)]
+
+    all_fresh_intrusions, all_reloads, all_reclaims = {}, {}, {}
 
     for eval_time_current in eval_times:
         current_slice = today_master[today_master['Datetime'] <= eval_time_current]
         if current_slice.empty: continue
+        today_latest_ltp = current_slice.groupby('Symbol')['Close'].last().to_dict()
+        
+        for sym, st in memory_bank.items():
+            ltp = today_latest_ltp.get(sym)
+            if ltp:
+                if st['state'] == 'ACTIVE' and ((st['dir'] == 1 and ltp < st['origin']) or (st['dir'] == -1 and ltp > st['origin'])):
+                    st['state'], st['breach_time'] = 'BREACHED', eval_time_current.strftime('%Y-%m-%d %H:%M')
+                elif st['state'] == 'BREACHED' and ((st['dir'] == 1 and ltp >= st['origin']) or (st['dir'] == -1 and ltp <= st['origin'])):
+                    st['state'], st['breach_time'] = 'ACTIVE', None
 
-        try:
-            today_latest_ltp = current_slice.groupby('Symbol')['Close'].last().to_dict()
-            for sym, st in memory_bank.items():
-                if sym in today_latest_ltp:
-                    ltp = today_latest_ltp[sym]
-                    if st['state'] == 'ACTIVE':
-                        if (st['dir'] == 1 and ltp < st['origin']) or (st['dir'] == -1 and ltp > st['origin']):
-                            st['state'] = 'BREACHED'
-                            st['breach_time'] = eval_time_current.strftime('%Y-%m-%d %H:%M')
-                    elif st['state'] == 'BREACHED':
-                        if (st['dir'] == 1 and ltp >= st['origin']) or (st['dir'] == -1 and ltp <= st['origin']):
-                            st['state'] = 'ACTIVE'
-                            st['breach_time'] = None
-
-            curr_anomalies = evaluate_technical_confluence(current_slice, eval_time_current, hist_15m_tech=hist_15m_tech, window_mins=15)
-
-            if not curr_anomalies.empty:
-                for _, row in curr_anomalies.iterrows():
-                    sym = row['Symbol']
-                    price = row['Close']
-                    direction = row['Direction']
-
-                    if sym not in memory_bank:
-                        if sym not in all_fresh_intrusions:
-                            row['Eval_Time'] = eval_time_current.strftime('%H:%M')
-                            all_fresh_intrusions[sym] = row
-                    else:
-                        st = memory_bank[sym]
-                        if st['dir'] == 1:
-                            row['Net_Drift'] = ((price - st['origin']) / st['origin']) * 100
-                        else:
-                            row['Net_Drift'] = ((st['origin'] - price) / st['origin']) * 100
-
-                        if st['state'] == 'ACTIVE' and row['Direction'] == st['dir']:
-                            if (st['dir'] == 1 and price >= st['origin']) or (st['dir'] == -1 and price <= st['origin']):
-                                row['Eval_Time'] = eval_time_current.strftime('%H:%M')
-                                row['Macro_Price'] = st['origin']
-                                row['Macro_Date'] = st['date']
-                                row['Micro_Price'] = price
-                                all_reloads[sym] = row
-                            else:
-                                st['state'] = 'BREACHED'
-                                st['breach_time'] = eval_time_current.strftime('%Y-%m-%d %H:%M')
-
-                        elif st['state'] == 'BREACHED' and row['Direction'] == st['dir']:
-                            if (st['dir'] == 1 and price > st['origin']) or (st['dir'] == -1 and price < st['origin']):
-                                st['state'] = 'ACTIVE' 
-                                st['breach_time'] = None
-                                row['Eval_Time'] = eval_time_current.strftime('%H:%M')
-                                row['Origin'] = st['origin']
-                                row['First_Date'] = st['date']
-                                all_reclaims[sym] = row
-        except:
-            continue
+        if not all_anomalies.empty:
+            curr_anoms = all_anomalies[all_anomalies['Eval_Time'] == eval_time_current]
+            for _, row in curr_anoms.iterrows():
+                sym, price, direction = row['Symbol'], row['Close'], row['Direction']
+                if sym not in memory_bank:
+                    if sym not in all_fresh_intrusions:
+                        row['Eval_Time_Str'] = eval_time_current.strftime('%H:%M')
+                        all_fresh_intrusions[sym] = row
+                else:
+                    st = memory_bank[sym]
+                    row['Net_Drift'] = ((price - st['origin']) / st['origin'] * 100) if st['dir'] == 1 else ((st['origin'] - price) / st['origin'] * 100)
+                    
+                    if st['state'] == 'ACTIVE' and direction == st['dir']:
+                        row['Eval_Time_Str'] = eval_time_current.strftime('%H:%M')
+                        row['Macro_Price'], row['Macro_Date'], row['Micro_Price'] = st['origin'], st['date'], price
+                        all_reloads[sym] = row
+                    elif st['state'] == 'BREACHED' and direction == st['dir']:
+                        st['state'], st['breach_time'] = 'ACTIVE', None
+                        row['Eval_Time_Str'] = eval_time_current.strftime('%H:%M')
+                        row['Origin'], row['First_Date'] = st['origin'], st['date']
+                        all_reclaims[sym] = row
 
     final_ltp_dict = today_master.groupby('Symbol')['Close'].last().to_dict()
-    valid_fresh = {}
+    valid_fresh, breached = {}, []
+
     for sym, row in all_fresh_intrusions.items():
-        ltp = final_ltp_dict.get(sym, row['Close'])
-        direction = row['Direction']
-        birth_price = row['Close']
+        ltp, direction, birth_price = final_ltp_dict.get(sym, row['Close']), row['Direction'], row['Close']
         if (direction == 1 and ltp < birth_price) or (direction == -1 and ltp > birth_price):
-            memory_bank[sym] = {'state': 'BREACHED', 'origin': birth_price, 'date': target_date_str, 'time': row.get('Eval_Time', '15:15'), 'dir': direction, 'breach_time': f"{target_date_str} EOD Violation"}
+            memory_bank[sym] = {'state': 'BREACHED', 'origin': birth_price, 'date': target_date_str, 'time': row.get('Eval_Time_Str', '15:15'), 'dir': direction, 'breach_time': f"{target_date_str} EOD Violation"}
         else:
             valid_fresh[sym] = row
 
-    breached = []
     for sym, st in memory_bank.items():
-        if st['state'] == 'BREACHED' and sym in final_ltp_dict:
-            if sym not in all_reclaims: 
-                breached.append({'Symbol': sym, 'LTP': final_ltp_dict[sym], 'Origin': st['origin'], 'Dir': "BULLISH" if st['dir'] == 1 else "BEARISH", 'Time': st['breach_time'], 'First_Date': st['date'], 'Anchor_Time': st.get('time', '09:15')})
+        if st['state'] == 'BREACHED' and sym in final_ltp_dict and sym not in all_reclaims:
+            breached.append({'Symbol': sym, 'LTP': final_ltp_dict[sym], 'Origin': st['origin'], 'Dir': "BULLISH" if st['dir'] == 1 else "BEARISH", 'Time': st['breach_time'], 'First_Date': st['date'], 'Anchor_Time': st.get('time', '09:15')})
 
     # ----------------------------------------------------------------------
     # TERMINAL OUTPUT
@@ -456,43 +354,39 @@ def scan_institutional_tape(target_date_str):
         print(f"{COLOR_BOLD}⚡ BASKET 1: FRESH INTRUSIONS (Phase 1 - Day-1 Births){COLOR_RESET}")
         for sym, row in valid_fresh.items():
             pct_move, ltp = row['Rec_Pct_Move'], row['Close']
-            color = COLOR_GREEN if pct_move > 0 else COLOR_RED
-            d_str = "BULLISH" if pct_move > 0 else "BEARISH"
+            color, d_str = (COLOR_GREEN, "BULLISH") if pct_move > 0 else (COLOR_RED, "BEARISH")
             print(f"  {color}🚨 {sym:<12} Block Move: {pct_move:+.2f}% ({d_str}){COLOR_RESET}")
             print(f"      └─ 🎯 Tech Filters Passed : BB-RSI Breakout | ADX:{row.get('ADX', 0):.1f} | Renko: {d_str}")
-            print(f"      └─ ⚓ Breakout Anchor     : {target_date_str} @ {row.get('Eval_Time', '15:15')} | Price: ₹{ltp:.2f}")
+            print(f"      └─ ⚓ Breakout Anchor     : {target_date_str} @ {row.get('Eval_Time_Str', '15:15')} | Price: ₹{ltp:.2f}")
             print(f"      └─ 🎯 Latest LTP          : {target_date_str} @ EOD    | Price: ₹{final_ltp_dict.get(sym, ltp):.2f}\n")
 
     if all_reloads:
         print(f"{COLOR_BOLD}🔄 BASKET 2: ALGORITHMIC RELOADS (Phase 2 - Institutional Continuations){COLOR_RESET}")
         for sym, row in all_reloads.items():
             pct_move, ltp = row['Rec_Pct_Move'], row['Close']
-            color = COLOR_GREEN if pct_move > 0 else COLOR_RED
-            d_str = "BULLISH" if pct_move > 0 else "BEARISH"
+            color, d_str = (COLOR_GREEN, "BULLISH") if pct_move > 0 else (COLOR_RED, "BEARISH")
             print(f"  {color}🔄 {sym:<12} Block Move: {pct_move:+.2f}% ({d_str}){COLOR_RESET}")
             print(f"      └─ 🎯 Tech Filters Passed : BB-RSI Breakout | ADX:{row.get('ADX', 0):.1f} | Renko: {d_str}")
             print(f"      └─ ⚓ Macro Floor (Origin): {row['Macro_Date']} @ {memory_bank[sym].get('time', '09:15')} | Price: ₹{row['Macro_Price']:.2f}")
-            print(f"      └─ ⚡ Micro Floor (Reload): {target_date_str} @ {row.get('Eval_Time', '15:15')} | Price: ₹{row['Micro_Price']:.2f}")
+            print(f"      └─ ⚡ Micro Floor (Reload): {target_date_str} @ {row.get('Eval_Time_Str', '15:15')} | Price: ₹{row['Micro_Price']:.2f}")
             print(f"      └─ 🎯 Latest LTP          : {target_date_str} @ EOD    | Price: ₹{final_ltp_dict.get(sym, ltp):.2f} (Trend Drift: {row['Net_Drift']:+.2f}%)\n")
 
     if breached:
         print(f"{COLOR_DIM}⚠️ BASKET 3: BREACHED PIVOTS (Phase 3 - Trapped Capital / Dead Trends){COLOR_RESET}")
         for b in breached:
-            b_time = b['Time'] if b['Time'] else 'Pending Intraday Breakdown'
             print(f"  {COLOR_YELLOW}⚠️ {b['Symbol']:<12} {b['Dir']} Anchor shattered!{COLOR_RESET}")
             print(f"      └─ ⚓ Anchor : {b['First_Date']} @ {b['Anchor_Time']} | LTP: ₹{b['Origin']:.2f}")
-            print(f"      └─ 🎯 Latest : Breached At {b_time} | Current LTP: ₹{b['LTP']:.2f}\n")
+            print(f"      └─ 🎯 Latest : Breached At {b.get('Time', 'Pending')} | Current LTP: ₹{b['LTP']:.2f}\n")
 
     if all_reclaims:
         print(f"{COLOR_BOLD}🪤 BASKET 4: INSTITUTIONAL RECLAIMS (Phase 4 - Liquidity Traps){COLOR_RESET}")
         for sym, row in all_reclaims.items():
             pct_move, ltp = row['Rec_Pct_Move'], row['Close']
-            color = COLOR_MAGENTA
             d_str = "BULLISH" if pct_move > 0 else "BEARISH"
-            print(f"  {color}🔥 {sym:<12} Block Move: {pct_move:+.2f}% ({d_str}){COLOR_RESET}")
+            print(f"  {COLOR_MAGENTA}🔥 {sym:<12} Block Move: {pct_move:+.2f}% ({d_str}){COLOR_RESET}")
             print(f"      └─ 🎯 Tech Filters Passed : BB-RSI Breakout | ADX:{row.get('ADX', 0):.1f} | Renko: {d_str}")
             print(f"      └─ ⚓ Anchor : {row['First_Date']} @ {memory_bank[sym].get('time', '09:15')} | LTP: ₹{row['Origin']:.2f}")
-            print(f"      └─ 🎯 Latest : Reclaimed At {target_date_str} @ {row.get('Eval_Time', '15:15')} | LTP: ₹{ltp:.2f}\n")
+            print(f"      └─ 🎯 Latest : Reclaimed At {target_date_str} @ {row.get('Eval_Time_Str', '15:15')} | LTP: ₹{ltp:.2f}\n")
 
     if not any([valid_fresh, all_reloads, all_reclaims, breached]):
         print(f"{COLOR_DIM}[Terminal Silent] No active institutional structure passing strict filters.{COLOR_RESET}\n")
@@ -503,18 +397,14 @@ def scan_institutional_tape(target_date_str):
 def run_production_sweep():
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--date", type=str, default="")
-    parser.add_argument("positional_date", nargs="?", default="")
     args, _ = parser.parse_known_args()
 
-    raw_date_str = args.date or args.positional_date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
-    is_backtest = bool(raw_date_str)
-
-    if not is_backtest:
+    raw_date_str = args.date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
+    
+    if not raw_date_str:
         target_dt = datetime.utcnow() + timedelta(hours=5, minutes=30)
-        if target_dt.weekday() == 5: 
-            target_dt -= timedelta(days=1)
-        elif target_dt.weekday() == 6: 
-            target_dt -= timedelta(days=2)
+        if target_dt.weekday() == 5: target_dt -= timedelta(days=1)
+        elif target_dt.weekday() == 6: target_dt -= timedelta(days=2)
         target_date_str = target_dt.strftime("%Y-%m-%d")
     else:
         target_date_str = datetime.strptime(raw_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
@@ -522,6 +412,7 @@ def run_production_sweep():
     if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
         print(f"❌ {COLOR_RED}Error: UPSTOX_ACCESS_TOKEN environment variable not found.{COLOR_RESET}")
         return
+        
     scan_institutional_tape(target_date_str)
 
 if __name__ == "__main__":
