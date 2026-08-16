@@ -87,7 +87,7 @@ MICRO_MANDATORY_RSI_BB      = False
 MICRO_MANDATORY_ADX_DMI     = False
 MICRO_MANDATORY_EMA_SPREAD  = False
 MICRO_MANDATORY_STOCHASTIC  = False
-MICRO_MINIMUM_SCORE         = 2      # Out of 6
+MICRO_MINIMUM_SCORE         = 6      # Out of 6
 
 # ==============================================================================
 # 🎛️ TIER 3: TRADE MANAGEMENT (EXIT STRATEGY)
