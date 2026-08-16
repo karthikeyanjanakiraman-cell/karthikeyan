@@ -57,7 +57,7 @@ ADX_PERIOD = 14
 ADX_THRESHOLD = 20
 STOCH_PERIOD = 14
 
-MICRO_RENKO_CONFIRM_BRICKS = 2  # Micro Tactical Trigger (2-Brick Rule)
+MICRO_RENKO_CONFIRM_BRICKS = 1  # Micro Tactical Trigger (2-Brick Rule)
 MACRO_RENKO_CONFIRM_BRICKS = 1  # Macro Structural Trend Confirmation
 RENKO_MIN_BRICK = 0.05
 RENKO_DEFAULT_PCT = 0.005
@@ -70,10 +70,10 @@ GLOBAL_MACRO_STRATEGY_2D = "BOTH"  # "BULLISH", "BEARISH", or "BOTH"
 MACRO_MANDATORY_PRICE_RENKO = True
 MACRO_MANDATORY_VOL_RENKO   = True
 MACRO_MANDATORY_RSI_BB      = False
-MACRO_MANDATORY_ADX_DMI     = False
+MACRO_MANDATORY_ADX_DMI     = True
 MACRO_MANDATORY_EMA_SPREAD  = False
 MACRO_MANDATORY_STOCHASTIC  = False
-MACRO_MINIMUM_SCORE         = 4      # Out of 6
+MACRO_MINIMUM_SCORE         = 3      # Out of 6
 
 # ==============================================================================
 # 🎛️ TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER)
@@ -91,13 +91,13 @@ MICRO_MINIMUM_SCORE         = 2      # Out of 6
 # ==============================================================================
 # 🎛️ TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
 # ==============================================================================
-MICRO_EXIT_PRICE_BRICKS = 4  
-MICRO_EXIT_VOL_BRICKS   = 4  
-MACRO_EXIT_PRICE_BRICKS = 2  
+MICRO_EXIT_PRICE_BRICKS = 2  
+MICRO_EXIT_VOL_BRICKS   = 2  
+MACRO_EXIT_PRICE_BRICKS = 1  
 MACRO_EXIT_VOL_BRICKS   = 1  
 
 # 🛑 Strict Session Cutoff (Blocks 15:25 ghost trades from triggering)
-ENTRY_CUTOFF_TIME = "15:10"
+ENTRY_CUTOFF_TIME = "15:00"
 
 
 # ==============================================================================
