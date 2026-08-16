@@ -46,8 +46,8 @@ API_ERROR_LOGGED = False
 # ==============================================================================
 # ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
-MICRO_TIMEFRAME = "1min"  # Micro Execution & Tactical Trigger
-MACRO_TIMEFRAMES = ["5min","15min", "30min", "240min", "60min", "1D"]  # Multiple Macro Structural Tiers
+MICRO_TIMEFRAME = "5min"  # Micro Execution & Tactical Trigger
+MACRO_TIMEFRAMES = ["10min","15min", "30min", "240min", "60min", "1D"]  # Multiple Macro Structural Tiers
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -58,7 +58,7 @@ ADX_THRESHOLD = 20
 STOCH_PERIOD = 14
 
 MICRO_RENKO_CONFIRM_BRICKS = 2  # Micro Tactical Trigger (2-Brick Rule)
-MACRO_RENKO_CONFIRM_BRICKS = 1  # Macro Structural Trend Confirmation
+MACRO_RENKO_CONFIRM_BRICKS = 0  # Macro Structural Trend Confirmation
 RENKO_MIN_BRICK = 0.05
 RENKO_DEFAULT_PCT = 0.005
 
