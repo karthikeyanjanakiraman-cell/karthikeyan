@@ -1,16 +1,17 @@
 """
 system3.py - Asit Baran Pati Multi-Timeframe Trading System Implementation
-Fully Integrated Pipeline:
+Fully Integrated & Optimized Pipeline:
 - Global Configurable Timeframes (Pilot, Execution 60min, Macro 2D)
 - Configurable Global 2D Strategy Bias ("BULLISH", "BEARISH", or "BOTH")
 - ATR-14 Dynamic Brick Reset Matrix
 - 45-Degree Geometric Angle Renko Construction (1-Min Micro Execution)
 - 8/21 EMA Fast-Line Compression/Expansion Gate (60-Min Macro Execution)
-- ATR-Stochastic Hybrid Crossover Gate (60-Min Macro Execution)
+- ATR-Stochastic Momentum Continuation State Gate (Fixed single-bar crossover trap)
 - Multi-Timeframe BB-RSI & ADXBO Filters (60-Min Macro Execution)
 """
 
 import argparse
+import concurrent.futures
 import datetime
 from datetime import datetime, timedelta
 import gzip
@@ -18,8 +19,8 @@ import io
 import json
 import os
 import sys
+import time
 import urllib.parse
-import concurrent.futures
 
 import numpy as np
 import pandas as pd
@@ -47,7 +48,7 @@ API_ERROR_LOGGED = False
 # ==============================================================================
 # 1. Multi-Timeframe Architecture Tiers
 PILOT_TIMEFRAME = "1min"
-EXECUTION_TIMEFRAME = "5min"  # Primary 60-Min Operational Window for Core Gates
+EXECUTION_TIMEFRAME = "15min"  # Primary 60-Min Operational Window for Core Gates
 MACRO_TIMEFRAME = "2D"         # Strategic Macro Window
 
 # 2. Indicator Parameters
@@ -60,7 +61,7 @@ ADX_THRESHOLD = 20
 STOCH_PERIOD = 14
 
 # 3. Micro Execution & Renko Trigger Parameters
-RENKO_CONFIRM_BRICKS = 2  # The Asit Baran Pati Confluence Rule
+RENKO_CONFIRM_BRICKS = 2  # The Asit Baran Pati 2-Brick Execution Rule
 RENKO_MIN_BRICK = 0.05
 RENKO_DEFAULT_PCT = 0.005
 
@@ -119,7 +120,7 @@ def get_past_trading_days(target_date_str, num_days=20):
       current_dt -= timedelta(days=1)
     trading_days.reverse()
     return trading_days
-  except:
+  except Exception:
     return []
 
 
@@ -145,38 +146,43 @@ def calculate_atr_14_brick_size(df_daily):
 
 
 def check_ema_compression_expansion(df_exec):
-  """8/21 EMA Fast-Line Compression Zone & Expansion Gate."""
+  """8/21 EMA Fast-Line Alignment & Expansion Gate."""
   df = df_exec.copy()
   df["EMA_8"] = df["Close"].ewm(span=8, adjust=False).mean()
   df["EMA_21"] = df["Close"].ewm(span=21, adjust=False).mean()
   df["EMA_Spread"] = abs(df["EMA_8"] - df["EMA_21"])
-  spread_threshold = df["EMA_Spread"].rolling(window=20).mean() * 0.25
+  spread_threshold = (
+      df["EMA_Spread"].rolling(window=20, min_periods=1).mean() * 0.20
+  )
 
-  df["EMA_Expanded"] = (df["EMA_Spread"] > spread_threshold) & (
-      df["EMA_8"].diff().abs() > df["EMA_21"].diff().abs()
+  df["EMA_Bull_Expanded"] = (df["EMA_8"] > df["EMA_21"]) & (
+      df["EMA_Spread"] >= spread_threshold
+  )
+  df["EMA_Bear_Expanded"] = (df["EMA_8"] < df["EMA_21"]) & (
+      df["EMA_Spread"] >= spread_threshold
   )
   return df
 
 
 def check_atr_stochastic_hybrid(df_exec):
-  """ATR-Stochastic Hybrid Crossover Gate."""
+  """ATR-Stochastic Momentum & Volatility Gate (State-Based Continuation)."""
   df = df_exec.copy()
   high = df["High"]
   low = df["Low"]
   close = df["Close"]
 
-  lowest_low = low.rolling(window=STOCH_PERIOD).min()
-  highest_high = high.rolling(window=STOCH_PERIOD).max()
+  lowest_low = low.rolling(window=STOCH_PERIOD, min_periods=1).min()
+  highest_high = high.rolling(window=STOCH_PERIOD, min_periods=1).max()
   df["Stoch_K"] = (
       (close - lowest_low) / (highest_high - lowest_low + 1e-9)
   ) * 100
 
-  atr_median = df["ATR"].rolling(window=50).median()
-  df["Volatility_Gate_Passed"] = df["ATR"] >= atr_median
-  df["Stoch_Crossover"] = (df["Stoch_K"] > 50) & (
-      df["Stoch_K"].shift(1) <= 50
-  )
-  df["ATR_Stoch_Pass"] = df["Stoch_Crossover"] & df["Volatility_Gate_Passed"]
+  atr_median = df["ATR"].rolling(window=50, min_periods=1).median()
+  df["Volatility_Gate_Passed"] = df["ATR"] >= (atr_median * 0.75)
+
+  # State-based momentum continuation (captures big movers throughout the rally)
+  df["Stoch_Bull_Pass"] = (df["Stoch_K"] >= 50) & df["Volatility_Gate_Passed"]
+  df["Stoch_Bear_Pass"] = (df["Stoch_K"] <= 50) & df["Volatility_Gate_Passed"]
   return df
 
 
@@ -298,10 +304,10 @@ def prepare_technical_data(rolling_master_df):
   tech_exec["RSI"] = 100 - (100 / (1 + (avg_gain / (avg_loss + 1e-8))))
 
   tech_exec["RSI_SMA"] = tech_exec.groupby("Symbol")["RSI"].transform(
-      lambda x: x.rolling(BB_SMA_PERIOD).mean()
+      lambda x: x.rolling(BB_SMA_PERIOD, min_periods=1).mean()
   )
   tech_exec["RSI_STD"] = tech_exec.groupby("Symbol")["RSI"].transform(
-      lambda x: x.rolling(BB_SMA_PERIOD).std()
+      lambda x: x.rolling(BB_SMA_PERIOD, min_periods=1).std()
   )
   tech_exec["BB_Upper"] = tech_exec["RSI_SMA"] + (
       BB_STD_DEV * tech_exec["RSI_STD"]
@@ -346,29 +352,26 @@ def prepare_technical_data(rolling_master_df):
   tech_exec["ADX"] = tech_exec.groupby("Symbol")["DX"].transform(
       lambda x: x.ewm(alpha=1 / ADX_PERIOD, adjust=False).mean()
   )
-  tech_exec["ADX_prev"] = tech_exec.groupby("Symbol")["ADX"].shift(1)
 
-  # Integrate EMA Expansion & ATR-Stochastic Hybrid Gates
+  # Integrate EMA Expansion & ATR-Stochastic Gates
   tech_exec = check_ema_compression_expansion(tech_exec)
   tech_exec = check_atr_stochastic_hybrid(tech_exec)
 
-  # Master Permission Gauntlet
+  # Robust Master Permission Gauntlet (Maintains permission throughout high-momentum rallies)
   tech_exec["Armed_Bull"] = (
-      (tech_exec["RSI"] > tech_exec["BB_Upper"])
-      & (tech_exec["ADX"] > ADX_THRESHOLD)
-      & (tech_exec["ADX"] > tech_exec["ADX_prev"])
+      (tech_exec["RSI"] >= tech_exec["RSI_SMA"])
+      & (tech_exec["ADX"] >= ADX_THRESHOLD)
       & (tech_exec["+DI"] > tech_exec["-DI"])
-      & tech_exec["EMA_Expanded"]
-      & tech_exec["ATR_Stoch_Pass"]
+      & tech_exec["EMA_Bull_Expanded"]
+      & tech_exec["Stoch_Bull_Pass"]
   )
 
   tech_exec["Armed_Bear"] = (
-      (tech_exec["RSI"] < tech_exec["BB_Lower"])
-      & (tech_exec["ADX"] > ADX_THRESHOLD)
-      & (tech_exec["ADX"] > tech_exec["ADX_prev"])
+      (tech_exec["RSI"] <= tech_exec["RSI_SMA"])
+      & (tech_exec["ADX"] >= ADX_THRESHOLD)
       & (tech_exec["-DI"] > tech_exec["+DI"])
-      & tech_exec["EMA_Expanded"]
-      & tech_exec["ATR_Stoch_Pass"]
+      & tech_exec["EMA_Bear_Expanded"]
+      & tech_exec["Stoch_Bear_Pass"]
   )
 
   exec_mins = (
@@ -383,7 +386,9 @@ def prepare_technical_data(rolling_master_df):
   env_df = tech_exec[
       ["Symbol", "Eval_Time", "ATR", "Armed_Bull", "Armed_Bear", "ADX"]
   ].copy()
-  env_df = env_df.sort_values("Eval_Time").rename(columns={"Eval_Time": "Datetime"})
+  env_df = env_df.sort_values("Eval_Time").rename(
+      columns={"Eval_Time": "Datetime"}
+  )
 
   df_1m = rolling_master_df.sort_values("Datetime").copy()
   df_1m_merged = pd.merge_asof(
@@ -428,7 +433,8 @@ def scan_institutional_tape(target_date_str):
       " once)..."
   )
   fetch_tasks = [
-      (item, trading_days[0], target_date_str, is_live_today) for item in universe
+      (item, trading_days[0], target_date_str, is_live_today)
+      for item in universe
   ]
   historical_dfs = []
 
@@ -540,7 +546,8 @@ def scan_institutional_tape(target_date_str):
     for future in concurrent.futures.as_completed(futures):
       completed += 1
       sys.stdout.write(
-          f"\r📡 Fetching Data... {completed}/{len(fetch_tasks)} symbols processed"
+          f"\r📡 Fetching Data... {completed}/{len(fetch_tasks)} symbols"
+          " processed"
       )
       sys.stdout.flush()
       res = future.result()
@@ -780,7 +787,10 @@ def scan_institutional_tape(target_date_str):
           if row["Direction"] == 1
           else (COLOR_RED, "BEARISH")
       )
-      print(f"  {color}🚨 {sym:<12} Day Move: {pct_move:+.2f}% ({d_str}){COLOR_RESET}")
+      print(
+          f"  {color}🚨 {sym:<12} Day Move: {pct_move:+.2f}%"
+          f" ({d_str}){COLOR_RESET}"
+      )
       print(
           f"      └─ 🎯 Macro Permission Passed : {EXECUTION_TIMEFRAME} [BB-RSI +"
           f" ADX + EMA Exp + Stoch] | ADX:{row.get('ADX', 0):.1f}"
@@ -814,7 +824,10 @@ def scan_institutional_tape(target_date_str):
           if row["Direction"] == 1
           else (COLOR_RED, "BEARISH")
       )
-      print(f"  {color}🔄 {sym:<12} Day Move: {pct_move:+.2f}% ({d_str}){COLOR_RESET}")
+      print(
+          f"  {color}🔄 {sym:<12} Day Move: {pct_move:+.2f}%"
+          f" ({d_str}){COLOR_RESET}"
+      )
       print(
           f"      └─ 🎯 Macro Permission Passed : {EXECUTION_TIMEFRAME} [BB-RSI +"
           f" ADX + EMA Exp + Stoch] | ADX:{row.get('ADX', 0):.1f}"
@@ -870,7 +883,10 @@ def scan_institutional_tape(target_date_str):
           (ltp - morning_opens.get(sym, ltp)) / morning_opens.get(sym, ltp)
       ) * 100
       d_str = "BULLISH" if row["Direction"] == 1 else "BEARISH"
-      print(f"  {COLOR_MAGENTA}🔥 {sym:<12} Day Move: {pct_move:+.2f}% ({d_str}){COLOR_RESET}")
+      print(
+          f"  {COLOR_MAGENTA}🔥 {sym:<12} Day Move: {pct_move:+.2f}%"
+          f" ({d_str}){COLOR_RESET}"
+      )
       print(
           f"      └─ 🎯 Macro Permission Passed : {EXECUTION_TIMEFRAME} [BB-RSI +"
           f" ADX + EMA Exp + Stoch] | ADX:{row.get('ADX', 0):.1f}"
@@ -889,9 +905,7 @@ def scan_institutional_tape(target_date_str):
           f" {target_date_str} @ {row['Eval_Time_Str']} | LTP: ₹{ltp:.2f}\n"
       )
 
-  if not any(
-      [all_fresh_intrusions, all_reloads, all_reclaims, breached]
-  ):
+  if not any([all_fresh_intrusions, all_reloads, all_reclaims, breached]):
     print(
         f"{COLOR_DIM}[Terminal Silent] No active institutional structure"
         f" passing strict filters.{COLOR_RESET}\n"
@@ -935,4 +949,3 @@ if __name__ == "__main__":
 
   warnings.filterwarnings("ignore")
   run_production_sweep()
-
