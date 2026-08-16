@@ -47,7 +47,7 @@ API_ERROR_LOGGED = False
 # ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
 MICRO_TIMEFRAME = "1min"  # Micro Execution & Tactical Trigger
-MACRO_TIMEFRAMES = ["5min"]  # Strategic Structural & Pilot Tiers
+MACRO_TIMEFRAMES = ["15min"]  # Strategic Structural & Pilot Tiers
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -93,8 +93,8 @@ MICRO_MINIMUM_SCORE         = 3      # Out of 6
 # ==============================================================================
 MICRO_EXIT_PRICE_BRICKS = 5  
 MICRO_EXIT_VOL_BRICKS   = 5  
-MACRO_EXIT_PRICE_BRICKS = 2  
-MACRO_EXIT_VOL_BRICKS   = 2  
+MACRO_EXIT_PRICE_BRICKS = 1
+MACRO_EXIT_VOL_BRICKS   = 1  
 
 # 🛑 Strict Session Cutoff (Blocks 15:25 ghost trades from triggering)
 ENTRY_CUTOFF_TIME = "15:00"
