@@ -10,6 +10,7 @@ Incorporates:
 - Multi-Timeframe RSI, Bollinger Bands, and ADXBO Filters
 """
 
+import argparse
 import datetime
 from datetime import datetime, timedelta
 import gzip
