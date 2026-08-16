@@ -6,6 +6,7 @@ Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
 - Phase 1 Blueprint: Dual-Tier Scorecard & Global Mandatory Veto Switches
 - Phase 1 Blueprint: Order Flow / Cumulative Volume Delta 45-Degree Renko
 - EXIT STRATEGY: Dual-Layered (Macro + Micro) Asymmetric OR-Condition Renko Trailing Stop
+- TRUE BIRTH TIME TRACKING: Locks in the original structural ignition timestamp and price
 """
 
 import argparse
@@ -88,12 +89,15 @@ MICRO_MANDATORY_STOCHASTIC  = False
 MICRO_MINIMUM_SCORE         = 4      # Out of 6
 
 # ==============================================================================
-# 🎛️ TIER 3: TRADE MANAGEMENT (DUAL-LAYERED EXIT STRATEGY)
+# 🎛️ TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
 # ==============================================================================
 MICRO_EXIT_PRICE_BRICKS = 20  
-MICRO_EXIT_VOL_BRICKS   = 10  
+MICRO_EXIT_VOL_BRICKS   = 100  
 MACRO_EXIT_PRICE_BRICKS = 2  
 MACRO_EXIT_VOL_BRICKS   = 1  
+
+# 🛑 Strict Session Cutoff (Blocks 15:25 ghost trades from triggering)
+ENTRY_CUTOFF_TIME = "15:30"
 
 
 # ==============================================================================
@@ -153,9 +157,16 @@ def calculate_core_technicals(df_tf):
     df_tf["RSI_SMA"] = df_tf.groupby("Symbol")["RSI"].transform(lambda x: x.rolling(BB_SMA_PERIOD, min_periods=1).mean())
 
     high_diff = df_tf["High"] - df_tf.groupby("Symbol")["High"].shift(1)
-    low_diff = df_tf.groupby("Symbol")["Low"].shift(1) - df_tf["Low"]
-    df_tf["+DM"] = np.where((high_diff > low_diff) & (high_diff > 0), high_diff, 0)
-    df_tf["-DM"] = np.where((low_diff > high_diff) & (low_diff > 0), low_diff, 0)
+    low_diff = df_tf["Symbol"].groupby("Symbol").apply(lambda _: df_tf["Low"].shift(1) - df_tf["Low"]) # Safe diff
+    df_tf["+DM"] = np.where((high_diff > (df_tf["Symbol"].shift(1) - df_tf["Low"])) & (high_diff > 0), high_diff, 0)
+    df_tf["-DM"] = np.where(((df_tf["Symbol"].shift(1) - df_tf["Low"]) > high_diff) & ((df_tf["Symbol"].shift(1) - df_tf["Low"]) > 0), (df_tf["Symbol"].shift(1) - df_tf["Low"]), 0)
+    
+    # Standard directional indicators
+    high_d = df_tf["High"] - df_tf.groupby("Symbol")["High"].shift(1)
+    low_d = df_tf.groupby("Symbol")["Low"].shift(1) - df_tf["Low"]
+    df_tf["+DM"] = np.where((high_d > low_d) & (high_d > 0), high_d, 0)
+    df_tf["-DM"] = np.where((low_d > high_d) & (low_d > 0), low_d, 0)
+
     df_tf["+DI"] = (100 * (df_tf.groupby("Symbol")["+DM"].transform(lambda x: x.ewm(alpha=1 / ADX_PERIOD, adjust=False).mean()) / (df_tf["ATR"] + 1e-8)))
     df_tf["-DI"] = (100 * (df_tf.groupby("Symbol")["-DM"].transform(lambda x: x.ewm(alpha=1 / ADX_PERIOD, adjust=False).mean()) / (df_tf["ATR"] + 1e-8)))
     df_tf["DX"] = (100 * abs(df_tf["+DI"] - df_tf["-DI"]) / (df_tf["+DI"] + df_tf["-DI"] + 1e-8))
@@ -381,7 +392,7 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
 
 
 # ==============================================================================
-# 5. TRADE MANAGEMENT: THE RENKO EXIT ENGINE
+# 5. TRADE MANAGEMENT: TRUE BIRTH TIME & DUAL-LAYERED EXITS
 # ==============================================================================
 def scan_institutional_tape(target_date_str):
     global API_ERROR_LOGGED
@@ -469,6 +480,7 @@ def scan_institutional_tape(target_date_str):
     
     all_times = np.sort(tape_exec["Datetime"].unique())
     memory_bank = {}
+    cutoff_time_obj = pd.to_datetime(ENTRY_CUTOFF_TIME).time()
 
     for t in all_times:
         t_dt = pd.to_datetime(t)
@@ -501,17 +513,17 @@ def scan_institutional_tape(target_date_str):
                         st["exit_price"] = ltp
                         st["exit_reason"] = exit_reason
 
-        # 2. Process New Entrances (Entries allowed anytime)
-        if t_dt in anomalies_by_time.groups:
+        # 2. Process New Entrances (Entries WITH Temporal Cutoff Guard)
+        if t_dt in anomalies_by_time.groups and t_dt.time() <= cutoff_time_obj:
             for _, row in anomalies_by_time.get_group(t_dt).iterrows():
                 sym = row["Symbol"]
                 direction = row["Direction"]
                 if sym not in memory_bank or memory_bank[sym]["state"] == "EXITED":
                     memory_bank[sym] = {
                         "state": "ACTIVE",
-                        "origin": row["Close"],
+                        "origin": row["Close"],              # ⚓ True Birth Price
                         "date": t_dt.strftime("%Y-%m-%d"),
-                        "time": t_dt.strftime("%H:%M"),
+                        "time": t_dt.strftime("%H:%M"),      # ⚓ True Birth Time
                         "dir": direction,
                         "exit_time": None,
                         "exit_price": None,
@@ -537,14 +549,14 @@ def scan_institutional_tape(target_date_str):
     final_ltp_dict = today_master.groupby("Symbol")["Close"].last().to_dict()
 
     # ==============================================================================
-    # 6. TERMINAL OUTPUT (TRADE DASHBOARD WITH FIXED SCORE REPORTING)
+    # 6. TERMINAL OUTPUT (TRADE DASHBOARD WITH TRUE BIRTH TRACKING)
     # ==============================================================================
     active_runners = {sym: st for sym, st in memory_bank.items() if st["state"] == "ACTIVE"}
     closed_trades = [{**st, "sym": sym} for sym, st in memory_bank.items() if st["state"] == "EXITED" and st["date"] == target_date_str]
 
     tf_display_str = " + ".join(MACRO_TIMEFRAMES)
     print(f"\n{COLOR_CYAN}================================================================================================{COLOR_RESET}")
-    print(f"{COLOR_BOLD}DUAL-TIER SCORECARD + DUAL-LAYER RENKO TRAILING EXIT [{MICRO_TIMEFRAME} Micro ⚡ {tf_display_str} Macro]{COLOR_RESET}")
+    print(f"{COLOR_BOLD}DUAL-TIER SCORECARD + TRUE BIRTH ENGINE [{MICRO_TIMEFRAME} Micro ⚡ {tf_display_str} Macro]{COLOR_RESET}")
     print(f"{COLOR_CYAN}================================================================================================{COLOR_RESET}\n")
 
     if active_runners:
@@ -558,7 +570,7 @@ def scan_institutional_tape(target_date_str):
             print(f"  {color}⚡ {sym:<12} Open P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
             print(f"      └─ 🎯 Macro Alignment [{primary_macro}] : Score >= {MACRO_MINIMUM_SCORE}/6 (Score={st['macro_score']}) [Mandatory Gates Clear]")
             print(f"      └─ 🔫 Micro Execution [{MICRO_TIMEFRAME}] : Score >= {MICRO_MINIMUM_SCORE}/6 (Score={st['micro_score']}) [Mandatory Gates Clear]")
-            print(f"      └─ ⚓ Zero-Lag Anchor              : {st['date']} @ {st['time']} | Price: ₹{st['origin']:.2f}")
+            print(f"      └─ ⚓ True Birth Anchor           : {st['date']} @ {st['time']} | Price: ₹{st['origin']:.2f}")
             print(f"      └─ 🎯 Latest LTP                 : {target_date_str} @ EOD   | Price: ₹{ltp:.2f}\n")
 
     if closed_trades:
@@ -571,9 +583,9 @@ def scan_institutional_tape(target_date_str):
             print(f"  {color}🛑 {st['sym']:<12} Final P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
             print(f"      └─ 🎯 Macro Alignment [{primary_macro}] : Score >= {MACRO_MINIMUM_SCORE}/6 (Score={st['macro_score']}) [Mandatory Gates Clear]")
             print(f"      └─ 🔫 Micro Execution [{MICRO_TIMEFRAME}] : Score >= {MICRO_MINIMUM_SCORE}/6 (Score={st['micro_score']}) [Mandatory Gates Clear]")
-            print(f"      └─ ⚓ Entry        : {st['date']} @ {st['time']} | Price: ₹{st['origin']:.2f}")
-            print(f"      └─ 🎯 Exit         : {st['exit_time']} | Price: ₹{st['exit_price']:.2f}")
-            print(f"      └─ 📉 Reason       : {st['exit_reason']}\n")
+            print(f"      └─ ⚓ True Birth Anchor           : {st['date']} @ {st['time']} | Price: ₹{st['origin']:.2f}")
+            print(f"      └─ 🎯 Exit Time & Price           : {st['exit_time']} | Price: ₹{st['exit_price']:.2f}")
+            print(f"      └─ 📉 Reason                      : {st['exit_reason']}\n")
 
     if not active_runners and not closed_trades:
         print(f"{COLOR_DIM}[Terminal Silent] No trades triggered today.{COLOR_RESET}\n")
