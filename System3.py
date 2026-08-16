@@ -10,6 +10,7 @@ from datetime import datetime, timedelta
 import concurrent.futures
 
 import requests
+from requests.adapters import HTTPAdapter
 import pandas as pd
 import numpy as np
 
@@ -28,13 +29,18 @@ COLOR_BOLD = '\033[1m'
 BACKTRACE_DAYS = 20      # 1 F&O Monthly Derivative Cycle
 MAX_BREACH_DAYS = 0      # Kill Switch: Days a stock can stay breached before memory purge
 
+# Set up global session for connection pooling (Speed Fix)
+GLOBAL_SESSION = requests.Session()
+adapter = HTTPAdapter(pool_connections=50, pool_maxsize=50)
+GLOBAL_SESSION.mount('https://', adapter)
+
 # ==============================================================================
 # 1. LIVE INGESTION (F&O Universe & Parallel Fetching)
 # ==============================================================================
 def get_dynamic_fno_universe():
     nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
     try:
-        response = requests.get(nse_url, timeout=5)
+        response = GLOBAL_SESSION.get(nse_url, timeout=10)
         if response.status_code != 200:
             return []
         nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
@@ -57,12 +63,11 @@ def fetch_upstox_candles_for_date(instrument_key, date_str, retries=5):
     else:
         url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{date_str}/{date_str}"
 
-    # Rate-Limit Backoff Loop (Solves the 45-minute crawl without crashing)
     for attempt in range(retries):
         try:
-            response = requests.get(url, headers=headers, timeout=10)
+            response = GLOBAL_SESSION.get(url, headers=headers, timeout=10)
             if response.status_code == 429:
-                time.sleep(1.5)  # Pause and breathe if Upstox complains about speed
+                time.sleep(1.5)
                 continue
             if response.status_code != 200:
                 return None
@@ -99,9 +104,9 @@ def get_past_trading_days(target_date_str, num_days=20):
 def prepare_technical_data(rolling_master_df):
     df = rolling_master_df.copy()
     
-    # Group to 15m Blocks
+    # FIXED: Removed 'Turnover' and 'abs_move' that caused the KeyError
     hist_15m = df.groupby(['Symbol', pd.Grouper(key='Datetime', freq='15min', closed='left', label='left')]).agg({
-        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum', 'Turnover': 'sum', 'abs_move': 'sum'
+        'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
     }).reset_index()
     
     hist_15m = hist_15m.dropna(subset=['Close']).sort_values(['Symbol', 'Datetime'])
@@ -186,12 +191,12 @@ def evaluate_technical_confluence(master_df, current_eval_time, hist_15m_tech=No
         g_rec['Rec_Pct_Move'] = ((g_rec['Close'] - g_rec['Open']) / (g_rec['Open'] + 1e-8)) * 100
 
         if hist_15m_tech is not None and not hist_15m_tech.empty:
-            tech_slice = hist_15m_tech[hist_15m_tech['Datetime'] < current_eval_time].groupby('Symbol').last().reset_index()
+            # OPTIMIZATION: drop_duplicates is orders of magnitude faster than groupby().last()
+            tech_slice = hist_15m_tech[hist_15m_tech['Datetime'] < current_eval_time].drop_duplicates(subset=['Symbol'], keep='last')
             
             if not tech_slice.empty:
                 merged = pd.merge(g_rec, tech_slice[['Symbol', 'RSI', 'BB_Upper', 'BB_Lower', 'ADX', 'ADX_prev', '+DI', '-DI', 'Renko_Trend']], on='Symbol', how='inner')
                 
-                # FULL STRICT FILTERS ACTIVE: BB-RSI Breakout + ADX > 20 + Rising ADX + DI + Renko
                 bull_cond = (merged['RSI'] > merged['BB_Upper']) & \
                             (merged['ADX'] > 20) & \
                             (merged['ADX'] > merged['ADX_prev']) & \
@@ -245,8 +250,8 @@ def scan_institutional_tape(target_date_str):
             return df
         return None
 
-    # THE SPEED FIX: ThreadPoolExecutor with 8 workers drastically cuts the 45-min fetch time to ~3 mins
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+    # SPEED FIX: Pool Size up to 20 over a persistent Session
+    with concurrent.futures.ThreadPoolExecutor(max_workers=20) as executor:
         results = list(executor.map(fetch_worker, fetch_tasks))
         for res in results:
             if res is not None:
@@ -304,11 +309,13 @@ def scan_institutional_tape(target_date_str):
 
         try:
             time_steps = pd.date_range(start=day_start + pd.Timedelta(minutes=15), end=day_end, freq='15min')
+            # SPEED FIX: O(1) Dictionary Lookup instead of filtering a dataframe 500 times
+            day_candle_dict = day_master.set_index(['Datetime', 'Symbol'])['Close'].to_dict()
+            
             for t in time_steps:
-                t_candles = day_master[day_master['Datetime'] == t].set_index('Symbol')['Close'].to_dict()
                 for sym, st in memory_bank.items():
-                    if sym in t_candles:
-                        ltp = t_candles[sym]
+                    ltp = day_candle_dict.get((t, sym))
+                    if ltp is not None:
                         if st['state'] == 'ACTIVE':
                             if (st['dir'] == 1 and ltp < st['origin']) or (st['dir'] == -1 and ltp > st['origin']):
                                 st['state'] = 'BREACHED'
