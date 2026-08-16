@@ -32,8 +32,8 @@ MAX_BREACH_DAYS = 0
 # ★ GLOBAL CONFIGURATION: TIMEFRAMES & INDICATORS ★
 # ==============================================================================
 # 1. Timeframe Settings
-TIMEFRAME = '60min'              # Pandas frequency string (e.g., '5min', '15min', '1H')
-TIMEFRAME_MINS = 60              # Integer minutes for timedelta offsets
+TIMEFRAME = '240min'              # Pandas frequency string (e.g., '5min', '15min', '1H')
+TIMEFRAME_MINS = 240              # Integer minutes for timedelta offsets
 
 # 2. ATR (Average True Range)
 ATR_PERIOD = 14
