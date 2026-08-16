@@ -1,13 +1,14 @@
-"""
-system3.py - Asit Baran Pati Multi-Timeframe Trading System Implementation
-Fully Integrated & Optimized Pipeline:
-- Global Configurable Timeframes (Pilot, Execution 60min, Macro 2D)
-- Configurable Global 2D Strategy Bias ("BULLISH", "BEARISH", or "BOTH")
-- ATR-14 Dynamic Brick Reset Matrix
-- 45-Degree Geometric Angle Renko Construction (1-Min Micro Execution)
-- 8/21 EMA Fast-Line Compression/Expansion Gate (60-Min Macro Execution)
-- ATR-Stochastic Momentum Continuation State Gate (Fixed single-bar crossover trap)
-- Multi-Timeframe BB-RSI & ADXBO Filters (60-Min Macro Execution)
+"""system3.py - Asit Baran Pati Multi-Timeframe Trading System Implementation
+
+Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
+- Configurable Micro Execution Timeframe (e.g., "1min", "3min", "5min")
+- Configurable Macro Hierarchy Array (e.g., ["15min", "60min", "1D"])
+- 45-Degree Geometric Renko across BOTH Macro Structure & Micro Execution
+- Solves 09:15-10:15 AM Opening Gap via Pilot Timeframe & Prior-Day Macro Carryover
+- Persistent Momentum State Gates (Fixes single-bar Stochastic/EMA bottleneck)
+- Complete Indicator Gauntlet (BB-RSI, ADXBO, 8/21 EMA Expansion, ATR-Stochastic)
+- Zero-Lookahead Vectorized Alignment via pd.merge_asof
+- State-Based 4-Phase Memory Bank (Intrusions, Reloads, Breaches, Reclaims)
 """
 
 import argparse
@@ -21,10 +22,13 @@ import os
 import sys
 import time
 import urllib.parse
+import warnings
 
 import numpy as np
 import pandas as pd
 import requests
+
+warnings.filterwarnings("ignore")
 
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
@@ -44,12 +48,15 @@ MAX_BREACH_DAYS = 0
 API_ERROR_LOGGED = False
 
 # ==============================================================================
-# ★ GLOBAL CONFIGURATION: TIMEFRAMES & INDICATORS ★
+# ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
-# 1. Multi-Timeframe Architecture Tiers
-PILOT_TIMEFRAME = "1min"
-EXECUTION_TIMEFRAME = "15min"  # Primary 60-Min Operational Window for Core Gates
-MACRO_TIMEFRAME = "2D"         # Strategic Macro Window
+# 1. Configurable Timeframe Hierarchy
+MICRO_TIMEFRAME = "1min"  # Micro Execution & Tactical Trigger
+MACRO_TIMEFRAMES = [
+    "15min",
+    "60min",
+]  # Strategic Structural & Pilot Tiers (N-Timeframe Array)
+MACRO_STRATEGIC_WINDOW = "2D"  # Multi-Day Trend Horizon
 
 # 2. Indicator Parameters
 ATR_PERIOD = 14
@@ -60,25 +67,22 @@ ADX_PERIOD = 14
 ADX_THRESHOLD = 20
 STOCH_PERIOD = 14
 
-# 3. Micro Execution & Renko Trigger Parameters
-RENKO_CONFIRM_BRICKS = 2  # The Asit Baran Pati 2-Brick Execution Rule
+# 3. 45-Degree Renko Parameters (Dual-Tier Calibration)
+MICRO_RENKO_CONFIRM_BRICKS = 2  # Micro Tactical Trigger (2-Brick Rule)
+MACRO_RENKO_CONFIRM_BRICKS = 2  # Macro Structural Trend Confirmation
 RENKO_MIN_BRICK = 0.05
 RENKO_DEFAULT_PCT = 0.005
 
-# 4. Risk Management
+# 4. Risk Management & Strategy Bias
 BREACH_PURGE_PCT = 0.015
-
-# ==============================================================================
-# ★ CONFIGURABLE GLOBAL 2D STRATEGY BIAS ★
-# Options: "BULLISH", "BEARISH", or "BOTH"
-# ==============================================================================
-GLOBAL_MACRO_STRATEGY_2D = "BOTH"
+GLOBAL_MACRO_STRATEGY_2D = "BOTH"  # Options: "BULLISH", "BEARISH", or "BOTH"
 
 
 # ==============================================================================
 # 1. LIVE INGESTION (F&O Universe & Parallel Bulk Fetching)
 # ==============================================================================
 def get_dynamic_fno_universe():
+  """Fetches all active underlying F&O equities and indices from NSE."""
   nse_url = (
       "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
   )
@@ -110,6 +114,7 @@ def get_dynamic_fno_universe():
 
 
 def get_past_trading_days(target_date_str, num_days=20):
+  """Computes historical trading calendar skipping weekends."""
   try:
     target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
     trading_days = []
@@ -125,75 +130,26 @@ def get_past_trading_days(target_date_str, num_days=20):
 
 
 # ==============================================================================
-# 2. TECHNICAL GATES & 45-DEGREE RENKO CONSTRUCTION
+# 2. 45-DEGREE RENKO GEOMETRIC CONSTRUCTION ENGINE
 # ==============================================================================
-def calculate_atr_14_brick_size(df_daily):
-  """ATR-14 Dynamic Brick Reset Matrix computed fresh from daily baseline."""
-  high = df_daily["High"]
-  low = df_daily["Low"]
-  close = df_daily["Close"]
+def construct_45deg_renko_matrix(df, tf_name, confirm_bricks=2):
+  """Builds dynamic, time-independent 45-degree Renko diagonal bricks.
 
-  tr1 = high - low
-  tr2 = abs(high - close.shift(1))
-  tr3 = abs(low - close.shift(1))
-  tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-  atr_14 = tr.rolling(window=ATR_PERIOD).mean()
-  return (
-      atr_14.iloc[-1]
-      if not atr_14.empty and not pd.isna(atr_14.iloc[-1])
-      else 0.05
-  )
+  Enforces:
+  - Unit slope (Delta Y / Delta X = 1 => 45 degrees)
+  - 2 x Brick Size trend reversal hysteresis
+  - Directional brick count tracking
+  """
+  renko_trends = np.zeros(len(df))
+  renko_counts = np.zeros(len(df))
 
-
-def check_ema_compression_expansion(df_exec):
-  """8/21 EMA Fast-Line Alignment & Expansion Gate."""
-  df = df_exec.copy()
-  df["EMA_8"] = df["Close"].ewm(span=8, adjust=False).mean()
-  df["EMA_21"] = df["Close"].ewm(span=21, adjust=False).mean()
-  df["EMA_Spread"] = abs(df["EMA_8"] - df["EMA_21"])
-  spread_threshold = (
-      df["EMA_Spread"].rolling(window=20, min_periods=1).mean() * 0.20
-  )
-
-  df["EMA_Bull_Expanded"] = (df["EMA_8"] > df["EMA_21"]) & (
-      df["EMA_Spread"] >= spread_threshold
-  )
-  df["EMA_Bear_Expanded"] = (df["EMA_8"] < df["EMA_21"]) & (
-      df["EMA_Spread"] >= spread_threshold
-  )
-  return df
-
-
-def check_atr_stochastic_hybrid(df_exec):
-  """ATR-Stochastic Momentum & Volatility Gate (State-Based Continuation)."""
-  df = df_exec.copy()
-  high = df["High"]
-  low = df["Low"]
-  close = df["Close"]
-
-  lowest_low = low.rolling(window=STOCH_PERIOD, min_periods=1).min()
-  highest_high = high.rolling(window=STOCH_PERIOD, min_periods=1).max()
-  df["Stoch_K"] = (
-      (close - lowest_low) / (highest_high - lowest_low + 1e-9)
-  ) * 100
-
-  atr_median = df["ATR"].rolling(window=50, min_periods=1).median()
-  df["Volatility_Gate_Passed"] = df["ATR"] >= (atr_median * 0.75)
-
-  # State-based momentum continuation (captures big movers throughout the rally)
-  df["Stoch_Bull_Pass"] = (df["Stoch_K"] >= 50) & df["Volatility_Gate_Passed"]
-  df["Stoch_Bear_Pass"] = (df["Stoch_K"] <= 50) & df["Volatility_Gate_Passed"]
-  return df
-
-
-def apply_1m_renko_and_signals(df_1m):
-  """45-Degree Geometric Angle Renko Construction & Confluence Trigger."""
-  renko_trends = np.zeros(len(df_1m))
-  renko_counts = np.zeros(len(df_1m))
-
-  for sym, indices in df_1m.groupby("Symbol").indices.items():
-    sub_closes = df_1m["Close"].values[indices]
-    sub_atrs = df_1m["ATR"].values[indices]
+  for sym, indices in df.groupby("Symbol").indices.items():
+    sub_closes = df["Close"].values[indices]
+    sub_atrs = (
+        df["ATR"].values[indices]
+        if "ATR" in df.columns
+        else (sub_closes * RENKO_DEFAULT_PCT)
+    )
 
     if len(sub_closes) > 0:
       trends = np.zeros(len(sub_closes))
@@ -206,22 +162,32 @@ def apply_1m_renko_and_signals(df_1m):
         bs = max(sub_atrs[i], RENKO_MIN_BRICK)
         move = sub_closes[i] - curr_price
 
-        if move >= bs:
-          bricks = int(move // bs)
-          if curr_trend == 1:
-            curr_count += bricks
-          else:
+        if curr_trend >= 0:
+          # Continuation Bullish
+          if move >= bs:
+            bricks = int(move // bs)
             curr_trend = 1
-            curr_count = bricks
-          curr_price += bricks * bs
-        elif move <= -bs:
-          bricks = int(abs(move) // bs)
-          if curr_trend == -1:
-            curr_count -= bricks
-          else:
+            curr_count = curr_count + bricks if curr_count > 0 else bricks
+            curr_price += bricks * bs
+          # Reversal Bearish (Requires 2 * BS displacement)
+          elif move <= -(2 * bs):
+            bricks = int(abs(move) // bs)
             curr_trend = -1
             curr_count = -bricks
-          curr_price -= bricks * bs
+            curr_price -= bricks * bs
+        else:
+          # Continuation Bearish
+          if move <= -bs:
+            bricks = int(abs(move) // bs)
+            curr_trend = -1
+            curr_count = curr_count - bricks if curr_count < 0 else -bricks
+            curr_price -= bricks * bs
+          # Reversal Bullish (Requires 2 * BS displacement)
+          elif move >= (2 * bs):
+            bricks = int(move // bs)
+            curr_trend = 1
+            curr_count = bricks
+            curr_price += bricks * bs
 
         trends[i] = curr_trend
         counts[i] = curr_count
@@ -229,40 +195,27 @@ def apply_1m_renko_and_signals(df_1m):
       renko_trends[indices] = trends
       renko_counts[indices] = counts
 
-  df_1m["Renko_Trend"] = renko_trends
-  df_1m["Renko_Brick_Count"] = renko_counts
-
-  # Zero-Lag Execution Trigger matching Macro Permission AND Renko threshold
-  df_1m["Trigger_Bull"] = df_1m["Armed_Bull"] & (
-      df_1m["Renko_Brick_Count"] >= RENKO_CONFIRM_BRICKS
-  )
-  df_1m["Trigger_Bear"] = df_1m["Armed_Bear"] & (
-      df_1m["Renko_Brick_Count"] <= -RENKO_CONFIRM_BRICKS
-  )
-
-  df_1m["Trigger_Bull_Prev"] = (
-      df_1m.groupby("Symbol")["Trigger_Bull"].shift(1).fillna(False)
-  )
-  df_1m["Trigger_Bear_Prev"] = (
-      df_1m.groupby("Symbol")["Trigger_Bear"].shift(1).fillna(False)
-  )
-
-  df_1m["New_Bull"] = df_1m["Trigger_Bull"] & ~df_1m["Trigger_Bull_Prev"]
-  df_1m["New_Bear"] = df_1m["Trigger_Bear"] & ~df_1m["Trigger_Bear_Prev"]
-
-  df_1m["Direction"] = np.where(
-      df_1m["New_Bull"], 1, np.where(df_1m["New_Bear"], -1, 0)
-  )
-  return df_1m
+  df[f"Renko_Trend_{tf_name}"] = renko_trends
+  df[f"Renko_Brick_Count_{tf_name}"] = renko_counts
+  df[f"Renko_Bull_{tf_name}"] = renko_counts >= confirm_bricks
+  df[f"Renko_Bear_{tf_name}"] = renko_counts <= -confirm_bricks
+  return df
 
 
-def prepare_technical_data(rolling_master_df):
-  """Unifies all 60-min execution gates into the master permission structure."""
-  tech_exec = (
-      rolling_master_df.groupby([
+# ==============================================================================
+# 3. UNIVERSAL MODULAR GATE EVALUATOR (Applied to ANY Timeframe)
+# ==============================================================================
+def evaluate_single_timeframe_gates(df_base, tf_str):
+  """Resamples atomic data to tf_str, computes all technical gates + 45-deg Renko,
+
+  and forward-shifts timestamps to eliminate lookahead bias.
+  """
+  # 1. Resample to Target Timeframe
+  df_tf = (
+      df_base.groupby([
           "Symbol",
           pd.Grouper(
-              key="Datetime", freq=EXECUTION_TIMEFRAME, closed="left", label="left"
+              key="Datetime", freq=tf_str, closed="left", label="left"
           ),
       ])
       .agg({
@@ -275,152 +228,288 @@ def prepare_technical_data(rolling_master_df):
       .reset_index()
   )
 
-  tech_exec = tech_exec.dropna(subset=["Close"]).sort_values(["Symbol", "Datetime"])
+  df_tf = df_tf.dropna(subset=["Close"]).sort_values(["Symbol", "Datetime"])
 
-  # ATR & Technicals
-  tech_exec["H-L"] = tech_exec["High"] - tech_exec["Low"]
-  tech_exec["H-PC"] = (
-      tech_exec["High"] - tech_exec.groupby("Symbol")["Close"].shift(1)
+  # 2. True Range & ATR-14 Baseline
+  df_tf["H-L"] = df_tf["High"] - df_tf["Low"]
+  df_tf["H-PC"] = (
+      df_tf["High"] - df_tf.groupby("Symbol")["Close"].shift(1)
   ).abs()
-  tech_exec["L-PC"] = (
-      tech_exec["Low"] - tech_exec.groupby("Symbol")["Close"].shift(1)
+  df_tf["L-PC"] = (
+      df_tf["Low"] - df_tf.groupby("Symbol")["Close"].shift(1)
   ).abs()
-  tech_exec["TR"] = tech_exec[["H-L", "H-PC", "L-PC"]].max(axis=1)
-  atr_series = tech_exec.groupby("Symbol")["TR"].transform(
+  df_tf["TR"] = df_tf[["H-L", "H-PC", "L-PC"]].max(axis=1)
+  atr_series = df_tf.groupby("Symbol")["TR"].transform(
       lambda x: x.ewm(alpha=1 / ATR_PERIOD, adjust=False).mean()
   )
-  tech_exec["ATR"] = atr_series
+  df_tf["ATR"] = atr_series
 
-  # RSI & Bollinger Bands on RSI
-  delta = tech_exec.groupby("Symbol")["Close"].diff()
+  # 3. RSI-14 & Bollinger Bands on RSI (20, 2)
+  delta = df_tf.groupby("Symbol")["Close"].diff()
   gain = delta.where(delta > 0, 0)
   loss = -delta.where(delta < 0, 0)
-  avg_gain = gain.groupby(tech_exec["Symbol"]).transform(
+  avg_gain = gain.groupby(df_tf["Symbol"]).transform(
       lambda x: x.ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
   )
-  avg_loss = loss.groupby(tech_exec["Symbol"]).transform(
+  avg_loss = loss.groupby(df_tf["Symbol"]).transform(
       lambda x: x.ewm(alpha=1 / RSI_PERIOD, adjust=False).mean()
   )
-  tech_exec["RSI"] = 100 - (100 / (1 + (avg_gain / (avg_loss + 1e-8))))
+  df_tf["RSI"] = 100 - (100 / (1 + (avg_gain / (avg_loss + 1e-8))))
 
-  tech_exec["RSI_SMA"] = tech_exec.groupby("Symbol")["RSI"].transform(
+  df_tf["RSI_SMA"] = df_tf.groupby("Symbol")["RSI"].transform(
       lambda x: x.rolling(BB_SMA_PERIOD, min_periods=1).mean()
   )
-  tech_exec["RSI_STD"] = tech_exec.groupby("Symbol")["RSI"].transform(
+  df_tf["RSI_STD"] = df_tf.groupby("Symbol")["RSI"].transform(
       lambda x: x.rolling(BB_SMA_PERIOD, min_periods=1).std()
   )
-  tech_exec["BB_Upper"] = tech_exec["RSI_SMA"] + (
-      BB_STD_DEV * tech_exec["RSI_STD"]
-  )
-  tech_exec["BB_Lower"] = tech_exec["RSI_SMA"] - (
-      BB_STD_DEV * tech_exec["RSI_STD"]
-  )
+  df_tf["BB_Upper"] = df_tf["RSI_SMA"] + (BB_STD_DEV * df_tf["RSI_STD"])
+  df_tf["BB_Lower"] = df_tf["RSI_SMA"] - (BB_STD_DEV * df_tf["RSI_STD"])
 
-  # ADX Breakout (ADXBO)
-  high_diff = tech_exec["High"] - tech_exec.groupby("Symbol")["High"].shift(1)
-  low_diff = tech_exec.groupby("Symbol")["Low"].shift(1) - tech_exec["Low"]
-  tech_exec["+DM"] = np.where(
+  # 4. ADX Directional Breakout (ADXBO)
+  high_diff = df_tf["High"] - df_tf.groupby("Symbol")["High"].shift(1)
+  low_diff = df_tf.groupby("Symbol")["Low"].shift(1) - df_tf["Low"]
+  df_tf["+DM"] = np.where(
       (high_diff > low_diff) & (high_diff > 0), high_diff, 0
   )
-  tech_exec["-DM"] = np.where(
-      (low_diff > high_diff) & (low_diff > 0), low_diff, 0
-  )
+  df_tf["-DM"] = np.where((low_diff > high_diff) & (low_diff > 0), low_diff, 0)
 
-  tech_exec["+DI"] = (
+  df_tf["+DI"] = (
       100
       * (
-          tech_exec.groupby("Symbol")["+DM"].transform(
+          df_tf.groupby("Symbol")["+DM"].transform(
               lambda x: x.ewm(alpha=1 / ADX_PERIOD, adjust=False).mean()
           )
           / (atr_series + 1e-8)
       )
   )
-  tech_exec["-DI"] = (
+  df_tf["-DI"] = (
       100
       * (
-          tech_exec.groupby("Symbol")["-DM"].transform(
+          df_tf.groupby("Symbol")["-DM"].transform(
               lambda x: x.ewm(alpha=1 / ADX_PERIOD, adjust=False).mean()
           )
           / (atr_series + 1e-8)
       )
   )
-  tech_exec["DX"] = (
+  df_tf["DX"] = (
       100
-      * abs(tech_exec["+DI"] - tech_exec["-DI"])
-      / (tech_exec["+DI"] + tech_exec["-DI"] + 1e-8)
+      * abs(df_tf["+DI"] - df_tf["-DI"])
+      / (df_tf["+DI"] + df_tf["-DI"] + 1e-8)
   )
-  tech_exec["ADX"] = tech_exec.groupby("Symbol")["DX"].transform(
+  df_tf["ADX"] = df_tf.groupby("Symbol")["DX"].transform(
       lambda x: x.ewm(alpha=1 / ADX_PERIOD, adjust=False).mean()
   )
 
-  # Integrate EMA Expansion & ATR-Stochastic Gates
-  tech_exec = check_ema_compression_expansion(tech_exec)
-  tech_exec = check_atr_stochastic_hybrid(tech_exec)
-
-  # Robust Master Permission Gauntlet (Maintains permission throughout high-momentum rallies)
-  tech_exec["Armed_Bull"] = (
-      (tech_exec["RSI"] >= tech_exec["RSI_SMA"])
-      & (tech_exec["ADX"] >= ADX_THRESHOLD)
-      & (tech_exec["+DI"] > tech_exec["-DI"])
-      & tech_exec["EMA_Bull_Expanded"]
-      & tech_exec["Stoch_Bull_Pass"]
+  # 5. 8/21 EMA Fast-Line Alignment & Expansion Gate
+  df_tf["EMA_8"] = (
+      df_tf.groupby("Symbol")["Close"]
+      .transform(lambda x: x.ewm(span=8, adjust=False).mean())
+  )
+  df_tf["EMA_21"] = (
+      df_tf.groupby("Symbol")["Close"]
+      .transform(lambda x: x.ewm(span=21, adjust=False).mean())
+  )
+  df_tf["EMA_Spread"] = abs(df_tf["EMA_8"] - df_tf["EMA_21"])
+  spread_thresh = (
+      df_tf.groupby("Symbol")["EMA_Spread"].transform(
+          lambda x: x.rolling(window=20, min_periods=1).mean()
+      )
+      * 0.20
   )
 
-  tech_exec["Armed_Bear"] = (
-      (tech_exec["RSI"] <= tech_exec["RSI_SMA"])
-      & (tech_exec["ADX"] >= ADX_THRESHOLD)
-      & (tech_exec["-DI"] > tech_exec["+DI"])
-      & tech_exec["EMA_Bear_Expanded"]
-      & tech_exec["Stoch_Bear_Pass"]
+  df_tf["EMA_Bull_Expanded"] = (df_tf["EMA_8"] > df_tf["EMA_21"]) & (
+      df_tf["EMA_Spread"] >= spread_thresh
+  )
+  df_tf["EMA_Bear_Expanded"] = (df_tf["EMA_8"] < df_tf["EMA_21"]) & (
+      df_tf["EMA_Spread"] >= spread_thresh
   )
 
-  exec_mins = (
-      int(EXECUTION_TIMEFRAME.replace("min", ""))
-      if "min" in EXECUTION_TIMEFRAME
-      else 60
+  # 6. ATR-Stochastic Volatility & Momentum State Gate
+  lowest_low = df_tf.groupby("Symbol")["Low"].transform(
+      lambda x: x.rolling(window=STOCH_PERIOD, min_periods=1).min()
   )
-  tech_exec["Eval_Time"] = tech_exec["Datetime"] + pd.Timedelta(
-      minutes=exec_mins
+  highest_high = df_tf.groupby("Symbol")["High"].transform(
+      lambda x: x.rolling(window=STOCH_PERIOD, min_periods=1).max()
+  )
+  df_tf["Stoch_K"] = (
+      (df_tf["Close"] - lowest_low) / (highest_high - lowest_low + 1e-9)
+  ) * 100
+
+  atr_median = df_tf.groupby("Symbol")["ATR"].transform(
+      lambda x: x.rolling(window=50, min_periods=1).median()
+  )
+  df_tf["Vol_Pass"] = df_tf["ATR"] >= (atr_median * 0.75)
+
+  df_tf["Stoch_Bull_Pass"] = (df_tf["Stoch_K"] >= 50) & df_tf["Vol_Pass"]
+  df_tf["Stoch_Bear_Pass"] = (df_tf["Stoch_K"] <= 50) & df_tf["Vol_Pass"]
+
+  # 7. 45-Degree Macro Structural Renko Construction
+  df_tf = construct_45deg_renko_matrix(
+      df_tf, tf_name=tf_str, confirm_bricks=MACRO_RENKO_CONFIRM_BRICKS
   )
 
-  env_df = tech_exec[
-      ["Symbol", "Eval_Time", "ATR", "Armed_Bull", "Armed_Bear", "ADX"]
-  ].copy()
+  # 8. Timeframe Master Permission Gauntlet
+  bull_col = f"Armed_Bull_{tf_str}"
+  bear_col = f"Armed_Bear_{tf_str}"
+
+  df_tf[bull_col] = (
+      (df_tf["RSI"] >= df_tf["RSI_SMA"])
+      & (df_tf["ADX"] >= ADX_THRESHOLD)
+      & (df_tf["+DI"] > df_tf["-DI"])
+      & df_tf["EMA_Bull_Expanded"]
+      & df_tf["Stoch_Bull_Pass"]
+      & df_tf[f"Renko_Bull_{tf_str}"]
+  )
+
+  df_tf[bear_col] = (
+      (df_tf["RSI"] <= df_tf["RSI_SMA"])
+      & (df_tf["ADX"] >= ADX_THRESHOLD)
+      & (df_tf["-DI"] > df_tf["+DI"])
+      & df_tf["EMA_Bear_Expanded"]
+      & df_tf["Stoch_Bear_Pass"]
+      & df_tf[f"Renko_Bear_{tf_str}"]
+  )
+
+  # Forward-shift timestamp by timeframe interval to eliminate lookahead bias
+  shift_delta = pd.to_timedelta(tf_str)
+  df_tf["Eval_Time"] = df_tf["Datetime"] + shift_delta
+
+  export_cols = ["Symbol", "Eval_Time", bull_col, bear_col, "ATR", "ADX"]
+  env_df = df_tf[export_cols].copy()
   env_df = env_df.sort_values("Eval_Time").rename(
-      columns={"Eval_Time": "Datetime"}
+      columns={
+          "Eval_Time": "Datetime",
+          "ATR": f"ATR_{tf_str}",
+          "ADX": f"ADX_{tf_str}",
+      }
   )
-
-  df_1m = rolling_master_df.sort_values("Datetime").copy()
-  df_1m_merged = pd.merge_asof(
-      df_1m, env_df, on="Datetime", by="Symbol", direction="backward"
-  )
-  df_1m_merged = df_1m_merged.sort_values(["Symbol", "Datetime"]).reset_index(
-      drop=True
-  )
-
-  df_1m_merged["ATR"] = df_1m_merged["ATR"].fillna(
-      df_1m_merged["Close"] * RENKO_DEFAULT_PCT
-  )
-  df_1m_merged["Armed_Bull"] = df_1m_merged["Armed_Bull"].fillna(False)
-  df_1m_merged["Armed_Bear"] = df_1m_merged["Armed_Bear"].fillna(False)
-
-  final_1m_tape = apply_1m_renko_and_signals(df_1m_merged)
-  return final_1m_tape
+  return env_df
 
 
 # ==============================================================================
-# 3. LIGHTNING STATE-BASED MEMORY ENGINE
+# 4. MICRO EXECUTION TAPE & CONFLUENCE MATCHER
+# ==============================================================================
+def prepare_unified_execution_tape(
+    rolling_master_df, micro_tf, macro_timeframes
+):
+  """Builds atomic micro tape, maps all macro gates with morning handoff logic,
+
+  and constructs the micro 45-degree Renko tactical execution trigger.
+  """
+  # 1. Resample to Configured Micro Timeframe
+  if micro_tf != "1min":
+    df_micro = (
+        rolling_master_df.groupby([
+            "Symbol",
+            pd.Grouper(
+                key="Datetime", freq=micro_tf, closed="left", label="left"
+            ),
+        ])
+        .agg({
+            "Open": "first",
+            "High": "max",
+            "Low": "min",
+            "Close": "last",
+            "Volume": "sum",
+        })
+        .reset_index()
+    )
+    df_micro = df_micro.dropna(subset=["Close"]).sort_values(
+        ["Symbol", "Datetime"]
+    )
+  else:
+    df_micro = rolling_master_df.sort_values(["Symbol", "Datetime"]).copy()
+
+  # Baseline micro ATR
+  df_micro["H-L"] = df_micro["High"] - df_micro["Low"]
+  df_micro["H-PC"] = (
+      df_micro["High"] - df_micro.groupby("Symbol")["Close"].shift(1)
+  ).abs()
+  df_micro["L-PC"] = (
+      df_micro["Low"] - df_micro.groupby("Symbol")["Close"].shift(1)
+  ).abs()
+  df_micro["TR"] = df_micro[["H-L", "H-PC", "L-PC"]].max(axis=1)
+  df_micro["ATR"] = df_micro.groupby("Symbol")["TR"].transform(
+      lambda x: x.ewm(alpha=1 / ATR_PERIOD, adjust=False).mean()
+  )
+  df_micro["ATR"] = df_micro["ATR"].fillna(
+      df_micro["Close"] * RENKO_DEFAULT_PCT
+  )
+
+  bull_gate_cols = []
+  bear_gate_cols = []
+
+  # 2. Resample and Merge Each Configured Macro Timeframe
+  for tf in macro_timeframes:
+    print(f"   ├─ Evaluating Confluence Gates + 45° Renko for [{tf}]...")
+    env_df = evaluate_single_timeframe_gates(rolling_master_df, tf)
+
+    bull_col = f"Armed_Bull_{tf}"
+    bear_col = f"Armed_Bear_{tf}"
+    bull_gate_cols.append(bull_col)
+    bear_gate_cols.append(bear_col)
+
+    # Backward merge guarantees prior-day macro state carryover between 09:15-10:15 AM
+    df_micro = pd.merge_asof(
+        df_micro, env_df, on="Datetime", by="Symbol", direction="backward"
+    )
+    df_micro[bull_col] = df_micro[bull_col].fillna(False)
+    df_micro[bear_col] = df_micro[bear_col].fillna(False)
+
+  # 3. Master Multi-Timeframe Confluence Logical AND
+  df_micro["Master_Armed_Bull"] = df_micro[bull_gate_cols].all(axis=1)
+  df_micro["Master_Armed_Bear"] = df_micro[bear_gate_cols].all(axis=1)
+
+  # 4. Construct Micro 45-Degree Renko Tactical Trigger
+  df_micro = construct_45deg_renko_matrix(
+      df_micro, tf_name=micro_tf, confirm_bricks=MICRO_RENKO_CONFIRM_BRICKS
+  )
+
+  df_micro["Trigger_Bull"] = (
+      df_micro["Master_Armed_Bull"] & df_micro[f"Renko_Bull_{micro_tf}"]
+  )
+  df_micro["Trigger_Bear"] = (
+      df_micro["Master_Armed_Bear"] & df_micro[f"Renko_Bear_{micro_tf}"]
+  )
+
+  df_micro["Trigger_Bull_Prev"] = (
+      df_micro.groupby("Symbol")["Trigger_Bull"].shift(1).fillna(False)
+  )
+  df_micro["Trigger_Bear_Prev"] = (
+      df_micro.groupby("Symbol")["Trigger_Bear"].shift(1).fillna(False)
+  )
+
+  df_micro["New_Bull"] = df_micro["Trigger_Bull"] & ~df_micro[
+      "Trigger_Bull_Prev"
+  ]
+  df_micro["New_Bear"] = df_micro["Trigger_Bear"] & ~df_micro[
+      "Trigger_Bear_Prev"
+  ]
+
+  df_micro["Direction"] = np.where(
+      df_micro["New_Bull"], 1, np.where(df_micro["New_Bear"], -1, 0)
+  )
+  return df_micro
+
+
+# ==============================================================================
+# 5. LIGHTNING STATE-BASED MEMORY ENGINE
 # ==============================================================================
 def scan_institutional_tape(target_date_str):
+  """Executes the complete multi-timeframe backtrace and real-time state analysis."""
   global API_ERROR_LOGGED
 
-  print(f"\n📡 Initiating Zero-Lag Decoupled Engine for {target_date_str}...")
+  print(
+      f"\n📡 Initiating Multi-Timeframe Zero-Lag Engine for {target_date_str}..."
+  )
   universe = get_dynamic_fno_universe()
   if not universe:
     print(f"⚠️ {COLOR_RED}No F&O universe found.{COLOR_RESET}")
     return
 
-  trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
+  trading_days = get_past_trading_days(
+      target_date_str, num_days=BACKTRACE_DAYS
+  )
   if not trading_days:
     return
 
@@ -429,8 +518,8 @@ def scan_institutional_tape(target_date_str):
   is_live_today = target_date_str == current_now.strftime("%Y-%m-%d")
 
   print(
-      f"🚀 Multithreading Bulk Fetch for {len(universe)} symbols (20 days at"
-      " once)..."
+      f"🚀 Multithreading Bulk Ingestion for {len(universe)} symbols (20 days"
+      " lookback)..."
   )
   fetch_tasks = [
       (item, trading_days[0], target_date_str, is_live_today)
@@ -564,40 +653,32 @@ def scan_institutional_tape(target_date_str):
 
   rolling_master_df = pd.concat(historical_dfs, ignore_index=True)
 
-  # Apply Configurable Global 2D Strategy Bias Filter
+  # Global Strategy Bias Log
   global GLOBAL_MACRO_STRATEGY_2D
-  if GLOBAL_MACRO_STRATEGY_2D == "BULLISH":
-    print(
-        f"{COLOR_CYAN}[Macro 2D Bias] Configured to: BULLISH (Shorts"
-        f" Vetoed){COLOR_RESET}"
-    )
-  elif GLOBAL_MACRO_STRATEGY_2D == "BEARISH":
-    print(
-        f"{COLOR_CYAN}[Macro 2D Bias] Configured to: BEARISH (Longs"
-        f" Vetoed){COLOR_RESET}"
-    )
-  else:
-    print(
-        f"{COLOR_CYAN}[Macro 2D Bias] Configured to: BOTH (Bi-directional"
-        f" Active){COLOR_RESET}"
-    )
-
   print(
-      f"⚙️ Computing Execution TF ({EXECUTION_TIMEFRAME}) & Full Technical"
-      " Gates..."
+      f"{COLOR_CYAN}[Macro Bias] Configured to: {GLOBAL_MACRO_STRATEGY_2D} |"
+      f" Micro TF: [{MICRO_TIMEFRAME}] | Macro Hierarchy:"
+      f" {MACRO_TIMEFRAMES}{COLOR_RESET}"
   )
-  tape_1m = prepare_technical_data(rolling_master_df)
+  print(
+      f"⚙️ Computing N-Timeframe Confluence Matrix & Dual-Tier 45° Renko"
+      " Construction..."
+  )
+
+  tape_exec = prepare_unified_execution_tape(
+      rolling_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES
+  )
 
   if GLOBAL_MACRO_STRATEGY_2D == "BULLISH":
-    tape_1m["Armed_Bear"] = False
+    tape_exec["Master_Armed_Bear"] = False
   elif GLOBAL_MACRO_STRATEGY_2D == "BEARISH":
-    tape_1m["Armed_Bull"] = False
+    tape_exec["Master_Armed_Bull"] = False
 
-  all_anomalies = tape_1m[tape_1m["Direction"] != 0].copy()
+  all_anomalies = tape_exec[tape_exec["Direction"] != 0].copy()
   anomalies_by_time = all_anomalies.groupby("Datetime")
 
-  closes_dict = tape_1m.set_index(["Datetime", "Symbol"])["Close"].to_dict()
-  all_times = np.sort(tape_1m["Datetime"].unique())
+  closes_dict = tape_exec.set_index(["Datetime", "Symbol"])["Close"].to_dict()
+  all_times = np.sort(tape_exec["Datetime"].unique())
 
   memory_bank = {}
   historical_times = [
@@ -673,7 +754,7 @@ def scan_institutional_tape(target_date_str):
     )
     return
 
-  today_master = tape_1m[tape_1m["Datetime"].dt.date == target_dt.date()]
+  today_master = tape_exec[tape_exec["Datetime"].dt.date == target_dt.date()]
   morning_opens = (
       today_master[
           today_master["Datetime"].dt.time
@@ -759,14 +840,15 @@ def scan_institutional_tape(target_date_str):
       })
 
   # ==============================================================================
-  # 4. TERMINAL OUTPUT
+  # 6. TERMINAL OUTPUT
   # ==============================================================================
+  tf_display_str = " + ".join(MACRO_TIMEFRAMES)
   print(
       f"\n{COLOR_CYAN}================================================================================================{COLOR_RESET}"
   )
   print(
-      f"{COLOR_BOLD}FULL UNIVERSE TECHNICAL CONFLUENCE TAPE | DATE:"
-      f" {target_date_str}{COLOR_RESET}"
+      f"{COLOR_BOLD}UNIVERSAL CONFLUENCE TAPE [{MICRO_TIMEFRAME} Micro ⚡"
+      f" {tf_display_str} Macro] | DATE: {target_date_str}{COLOR_RESET}"
   )
   print(
       f"{COLOR_CYAN}================================================================================================{COLOR_RESET}\n"
@@ -792,19 +874,19 @@ def scan_institutional_tape(target_date_str):
           f" ({d_str}){COLOR_RESET}"
       )
       print(
-          f"      └─ 🎯 Macro Permission Passed : {EXECUTION_TIMEFRAME} [BB-RSI +"
-          f" ADX + EMA Exp + Stoch] | ADX:{row.get('ADX', 0):.1f}"
+          f"      └─ 🎯 Macro Structural Alignment   : [{tf_display_str}]"
+          f" [BB-RSI + ADX + EMA + Stoch + 45° Renko >= {MACRO_RENKO_CONFIRM_BRICKS}B]"
       )
       print(
-          "      └─ 🔫 1-Min 45° Renko Trigger : >="
-          f" {RENKO_CONFIRM_BRICKS} Bricks"
+          f"      └─ 🔫 {MICRO_TIMEFRAME} Tactical 45° Renko Trigger : >="
+          f" {MICRO_RENKO_CONFIRM_BRICKS} Bricks"
       )
       print(
-          "      └─ ⚓ Zero-Lag Anchor       :"
+          "      └─ ⚓ Zero-Lag Anchor              :"
           f" {target_date_str} @ {row['Eval_Time_Str']} | Price: ₹{ltp:.2f}"
       )
       print(
-          "      └─ 🎯 Latest LTP          :"
+          "      └─ 🎯 Latest LTP                 :"
           f" {target_date_str} @ EOD   | Price:"
           f" ₹{final_ltp_dict.get(sym, ltp):.2f}\n"
       )
@@ -829,25 +911,25 @@ def scan_institutional_tape(target_date_str):
           f" ({d_str}){COLOR_RESET}"
       )
       print(
-          f"      └─ 🎯 Macro Permission Passed : {EXECUTION_TIMEFRAME} [BB-RSI +"
-          f" ADX + EMA Exp + Stoch] | ADX:{row.get('ADX', 0):.1f}"
+          f"      └─ 🎯 Macro Structural Alignment   : [{tf_display_str}]"
+          f" [BB-RSI + ADX + EMA + Stoch + 45° Renko >= {MACRO_RENKO_CONFIRM_BRICKS}B]"
       )
       print(
-          "      └─ 🔫 1-Min 45° Renko Trigger : >="
-          f" {RENKO_CONFIRM_BRICKS} Bricks"
+          f"      └─ 🔫 {MICRO_TIMEFRAME} Tactical 45° Renko Trigger : >="
+          f" {MICRO_RENKO_CONFIRM_BRICKS} Bricks"
       )
       print(
-          "      └─ ⚓ Macro Floor (Origin):"
+          "      └─ ⚓ Macro Floor (Origin)       :"
           f" {row['Macro_Date']} @ {memory_bank[sym].get('time', '09:15')} |"
           f" Price: ₹{row['Macro_Price']:.2f}"
       )
       print(
-          "      └─ ⚡ Micro Floor (Reload):"
+          "      └─ ⚡ Micro Floor (Reload)        :"
           f" {target_date_str} @ {row['Eval_Time_Str']} | Price:"
           f" ₹{row['Micro_Price']:.2f}"
       )
       print(
-          "      └─ 🎯 Latest LTP          :"
+          "      └─ 🎯 Latest LTP                 :"
           f" {target_date_str} @ EOD   | Price:"
           f" ₹{final_ltp_dict.get(sym, ltp):.2f} (Trend Drift:"
           f" {row['Net_Drift']:+.2f}%)\n"
@@ -888,12 +970,12 @@ def scan_institutional_tape(target_date_str):
           f" ({d_str}){COLOR_RESET}"
       )
       print(
-          f"      └─ 🎯 Macro Permission Passed : {EXECUTION_TIMEFRAME} [BB-RSI +"
-          f" ADX + EMA Exp + Stoch] | ADX:{row.get('ADX', 0):.1f}"
+          f"      └─ 🎯 Macro Structural Alignment   : [{tf_display_str}]"
+          f" [BB-RSI + ADX + EMA + Stoch + 45° Renko >= {MACRO_RENKO_CONFIRM_BRICKS}B]"
       )
       print(
-          "      └─ 🔫 1-Min 45° Renko Trigger : >="
-          f" {RENKO_CONFIRM_BRICKS} Bricks"
+          f"      └─ 🔫 {MICRO_TIMEFRAME} Tactical 45° Renko Trigger : >="
+          f" {MICRO_RENKO_CONFIRM_BRICKS} Bricks"
       )
       print(
           "      └─ ⚓ Anchor :"
@@ -913,7 +995,7 @@ def scan_institutional_tape(target_date_str):
 
 
 # ==============================================================================
-# 5. RUN EXECUTOR
+# 7. RUN EXECUTOR
 # ==============================================================================
 def run_production_sweep():
   parser = argparse.ArgumentParser()
@@ -945,7 +1027,4 @@ def run_production_sweep():
 
 
 if __name__ == "__main__":
-  import warnings
-
-  warnings.filterwarnings("ignore")
   run_production_sweep()
