@@ -156,12 +156,7 @@ def calculate_core_technicals(df_tf):
     df_tf["RSI"] = 100 - (100 / (1 + (avg_gain / (avg_loss + 1e-8))))
     df_tf["RSI_SMA"] = df_tf.groupby("Symbol")["RSI"].transform(lambda x: x.rolling(BB_SMA_PERIOD, min_periods=1).mean())
 
-    high_diff = df_tf["High"] - df_tf.groupby("Symbol")["High"].shift(1)
-    low_diff = df_tf["Symbol"].groupby("Symbol").apply(lambda _: df_tf["Low"].shift(1) - df_tf["Low"]) # Safe diff
-    df_tf["+DM"] = np.where((high_diff > (df_tf["Symbol"].shift(1) - df_tf["Low"])) & (high_diff > 0), high_diff, 0)
-    df_tf["-DM"] = np.where(((df_tf["Symbol"].shift(1) - df_tf["Low"]) > high_diff) & ((df_tf["Symbol"].shift(1) - df_tf["Low"]) > 0), (df_tf["Symbol"].shift(1) - df_tf["Low"]), 0)
-    
-    # Standard directional indicators
+    # Corrected Directional Movement calculation
     high_d = df_tf["High"] - df_tf.groupby("Symbol")["High"].shift(1)
     low_d = df_tf.groupby("Symbol")["Low"].shift(1) - df_tf["Low"]
     df_tf["+DM"] = np.where((high_d > low_d) & (high_d > 0), high_d, 0)
@@ -188,6 +183,9 @@ def calculate_core_technicals(df_tf):
     df_tf["Stoch_Bear_Pass"] = (df_tf["Stoch_K"] <= 50) & df_tf["Vol_Pass"]
 
     return df_tf
+
+
+    
 
 def construct_45deg_renko_matrix(df, tf_name, confirm_bricks):
     renko_counts = np.zeros(len(df))
