@@ -46,8 +46,8 @@ API_ERROR_LOGGED = False
 # ==============================================================================
 # ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
-MICRO_TIMEFRAME = "1min"  # Micro Execution & Tactical Trigger
-MACRO_TIMEFRAMES = ["5min"]  # Strategic Structural & Pilot Tiers
+MICRO_TIMEFRAME = "15min"  # Micro Execution & Tactical Trigger
+MACRO_TIMEFRAMES = ["60min"]  # Strategic Structural & Pilot Tiers
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
