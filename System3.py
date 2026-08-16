@@ -25,35 +25,26 @@ COLOR_DIM = '\033[2m'
 COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 
-BACKTRACE_DAYS = 50      
+BACKTRACE_DAYS = 20      
 MAX_BREACH_DAYS = 0      
+
+# Global flag to stop spamming the console with the same API error
+API_ERROR_LOGGED = False
 
 # ==============================================================================
 # ★ GLOBAL CONFIGURATION: TIMEFRAMES & INDICATORS ★
 # ==============================================================================
-# 1. Timeframe Settings
-TIMEFRAME = '240min'              # Pandas frequency string (e.g., '5min', '15min', '1H')
-TIMEFRAME_MINS = 240              # Integer minutes for timedelta offsets
-
-# 2. ATR (Average True Range)
+TIMEFRAME = '15min'              
+TIMEFRAME_MINS = 15              
 ATR_PERIOD = 14
-
-# 3. BB-RSI (Bollinger Bands applied to RSI)
 RSI_PERIOD = 14
 BB_SMA_PERIOD = 20
-BB_STD_DEV = 2.0               # Standard Deviation multiplier for the bands
-
-# 4. ADX / DMI (Trend Strength)
+BB_STD_DEV = 2.0               
 ADX_PERIOD = 14
-ADX_THRESHOLD = 20             # Minimum ADX required to validate a breakout
-
-# 5. ATR-Synthesized Renko
-RENKO_MIN_BRICK = 0.05         # Absolute minimum brick size
-RENKO_DEFAULT_PCT = 0.005      # Fallback brick size (0.5% of price) if ATR is NaN
-
-# 6. Memory & State Risk Rules
-BREACH_PURGE_PCT = 0.015       # 1.5% deviation allowed at EOD before clearing a breached level
-# ==============================================================================
+ADX_THRESHOLD = 20             
+RENKO_MIN_BRICK = 0.05         
+RENKO_DEFAULT_PCT = 0.005      
+BREACH_PURGE_PCT = 0.015       
 
 # ==============================================================================
 # 1. LIVE INGESTION (F&O Universe & Parallel Bulk Fetching)
@@ -85,7 +76,7 @@ def get_past_trading_days(target_date_str, num_days=20):
         return []
 
 # ==============================================================================
-# 2. TECHNICAL PRE-COMPUTATION ENGINE (BB-RSI, ADX, Renko)
+# 2. TECHNICAL PRE-COMPUTATION ENGINE
 # ==============================================================================
 def prepare_technical_data(df):
     tech_df = df.groupby(['Symbol', pd.Grouper(key='Datetime', freq=TIMEFRAME, closed='left', label='left')]).agg({
@@ -94,7 +85,6 @@ def prepare_technical_data(df):
     
     tech_df = tech_df.dropna(subset=['Close']).sort_values(['Symbol', 'Datetime'])
     
-    # ATR Calculation
     tech_df['H-L'] = tech_df['High'] - tech_df['Low']
     tech_df['H-PC'] = (tech_df['High'] - tech_df.groupby('Symbol')['Close'].shift(1)).abs()
     tech_df['L-PC'] = (tech_df['Low'] - tech_df.groupby('Symbol')['Close'].shift(1)).abs()
@@ -102,7 +92,6 @@ def prepare_technical_data(df):
     atr_series = tech_df.groupby('Symbol')['TR'].transform(lambda x: x.ewm(alpha=1/ATR_PERIOD, adjust=False).mean())
     tech_df['ATR'] = atr_series
 
-    # BB-RSI Calculation
     delta = tech_df.groupby('Symbol')['Close'].diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
@@ -117,7 +106,6 @@ def prepare_technical_data(df):
     tech_df['BB_Upper'] = tech_df['RSI_SMA'] + (BB_STD_DEV * tech_df['RSI_STD'])
     tech_df['BB_Lower'] = tech_df['RSI_SMA'] - (BB_STD_DEV * tech_df['RSI_STD'])
     
-    # ADX / DMI Calculation
     high_diff = tech_df['High'] - tech_df.groupby('Symbol')['High'].shift(1)
     low_diff = tech_df.groupby('Symbol')['Low'].shift(1) - tech_df['Low']
     
@@ -132,7 +120,6 @@ def prepare_technical_data(df):
     tech_df['ADX'] = tech_df.groupby('Symbol')['DX'].transform(lambda x: x.ewm(alpha=1/ADX_PERIOD, adjust=False).mean())
     tech_df['ADX_prev'] = tech_df.groupby('Symbol')['ADX'].shift(1)
     
-    # ATR-Synthesized Renko
     renko_trends = np.ones(len(tech_df))
     for sym, indices in tech_df.groupby('Symbol').indices.items():
         sub_closes = tech_df['Close'].values[indices]
@@ -157,7 +144,7 @@ def prepare_technical_data(df):
     return tech_df
 
 # ==============================================================================
-# 3. VECTORIZED ANOMALY DETECTION (GATEKEEPER)
+# 3. VECTORIZED ANOMALY DETECTION
 # ==============================================================================
 def extract_all_anomalies(tech_df):
     df = tech_df.copy()
@@ -166,10 +153,7 @@ def extract_all_anomalies(tech_df):
     bull_cond = (df['RSI'] > df['BB_Upper']) & (df['ADX'] > ADX_THRESHOLD) & (df['ADX'] > df['ADX_prev']) & (df['+DI'] > df['-DI']) & (df['Renko_Trend'] == 1)
     bear_cond = (df['RSI'] < df['BB_Lower']) & (df['ADX'] > ADX_THRESHOLD) & (df['ADX'] > df['ADX_prev']) & (df['-DI'] > df['+DI']) & (df['Renko_Trend'] == -1)
     
-    # Calculate Direction on the entire DataFrame before filtering
     df['Direction'] = np.where(bull_cond, 1, np.where(bear_cond, -1, 0))
-    
-    # Filter anomalies safely
     anomalies = df[df['Direction'] != 0].copy()
     
     if anomalies.empty:
@@ -183,6 +167,8 @@ def extract_all_anomalies(tech_df):
 # 4. LIGHTNING STATE-BASED MEMORY ENGINE
 # ==============================================================================
 def scan_institutional_tape(target_date_str):
+    global API_ERROR_LOGGED
+    
     print(f"\n📡 Initiating Vectorized Engine [{TIMEFRAME} Timeframe] for {target_date_str}...")
     universe = get_dynamic_fno_universe()
     if not universe:
@@ -201,6 +187,7 @@ def scan_institutional_tape(target_date_str):
     historical_dfs = []
 
     def fetch_worker(task):
+        global API_ERROR_LOGGED
         item, start_date, end_date, live = task
         key = urllib.parse.quote(item['key'])
         access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
@@ -210,28 +197,29 @@ def scan_institutional_tape(target_date_str):
         hist_end = end_date if not live else (current_now - timedelta(days=1)).strftime("%Y-%m-%d")
         
         # Historical chunk
-        for attempt in range(4):
+        for attempt in range(3):
             try:
-                res = requests.get(f"https://api.upstox.com/v2/historical-candle/{key}/1minute/{hist_end}/{start_date}", headers=headers, timeout=15)
-                if res.status_code == 429: time.sleep(1.5); continue
-                if res.status_code == 200 and res.json().get('data', {}).get('candles'):
-                    dfs.append(pd.DataFrame(res.json()['data']['candles'], columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI']))
-                break
+                url = f"https://api.upstox.com/v2/historical-candle/{key}/1minute/{hist_end}/{start_date}"
+                res = requests.get(url, headers=headers, timeout=15)
+                
+                if res.status_code == 429: 
+                    time.sleep(1.5)
+                    continue
+                elif res.status_code == 200:
+                    data = res.json().get('data', {}).get('candles')
+                    if data:
+                        dfs.append(pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI']))
+                    break
+                else:
+                    # DIAGNOSTIC PRINT: Show exactly why Upstox is rejecting the call
+                    if not API_ERROR_LOGGED:
+                        print(f"\n\n{COLOR_RED}❌ [UPSTOX API REJECTION] HTTP {res.status_code}{COLOR_RESET}")
+                        print(f"{COLOR_YELLOW}Response Message: {res.text}{COLOR_RESET}\n")
+                        API_ERROR_LOGGED = True
+                    break
             except Exception:
                 time.sleep(1)
             
-        # Live intraday chunk
-        if live:
-            for attempt in range(4):
-                try:
-                    res = requests.get(f"https://api.upstox.com/v2/historical-candle/intraday/{key}/1minute", headers=headers, timeout=15)
-                    if res.status_code == 429: time.sleep(1.5); continue
-                    if res.status_code == 200 and res.json().get('data', {}).get('candles'):
-                        dfs.append(pd.DataFrame(res.json()['data']['candles'], columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI']))
-                    break
-                except Exception:
-                    time.sleep(1)
-
         if dfs:
             df = pd.concat(dfs, ignore_index=True)
             df['Datetime'] = pd.to_datetime(df['Timestamp']).dt.tz_localize(None)
@@ -240,7 +228,6 @@ def scan_institutional_tape(target_date_str):
             return df
         return None
 
-    # execution with progress tracker and reduced max_workers to avoid firewall DDOS triggers
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(fetch_worker, task): task for task in fetch_tasks}
         completed = 0
@@ -251,10 +238,10 @@ def scan_institutional_tape(target_date_str):
             res = future.result()
             if res is not None:
                 historical_dfs.append(res)
-    print() # Clear line
+    print() 
 
     if not historical_dfs:
-        print(f"⚠️ {COLOR_RED}Fatal Error: No data retrieved. Check API token or network limits.{COLOR_RESET}")
+        print(f"⚠️ {COLOR_RED}Fatal Error: No data retrieved. Check the API Rejection message above.{COLOR_RESET}")
         return
 
     rolling_master_df = pd.concat(historical_dfs, ignore_index=True)
@@ -308,7 +295,6 @@ def scan_institutional_tape(target_date_str):
             if sym in daily_closes:
                 st = memory_bank[sym]
                 if st['state'] == 'BREACHED':
-                    # Check against the Global Purge Percentage
                     if (st['dir'] == 1 and daily_closes[sym] < st['origin'] * (1.0 - BREACH_PURGE_PCT)) or \
                        (st['dir'] == -1 and daily_closes[sym] > st['origin'] * (1.0 + BREACH_PURGE_PCT)):
                         del memory_bank[sym]
@@ -322,7 +308,6 @@ def scan_institutional_tape(target_date_str):
         print(f"\n{COLOR_YELLOW}[Terminal Standby] Market data for {target_date_str} is empty or not available yet.{COLOR_RESET}\n")
         return
 
-    # Auto-generate evaluation checkpoints strictly based on the configured TIMEFRAME
     if not is_live_today or current_now.hour >= 16:
         start_eval = target_dt + pd.Timedelta(hours=9, minutes=15) + pd.Timedelta(minutes=TIMEFRAME_MINS)
         end_eval = target_dt + pd.Timedelta(hours=15, minutes=15)
@@ -457,3 +442,4 @@ if __name__ == "__main__":
     import warnings
     warnings.filterwarnings("ignore")
     run_production_sweep()
+
