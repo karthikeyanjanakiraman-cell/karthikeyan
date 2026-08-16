@@ -60,7 +60,7 @@ ADX_THRESHOLD = 20
 STOCH_PERIOD = 14
 
 # 3. Micro Execution & Renko Trigger Parameters
-RENKO_CONFIRM_BRICKS = 10  # The Asit Baran Pati Confluence Rule
+RENKO_CONFIRM_BRICKS = 02  # The Asit Baran Pati Confluence Rule
 RENKO_MIN_BRICK = 0.05
 RENKO_DEFAULT_PCT = 0.005
 
