@@ -105,7 +105,8 @@ def get_dynamic_fno_universe():
     nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
     try:
         response = requests.get(nse_url, timeout=15)
-        if response.status_code != 200: return []
+        if response.status_code != 200:
+            return []
         nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
         fno_underlying = {
             item.get("underlying_symbol") for item in nse_data
@@ -385,8 +386,10 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
 
     bull_col = f"Armed_Bull_{tf_str}"
     bear_col = f"Armed_Bear_{tf_str}"
+    score_bull_col = f"Score_Bull_{tf_str}"
+    score_bear_col = f"Score_Bear_{tf_str}"
     
-    export_cols = ["Symbol", "Eval_Time", bull_col, bear_col, "ATR", "ADX"]
+    export_cols = ["Symbol", "Eval_Time", bull_col, bear_col, score_bull_col, score_bear_col, "ATR", "ADX"]
     env_df = df_tf[export_cols].copy()
     env_df = env_df.rename(columns={"Eval_Time": "Datetime", "ATR": f"ATR_{tf_str}", "ADX": f"ADX_{tf_str}"})
     env_df = env_df.sort_values("Datetime").reset_index(drop=True)
@@ -426,12 +429,16 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
 
         bull_col = f"Armed_Bull_{tf}"
         bear_col = f"Armed_Bear_{tf}"
+        score_bull_col = f"Score_Bull_{tf}"
+        score_bear_col = f"Score_Bear_{tf}"
         bull_gate_cols.append(bull_col)
         bear_gate_cols.append(bear_col)
 
         df_micro = pd.merge_asof(df_micro, env_df, on="Datetime", by="Symbol", direction="backward")
         df_micro[bull_col] = df_micro[bull_col].fillna(False)
         df_micro[bear_col] = df_micro[bear_col].fillna(False)
+        df_micro[score_bull_col] = df_micro[score_bull_col].fillna(0).astype(int)
+        df_micro[score_bear_col] = df_micro[score_bear_col].fillna(0).astype(int)
 
     df_micro["Master_Armed_Bull"] = df_micro[bull_gate_cols].all(axis=1)
     df_micro["Master_Armed_Bear"] = df_micro[bear_gate_cols].all(axis=1)
@@ -466,7 +473,8 @@ def scan_institutional_tape(target_date_str):
         return
 
     trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
-    if not trading_days: return
+    if not trading_days:
+        return
 
     target_dt = pd.to_datetime(target_date_str)
     current_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
@@ -495,7 +503,8 @@ def scan_institutional_tape(target_date_str):
                     continue
                 elif res.status_code == 200:
                     data = res.json().get("data", {}).get("candles")
-                    if data: dfs.append(pd.DataFrame(data, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume", "OI"]))
+                    if data:
+                        dfs.append(pd.DataFrame(data, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume", "OI"]))
                     break
                 else:
                     if not API_ERROR_LOGGED:
@@ -503,7 +512,8 @@ def scan_institutional_tape(target_date_str):
                         print(f"{COLOR_YELLOW}Response Message: {res.text}{COLOR_RESET}\n")
                         API_ERROR_LOGGED = True
                     break
-            except Exception: time.sleep(1)
+            except Exception:
+                time.sleep(1)
 
         if live:
             for attempt in range(3):
@@ -515,7 +525,8 @@ def scan_institutional_tape(target_date_str):
                     if res.status_code == 200 and res.json().get("data", {}).get("candles"):
                         dfs.append(pd.DataFrame(res.json()["data"]["candles"], columns=["Timestamp", "Open", "High", "Low", "Close", "Volume", "OI"]))
                     break
-                except Exception: time.sleep(1)
+                except Exception:
+                    time.sleep(1)
 
         if dfs:
             df = pd.concat(dfs, ignore_index=True)
@@ -533,7 +544,8 @@ def scan_institutional_tape(target_date_str):
             sys.stdout.write(f"\r📡 Fetching Data... {completed}/{len(fetch_tasks)} symbols processed")
             sys.stdout.flush()
             res = future.result()
-            if res is not None: historical_dfs.append(res)
+            if res is not None:
+                historical_dfs.append(res)
     print()
 
     if not historical_dfs:
@@ -543,12 +555,14 @@ def scan_institutional_tape(target_date_str):
     rolling_master_df = pd.concat(historical_dfs, ignore_index=True)
 
     print(f"{COLOR_CYAN}[Macro Bias] Configured to: {GLOBAL_MACRO_STRATEGY_2D} | Micro TF: [{MICRO_TIMEFRAME}] | Macro Hierarchy: {MACRO_TIMEFRAMES}{COLOR_RESET}")
-    print(f"⚙️ Computing Scorecards, Phase 1 Dual-Tier Renko (Price+Vol)...")
+    print("⚙️ Computing Scorecards, Phase 1 Dual-Tier Renko (Price+Vol)...")
 
     tape_exec = prepare_unified_execution_tape(rolling_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES)
 
-    if GLOBAL_MACRO_STRATEGY_2D == "BULLISH": tape_exec["Master_Armed_Bear"] = False
-    elif GLOBAL_MACRO_STRATEGY_2D == "BEARISH": tape_exec["Master_Armed_Bull"] = False
+    if GLOBAL_MACRO_STRATEGY_2D == "BULLISH":
+        tape_exec["Master_Armed_Bear"] = False
+    elif GLOBAL_MACRO_STRATEGY_2D == "BEARISH":
+        tape_exec["Master_Armed_Bull"] = False
 
     all_anomalies = tape_exec[tape_exec["Direction"] != 0].copy()
     anomalies_by_time = all_anomalies.groupby("Datetime")
@@ -666,12 +680,14 @@ def scan_institutional_tape(target_date_str):
             pct_move = ((ltp - morning_opens.get(sym, ltp)) / morning_opens.get(sym, ltp)) * 100
             color, d_str = ((COLOR_GREEN, "BULLISH") if row["Direction"] == 1 else (COLOR_RED, "BEARISH"))
             
-            macro_score = row[f"Score_{d_str[:4].capitalize()}_{MACRO_TIMEFRAMES[-1]}"]
-            micro_score = row[f"Score_{d_str[:4].capitalize()}_{MICRO_TIMEFRAME}"]
+            macro_score_key = f"Score_{d_str[:4].capitalize()}_{MACRO_TIMEFRAMES[-1]}"
+            micro_score_key = f"Score_{d_str[:4].capitalize()}_{MICRO_TIMEFRAME}"
+            macro_score = row.get(macro_score_key, 0)
+            micro_score = row.get(micro_score_key, 0)
             
             print(f"  {color}🚨 {sym:<12} Day Move: {pct_move:+.2f}% ({d_str}){COLOR_RESET}")
-            print(f"      └─ 🎯 Macro Alignment [{tf_display_str}] : Score >= {MACRO_MINIMUM_SCORE}/6 (Pass={macro_score}) [Mandatory Gates Clear]")
-            print(f"      └─ 🔫 Micro Execution [{MICRO_TIMEFRAME}] : Score >= {MICRO_MINIMUM_SCORE}/6 (Pass={micro_score}) [Mandatory Gates Clear]")
+            print(f"      └─ 🎯 Macro Alignment [{tf_display_str}] : Score >= {MACRO_MINIMUM_SCORE}/6 (Score={macro_score}) [Mandatory Gates Clear]")
+            print(f"      └─ 🔫 Micro Execution [{MICRO_TIMEFRAME}] : Score >= {MICRO_MINIMUM_SCORE}/6 (Score={micro_score}) [Mandatory Gates Clear]")
             print(f"      └─ ⚓ Zero-Lag Anchor              : {target_date_str} @ {row['Eval_Time_Str']} | Price: ₹{ltp:.2f}")
             print(f"      └─ 🎯 Latest LTP                 : {target_date_str} @ EOD   | Price: ₹{final_ltp_dict.get(sym, ltp):.2f}\n")
 
@@ -723,8 +739,10 @@ def run_production_sweep():
 
     if not raw_date_str:
         target_dt = datetime.utcnow() + timedelta(hours=5, minutes=30)
-        if target_dt.weekday() == 5: target_dt -= timedelta(days=1)
-        elif target_dt.weekday() == 6: target_dt -= timedelta(days=2)
+        if target_dt.weekday() == 5:
+            target_dt -= timedelta(days=1)
+        elif target_dt.weekday() == 6:
+            target_dt -= timedelta(days=2)
         target_date_str = target_dt.strftime("%Y-%m-%d")
     else:
         target_date_str = datetime.strptime(raw_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
