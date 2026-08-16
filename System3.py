@@ -29,6 +29,33 @@ BACKTRACE_DAYS = 20
 MAX_BREACH_DAYS = 0      
 
 # ==============================================================================
+# ★ GLOBAL CONFIGURATION: TIMEFRAMES & INDICATORS ★
+# ==============================================================================
+# 1. Timeframe Settings
+TIMEFRAME = '1H'              # Pandas frequency string (e.g., '5min', '15min', '1H')
+TIMEFRAME_MINS = 60              # Integer minutes for timedelta offsets
+
+# 2. ATR (Average True Range)
+ATR_PERIOD = 14
+
+# 3. BB-RSI (Bollinger Bands applied to RSI)
+RSI_PERIOD = 14
+BB_SMA_PERIOD = 20
+BB_STD_DEV = 2.0               # Standard Deviation multiplier for the bands
+
+# 4. ADX / DMI (Trend Strength)
+ADX_PERIOD = 14
+ADX_THRESHOLD = 20             # Minimum ADX required to validate a breakout
+
+# 5. ATR-Synthesized Renko
+RENKO_MIN_BRICK = 0.05         # Absolute minimum brick size
+RENKO_DEFAULT_PCT = 0.005      # Fallback brick size (0.5% of price) if ATR is NaN
+
+# 6. Memory & State Risk Rules
+BREACH_PURGE_PCT = 0.015       # 1.5% deviation allowed at EOD before clearing a breached level
+# ==============================================================================
+
+# ==============================================================================
 # 1. LIVE INGESTION (F&O Universe & Parallel Bulk Fetching)
 # ==============================================================================
 def get_dynamic_fno_universe():
@@ -61,57 +88,61 @@ def get_past_trading_days(target_date_str, num_days=20):
 # 2. TECHNICAL PRE-COMPUTATION ENGINE (BB-RSI, ADX, Renko)
 # ==============================================================================
 def prepare_technical_data(df):
-    hist_15m = df.groupby(['Symbol', pd.Grouper(key='Datetime', freq='15min', closed='left', label='left')]).agg({
+    tech_df = df.groupby(['Symbol', pd.Grouper(key='Datetime', freq=TIMEFRAME, closed='left', label='left')]).agg({
         'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last', 'Volume': 'sum'
     }).reset_index()
     
-    hist_15m = hist_15m.dropna(subset=['Close']).sort_values(['Symbol', 'Datetime'])
+    tech_df = tech_df.dropna(subset=['Close']).sort_values(['Symbol', 'Datetime'])
     
-    hist_15m['H-L'] = hist_15m['High'] - hist_15m['Low']
-    hist_15m['H-PC'] = (hist_15m['High'] - hist_15m.groupby('Symbol')['Close'].shift(1)).abs()
-    hist_15m['L-PC'] = (hist_15m['Low'] - hist_15m.groupby('Symbol')['Close'].shift(1)).abs()
-    hist_15m['TR'] = hist_15m[['H-L', 'H-PC', 'L-PC']].max(axis=1)
-    atr14 = hist_15m.groupby('Symbol')['TR'].transform(lambda x: x.ewm(alpha=1/14, adjust=False).mean())
-    hist_15m['ATR'] = atr14
+    # ATR Calculation
+    tech_df['H-L'] = tech_df['High'] - tech_df['Low']
+    tech_df['H-PC'] = (tech_df['High'] - tech_df.groupby('Symbol')['Close'].shift(1)).abs()
+    tech_df['L-PC'] = (tech_df['Low'] - tech_df.groupby('Symbol')['Close'].shift(1)).abs()
+    tech_df['TR'] = tech_df[['H-L', 'H-PC', 'L-PC']].max(axis=1)
+    atr_series = tech_df.groupby('Symbol')['TR'].transform(lambda x: x.ewm(alpha=1/ATR_PERIOD, adjust=False).mean())
+    tech_df['ATR'] = atr_series
 
-    delta = hist_15m.groupby('Symbol')['Close'].diff()
+    # BB-RSI Calculation
+    delta = tech_df.groupby('Symbol')['Close'].diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
     
-    avg_gain = gain.groupby(hist_15m['Symbol']).transform(lambda x: x.ewm(alpha=1/14, adjust=False).mean())
-    avg_loss = loss.groupby(hist_15m['Symbol']).transform(lambda x: x.ewm(alpha=1/14, adjust=False).mean())
+    avg_gain = gain.groupby(tech_df['Symbol']).transform(lambda x: x.ewm(alpha=1/RSI_PERIOD, adjust=False).mean())
+    avg_loss = loss.groupby(tech_df['Symbol']).transform(lambda x: x.ewm(alpha=1/RSI_PERIOD, adjust=False).mean())
     rs = avg_gain / (avg_loss + 1e-8)
-    hist_15m['RSI'] = 100 - (100 / (1 + rs))
+    tech_df['RSI'] = 100 - (100 / (1 + rs))
     
-    hist_15m['RSI_SMA'] = hist_15m.groupby('Symbol')['RSI'].transform(lambda x: x.rolling(20).mean())
-    hist_15m['RSI_STD'] = hist_15m.groupby('Symbol')['RSI'].transform(lambda x: x.rolling(20).std())
-    hist_15m['BB_Upper'] = hist_15m['RSI_SMA'] + (2 * hist_15m['RSI_STD'])
-    hist_15m['BB_Lower'] = hist_15m['RSI_SMA'] - (2 * hist_15m['RSI_STD'])
+    tech_df['RSI_SMA'] = tech_df.groupby('Symbol')['RSI'].transform(lambda x: x.rolling(BB_SMA_PERIOD).mean())
+    tech_df['RSI_STD'] = tech_df.groupby('Symbol')['RSI'].transform(lambda x: x.rolling(BB_SMA_PERIOD).std())
+    tech_df['BB_Upper'] = tech_df['RSI_SMA'] + (BB_STD_DEV * tech_df['RSI_STD'])
+    tech_df['BB_Lower'] = tech_df['RSI_SMA'] - (BB_STD_DEV * tech_df['RSI_STD'])
     
-    high_diff = hist_15m['High'] - hist_15m.groupby('Symbol')['High'].shift(1)
-    low_diff = hist_15m.groupby('Symbol')['Low'].shift(1) - hist_15m['Low']
+    # ADX / DMI Calculation
+    high_diff = tech_df['High'] - tech_df.groupby('Symbol')['High'].shift(1)
+    low_diff = tech_df.groupby('Symbol')['Low'].shift(1) - tech_df['Low']
     
-    hist_15m['+DM'] = np.where((high_diff > low_diff) & (high_diff > 0), high_diff, 0)
-    hist_15m['-DM'] = np.where((low_diff > high_diff) & (low_diff > 0), low_diff, 0)
+    tech_df['+DM'] = np.where((high_diff > low_diff) & (high_diff > 0), high_diff, 0)
+    tech_df['-DM'] = np.where((low_diff > high_diff) & (low_diff > 0), low_diff, 0)
     
-    hist_15m['+DI'] = 100 * (hist_15m.groupby('Symbol')['+DM'].transform(lambda x: x.ewm(alpha=1/14, adjust=False).mean()) / (atr14 + 1e-8))
-    hist_15m['-DI'] = 100 * (hist_15m.groupby('Symbol')['-DM'].transform(lambda x: x.ewm(alpha=1/14, adjust=False).mean()) / (atr14 + 1e-8))
+    tech_df['+DI'] = 100 * (tech_df.groupby('Symbol')['+DM'].transform(lambda x: x.ewm(alpha=1/ADX_PERIOD, adjust=False).mean()) / (atr_series + 1e-8))
+    tech_df['-DI'] = 100 * (tech_df.groupby('Symbol')['-DM'].transform(lambda x: x.ewm(alpha=1/ADX_PERIOD, adjust=False).mean()) / (atr_series + 1e-8))
     
-    dx = 100 * abs(hist_15m['+DI'] - hist_15m['-DI']) / (hist_15m['+DI'] + hist_15m['-DI'] + 1e-8)
-    hist_15m['DX'] = dx
-    hist_15m['ADX'] = hist_15m.groupby('Symbol')['DX'].transform(lambda x: x.ewm(alpha=1/14, adjust=False).mean())
-    hist_15m['ADX_prev'] = hist_15m.groupby('Symbol')['ADX'].shift(1)
+    dx = 100 * abs(tech_df['+DI'] - tech_df['-DI']) / (tech_df['+DI'] + tech_df['-DI'] + 1e-8)
+    tech_df['DX'] = dx
+    tech_df['ADX'] = tech_df.groupby('Symbol')['DX'].transform(lambda x: x.ewm(alpha=1/ADX_PERIOD, adjust=False).mean())
+    tech_df['ADX_prev'] = tech_df.groupby('Symbol')['ADX'].shift(1)
     
-    renko_trends = np.ones(len(hist_15m))
-    for sym, indices in hist_15m.groupby('Symbol').indices.items():
-        sub_closes = hist_15m['Close'].values[indices]
-        sub_atrs = hist_15m['ATR'].fillna(hist_15m['Close']*0.005).values[indices]
+    # ATR-Synthesized Renko
+    renko_trends = np.ones(len(tech_df))
+    for sym, indices in tech_df.groupby('Symbol').indices.items():
+        sub_closes = tech_df['Close'].values[indices]
+        sub_atrs = tech_df['ATR'].fillna(tech_df['Close'] * RENKO_DEFAULT_PCT).values[indices]
         if len(sub_closes) > 0:
             trends = np.ones(len(sub_closes))
             curr_trend = 1
             curr_price = sub_closes[0]
             for i in range(1, len(sub_closes)):
-                bs = max(sub_atrs[i], 0.05)  
+                bs = max(sub_atrs[i], RENKO_MIN_BRICK)  
                 move = sub_closes[i] - curr_price
                 if move >= bs:
                     curr_trend = 1
@@ -122,18 +153,18 @@ def prepare_technical_data(df):
                 trends[i] = curr_trend
             renko_trends[indices] = trends
             
-    hist_15m['Renko_Trend'] = renko_trends
-    return hist_15m
+    tech_df['Renko_Trend'] = renko_trends
+    return tech_df
 
 # ==============================================================================
-# 3. VECTORIZED ANOMALY DETECTION (FIXED SLICING BUG)
+# 3. VECTORIZED ANOMALY DETECTION (GATEKEEPER)
 # ==============================================================================
-def extract_all_anomalies(hist_15m):
-    df = hist_15m.copy()
+def extract_all_anomalies(tech_df):
+    df = tech_df.copy()
     df['Rec_Pct_Move'] = ((df['Close'] - df['Open']) / (df['Open'] + 1e-8)) * 100
     
-    bull_cond = (df['RSI'] > df['BB_Upper']) & (df['ADX'] > 20) & (df['ADX'] > df['ADX_prev']) & (df['+DI'] > df['-DI']) & (df['Renko_Trend'] == 1)
-    bear_cond = (df['RSI'] < df['BB_Lower']) & (df['ADX'] > 20) & (df['ADX'] > df['ADX_prev']) & (df['-DI'] > df['+DI']) & (df['Renko_Trend'] == -1)
+    bull_cond = (df['RSI'] > df['BB_Upper']) & (df['ADX'] > ADX_THRESHOLD) & (df['ADX'] > df['ADX_prev']) & (df['+DI'] > df['-DI']) & (df['Renko_Trend'] == 1)
+    bear_cond = (df['RSI'] < df['BB_Lower']) & (df['ADX'] > ADX_THRESHOLD) & (df['ADX'] > df['ADX_prev']) & (df['-DI'] > df['+DI']) & (df['Renko_Trend'] == -1)
     
     # Calculate Direction on the entire DataFrame before filtering
     df['Direction'] = np.where(bull_cond, 1, np.where(bear_cond, -1, 0))
@@ -145,14 +176,14 @@ def extract_all_anomalies(hist_15m):
         anomalies['Eval_Time'] = pd.Series(dtype='datetime64[ns]')
         return anomalies
     
-    anomalies['Eval_Time'] = anomalies['Datetime'] + pd.Timedelta(minutes=15)
+    anomalies['Eval_Time'] = anomalies['Datetime'] + pd.Timedelta(minutes=TIMEFRAME_MINS)
     return anomalies
 
 # ==============================================================================
 # 4. LIGHTNING STATE-BASED MEMORY ENGINE
 # ==============================================================================
 def scan_institutional_tape(target_date_str):
-    print(f"\n📡 Initiating Vectorized Engine for {target_date_str}...")
+    print(f"\n📡 Initiating Vectorized Engine [{TIMEFRAME} Timeframe] for {target_date_str}...")
     universe = get_dynamic_fno_universe()
     if not universe:
         print(f"⚠️ {COLOR_RED}No F&O universe found.{COLOR_RESET}")
@@ -229,14 +260,14 @@ def scan_institutional_tape(target_date_str):
     rolling_master_df = pd.concat(historical_dfs, ignore_index=True)
     
     print(f"⚙️ Computing Technical Matrices instantly...")
-    hist_15m_tech = prepare_technical_data(rolling_master_df)
+    tech_df = prepare_technical_data(rolling_master_df)
     
-    all_anomalies = extract_all_anomalies(hist_15m_tech)
+    all_anomalies = extract_all_anomalies(tech_df)
     anomalies_by_time = all_anomalies.groupby('Eval_Time')
     
-    closes_15m = hist_15m_tech.copy()
-    closes_15m['Eval_Time'] = closes_15m['Datetime'] + pd.Timedelta(minutes=15)
-    closes_dict = closes_15m.set_index(['Eval_Time', 'Symbol'])['Close'].to_dict()
+    closes_df = tech_df.copy()
+    closes_df['Eval_Time'] = closes_df['Datetime'] + pd.Timedelta(minutes=TIMEFRAME_MINS)
+    closes_dict = closes_df.set_index(['Eval_Time', 'Symbol'])['Close'].to_dict()
 
     memory_bank = {} 
     unique_days = sorted(rolling_master_df['Datetime'].dt.date.unique())
@@ -253,7 +284,7 @@ def scan_institutional_tape(target_date_str):
                     st['state'] = 'BREACHED'
                     st['breach_time'] = f"{day_str} 09:15 (GAP)"
 
-        day_times = sorted([t for t in closes_15m['Eval_Time'].unique() if t.date() == d])
+        day_times = sorted([t for t in closes_df['Eval_Time'].unique() if t.date() == d])
         
         for t in day_times:
             for sym, st in memory_bank.items():
@@ -277,7 +308,9 @@ def scan_institutional_tape(target_date_str):
             if sym in daily_closes:
                 st = memory_bank[sym]
                 if st['state'] == 'BREACHED':
-                    if (st['dir'] == 1 and daily_closes[sym] < st['origin'] * 0.985) or (st['dir'] == -1 and daily_closes[sym] > st['origin'] * 1.015):
+                    # Check against the Global Purge Percentage
+                    if (st['dir'] == 1 and daily_closes[sym] < st['origin'] * (1.0 - BREACH_PURGE_PCT)) or \
+                       (st['dir'] == -1 and daily_closes[sym] > st['origin'] * (1.0 + BREACH_PURGE_PCT)):
                         del memory_bank[sym]
 
     # ----------------------------------------------------------------------
@@ -289,8 +322,11 @@ def scan_institutional_tape(target_date_str):
         print(f"\n{COLOR_YELLOW}[Terminal Standby] Market data for {target_date_str} is empty or not available yet.{COLOR_RESET}\n")
         return
 
+    # Auto-generate evaluation checkpoints strictly based on the configured TIMEFRAME
     if not is_live_today or current_now.hour >= 16:
-        eval_times = [target_dt + pd.Timedelta(hours=h, minutes=m) for h, m in [(9,45), (10,30), (11,30), (12,30), (13,30), (14,30), (15,15)]]
+        start_eval = target_dt + pd.Timedelta(hours=9, minutes=15) + pd.Timedelta(minutes=TIMEFRAME_MINS)
+        end_eval = target_dt + pd.Timedelta(hours=15, minutes=15)
+        eval_times = pd.date_range(start=start_eval, end=end_eval, freq=TIMEFRAME).tolist()
     else:
         eval_times = [current_now.replace(second=0, microsecond=0) - timedelta(minutes=1)]
 
