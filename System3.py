@@ -45,7 +45,7 @@ ADX_PERIOD = 14
 ADX_THRESHOLD = 20             
 
 # 2. 1-Minute Micro Execution (Trigger)
-RENKO_CONFIRM_BRICKS = 2       # The Asit Baran Pati 2-Brick Confirmation Rule
+RENKO_CONFIRM_BRICKS = 20       # The Asit Baran Pati 2-Brick Confirmation Rule
 RENKO_MIN_BRICK = 0.05         
 RENKO_DEFAULT_PCT = 0.005      
 
