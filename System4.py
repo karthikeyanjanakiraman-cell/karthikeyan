@@ -488,8 +488,8 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
 # 5. FYERS SCANNING & TRADE MANAGEMENT ENGINE
 # ==============================================================================
 def scan_fyers_institutional_tape(target_date_str):
-    app_id = os.environ.get("FYERS_APP_ID")
-    access_token = os.environ.get("FYERS_ACCESS_TOKEN")
+    app_id = os.environ.get("CLIENT_ID")
+    access_token = os.environ.get("ACCESS_TOKEN")
     
     if not app_id or not access_token:
         print(f"❌ {COLOR_RED}Error: FYERS_APP_ID or FYERS_ACCESS_TOKEN environment variables not found.{COLOR_RESET}")
