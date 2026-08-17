@@ -6,6 +6,7 @@ Key Features:
 - FYERS NIFTY 50 & SENSEX CE / PE Options Dynamic Extraction
 - Indestructible Fuzzy Parser (100% Immune to Fyers Data Schema Shifts)
 - Symbol-Based Filtering (Bypasses underlying column naming inconsistencies)
+- Datetime Resolution Normalization (Fixes Pandas MergeErrors)
 - 09:15 AM Opening Strike Freeze (Locked for the Whole Session)
 - Dual-Tier 7-Pillar Scorecard & 45-Degree Price/Volume/Velocity Renko Engine
 """
@@ -141,38 +142,30 @@ def fetch_fyers_instruments(segment):
             if len(parts) < 10:
                 continue
             
-            # 1. Fuzzy match the Symbol Column
             symbol = next((p for p in parts if p.startswith("NSE:") or p.startswith("BSE:")), None)
             if not symbol: continue
             
-            # Fast filter: Only process Index Options
             if "NIFTY" not in symbol and "SENSEX" not in symbol:
                 continue
 
-            # 2. Fuzzy match the Option Type (CE/PE)
             opt_type = next((p.strip().upper() for p in parts if p.strip().upper() in ["CE", "PE"]), None)
             if not opt_type:
-                # Fallback: Sometimes CE/PE is only appended to the symbol itself
                 if symbol.endswith("CE"): opt_type = "CE"
                 elif symbol.endswith("PE"): opt_type = "PE"
                 else: continue
 
-            # 3. Fuzzy match the Epoch Expiry Timestamp (10-digit number)
-            valid_prefixes = tuple(str(i) for i in range(16, 22))  # Valid timestamp ranges for current decade
+            valid_prefixes = tuple(str(i) for i in range(16, 22))
             expiry_epoch_str = next((p for p in parts if p.isdigit() and len(p) == 10 and p.startswith(valid_prefixes)), None)
             if not expiry_epoch_str: continue
             
             expiry_epoch = int(expiry_epoch_str)
             expiry_date = datetime.utcfromtimestamp(expiry_epoch).strftime('%Y-%m-%d')
 
-            # 4. Fuzzy match the Strike Price (Scan backwards to avoid parsing random ID floats)
             strike = None
             for p in reversed(parts):
                 try:
                     val = float(p)
-                    # Nifty/Sensex strikes are large numbers and always divisible by 50 (or 100)
                     if 1000.0 <= val <= 200000.0 and val % 50 == 0:
-                        # Ensure we didn't accidentally grab the epoch timestamp
                         if str(int(val)) != expiry_epoch_str:
                             strike = val
                             break
@@ -227,7 +220,6 @@ def build_locked_options_universe(target_date_str, headers):
         if not master_data:
             continue
 
-        # Filters by scanning the actual symbol name (e.g. NSE:NIFTY...) to bypass underlying column errors
         underlying_tag = f":{config['underlying_symbol']}"
         option_contracts = [
             item for item in master_data
@@ -240,7 +232,6 @@ def build_locked_options_universe(target_date_str, headers):
 
         all_expiries = sorted(list({item.get("expiry") for item in option_contracts if item.get("expiry") >= target_date_str}))
         
-        # Auto-correction if the target date is missing from live files
         if not all_expiries:
             fallback_expiries = sorted(list({item.get("expiry") for item in option_contracts}))
             if fallback_expiries:
@@ -512,6 +503,10 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
 # ==============================================================================
 def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes):
     df_micro = rolling_master_df.sort_values(["Symbol", "Datetime"]).copy()
+    
+    # 🔥 PANDAS MERGEERROR FIX: Force normalize df_micro Datetime to datetime64[ns]
+    df_micro["Datetime"] = pd.to_datetime(df_micro["Datetime"]).astype("datetime64[ns]")
+
     df_micro = calculate_core_technicals(df_micro)
     df_micro = construct_45deg_renko_matrix(df_micro, micro_tf, MICRO_RENKO_CONFIRM_BRICKS)
     df_micro = construct_volume_delta_renko_matrix(df_micro, micro_tf, MICRO_RENKO_CONFIRM_BRICKS)
@@ -523,6 +518,10 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
     for tf in macro_timeframes:
         print(f"   ├─ Evaluating Macro Context Gates for Options [{tf}]...")
         env_df = evaluate_single_timeframe_gates(rolling_master_df, tf)
+        
+        # 🔥 PANDAS MERGEERROR FIX: Force normalize env_df Datetime to match df_micro
+        env_df["Datetime"] = pd.to_datetime(env_df["Datetime"]).astype("datetime64[ns]")
+
         bull_col, bear_col = f"Armed_Bull_{tf}", f"Armed_Bear_{tf}"
         bull_gate_cols.append(bull_col)
         bear_gate_cols.append(bear_col)
@@ -598,6 +597,10 @@ def scan_fyers_institutional_tape(target_date_str):
                             df = pd.DataFrame(data["candles"], columns=["Epoch", "Open", "High", "Low", "Close", "Volume"])
                             df["Datetime"] = pd.to_datetime(df["Epoch"], unit='s')
                             df["Datetime"] = df["Datetime"].dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata').dt.tz_localize(None)
+                            
+                            # 🔥 PANDAS MERGEERROR FIX: Force resolution out of the gate
+                            df["Datetime"] = df["Datetime"].astype("datetime64[ns]")
+                            
                             df = df.drop_duplicates(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
                             df["Symbol"] = symbol
                             return df
@@ -776,3 +779,4 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
+
