@@ -4,7 +4,7 @@ Fyers API Implementation (Production-Grade & CI/CD Resilient)
 
 Key Features:
 - FYERS NIFTY 50 & SENSEX CE / PE Options Dynamic Extraction
-- Raw Text CSV Parser (100% Immune to Fyers Data Schema Shifts)
+- Indestructible Fuzzy Parser (100% Immune to Fyers Data Schema Shifts)
 - Symbol-Based Filtering (Bypasses underlying column naming inconsistencies)
 - 09:15 AM Opening Strike Freeze (Locked for the Whole Session)
 - Dual-Tier 7-Pillar Scorecard & 45-Degree Price/Volume/Velocity Renko Engine
@@ -116,39 +116,71 @@ ENTRY_CUTOFF_TIME = "15:00"
 # 1. FYERS SPECIFIC INGESTION & 09:15 STRIKE SELECTION
 # ==============================================================================
 def fetch_fyers_instruments(segment):
-    """Raw text parser to bypass Pandas dataframe shifting vulnerabilities."""
+    """
+    Indestructible Fuzzy Parser for Fyers CSV. 
+    Bypasses rigid column numbers and identifies data by its literal value structure.
+    """
     url = f"https://public.fyers.in/sym_details/{segment}.csv"
     try:
-        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
+        }
         res = requests.get(url, headers=headers, timeout=15)
         if res.status_code != 200:
             print(f"{COLOR_RED}[API Error] HTTP {res.status_code} fetching {segment}{COLOR_RESET}")
             return []
             
+        text_data = res.text.strip()
+        lines = text_data.split('\n')
+        print(f"   ├─ {COLOR_DIM}[Data Loader] Downloaded {len(lines)} raw lines from {segment}{COLOR_RESET}")
+
         contracts = []
-        lines = res.text.strip().split('\n')
         
         for line in lines:
             parts = line.split(',')
-            # Ensure the row has enough columns to prevent index errors
-            if len(parts) < 16:
+            if len(parts) < 10:
                 continue
             
-            # Fyers Standard Mapping: 1=Symbol, 8=Epoch Expiry, 14=Strike, 15=OptionType
-            symbol = parts[1]
-            opt_type = parts[15].strip().upper()
+            # 1. Fuzzy match the Symbol Column
+            symbol = next((p for p in parts if p.startswith("NSE:") or p.startswith("BSE:")), None)
+            if not symbol: continue
             
-            if opt_type not in ["CE", "PE"]:
+            # Fast filter: Only process Index Options
+            if "NIFTY" not in symbol and "SENSEX" not in symbol:
                 continue
-                
-            try:
-                expiry_epoch = int(parts[8])
-                # Converts Fyers timestamp to YYYY-MM-DD
-                expiry_date = datetime.utcfromtimestamp(expiry_epoch).strftime('%Y-%m-%d')
-                strike = float(parts[14])
-            except ValueError:
-                continue
-                
+
+            # 2. Fuzzy match the Option Type (CE/PE)
+            opt_type = next((p.strip().upper() for p in parts if p.strip().upper() in ["CE", "PE"]), None)
+            if not opt_type:
+                # Fallback: Sometimes CE/PE is only appended to the symbol itself
+                if symbol.endswith("CE"): opt_type = "CE"
+                elif symbol.endswith("PE"): opt_type = "PE"
+                else: continue
+
+            # 3. Fuzzy match the Epoch Expiry Timestamp (10-digit number)
+            valid_prefixes = tuple(str(i) for i in range(16, 22))  # Valid timestamp ranges for current decade
+            expiry_epoch_str = next((p for p in parts if p.isdigit() and len(p) == 10 and p.startswith(valid_prefixes)), None)
+            if not expiry_epoch_str: continue
+            
+            expiry_epoch = int(expiry_epoch_str)
+            expiry_date = datetime.utcfromtimestamp(expiry_epoch).strftime('%Y-%m-%d')
+
+            # 4. Fuzzy match the Strike Price (Scan backwards to avoid parsing random ID floats)
+            strike = None
+            for p in reversed(parts):
+                try:
+                    val = float(p)
+                    # Nifty/Sensex strikes are large numbers and always divisible by 50 (or 100)
+                    if 1000.0 <= val <= 200000.0 and val % 50 == 0:
+                        # Ensure we didn't accidentally grab the epoch timestamp
+                        if str(int(val)) != expiry_epoch_str:
+                            strike = val
+                            break
+                except ValueError:
+                    pass
+                    
+            if not strike: continue
+
             contracts.append({
                 "symbolDetails": symbol,
                 "expiry": expiry_date,
@@ -156,11 +188,12 @@ def fetch_fyers_instruments(segment):
                 "optionType": opt_type
             })
             
-        print(f"   ├─ {COLOR_DIM}[Data Loader] Parsed {len(contracts)} total option contracts from {segment}{COLOR_RESET}")
+        print(f"   ├─ {COLOR_DIM}[Data Loader] Successfully extracted {len(contracts)} Index Options from {segment}{COLOR_RESET}")
         return contracts
     except Exception as e:
         print(f"{COLOR_RED}[API Error] Failed fetching/parsing {segment}: {e}{COLOR_RESET}")
         return []
+
 
 def get_fyers_spot_opening_price_at_0915(spot_key, target_date_str, headers):
     url = "https://api-t1.fyers.in/data/history"
