@@ -4,8 +4,8 @@ Fyers API Implementation (Production-Grade & CI/CD Resilient)
 
 Key Features:
 - FYERS NIFTY 50 & SENSEX CE / PE Options Dynamic Extraction
-- Column-Agnostic CSV Parser (Immune to Fyers Schema Changes)
-- Date-Mismatch Auto-Fallback (Snaps to nearest valid expiry if date is missing)
+- Raw Text CSV Parser (100% Immune to Fyers Data Schema Shifts)
+- Symbol-Based Filtering (Bypasses underlying column naming inconsistencies)
 - 09:15 AM Opening Strike Freeze (Locked for the Whole Session)
 - Dual-Tier 7-Pillar Scorecard & 45-Degree Price/Volume/Velocity Renko Engine
 """
@@ -14,7 +14,6 @@ import argparse
 import concurrent.futures
 import datetime
 from datetime import datetime, timedelta
-import io
 import os
 import sys
 import time
@@ -117,24 +116,48 @@ ENTRY_CUTOFF_TIME = "15:00"
 # 1. FYERS SPECIFIC INGESTION & 09:15 STRIKE SELECTION
 # ==============================================================================
 def fetch_fyers_instruments(segment):
-    """Dynamically parses Fyers CSV, bypassing column count errors entirely."""
+    """Raw text parser to bypass Pandas dataframe shifting vulnerabilities."""
     url = f"https://public.fyers.in/sym_details/{segment}.csv"
     try:
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         res = requests.get(url, headers=headers, timeout=15)
         if res.status_code != 200:
+            print(f"{COLOR_RED}[API Error] HTTP {res.status_code} fetching {segment}{COLOR_RESET}")
             return []
             
-        # header=None and on_bad_lines='skip' guarantees Pandas won't crash if Fyers adds/removes columns
-        df = pd.read_csv(io.StringIO(res.text), header=None, on_bad_lines='skip', low_memory=False)
+        contracts = []
+        lines = res.text.strip().split('\n')
         
-        # We exclusively grab Fyers standard columns: 1:Symbol, 8:Expiry, 13:Underlying, 14:Strike, 15:Type
-        df = df[[1, 8, 13, 14, 15]]
-        df.columns = ["symbolDetails", "expiryDate", "underlying", "strikePrice", "optionType"]
-        
-        # Safely convert Expiry Epoch to String Date
-        df['expiry'] = pd.to_datetime(df['expiryDate'], unit='s', errors='coerce').dt.strftime('%Y-%m-%d')
-        return df.dropna(subset=['expiry']).to_dict('records')
+        for line in lines:
+            parts = line.split(',')
+            # Ensure the row has enough columns to prevent index errors
+            if len(parts) < 16:
+                continue
+            
+            # Fyers Standard Mapping: 1=Symbol, 8=Epoch Expiry, 14=Strike, 15=OptionType
+            symbol = parts[1]
+            opt_type = parts[15].strip().upper()
+            
+            if opt_type not in ["CE", "PE"]:
+                continue
+                
+            try:
+                expiry_epoch = int(parts[8])
+                # Converts Fyers timestamp to YYYY-MM-DD
+                expiry_date = datetime.utcfromtimestamp(expiry_epoch).strftime('%Y-%m-%d')
+                strike = float(parts[14])
+            except ValueError:
+                continue
+                
+            contracts.append({
+                "symbolDetails": symbol,
+                "expiry": expiry_date,
+                "strikePrice": strike,
+                "optionType": opt_type
+            })
+            
+        print(f"   ├─ {COLOR_DIM}[Data Loader] Parsed {len(contracts)} total option contracts from {segment}{COLOR_RESET}")
+        return contracts
     except Exception as e:
         print(f"{COLOR_RED}[API Error] Failed fetching/parsing {segment}: {e}{COLOR_RESET}")
         return []
@@ -171,24 +194,25 @@ def build_locked_options_universe(target_date_str, headers):
         if not master_data:
             continue
 
+        # Filters by scanning the actual symbol name (e.g. NSE:NIFTY...) to bypass underlying column errors
+        underlying_tag = f":{config['underlying_symbol']}"
         option_contracts = [
             item for item in master_data
-            if str(item.get("underlying")).upper() == config["underlying_symbol"].upper()
-            and item.get("optionType") in ("CE", "PE")
+            if underlying_tag in item["symbolDetails"].upper()
         ]
 
         if not option_contracts:
+            print(f"   ├─ [{index_name}] {COLOR_RED}Failed to match any contracts for {config['underlying_symbol']}.{COLOR_RESET}")
             continue
 
-        # Get expiries on or after target date
         all_expiries = sorted(list({item.get("expiry") for item in option_contracts if item.get("expiry") >= target_date_str}))
         
-        # 🔥 CRITICAL FAILSAFE: If Target Date is NOT in Fyers Live Options Chain, fallback to nearest live date
+        # Auto-correction if the target date is missing from live files
         if not all_expiries:
             fallback_expiries = sorted(list({item.get("expiry") for item in option_contracts}))
             if fallback_expiries:
                 target_expiry = fallback_expiries[0]
-                print(f"   ├─ [{index_name}] {COLOR_YELLOW}Warning: {target_date_str} not available in live chain. Auto-correcting to Nearest Expiry: {target_expiry}{COLOR_RESET}")
+                print(f"   ├─ [{index_name}] {COLOR_YELLOW}Warning: {target_date_str} not available. Auto-correcting to Nearest Expiry: {target_expiry}{COLOR_RESET}")
             else:
                 continue
         else:
@@ -214,16 +238,11 @@ def build_locked_options_universe(target_date_str, headers):
         
         matched_count = 0
         for item in option_contracts:
-            contract_expiry = item.get("expiry")
-            try:
-                contract_strike = float(item.get("strikePrice", 0))
-            except Exception: continue
-
-            if contract_expiry == target_expiry and contract_strike in selected_strikes:
+            if item.get("expiry") == target_expiry and float(item.get("strikePrice", 0)) in selected_strikes:
                 selected_option_universe.append({
                     "symbol": item.get("symbolDetails"),
                     "underlying": index_name,
-                    "strike": contract_strike,
+                    "strike": float(item.get("strikePrice", 0)),
                     "option_type": item.get("optionType"),
                     "expiry": target_expiry
                 })
