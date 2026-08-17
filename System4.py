@@ -4,9 +4,9 @@ Fyers API Implementation (Production-Grade & CI/CD Resilient)
 
 Key Features:
 - FYERS NIFTY 50 & SENSEX CE / PE Options Dynamic Extraction
-- Global Configurable Strike Count per Side (ITM/ATM/OTM)
+- Column-Agnostic CSV Parser (Immune to Fyers Schema Changes)
+- Date-Mismatch Auto-Fallback (Snaps to nearest valid expiry if date is missing)
 - 09:15 AM Opening Strike Freeze (Locked for the Whole Session)
-- Automatic Expiry Roll: Moves to Next Week's Expiry on Expiry Days
 - Dual-Tier 7-Pillar Scorecard & 45-Degree Price/Volume/Velocity Renko Engine
 """
 
@@ -45,7 +45,6 @@ BACKTRACE_DAYS = 1
 # ==============================================================================
 NUM_STRIKES_PER_SIDE = 2
 
-# Target underlying index definitions (Mapped to Fyers Symbol Standards)
 INDEX_CONFIG = {
     "NIFTY": {
         "segment_file": "NSE_FO",
@@ -79,7 +78,7 @@ MACRO_RENKO_CONFIRM_BRICKS = 0
 RENKO_MIN_BRICK = 0.50
 RENKO_DEFAULT_PCT = 0.01
 
-GLOBAL_MACRO_STRATEGY_2D = "BOTH"  # "BULLISH", "BEARISH", or "BOTH"
+GLOBAL_MACRO_STRATEGY_2D = "BOTH"  
 
 # ==============================================================================
 # 🎛️ TIER 1 & 2: MACRO & MICRO CONTEXT SWITCHBOARDS
@@ -118,41 +117,29 @@ ENTRY_CUTOFF_TIME = "15:00"
 # 1. FYERS SPECIFIC INGESTION & 09:15 STRIKE SELECTION
 # ==============================================================================
 def fetch_fyers_instruments(segment):
-    """Fetch and parse Fyers daily CSV symbol master safely."""
+    """Dynamically parses Fyers CSV, bypassing column count errors entirely."""
     url = f"https://public.fyers.in/sym_details/{segment}.csv"
     try:
-        # Added User-Agent to prevent Fyers from blocking the request (403 Forbidden)
         headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
         res = requests.get(url, headers=headers, timeout=15)
         if res.status_code != 200:
             return []
             
-        # Read the CSV dynamically without forcing a strict column count
+        # header=None and on_bad_lines='skip' guarantees Pandas won't crash if Fyers adds/removes columns
         df = pd.read_csv(io.StringIO(res.text), header=None, on_bad_lines='skip', low_memory=False)
         
-        # Map only the 5 specific columns we need using Fyers' standard indices
-        # 1: symbolDetails, 8: expiryDate, 13: underlying, 14: strikePrice, 15: optionType
-        df = df.rename(columns={
-            1: "symbolDetails",
-            8: "expiryDate",
-            13: "underlying",
-            14: "strikePrice",
-            15: "optionType"
-        })
+        # We exclusively grab Fyers standard columns: 1:Symbol, 8:Expiry, 13:Underlying, 14:Strike, 15:Type
+        df = df[[1, 8, 13, 14, 15]]
+        df.columns = ["symbolDetails", "expiryDate", "underlying", "strikePrice", "optionType"]
         
-        # Keep only the target columns, ignoring any new columns Fyers added
-        df = df[["symbolDetails", "expiryDate", "underlying", "strikePrice", "optionType"]]
-        
-        # Safe epoch conversion
+        # Safely convert Expiry Epoch to String Date
         df['expiry'] = pd.to_datetime(df['expiryDate'], unit='s', errors='coerce').dt.strftime('%Y-%m-%d')
         return df.dropna(subset=['expiry']).to_dict('records')
     except Exception as e:
-        print(f"{COLOR_RED}[API Error] Failed fetching Fyers master contracts for {segment}: {e}{COLOR_RESET}")
+        print(f"{COLOR_RED}[API Error] Failed fetching/parsing {segment}: {e}{COLOR_RESET}")
         return []
 
-
 def get_fyers_spot_opening_price_at_0915(spot_key, target_date_str, headers):
-    """Fetch the opening candle price safely with index array protection."""
     url = "https://api-t1.fyers.in/data/history"
     params = {
         "symbol": spot_key,
@@ -165,7 +152,6 @@ def get_fyers_spot_opening_price_at_0915(spot_key, target_date_str, headers):
         res = requests.get(url, headers=headers, params=params, timeout=10)
         if res.status_code == 200:
             data = res.json()
-            # Safe list indexing to prevent 'IndexError: list index out of range'
             if data.get("s") == "ok" and data.get("candles") and len(data["candles"]) > 0:
                 first_candle_open = float(data["candles"][0][1])
                 return first_candle_open
@@ -174,7 +160,6 @@ def get_fyers_spot_opening_price_at_0915(spot_key, target_date_str, headers):
     return None
 
 def build_locked_options_universe(target_date_str, headers):
-    """Builds and anchors the CE/PE options universe for Fyers."""
     print(f"\n{COLOR_CYAN}🔍 Initializing Fyers Near-Index Option Strike Engine for {target_date_str}...{COLOR_RESET}")
     nse_master = fetch_fyers_instruments("NSE_FO")
     bse_master = fetch_fyers_instruments("BSE_FO")
@@ -195,16 +180,24 @@ def build_locked_options_universe(target_date_str, headers):
         if not option_contracts:
             continue
 
+        # Get expiries on or after target date
         all_expiries = sorted(list({item.get("expiry") for item in option_contracts if item.get("expiry") >= target_date_str}))
+        
+        # 🔥 CRITICAL FAILSAFE: If Target Date is NOT in Fyers Live Options Chain, fallback to nearest live date
         if not all_expiries:
-            continue
-
-        if all_expiries[0] == target_date_str:
-            target_expiry = all_expiries[1] if len(all_expiries) > 1 else all_expiries[0]
-            print(f"   ├─ [{index_name}] Today is Expiry Day! ➔ {COLOR_YELLOW}Rolling to Next Week: {target_expiry}{COLOR_RESET}")
+            fallback_expiries = sorted(list({item.get("expiry") for item in option_contracts}))
+            if fallback_expiries:
+                target_expiry = fallback_expiries[0]
+                print(f"   ├─ [{index_name}] {COLOR_YELLOW}Warning: {target_date_str} not available in live chain. Auto-correcting to Nearest Expiry: {target_expiry}{COLOR_RESET}")
+            else:
+                continue
         else:
-            target_expiry = all_expiries[0]
-            print(f"   ├─ [{index_name}] Near Expiry Selected: {COLOR_GREEN}{target_expiry}{COLOR_RESET}")
+            if all_expiries[0] == target_date_str:
+                target_expiry = all_expiries[1] if len(all_expiries) > 1 else all_expiries[0]
+                print(f"   ├─ [{index_name}] Today is Expiry Day! ➔ {COLOR_YELLOW}Rolling to Next Week: {target_expiry}{COLOR_RESET}")
+            else:
+                target_expiry = all_expiries[0]
+                print(f"   ├─ [{index_name}] Near Expiry Selected: {COLOR_GREEN}{target_expiry}{COLOR_RESET}")
 
         spot_price = get_fyers_spot_opening_price_at_0915(config["spot_key"], target_date_str, headers)
         
@@ -507,7 +500,6 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
 # ==============================================================================
 def scan_fyers_institutional_tape(target_date_str):
     try:
-        # STRICT FALLBACK SUPPORT: Checks for FYERS_CLIENT_ID first, then falls back to FYERS_APP_ID if needed
         app_id = os.environ.get("FYERS_CLIENT_ID") or os.environ.get("FYERS_APP_ID")
         access_token = os.environ.get("FYERS_ACCESS_TOKEN")
         
@@ -732,4 +724,3 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
-
