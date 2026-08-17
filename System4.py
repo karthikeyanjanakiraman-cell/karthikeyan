@@ -1,9 +1,9 @@
 """
 system3.py - NIFTY & SENSEX Options Multi-Timeframe Renko Execution Engine
-Fyers API Implementation
+Fyers API Implementation (Production-Grade & CI/CD Resilient)
 
 Key Features:
-- FYERS NIFTY 50 & SENSEX CE / PE Options Dynamic Extraction (CSV Master)
+- FYERS NIFTY 50 & SENSEX CE / PE Options Dynamic Extraction
 - Global Configurable Strike Count per Side (ITM/ATM/OTM)
 - 09:15 AM Opening Strike Freeze (Locked for the Whole Session)
 - Automatic Expiry Roll: Moves to Next Week's Expiry on Expiry Days
@@ -14,10 +14,12 @@ import argparse
 import concurrent.futures
 import datetime
 from datetime import datetime, timedelta
+import io
 import os
 import sys
 import time
 import warnings
+import traceback
 
 import numpy as np
 import pandas as pd
@@ -116,25 +118,33 @@ ENTRY_CUTOFF_TIME = "15:00"
 # 1. FYERS SPECIFIC INGESTION & 09:15 STRIKE SELECTION
 # ==============================================================================
 def fetch_fyers_instruments(segment):
-    """Fetch and parse Fyers daily CSV symbol master."""
+    """Fetch and parse Fyers daily CSV symbol master safely."""
     url = f"https://public.fyers.in/sym_details/{segment}.csv"
     try:
-        # Fyers CSV schema mapping
+        # Added User-Agent to prevent Fyers from blocking the request (403 Forbidden)
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"}
+        res = requests.get(url, headers=headers, timeout=15)
+        if res.status_code != 200:
+            return []
+            
         cols = ["fyToken", "symbolDetails", "exchangeInstId", "minLotSize", "tickSize", 
                 "isin", "tradingSession", "lastUpdateDate", "expiryDate", "symbolTicker", 
                 "exchange", "segment", "scripCode", "underlying", "strikePrice", "optionType", "fyUnderlyingToken"]
         
-        df = pd.read_csv(url, header=None, names=cols, usecols=["symbolDetails", "expiryDate", "underlying", "strikePrice", "optionType"])
+        # Read with safe fallbacks if Fyers breaks their CSV format
+        df = pd.read_csv(io.StringIO(res.text), header=None, names=cols, 
+                         usecols=["symbolDetails", "expiryDate", "underlying", "strikePrice", "optionType"],
+                         on_bad_lines='skip', low_memory=False)
         
-        # Convert Fyers epoch expiry (seconds) to YYYY-MM-DD
-        df['expiry'] = pd.to_datetime(df['expiryDate'], unit='s').dt.strftime('%Y-%m-%d')
-        return df.to_dict('records')
+        # Safe epoch conversion
+        df['expiry'] = pd.to_datetime(df['expiryDate'], unit='s', errors='coerce').dt.strftime('%Y-%m-%d')
+        return df.dropna(subset=['expiry']).to_dict('records')
     except Exception as e:
         print(f"{COLOR_RED}[API Error] Failed fetching Fyers master contracts for {segment}: {e}{COLOR_RESET}")
         return []
 
 def get_fyers_spot_opening_price_at_0915(spot_key, target_date_str, headers):
-    """Fetch the opening candle price at 09:15 for the underlying index from Fyers."""
+    """Fetch the opening candle price safely with index array protection."""
     url = "https://api-t1.fyers.in/data/history"
     params = {
         "symbol": spot_key,
@@ -147,8 +157,8 @@ def get_fyers_spot_opening_price_at_0915(spot_key, target_date_str, headers):
         res = requests.get(url, headers=headers, params=params, timeout=10)
         if res.status_code == 200:
             data = res.json()
-            if data.get("s") == "ok" and data.get("candles"):
-                # Fyers candle format: [epoch, open, high, low, close, vol]
+            # Safe list indexing to prevent 'IndexError: list index out of range'
+            if data.get("s") == "ok" and data.get("candles") and len(data["candles"]) > 0:
                 first_candle_open = float(data["candles"][0][1])
                 return first_candle_open
     except Exception:
@@ -193,7 +203,7 @@ def build_locked_options_universe(target_date_str, headers):
         if spot_price is None:
             available_strikes = [float(item.get("strikePrice", 0)) for item in option_contracts if item.get("expiry") == target_expiry]
             spot_price = float(np.median(available_strikes)) if available_strikes else (24000.0 if index_name == "NIFTY" else 79000.0)
-            print(f"   ├─ [{index_name}] {COLOR_YELLOW}Notice: 09:15 Spot unreached. Fallback Anchor @ ₹{spot_price:.2f}{COLOR_RESET}")
+            print(f"   ├─ [{index_name}] {COLOR_YELLOW}Notice: 09:15 Spot API failed/unreached. Fallback Anchor @ ₹{spot_price:.2f}{COLOR_RESET}")
         else:
             print(f"   ├─ [{index_name}] ⚓ 09:15 AM Spot Index Price: ₹{spot_price:.2f}")
 
@@ -235,7 +245,7 @@ def get_past_trading_days(target_date_str, num_days=20):
 
 
 # ==============================================================================
-# 2. CORE TECHNICAL & RENKO ENGINES (Unchanged structural logic)
+# 2. CORE TECHNICAL & RENKO ENGINES
 # ==============================================================================
 def calculate_core_technicals(df_tf):
     df_tf["H-L"] = df_tf["High"] - df_tf["Low"]
@@ -488,205 +498,212 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
 # 5. FYERS SCANNING & TRADE MANAGEMENT ENGINE
 # ==============================================================================
 def scan_fyers_institutional_tape(target_date_str):
-    app_id = os.environ.get("CLIENT_ID")
-    access_token = os.environ.get("ACCESS_TOKEN")
-    
-    if not app_id or not access_token:
-        print(f"❌ {COLOR_RED}Error: FYERS_APP_ID or FYERS_ACCESS_TOKEN environment variables not found.{COLOR_RESET}")
-        return
-
-    headers = {"Authorization": f"{app_id}:{access_token}"}
-    universe = build_locked_options_universe(target_date_str, headers)
-    
-    if not universe:
-        print(f"{COLOR_RED}❌ No valid option strikes generated for {target_date_str}.{COLOR_RESET}")
-        return
-
-    trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
-    if not trading_days:
-        return
-
-    target_dt = pd.to_datetime(target_date_str)
-    print(f"🚀 Multithreading Bulk Ingestion for {len(universe)} Fyers Option Contracts...")
-    fetch_tasks = [(item, trading_days[0], target_date_str) for item in universe]
-    historical_dfs = []
-
-    def fetch_fyers_worker(task):
-        item, start_date, end_date = task
-        symbol = item["symbol"]
-        url = "https://api-t1.fyers.in/data/history"
-        params = {
-            "symbol": symbol,
-            "resolution": "1",
-            "date_format": "1",
-            "range_from": start_date,
-            "range_to": end_date
-        }
+    try:
+        # STRICT FALLBACK SUPPORT: Checks for FYERS_CLIENT_ID first, then falls back to FYERS_APP_ID if needed
+        app_id = os.environ.get("FYERS_CLIENT_ID") or os.environ.get("FYERS_APP_ID")
+        access_token = os.environ.get("FYERS_ACCESS_TOKEN")
         
-        for attempt in range(3):
-            try:
-                res = requests.get(url, headers=headers, params=params, timeout=15)
-                if res.status_code == 200:
-                    data = res.json()
-                    if data.get("s") == "ok" and data.get("candles"):
-                        df = pd.DataFrame(data["candles"], columns=["Epoch", "Open", "High", "Low", "Close", "Volume"])
-                        # Fyers returns Epoch in seconds representing IST time block. Convert to Datetime.
-                        df["Datetime"] = pd.to_datetime(df["Epoch"], unit='s')
-                        # Fyers epoch represents India time natively in their payload
-                        df["Datetime"] = df["Datetime"].dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata').dt.tz_localize(None)
-                        df = df.drop_duplicates(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
-                        df["Symbol"] = symbol
-                        return df
-                    break
-                elif res.status_code == 429: time.sleep(1.5)
-                else: break
-            except Exception: time.sleep(1)
-        return None
+        print(f"\n{COLOR_DIM}[System Auth Check] Client ID Passed: {'Yes' if app_id else 'NO'} | Token Passed: {'Yes' if access_token else 'NO'}{COLOR_RESET}")
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(fetch_fyers_worker, task): task for task in fetch_tasks}
-        completed = 0
-        for future in concurrent.futures.as_completed(futures):
-            completed += 1
-            sys.stdout.write(f"\r📡 Fetching Fyers History... {completed}/{len(fetch_tasks)} options contracts processed")
-            sys.stdout.flush()
-            res = future.result()
-            if res is not None: historical_dfs.append(res)
-    print()
+        if not app_id or not access_token:
+            print(f"❌ {COLOR_RED}Error: FYERS_CLIENT_ID or FYERS_ACCESS_TOKEN environment variables not found.{COLOR_RESET}")
+            return
 
-    if not historical_dfs:
-        print(f"{COLOR_YELLOW}[Warning] No candle data returned for the selected Fyers option strikes.{COLOR_RESET}")
-        return
-
-    rolling_master_df = pd.concat(historical_dfs, ignore_index=True)
-    print("⚙️ Computing Technicals, Velocity Matrices & Option Micro/Macro Tape...")
-
-    tape_exec = prepare_unified_execution_tape(rolling_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES)
-    if GLOBAL_MACRO_STRATEGY_2D == "BULLISH": tape_exec["Master_Armed_Bear"] = False
-    elif GLOBAL_MACRO_STRATEGY_2D == "BEARISH": tape_exec["Master_Armed_Bull"] = False
-
-    all_anomalies = tape_exec[tape_exec["Direction"] != 0].copy()
-    anomalies_by_time = all_anomalies.groupby("Datetime")
-
-    closes_dict = tape_exec.set_index(["Datetime", "Symbol"])["Close"].to_dict()
-    micro_price_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Renko_Count_{MICRO_TIMEFRAME}"].to_dict()
-    micro_vol_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{MICRO_TIMEFRAME}"].to_dict()
-    micro_vel_bars = tape_exec.set_index(["Datetime", "Symbol"])[f"Bars_Since_Brick_{MICRO_TIMEFRAME}"].to_dict()
-    macro_price_renkos = {tf: tape_exec.set_index(["Datetime", "Symbol"])[f"Renko_Count_{tf}"].to_dict() for tf in MACRO_TIMEFRAMES}
-    macro_vol_renkos = {tf: tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{tf}"].to_dict() for tf in MACRO_TIMEFRAMES}
-    
-    all_times = np.sort(tape_exec["Datetime"].unique())
-    memory_bank = {}
-    cutoff_time_obj = pd.to_datetime(ENTRY_CUTOFF_TIME).time()
-
-    for t in all_times:
-        t_dt = pd.to_datetime(t)
+        headers = {"Authorization": f"{app_id}:{access_token}"}
+        universe = build_locked_options_universe(target_date_str, headers)
         
-        for sym, st in memory_bank.items():
-            if st["state"] == "ACTIVE":
-                ltp = closes_dict.get((t_dt, sym))
-                mi_p_count = micro_price_renko.get((t_dt, sym), 0)
-                mi_v_count = micro_vol_renko.get((t_dt, sym), 0)
-                mi_bars_stalled = micro_vel_bars.get((t_dt, sym), 0)
+        if not universe:
+            print(f"{COLOR_RED}❌ No valid option strikes generated for {target_date_str}.{COLOR_RESET}")
+            return
 
-                if ltp is not None:
-                    exit_reason = None
-                    if mi_bars_stalled > RENKO_VELOCITY_MAX_BARS:
-                        exit_reason = f"Velocity Stall (No brick in {RENKO_VELOCITY_MAX_BARS} bars)"
-                    
-                    if not exit_reason:
-                        if st["dir"] == 1:
-                            if mi_p_count <= -MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
-                            elif mi_v_count <= -MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
-                            else:
-                                for tf in st["triggering_macro_tfs"]:
-                                    if macro_price_renkos[tf].get((t_dt, sym), 0) <= -MACRO_EXIT_PRICE_BRICKS:
-                                        exit_reason = f"Macro [{tf}] Price Break"
-                                        break
-                                    if macro_vol_renkos[tf].get((t_dt, sym), 0) <= -MACRO_EXIT_VOL_BRICKS:
-                                        exit_reason = f"Macro [{tf}] Volume Break"
-                                        break
-                        elif st["dir"] == -1:
-                            if mi_p_count >= MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
-                            elif mi_v_count >= MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
-                            else:
-                                for tf in st["triggering_macro_tfs"]:
-                                    if macro_price_renkos[tf].get((t_dt, sym), 0) >= MACRO_EXIT_PRICE_BRICKS:
-                                        exit_reason = f"Macro [{tf}] Price Break"
-                                        break
-                                    if macro_vol_renkos[tf].get((t_dt, sym), 0) >= MACRO_EXIT_VOL_BRICKS:
-                                        exit_reason = f"Macro [{tf}] Volume Break"
-                                        break
-                    
-                    if exit_reason:
-                        st["state"] = "EXITED"
-                        st["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M")
-                        st["exit_price"] = ltp
-                        st["exit_reason"] = exit_reason
+        trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
+        if not trading_days:
+            return
 
-        if t_dt in anomalies_by_time.groups and t_dt.time() <= cutoff_time_obj:
-            for _, row in anomalies_by_time.get_group(t_dt).iterrows():
-                sym = row["Symbol"]
-                direction = row["Direction"]
-                triggered_m_tfs = [tf for tf in MACRO_TIMEFRAMES if row.get(f"Armed_Bull_{tf}" if direction == 1 else f"Armed_Bear_{tf}", False)]
+        target_dt = pd.to_datetime(target_date_str)
+        print(f"🚀 Multithreading Bulk Ingestion for {len(universe)} Fyers Option Contracts...")
+        fetch_tasks = [(item, trading_days[0], target_date_str) for item in universe]
+        historical_dfs = []
 
-                if sym not in memory_bank or memory_bank[sym]["state"] == "EXITED":
-                    memory_bank[sym] = {
-                        "state": "ACTIVE",
-                        "origin": row["Close"],              
-                        "date": t_dt.strftime("%Y-%m-%d"),
-                        "time": t_dt.strftime("%H:%M"),      
-                        "dir": direction,
-                        "exit_time": None,
-                        "exit_price": None,
-                        "exit_reason": None,
-                        "triggering_macro_tfs": triggered_m_tfs
-                    }
+        def fetch_fyers_worker(task):
+            item, start_date, end_date = task
+            symbol = item["symbol"]
+            url = "https://api-t1.fyers.in/data/history"
+            params = {
+                "symbol": symbol,
+                "resolution": "1",
+                "date_format": "1",
+                "range_from": start_date,
+                "range_to": end_date
+            }
+            
+            for attempt in range(3):
+                try:
+                    res = requests.get(url, headers=headers, params=params, timeout=15)
+                    if res.status_code == 200:
+                        data = res.json()
+                        if data.get("s") == "ok" and data.get("candles"):
+                            df = pd.DataFrame(data["candles"], columns=["Epoch", "Open", "High", "Low", "Close", "Volume"])
+                            df["Datetime"] = pd.to_datetime(df["Epoch"], unit='s')
+                            df["Datetime"] = df["Datetime"].dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata').dt.tz_localize(None)
+                            df = df.drop_duplicates(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
+                            df["Symbol"] = symbol
+                            return df
+                        break
+                    elif res.status_code == 429: time.sleep(1.5)
+                    else: break
+                except Exception: time.sleep(1)
+            return None
 
-        if t_dt.hour == 15 and t_dt.minute >= 15:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(fetch_fyers_worker, task): task for task in fetch_tasks}
+            completed = 0
+            for future in concurrent.futures.as_completed(futures):
+                completed += 1
+                sys.stdout.write(f"\r📡 Fetching Fyers History... {completed}/{len(fetch_tasks)} options contracts processed")
+                sys.stdout.flush()
+                res = future.result()
+                if res is not None: historical_dfs.append(res)
+        print()
+
+        if not historical_dfs:
+            print(f"{COLOR_YELLOW}[Warning] No candle data returned for the selected Fyers option strikes.{COLOR_RESET}")
+            return
+
+        rolling_master_df = pd.concat(historical_dfs, ignore_index=True)
+        print("⚙️ Computing Technicals, Velocity Matrices & Option Micro/Macro Tape...")
+
+        tape_exec = prepare_unified_execution_tape(rolling_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES)
+        if GLOBAL_MACRO_STRATEGY_2D == "BULLISH": tape_exec["Master_Armed_Bear"] = False
+        elif GLOBAL_MACRO_STRATEGY_2D == "BEARISH": tape_exec["Master_Armed_Bull"] = False
+
+        all_anomalies = tape_exec[tape_exec["Direction"] != 0].copy()
+        anomalies_by_time = all_anomalies.groupby("Datetime")
+
+        closes_dict = tape_exec.set_index(["Datetime", "Symbol"])["Close"].to_dict()
+        micro_price_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Renko_Count_{MICRO_TIMEFRAME}"].to_dict()
+        micro_vol_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{MICRO_TIMEFRAME}"].to_dict()
+        micro_vel_bars = tape_exec.set_index(["Datetime", "Symbol"])[f"Bars_Since_Brick_{MICRO_TIMEFRAME}"].to_dict()
+        macro_price_renkos = {tf: tape_exec.set_index(["Datetime", "Symbol"])[f"Renko_Count_{tf}"].to_dict() for tf in MACRO_TIMEFRAMES}
+        macro_vol_renkos = {tf: tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{tf}"].to_dict() for tf in MACRO_TIMEFRAMES}
+        
+        all_times = np.sort(tape_exec["Datetime"].unique())
+        memory_bank = {}
+        cutoff_time_obj = pd.to_datetime(ENTRY_CUTOFF_TIME).time()
+
+        for t in all_times:
+            t_dt = pd.to_datetime(t)
+            
             for sym, st in memory_bank.items():
                 if st["state"] == "ACTIVE":
-                    st["state"] = "EXITED"
-                    st["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M") + " (EOD)"
-                    st["exit_price"] = closes_dict.get((t_dt, sym), st["origin"])
-                    st["exit_reason"] = "End of Day Market Close"
+                    ltp = closes_dict.get((t_dt, sym))
+                    mi_p_count = micro_price_renko.get((t_dt, sym), 0)
+                    mi_v_count = micro_vol_renko.get((t_dt, sym), 0)
+                    mi_bars_stalled = micro_vel_bars.get((t_dt, sym), 0)
 
-    today_master = tape_exec[tape_exec["Datetime"].dt.date == target_dt.date()]
-    if today_master.empty: return
-        
-    final_ltp_dict = today_master.groupby("Symbol")["Close"].last().to_dict()
+                    if ltp is not None:
+                        exit_reason = None
+                        if mi_bars_stalled > RENKO_VELOCITY_MAX_BARS:
+                            exit_reason = f"Velocity Stall (No brick in {RENKO_VELOCITY_MAX_BARS} bars)"
+                        
+                        if not exit_reason:
+                            if st["dir"] == 1:
+                                if mi_p_count <= -MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
+                                elif mi_v_count <= -MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
+                                else:
+                                    for tf in st["triggering_macro_tfs"]:
+                                        if macro_price_renkos[tf].get((t_dt, sym), 0) <= -MACRO_EXIT_PRICE_BRICKS:
+                                            exit_reason = f"Macro [{tf}] Price Break"
+                                            break
+                                        if macro_vol_renkos[tf].get((t_dt, sym), 0) <= -MACRO_EXIT_VOL_BRICKS:
+                                            exit_reason = f"Macro [{tf}] Volume Break"
+                                            break
+                            elif st["dir"] == -1:
+                                if mi_p_count >= MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
+                                elif mi_v_count >= MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
+                                else:
+                                    for tf in st["triggering_macro_tfs"]:
+                                        if macro_price_renkos[tf].get((t_dt, sym), 0) >= MACRO_EXIT_PRICE_BRICKS:
+                                            exit_reason = f"Macro [{tf}] Price Break"
+                                            break
+                                        if macro_vol_renkos[tf].get((t_dt, sym), 0) >= MACRO_EXIT_VOL_BRICKS:
+                                            exit_reason = f"Macro [{tf}] Volume Break"
+                                            break
+                        
+                        if exit_reason:
+                            st["state"] = "EXITED"
+                            st["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M")
+                            st["exit_price"] = ltp
+                            st["exit_reason"] = exit_reason
 
-    # ==============================================================================
-    # 6. TERMINAL OUTPUT DISPLAY
-    # ==============================================================================
-    active_runners = {sym: st for sym, st in memory_bank.items() if st["state"] == "ACTIVE"}
-    closed_trades = [{**st, "sym": sym} for sym, st in memory_bank.items() if st["state"] == "EXITED" and st["date"] == target_date_str]
+            if t_dt in anomalies_by_time.groups and t_dt.time() <= cutoff_time_obj:
+                for _, row in anomalies_by_time.get_group(t_dt).iterrows():
+                    sym = row["Symbol"]
+                    direction = row["Direction"]
+                    triggered_m_tfs = [tf for tf in MACRO_TIMEFRAMES if row.get(f"Armed_Bull_{tf}" if direction == 1 else f"Armed_Bear_{tf}", False)]
 
-    tf_display_str = " | ".join(MACRO_TIMEFRAMES)
-    print(f"\n{COLOR_CYAN}================================================================================================{COLOR_RESET}")
-    print(f"{COLOR_BOLD}FYERS NIFTY & SENSEX DUAL-TIER ENGINE [{MICRO_TIMEFRAME} Micro ⚡ Macro: {tf_display_str}]{COLOR_RESET}")
-    print(f"{COLOR_CYAN}================================================================================================{COLOR_RESET}\n")
+                    if sym not in memory_bank or memory_bank[sym]["state"] == "EXITED":
+                        memory_bank[sym] = {
+                            "state": "ACTIVE",
+                            "origin": row["Close"],              
+                            "date": t_dt.strftime("%Y-%m-%d"),
+                            "time": t_dt.strftime("%H:%M"),      
+                            "dir": direction,
+                            "exit_time": None,
+                            "exit_price": None,
+                            "exit_reason": None,
+                            "triggering_macro_tfs": triggered_m_tfs
+                        }
 
-    if active_runners:
-        print(f"{COLOR_BOLD}🟢 BASKET 1: ACTIVE OPTION RUNNERS{COLOR_RESET}")
-        for sym, st in active_runners.items():
-            ltp = final_ltp_dict.get(sym, st["origin"])
-            pnl_pct = ((ltp - st["origin"]) / st["origin"]) * 100 if st["dir"] == 1 else ((st["origin"] - ltp) / st["origin"]) * 100
-            color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
-            d_str = "BUY/LONG" if st["dir"] == 1 else "SELL/SHORT"
-            print(f"  {color}⚡ {sym:<25} P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
-            print(f"      └─ ⚓ Qualifying Macro TFs : {', '.join(st['triggering_macro_tfs'])}")
-            print(f"      └─ 🎯 Entry / LTP          : ₹{st['origin']:.2f} ➔ ₹{ltp:.2f}\n")
+            if t_dt.hour == 15 and t_dt.minute >= 15:
+                for sym, st in memory_bank.items():
+                    if st["state"] == "ACTIVE":
+                        st["state"] = "EXITED"
+                        st["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M") + " (EOD)"
+                        st["exit_price"] = closes_dict.get((t_dt, sym), st["origin"])
+                        st["exit_reason"] = "End of Day Market Close"
 
-    if closed_trades:
-        print(f"{COLOR_BOLD}🛑 BASKET 2: CLOSED OPTION TRADES{COLOR_RESET}")
-        for st in closed_trades:
-            pnl_pct = ((st["exit_price"] - st["origin"]) / st["origin"]) * 100 if st["dir"] == 1 else ((st["origin"] - st["exit_price"]) / st["origin"]) * 100
-            color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
-            d_str = "BUY/LONG" if st["dir"] == 1 else "SELL/SHORT"
-            print(f"  {color}🛑 {st['sym']:<25} Final P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
-            print(f"      └─ 🎯 Exit Time / Price    : {st['exit_time']} | ₹{st['exit_price']:.2f}")
-            print(f"      └─ 📉 Exit Reason          : {st['exit_reason']}\n")
+        today_master = tape_exec[tape_exec["Datetime"].dt.date == target_dt.date()]
+        if today_master.empty: return
+            
+        final_ltp_dict = today_master.groupby("Symbol")["Close"].last().to_dict()
+
+        # ==============================================================================
+        # 6. TERMINAL OUTPUT DISPLAY
+        # ==============================================================================
+        active_runners = {sym: st for sym, st in memory_bank.items() if st["state"] == "ACTIVE"}
+        closed_trades = [{**st, "sym": sym} for sym, st in memory_bank.items() if st["state"] == "EXITED" and st["date"] == target_date_str]
+
+        tf_display_str = " | ".join(MACRO_TIMEFRAMES)
+        print(f"\n{COLOR_CYAN}================================================================================================{COLOR_RESET}")
+        print(f"{COLOR_BOLD}FYERS NIFTY & SENSEX DUAL-TIER ENGINE [{MICRO_TIMEFRAME} Micro ⚡ Macro: {tf_display_str}]{COLOR_RESET}")
+        print(f"{COLOR_CYAN}================================================================================================{COLOR_RESET}\n")
+
+        if active_runners:
+            print(f"{COLOR_BOLD}🟢 BASKET 1: ACTIVE OPTION RUNNERS{COLOR_RESET}")
+            for sym, st in active_runners.items():
+                ltp = final_ltp_dict.get(sym, st["origin"])
+                pnl_pct = ((ltp - st["origin"]) / st["origin"]) * 100 if st["dir"] == 1 else ((st["origin"] - ltp) / st["origin"]) * 100
+                color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
+                d_str = "BUY/LONG" if st["dir"] == 1 else "SELL/SHORT"
+                print(f"  {color}⚡ {sym:<25} P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
+                print(f"      └─ ⚓ Qualifying Macro TFs : {', '.join(st['triggering_macro_tfs'])}")
+                print(f"      └─ 🎯 Entry / LTP          : ₹{st['origin']:.2f} ➔ ₹{ltp:.2f}\n")
+
+        if closed_trades:
+            print(f"{COLOR_BOLD}🛑 BASKET 2: CLOSED OPTION TRADES{COLOR_RESET}")
+            for st in closed_trades:
+                pnl_pct = ((st["exit_price"] - st["origin"]) / st["origin"]) * 100 if st["dir"] == 1 else ((st["origin"] - st["exit_price"]) / st["origin"]) * 100
+                color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
+                d_str = "BUY/LONG" if st["dir"] == 1 else "SELL/SHORT"
+                print(f"  {color}🛑 {st['sym']:<25} Final P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
+                print(f"      └─ 🎯 Exit Time / Price    : {st['exit_time']} | ₹{st['exit_price']:.2f}")
+                print(f"      └─ 📉 Exit Reason          : {st['exit_reason']}\n")
+
+    except Exception as e:
+        print(f"\n{COLOR_RED}💥 CRITICAL ENGINE FAILURE: {e}{COLOR_RESET}")
+        traceback.print_exc()
+
 
 def run_production_sweep():
     parser = argparse.ArgumentParser()
