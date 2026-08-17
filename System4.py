@@ -43,7 +43,7 @@ BACKTRACE_DAYS = 1
 # ==============================================================================
 # ★ GLOBAL CONFIGURATION: INDEX OPTIONS & STRIKE PROCESSING ★
 # ==============================================================================
-NUM_STRIKES_PER_SIDE = 2
+NUM_STRIKES_PER_SIDE = 4
 
 INDEX_CONFIG = {
     "NIFTY": {
@@ -63,8 +63,8 @@ INDEX_CONFIG = {
 # ==============================================================================
 # ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
-MICRO_TIMEFRAME = "1min"
-MACRO_TIMEFRAMES = ["5min"]
+MICRO_TIMEFRAME = "15min"
+MACRO_TIMEFRAMES = ["60min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
