@@ -127,14 +127,21 @@ def fetch_fyers_instruments(segment):
         if res.status_code != 200:
             return []
             
-        cols = ["fyToken", "symbolDetails", "exchangeInstId", "minLotSize", "tickSize", 
-                "isin", "tradingSession", "lastUpdateDate", "expiryDate", "symbolTicker", 
-                "exchange", "segment", "scripCode", "underlying", "strikePrice", "optionType", "fyUnderlyingToken"]
+        # Read the CSV dynamically without forcing a strict column count
+        df = pd.read_csv(io.StringIO(res.text), header=None, on_bad_lines='skip', low_memory=False)
         
-        # Read with safe fallbacks if Fyers breaks their CSV format
-        df = pd.read_csv(io.StringIO(res.text), header=None, names=cols, 
-                         usecols=["symbolDetails", "expiryDate", "underlying", "strikePrice", "optionType"],
-                         on_bad_lines='skip', low_memory=False)
+        # Map only the 5 specific columns we need using Fyers' standard indices
+        # 1: symbolDetails, 8: expiryDate, 13: underlying, 14: strikePrice, 15: optionType
+        df = df.rename(columns={
+            1: "symbolDetails",
+            8: "expiryDate",
+            13: "underlying",
+            14: "strikePrice",
+            15: "optionType"
+        })
+        
+        # Keep only the target columns, ignoring any new columns Fyers added
+        df = df[["symbolDetails", "expiryDate", "underlying", "strikePrice", "optionType"]]
         
         # Safe epoch conversion
         df['expiry'] = pd.to_datetime(df['expiryDate'], unit='s', errors='coerce').dt.strftime('%Y-%m-%d')
@@ -142,6 +149,7 @@ def fetch_fyers_instruments(segment):
     except Exception as e:
         print(f"{COLOR_RED}[API Error] Failed fetching Fyers master contracts for {segment}: {e}{COLOR_RESET}")
         return []
+
 
 def get_fyers_spot_opening_price_at_0915(spot_key, target_date_str, headers):
     """Fetch the opening candle price safely with index array protection."""
@@ -713,6 +721,7 @@ def run_production_sweep():
 
     if not raw_date_str:
         target_dt = datetime.utcnow() + timedelta(hours=5, minutes=30)
+        # Offset for weekends if backtest date isn't explicitly provided
         if target_dt.weekday() == 5: target_dt -= timedelta(days=1)
         elif target_dt.weekday() == 6: target_dt -= timedelta(days=2)
         target_date_str = target_dt.strftime("%Y-%m-%d")
@@ -723,3 +732,4 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
+
