@@ -44,7 +44,7 @@ BACKTRACE_DAYS = 1
 # ==============================================================================
 # ★ GLOBAL CONFIGURATION: INDEX OPTIONS & STRIKE PROCESSING ★
 # ==============================================================================
-NUM_STRIKES_PER_SIDE = 4
+NUM_STRIKES_PER_SIDE = 10
 
 INDEX_CONFIG = {
     "NIFTY": {
@@ -64,8 +64,8 @@ INDEX_CONFIG = {
 # ==============================================================================
 # ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
-MICRO_TIMEFRAME = "1min"   # Accelerated to capture early momentum
-MACRO_TIMEFRAMES = ["5min"]  # Accelerated to sync with 1min triggers
+MICRO_TIMEFRAME = "3min"   # Accelerated to capture early momentum
+MACRO_TIMEFRAMES = ["15min"]  # Accelerated to sync with 1min triggers
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -77,7 +77,7 @@ STOCH_PERIOD = 14
 MICRO_RENKO_CONFIRM_BRICKS = 1
 MACRO_RENKO_CONFIRM_BRICKS = 1
 RENKO_MIN_BRICK = 0.50
-RENKO_DEFAULT_PCT = 0.005
+RENKO_DEFAULT_PCT = 0.1
 
 GLOBAL_MACRO_STRATEGY_2D = "BOTH"  
 
