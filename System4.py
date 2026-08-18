@@ -5,9 +5,10 @@ Fyers API Implementation (Production-Grade & CI/CD Resilient)
 Key Features:
 - FYERS NIFTY 50 & SENSEX CE / PE Options Dynamic Extraction
 - STRICTLY OPTION BUYING ONLY (Long CE / Long PE)
+- SNIPER ENTRY MANDATE (Requires exact-minute fresh brick to enter)
+- 14:30 PM Cutoff Time to avoid EOD Theta Traps
 - Indestructible Fuzzy Parser (100% Immune to Fyers Data Schema Shifts)
 - Datetime Resolution Normalization (Fixes Pandas MergeErrors)
-- 09:15 AM Opening Strike Freeze (Locked for the Whole Session)
 - Dual-Tier 7-Pillar Scorecard & 45-Degree Price/Volume/Velocity Renko Engine
 - Sequential True Trade Ledger (Logs multiple entries/exits per strike)
 """
@@ -39,12 +40,12 @@ COLOR_DIM = "\033[2m"
 COLOR_RESET = "\033[0m"
 COLOR_BOLD = "\033[1m"
 
-BACKTRACE_DAYS = 10
+BACKTRACE_DAYS = 1
 
 # ==============================================================================
 # ★ GLOBAL CONFIGURATION: INDEX OPTIONS & STRIKE PROCESSING ★
 # ==============================================================================
-NUM_STRIKES_PER_SIDE = 10
+NUM_STRIKES_PER_SIDE = 4
 
 INDEX_CONFIG = {
     "NIFTY": {
@@ -64,8 +65,8 @@ INDEX_CONFIG = {
 # ==============================================================================
 # ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
-MICRO_TIMEFRAME = "1min"   # Accelerated to capture early momentum
-MACRO_TIMEFRAMES = ["5min"]  # Accelerated to sync with 1min triggers
+MICRO_TIMEFRAME = "3min"
+MACRO_TIMEFRAMES = ["15min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -86,22 +87,22 @@ GLOBAL_MACRO_STRATEGY_2D = "BOTH"
 # ==============================================================================
 MACRO_MANDATORY_PRICE_RENKO    = True
 MACRO_MANDATORY_VOL_RENKO      = True
-MACRO_MANDATORY_RENKO_VELOCITY = False
+MACRO_MANDATORY_RENKO_VELOCITY = True
 MACRO_MANDATORY_RSI_BB         = False
 MACRO_MANDATORY_ADX_DMI        = False
 MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
-MACRO_MINIMUM_SCORE            = 2
+MACRO_MINIMUM_SCORE            = 3
 
 SYNC_MICRO_WITH_MACRO          = False
 MICRO_MANDATORY_PRICE_RENKO    = True
 MICRO_MANDATORY_VOL_RENKO      = True
-MICRO_MANDATORY_RENKO_VELOCITY = False
+MICRO_MANDATORY_RENKO_VELOCITY = True
 MICRO_MANDATORY_RSI_BB         = False
 MICRO_MANDATORY_ADX_DMI        = False
-MICRO_MANDATORY_EMA_SPREAD     = False
+MICRO_MANDATORY_EMA_SPREAD     = True
 MICRO_MANDATORY_STOCHASTIC     = False
-MICRO_MINIMUM_SCORE            = 2
+MICRO_MINIMUM_SCORE            = 4
 
 # ==============================================================================
 # 🎛️ TIER 3: TRADE MANAGEMENT & TEMPORAL GATES
@@ -111,7 +112,7 @@ MICRO_EXIT_VOL_BRICKS   = 5
 MACRO_EXIT_PRICE_BRICKS = 1
 MACRO_EXIT_VOL_BRICKS   = 1  
 RENKO_VELOCITY_MAX_BARS = 12
-ENTRY_CUTOFF_TIME = "15:00"
+ENTRY_CUTOFF_TIME = "14:30"  # Prevent EOD Theta traps
 
 
 # ==============================================================================
@@ -505,7 +506,6 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
 def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes):
     df_micro = rolling_master_df.sort_values(["Symbol", "Datetime"]).copy()
     
-    # 🔥 PANDAS MERGEERROR FIX: Force normalize df_micro Datetime to datetime64[ns]
     df_micro["Datetime"] = pd.to_datetime(df_micro["Datetime"]).astype("datetime64[ns]")
 
     df_micro = calculate_core_technicals(df_micro)
@@ -534,15 +534,18 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
     df_micro["Master_Armed_Bear"] = df_micro[bear_gate_cols].any(axis=1)
     df_micro = df_micro.sort_values(["Symbol", "Datetime"]).reset_index(drop=True)
 
-    df_micro["Trigger_Bull"] = df_micro["Master_Armed_Bull"] & df_micro[f"Armed_Bull_{micro_tf}"]
-    df_micro["Trigger_Bear"] = df_micro["Master_Armed_Bear"] & df_micro[f"Armed_Bear_{micro_tf}"]
+    # 🔥 SNIPER MANDATE: Force execution exactly on the minute a new brick is born.
+    df_micro["Fresh_Brick"] = df_micro[f"Bars_Since_Brick_{micro_tf}"] == 0
+
+    df_micro["Trigger_Bull"] = df_micro["Master_Armed_Bull"] & df_micro[f"Armed_Bull_{micro_tf}"] & df_micro["Fresh_Brick"]
+    df_micro["Trigger_Bear"] = df_micro["Master_Armed_Bear"] & df_micro[f"Armed_Bear_{micro_tf}"] & df_micro["Fresh_Brick"]
+    
     df_micro["Trigger_Bull_Prev"] = df_micro.groupby("Symbol")["Trigger_Bull"].shift(1).fillna(False)
     df_micro["Trigger_Bear_Prev"] = df_micro.groupby("Symbol")["Trigger_Bear"].shift(1).fillna(False)
 
     df_micro["New_Bull"] = df_micro["Trigger_Bull"] & ~df_micro["Trigger_Bull_Prev"]
     
-    # 🔥 OPTIONS BUYING ONLY: We completely disable "New_Bear" (Shorting). 
-    # If a premium starts collapsing, the engine ignores it entirely instead of selling it short.
+    # 🔥 OPTIONS BUYING ONLY: Disables Shorting (-1) entirely
     df_micro["Direction"] = np.where(df_micro["New_Bull"], 1, 0)
 
     return df_micro.sort_values("Datetime").reset_index(drop=True)
@@ -705,12 +708,12 @@ def scan_fyers_institutional_tape(target_date_str):
                             "triggering_macro_tfs": triggered_m_tfs
                         }
 
-            # 3. End of Day Forced Exit (15:15)
-            if t_dt.hour == 15 and t_dt.minute >= 15:
+            # 3. End of Day Forced Exit (14:30)
+            if t_dt.hour == 14 and t_dt.minute >= 30:
                 for sym in list(active_trades.keys()):
                     st = active_trades[sym]
                     st["state"] = "EXITED"
-                    st["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M") + " (EOD)"
+                    st["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M") + " (EOD Cutoff)"
                     st["exit_price"] = closes_dict.get((t_dt, sym), st["origin"])
                     st["exit_reason"] = "End of Day Market Close"
                     closed_trades_history.append(st)
