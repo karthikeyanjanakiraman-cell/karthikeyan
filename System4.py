@@ -64,8 +64,8 @@ INDEX_CONFIG = {
 # ==============================================================================
 # ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
-MICRO_TIMEFRAME = "3min"
-MACRO_TIMEFRAMES = ["15min"]
+MICRO_TIMEFRAME = "1min"
+MACRO_TIMEFRAMES = ["5min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
