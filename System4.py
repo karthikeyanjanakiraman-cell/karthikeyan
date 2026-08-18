@@ -9,6 +9,7 @@ Key Features:
 - Datetime Resolution Normalization (Fixes Pandas MergeErrors)
 - 09:15 AM Opening Strike Freeze (Locked for the Whole Session)
 - Dual-Tier 7-Pillar Scorecard & 45-Degree Price/Volume/Velocity Renko Engine
+- Sequential True Trade Ledger (Logs multiple entries/exits per strike)
 """
 
 import argparse
@@ -643,62 +644,72 @@ def scan_fyers_institutional_tape(target_date_str):
         macro_vol_renkos = {tf: tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{tf}"].to_dict() for tf in MACRO_TIMEFRAMES}
         
         all_times = np.sort(tape_exec["Datetime"].unique())
-        memory_bank = {}
+        
+        # 🔥 TRUE TRADE LEDGER: Separates active tracking from permanent historical logging
+        active_trades = {}
+        closed_trades_history = []
         cutoff_time_obj = pd.to_datetime(ENTRY_CUTOFF_TIME).time()
 
         for t in all_times:
             t_dt = pd.to_datetime(t)
             
-            for sym, st in memory_bank.items():
-                if st["state"] == "ACTIVE":
-                    ltp = closes_dict.get((t_dt, sym))
-                    mi_p_count = micro_price_renko.get((t_dt, sym), 0)
-                    mi_v_count = micro_vol_renko.get((t_dt, sym), 0)
-                    mi_bars_stalled = micro_vel_bars.get((t_dt, sym), 0)
+            # 1. Manage Active Trades (Checking for Exits)
+            for sym in list(active_trades.keys()):
+                st = active_trades[sym]
+                ltp = closes_dict.get((t_dt, sym))
+                mi_p_count = micro_price_renko.get((t_dt, sym), 0)
+                mi_v_count = micro_vol_renko.get((t_dt, sym), 0)
+                mi_bars_stalled = micro_vel_bars.get((t_dt, sym), 0)
 
-                    if ltp is not None:
-                        exit_reason = None
-                        if mi_bars_stalled > RENKO_VELOCITY_MAX_BARS:
-                            exit_reason = f"Velocity Stall (No brick in {RENKO_VELOCITY_MAX_BARS} bars)"
-                        
-                        if not exit_reason:
-                            if st["dir"] == 1:
-                                if mi_p_count <= -MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
-                                elif mi_v_count <= -MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
-                                else:
-                                    for tf in st["triggering_macro_tfs"]:
-                                        if macro_price_renkos[tf].get((t_dt, sym), 0) <= -MACRO_EXIT_PRICE_BRICKS:
-                                            exit_reason = f"Macro [{tf}] Price Break"
-                                            break
-                                        if macro_vol_renkos[tf].get((t_dt, sym), 0) <= -MACRO_EXIT_VOL_BRICKS:
-                                            exit_reason = f"Macro [{tf}] Volume Break"
-                                            break
-                            elif st["dir"] == -1:
-                                if mi_p_count >= MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
-                                elif mi_v_count >= MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
-                                else:
-                                    for tf in st["triggering_macro_tfs"]:
-                                        if macro_price_renkos[tf].get((t_dt, sym), 0) >= MACRO_EXIT_PRICE_BRICKS:
-                                            exit_reason = f"Macro [{tf}] Price Break"
-                                            break
-                                        if macro_vol_renkos[tf].get((t_dt, sym), 0) >= MACRO_EXIT_VOL_BRICKS:
-                                            exit_reason = f"Macro [{tf}] Volume Break"
-                                            break
-                        
-                        if exit_reason:
-                            st["state"] = "EXITED"
-                            st["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M")
-                            st["exit_price"] = ltp
-                            st["exit_reason"] = exit_reason
+                if ltp is not None:
+                    exit_reason = None
+                    if mi_bars_stalled > RENKO_VELOCITY_MAX_BARS:
+                        exit_reason = f"Velocity Stall (No brick in {RENKO_VELOCITY_MAX_BARS} bars)"
+                    
+                    if not exit_reason:
+                        if st["dir"] == 1:
+                            if mi_p_count <= -MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
+                            elif mi_v_count <= -MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
+                            else:
+                                for tf in st["triggering_macro_tfs"]:
+                                    if macro_price_renkos[tf].get((t_dt, sym), 0) <= -MACRO_EXIT_PRICE_BRICKS:
+                                        exit_reason = f"Macro [{tf}] Price Break"
+                                        break
+                                    if macro_vol_renkos[tf].get((t_dt, sym), 0) <= -MACRO_EXIT_VOL_BRICKS:
+                                        exit_reason = f"Macro [{tf}] Volume Break"
+                                        break
+                        elif st["dir"] == -1:
+                            if mi_p_count >= MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
+                            elif mi_v_count >= MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
+                            else:
+                                for tf in st["triggering_macro_tfs"]:
+                                    if macro_price_renkos[tf].get((t_dt, sym), 0) >= MACRO_EXIT_PRICE_BRICKS:
+                                        exit_reason = f"Macro [{tf}] Price Break"
+                                        break
+                                    if macro_vol_renkos[tf].get((t_dt, sym), 0) >= MACRO_EXIT_VOL_BRICKS:
+                                        exit_reason = f"Macro [{tf}] Volume Break"
+                                        break
+                    
+                    if exit_reason:
+                        st["state"] = "EXITED"
+                        st["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M")
+                        st["exit_price"] = ltp
+                        st["exit_reason"] = exit_reason
+                        # Archive to Ledger and remove from active tracking
+                        closed_trades_history.append(st)
+                        del active_trades[sym]
 
+            # 2. Process New Entrances
             if t_dt in anomalies_by_time.groups and t_dt.time() <= cutoff_time_obj:
                 for _, row in anomalies_by_time.get_group(t_dt).iterrows():
                     sym = row["Symbol"]
                     direction = row["Direction"]
                     triggered_m_tfs = [tf for tf in MACRO_TIMEFRAMES if row.get(f"Armed_Bull_{tf}" if direction == 1 else f"Armed_Bear_{tf}", False)]
 
-                    if sym not in memory_bank or memory_bank[sym]["state"] == "EXITED":
-                        memory_bank[sym] = {
+                    # Only open a new trade if we aren't already holding this exact strike
+                    if sym not in active_trades:
+                        active_trades[sym] = {
+                            "sym": sym,
                             "state": "ACTIVE",
                             "origin": row["Close"],              
                             "date": t_dt.strftime("%Y-%m-%d"),
@@ -710,13 +721,16 @@ def scan_fyers_institutional_tape(target_date_str):
                             "triggering_macro_tfs": triggered_m_tfs
                         }
 
+            # 3. End of Day Forced Exit (15:15)
             if t_dt.hour == 15 and t_dt.minute >= 15:
-                for sym, st in memory_bank.items():
-                    if st["state"] == "ACTIVE":
-                        st["state"] = "EXITED"
-                        st["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M") + " (EOD)"
-                        st["exit_price"] = closes_dict.get((t_dt, sym), st["origin"])
-                        st["exit_reason"] = "End of Day Market Close"
+                for sym in list(active_trades.keys()):
+                    st = active_trades[sym]
+                    st["state"] = "EXITED"
+                    st["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M") + " (EOD)"
+                    st["exit_price"] = closes_dict.get((t_dt, sym), st["origin"])
+                    st["exit_reason"] = "End of Day Market Close"
+                    closed_trades_history.append(st)
+                    del active_trades[sym]
 
         today_master = tape_exec[tape_exec["Datetime"].dt.date == target_dt.date()]
         if today_master.empty: return
@@ -726,33 +740,35 @@ def scan_fyers_institutional_tape(target_date_str):
         # ==============================================================================
         # 6. TERMINAL OUTPUT DISPLAY
         # ==============================================================================
-        active_runners = {sym: st for sym, st in memory_bank.items() if st["state"] == "ACTIVE"}
-        closed_trades = [{**st, "sym": sym} for sym, st in memory_bank.items() if st["state"] == "EXITED" and st["date"] == target_date_str]
+        current_active_runners = {sym: st for sym, st in active_trades.items() if st["state"] == "ACTIVE"}
+        today_closed_trades = [st for st in closed_trades_history if st["date"] == target_date_str]
 
         tf_display_str = " | ".join(MACRO_TIMEFRAMES)
         print(f"\n{COLOR_CYAN}================================================================================================{COLOR_RESET}")
         print(f"{COLOR_BOLD}FYERS NIFTY & SENSEX DUAL-TIER ENGINE [{MICRO_TIMEFRAME} Micro ⚡ Macro: {tf_display_str}]{COLOR_RESET}")
         print(f"{COLOR_CYAN}================================================================================================{COLOR_RESET}\n")
 
-        if active_runners:
+        if current_active_runners:
             print(f"{COLOR_BOLD}🟢 BASKET 1: ACTIVE OPTION RUNNERS{COLOR_RESET}")
-            for sym, st in active_runners.items():
+            for sym, st in current_active_runners.items():
                 ltp = final_ltp_dict.get(sym, st["origin"])
                 pnl_pct = ((ltp - st["origin"]) / st["origin"]) * 100 if st["dir"] == 1 else ((st["origin"] - ltp) / st["origin"]) * 100
                 color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
                 d_str = "BUY/LONG" if st["dir"] == 1 else "SELL/SHORT"
                 print(f"  {color}⚡ {sym:<25} P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
                 print(f"      └─ ⚓ Qualifying Macro TFs : {', '.join(st['triggering_macro_tfs'])}")
-                print(f"      └─ 🎯 Entry / LTP          : ₹{st['origin']:.2f} ➔ ₹{ltp:.2f}\n")
+                print(f"      └─ 🎯 Entry Time / Premium : {st['time']} | ₹{st['origin']:.2f}")
+                print(f"      └─ 🎯 Latest Premium (LTP) : ₹{ltp:.2f}\n")
 
-        if closed_trades:
-            print(f"{COLOR_BOLD}🛑 BASKET 2: CLOSED OPTION TRADES{COLOR_RESET}")
-            for st in closed_trades:
+        if today_closed_trades:
+            print(f"{COLOR_BOLD}🛑 BASKET 2: FULL DAY CLOSED TRADES LEDGER{COLOR_RESET}")
+            for st in today_closed_trades:
                 pnl_pct = ((st["exit_price"] - st["origin"]) / st["origin"]) * 100 if st["dir"] == 1 else ((st["origin"] - st["exit_price"]) / st["origin"]) * 100
                 color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
                 d_str = "BUY/LONG" if st["dir"] == 1 else "SELL/SHORT"
                 print(f"  {color}🛑 {st['sym']:<25} Final P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
-                print(f"      └─ 🎯 Exit Time / Price    : {st['exit_time']} | ₹{st['exit_price']:.2f}")
+                print(f"      └─ ⚓ Entry Time / Premium : {st['time']} | ₹{st['origin']:.2f}")
+                print(f"      └─ 🎯 Exit Time / Premium  : {st['exit_time'][11:]} | ₹{st['exit_price']:.2f}")
                 print(f"      └─ 📉 Exit Reason          : {st['exit_reason']}\n")
 
     except Exception as e:
