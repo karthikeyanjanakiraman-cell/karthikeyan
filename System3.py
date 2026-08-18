@@ -41,14 +41,14 @@ COLOR_DIM = "\033[2m"
 COLOR_RESET = "\033[0m"
 COLOR_BOLD = "\033[1m"
 
-BACKTRACE_DAYS = 1
+BACKTRACE_DAYS = 100
 API_ERROR_LOGGED = False
 
 # ==============================================================================
 # ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
-MICRO_TIMEFRAME = "1min"  # Micro Execution & Tactical Trigger
-MACRO_TIMEFRAMES = ["5min"]  # Macro Structural Tiers
+MICRO_TIMEFRAME = "60min"  # Micro Execution & Tactical Trigger
+MACRO_TIMEFRAMES = ["240min"]  # Macro Structural Tiers
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
