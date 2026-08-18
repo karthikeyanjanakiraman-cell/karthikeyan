@@ -64,8 +64,8 @@ INDEX_CONFIG = {
 # ==============================================================================
 # ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
-MICRO_TIMEFRAME = "3min"   # Accelerated to capture early momentum
-MACRO_TIMEFRAMES = ["15min"]  # Accelerated to sync with 1min triggers
+MICRO_TIMEFRAME = "1min"   # Accelerated to capture early momentum
+MACRO_TIMEFRAMES = ["5min"]  # Accelerated to sync with 1min triggers
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
