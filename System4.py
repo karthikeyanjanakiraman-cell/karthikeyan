@@ -4,8 +4,8 @@ Fyers API Implementation (Production-Grade & CI/CD Resilient)
 
 Key Features:
 - FYERS NIFTY 50 & SENSEX CE / PE Options Dynamic Extraction
+- STRICTLY OPTION BUYING ONLY (Long CE / Long PE)
 - Indestructible Fuzzy Parser (100% Immune to Fyers Data Schema Shifts)
-- Symbol-Based Filtering (Bypasses underlying column naming inconsistencies)
 - Datetime Resolution Normalization (Fixes Pandas MergeErrors)
 - 09:15 AM Opening Strike Freeze (Locked for the Whole Session)
 - Dual-Tier 7-Pillar Scorecard & 45-Degree Price/Volume/Velocity Renko Engine
@@ -64,8 +64,8 @@ INDEX_CONFIG = {
 # ==============================================================================
 # ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
-MICRO_TIMEFRAME = "1min"
-MACRO_TIMEFRAMES = ["5min"]
+MICRO_TIMEFRAME = "1min"   # Accelerated to capture early momentum
+MACRO_TIMEFRAMES = ["5min"]  # Accelerated to sync with 1min triggers
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -520,7 +520,6 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
         print(f"   ├─ Evaluating Macro Context Gates for Options [{tf}]...")
         env_df = evaluate_single_timeframe_gates(rolling_master_df, tf)
         
-        # 🔥 PANDAS MERGEERROR FIX: Force normalize env_df Datetime to match df_micro
         env_df["Datetime"] = pd.to_datetime(env_df["Datetime"]).astype("datetime64[ns]")
 
         bull_col, bear_col = f"Armed_Bull_{tf}", f"Armed_Bear_{tf}"
@@ -541,8 +540,10 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
     df_micro["Trigger_Bear_Prev"] = df_micro.groupby("Symbol")["Trigger_Bear"].shift(1).fillna(False)
 
     df_micro["New_Bull"] = df_micro["Trigger_Bull"] & ~df_micro["Trigger_Bull_Prev"]
-    df_micro["New_Bear"] = df_micro["Trigger_Bear"] & ~df_micro["Trigger_Bear_Prev"]
-    df_micro["Direction"] = np.where(df_micro["New_Bull"], 1, np.where(df_micro["New_Bear"], -1, 0))
+    
+    # 🔥 OPTIONS BUYING ONLY: We completely disable "New_Bear" (Shorting). 
+    # If a premium starts collapsing, the engine ignores it entirely instead of selling it short.
+    df_micro["Direction"] = np.where(df_micro["New_Bull"], 1, 0)
 
     return df_micro.sort_values("Datetime").reset_index(drop=True)
 
@@ -599,7 +600,6 @@ def scan_fyers_institutional_tape(target_date_str):
                             df["Datetime"] = pd.to_datetime(df["Epoch"], unit='s')
                             df["Datetime"] = df["Datetime"].dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata').dt.tz_localize(None)
                             
-                            # 🔥 PANDAS MERGEERROR FIX: Force resolution out of the gate
                             df["Datetime"] = df["Datetime"].astype("datetime64[ns]")
                             
                             df = df.drop_duplicates(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
@@ -630,8 +630,6 @@ def scan_fyers_institutional_tape(target_date_str):
         print("⚙️ Computing Technicals, Velocity Matrices & Option Micro/Macro Tape...")
 
         tape_exec = prepare_unified_execution_tape(rolling_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES)
-        if GLOBAL_MACRO_STRATEGY_2D == "BULLISH": tape_exec["Master_Armed_Bear"] = False
-        elif GLOBAL_MACRO_STRATEGY_2D == "BEARISH": tape_exec["Master_Armed_Bull"] = False
 
         all_anomalies = tape_exec[tape_exec["Direction"] != 0].copy()
         anomalies_by_time = all_anomalies.groupby("Datetime")
@@ -645,7 +643,6 @@ def scan_fyers_institutional_tape(target_date_str):
         
         all_times = np.sort(tape_exec["Datetime"].unique())
         
-        # 🔥 TRUE TRADE LEDGER: Separates active tracking from permanent historical logging
         active_trades = {}
         closed_trades_history = []
         cutoff_time_obj = pd.to_datetime(ENTRY_CUTOFF_TIME).time()
@@ -667,35 +664,23 @@ def scan_fyers_institutional_tape(target_date_str):
                         exit_reason = f"Velocity Stall (No brick in {RENKO_VELOCITY_MAX_BARS} bars)"
                     
                     if not exit_reason:
-                        if st["dir"] == 1:
-                            if mi_p_count <= -MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
-                            elif mi_v_count <= -MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
-                            else:
-                                for tf in st["triggering_macro_tfs"]:
-                                    if macro_price_renkos[tf].get((t_dt, sym), 0) <= -MACRO_EXIT_PRICE_BRICKS:
-                                        exit_reason = f"Macro [{tf}] Price Break"
-                                        break
-                                    if macro_vol_renkos[tf].get((t_dt, sym), 0) <= -MACRO_EXIT_VOL_BRICKS:
-                                        exit_reason = f"Macro [{tf}] Volume Break"
-                                        break
-                        elif st["dir"] == -1:
-                            if mi_p_count >= MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
-                            elif mi_v_count >= MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
-                            else:
-                                for tf in st["triggering_macro_tfs"]:
-                                    if macro_price_renkos[tf].get((t_dt, sym), 0) >= MACRO_EXIT_PRICE_BRICKS:
-                                        exit_reason = f"Macro [{tf}] Price Break"
-                                        break
-                                    if macro_vol_renkos[tf].get((t_dt, sym), 0) >= MACRO_EXIT_VOL_BRICKS:
-                                        exit_reason = f"Macro [{tf}] Volume Break"
-                                        break
+                        # Since we are Long Only, we only check for Bearish structure breaks (-1 values)
+                        if mi_p_count <= -MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
+                        elif mi_v_count <= -MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
+                        else:
+                            for tf in st["triggering_macro_tfs"]:
+                                if macro_price_renkos[tf].get((t_dt, sym), 0) <= -MACRO_EXIT_PRICE_BRICKS:
+                                    exit_reason = f"Macro [{tf}] Price Break"
+                                    break
+                                if macro_vol_renkos[tf].get((t_dt, sym), 0) <= -MACRO_EXIT_VOL_BRICKS:
+                                    exit_reason = f"Macro [{tf}] Volume Break"
+                                    break
                     
                     if exit_reason:
                         st["state"] = "EXITED"
                         st["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M")
                         st["exit_price"] = ltp
                         st["exit_reason"] = exit_reason
-                        # Archive to Ledger and remove from active tracking
                         closed_trades_history.append(st)
                         del active_trades[sym]
 
@@ -706,7 +691,6 @@ def scan_fyers_institutional_tape(target_date_str):
                     direction = row["Direction"]
                     triggered_m_tfs = [tf for tf in MACRO_TIMEFRAMES if row.get(f"Armed_Bull_{tf}" if direction == 1 else f"Armed_Bear_{tf}", False)]
 
-                    # Only open a new trade if we aren't already holding this exact strike
                     if sym not in active_trades:
                         active_trades[sym] = {
                             "sym": sym,
@@ -752,9 +736,9 @@ def scan_fyers_institutional_tape(target_date_str):
             print(f"{COLOR_BOLD}🟢 BASKET 1: ACTIVE OPTION RUNNERS{COLOR_RESET}")
             for sym, st in current_active_runners.items():
                 ltp = final_ltp_dict.get(sym, st["origin"])
-                pnl_pct = ((ltp - st["origin"]) / st["origin"]) * 100 if st["dir"] == 1 else ((st["origin"] - ltp) / st["origin"]) * 100
+                pnl_pct = ((ltp - st["origin"]) / st["origin"]) * 100
                 color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
-                d_str = "BUY/LONG" if st["dir"] == 1 else "SELL/SHORT"
+                d_str = "BUY/LONG"
                 print(f"  {color}⚡ {sym:<25} P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
                 print(f"      └─ ⚓ Qualifying Macro TFs : {', '.join(st['triggering_macro_tfs'])}")
                 print(f"      └─ 🎯 Entry Time / Premium : {st['time']} | ₹{st['origin']:.2f}")
@@ -763,9 +747,9 @@ def scan_fyers_institutional_tape(target_date_str):
         if today_closed_trades:
             print(f"{COLOR_BOLD}🛑 BASKET 2: FULL DAY CLOSED TRADES LEDGER{COLOR_RESET}")
             for st in today_closed_trades:
-                pnl_pct = ((st["exit_price"] - st["origin"]) / st["origin"]) * 100 if st["dir"] == 1 else ((st["origin"] - st["exit_price"]) / st["origin"]) * 100
+                pnl_pct = ((st["exit_price"] - st["origin"]) / st["origin"]) * 100
                 color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
-                d_str = "BUY/LONG" if st["dir"] == 1 else "SELL/SHORT"
+                d_str = "BUY/LONG"
                 print(f"  {color}🛑 {st['sym']:<25} Final P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
                 print(f"      └─ ⚓ Entry Time / Premium : {st['time']} | ₹{st['origin']:.2f}")
                 print(f"      └─ 🎯 Exit Time / Premium  : {st['exit_time'][11:]} | ₹{st['exit_price']:.2f}")
@@ -795,4 +779,3 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
-
