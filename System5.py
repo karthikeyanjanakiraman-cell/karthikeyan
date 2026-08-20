@@ -110,13 +110,23 @@ def fetch_json_gz(url):
         'Accept': 'application/json, text/plain, */*',
     }
     try:
-        response = requests.get(url, headers=headers, timeout=20)
+        print(f"  ├─ ⏳ Downloading massive instrument file (this may take 10-20 seconds)...")
+        # Increased timeout to 45 seconds for safety on large files
+        response = requests.get(url, headers=headers, timeout=45) 
+        
         if response.status_code == 200:
-            return json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
+            print(f"  ├─ ✅ Download successful! Extracting & parsing JSON into memory...")
+            data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
+            print(f"  ├─ ✅ Parsing complete! Total instruments loaded: {len(data)}")
+            return data
         else:
-            print(f"{COLOR_DIM}[Warning] HTTP {response.status_code} when fetching: {url}{COLOR_RESET}")
+            print(f"{COLOR_RED}[Error] HTTP {response.status_code} when fetching: {url}{COLOR_RESET}")
+            
+    except requests.exceptions.Timeout:
+        print(f"{COLOR_RED}[Error] Connection timed out! The file is too large for the current network speed.{COLOR_RESET}")
     except Exception as e: 
-        print(f"{COLOR_DIM}[Warning] Exception fetching {url}: {e}{COLOR_RESET}")
+        print(f"{COLOR_RED}[Error] Exception fetching {url}: {e}{COLOR_RESET}")
+        
     return []
 
 def get_options_universe():
