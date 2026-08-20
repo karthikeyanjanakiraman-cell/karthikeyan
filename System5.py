@@ -200,7 +200,7 @@ def build_options_matrix(spot_prices, options_instruments):
     print(f"⚙️ Building Options Contract Matrix (Offset: ±{STRIKE_RANGE_OFFSET}, Expiry: {TARGET_EXPIRY})...")
     grouped_options = {}
     for opt in options_instruments:
-        grouped_options.setdefault(opt["underlying_symbol"], []).append(opt)
+        grouped_options.setdefault(opt.get("underlying_symbol"), []).append(opt)
 
     target_contracts = []
     
@@ -208,15 +208,26 @@ def build_options_matrix(spot_prices, options_instruments):
         opts = grouped_options.get(symbol, [])
         if not opts: continue
         
-        # 1. Determine Expiry
-        expiries = sorted(list(set(pd.to_datetime(o["expiry"]).date() for o in opts)))
+        # Safely normalize the strike price key (Upstox uses both 'strike_price' and 'strike')
+        for o in opts:
+            raw_strike = o.get("strike_price") if "strike_price" in o else o.get("strike")
+            try:
+                o["_normalized_strike"] = float(raw_strike)
+            except (ValueError, TypeError):
+                o["_normalized_strike"] = None
+
+        # 1. Determine Expiry (Filter out any invalid contracts missing expiry or strike)
+        valid_opts = [o for o in opts if o.get("expiry") and o.get("_normalized_strike") is not None]
+        if not valid_opts: continue
+        
+        expiries = sorted(list(set(pd.to_datetime(o["expiry"]).date() for o in valid_opts)))
         if not expiries: continue
         
         chosen_expiry = expiries[0] if TARGET_EXPIRY == "CURRENT" else (expiries[1] if len(expiries) > 1 else expiries[0])
-        expiry_opts = [o for o in opts if pd.to_datetime(o["expiry"]).date() == chosen_expiry]
+        expiry_opts = [o for o in valid_opts if pd.to_datetime(o["expiry"]).date() == chosen_expiry]
         
         # 2. Determine Strikes
-        unique_strikes = sorted(list(set(o["strike"] for o in expiry_opts)))
+        unique_strikes = sorted(list(set(o["_normalized_strike"] for o in expiry_opts)))
         if not unique_strikes: continue
         
         closest_strike = min(unique_strikes, key=lambda x: abs(x - spot_price))
@@ -227,13 +238,13 @@ def build_options_matrix(spot_prices, options_instruments):
         selected_strikes = unique_strikes[start_idx:end_idx]
         
         # 3. Gather Contracts (CE & PE)
-        final_opts = [o for o in expiry_opts if o["strike"] in selected_strikes]
+        final_opts = [o for o in expiry_opts if o["_normalized_strike"] in selected_strikes]
         for opt in final_opts:
             target_contracts.append({
-                "symbol": opt["trading_symbol"],
+                "symbol": opt.get("trading_symbol", opt.get("tradingsymbol", "UNKNOWN")),
                 "key": opt["instrument_key"],
                 "underlying": symbol,
-                "type": opt["instrument_type"]
+                "type": opt.get("instrument_type")
             })
             
     return target_contracts
