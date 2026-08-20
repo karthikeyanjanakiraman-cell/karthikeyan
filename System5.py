@@ -48,7 +48,7 @@ BACKTRACE_DAYS = 15          # Reduced to manage 1800+ contract data load
 MAX_API_WORKERS = 40         # Aggressive threading worker count
 
 MICRO_TIMEFRAME = "1min"
-MACRO_TIMEFRAMES = ["15min"]
+MACRO_TIMEFRAMES = ["20min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
