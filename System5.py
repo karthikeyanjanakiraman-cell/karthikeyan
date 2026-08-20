@@ -54,7 +54,7 @@ MIN_PREV_DAY_VOLUME = 800000  # Option must have traded >= 10,000 contracts on t
 MAX_API_WORKERS = 40         # Aggressive threading worker count
 
 MICRO_TIMEFRAME = "1min"
-MACRO_TIMEFRAMES = ["5min"]
+MACRO_TIMEFRAMES = ["20min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -80,8 +80,8 @@ MACRO_MANDATORY_RENKO_VELOCITY = False
 MACRO_MANDATORY_RSI_BB         = False
 MACRO_MANDATORY_ADX_DMI        = False
 MACRO_MANDATORY_EMA_SPREAD     = False
-MACRO_MANDATORY_STOCHASTIC     = True
-MACRO_MINIMUM_SCORE            = 3      
+MACRO_MANDATORY_STOCHASTIC     = False
+MACRO_MINIMUM_SCORE            = 2      
 
 SYNC_MICRO_WITH_MACRO          = False  
 
@@ -90,9 +90,9 @@ MICRO_MANDATORY_VOL_RENKO      = True
 MICRO_MANDATORY_RENKO_VELOCITY = False
 MICRO_MANDATORY_RSI_BB         = False
 MICRO_MANDATORY_ADX_DMI        = False
-MICRO_MANDATORY_EMA_SPREAD     = True
-MICRO_MANDATORY_STOCHASTIC     = True
-MICRO_MINIMUM_SCORE            = 3      
+MICRO_MANDATORY_EMA_SPREAD     = False
+MICRO_MANDATORY_STOCHASTIC     = False
+MICRO_MINIMUM_SCORE            = 2      
 
 # ==============================================================================
 # 🎛️ TIER 3: TRADE MANAGEMENT & TEMPORAL GATES
