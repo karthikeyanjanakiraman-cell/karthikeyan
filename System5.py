@@ -45,11 +45,11 @@ COLOR_BOLD = "\033[1m"
 # Options Selection Configurations
 STRIKE_RANGE_OFFSET = 2      # Number of strikes above and below ATM
 TARGET_EXPIRY = "CURRENT"    # "CURRENT" or "NEXT"
-BACKTRACE_DAYS = 15          # Reduced to manage data load
+BACKTRACE_DAYS = 7          # Reduced to manage data load
 
 # 🌟 NEW PRE-FILTER VARIABLES (The Speed Enablers)
-MIN_OPT_PREMIUM = 5.0        # Option must close >= ₹5.00 on the previous day
-MIN_PREV_DAY_VOLUME = 10000  # Option must have traded >= 10,000 contracts on the previous day
+MIN_OPT_PREMIUM = 10.0        # Option must close >= ₹5.00 on the previous day
+MIN_PREV_DAY_VOLUME = 100000  # Option must have traded >= 10,000 contracts on the previous day
 
 MAX_API_WORKERS = 40         # Aggressive threading worker count
 
