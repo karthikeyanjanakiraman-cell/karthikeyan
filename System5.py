@@ -105,17 +105,23 @@ EXCLUDED_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "B
 # 1. LIVE INGESTION: OPTIONS MATRIX & MULTITHREADING
 # ==============================================================================
 def fetch_json_gz(url):
+    # Added a standard User-Agent header and error printing for stability
+    headers = {'User-Agent': 'Mozilla/5.0'}
     try:
-        response = requests.get(url, timeout=15)
+        response = requests.get(url, headers=headers, timeout=15)
         if response.status_code == 200:
             return json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
-    except Exception: pass
+        else:
+            print(f"{COLOR_DIM}[Warning] HTTP {response.status_code} when fetching: {url}{COLOR_RESET}")
+    except Exception as e: 
+        print(f"{COLOR_DIM}[Warning] Exception fetching {url}: {e}{COLOR_RESET}")
     return []
 
 def get_options_universe():
     print(f"📡 Fetching Master Instrument Matrices (EQ & FO)...")
+    # Corrected the F&O URL to NFO.json.gz
     eq_data = fetch_json_gz("https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz")
-    fo_data = fetch_json_gz("https://assets.upstox.com/market-quote/instruments/exchange/NSE_FO.json.gz")
+    fo_data = fetch_json_gz("https://assets.upstox.com/market-quote/instruments/exchange/NFO.json.gz")
 
     if not eq_data or not fo_data:
         print(f"{COLOR_RED}[Error] Failed to fetch master instruments.{COLOR_RESET}")
