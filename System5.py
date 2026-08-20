@@ -105,10 +105,12 @@ EXCLUDED_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "B
 # 1. LIVE INGESTION: OPTIONS MATRIX & MULTITHREADING
 # ==============================================================================
 def fetch_json_gz(url):
-    # Added a standard User-Agent header and error printing for stability
-    headers = {'User-Agent': 'Mozilla/5.0'}
+    headers = {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'Accept': 'application/json, text/plain, */*',
+    }
     try:
-        response = requests.get(url, headers=headers, timeout=15)
+        response = requests.get(url, headers=headers, timeout=20)
         if response.status_code == 200:
             return json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
         else:
@@ -118,28 +120,28 @@ def fetch_json_gz(url):
     return []
 
 def get_options_universe():
-    print(f"📡 Fetching Master Instrument Matrices (EQ & FO)...")
-    # Corrected the F&O URL to NFO.json.gz
-    eq_data = fetch_json_gz("https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz")
-    fo_data = fetch_json_gz("https://assets.upstox.com/market-quote/instruments/exchange/NFO.json.gz")
+    print(f"📡 Fetching Master Instrument Matrix (Upstox Complete File)...")
+    
+    # Use the 'complete' file which guarantees access to all segments
+    master_data = fetch_json_gz("https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz")
 
-    if not eq_data or not fo_data:
+    if not master_data:
         print(f"{COLOR_RED}[Error] Failed to fetch master instruments.{COLOR_RESET}")
         return [], []
 
     # Map underlying F&O Stocks (exclude indices)
     fo_underlyings = {
-        item.get("underlying_symbol") for item in fo_data
+        item.get("underlying_symbol") for item in master_data
         if item.get("instrument_type") == "OPTSTK" and item.get("underlying_symbol") not in EXCLUDED_INDICES
     }
 
     spot_instruments = [
-        item for item in eq_data 
+        item for item in master_data 
         if item.get("trading_symbol") in fo_underlyings and item.get("segment") == "NSE_EQ"
     ]
     
     options_instruments = [
-        item for item in fo_data 
+        item for item in master_data 
         if item.get("instrument_type") == "OPTSTK" and item.get("underlying_symbol") not in EXCLUDED_INDICES
     ]
 
