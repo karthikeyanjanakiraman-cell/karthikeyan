@@ -132,18 +132,22 @@ def fetch_json_gz(url):
 def get_options_universe():
     print(f"📡 Fetching Master Instrument Matrix (Upstox Complete File)...")
     
-    # Use the 'complete' file which guarantees access to all segments
     master_data = fetch_json_gz("https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz")
 
     if not master_data:
         print(f"{COLOR_RED}[Error] Failed to fetch master instruments.{COLOR_RESET}")
         return [], []
 
-    # Map underlying F&O Stocks (exclude indices)
+    # Map underlying F&O Stocks (Broadened search to catch Upstox's naming convention)
     fo_underlyings = {
         item.get("underlying_symbol") for item in master_data
-        if item.get("instrument_type") == "OPTSTK" and item.get("underlying_symbol") not in EXCLUDED_INDICES
+        if item.get("instrument_type") in ("OPTSTK", "CE", "PE") and item.get("underlying_symbol") not in EXCLUDED_INDICES
     }
+    
+    # Remove any None values just in case
+    fo_underlyings.discard(None)
+    
+    print(f"  ├─ 🔍 Found {len(fo_underlyings)} F&O Underlying Stocks.")
 
     spot_instruments = [
         item for item in master_data 
@@ -152,8 +156,10 @@ def get_options_universe():
     
     options_instruments = [
         item for item in master_data 
-        if item.get("instrument_type") == "OPTSTK" and item.get("underlying_symbol") not in EXCLUDED_INDICES
+        if item.get("underlying_symbol") in fo_underlyings and item.get("instrument_type") in ("OPTSTK", "CE", "PE")
     ]
+    
+    print(f"  ├─ 🎯 Mapped {len(spot_instruments)} Spot Instruments & {len(options_instruments)} Options Contracts.")
 
     return spot_instruments, options_instruments
 
