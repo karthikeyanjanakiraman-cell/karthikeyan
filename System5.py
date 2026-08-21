@@ -196,28 +196,41 @@ def fetch_latest_spot_prices(spot_instruments, headers, target_date_str):
     is_live_today = target_date_str == ist_now.strftime("%Y-%m-%d")
     
     if is_live_today:
-        print("  ├─ [Live Mode] Using instant batch LTP API (No historical Spot data fetched)...")
+        print("  ├─ [Live Mode] Using instant batch LTP API (Chunking to prevent URL length limits)...")
         key_to_name = {inst["instrument_key"]: inst["name"] for inst in spot_instruments if inst.get("instrument_key")}
         valid_keys = list(key_to_name.keys())
         
-        # Upstox supports up to 500 keys per request, chunk by 400 to be safe
-        for i in range(0, len(valid_keys), 400):
-            chunk = valid_keys[i:i + 400]
-            keys_str = ",".join([urllib.parse.quote(k) for k in chunk])
-            url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={keys_str}"
+        # HTTP GET URLs have a ~2048 character limit. Chunking by 50 keys keeps the URL safely under 1000 chars.
+        for i in range(0, len(valid_keys), 50):
+            chunk = valid_keys[i:i + 50]
+            chunk_str = ",".join(chunk)
             
             try:
-                res = requests.get(url, headers=headers, timeout=10)
+                res = requests.get(
+                    "https://api.upstox.com/v2/market-quote/ltp", 
+                    params={"instrument_key": chunk_str}, 
+                    headers=headers, 
+                    timeout=10
+                )
                 if res.status_code == 200:
                     data = res.json().get("data", {})
                     for k, v in data.items():
                         if v.get("last_price"):
                             spot_prices[key_to_name[k]] = v["last_price"]
+                else:
+                    print(f"  ├─ [Warning] LTP API HTTP {res.status_code}: {res.text}")
             except Exception as e:
-                pass
-    else:
-        print(f"  ├─ [Historical Mode] Fetching Daily EOD Spot Prices for {target_date_str}...")
-        # Fallback to fetching ONLY daily candles (never 1-min) for spot prices to minimize API payload
+                print(f"  ├─ [Warning] LTP request exception: {e}")
+
+    # 🌟 THE FAILSAFE FALLBACK 🌟
+    # If spot_prices is still empty (due to missing API scope, HTTP 414, or weekends),
+    # or if we are actively backtesting a past date, fallback to the robust historical API.
+    if not spot_prices:
+        if is_live_today:
+            print(f"{COLOR_YELLOW}  ├─ [Fallback] Live LTP API failed or returned empty. Falling back to EOD Historical API...{COLOR_RESET}")
+        else:
+            print(f"  ├─ [Historical Mode] Fetching Daily EOD Spot Prices for {target_date_str}...")
+            
         target_dt = dt.strptime(target_date_str, "%Y-%m-%d")
         ten_days_ago = (target_dt - timedelta(days=10)).strftime("%Y-%m-%d")
         
