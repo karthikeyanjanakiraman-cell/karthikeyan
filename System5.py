@@ -119,12 +119,13 @@ def fetch_json_gz(url):
         response.raise_for_status()
         
         print(f"  ├─ ✅ Download successful! Extracting & parsing JSON into memory...")
-        try:
-            # If requests auto-decompressed due to headers
-            data = json.loads(response.content)
-        except json.JSONDecodeError:
-            # Manual GZIP extraction fallback
+        
+        # Safely check if the response is actually GZIP compressed via Magic Bytes (0x1F, 0x8B)
+        if response.content[:2] == b'\x1f\x8b':
             data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
+        else:
+            # If requests already auto-decompressed it in the background
+            data = response.json()
             
         print(f"  ├─ ✅ Parsing complete! Total instruments loaded: {len(data)}")
         return data
