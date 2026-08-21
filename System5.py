@@ -10,7 +10,6 @@ Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine
 
 import argparse
 import concurrent.futures
-import datetime
 import gzip
 import io
 import json
@@ -42,16 +41,14 @@ COLOR_BOLD = "\033[1m"
 # ==============================================================================
 # ★ GLOBAL CONFIGURATION: OPTIONS, TIMEFRAMES & INDICATORS ★
 # ==============================================================================
-# Options Selection Configurations
-STRIKE_RANGE_OFFSET = 1      # Number of strikes above and below ATM
-TARGET_EXPIRY = "CURRENT"    # "CURRENT" or "NEXT"
-BACKTRACE_DAYS = 2          # Reduced to manage data load
+STRIKE_RANGE_OFFSET = 1      
+TARGET_EXPIRY = "CURRENT"    
+BACKTRACE_DAYS = 2          
 
-# 🌟 NEW PRE-FILTER VARIABLES (The Speed Enablers)
-MIN_OPT_PREMIUM = 30.0        # Option must close >= ₹5.00 on the previous day
-MIN_PREV_DAY_VOLUME = 800000  # Option must have traded >= 10,000 contracts on the previous day
+MIN_OPT_PREMIUM = 30.0        
+MIN_PREV_DAY_VOLUME = 800000  
 
-MAX_API_WORKERS = 40         # Aggressive threading worker count
+MAX_API_WORKERS = 25         # Safely optimized for Upstox limits
 
 MICRO_TIMEFRAME = "1min"
 MACRO_TIMEFRAMES = ["20min"]
@@ -67,7 +64,7 @@ STOCH_PERIOD = 14
 MICRO_RENKO_CONFIRM_BRICKS = 1
 MACRO_RENKO_CONFIRM_BRICKS = 1
 RENKO_MIN_BRICK = 0.05
-RENKO_DEFAULT_PCT = 0.05     # 5% for options premium volatility
+RENKO_DEFAULT_PCT = 0.05     
 
 GLOBAL_MACRO_STRATEGY_2D = "BOTH" 
 
@@ -105,7 +102,7 @@ MACRO_EXIT_VOL_BRICKS   = 1
 RENKO_VELOCITY_MAX_BARS = 12 
 ENTRY_CUTOFF_TIME = "15:00"
 
-EXCLUDED_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"}
+EXCLUDED_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "NIFTYNXT50"}
 
 
 # ==============================================================================
@@ -113,19 +110,24 @@ EXCLUDED_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "B
 # ==============================================================================
 def fetch_json_gz(url):
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
         'Accept': 'application/json, text/plain, */*',
     }
     try:
         print(f"  ├─ ⏳ Downloading massive instrument file (this may take 10-20 seconds)...")
         response = requests.get(url, headers=headers, timeout=45) 
-        if response.status_code == 200:
-            print(f"  ├─ ✅ Download successful! Extracting & parsing JSON into memory...")
+        response.raise_for_status()
+        
+        print(f"  ├─ ✅ Download successful! Extracting & parsing JSON into memory...")
+        try:
+            # If requests auto-decompressed due to headers
+            data = json.loads(response.content)
+        except json.JSONDecodeError:
+            # Manual GZIP extraction fallback
             data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
-            print(f"  ├─ ✅ Parsing complete! Total instruments loaded: {len(data)}")
-            return data
-        else:
-            print(f"{COLOR_RED}[Error] HTTP {response.status_code} when fetching: {url}{COLOR_RESET}")
+            
+        print(f"  ├─ ✅ Parsing complete! Total instruments loaded: {len(data)}")
+        return data
     except requests.exceptions.Timeout:
         print(f"{COLOR_RED}[Error] Connection timed out! The file is too large for the current network speed.{COLOR_RESET}")
     except Exception as e: 
@@ -140,21 +142,25 @@ def get_options_universe():
         print(f"{COLOR_RED}[Error] Failed to fetch master instruments.{COLOR_RESET}")
         return [], []
 
-    fo_underlyings = {
-        item.get("underlying_symbol") for item in master_data
-        if item.get("instrument_type") in ("OPTSTK", "CE", "PE") and item.get("underlying_symbol") not in EXCLUDED_INDICES
+    # Map NSE_EQ stocks to FO names. Indices have no NSE_EQ segment.
+    eq_stocks = {
+        item.get("tradingsymbol"): item 
+        for item in master_data 
+        if item.get("segment") == "NSE_EQ" and item.get("tradingsymbol") not in EXCLUDED_INDICES
     }
-    fo_underlyings.discard(None)
-    print(f"  ├─ 🔍 Found {len(fo_underlyings)} F&O Underlying Stocks.")
 
-    spot_instruments = [
-        item for item in master_data 
-        if item.get("trading_symbol") in fo_underlyings and item.get("segment") == "NSE_EQ"
-    ]
+    # Find F&O contracts where the 'name' matches a valid NSE_EQ tradingsymbol
     options_instruments = [
         item for item in master_data 
-        if item.get("underlying_symbol") in fo_underlyings and item.get("instrument_type") in ("OPTSTK", "CE", "PE")
+        if item.get("instrument_type") in ("OPTSTK", "CE", "PE")
+        and item.get("name") in eq_stocks
+        and item.get("exchange") == "NSE_FO"
     ]
+    
+    valid_fo_names = {item.get("name") for item in options_instruments}
+    spot_instruments = [eq_stocks[name] for name in valid_fo_names]
+
+    print(f"  ├─ 🔍 Found {len(valid_fo_names)} Pure F&O Underlying Stocks (Indices completely isolated).")
     print(f"  ├─ 🎯 Mapped {len(spot_instruments)} Spot Instruments & {len(options_instruments)} Options Contracts.")
 
     return spot_instruments, options_instruments
@@ -164,25 +170,38 @@ def safe_api_request(url, headers, is_live=False):
         try:
             res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 200:
-                data = res.json().get("data", {}).get("candles", [])
-                return data
+                return res.json().get("data", {}).get("candles", [])
             elif res.status_code == 429:
-                time.sleep(random.uniform(0.5, 2.0) * (attempt + 1))  # Aggressive Jitter Backoff
+                time.sleep(random.uniform(0.5, 2.0) * (attempt + 1))  
             else:
                 break
         except Exception:
             time.sleep(1)
     return []
 
+def get_latest_close_price(key, headers):
+    # Try intraday first
+    data = safe_api_request(f"https://api.upstox.com/v2/historical-candle/intraday/{key}/1minute", headers, is_live=True)
+    if data: return data[0][4]
+    
+    # Fallback to historical (weekend/holiday safety)
+    today = dt.utcnow().strftime("%Y-%m-%d")
+    week_ago = (dt.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+    data = safe_api_request(f"https://api.upstox.com/v2/historical-candle/{key}/day/{today}/{week_ago}", headers)
+    if data: return data[0][4]
+    return None
+
 def fetch_latest_spot_prices(spot_instruments, headers):
     print(f"🚀 Fetching Spot Prices for {len(spot_instruments)} Underlyings...")
     spot_prices = {}
     
     def worker(inst):
-        key = urllib.parse.quote(inst["instrument_key"])
-        data = safe_api_request(f"https://api.upstox.com/v2/historical-candle/intraday/{key}/1minute", headers)
-        if data: return inst["trading_symbol"], data[0][4] 
-        return inst["trading_symbol"], None
+        try:
+            key = urllib.parse.quote(inst["instrument_key"])
+            price = get_latest_close_price(key, headers)
+            return inst["tradingsymbol"], price
+        except Exception:
+            return inst["tradingsymbol"], None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_API_WORKERS) as executor:
         futures = {executor.submit(worker, inst): inst for inst in spot_instruments}
@@ -196,9 +215,10 @@ def build_options_matrix(spot_prices, options_instruments):
     print(f"⚙️ Building Options Contract Matrix (Offset: ±{STRIKE_RANGE_OFFSET}, Expiry: {TARGET_EXPIRY})...")
     grouped_options = {}
     for opt in options_instruments:
-        grouped_options.setdefault(opt.get("underlying_symbol"), []).append(opt)
+        grouped_options.setdefault(opt.get("name"), []).append(opt)
 
     target_contracts = []
+    today = dt.utcnow().date()
     
     for symbol, spot_price in spot_prices.items():
         opts = grouped_options.get(symbol, [])
@@ -211,10 +231,11 @@ def build_options_matrix(spot_prices, options_instruments):
             except (ValueError, TypeError):
                 o["_normalized_strike"] = None
 
+        # Ignore mathematically expired contracts if backtesting heavily
         valid_opts = [o for o in opts if o.get("expiry") and o.get("_normalized_strike") is not None]
         if not valid_opts: continue
         
-        expiries = sorted(list(set(pd.to_datetime(o["expiry"]).date() for o in valid_opts)))
+        expiries = sorted(list(set(pd.to_datetime(o["expiry"]).date() for o in valid_opts if pd.to_datetime(o["expiry"]).date() >= today)))
         if not expiries: continue
         
         chosen_expiry = expiries[0] if TARGET_EXPIRY == "CURRENT" else (expiries[1] if len(expiries) > 1 else expiries[0])
@@ -233,7 +254,7 @@ def build_options_matrix(spot_prices, options_instruments):
         final_opts = [o for o in expiry_opts if o["_normalized_strike"] in selected_strikes]
         for opt in final_opts:
             target_contracts.append({
-                "symbol": opt.get("trading_symbol", opt.get("tradingsymbol", "UNKNOWN")),
+                "symbol": opt.get("tradingsymbol", opt.get("trading_symbol", "UNKNOWN")),
                 "key": opt["instrument_key"],
                 "underlying": symbol,
                 "type": opt.get("instrument_type")
@@ -241,38 +262,31 @@ def build_options_matrix(spot_prices, options_instruments):
             
     return target_contracts
 
-def get_previous_trading_day(target_date_str):
-    target_dt = dt.strptime(target_date_str, "%Y-%m-%d")
-    current_dt = target_dt - timedelta(days=1)
-    while current_dt.weekday() >= 5: # Skip weekends
-        current_dt -= timedelta(days=1)
-    return current_dt.strftime("%Y-%m-%d")
-
-# 🌟 NEW: THE STAGE 1 PRE-FILTER ENGINE
 def filter_liquid_options(target_contracts, headers, target_date_str):
     print(f"\n🧹 STAGE 1 INGESTION: Pre-Filtering {len(target_contracts)} contracts...")
     print(f"  ├─ Rules: Prev. Day Close >= ₹{MIN_OPT_PREMIUM} | Prev. Day Vol >= {MIN_PREV_DAY_VOLUME}")
     
-    prev_day = get_previous_trading_day(target_date_str)
-    # Fetch a small 7-day window ending on the previous trading day to ensure we catch the daily candle
-    five_days_ago = (dt.strptime(prev_day, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
+    target_dt = dt.strptime(target_date_str, "%Y-%m-%d")
+    prev_day = (target_dt - timedelta(days=1)).strftime("%Y-%m-%d")
+    fifteen_days_ago = (target_dt - timedelta(days=15)).strftime("%Y-%m-%d")
     
     filtered_contracts = []
     
     def worker(contract):
-        key = urllib.parse.quote(contract["key"])
-        url = f"https://api.upstox.com/v2/historical-candle/{key}/day/{prev_day}/{five_days_ago}"
-        data = safe_api_request(url, headers)
-        
-        if data:
-            # Upstox returns data descending (latest first). data[0] is the daily candle for 'prev_day'.
-            # Format: [Timestamp, Open, High, Low, Close, Volume, OI]
-            latest_candle = data[0]
-            close_price = latest_candle[4]
-            volume = latest_candle[5]
+        try:
+            key = urllib.parse.quote(contract["key"])
+            url = f"https://api.upstox.com/v2/historical-candle/{key}/day/{prev_day}/{fifteen_days_ago}"
+            data = safe_api_request(url, headers)
             
-            if close_price >= MIN_OPT_PREMIUM and volume >= MIN_PREV_DAY_VOLUME:
-                return contract
+            if data and len(data) > 0:
+                latest_candle = data[0]
+                close_price = latest_candle[4]
+                volume = latest_candle[5]
+                
+                if close_price >= MIN_OPT_PREMIUM and volume >= MIN_PREV_DAY_VOLUME:
+                    return contract
+        except Exception:
+            pass
         return None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_API_WORKERS) as executor:
@@ -494,8 +508,9 @@ def apply_dual_tier_scorecard(df, tf_str, tier_type):
     return df
 
 def evaluate_single_timeframe_gates(df_base, tf_str):
+    # Alignment fix: Anchors grouping at 09:15 NSE open
     df_tf = (
-        df_base.groupby(["Symbol", pd.Grouper(key="Datetime", freq=tf_str, closed="left", label="left")])
+        df_base.groupby(["Symbol", pd.Grouper(key="Datetime", freq=tf_str, closed="left", label="left", origin=pd.Timestamp('2000-01-01 09:15:00'))])
         .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
         .reset_index()
     )
@@ -508,6 +523,7 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
     
     df_tf = apply_dual_tier_scorecard(df_tf, tf_str, "MACRO")
 
+    # Shift time cleanly to avoid lookahead bias in `merge_asof`
     df_tf["Eval_Time"] = df_tf["Datetime"] + pd.to_timedelta(tf_str)
     
     export_cols = [
@@ -527,7 +543,7 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
 def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes):
     if micro_tf != "1min":
         df_micro = (
-            rolling_master_df.groupby(["Symbol", pd.Grouper(key="Datetime", freq=micro_tf, closed="left", label="left")])
+            rolling_master_df.groupby(["Symbol", pd.Grouper(key="Datetime", freq=micro_tf, closed="left", label="left", origin=pd.Timestamp('2000-01-01 09:15:00'))])
             .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
             .reset_index()
         )
@@ -540,12 +556,16 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
     df_micro = construct_volume_delta_renko_matrix(df_micro, micro_tf, MICRO_RENKO_CONFIRM_BRICKS)
     df_micro = construct_renko_velocity_engine(df_micro, micro_tf)
     df_micro = apply_dual_tier_scorecard(df_micro, micro_tf, "MICRO")
+    
+    # Critical pd.merge_asof condition: Both DataFrames must be strictly sorted by 'on' before merge
     df_micro = df_micro.sort_values("Datetime").reset_index(drop=True)
 
     bull_gate_cols, bear_gate_cols = [], []
     for tf in macro_timeframes:
         print(f"   ├─ Evaluating Macro Context Gates + Price/Vol/Vel Renko for [{tf}]...")
         env_df = evaluate_single_timeframe_gates(rolling_master_df, tf)
+        env_df = env_df.sort_values("Datetime").reset_index(drop=True)  # Ensuring sorted alignment
+        
         bull_col, bear_col = f"Armed_Bull_{tf}", f"Armed_Bear_{tf}"
         bull_gate_cols.append(bull_col)
         bear_gate_cols.append(bear_col)
@@ -618,23 +638,26 @@ def scan_institutional_tape(target_date_str):
 
     def fetch_worker(task):
         item, start_date, end_date, live = task
-        key = urllib.parse.quote(item["key"])
-        dfs = []
-        hist_end = end_date if not live else (current_now - timedelta(days=1)).strftime("%Y-%m-%d")
+        try:
+            key = urllib.parse.quote(item["key"])
+            dfs = []
+            hist_end = end_date if not live else (current_now - timedelta(days=1)).strftime("%Y-%m-%d")
 
-        data = safe_api_request(f"https://api.upstox.com/v2/historical-candle/{key}/1minute/{hist_end}/{start_date}", headers)
-        if data: dfs.append(pd.DataFrame(data, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume", "OI"]))
-
-        if live:
-            data = safe_api_request(f"https://api.upstox.com/v2/historical-candle/intraday/{key}/1minute", headers, is_live=True)
+            data = safe_api_request(f"https://api.upstox.com/v2/historical-candle/{key}/1minute/{hist_end}/{start_date}", headers)
             if data: dfs.append(pd.DataFrame(data, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume", "OI"]))
 
-        if dfs:
-            df = pd.concat(dfs, ignore_index=True)
-            df["Datetime"] = pd.to_datetime(df["Timestamp"]).dt.tz_localize(None)
-            df = df.drop_duplicates(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
-            df["Symbol"] = item["symbol"]
-            return df
+            if live:
+                data = safe_api_request(f"https://api.upstox.com/v2/historical-candle/intraday/{key}/1minute", headers, is_live=True)
+                if data: dfs.append(pd.DataFrame(data, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume", "OI"]))
+
+            if dfs:
+                df = pd.concat(dfs, ignore_index=True)
+                df["Datetime"] = pd.to_datetime(df["Timestamp"]).dt.tz_localize(None)
+                df = df.drop_duplicates(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
+                df["Symbol"] = item["symbol"]
+                return df
+        except Exception:
+            pass
         return None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_API_WORKERS) as executor:
@@ -653,6 +676,10 @@ def scan_institutional_tape(target_date_str):
         return
 
     rolling_master_df = pd.concat(historical_dfs, ignore_index=True)
+    if rolling_master_df.empty:
+        print(f"❌ {COLOR_RED}Concat generated empty dataframe.{COLOR_RESET}")
+        return
+
     print("\n⚙️ Computing 7-Pillar Scorecards & Velocity Matrices on Premium Data...")
 
     tape_exec = prepare_unified_execution_tape(rolling_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES)
@@ -832,3 +859,4 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
+
