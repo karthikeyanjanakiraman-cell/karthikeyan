@@ -179,6 +179,7 @@ def get_options_universe():
     for item in master_data:
         inst_type = item.get("instrument_type")
         
+        # 100% Strict Filtering: MUST be specifically a Stock Option
         if inst_type == "OPTSTK" or (inst_type in ("CE", "PE") and item.get("segment") == "NSE_FO"):
             underlying = item.get("name") or item.get("underlying_symbol")
             if underlying in eq_stocks_by_name:
@@ -297,7 +298,7 @@ def build_options_matrix(spot_prices, options_instruments, target_date_str):
             grouped_options.setdefault(underlying, []).append(opt)
 
     target_contracts = []
-    skipped_reasons = {"no_options": 0, "no_valid_expiries": 0, "no_strikes": 0}
+    skipped_reasons = {"no_options": 0, "invalid_schema": 0, "no_valid_expiries": 0, "no_strikes": 0}
     target_date_obj = dt.strptime(target_date_str, "%Y-%m-%d").date()
     
     for symbol, spot_price in spot_prices.items():
@@ -311,24 +312,44 @@ def build_options_matrix(spot_prices, options_instruments, target_date_str):
         except (ValueError, TypeError):
             continue
         
+        valid_opts = []
         for o in opts:
-            raw_strike = o.get("strike_price") if "strike_price" in o else o.get("strike")
+            # Bulletproof Key Interception (Handles Upstox schema chaos)
+            raw_strike = o.get("strike") or o.get("strike_price") or o.get("strikePrice")
+            raw_expiry = o.get("expiry") or o.get("expiry_date") or o.get("expiryDate")
+            
+            if raw_strike is None or raw_expiry is None:
+                continue
+                
             try:
-                o["_normalized_strike"] = float(raw_strike)
-            except (ValueError, TypeError):
-                o["_normalized_strike"] = None
+                norm_strike = float(raw_strike)
+                
+                # Handles Unix ms timestamps (13-digits) vs Strings ("2024-05-30")
+                if isinstance(raw_expiry, (int, float)) and len(str(int(raw_expiry))) == 13:
+                    parsed_exp = pd.to_datetime(raw_expiry, unit='ms').date()
+                else:
+                    parsed_exp = pd.to_datetime(raw_expiry).date()
+                
+                # Drop contracts that mathematically expired before the target date
+                if parsed_exp >= target_date_obj:
+                    o["_normalized_strike"] = norm_strike
+                    o["_parsed_expiry"] = parsed_exp
+                    valid_opts.append(o)
+            except Exception:
+                continue
 
-        valid_opts = [o for o in opts if o.get("expiry") and o.get("_normalized_strike") is not None]
-        if not valid_opts: continue
-        
-        expiries = sorted(list(set(pd.to_datetime(o["expiry"]).date() for o in valid_opts if pd.to_datetime(o["expiry"]).date() >= target_date_obj)))
+        if not valid_opts:
+            skipped_reasons["invalid_schema"] += 1
+            continue
+            
+        expiries = sorted(list(set(o["_parsed_expiry"] for o in valid_opts)))
         
         if not expiries: 
             skipped_reasons["no_valid_expiries"] += 1
             continue
         
         chosen_expiry = expiries[0] if TARGET_EXPIRY == "CURRENT" else (expiries[1] if len(expiries) > 1 else expiries[0])
-        expiry_opts = [o for o in valid_opts if pd.to_datetime(o["expiry"]).date() == chosen_expiry]
+        expiry_opts = [o for o in valid_opts if o["_parsed_expiry"] == chosen_expiry]
         
         unique_strikes = sorted(list(set(o["_normalized_strike"] for o in expiry_opts)))
         if not unique_strikes: 
@@ -344,16 +365,22 @@ def build_options_matrix(spot_prices, options_instruments, target_date_str):
         
         final_opts = [o for o in expiry_opts if o["_normalized_strike"] in selected_strikes]
         for opt in final_opts:
-            target_contracts.append({
-                "symbol": opt.get("tradingsymbol", opt.get("trading_symbol", "UNKNOWN")),
-                "key": opt["instrument_key"],
-                "underlying": symbol,
-                "type": opt.get("instrument_type")
-            })
+            sym_key = opt.get("tradingsymbol") or opt.get("trading_symbol") or "UNKNOWN"
+            inst_key = opt.get("instrument_key")
+            
+            if inst_key:
+                target_contracts.append({
+                    "symbol": sym_key,
+                    "key": inst_key,
+                    "underlying": symbol,
+                    "type": opt.get("instrument_type")
+                })
             
     if not target_contracts:
         print(f"{COLOR_YELLOW}  ├─ [Warning] Matrix mapping dropped all symbols! Diagnostics:{COLOR_RESET}")
-        print(f"      └─ Valid Options Unavailable: {skipped_reasons['no_options']}")
+        print(f"      └─ Underlying lacking options data: {skipped_reasons['no_options']}")
+        print(f"      └─ Invalid Schema or All Contracts Expired before {target_date_obj}: {skipped_reasons['invalid_schema']}")
+        print(f"      └─ Valid Expiries Missing: {skipped_reasons['no_valid_expiries']}")
         print(f"      └─ Valid Strikes Missing: {skipped_reasons['no_strikes']}")
 
     return target_contracts
@@ -942,7 +969,6 @@ def run_production_sweep():
     args, _ = parser.parse_known_args()
     raw_date_str = args.date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
 
-    # CRITICAL: We now pull the target date using the synced Upstox server time.
     if not raw_date_str:
         target_dt = get_ist_now()
         if target_dt.weekday() == 5: target_dt -= timedelta(days=1)
@@ -959,4 +985,3 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
-
