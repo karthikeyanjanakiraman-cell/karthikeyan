@@ -143,28 +143,42 @@ def get_options_universe():
         print(f"{COLOR_RED}[Error] Failed to fetch master instruments.{COLOR_RESET}")
         return [], []
 
-    # Map NSE_EQ stocks to FO names. Indices have no NSE_EQ segment.
-    eq_stocks = {
-        item.get("tradingsymbol"): item 
-        for item in master_data 
-        if item.get("segment") == "NSE_EQ" and item.get("tradingsymbol") not in EXCLUDED_INDICES
-    }
+    # 1. Map all Cash (Equity) stocks. Indices (like NIFTY) don't have an NSE_EQ entry.
+    eq_stocks = {}
+    for item in master_data:
+        # Check both 'exchange' and 'segment' to counter Upstox API variations
+        if item.get("exchange") == "NSE_EQ" or item.get("segment") == "NSE_EQ":
+            # Check both 'tradingsymbol' and 'trading_symbol'
+            sym = item.get("tradingsymbol") or item.get("trading_symbol")
+            if sym and sym not in EXCLUDED_INDICES:
+                eq_stocks[sym] = item
 
-    # Find F&O contracts where the 'name' matches a valid NSE_EQ tradingsymbol
-    options_instruments = [
-        item for item in master_data 
-        if item.get("instrument_type") in ("OPTSTK", "CE", "PE")
-        and item.get("name") in eq_stocks
-        and item.get("exchange") == "NSE_FO"
-    ]
+    # 2. Map F&O contracts to their verified NSE_EQ cash equivalents
+    options_instruments = []
+    valid_fo_names = set()
     
-    valid_fo_names = {item.get("name") for item in options_instruments}
+    for item in master_data:
+        inst_type = item.get("instrument_type")
+        
+        # Capture CE/PE and OPTSTK formats
+        if inst_type in ("OPTSTK", "CE", "PE"):
+            # Upstox stores the underlying ticker in 'name' or 'underlying_symbol' for F&O
+            underlying = item.get("name") or item.get("underlying_symbol")
+            
+            # If the underlying exists in our Cash market map, it's a valid F&O stock
+            if underlying in eq_stocks:
+                options_instruments.append(item)
+                valid_fo_names.add(underlying)
+                
+    # 3. Retrieve the final Spot mappings based ONLY on valid options found
     spot_instruments = [eq_stocks[name] for name in valid_fo_names]
 
     print(f"  ├─ 🔍 Found {len(valid_fo_names)} Pure F&O Underlying Stocks (Indices completely isolated).")
     print(f"  ├─ 🎯 Mapped {len(spot_instruments)} Spot Instruments & {len(options_instruments)} Options Contracts.")
 
     return spot_instruments, options_instruments
+
+
 
 def safe_api_request(url, headers, is_live=False):
     for attempt in range(5):
