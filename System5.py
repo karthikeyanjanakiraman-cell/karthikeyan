@@ -48,7 +48,7 @@ BACKTRACE_DAYS = 2
 MIN_OPT_PREMIUM = 30.0        
 MIN_PREV_DAY_VOLUME = 800000  
 
-MAX_API_WORKERS = 25         # Safely optimized for Upstox limits
+MAX_API_WORKERS = 25         
 
 MICRO_TIMEFRAME = "1min"
 MACRO_TIMEFRAMES = ["20min"]
@@ -104,6 +104,7 @@ ENTRY_CUTOFF_TIME = "15:00"
 
 EXCLUDED_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "NIFTYNXT50"}
 
+_API_ERROR_PRINTED = False
 
 # ==============================================================================
 # 1. LIVE INGESTION: OPTIONS MATRIX & FAST PRE-FILTERING
@@ -119,12 +120,9 @@ def fetch_json_gz(url):
         response.raise_for_status()
         
         print(f"  ├─ ✅ Download successful! Extracting & parsing JSON into memory...")
-        
-        # Safely check if the response is actually GZIP compressed via Magic Bytes (0x1F, 0x8B)
         if response.content[:2] == b'\x1f\x8b':
             data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
         else:
-            # If requests already auto-decompressed it in the background
             data = response.json()
             
         print(f"  ├─ ✅ Parsing complete! Total instruments loaded: {len(data)}")
@@ -143,7 +141,6 @@ def get_options_universe():
         print(f"{COLOR_RED}[Error] Failed to fetch master instruments.{COLOR_RESET}")
         return [], []
 
-    # 1. Map all Cash (Equity) stocks using the universal 'name' property (e.g. "RELIANCE")
     eq_stocks_by_name = {}
     for item in master_data:
         if item.get("exchange") == "NSE_EQ" or item.get("segment") == "NSE_EQ":
@@ -151,30 +148,28 @@ def get_options_universe():
             if name and name not in EXCLUDED_INDICES:
                 eq_stocks_by_name[name] = item
 
-    # 2. Map F&O contracts to their verified NSE_EQ cash equivalents
     options_instruments = []
     valid_fo_names = set()
     
     for item in master_data:
         inst_type = item.get("instrument_type")
-        # Capture CE/PE and OPTSTK formats
-        if inst_type in ("OPTSTK", "CE", "PE"):
-            # The underlying name in F&O perfectly matches the 'name' in cash
+        
+        # 100% Strict Filtering: MUST be specifically a Stock Option
+        if inst_type == "OPTSTK" or (inst_type in ("CE", "PE") and item.get("segment") == "NSE_FO"):
             underlying = item.get("name") or item.get("underlying_symbol")
-            
             if underlying in eq_stocks_by_name:
                 options_instruments.append(item)
                 valid_fo_names.add(underlying)
                 
-    # 3. Retrieve the final Spot mappings based ONLY on valid options found
     spot_instruments = [eq_stocks_by_name[n] for n in valid_fo_names]
 
-    print(f"  ├─ 🔍 Found {len(valid_fo_names)} Pure F&O Underlying Stocks (Indices completely isolated).")
+    print(f"  ├─ 🔍 Found {len(valid_fo_names)} Pure F&O Underlying Stocks (Indices strictly filtered).")
     print(f"  ├─ 🎯 Mapped {len(spot_instruments)} Spot Instruments & {len(options_instruments)} Options Contracts.")
 
     return spot_instruments, options_instruments
 
 def safe_api_request(url, headers, is_live=False):
+    global _API_ERROR_PRINTED
     for attempt in range(5):
         try:
             res = requests.get(url, headers=headers, timeout=10)
@@ -183,55 +178,80 @@ def safe_api_request(url, headers, is_live=False):
             elif res.status_code == 429:
                 time.sleep(random.uniform(0.5, 2.0) * (attempt + 1))  
             else:
+                if not _API_ERROR_PRINTED:
+                    print(f"\n{COLOR_RED}[API Error Diagnostic] Upstox returned HTTP {res.status_code}")
+                    print(f"URL: {url}")
+                    print(f"Message: {res.text}{COLOR_RESET}\n")
+                    _API_ERROR_PRINTED = True
                 break
         except Exception:
             time.sleep(1)
     return []
 
-def get_latest_close_price(key, headers):
-    # Try intraday first
-    data = safe_api_request(f"https://api.upstox.com/v2/historical-candle/intraday/{key}/1minute", headers, is_live=True)
-    if data: return data[0][4]
-    
-    # Fallback to historical (weekend/holiday safety)
-    today = dt.utcnow().strftime("%Y-%m-%d")
-    week_ago = (dt.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
-    data = safe_api_request(f"https://api.upstox.com/v2/historical-candle/{key}/day/{today}/{week_ago}", headers)
-    if data: return data[0][4]
-    return None
-
-def fetch_latest_spot_prices(spot_instruments, headers):
-    print(f"🚀 Fetching Spot Prices for {len(spot_instruments)} Underlyings...")
+def fetch_latest_spot_prices(spot_instruments, headers, target_date_str):
+    print(f"🚀 Fetching Spot Prices to calculate ATM Strikes...")
     spot_prices = {}
     
-    def worker(inst):
-        # We MUST use the 'name' property so it aligns perfectly with the options matrix
-        sym = inst.get("name", "UNKNOWN")
-        try:
-            raw_key = inst.get("instrument_key")
-            if not raw_key:
-                return sym, None
-                
-            key = urllib.parse.quote(raw_key)
-            price = get_latest_close_price(key, headers)
-            return sym, price
-        except Exception:
+    ist_now = dt.utcnow() + timedelta(hours=5, minutes=30)
+    is_live_today = target_date_str == ist_now.strftime("%Y-%m-%d")
+    
+    if is_live_today:
+        print("  ├─ [Live Mode] Using instant batch LTP API (No historical Spot data fetched)...")
+        key_to_name = {inst["instrument_key"]: inst["name"] for inst in spot_instruments if inst.get("instrument_key")}
+        valid_keys = list(key_to_name.keys())
+        
+        # Upstox supports up to 500 keys per request, chunk by 400 to be safe
+        for i in range(0, len(valid_keys), 400):
+            chunk = valid_keys[i:i + 400]
+            keys_str = ",".join([urllib.parse.quote(k) for k in chunk])
+            url = f"https://api.upstox.com/v2/market-quote/ltp?instrument_key={keys_str}"
+            
+            try:
+                res = requests.get(url, headers=headers, timeout=10)
+                if res.status_code == 200:
+                    data = res.json().get("data", {})
+                    for k, v in data.items():
+                        if v.get("last_price"):
+                            spot_prices[key_to_name[k]] = v["last_price"]
+            except Exception as e:
+                pass
+    else:
+        print(f"  ├─ [Historical Mode] Fetching Daily EOD Spot Prices for {target_date_str}...")
+        # Fallback to fetching ONLY daily candles (never 1-min) for spot prices to minimize API payload
+        target_dt = dt.strptime(target_date_str, "%Y-%m-%d")
+        ten_days_ago = (target_dt - timedelta(days=10)).strftime("%Y-%m-%d")
+        
+        def worker(inst):
+            sym = inst.get("name", "UNKNOWN")
+            try:
+                raw_key = inst.get("instrument_key")
+                if not raw_key: return sym, None
+                key = urllib.parse.quote(raw_key)
+                data = safe_api_request(f"https://api.upstox.com/v2/historical-candle/{key}/day/{target_date_str}/{ten_days_ago}", headers)
+                if data: 
+                    return sym, data[0][4]
+            except Exception:
+                pass
             return sym, None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_API_WORKERS) as executor:
-        futures = {executor.submit(worker, inst): inst for inst in spot_instruments}
-        for future in concurrent.futures.as_completed(futures):
-            sym, price = future.result()
-            # Map spot price strictly via 'name'
-            if price and sym != "UNKNOWN": 
-                spot_prices[sym] = price
+        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_API_WORKERS) as executor:
+            futures = {executor.submit(worker, inst): inst for inst in spot_instruments}
+            for future in concurrent.futures.as_completed(futures):
+                sym, price = future.result()
+                if price and sym != "UNKNOWN": 
+                    spot_prices[sym] = price
             
     return spot_prices
 
 def build_options_matrix(spot_prices, options_instruments):
     print(f"⚙️ Building Options Contract Matrix (Offset: ±{STRIKE_RANGE_OFFSET}, Expiry: {TARGET_EXPIRY})...")
     
-    # Group options by their underlying 'name' so it perfectly matches the spot_prices dictionary
+    if not spot_prices:
+        print(f"{COLOR_RED}  ├─ [Error] spot_prices dictionary is entirely empty! Spot API calls failed.{COLOR_RESET}")
+        return []
+        
+    print(f"  ├─ Successfully loaded {len(spot_prices)} Spot Prices. Mapping options...")
+
     grouped_options = {}
     for opt in options_instruments:
         underlying = opt.get("name") or opt.get("underlying_symbol")
@@ -239,11 +259,16 @@ def build_options_matrix(spot_prices, options_instruments):
             grouped_options.setdefault(underlying, []).append(opt)
 
     target_contracts = []
-    today = dt.utcnow().date()
+    ist_today = (dt.utcnow() + timedelta(hours=5, minutes=30)).date()
     
-    for symbol, spot_price in spot_prices.items(): # 'symbol' is now the pure ticker string (e.g. "RELIANCE")
+    for symbol, spot_price in spot_prices.items():
         opts = grouped_options.get(symbol, [])
         if not opts: continue
+            
+        try:
+            spot_price = float(spot_price)
+        except (ValueError, TypeError):
+            continue
         
         for o in opts:
             raw_strike = o.get("strike_price") if "strike_price" in o else o.get("strike")
@@ -252,11 +277,10 @@ def build_options_matrix(spot_prices, options_instruments):
             except (ValueError, TypeError):
                 o["_normalized_strike"] = None
 
-        # Ignore mathematically expired contracts if backtesting heavily
         valid_opts = [o for o in opts if o.get("expiry") and o.get("_normalized_strike") is not None]
         if not valid_opts: continue
         
-        expiries = sorted(list(set(pd.to_datetime(o["expiry"]).date() for o in valid_opts if pd.to_datetime(o["expiry"]).date() >= today)))
+        expiries = sorted(list(set(pd.to_datetime(o["expiry"]).date() for o in valid_opts if pd.to_datetime(o["expiry"]).date() >= ist_today)))
         if not expiries: continue
         
         chosen_expiry = expiries[0] if TARGET_EXPIRY == "CURRENT" else (expiries[1] if len(expiries) > 1 else expiries[0])
@@ -280,11 +304,11 @@ def build_options_matrix(spot_prices, options_instruments):
                 "underlying": symbol,
                 "type": opt.get("instrument_type")
             })
-            
+
     return target_contracts
 
 def filter_liquid_options(target_contracts, headers, target_date_str):
-    print(f"\n🧹 STAGE 1 INGESTION: Pre-Filtering {len(target_contracts)} contracts...")
+    print(f"\n🧹 STAGE 1 INGESTION: Pre-Filtering {len(target_contracts)} Stock Option contracts...")
     print(f"  ├─ Rules: Prev. Day Close >= ₹{MIN_OPT_PREMIUM} | Prev. Day Vol >= {MIN_PREV_DAY_VOLUME}")
     
     target_dt = dt.strptime(target_date_str, "%Y-%m-%d")
@@ -529,7 +553,6 @@ def apply_dual_tier_scorecard(df, tf_str, tier_type):
     return df
 
 def evaluate_single_timeframe_gates(df_base, tf_str):
-    # Alignment fix: Anchors grouping at 09:15 NSE open
     df_tf = (
         df_base.groupby(["Symbol", pd.Grouper(key="Datetime", freq=tf_str, closed="left", label="left", origin=pd.Timestamp('2000-01-01 09:15:00'))])
         .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
@@ -543,8 +566,6 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
     df_tf = construct_renko_velocity_engine(df_tf, tf_str)
     
     df_tf = apply_dual_tier_scorecard(df_tf, tf_str, "MACRO")
-
-    # Shift time cleanly to avoid lookahead bias in `merge_asof`
     df_tf["Eval_Time"] = df_tf["Datetime"] + pd.to_timedelta(tf_str)
     
     export_cols = [
@@ -577,15 +598,13 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
     df_micro = construct_volume_delta_renko_matrix(df_micro, micro_tf, MICRO_RENKO_CONFIRM_BRICKS)
     df_micro = construct_renko_velocity_engine(df_micro, micro_tf)
     df_micro = apply_dual_tier_scorecard(df_micro, micro_tf, "MICRO")
-    
-    # Critical pd.merge_asof condition: Both DataFrames must be strictly sorted by 'on' before merge
     df_micro = df_micro.sort_values("Datetime").reset_index(drop=True)
 
     bull_gate_cols, bear_gate_cols = [], []
     for tf in macro_timeframes:
         print(f"   ├─ Evaluating Macro Context Gates + Price/Vol/Vel Renko for [{tf}]...")
         env_df = evaluate_single_timeframe_gates(rolling_master_df, tf)
-        env_df = env_df.sort_values("Datetime").reset_index(drop=True)  # Ensuring sorted alignment
+        env_df = env_df.sort_values("Datetime").reset_index(drop=True)
         
         bull_col, bear_col = f"Armed_Bull_{tf}", f"Armed_Bear_{tf}"
         bull_gate_cols.append(bull_col)
@@ -625,21 +644,25 @@ def scan_institutional_tape(target_date_str):
     if not access_token:
         print(f"❌ {COLOR_RED}Error: UPSTOX_ACCESS_TOKEN missing.{COLOR_RESET}")
         return
-    headers = {"Accept": "application/json", "Authorization": f"Bearer {access_token}"}
+        
+    headers = {
+        "Accept": "application/json", 
+        "Api-Version": "2.0",
+        "Authorization": f"Bearer {access_token}"
+    }
 
     spot_inst, options_inst = get_options_universe()
     if not spot_inst: return
 
-    spot_prices = fetch_latest_spot_prices(spot_inst, headers)
+    spot_prices = fetch_latest_spot_prices(spot_inst, headers, target_date_str)
     target_contracts = build_options_matrix(spot_prices, options_inst)
     
     if not target_contracts:
-        print(f"{COLOR_RED}[Error] No options contracts mapped.{COLOR_RESET}")
+        print(f"{COLOR_RED}[Error] No options contracts mapped. Terminating run.{COLOR_RESET}")
         return
         
     print(f"✅ Mapped {len(target_contracts)} total option contracts for analysis.")
 
-    # 🌟 APPLY STAGE 1 FAST PRE-FILTER (Liquidity + Premium)
     target_contracts = filter_liquid_options(target_contracts, headers, target_date_str)
     
     if not target_contracts:
@@ -653,7 +676,7 @@ def scan_institutional_tape(target_date_str):
     current_now = dt.utcnow() + timedelta(hours=5, minutes=30)
     is_live_today = target_date_str == current_now.strftime("%Y-%m-%d")
 
-    print(f"\n🚀 STAGE 2 INGESTION: Multithreading Bulk 1-Min Data for {len(target_contracts)} Liquid Contracts...")
+    print(f"\n🚀 STAGE 2 INGESTION: Multithreading Bulk 1-Min Data for {len(target_contracts)} Stock Option Contracts...")
     fetch_tasks = [(item, trading_days[0], target_date_str, is_live_today) for item in target_contracts]
     historical_dfs = []
 
