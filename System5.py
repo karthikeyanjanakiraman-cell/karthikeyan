@@ -143,15 +143,13 @@ def get_options_universe():
         print(f"{COLOR_RED}[Error] Failed to fetch master instruments.{COLOR_RESET}")
         return [], []
 
-    # 1. Map all Cash (Equity) stocks. Indices (like NIFTY) don't have an NSE_EQ entry.
-    eq_stocks = {}
+    # 1. Map all Cash (Equity) stocks using the universal 'name' property (e.g. "RELIANCE")
+    eq_stocks_by_name = {}
     for item in master_data:
-        # Check both 'exchange' and 'segment' to counter Upstox API variations
         if item.get("exchange") == "NSE_EQ" or item.get("segment") == "NSE_EQ":
-            # Check both 'tradingsymbol' and 'trading_symbol'
-            sym = item.get("tradingsymbol") or item.get("trading_symbol")
-            if sym and sym not in EXCLUDED_INDICES:
-                eq_stocks[sym] = item
+            name = item.get("name")
+            if name and name not in EXCLUDED_INDICES:
+                eq_stocks_by_name[name] = item
 
     # 2. Map F&O contracts to their verified NSE_EQ cash equivalents
     options_instruments = []
@@ -159,26 +157,22 @@ def get_options_universe():
     
     for item in master_data:
         inst_type = item.get("instrument_type")
-        
         # Capture CE/PE and OPTSTK formats
         if inst_type in ("OPTSTK", "CE", "PE"):
-            # Upstox stores the underlying ticker in 'name' or 'underlying_symbol' for F&O
+            # The underlying name in F&O perfectly matches the 'name' in cash
             underlying = item.get("name") or item.get("underlying_symbol")
             
-            # If the underlying exists in our Cash market map, it's a valid F&O stock
-            if underlying in eq_stocks:
+            if underlying in eq_stocks_by_name:
                 options_instruments.append(item)
                 valid_fo_names.add(underlying)
                 
     # 3. Retrieve the final Spot mappings based ONLY on valid options found
-    spot_instruments = [eq_stocks[name] for name in valid_fo_names]
+    spot_instruments = [eq_stocks_by_name[n] for n in valid_fo_names]
 
     print(f"  ├─ 🔍 Found {len(valid_fo_names)} Pure F&O Underlying Stocks (Indices completely isolated).")
     print(f"  ├─ 🎯 Mapped {len(spot_instruments)} Spot Instruments & {len(options_instruments)} Options Contracts.")
 
     return spot_instruments, options_instruments
-
-
 
 def safe_api_request(url, headers, is_live=False):
     for attempt in range(5):
@@ -211,8 +205,8 @@ def fetch_latest_spot_prices(spot_instruments, headers):
     spot_prices = {}
     
     def worker(inst):
-        # Safely capture the symbol accounting for both Upstox spelling variations
-        sym = inst.get("tradingsymbol") or inst.get("trading_symbol", "UNKNOWN")
+        # We MUST use the 'name' property so it aligns perfectly with the options matrix
+        sym = inst.get("name", "UNKNOWN")
         try:
             raw_key = inst.get("instrument_key")
             if not raw_key:
@@ -222,31 +216,32 @@ def fetch_latest_spot_prices(spot_instruments, headers):
             price = get_latest_close_price(key, headers)
             return sym, price
         except Exception:
-            # Safely return the parsed symbol instead of strictly calling inst["tradingsymbol"]
             return sym, None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_API_WORKERS) as executor:
         futures = {executor.submit(worker, inst): inst for inst in spot_instruments}
         for future in concurrent.futures.as_completed(futures):
             sym, price = future.result()
-            # Only map the spot price if we successfully fetched it and recognized the symbol
+            # Map spot price strictly via 'name'
             if price and sym != "UNKNOWN": 
                 spot_prices[sym] = price
             
     return spot_prices
 
-
-
 def build_options_matrix(spot_prices, options_instruments):
     print(f"⚙️ Building Options Contract Matrix (Offset: ±{STRIKE_RANGE_OFFSET}, Expiry: {TARGET_EXPIRY})...")
+    
+    # Group options by their underlying 'name' so it perfectly matches the spot_prices dictionary
     grouped_options = {}
     for opt in options_instruments:
-        grouped_options.setdefault(opt.get("name"), []).append(opt)
+        underlying = opt.get("name") or opt.get("underlying_symbol")
+        if underlying:
+            grouped_options.setdefault(underlying, []).append(opt)
 
     target_contracts = []
     today = dt.utcnow().date()
     
-    for symbol, spot_price in spot_prices.items():
+    for symbol, spot_price in spot_prices.items(): # 'symbol' is now the pure ticker string (e.g. "RELIANCE")
         opts = grouped_options.get(symbol, [])
         if not opts: continue
         
@@ -885,4 +880,3 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
-
