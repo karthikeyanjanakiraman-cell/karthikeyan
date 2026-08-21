@@ -10,6 +10,7 @@ Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine
 
 import argparse
 import concurrent.futures
+import email.utils
 import gzip
 import io
 import json
@@ -37,6 +38,30 @@ COLOR_YELLOW = "\033[93m"
 COLOR_DIM = "\033[2m"
 COLOR_RESET = "\033[0m"
 COLOR_BOLD = "\033[1m"
+
+# ==============================================================================
+# ★ TIME SYNCHRONIZATION (IMMUNE TO SERVER CLOCK SKEW) ★
+# ==============================================================================
+_REAL_WORLD_NOW = None
+
+def get_ist_now():
+    """Fetches the true real-world time directly from Upstox servers to bypass any local clock skew."""
+    global _REAL_WORLD_NOW
+    if _REAL_WORLD_NOW is not None:
+        return _REAL_WORLD_NOW
+        
+    try:
+        res = requests.head("https://api.upstox.com/v2/market-quote/ltp", timeout=3)
+        if 'Date' in res.headers:
+            utc_dt = email.utils.parsedate_to_datetime(res.headers['Date'])
+            _REAL_WORLD_NOW = (utc_dt + timedelta(hours=5, minutes=30)).replace(tzinfo=None)
+            print(f"{COLOR_DIM}[Time Sync] Hard-Synced to Upstox Server Time: {_REAL_WORLD_NOW.strftime('%Y-%m-%d %H:%M:%S')} IST{COLOR_RESET}")
+            return _REAL_WORLD_NOW
+    except Exception:
+        pass
+        
+    _REAL_WORLD_NOW = dt.utcnow() + timedelta(hours=5, minutes=30)
+    return _REAL_WORLD_NOW
 
 # ==============================================================================
 # ★ GLOBAL CONFIGURATION: OPTIONS, TIMEFRAMES & INDICATORS ★
@@ -191,7 +216,7 @@ def fetch_latest_spot_prices(spot_instruments, headers, target_date_str):
     print(f"🚀 Fetching Spot Prices to calculate ATM Strikes...")
     spot_prices = {}
     
-    ist_now = dt.utcnow() + timedelta(hours=5, minutes=30)
+    ist_now = get_ist_now()
     is_live_today = target_date_str == ist_now.strftime("%Y-%m-%d")
     
     if is_live_today:
@@ -273,6 +298,7 @@ def build_options_matrix(spot_prices, options_instruments, target_date_str):
 
     target_contracts = []
     skipped_reasons = {"no_options": 0, "no_valid_expiries": 0, "no_strikes": 0}
+    target_date_obj = dt.strptime(target_date_str, "%Y-%m-%d").date()
     
     for symbol, spot_price in spot_prices.items():
         opts = grouped_options.get(symbol, [])
@@ -295,9 +321,7 @@ def build_options_matrix(spot_prices, options_instruments, target_date_str):
         valid_opts = [o for o in opts if o.get("expiry") and o.get("_normalized_strike") is not None]
         if not valid_opts: continue
         
-        # FIXED: Removed the target_date skew filter. 
-        # Upstox live master files inherently only contain currently active contracts.
-        expiries = sorted(list(set(pd.to_datetime(o["expiry"]).date() for o in valid_opts)))
+        expiries = sorted(list(set(pd.to_datetime(o["expiry"]).date() for o in valid_opts if pd.to_datetime(o["expiry"]).date() >= target_date_obj)))
         
         if not expiries: 
             skipped_reasons["no_valid_expiries"] += 1
@@ -374,12 +398,6 @@ def filter_liquid_options(target_contracts, headers, target_date_str):
                 
     if not filtered_contracts:
         print(f"\n{COLOR_YELLOW}⚠️ All contracts failed Liquidity (Vol >= {MIN_PREV_DAY_VOLUME}) or Premium (Price >= ₹{MIN_OPT_PREMIUM}) checks.{COLOR_RESET}")
-        
-        # If the environment year is > 2025, warn them that their fake clock is causing the Upstox API to return empty data.
-        if target_dt.year >= 2025:
-            print(f"{COLOR_RED}⚠️ CRITICAL DIAGNOSTIC: Your system clock is set to {target_date_str}. Upstox's historical API will return empty data because this date hasn't occurred yet in reality!{COLOR_RESET}")
-            print(f"{COLOR_RED}⚠️ FIX: Pass a real past date to the script (e.g., python system3.py -d 2024-05-20){COLOR_RESET}")
-            
     else:
         print(f"\n  ├─ ✅ Pre-Filter Complete: {len(filtered_contracts)} highly liquid contracts passed.")
         
@@ -710,7 +728,7 @@ def scan_institutional_tape(target_date_str):
     if not trading_days: return
 
     target_dt = pd.to_datetime(target_date_str)
-    current_now = dt.utcnow() + timedelta(hours=5, minutes=30)
+    current_now = get_ist_now()
     is_live_today = target_date_str == current_now.strftime("%Y-%m-%d")
 
     print(f"\n🚀 STAGE 2 INGESTION: Multithreading Bulk 1-Min Data for {len(target_contracts)} Stock Option Contracts...")
@@ -924,8 +942,9 @@ def run_production_sweep():
     args, _ = parser.parse_known_args()
     raw_date_str = args.date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
 
+    # CRITICAL: We now pull the target date using the synced Upstox server time.
     if not raw_date_str:
-        target_dt = dt.utcnow() + timedelta(hours=5, minutes=30)
+        target_dt = get_ist_now()
         if target_dt.weekday() == 5: target_dt -= timedelta(days=1)
         elif target_dt.weekday() == 6: target_dt -= timedelta(days=2)
         target_date_str = target_dt.strftime("%Y-%m-%d")
@@ -940,3 +959,4 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
+
