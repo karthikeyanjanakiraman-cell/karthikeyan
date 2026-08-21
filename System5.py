@@ -211,20 +211,31 @@ def fetch_latest_spot_prices(spot_instruments, headers):
     spot_prices = {}
     
     def worker(inst):
+        # Safely capture the symbol accounting for both Upstox spelling variations
+        sym = inst.get("tradingsymbol") or inst.get("trading_symbol", "UNKNOWN")
         try:
-            key = urllib.parse.quote(inst["instrument_key"])
+            raw_key = inst.get("instrument_key")
+            if not raw_key:
+                return sym, None
+                
+            key = urllib.parse.quote(raw_key)
             price = get_latest_close_price(key, headers)
-            return inst["tradingsymbol"], price
+            return sym, price
         except Exception:
-            return inst["tradingsymbol"], None
+            # Safely return the parsed symbol instead of strictly calling inst["tradingsymbol"]
+            return sym, None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_API_WORKERS) as executor:
         futures = {executor.submit(worker, inst): inst for inst in spot_instruments}
         for future in concurrent.futures.as_completed(futures):
             sym, price = future.result()
-            if price: spot_prices[sym] = price
+            # Only map the spot price if we successfully fetched it and recognized the symbol
+            if price and sym != "UNKNOWN": 
+                spot_prices[sym] = price
             
     return spot_prices
+
+
 
 def build_options_matrix(spot_prices, options_instruments):
     print(f"⚙️ Building Options Contract Matrix (Offset: ±{STRIKE_RANGE_OFFSET}, Expiry: {TARGET_EXPIRY})...")
