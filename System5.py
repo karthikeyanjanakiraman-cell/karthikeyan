@@ -216,15 +216,19 @@ def fetch_latest_spot_prices(spot_instruments, headers, target_date_str):
                     data = res.json().get("data", {})
                     for k, v in data.items():
                         if v.get("last_price"):
-                            spot_prices[key_to_name[k]] = v["last_price"]
+                            # Upstox returns keys like 'NSE_EQ:RELIANCE', extract the ticker
+                            inst_token = v.get("instrument_token")
+                            if inst_token and inst_token in key_to_name:
+                                spot_prices[key_to_name[inst_token]] = v["last_price"]
+                            else:
+                                sym = k.split(":")[-1] if ":" in k else k
+                                spot_prices[sym] = v["last_price"]
                 else:
                     print(f"  ├─ [Warning] LTP API HTTP {res.status_code}: {res.text}")
             except Exception as e:
                 print(f"  ├─ [Warning] LTP request exception: {e}")
 
-    # 🌟 THE FAILSAFE FALLBACK 🌟
-    # If spot_prices is still empty (due to missing API scope, HTTP 414, or weekends),
-    # or if we are actively backtesting a past date, fallback to the robust historical API.
+    # Fallback to historical if Live API failed or if Backtesting
     if not spot_prices:
         if is_live_today:
             print(f"{COLOR_YELLOW}  ├─ [Fallback] Live LTP API failed or returned empty. Falling back to EOD Historical API...{COLOR_RESET}")
@@ -256,7 +260,7 @@ def fetch_latest_spot_prices(spot_instruments, headers, target_date_str):
             
     return spot_prices
 
-def build_options_matrix(spot_prices, options_instruments):
+def build_options_matrix(spot_prices, options_instruments, target_date_str):
     print(f"⚙️ Building Options Contract Matrix (Offset: ±{STRIKE_RANGE_OFFSET}, Expiry: {TARGET_EXPIRY})...")
     
     if not spot_prices:
@@ -272,11 +276,17 @@ def build_options_matrix(spot_prices, options_instruments):
             grouped_options.setdefault(underlying, []).append(opt)
 
     target_contracts = []
-    ist_today = (dt.utcnow() + timedelta(hours=5, minutes=30)).date()
+    
+    # Critical Fix: Anchor the expiry filter to the Target Date, NOT the computer's system clock!
+    target_date_obj = dt.strptime(target_date_str, "%Y-%m-%d").date()
+    
+    skipped_reasons = {"no_options": 0, "no_valid_expiries": 0, "no_strikes": 0}
     
     for symbol, spot_price in spot_prices.items():
         opts = grouped_options.get(symbol, [])
-        if not opts: continue
+        if not opts: 
+            skipped_reasons["no_options"] += 1
+            continue
             
         try:
             spot_price = float(spot_price)
@@ -293,14 +303,20 @@ def build_options_matrix(spot_prices, options_instruments):
         valid_opts = [o for o in opts if o.get("expiry") and o.get("_normalized_strike") is not None]
         if not valid_opts: continue
         
-        expiries = sorted(list(set(pd.to_datetime(o["expiry"]).date() for o in valid_opts if pd.to_datetime(o["expiry"]).date() >= ist_today)))
-        if not expiries: continue
+        # Only accept options where the expiry date is >= the target date we are scanning
+        expiries = sorted(list(set(pd.to_datetime(o["expiry"]).date() for o in valid_opts if pd.to_datetime(o["expiry"]).date() >= target_date_obj)))
+        
+        if not expiries: 
+            skipped_reasons["no_valid_expiries"] += 1
+            continue
         
         chosen_expiry = expiries[0] if TARGET_EXPIRY == "CURRENT" else (expiries[1] if len(expiries) > 1 else expiries[0])
         expiry_opts = [o for o in valid_opts if pd.to_datetime(o["expiry"]).date() == chosen_expiry]
         
         unique_strikes = sorted(list(set(o["_normalized_strike"] for o in expiry_opts)))
-        if not unique_strikes: continue
+        if not unique_strikes: 
+            skipped_reasons["no_strikes"] += 1
+            continue
         
         closest_strike = min(unique_strikes, key=lambda x: abs(x - spot_price))
         atm_idx = unique_strikes.index(closest_strike)
@@ -317,6 +333,12 @@ def build_options_matrix(spot_prices, options_instruments):
                 "underlying": symbol,
                 "type": opt.get("instrument_type")
             })
+            
+    if not target_contracts:
+        print(f"{COLOR_YELLOW}  ├─ [Warning] Matrix mapping dropped all symbols! Diagnostics:{COLOR_RESET}")
+        print(f"      └─ Valid Options Unavailable: {skipped_reasons['no_options']}")
+        print(f"      └─ All Expiries Expired (Target {target_date_obj}): {skipped_reasons['no_valid_expiries']}")
+        print(f"      └─ Valid Strikes Missing: {skipped_reasons['no_strikes']}")
 
     return target_contracts
 
@@ -668,7 +690,9 @@ def scan_institutional_tape(target_date_str):
     if not spot_inst: return
 
     spot_prices = fetch_latest_spot_prices(spot_inst, headers, target_date_str)
-    target_contracts = build_options_matrix(spot_prices, options_inst)
+    
+    # 🌟 CRITICAL FIX: Pass the target_date_str to correctly anchor the expiry filter
+    target_contracts = build_options_matrix(spot_prices, options_inst, target_date_str)
     
     if not target_contracts:
         print(f"{COLOR_RED}[Error] No options contracts mapped. Terminating run.{COLOR_RESET}")
