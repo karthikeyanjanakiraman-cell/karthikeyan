@@ -2,7 +2,7 @@
 
 Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine
 - Target: F&O Stocks Only (Indices Excluded)
-- Execution: Direct Options Premium Charting (Method A)
+- Execution: Direct Options Premium Charting (Option BUYER / LONG ONLY)
 - Configurable Expiry & Strike Offset Matrices
 - TWO-STAGE INGESTION: Ultra-Fast Previous Day Volume & Premium Pre-Filtering
 - Aggressive Multithreading with HTTP 429 (Rate Limit) Evasion
@@ -91,7 +91,8 @@ MACRO_RENKO_CONFIRM_BRICKS = 1
 RENKO_MIN_BRICK = 0.05
 RENKO_DEFAULT_PCT = 0.05     
 
-GLOBAL_MACRO_STRATEGY_2D = "BOTH" 
+# Hardcoded to LONG_ONLY for Option Buying (Never shorting an option)
+GLOBAL_MACRO_STRATEGY_2D = "LONG_ONLY" 
 
 # ==============================================================================
 # 🎛️ TIER 1 & 2: DUAL-TIER SWITCHBOARDS - 7 PILLARS
@@ -179,7 +180,6 @@ def get_options_universe():
     for item in master_data:
         inst_type = item.get("instrument_type")
         
-        # 100% Strict Filtering: MUST be specifically a Stock Option
         if inst_type == "OPTSTK" or (inst_type in ("CE", "PE") and item.get("segment") == "NSE_FO"):
             underlying = item.get("name") or item.get("underlying_symbol")
             if underlying in eq_stocks_by_name:
@@ -314,7 +314,6 @@ def build_options_matrix(spot_prices, options_instruments, target_date_str):
         
         valid_opts = []
         for o in opts:
-            # Bulletproof Key Interception (Handles Upstox schema chaos)
             raw_strike = o.get("strike") or o.get("strike_price") or o.get("strikePrice")
             raw_expiry = o.get("expiry") or o.get("expiry_date") or o.get("expiryDate")
             
@@ -324,13 +323,11 @@ def build_options_matrix(spot_prices, options_instruments, target_date_str):
             try:
                 norm_strike = float(raw_strike)
                 
-                # Handles Unix ms timestamps (13-digits) vs Strings ("2024-05-30")
                 if isinstance(raw_expiry, (int, float)) and len(str(int(raw_expiry))) == 13:
                     parsed_exp = pd.to_datetime(raw_expiry, unit='ms').date()
                 else:
                     parsed_exp = pd.to_datetime(raw_expiry).date()
                 
-                # Drop contracts that mathematically expired before the target date
                 if parsed_exp >= target_date_obj:
                     o["_normalized_strike"] = norm_strike
                     o["_parsed_expiry"] = parsed_exp
@@ -809,10 +806,14 @@ def scan_institutional_tape(target_date_str):
     print("\n⚙️ Computing 7-Pillar Scorecards & Velocity Matrices on Premium Data...")
 
     tape_exec = prepare_unified_execution_tape(rolling_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES)
-    if GLOBAL_MACRO_STRATEGY_2D == "BULLISH": tape_exec["Master_Armed_Bear"] = False
-    elif GLOBAL_MACRO_STRATEGY_2D == "BEARISH": tape_exec["Master_Armed_Bull"] = False
+    
+    # 🌟 ENFORCE LONG-ONLY OPTION BUYING 🌟
+    # We do not want to short options, so we completely disable Bearish triggers (Direction = -1)
+    tape_exec["Master_Armed_Bear"] = False
+    tape_exec["Direction"] = np.where(tape_exec["Direction"] == 1, 1, 0)
 
-    all_anomalies = tape_exec[tape_exec["Direction"] != 0].copy()
+    # Filter anomaly array to ONLY process LONG trades
+    all_anomalies = tape_exec[tape_exec["Direction"] == 1].copy()
     anomalies_by_time = all_anomalies.groupby("Datetime")
 
     closes_dict = tape_exec.set_index(["Datetime", "Symbol"])["Close"].to_dict()
@@ -855,19 +856,6 @@ def scan_institutional_tape(target_date_str):
                                         exit_reason = f"Macro [{tf}] Price Break"
                                         break
                                     if ma_v <= -MACRO_EXIT_VOL_BRICKS:
-                                        exit_reason = f"Macro [{tf}] Volume Break"
-                                        break
-                        elif st["dir"] == -1:
-                            if mi_p_count >= MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
-                            elif mi_v_count >= MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
-                            else:
-                                for tf in st["triggering_macro_tfs"]:
-                                    ma_p = macro_price_renkos[tf].get((t_dt, sym), 0)
-                                    ma_v = macro_vol_renkos[tf].get((t_dt, sym), 0)
-                                    if ma_p >= MACRO_EXIT_PRICE_BRICKS:
-                                        exit_reason = f"Macro [{tf}] Price Break"
-                                        break
-                                    if ma_v >= MACRO_EXIT_VOL_BRICKS:
                                         exit_reason = f"Macro [{tf}] Volume Break"
                                         break
                     
@@ -933,9 +921,12 @@ def scan_institutional_tape(target_date_str):
         print(f"{COLOR_BOLD}🟢 BASKET 1: ACTIVE RUNNERS (Riding the Trend){COLOR_RESET}")
         for sym, st in active_runners.items():
             ltp = final_ltp_dict.get(sym, st["origin"])
-            pnl_pct = ((ltp - st["origin"]) / st["origin"]) * 100 if st["dir"] == 1 else ((st["origin"] - ltp) / st["origin"]) * 100
+            pnl_pct = ((ltp - st["origin"]) / st["origin"]) * 100 
             color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
-            d_str = "BULLISH" if st["dir"] == 1 else "BEARISH"
+            
+            # Dynamically display LONG CE or LONG PE based on the ticker string
+            opt_type = "CE" if "CE" in sym[-5:] else "PE" if "PE" in sym[-5:] else "OPT"
+            d_str = f"LONG {opt_type}"
             
             print(f"  {color}⚡ {sym:<20} Open P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
             print(f"      └─ ⚓ Qualifying Macro TFs        : {', '.join(st['triggering_macro_tfs'])}")
@@ -946,9 +937,12 @@ def scan_institutional_tape(target_date_str):
     if closed_trades:
         print(f"{COLOR_BOLD}🛑 BASKET 2: CLOSED TRADES (Renko Structure Broken / Stagnation){COLOR_RESET}")
         for st in closed_trades:
-            pnl_pct = ((st["exit_price"] - st["origin"]) / st["origin"]) * 100 if st["dir"] == 1 else ((st["origin"] - st["exit_price"]) / st["origin"]) * 100
+            pnl_pct = ((st["exit_price"] - st["origin"]) / st["origin"]) * 100 
             color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
-            d_str = "BULLISH" if st["dir"] == 1 else "BEARISH"
+            
+            # Dynamically display LONG CE or LONG PE based on the ticker string
+            opt_type = "CE" if "CE" in st["sym"][-5:] else "PE" if "PE" in st["sym"][-5:] else "OPT"
+            d_str = f"LONG {opt_type}"
 
             print(f"  {color}🛑 {st['sym']:<20} Final P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
             print(f"      └─ ⚓ Qualifying Macro TFs        : {', '.join(st['triggering_macro_tfs'])}")
@@ -958,7 +952,7 @@ def scan_institutional_tape(target_date_str):
             print(f"      └─ 📉 Reason                      : {st['exit_reason']}\n")
 
     if not active_runners and not closed_trades:
-        print(f"{COLOR_DIM}[Terminal Silent] No trades triggered today.{COLOR_RESET}\n")
+        print(f"{COLOR_DIM}[Terminal Silent] No LONG trades triggered today.{COLOR_RESET}\n")
 
 # ==============================================================================
 # 7. RUN EXECUTOR
