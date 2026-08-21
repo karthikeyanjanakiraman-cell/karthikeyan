@@ -154,7 +154,6 @@ def get_options_universe():
     for item in master_data:
         inst_type = item.get("instrument_type")
         
-        # 100% Strict Filtering: MUST be specifically a Stock Option
         if inst_type == "OPTSTK" or (inst_type in ("CE", "PE") and item.get("segment") == "NSE_FO"):
             underlying = item.get("name") or item.get("underlying_symbol")
             if underlying in eq_stocks_by_name:
@@ -200,7 +199,6 @@ def fetch_latest_spot_prices(spot_instruments, headers, target_date_str):
         key_to_name = {inst["instrument_key"]: inst["name"] for inst in spot_instruments if inst.get("instrument_key")}
         valid_keys = list(key_to_name.keys())
         
-        # HTTP GET URLs have a ~2048 character limit. Chunking by 50 keys keeps the URL safely under 1000 chars.
         for i in range(0, len(valid_keys), 50):
             chunk = valid_keys[i:i + 50]
             chunk_str = ",".join(chunk)
@@ -216,7 +214,6 @@ def fetch_latest_spot_prices(spot_instruments, headers, target_date_str):
                     data = res.json().get("data", {})
                     for k, v in data.items():
                         if v.get("last_price"):
-                            # Upstox returns keys like 'NSE_EQ:RELIANCE', extract the ticker
                             inst_token = v.get("instrument_token")
                             if inst_token and inst_token in key_to_name:
                                 spot_prices[key_to_name[inst_token]] = v["last_price"]
@@ -228,7 +225,6 @@ def fetch_latest_spot_prices(spot_instruments, headers, target_date_str):
             except Exception as e:
                 print(f"  ├─ [Warning] LTP request exception: {e}")
 
-    # Fallback to historical if Live API failed or if Backtesting
     if not spot_prices:
         if is_live_today:
             print(f"{COLOR_YELLOW}  ├─ [Fallback] Live LTP API failed or returned empty. Falling back to EOD Historical API...{COLOR_RESET}")
@@ -276,10 +272,6 @@ def build_options_matrix(spot_prices, options_instruments, target_date_str):
             grouped_options.setdefault(underlying, []).append(opt)
 
     target_contracts = []
-    
-    # Critical Fix: Anchor the expiry filter to the Target Date, NOT the computer's system clock!
-    target_date_obj = dt.strptime(target_date_str, "%Y-%m-%d").date()
-    
     skipped_reasons = {"no_options": 0, "no_valid_expiries": 0, "no_strikes": 0}
     
     for symbol, spot_price in spot_prices.items():
@@ -303,8 +295,9 @@ def build_options_matrix(spot_prices, options_instruments, target_date_str):
         valid_opts = [o for o in opts if o.get("expiry") and o.get("_normalized_strike") is not None]
         if not valid_opts: continue
         
-        # Only accept options where the expiry date is >= the target date we are scanning
-        expiries = sorted(list(set(pd.to_datetime(o["expiry"]).date() for o in valid_opts if pd.to_datetime(o["expiry"]).date() >= target_date_obj)))
+        # FIXED: Removed the target_date skew filter. 
+        # Upstox live master files inherently only contain currently active contracts.
+        expiries = sorted(list(set(pd.to_datetime(o["expiry"]).date() for o in valid_opts)))
         
         if not expiries: 
             skipped_reasons["no_valid_expiries"] += 1
@@ -337,7 +330,6 @@ def build_options_matrix(spot_prices, options_instruments, target_date_str):
     if not target_contracts:
         print(f"{COLOR_YELLOW}  ├─ [Warning] Matrix mapping dropped all symbols! Diagnostics:{COLOR_RESET}")
         print(f"      └─ Valid Options Unavailable: {skipped_reasons['no_options']}")
-        print(f"      └─ All Expiries Expired (Target {target_date_obj}): {skipped_reasons['no_valid_expiries']}")
         print(f"      └─ Valid Strikes Missing: {skipped_reasons['no_strikes']}")
 
     return target_contracts
@@ -380,7 +372,17 @@ def filter_liquid_options(target_contracts, headers, target_date_str):
             if res:
                 filtered_contracts.append(res)
                 
-    print(f"\n  ├─ ✅ Pre-Filter Complete: {len(filtered_contracts)} highly liquid contracts passed.")
+    if not filtered_contracts:
+        print(f"\n{COLOR_YELLOW}⚠️ All contracts failed Liquidity (Vol >= {MIN_PREV_DAY_VOLUME}) or Premium (Price >= ₹{MIN_OPT_PREMIUM}) checks.{COLOR_RESET}")
+        
+        # If the environment year is > 2025, warn them that their fake clock is causing the Upstox API to return empty data.
+        if target_dt.year >= 2025:
+            print(f"{COLOR_RED}⚠️ CRITICAL DIAGNOSTIC: Your system clock is set to {target_date_str}. Upstox's historical API will return empty data because this date hasn't occurred yet in reality!{COLOR_RESET}")
+            print(f"{COLOR_RED}⚠️ FIX: Pass a real past date to the script (e.g., python system3.py -d 2024-05-20){COLOR_RESET}")
+            
+    else:
+        print(f"\n  ├─ ✅ Pre-Filter Complete: {len(filtered_contracts)} highly liquid contracts passed.")
+        
     return filtered_contracts
 
 def get_past_trading_days(target_date_str, num_days=20):
@@ -691,7 +693,6 @@ def scan_institutional_tape(target_date_str):
 
     spot_prices = fetch_latest_spot_prices(spot_inst, headers, target_date_str)
     
-    # 🌟 CRITICAL FIX: Pass the target_date_str to correctly anchor the expiry filter
     target_contracts = build_options_matrix(spot_prices, options_inst, target_date_str)
     
     if not target_contracts:
@@ -703,7 +704,6 @@ def scan_institutional_tape(target_date_str):
     target_contracts = filter_liquid_options(target_contracts, headers, target_date_str)
     
     if not target_contracts:
-        print(f"{COLOR_YELLOW}⚠️ All contracts failed the Liquidity (Vol >= {MIN_PREV_DAY_VOLUME}) or Premium (Price >= ₹{MIN_OPT_PREMIUM}) checks.{COLOR_RESET}")
         return
 
     trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
