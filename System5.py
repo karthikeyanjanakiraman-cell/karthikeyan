@@ -44,7 +44,7 @@ COLOR_BOLD = "\033[1m"
 # ★ GLOBAL CONFIGURATION: BROKER, OPTIONS & TIMEFRAMES ★
 # ==============================================================================
 # 🌟 ACTIVE BROKER ROUTING SWITCH ("UPSTOX" or "FYERS")
-ACTIVE_BROKER = "UPSTOX"
+ACTIVE_BROKER = "FYERS"
 
 # Options Selection Configurations
 STRIKE_RANGE_OFFSET = 2      # Number of strikes above and below ATM
