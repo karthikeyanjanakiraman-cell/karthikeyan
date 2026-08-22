@@ -178,45 +178,39 @@ def get_universe_data():
             print("  ├─ Downloading & Parsing FYERS F&O Data...")
             headers = {'User-Agent': 'Mozilla/5.0'}
             res_fo = requests.get("https://public.fyers.in/sym_details/NSE_FO.csv", headers=headers, timeout=15)
-            res_cm = requests.get("https://public.fyers.in/sym_details/NSE_CM.csv", headers=headers, timeout=15)
             
-            # Pandas handles quoted commas perfectly and prevents data corruption
-            df_fo = pd.read_csv(io.StringIO(res_fo.text), header=None)
-            df_cm = pd.read_csv(io.StringIO(res_cm.text), header=None)
+            # low_memory=False prevents Pandas from getting confused by mixed data types
+            df_fo = pd.read_csv(io.StringIO(res_fo.text), header=None, low_memory=False)
             
-            # Instrument Type 14 = OPTSTK (Stock Options Only)
-            df_optstk = df_fo[df_fo[2] == 14].copy()
+            # Filter by "CE" or "PE" instead of numeric ID to bypass the typing bug completely
+            df_opt = df_fo[df_fo[15].isin(["CE", "PE"])].copy()
             
-            for _, row in df_optstk.iterrows():
+            valid_underlyings = set()
+            
+            for _, row in df_opt.iterrows():
                 try:
-                    # Extract the pure base symbol (e.g. "RELIANCE 29 AUG..." -> "RELIANCE")
-                    base_symbol = str(row[1]).split()[0].strip()
-                    expiry_date = dt.fromtimestamp(int(row[8])).strftime("%Y-%m-%d")
-                    opt_inst.append({
-                        "symbol": str(row[9]), 
-                        "key": str(row[9]), 
-                        "underlying": base_symbol,
-                        "type": str(row[15]), 
-                        "strike": float(row[14]), 
-                        "expiry": expiry_date
-                    })
-                except: pass
-                
-            valid_underlyings = {o["underlying"] for o in opt_inst}
-            
-            # Instrument Type 10 = EQ (Equities)
-            df_eq = df_cm[df_cm[2] == 10].copy()
-            
-            for _, row in df_eq.iterrows():
-                try:
-                    ticker = str(row[9]) # e.g. "NSE:RELIANCE-EQ"
-                    base_symbol = ticker.replace("NSE:", "").replace("-EQ", "").strip()
-                    if base_symbol in valid_underlyings:
-                        spot_inst.append({
-                            "symbol": ticker, 
-                            "key": ticker, 
-                            "underlying": base_symbol
+                    underlying_key = str(row[13]) # Fyers stores the Spot Key here (e.g., "NSE:RELIANCE-EQ")
+                    base_symbol = underlying_key.replace("NSE:", "").replace("-EQ", "").replace("-INDEX", "").strip()
+                    
+                    if base_symbol not in EXCLUDED_INDICES:
+                        expiry_date = dt.fromtimestamp(int(row[8])).strftime("%Y-%m-%d")
+                        opt_inst.append({
+                            "symbol": str(row[9]), 
+                            "key": str(row[9]), 
+                            "underlying": base_symbol,
+                            "type": str(row[15]), 
+                            "strike": float(row[14]), 
+                            "expiry": expiry_date
                         })
+                        
+                        # Instantly build the Spot list using the exact key Fyers expects
+                        if base_symbol not in valid_underlyings:
+                            valid_underlyings.add(base_symbol)
+                            spot_inst.append({
+                                "symbol": base_symbol,
+                                "key": underlying_key,
+                                "underlying": base_symbol
+                            })
                 except: pass
                 
         except Exception as e:
@@ -935,3 +929,4 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
+
