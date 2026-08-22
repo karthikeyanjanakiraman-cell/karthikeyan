@@ -49,13 +49,13 @@ TARGET_EXPIRY = "CURRENT"    # "CURRENT" or "NEXT"
 BACKTRACE_DAYS = 15          # Default historical reach for Macro TFs
 
 # 🌟 NEW PRE-FILTER VARIABLES (The Speed Enablers)
-MIN_OPT_PREMIUM = 5.0        # Option must close >= ₹5.00 on the previous day
-MIN_PREV_DAY_VOLUME = 10000  # Option must have traded >= 10,000 contracts on the previous day
+MIN_OPT_PREMIUM = 50.0        # Option must close >= ₹5.00 on the previous day
+MIN_PREV_DAY_VOLUME = 100000  # Option must have traded >= 10,000 contracts on the previous day
 
 MAX_API_WORKERS = 40         # Aggressive threading worker count
 
 MICRO_TIMEFRAME = "1min"
-MACRO_TIMEFRAMES = ["20min"]
+MACRO_TIMEFRAMES = ["5min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -77,31 +77,31 @@ GLOBAL_MACRO_STRATEGY_2D = "BOTH"
 # ==============================================================================
 MACRO_MANDATORY_PRICE_RENKO    = True
 MACRO_MANDATORY_VOL_RENKO      = True
-MACRO_MANDATORY_RENKO_VELOCITY = True
+MACRO_MANDATORY_RENKO_VELOCITY = False
 MACRO_MANDATORY_RSI_BB         = False
 MACRO_MANDATORY_ADX_DMI        = False
 MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
-MACRO_MINIMUM_SCORE            = 3      
+MACRO_MINIMUM_SCORE            = 2      
 
 SYNC_MICRO_WITH_MACRO          = False  
 
 MICRO_MANDATORY_PRICE_RENKO    = True
 MICRO_MANDATORY_VOL_RENKO      = True
-MICRO_MANDATORY_RENKO_VELOCITY = True
+MICRO_MANDATORY_RENKO_VELOCITY = False
 MICRO_MANDATORY_RSI_BB         = False
 MICRO_MANDATORY_ADX_DMI        = False
-MICRO_MANDATORY_EMA_SPREAD     = True
-MICRO_MANDATORY_STOCHASTIC     = False
-MICRO_MINIMUM_SCORE            = 4      
+MICRO_MANDATORY_EMA_SPREAD     = False
+MICRO_MANDATORY_STOCHASTIC     = True
+MICRO_MINIMUM_SCORE            = 3      
 
 # ==============================================================================
 # 🎛️ TIER 3: TRADE MANAGEMENT & TEMPORAL GATES
 # ==============================================================================
 MICRO_EXIT_PRICE_BRICKS = 5  
 MICRO_EXIT_VOL_BRICKS   = 5  
-MACRO_EXIT_PRICE_BRICKS = 1
-MACRO_EXIT_VOL_BRICKS   = 1  
+MACRO_EXIT_PRICE_BRICKS = 5
+MACRO_EXIT_VOL_BRICKS   = 5  
 
 RENKO_VELOCITY_MAX_BARS = 12 
 ENTRY_CUTOFF_TIME = "15:00"
