@@ -240,14 +240,26 @@ def get_universe_data():
                         type_idx = i
                         break
 
-                if not opt_type or type_idx < 2:
+                if not opt_type or type_idx < 3:
                     continue
 
                 try:
                     strike_val = float(cols[type_idx - 1])
-                    base_symbol = cols[type_idx - 2].strip()
+                    # 🌟 FIX: base_symbol sits 3 columns left of CE/PE, not 2.
+                    # The column at (type_idx - 2) is a raw numeric underlying instrument
+                    # token (e.g. 26037 = NIFTY FIN SERVICE, 26009 = NIFTY BANK), NOT the
+                    # symbol name. Reading it as the name caused EXCLUDED_INDICES (which
+                    # matches on names like "BANKNIFTY") to silently miss index derivatives,
+                    # which then produced bogus spot tickers like "NSE:26037-EQ" downstream.
+                    base_symbol = cols[type_idx - 3].strip()
 
                     if base_symbol in EXCLUDED_INDICES:
+                        continue
+
+                    # Defensive guard: real NSE symbol names are never purely numeric.
+                    # If parsing still lands on a numeric token for any row (format drift,
+                    # malformed line, etc.), skip it instead of building an invalid ticker.
+                    if base_symbol.isdigit() or not base_symbol:
                         continue
 
                     sym_ticker = None
