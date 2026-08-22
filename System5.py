@@ -194,24 +194,30 @@ def get_options_universe():
     return spot_instruments, options_instruments
 
 def safe_api_request(url, headers, is_live=False):
-    global _API_ERROR_PRINTED
     for attempt in range(5):
         try:
             res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 200:
-                return res.json().get("data", {}).get("candles", [])
+                data = res.json().get("data", {}).get("candles", [])
+                
+                # 🛑 DIAGNOSTIC: If it successfully connected but Upstox returned NO data
+                if not data and "1minute" in url:
+                    print(f"\n{COLOR_YELLOW}[Debug] Upstox 200 OK, but NO candles returned for:{COLOR_RESET}")
+                    print(f"  └─ URL: {url}")
+                return data
+                
             elif res.status_code == 429:
-                time.sleep(random.uniform(0.5, 2.0) * (attempt + 1))  
+                time.sleep(random.uniform(0.5, 2.0) * (attempt + 1))
             else:
-                if not _API_ERROR_PRINTED:
-                    print(f"\n{COLOR_RED}[API Error Diagnostic] Upstox returned HTTP {res.status_code}")
-                    print(f"URL: {url}")
-                    print(f"Message: {res.text}{COLOR_RESET}\n")
-                    _API_ERROR_PRINTED = True
+                # 🛑 DIAGNOSTIC: If Upstox threw an actual error code (400, 403, etc.)
+                print(f"\n{COLOR_RED}[Debug] Upstox HTTP {res.status_code} Error:{COLOR_RESET}")
+                print(f"  └─ URL: {url}")
+                print(f"  └─ Response: {res.text}")
                 break
-        except Exception:
+        except Exception as e:
             time.sleep(1)
     return []
+
 
 def fetch_latest_spot_prices(spot_instruments, headers, target_date_str):
     print(f"🚀 Fetching Spot Prices to calculate ATM Strikes...")
