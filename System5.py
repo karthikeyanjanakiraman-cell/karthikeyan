@@ -55,7 +55,8 @@ BACKTRACE_DAYS = 15          # Default historical reach for Macro TFs
 MIN_OPT_PREMIUM = 15.0       # Option must close >= ₹15.00 on the previous day
 MIN_PREV_DAY_VOLUME = 250000 # Option must have traded >= 2.5 Lakh shares previously
 
-MAX_API_WORKERS = 40         # Aggressive threading worker count
+# FYERS has a strict 10 req/sec limit. UPSTOX allows heavy multithreading.
+MAX_API_WORKERS = 40 if ACTIVE_BROKER == "UPSTOX" else 7  
 
 MICRO_TIMEFRAME = "1min"
 MACRO_TIMEFRAMES = ["20min"]
@@ -197,7 +198,7 @@ def get_universe_data():
             for line in res_fo.text.strip().split('\n'):
                 cols = [c.strip() for c in line.split(',')]
                 
-                # 1. Find Option Type by scanning backwards to bypass Fyers' trailing dummy zeroes
+                # Find Option Type by scanning backwards to bypass Fyers' trailing dummy zeroes
                 opt_type = None
                 type_idx = -1
                 for i in range(len(cols)-1, -1, -1):
@@ -210,14 +211,14 @@ def get_universe_data():
                     continue
                     
                 try:
-                    # 2. Extract Strike & Underlying (Universally locked to the immediate left of Option Type)
+                    # Extract Strike & Underlying (Universally locked to the immediate left of Option Type)
                     strike_val = float(cols[type_idx - 1])
                     base_symbol = cols[type_idx - 2].strip()
                     
                     if base_symbol in EXCLUDED_INDICES:
                         continue
                         
-                    # 3. Find Symbol Ticker dynamically (Must start with NSE: and match the Option Type)
+                    # Find Symbol Ticker dynamically (Must start with NSE: and match the Option Type)
                     sym_ticker = None
                     for c in cols:
                         if c.startswith("NSE:") and opt_type in c:
@@ -227,12 +228,11 @@ def get_universe_data():
                     if not sym_ticker:
                         continue
                         
-                    # 4. Find Expiry Epoch dynamically (Look for the massive 10-digit integer)
+                    # Find Expiry Epoch dynamically (Look for the massive integer)
                     expiry_date = None
                     for c in cols:
                         try:
                             num = int(float(c))
-                            # Epoch timestamps for the 2020s fall cleanly in this range
                             if 1.5e9 < num < 3e9:
                                 expiry_date = dt.fromtimestamp(num).strftime("%Y-%m-%d")
                                 break
@@ -241,7 +241,6 @@ def get_universe_data():
                     if not expiry_date:
                         continue
                         
-                    # Safely extracted all data!
                     opt_inst.append({
                         "symbol": sym_ticker, 
                         "key": sym_ticker, 
@@ -251,7 +250,6 @@ def get_universe_data():
                         "expiry": expiry_date
                     })
                     
-                    # 5. Build Spot mapping safely
                     if base_symbol not in valid_underlyings:
                         valid_underlyings.add(base_symbol)
                         spot_ticker = spot_key_map.get(base_symbol, f"NSE:{base_symbol}-EQ")
@@ -273,11 +271,11 @@ def get_universe_data():
 def fetch_broker_data(key, tf_type, start_dt, end_dt, is_live=False):
     """Universal safe fetcher that routes requests cleanly without crashing"""
     headers = get_auth_headers()
-    encoded_key = urllib.parse.quote(key)
     
     for attempt in range(3):
         try:
             if ACTIVE_BROKER == "UPSTOX":
+                encoded_key = urllib.parse.quote(key)
                 res_tf = "1minute" if tf_type == "1minute" else "day"
                 
                 if is_live and tf_type == "1minute":
@@ -299,10 +297,19 @@ def fetch_broker_data(key, tf_type, start_dt, end_dt, is_live=False):
                     return df
 
             elif ACTIVE_BROKER == "FYERS":
-                res_tf = "1" if tf_type == "1minute" else "D"
-                url = f"https://api-t1.fyers.in/data/history?symbol={encoded_key}&resolution={res_tf}&date_format=1&range_from={start_dt}&range_to={end_dt}"
+                # Fyers officially uses "1D" for daily resolution, not "D"
+                res_tf = "1" if tf_type == "1minute" else "1D"
                 
-                res = requests.get(url, headers=headers, timeout=10)
+                # Use params dict so the 'requests' library handles the URL encoding perfectly
+                params = {
+                    "symbol": key,
+                    "resolution": res_tf,
+                    "date_format": "1",
+                    "range_from": start_dt,
+                    "range_to": end_dt
+                }
+                res = requests.get("https://api-t1.fyers.in/data/history", headers=headers, params=params, timeout=10)
+                
                 if res.status_code == 200:
                     data = res.json()
                     if not data: return None
@@ -312,12 +319,14 @@ def fetch_broker_data(key, tf_type, start_dt, end_dt, is_live=False):
                         return df
                     return None
 
+            # Rate Limit Backoff
             if res.status_code == 429:
-                time.sleep(random.uniform(0.5, 2.0) * (attempt + 1))
+                time.sleep(random.uniform(1.0, 3.0) * (attempt + 1))
             else:
                 break
         except Exception:
             time.sleep(1)
+            
     return None
 
 def fetch_latest_spot_prices(spot_instruments):
