@@ -179,40 +179,50 @@ def get_universe_data():
             headers = {'User-Agent': 'Mozilla/5.0'}
             res_fo = requests.get("https://public.fyers.in/sym_details/NSE_FO.csv", headers=headers, timeout=15)
             
-            # low_memory=False prevents Pandas from getting confused by mixed data types
-            df_fo = pd.read_csv(io.StringIO(res_fo.text), header=None, low_memory=False)
-            
-            # Filter by "CE" or "PE" instead of numeric ID to bypass the typing bug completely
-            df_opt = df_fo[df_fo[15].isin(["CE", "PE"])].copy()
-            
             valid_underlyings = set()
             
-            for _, row in df_opt.iterrows():
-                try:
-                    underlying_key = str(row[13]) # Fyers stores the Spot Key here (e.g., "NSE:RELIANCE-EQ")
-                    base_symbol = underlying_key.replace("NSE:", "").replace("-EQ", "").replace("-INDEX", "").strip()
-                    
-                    if base_symbol not in EXCLUDED_INDICES:
-                        expiry_date = dt.fromtimestamp(int(row[8])).strftime("%Y-%m-%d")
-                        opt_inst.append({
-                            "symbol": str(row[9]), 
-                            "key": str(row[9]), 
-                            "underlying": base_symbol,
-                            "type": str(row[15]), 
-                            "strike": float(row[14]), 
-                            "expiry": expiry_date
-                        })
-                        
-                        # Instantly build the Spot list using the exact key Fyers expects
-                        if base_symbol not in valid_underlyings:
-                            valid_underlyings.add(base_symbol)
-                            spot_inst.append({
-                                "symbol": base_symbol,
-                                "key": underlying_key,
-                                "underlying": base_symbol
-                            })
-                except: pass
+            # 🌟 BULLETPROOF PARSING: Anchor from the right side (Negative Indexing)
+            # This makes it 100% immune to random commas inside company names
+            for line in res_fo.text.strip().split('\n'):
+                cols = line.split(',')
                 
+                # A valid Fyers FO line has at least 16 columns
+                if len(cols) >= 16:
+                    opt_type = cols[-1].strip()  # Always Option Type ('CE', 'PE', etc.)
+                    
+                    if opt_type in ("CE", "PE"):
+                        strike_str = cols[-2].strip()      # Always Strike Price
+                        underlying_key = cols[-3].strip()  # Always Underlying Key
+                        sym_ticker = cols[-7].strip()      # Always Symbol Ticker
+                        expiry_epoch = cols[-8].strip()    # Always Epoch Timestamp
+                        
+                        base_symbol = underlying_key.replace("NSE:", "").replace("-EQ", "").replace("-INDEX", "").strip()
+                        
+                        if base_symbol not in EXCLUDED_INDICES:
+                            try:
+                                strike_val = float(strike_str)
+                                expiry_date = dt.fromtimestamp(int(expiry_epoch)).strftime("%Y-%m-%d")
+                                
+                                opt_inst.append({
+                                    "symbol": sym_ticker, 
+                                    "key": sym_ticker, 
+                                    "underlying": base_symbol,
+                                    "type": opt_type, 
+                                    "strike": strike_val, 
+                                    "expiry": expiry_date
+                                })
+                                
+                                # Instantly build the Spot list using the exact key Fyers expects
+                                if base_symbol not in valid_underlyings:
+                                    valid_underlyings.add(base_symbol)
+                                    spot_inst.append({
+                                        "symbol": base_symbol,
+                                        "key": underlying_key,
+                                        "underlying": base_symbol
+                                    })
+                            except Exception:
+                                pass
+                                
         except Exception as e:
             print(f"{COLOR_RED}[Error] FYERS CSV fetch failed: {e}{COLOR_RESET}")
 
@@ -929,4 +939,3 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
-
