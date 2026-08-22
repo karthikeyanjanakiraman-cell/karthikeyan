@@ -121,7 +121,7 @@ def validate_broker_auth():
             print(f"❌ {COLOR_RED}Error: UPSTOX_ACCESS_TOKEN environment variable not found.{COLOR_RESET}")
             sys.exit(1)
     elif ACTIVE_BROKER == "FYERS":
-        if not os.environ.get("FYERS_CLIENT_ID") or not os.environ.get("FYERS_ACCESS_TOKEN"):
+        if not os.environ.get("CLIENT_ID") or not os.environ.get("ACCESS_TOKEN"):
             print(f"❌ {COLOR_RED}Error: FYERS_CLIENT_ID or FYERS_ACCESS_TOKEN environment variables not found.{COLOR_RESET}")
             sys.exit(1)
 
