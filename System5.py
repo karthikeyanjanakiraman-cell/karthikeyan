@@ -44,7 +44,7 @@ COLOR_BOLD = "\033[1m"
 # ★ GLOBAL CONFIGURATION: BROKER, OPTIONS & TIMEFRAMES ★
 # ==============================================================================
 # 🌟 ACTIVE BROKER ROUTING SWITCH ("UPSTOX" or "FYERS")
-ACTIVE_BROKER = "FYERS"
+ACTIVE_BROKER = "UPSTOX"
 
 # Options Selection Configurations
 STRIKE_RANGE_OFFSET = 2      # Number of strikes above and below ATM
@@ -122,7 +122,7 @@ def validate_broker_auth():
             sys.exit(1)
     elif ACTIVE_BROKER == "FYERS":
         if not os.environ.get("CLIENT_ID") or not os.environ.get("ACCESS_TOKEN"):
-            print(f"❌ {COLOR_RED}Error: FYERS_CLIENT_ID or FYERS_ACCESS_TOKEN environment variables not found.{COLOR_RESET}")
+            print(f"❌ {COLOR_RED}Error: CLIENT_ID or ACCESS_TOKEN environment variables not found for Fyers.{COLOR_RESET}")
             sys.exit(1)
 
 def get_auth_headers():
@@ -914,3 +914,4 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
+
