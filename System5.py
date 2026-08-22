@@ -121,15 +121,15 @@ def validate_broker_auth():
             print(f"❌ {COLOR_RED}Error: UPSTOX_ACCESS_TOKEN environment variable not found.{COLOR_RESET}")
             sys.exit(1)
     elif ACTIVE_BROKER == "FYERS":
-        if not os.environ.get("CLIENT_ID") or not os.environ.get("ACCESS_TOKEN"):
-            print(f"❌ {COLOR_RED}Error: CLIENT_ID or ACCESS_TOKEN environment variables not found for Fyers.{COLOR_RESET}")
+        if not os.environ.get("FYERS_CLIENT_ID") or not os.environ.get("FYERS_ACCESS_TOKEN"):
+            print(f"❌ {COLOR_RED}Error: FYERS_CLIENT_ID or FYERS_ACCESS_TOKEN environment variables not found for Fyers.{COLOR_RESET}")
             sys.exit(1)
 
 def get_auth_headers():
     if ACTIVE_BROKER == "UPSTOX":
         return {"Accept": "application/json", "Authorization": f"Bearer {os.environ.get('UPSTOX_ACCESS_TOKEN', '')}"}
     elif ACTIVE_BROKER == "FYERS":
-        return {"Authorization": f"{os.environ.get('CLIENT_ID', '')}:{os.environ.get('ACCESS_TOKEN', '')}"}
+        return {"Authorization": f"{os.environ.get('FYERS_CLIENT_ID', '')}:{os.environ.get('FYERS_ACCESS_TOKEN', '')}"}
     return {}
 
 def fetch_json_gz(url):
@@ -914,4 +914,3 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
-
