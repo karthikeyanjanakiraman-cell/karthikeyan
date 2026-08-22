@@ -177,52 +177,93 @@ def get_universe_data():
         try:
             print("  ├─ Downloading & Parsing FYERS F&O Data...")
             headers = {'User-Agent': 'Mozilla/5.0'}
-            res_fo = requests.get("https://public.fyers.in/sym_details/NSE_FO.csv", headers=headers, timeout=15)
             
+            # Step 1: Pre-build Spot mapping safely from Equities CSV
+            res_cm = requests.get("https://public.fyers.in/sym_details/NSE_CM.csv", headers=headers, timeout=15)
+            spot_key_map = {}
+            if res_cm.status_code == 200:
+                for line in res_cm.text.strip().split('\n'):
+                    cols = [c.strip() for c in line.split(',')]
+                    for c in cols:
+                        if c.startswith("NSE:") and c.endswith("-EQ"):
+                            base = c.replace("NSE:", "").replace("-EQ", "")
+                            spot_key_map[base] = c
+                            break
+
+            # Step 2: Dynamically parse F&O file, completely ignoring fixed column indices
+            res_fo = requests.get("https://public.fyers.in/sym_details/NSE_FO.csv", headers=headers, timeout=15)
             valid_underlyings = set()
             
-            # 🌟 BULLETPROOF PARSING: Anchor from the right side (Negative Indexing)
-            # This makes it 100% immune to random commas inside company names
             for line in res_fo.text.strip().split('\n'):
-                cols = line.split(',')
+                cols = [c.strip() for c in line.split(',')]
                 
-                # A valid Fyers FO line has at least 16 columns
-                if len(cols) >= 16:
-                    opt_type = cols[-1].strip()  # Always Option Type ('CE', 'PE', etc.)
+                # 1. Find Option Type by scanning backwards to bypass Fyers' trailing dummy zeroes
+                opt_type = None
+                type_idx = -1
+                for i in range(len(cols)-1, -1, -1):
+                    if cols[i] in ("CE", "PE"):
+                        opt_type = cols[i]
+                        type_idx = i
+                        break
+                        
+                if not opt_type or type_idx < 2:
+                    continue
                     
-                    if opt_type in ("CE", "PE"):
-                        strike_str = cols[-2].strip()      # Always Strike Price
-                        underlying_key = cols[-3].strip()  # Always Underlying Key
-                        sym_ticker = cols[-7].strip()      # Always Symbol Ticker
-                        expiry_epoch = cols[-8].strip()    # Always Epoch Timestamp
+                try:
+                    # 2. Extract Strike & Underlying (Universally locked to the immediate left of Option Type)
+                    strike_val = float(cols[type_idx - 1])
+                    base_symbol = cols[type_idx - 2].strip()
+                    
+                    if base_symbol in EXCLUDED_INDICES:
+                        continue
                         
-                        base_symbol = underlying_key.replace("NSE:", "").replace("-EQ", "").replace("-INDEX", "").strip()
+                    # 3. Find Symbol Ticker dynamically (Must start with NSE: and match the Option Type)
+                    sym_ticker = None
+                    for c in cols:
+                        if c.startswith("NSE:") and opt_type in c:
+                            sym_ticker = c
+                            break
+                            
+                    if not sym_ticker:
+                        continue
                         
-                        if base_symbol not in EXCLUDED_INDICES:
-                            try:
-                                strike_val = float(strike_str)
-                                expiry_date = dt.fromtimestamp(int(expiry_epoch)).strftime("%Y-%m-%d")
-                                
-                                opt_inst.append({
-                                    "symbol": sym_ticker, 
-                                    "key": sym_ticker, 
-                                    "underlying": base_symbol,
-                                    "type": opt_type, 
-                                    "strike": strike_val, 
-                                    "expiry": expiry_date
-                                })
-                                
-                                # Instantly build the Spot list using the exact key Fyers expects
-                                if base_symbol not in valid_underlyings:
-                                    valid_underlyings.add(base_symbol)
-                                    spot_inst.append({
-                                        "symbol": base_symbol,
-                                        "key": underlying_key,
-                                        "underlying": base_symbol
-                                    })
-                            except Exception:
-                                pass
-                                
+                    # 4. Find Expiry Epoch dynamically (Look for the massive 10-digit integer)
+                    expiry_date = None
+                    for c in cols:
+                        try:
+                            num = int(float(c))
+                            # Epoch timestamps for the 2020s fall cleanly in this range
+                            if 1.5e9 < num < 3e9:
+                                expiry_date = dt.fromtimestamp(num).strftime("%Y-%m-%d")
+                                break
+                        except: pass
+                        
+                    if not expiry_date:
+                        continue
+                        
+                    # Safely extracted all data!
+                    opt_inst.append({
+                        "symbol": sym_ticker, 
+                        "key": sym_ticker, 
+                        "underlying": base_symbol,
+                        "type": opt_type, 
+                        "strike": strike_val, 
+                        "expiry": expiry_date
+                    })
+                    
+                    # 5. Build Spot mapping safely
+                    if base_symbol not in valid_underlyings:
+                        valid_underlyings.add(base_symbol)
+                        spot_ticker = spot_key_map.get(base_symbol, f"NSE:{base_symbol}-EQ")
+                        spot_inst.append({
+                            "symbol": base_symbol,
+                            "key": spot_ticker,
+                            "underlying": base_symbol
+                        })
+                        
+                except Exception:
+                    pass
+                    
         except Exception as e:
             print(f"{COLOR_RED}[Error] FYERS CSV fetch failed: {e}{COLOR_RESET}")
 
