@@ -2,15 +2,16 @@
 
 Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine
 - Target: F&O Stocks Only (Indices Excluded)
-- Execution: Direct Options Premium Charting (Option BUYER / LONG ONLY)
+- Execution: Direct Options Premium Charting (Method A)
 - Configurable Expiry & Strike Offset Matrices
 - TWO-STAGE INGESTION: Ultra-Fast Previous Day Volume & Premium Pre-Filtering
+- 3-TIER FALLBACK FETCHER: Bypasses Upstox 'Birthdate' Empty Array Errors
 - Aggressive Multithreading with HTTP 429 (Rate Limit) Evasion
 """
 
 import argparse
 import concurrent.futures
-import email.utils
+import datetime
 import gzip
 import io
 import json
@@ -40,40 +41,18 @@ COLOR_RESET = "\033[0m"
 COLOR_BOLD = "\033[1m"
 
 # ==============================================================================
-# ★ TIME SYNCHRONIZATION (IMMUNE TO SERVER CLOCK SKEW) ★
-# ==============================================================================
-_REAL_WORLD_NOW = None
-
-def get_ist_now():
-    """Fetches the true real-world time directly from Upstox servers to bypass any local clock skew."""
-    global _REAL_WORLD_NOW
-    if _REAL_WORLD_NOW is not None:
-        return _REAL_WORLD_NOW
-        
-    try:
-        res = requests.head("https://api.upstox.com/v2/market-quote/ltp", timeout=3)
-        if 'Date' in res.headers:
-            utc_dt = email.utils.parsedate_to_datetime(res.headers['Date'])
-            _REAL_WORLD_NOW = (utc_dt + timedelta(hours=5, minutes=30)).replace(tzinfo=None)
-            print(f"{COLOR_DIM}[Time Sync] Hard-Synced to Upstox Server Time: {_REAL_WORLD_NOW.strftime('%Y-%m-%d %H:%M:%S')} IST{COLOR_RESET}")
-            return _REAL_WORLD_NOW
-    except Exception:
-        pass
-        
-    _REAL_WORLD_NOW = dt.utcnow() + timedelta(hours=5, minutes=30)
-    return _REAL_WORLD_NOW
-
-# ==============================================================================
 # ★ GLOBAL CONFIGURATION: OPTIONS, TIMEFRAMES & INDICATORS ★
 # ==============================================================================
-STRIKE_RANGE_OFFSET = 1      
-TARGET_EXPIRY = "CURRENT"    
-BACKTRACE_DAYS = 2          
+# Options Selection Configurations
+STRIKE_RANGE_OFFSET = 2      # Number of strikes above and below ATM
+TARGET_EXPIRY = "CURRENT"    # "CURRENT" or "NEXT"
+BACKTRACE_DAYS = 15          # Default historical reach for Macro TFs
 
-MIN_OPT_PREMIUM = 30.0        
-MIN_PREV_DAY_VOLUME = 800000  
+# 🌟 NEW PRE-FILTER VARIABLES (The Speed Enablers)
+MIN_OPT_PREMIUM = 5.0        # Option must close >= ₹5.00 on the previous day
+MIN_PREV_DAY_VOLUME = 10000  # Option must have traded >= 10,000 contracts on the previous day
 
-MAX_API_WORKERS = 25         
+MAX_API_WORKERS = 40         # Aggressive threading worker count
 
 MICRO_TIMEFRAME = "1min"
 MACRO_TIMEFRAMES = ["20min"]
@@ -89,33 +68,32 @@ STOCH_PERIOD = 14
 MICRO_RENKO_CONFIRM_BRICKS = 1
 MACRO_RENKO_CONFIRM_BRICKS = 1
 RENKO_MIN_BRICK = 0.05
-RENKO_DEFAULT_PCT = 0.05     
+RENKO_DEFAULT_PCT = 0.05     # 5% for options premium volatility
 
-# Hardcoded to LONG_ONLY for Option Buying (Never shorting an option)
-GLOBAL_MACRO_STRATEGY_2D = "LONG_ONLY" 
+GLOBAL_MACRO_STRATEGY_2D = "BOTH" 
 
 # ==============================================================================
 # 🎛️ TIER 1 & 2: DUAL-TIER SWITCHBOARDS - 7 PILLARS
 # ==============================================================================
 MACRO_MANDATORY_PRICE_RENKO    = True
 MACRO_MANDATORY_VOL_RENKO      = True
-MACRO_MANDATORY_RENKO_VELOCITY = False
+MACRO_MANDATORY_RENKO_VELOCITY = True
 MACRO_MANDATORY_RSI_BB         = False
 MACRO_MANDATORY_ADX_DMI        = False
 MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
-MACRO_MINIMUM_SCORE            = 2      
+MACRO_MINIMUM_SCORE            = 3      
 
 SYNC_MICRO_WITH_MACRO          = False  
 
 MICRO_MANDATORY_PRICE_RENKO    = True
 MICRO_MANDATORY_VOL_RENKO      = True
-MICRO_MANDATORY_RENKO_VELOCITY = False
-MICRO_MANDATORY_RSI_BB         = True
+MICRO_MANDATORY_RENKO_VELOCITY = True
+MICRO_MANDATORY_RSI_BB         = False
 MICRO_MANDATORY_ADX_DMI        = False
-MICRO_MANDATORY_EMA_SPREAD     = False
+MICRO_MANDATORY_EMA_SPREAD     = True
 MICRO_MANDATORY_STOCHASTIC     = False
-MICRO_MINIMUM_SCORE            = 2      
+MICRO_MINIMUM_SCORE            = 4      
 
 # ==============================================================================
 # 🎛️ TIER 3: TRADE MANAGEMENT & TEMPORAL GATES
@@ -128,31 +106,27 @@ MACRO_EXIT_VOL_BRICKS   = 1
 RENKO_VELOCITY_MAX_BARS = 12 
 ENTRY_CUTOFF_TIME = "15:00"
 
-EXCLUDED_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "NIFTYNXT50"}
+EXCLUDED_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"}
 
-_API_ERROR_PRINTED = False
 
 # ==============================================================================
 # 1. LIVE INGESTION: OPTIONS MATRIX & FAST PRE-FILTERING
 # ==============================================================================
 def fetch_json_gz(url):
     headers = {
-        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)',
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
         'Accept': 'application/json, text/plain, */*',
     }
     try:
         print(f"  ├─ ⏳ Downloading massive instrument file (this may take 10-20 seconds)...")
         response = requests.get(url, headers=headers, timeout=45) 
-        response.raise_for_status()
-        
-        print(f"  ├─ ✅ Download successful! Extracting & parsing JSON into memory...")
-        if response.content[:2] == b'\x1f\x8b':
+        if response.status_code == 200:
+            print(f"  ├─ ✅ Download successful! Extracting & parsing JSON into memory...")
             data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
+            print(f"  ├─ ✅ Parsing complete! Total instruments loaded: {len(data)}")
+            return data
         else:
-            data = response.json()
-            
-        print(f"  ├─ ✅ Parsing complete! Total instruments loaded: {len(data)}")
-        return data
+            print(f"{COLOR_RED}[Error] HTTP {response.status_code} when fetching: {url}{COLOR_RESET}")
     except requests.exceptions.Timeout:
         print(f"{COLOR_RED}[Error] Connection timed out! The file is too large for the current network speed.{COLOR_RESET}")
     except Exception as e: 
@@ -167,197 +141,92 @@ def get_options_universe():
         print(f"{COLOR_RED}[Error] Failed to fetch master instruments.{COLOR_RESET}")
         return [], []
 
-    eq_stocks_by_name = {}
-    for item in master_data:
-        if item.get("exchange") == "NSE_EQ" or item.get("segment") == "NSE_EQ":
-            name = item.get("name")
-            if name and name not in EXCLUDED_INDICES:
-                eq_stocks_by_name[name] = item
+    fo_underlyings = {
+        item.get("underlying_symbol") for item in master_data
+        if item.get("instrument_type") in ("OPTSTK", "CE", "PE") and item.get("underlying_symbol") not in EXCLUDED_INDICES
+    }
+    fo_underlyings.discard(None)
+    print(f"  ├─ 🔍 Found {len(fo_underlyings)} F&O Underlying Stocks.")
 
-    options_instruments = []
-    valid_fo_names = set()
-    
-    for item in master_data:
-        inst_type = item.get("instrument_type")
-        
-        if inst_type == "OPTSTK" or (inst_type in ("CE", "PE") and item.get("segment") == "NSE_FO"):
-            underlying = item.get("name") or item.get("underlying_symbol")
-            if underlying in eq_stocks_by_name:
-                options_instruments.append(item)
-                valid_fo_names.add(underlying)
-                
-    spot_instruments = [eq_stocks_by_name[n] for n in valid_fo_names]
-
-    print(f"  ├─ 🔍 Found {len(valid_fo_names)} Pure F&O Underlying Stocks (Indices strictly filtered).")
+    spot_instruments = [
+        item for item in master_data 
+        if item.get("trading_symbol") in fo_underlyings and item.get("segment") == "NSE_EQ"
+    ]
+    options_instruments = [
+        item for item in master_data 
+        if item.get("underlying_symbol") in fo_underlyings and item.get("instrument_type") in ("OPTSTK", "CE", "PE")
+    ]
     print(f"  ├─ 🎯 Mapped {len(spot_instruments)} Spot Instruments & {len(options_instruments)} Options Contracts.")
 
     return spot_instruments, options_instruments
 
 def safe_api_request(url, headers, is_live=False):
-    for attempt in range(5):
+    """Robust API request with 429 backoff and handling for Upstox empty returns"""
+    for attempt in range(3):
         try:
             res = requests.get(url, headers=headers, timeout=10)
             if res.status_code == 200:
-                data = res.json().get("data", {}).get("candles", [])
-                
-                # 🛑 DIAGNOSTIC: If it successfully connected but Upstox returned NO data
-                if not data and "1minute" in url:
-                    print(f"\n{COLOR_YELLOW}[Debug] Upstox 200 OK, but NO candles returned for:{COLOR_RESET}")
-                    print(f"  └─ URL: {url}")
-                return data
-                
+                data = res.json().get("data", {})
+                if data is None: 
+                    return []
+                return data.get("candles", [])
             elif res.status_code == 429:
                 time.sleep(random.uniform(0.5, 2.0) * (attempt + 1))
             else:
-                # 🛑 DIAGNOSTIC: If Upstox threw an actual error code (400, 403, etc.)
-                print(f"\n{COLOR_RED}[Debug] Upstox HTTP {res.status_code} Error:{COLOR_RESET}")
-                print(f"  └─ URL: {url}")
-                print(f"  └─ Response: {res.text}")
+                print(f"\n{COLOR_RED}⚠️ HTTP {res.status_code} on URL: {url}{COLOR_RESET}")
                 break
-        except Exception as e:
+        except Exception:
             time.sleep(1)
     return []
 
-
-def fetch_latest_spot_prices(spot_instruments, headers, target_date_str):
-    print(f"🚀 Fetching Spot Prices to calculate ATM Strikes...")
+def fetch_latest_spot_prices(spot_instruments, headers):
+    print(f"🚀 Fetching Spot Prices for {len(spot_instruments)} Underlyings...")
     spot_prices = {}
     
-    ist_now = get_ist_now()
-    is_live_today = target_date_str == ist_now.strftime("%Y-%m-%d")
-    
-    if is_live_today:
-        print("  ├─ [Live Mode] Using instant batch LTP API (Chunking to prevent URL length limits)...")
-        key_to_name = {inst["instrument_key"]: inst["name"] for inst in spot_instruments if inst.get("instrument_key")}
-        valid_keys = list(key_to_name.keys())
-        
-        for i in range(0, len(valid_keys), 50):
-            chunk = valid_keys[i:i + 50]
-            chunk_str = ",".join(chunk)
-            
-            try:
-                res = requests.get(
-                    "https://api.upstox.com/v2/market-quote/ltp", 
-                    params={"instrument_key": chunk_str}, 
-                    headers=headers, 
-                    timeout=10
-                )
-                if res.status_code == 200:
-                    data = res.json().get("data", {})
-                    for k, v in data.items():
-                        if v.get("last_price"):
-                            inst_token = v.get("instrument_token")
-                            if inst_token and inst_token in key_to_name:
-                                spot_prices[key_to_name[inst_token]] = v["last_price"]
-                            else:
-                                sym = k.split(":")[-1] if ":" in k else k
-                                spot_prices[sym] = v["last_price"]
-                else:
-                    print(f"  ├─ [Warning] LTP API HTTP {res.status_code}: {res.text}")
-            except Exception as e:
-                print(f"  ├─ [Warning] LTP request exception: {e}")
+    def worker(inst):
+        key = urllib.parse.quote(inst["instrument_key"])
+        data = safe_api_request(f"https://api.upstox.com/v2/historical-candle/intraday/{key}/1minute", headers)
+        if data: return inst["trading_symbol"], data[0][4] 
+        return inst["trading_symbol"], None
 
-    if not spot_prices:
-        if is_live_today:
-            print(f"{COLOR_YELLOW}  ├─ [Fallback] Live LTP API failed or returned empty. Falling back to EOD Historical API...{COLOR_RESET}")
-        else:
-            print(f"  ├─ [Historical Mode] Fetching Daily EOD Spot Prices for {target_date_str}...")
-            
-        target_dt = dt.strptime(target_date_str, "%Y-%m-%d")
-        ten_days_ago = (target_dt - timedelta(days=10)).strftime("%Y-%m-%d")
-        
-        def worker(inst):
-            sym = inst.get("name", "UNKNOWN")
-            try:
-                raw_key = inst.get("instrument_key")
-                if not raw_key: return sym, None
-                key = urllib.parse.quote(raw_key)
-                data = safe_api_request(f"https://api.upstox.com/v2/historical-candle/{key}/day/{target_date_str}/{ten_days_ago}", headers)
-                if data: 
-                    return sym, data[0][4]
-            except Exception:
-                pass
-            return sym, None
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_API_WORKERS) as executor:
-            futures = {executor.submit(worker, inst): inst for inst in spot_instruments}
-            for future in concurrent.futures.as_completed(futures):
-                sym, price = future.result()
-                if price and sym != "UNKNOWN": 
-                    spot_prices[sym] = price
+    with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_API_WORKERS) as executor:
+        futures = {executor.submit(worker, inst): inst for inst in spot_instruments}
+        for future in concurrent.futures.as_completed(futures):
+            sym, price = future.result()
+            if price: spot_prices[sym] = price
             
     return spot_prices
 
-def build_options_matrix(spot_prices, options_instruments, target_date_str):
+def build_options_matrix(spot_prices, options_instruments):
     print(f"⚙️ Building Options Contract Matrix (Offset: ±{STRIKE_RANGE_OFFSET}, Expiry: {TARGET_EXPIRY})...")
-    
-    if not spot_prices:
-        print(f"{COLOR_RED}  ├─ [Error] spot_prices dictionary is entirely empty! Spot API calls failed.{COLOR_RESET}")
-        return []
-        
-    print(f"  ├─ Successfully loaded {len(spot_prices)} Spot Prices. Mapping options...")
-
     grouped_options = {}
     for opt in options_instruments:
-        underlying = opt.get("name") or opt.get("underlying_symbol")
-        if underlying:
-            grouped_options.setdefault(underlying, []).append(opt)
+        grouped_options.setdefault(opt.get("underlying_symbol"), []).append(opt)
 
     target_contracts = []
-    skipped_reasons = {"no_options": 0, "invalid_schema": 0, "no_valid_expiries": 0, "no_strikes": 0}
-    target_date_obj = dt.strptime(target_date_str, "%Y-%m-%d").date()
     
     for symbol, spot_price in spot_prices.items():
         opts = grouped_options.get(symbol, [])
-        if not opts: 
-            skipped_reasons["no_options"] += 1
-            continue
-            
-        try:
-            spot_price = float(spot_price)
-        except (ValueError, TypeError):
-            continue
+        if not opts: continue
         
-        valid_opts = []
         for o in opts:
-            raw_strike = o.get("strike") or o.get("strike_price") or o.get("strikePrice")
-            raw_expiry = o.get("expiry") or o.get("expiry_date") or o.get("expiryDate")
-            
-            if raw_strike is None or raw_expiry is None:
-                continue
-                
+            raw_strike = o.get("strike_price") if "strike_price" in o else o.get("strike")
             try:
-                norm_strike = float(raw_strike)
-                
-                if isinstance(raw_expiry, (int, float)) and len(str(int(raw_expiry))) == 13:
-                    parsed_exp = pd.to_datetime(raw_expiry, unit='ms').date()
-                else:
-                    parsed_exp = pd.to_datetime(raw_expiry).date()
-                
-                if parsed_exp >= target_date_obj:
-                    o["_normalized_strike"] = norm_strike
-                    o["_parsed_expiry"] = parsed_exp
-                    valid_opts.append(o)
-            except Exception:
-                continue
+                o["_normalized_strike"] = float(raw_strike)
+            except (ValueError, TypeError):
+                o["_normalized_strike"] = None
 
-        if not valid_opts:
-            skipped_reasons["invalid_schema"] += 1
-            continue
-            
-        expiries = sorted(list(set(o["_parsed_expiry"] for o in valid_opts)))
+        valid_opts = [o for o in opts if o.get("expiry") and o.get("_normalized_strike") is not None]
+        if not valid_opts: continue
         
-        if not expiries: 
-            skipped_reasons["no_valid_expiries"] += 1
-            continue
+        expiries = sorted(list(set(pd.to_datetime(o["expiry"]).date() for o in valid_opts)))
+        if not expiries: continue
         
         chosen_expiry = expiries[0] if TARGET_EXPIRY == "CURRENT" else (expiries[1] if len(expiries) > 1 else expiries[0])
-        expiry_opts = [o for o in valid_opts if o["_parsed_expiry"] == chosen_expiry]
+        expiry_opts = [o for o in valid_opts if pd.to_datetime(o["expiry"]).date() == chosen_expiry]
         
         unique_strikes = sorted(list(set(o["_normalized_strike"] for o in expiry_opts)))
-        if not unique_strikes: 
-            skipped_reasons["no_strikes"] += 1
-            continue
+        if not unique_strikes: continue
         
         closest_strike = min(unique_strikes, key=lambda x: abs(x - spot_price))
         atm_idx = unique_strikes.index(closest_strike)
@@ -368,51 +237,43 @@ def build_options_matrix(spot_prices, options_instruments, target_date_str):
         
         final_opts = [o for o in expiry_opts if o["_normalized_strike"] in selected_strikes]
         for opt in final_opts:
-            sym_key = opt.get("tradingsymbol") or opt.get("trading_symbol") or "UNKNOWN"
-            inst_key = opt.get("instrument_key")
+            target_contracts.append({
+                "symbol": opt.get("trading_symbol", opt.get("tradingsymbol", "UNKNOWN")),
+                "key": opt["instrument_key"],
+                "underlying": symbol,
+                "type": opt.get("instrument_type")
+            })
             
-            if inst_key:
-                target_contracts.append({
-                    "symbol": sym_key,
-                    "key": inst_key,
-                    "underlying": symbol,
-                    "type": opt.get("instrument_type")
-                })
-            
-    if not target_contracts:
-        print(f"{COLOR_YELLOW}  ├─ [Warning] Matrix mapping dropped all symbols! Diagnostics:{COLOR_RESET}")
-        print(f"      └─ Underlying lacking options data: {skipped_reasons['no_options']}")
-        print(f"      └─ Invalid Schema or All Contracts Expired before {target_date_obj}: {skipped_reasons['invalid_schema']}")
-        print(f"      └─ Valid Expiries Missing: {skipped_reasons['no_valid_expiries']}")
-        print(f"      └─ Valid Strikes Missing: {skipped_reasons['no_strikes']}")
-
     return target_contracts
 
+def get_previous_trading_day(target_date_str):
+    target_dt = dt.strptime(target_date_str, "%Y-%m-%d")
+    current_dt = target_dt - timedelta(days=1)
+    while current_dt.weekday() >= 5: # Skip weekends
+        current_dt -= timedelta(days=1)
+    return current_dt.strftime("%Y-%m-%d")
+
 def filter_liquid_options(target_contracts, headers, target_date_str):
-    print(f"\n🧹 STAGE 1 INGESTION: Pre-Filtering {len(target_contracts)} Stock Option contracts...")
+    print(f"\n🧹 STAGE 1 INGESTION: Pre-Filtering {len(target_contracts)} contracts...")
     print(f"  ├─ Rules: Prev. Day Close >= ₹{MIN_OPT_PREMIUM} | Prev. Day Vol >= {MIN_PREV_DAY_VOLUME}")
     
-    target_dt = dt.strptime(target_date_str, "%Y-%m-%d")
-    prev_day = (target_dt - timedelta(days=1)).strftime("%Y-%m-%d")
-    fifteen_days_ago = (target_dt - timedelta(days=15)).strftime("%Y-%m-%d")
+    prev_day = get_previous_trading_day(target_date_str)
+    five_days_ago = (dt.strptime(prev_day, "%Y-%m-%d") - timedelta(days=7)).strftime("%Y-%m-%d")
     
     filtered_contracts = []
     
     def worker(contract):
-        try:
-            key = urllib.parse.quote(contract["key"])
-            url = f"https://api.upstox.com/v2/historical-candle/{key}/day/{prev_day}/{fifteen_days_ago}"
-            data = safe_api_request(url, headers)
+        key = urllib.parse.quote(contract["key"])
+        url = f"https://api.upstox.com/v2/historical-candle/{key}/day/{prev_day}/{five_days_ago}"
+        data = safe_api_request(url, headers)
+        
+        if data:
+            latest_candle = data[0]
+            close_price = latest_candle[4]
+            volume = latest_candle[5]
             
-            if data and len(data) > 0:
-                latest_candle = data[0]
-                close_price = latest_candle[4]
-                volume = latest_candle[5]
-                
-                if close_price >= MIN_OPT_PREMIUM and volume >= MIN_PREV_DAY_VOLUME:
-                    return contract
-        except Exception:
-            pass
+            if close_price >= MIN_OPT_PREMIUM and volume >= MIN_PREV_DAY_VOLUME:
+                return contract
         return None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_API_WORKERS) as executor:
@@ -426,11 +287,7 @@ def filter_liquid_options(target_contracts, headers, target_date_str):
             if res:
                 filtered_contracts.append(res)
                 
-    if not filtered_contracts:
-        print(f"\n{COLOR_YELLOW}⚠️ All contracts failed Liquidity (Vol >= {MIN_PREV_DAY_VOLUME}) or Premium (Price >= ₹{MIN_OPT_PREMIUM}) checks.{COLOR_RESET}")
-    else:
-        print(f"\n  ├─ ✅ Pre-Filter Complete: {len(filtered_contracts)} highly liquid contracts passed.")
-        
+    print(f"\n  ├─ ✅ Pre-Filter Complete: {len(filtered_contracts)} highly liquid contracts passed.")
     return filtered_contracts
 
 def get_past_trading_days(target_date_str, num_days=20):
@@ -639,7 +496,7 @@ def apply_dual_tier_scorecard(df, tf_str, tier_type):
 
 def evaluate_single_timeframe_gates(df_base, tf_str):
     df_tf = (
-        df_base.groupby(["Symbol", pd.Grouper(key="Datetime", freq=tf_str, closed="left", label="left", origin=pd.Timestamp('2000-01-01 09:15:00'))])
+        df_base.groupby(["Symbol", pd.Grouper(key="Datetime", freq=tf_str, closed="left", label="left")])
         .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
         .reset_index()
     )
@@ -651,6 +508,7 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
     df_tf = construct_renko_velocity_engine(df_tf, tf_str)
     
     df_tf = apply_dual_tier_scorecard(df_tf, tf_str, "MACRO")
+
     df_tf["Eval_Time"] = df_tf["Datetime"] + pd.to_timedelta(tf_str)
     
     export_cols = [
@@ -670,7 +528,7 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
 def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes):
     if micro_tf != "1min":
         df_micro = (
-            rolling_master_df.groupby(["Symbol", pd.Grouper(key="Datetime", freq=micro_tf, closed="left", label="left", origin=pd.Timestamp('2000-01-01 09:15:00'))])
+            rolling_master_df.groupby(["Symbol", pd.Grouper(key="Datetime", freq=micro_tf, closed="left", label="left")])
             .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
             .reset_index()
         )
@@ -689,8 +547,6 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
     for tf in macro_timeframes:
         print(f"   ├─ Evaluating Macro Context Gates + Price/Vol/Vel Renko for [{tf}]...")
         env_df = evaluate_single_timeframe_gates(rolling_master_df, tf)
-        env_df = env_df.sort_values("Datetime").reset_index(drop=True)
-        
         bull_col, bear_col = f"Armed_Bull_{tf}", f"Armed_Bear_{tf}"
         bull_gate_cols.append(bull_col)
         bear_gate_cols.append(bear_col)
@@ -729,73 +585,84 @@ def scan_institutional_tape(target_date_str):
     if not access_token:
         print(f"❌ {COLOR_RED}Error: UPSTOX_ACCESS_TOKEN missing.{COLOR_RESET}")
         return
-        
-    headers = {
-        "Accept": "application/json", 
-        "Api-Version": "2.0",
-        "Authorization": f"Bearer {access_token}"
-    }
+    headers = {"Accept": "application/json", "Authorization": f"Bearer {access_token}"}
 
     spot_inst, options_inst = get_options_universe()
     if not spot_inst: return
 
-    spot_prices = fetch_latest_spot_prices(spot_inst, headers, target_date_str)
-    
-    target_contracts = build_options_matrix(spot_prices, options_inst, target_date_str)
+    spot_prices = fetch_latest_spot_prices(spot_inst, headers)
+    target_contracts = build_options_matrix(spot_prices, options_inst)
     
     if not target_contracts:
-        print(f"{COLOR_RED}[Error] No options contracts mapped. Terminating run.{COLOR_RESET}")
+        print(f"{COLOR_RED}[Error] No options contracts mapped.{COLOR_RESET}")
         return
         
     print(f"✅ Mapped {len(target_contracts)} total option contracts for analysis.")
 
+    # 🌟 APPLY STAGE 1 FAST PRE-FILTER (Liquidity + Premium)
     target_contracts = filter_liquid_options(target_contracts, headers, target_date_str)
     
     if not target_contracts:
+        print(f"{COLOR_YELLOW}⚠️ All contracts failed the Liquidity (Vol >= {MIN_PREV_DAY_VOLUME}) or Premium (Price >= ₹{MIN_OPT_PREMIUM}) checks.{COLOR_RESET}")
         return
 
     trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
     if not trading_days: return
 
     target_dt = pd.to_datetime(target_date_str)
-    current_now = get_ist_now()
+    current_now = dt.utcnow() + timedelta(hours=5, minutes=30)
     is_live_today = target_date_str == current_now.strftime("%Y-%m-%d")
 
-    print(f"\n🚀 STAGE 2 INGESTION: Multithreading Bulk 1-Min Data for {len(target_contracts)} Stock Option Contracts...")
+    print(f"\n🚀 STAGE 2 INGESTION: Multithreading Bulk 1-Min Data for {len(target_contracts)} Contracts...")
     fetch_tasks = [(item, trading_days[0], target_date_str, is_live_today) for item in target_contracts]
     historical_dfs = []
 
     def fetch_worker(task):
         item, start_date, end_date, live = task
-        try:
-            key = urllib.parse.quote(item["key"])
-            dfs = []
-            hist_end = end_date if not live else (current_now - timedelta(days=1)).strftime("%Y-%m-%d")
+        key = urllib.parse.quote(item["key"])
+        dfs = []
+        hist_end = end_date if not live else (current_now - timedelta(days=1)).strftime("%Y-%m-%d")
 
-            data = safe_api_request(f"https://api.upstox.com/v2/historical-candle/{key}/1minute/{hist_end}/{start_date}", headers)
-            if data: dfs.append(pd.DataFrame(data, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume", "OI"]))
+        # 🌟 3-TIER FALLBACK FETCHER: Solves Upstox Options 'Birthdate' Empty Array Errors
+        
+        # ATTEMPT 1: Full History (15 Days)
+        data = safe_api_request(f"https://api.upstox.com/v2/historical-candle/{key}/1minute/{hist_end}/{start_date}", headers)
+        
+        # ATTEMPT 2: Fallback to 5 Days (For newly created contracts)
+        if not data:
+            fallback_start = get_past_trading_days(end_date, num_days=5)[0]
+            data = safe_api_request(f"https://api.upstox.com/v2/historical-candle/{key}/1minute/{hist_end}/{fallback_start}", headers)
+            
+        # ATTEMPT 3: Extreme Fallback to 2 Days
+        if not data:
+            extreme_start = get_past_trading_days(end_date, num_days=2)[0]
+            data = safe_api_request(f"https://api.upstox.com/v2/historical-candle/{key}/1minute/{hist_end}/{extreme_start}", headers)
 
-            if live:
-                data = safe_api_request(f"https://api.upstox.com/v2/historical-candle/intraday/{key}/1minute", headers, is_live=True)
-                if data: dfs.append(pd.DataFrame(data, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume", "OI"]))
+        if data:
+            dfs.append(pd.DataFrame(data, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume", "OI"]))
 
-            if dfs:
-                df = pd.concat(dfs, ignore_index=True)
-                df["Datetime"] = pd.to_datetime(df["Timestamp"]).dt.tz_localize(None)
-                df = df.drop_duplicates(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
-                df["Symbol"] = item["symbol"]
-                return df
-        except Exception:
-            pass
-        return None
+        # LIVE SESSION: Always grab today's intraday tape
+        if live:
+            intra_data = safe_api_request(f"https://api.upstox.com/v2/historical-candle/intraday/{key}/1minute", headers, is_live=True)
+            if intra_data:
+                dfs.append(pd.DataFrame(intra_data, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume", "OI"]))
+
+        if not dfs:
+            print(f"{COLOR_RED}  ├─ [API Block] Upstox returned ZERO data for {item['symbol']} (Likely expired or restricted){COLOR_RESET}")
+            return None
+
+        df = pd.concat(dfs, ignore_index=True)
+        df["Datetime"] = pd.to_datetime(df["Timestamp"]).dt.tz_localize(None)
+        df = df.drop_duplicates(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
+        df["Symbol"] = item["symbol"]
+        return df
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_API_WORKERS) as executor:
         futures = {executor.submit(fetch_worker, task): task for task in fetch_tasks}
         completed = 0
         for future in concurrent.futures.as_completed(futures):
             completed += 1
-            sys.stdout.write(f"\r  ├─ Fetching 1-Min Data... {completed}/{len(fetch_tasks)} processed")
-            sys.stdout.flush()
+            print(f"  ├─ Fetching 1-Min Data... {completed}/{len(fetch_tasks)} processed")
             res = future.result()
             if res is not None: historical_dfs.append(res)
     print()
@@ -805,21 +672,13 @@ def scan_institutional_tape(target_date_str):
         return
 
     rolling_master_df = pd.concat(historical_dfs, ignore_index=True)
-    if rolling_master_df.empty:
-        print(f"❌ {COLOR_RED}Concat generated empty dataframe.{COLOR_RESET}")
-        return
-
-    print("\n⚙️ Computing 7-Pillar Scorecards & Velocity Matrices on Premium Data...")
+    print("⚙️ Computing 7-Pillar Scorecards & Velocity Matrices on Premium Data...")
 
     tape_exec = prepare_unified_execution_tape(rolling_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES)
-    
-    # 🌟 ENFORCE LONG-ONLY OPTION BUYING 🌟
-    # We do not want to short options, so we completely disable Bearish triggers (Direction = -1)
-    tape_exec["Master_Armed_Bear"] = False
-    tape_exec["Direction"] = np.where(tape_exec["Direction"] == 1, 1, 0)
+    if GLOBAL_MACRO_STRATEGY_2D == "BULLISH": tape_exec["Master_Armed_Bear"] = False
+    elif GLOBAL_MACRO_STRATEGY_2D == "BEARISH": tape_exec["Master_Armed_Bull"] = False
 
-    # Filter anomaly array to ONLY process LONG trades
-    all_anomalies = tape_exec[tape_exec["Direction"] == 1].copy()
+    all_anomalies = tape_exec[tape_exec["Direction"] != 0].copy()
     anomalies_by_time = all_anomalies.groupby("Datetime")
 
     closes_dict = tape_exec.set_index(["Datetime", "Symbol"])["Close"].to_dict()
@@ -862,6 +721,19 @@ def scan_institutional_tape(target_date_str):
                                         exit_reason = f"Macro [{tf}] Price Break"
                                         break
                                     if ma_v <= -MACRO_EXIT_VOL_BRICKS:
+                                        exit_reason = f"Macro [{tf}] Volume Break"
+                                        break
+                        elif st["dir"] == -1:
+                            if mi_p_count >= MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
+                            elif mi_v_count >= MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
+                            else:
+                                for tf in st["triggering_macro_tfs"]:
+                                    ma_p = macro_price_renkos[tf].get((t_dt, sym), 0)
+                                    ma_v = macro_vol_renkos[tf].get((t_dt, sym), 0)
+                                    if ma_p >= MACRO_EXIT_PRICE_BRICKS:
+                                        exit_reason = f"Macro [{tf}] Price Break"
+                                        break
+                                    if ma_v >= MACRO_EXIT_VOL_BRICKS:
                                         exit_reason = f"Macro [{tf}] Volume Break"
                                         break
                     
@@ -927,12 +799,9 @@ def scan_institutional_tape(target_date_str):
         print(f"{COLOR_BOLD}🟢 BASKET 1: ACTIVE RUNNERS (Riding the Trend){COLOR_RESET}")
         for sym, st in active_runners.items():
             ltp = final_ltp_dict.get(sym, st["origin"])
-            pnl_pct = ((ltp - st["origin"]) / st["origin"]) * 100 
+            pnl_pct = ((ltp - st["origin"]) / st["origin"]) * 100 if st["dir"] == 1 else ((st["origin"] - ltp) / st["origin"]) * 100
             color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
-            
-            # Dynamically display LONG CE or LONG PE based on the ticker string
-            opt_type = "CE" if "CE" in sym[-5:] else "PE" if "PE" in sym[-5:] else "OPT"
-            d_str = f"LONG {opt_type}"
+            d_str = "BULLISH" if st["dir"] == 1 else "BEARISH"
             
             print(f"  {color}⚡ {sym:<20} Open P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
             print(f"      └─ ⚓ Qualifying Macro TFs        : {', '.join(st['triggering_macro_tfs'])}")
@@ -943,12 +812,9 @@ def scan_institutional_tape(target_date_str):
     if closed_trades:
         print(f"{COLOR_BOLD}🛑 BASKET 2: CLOSED TRADES (Renko Structure Broken / Stagnation){COLOR_RESET}")
         for st in closed_trades:
-            pnl_pct = ((st["exit_price"] - st["origin"]) / st["origin"]) * 100 
+            pnl_pct = ((st["exit_price"] - st["origin"]) / st["origin"]) * 100 if st["dir"] == 1 else ((st["origin"] - st["exit_price"]) / st["origin"]) * 100
             color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
-            
-            # Dynamically display LONG CE or LONG PE based on the ticker string
-            opt_type = "CE" if "CE" in st["sym"][-5:] else "PE" if "PE" in st["sym"][-5:] else "OPT"
-            d_str = f"LONG {opt_type}"
+            d_str = "BULLISH" if st["dir"] == 1 else "BEARISH"
 
             print(f"  {color}🛑 {st['sym']:<20} Final P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
             print(f"      └─ ⚓ Qualifying Macro TFs        : {', '.join(st['triggering_macro_tfs'])}")
@@ -958,7 +824,7 @@ def scan_institutional_tape(target_date_str):
             print(f"      └─ 📉 Reason                      : {st['exit_reason']}\n")
 
     if not active_runners and not closed_trades:
-        print(f"{COLOR_DIM}[Terminal Silent] No LONG trades triggered today.{COLOR_RESET}\n")
+        print(f"{COLOR_DIM}[Terminal Silent] No trades triggered today.{COLOR_RESET}\n")
 
 # ==============================================================================
 # 7. RUN EXECUTOR
@@ -970,7 +836,7 @@ def run_production_sweep():
     raw_date_str = args.date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
 
     if not raw_date_str:
-        target_dt = get_ist_now()
+        target_dt = dt.utcnow() + timedelta(hours=5, minutes=30)
         if target_dt.weekday() == 5: target_dt -= timedelta(days=1)
         elif target_dt.weekday() == 6: target_dt -= timedelta(days=2)
         target_date_str = target_dt.strftime("%Y-%m-%d")
