@@ -52,10 +52,10 @@ BACKTRACE_DAYS = 15
 MIN_OPT_PREMIUM = 15.0
 MIN_PREV_DAY_VOLUME = 250000
 
-MAX_API_WORKERS = 40 if ACTIVE_BROKER == "UPSTOX" else 50
+MAX_API_WORKERS = 40 if ACTIVE_BROKER == "UPSTOX" else 35
 
 MICRO_TIMEFRAME = "1min"
-MACRO_TIMEFRAMES = ["5min"]
+MACRO_TIMEFRAMES = ["20min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -70,32 +70,37 @@ MACRO_RENKO_CONFIRM_BRICKS = 1
 RENKO_MIN_BRICK = 0.05
 RENKO_DEFAULT_PCT = 0.05
 
-GLOBAL_MACRO_STRATEGY_2D = "BOTH"
+# 🌟 BUY-ONLY MODE: user only buys options (never writes/shorts), so only
+# rising-premium ("BULLISH") triggers are actionable — a buy only profits when
+# the premium goes up. This applies per-contract: a bullish trigger on a PE
+# still captures downside moves in the underlying (PE premium rises when the
+# stock falls), so both directions are covered without ever needing to short.
+GLOBAL_MACRO_STRATEGY_2D = "BULLISH"
 
 MACRO_MANDATORY_PRICE_RENKO    = True
 MACRO_MANDATORY_VOL_RENKO      = True
-MACRO_MANDATORY_RENKO_VELOCITY = True
+MACRO_MANDATORY_RENKO_VELOCITY = False
 MACRO_MANDATORY_RSI_BB         = False
 MACRO_MANDATORY_ADX_DMI        = False
 MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
-MACRO_MINIMUM_SCORE            = 3
+MACRO_MINIMUM_SCORE            = 2
 
 SYNC_MICRO_WITH_MACRO          = False
 
 MICRO_MANDATORY_PRICE_RENKO    = True
 MICRO_MANDATORY_VOL_RENKO      = True
-MICRO_MANDATORY_RENKO_VELOCITY = True
-MICRO_MANDATORY_RSI_BB         = False
+MICRO_MANDATORY_RENKO_VELOCITY = False
+MICRO_MANDATORY_RSI_BB         = True
 MICRO_MANDATORY_ADX_DMI        = False
-MICRO_MANDATORY_EMA_SPREAD     = True
+MICRO_MANDATORY_EMA_SPREAD     = False
 MICRO_MANDATORY_STOCHASTIC     = False
-MICRO_MINIMUM_SCORE            = 4
+MICRO_MINIMUM_SCORE            = 3
 
 MICRO_EXIT_PRICE_BRICKS = 5
 MICRO_EXIT_VOL_BRICKS   = 5
-MACRO_EXIT_PRICE_BRICKS = 2
-MACRO_EXIT_VOL_BRICKS   = 2
+MACRO_EXIT_PRICE_BRICKS = 1
+MACRO_EXIT_VOL_BRICKS   = 1
 
 RENKO_VELOCITY_MAX_BARS = 12
 ENTRY_CUTOFF_TIME = "15:00"
@@ -930,13 +935,20 @@ def scan_institutional_tape(target_date_str):
     macro_vol_renkos = {tf: tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{tf}"].to_dict() for tf in MACRO_TIMEFRAMES}
 
     all_times = np.sort(tape_exec["Datetime"].unique())
+    # 🌟 FIX: memory_bank now maps Symbol -> LIST of trade episodes, not a single
+    # episode. The old code overwrote memory_bank[sym] every time a new trigger
+    # fired after a prior exit, so only the LAST birth-time of the day survived —
+    # every earlier trigger/exit for that contract was silently lost.
     memory_bank = {}
     cutoff_time_obj = pd.to_datetime(ENTRY_CUTOFF_TIME).time()
 
     for t in all_times:
         t_dt = pd.to_datetime(t)
 
-        for sym, st in memory_bank.items():
+        for sym, episodes in memory_bank.items():
+            if not episodes:
+                continue
+            st = episodes[-1]
             if st["state"] == "ACTIVE":
                 ltp = closes_dict.get((t_dt, sym))
                 mi_p_count = micro_price_renko.get((t_dt, sym), 0)
@@ -994,8 +1006,11 @@ def scan_institutional_tape(target_date_str):
                     if row.get(armed_col, False):
                         triggered_m_tfs.append(tf)
 
-                if sym not in memory_bank or memory_bank[sym]["state"] == "EXITED":
-                    memory_bank[sym] = {
+                existing = memory_bank.get(sym, [])
+                # Append a NEW episode whenever there's no prior episode, or the most
+                # recent one has already exited — instead of overwriting it.
+                if not existing or existing[-1]["state"] == "EXITED":
+                    new_episode = {
                         "state": "ACTIVE",
                         "origin": row["Close"],
                         "date": t_dt.strftime("%Y-%m-%d"),
@@ -1008,10 +1023,12 @@ def scan_institutional_tape(target_date_str):
                         "macro_scores": {tf: row.get(f"Score_Bull_{tf}" if direction == 1 else f"Score_Bear_{tf}", 0) for tf in MACRO_TIMEFRAMES},
                         "micro_score": row.get(f"Score_Bull_{MICRO_TIMEFRAME}" if direction == 1 else f"Score_Bear_{MICRO_TIMEFRAME}", 0)
                     }
+                    memory_bank.setdefault(sym, []).append(new_episode)
 
         if t_dt.hour == 15 and t_dt.minute >= 15:
-            for sym, st in memory_bank.items():
-                if st["state"] == "ACTIVE":
+            for sym, episodes in memory_bank.items():
+                if episodes and episodes[-1]["state"] == "ACTIVE":
+                    st = episodes[-1]
                     st["state"] = "EXITED"
                     st["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M") + " (EOD)"
                     st["exit_price"] = closes_dict.get((t_dt, sym), st["origin"])
@@ -1027,8 +1044,18 @@ def scan_institutional_tape(target_date_str):
     # ==============================================================================
     # 6. TERMINAL OUTPUT
     # ==============================================================================
-    active_runners = {sym: st for sym, st in memory_bank.items() if st["state"] == "ACTIVE"}
-    closed_trades = [{**st, "sym": sym} for sym, st in memory_bank.items() if st["state"] == "EXITED" and st["date"] == target_date_str]
+    # 🌟 Flatten each symbol's list of episodes: every trigger of the day now
+    # produces its own row in the output (previously only the LAST one survived).
+    active_runners = {}
+    closed_trades = []
+    for sym, episodes in memory_bank.items():
+        for st in episodes:
+            if st["state"] == "ACTIVE":
+                active_runners[sym] = st
+            elif st["state"] == "EXITED" and st["date"] == target_date_str:
+                closed_trades.append({**st, "sym": sym})
+    # Sort chronologically so multiple triggers on the same contract print in order.
+    closed_trades.sort(key=lambda x: (x["sym"], x["time"]))
 
     tf_display_str = " | ".join(MACRO_TIMEFRAMES)
     print(f"\n{COLOR_CYAN}================================================================================================{COLOR_RESET}")
