@@ -56,7 +56,7 @@ MIN_OPT_PREMIUM = 15.0       # Option must close >= ₹15.00 on the previous day
 MIN_PREV_DAY_VOLUME = 250000 # Option must have traded >= 2.5 Lakh shares previously
 
 # FYERS has a strict 10 req/sec limit. UPSTOX allows heavy multithreading.
-MAX_API_WORKERS = 40 if ACTIVE_BROKER == "UPSTOX" else 7  
+MAX_API_WORKERS = 40 if ACTIVE_BROKER == "UPSTOX" else 2  
 
 MICRO_TIMEFRAME = "1min"
 MACRO_TIMEFRAMES = ["20min"]
@@ -110,7 +110,8 @@ MACRO_EXIT_VOL_BRICKS   = 1
 RENKO_VELOCITY_MAX_BARS = 12 
 ENTRY_CUTOFF_TIME = "15:00"
 
-EXCLUDED_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX"}
+# Expanded to cover specific Fyers index symbols
+EXCLUDED_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "NIFTY50", "NIFTYBANK"}
 
 
 # ==============================================================================
@@ -297,18 +298,13 @@ def fetch_broker_data(key, tf_type, start_dt, end_dt, is_live=False):
                     return df
 
             elif ACTIVE_BROKER == "FYERS":
-                # Fyers officially uses "1D" for daily resolution, not "D"
-                res_tf = "1" if tf_type == "1minute" else "1D"
+                # FYERS STRICT RATE LIMIT DELAY (Bypasses 429 Bans)
+                time.sleep(0.2)
+                res_tf = "1" if tf_type == "1minute" else "D"
                 
-                # Use params dict so the 'requests' library handles the URL encoding perfectly
-                params = {
-                    "symbol": key,
-                    "resolution": res_tf,
-                    "date_format": "1",
-                    "range_from": start_dt,
-                    "range_to": end_dt
-                }
-                res = requests.get("https://api-t1.fyers.in/data/history", headers=headers, params=params, timeout=10)
+                # IMPORTANT FIX: Fyers backend crashes if the symbol colon is URL Encoded. We pass it raw.
+                url = f"https://api-t1.fyers.in/data/history?symbol={key}&resolution={res_tf}&date_format=1&range_from={start_dt}&range_to={end_dt}"
+                res = requests.get(url, headers=headers, timeout=10)
                 
                 if res.status_code == 200:
                     data = res.json()
@@ -319,7 +315,7 @@ def fetch_broker_data(key, tf_type, start_dt, end_dt, is_live=False):
                         return df
                     return None
 
-            # Rate Limit Backoff
+            # Exponential Rate Limit Backoff
             if res.status_code == 429:
                 time.sleep(random.uniform(1.0, 3.0) * (attempt + 1))
             else:
@@ -359,7 +355,10 @@ def fetch_latest_spot_prices(spot_instruments):
                 if price: spot_prices[sym] = price
             except Exception:
                 pass
-            
+    
+    if not spot_prices:
+        print(f"{COLOR_RED}  ├─ [Critical Error] Fyers returned NO spot prices. Token may be expired or IP rate-limited.{COLOR_RESET}")
+        
     return spot_prices
 
 def build_options_matrix(spot_prices, options_instruments):
@@ -731,6 +730,9 @@ def scan_institutional_tape(target_date_str):
     if not spot_inst: return
 
     spot_prices = fetch_latest_spot_prices(spot_inst)
+    if not spot_prices:
+        return
+        
     target_contracts = build_options_matrix(spot_prices, options_inst)
     
     if not target_contracts:
