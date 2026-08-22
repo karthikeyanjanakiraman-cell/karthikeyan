@@ -141,7 +141,6 @@ def fetch_json_gz(url):
     except Exception: pass
     return []
 
-
 def get_universe_data():
     print(f"📡 Fetching Master Instrument Matrix via {ACTIVE_BROKER}...")
     spot_inst, opt_inst = [], []
@@ -181,7 +180,7 @@ def get_universe_data():
             res_fo = requests.get("https://public.fyers.in/sym_details/NSE_FO.csv", headers=headers, timeout=15)
             res_cm = requests.get("https://public.fyers.in/sym_details/NSE_CM.csv", headers=headers, timeout=15)
             
-            # Pandas handles quoted commas perfectly
+            # Pandas handles quoted commas perfectly and prevents data corruption
             df_fo = pd.read_csv(io.StringIO(res_fo.text), header=None)
             df_cm = pd.read_csv(io.StringIO(res_cm.text), header=None)
             
@@ -225,8 +224,6 @@ def get_universe_data():
 
     print(f"  ├─ 🎯 Mapped {len(spot_inst)} Spot Instruments & {len(opt_inst)} Options Contracts.")
     return spot_inst, opt_inst
-
-
 
 def fetch_broker_data(key, tf_type, start_dt, end_dt, is_live=False):
     """Universal safe fetcher that routes requests cleanly without crashing"""
