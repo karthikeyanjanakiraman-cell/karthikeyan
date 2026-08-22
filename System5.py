@@ -34,6 +34,12 @@ import requests
 
 warnings.filterwarnings("ignore")
 
+# 🔖 BUILD MARKER — if this line does NOT appear at the very top of your CI
+# log, the workflow is not running this file. Check this FIRST before
+# re-reporting any traceback.
+print("🔖 SYSTEM3 BUILD: fyers-options-translation-v3 (2026-08-22) — "
+      "if you don't see this line, your CI is running a different/stale file.")
+
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
 # ==============================================================================
