@@ -141,6 +141,7 @@ def fetch_json_gz(url):
     except Exception: pass
     return []
 
+
 def get_universe_data():
     print(f"📡 Fetching Master Instrument Matrix via {ACTIVE_BROKER}...")
     spot_inst, opt_inst = [], []
@@ -175,34 +176,57 @@ def get_universe_data():
 
     elif ACTIVE_BROKER == "FYERS":
         try:
-            req_cm = requests.get("https://public.fyers.in/sym_details/NSE_CM.csv", timeout=15)
-            req_fo = requests.get("https://public.fyers.in/sym_details/NSE_FO.csv", timeout=15)
+            print("  ├─ Downloading & Parsing FYERS F&O Data...")
+            headers = {'User-Agent': 'Mozilla/5.0'}
+            res_fo = requests.get("https://public.fyers.in/sym_details/NSE_FO.csv", headers=headers, timeout=15)
+            res_cm = requests.get("https://public.fyers.in/sym_details/NSE_CM.csv", headers=headers, timeout=15)
             
-            for line in req_fo.text.strip().split('\n'):
-                cols = line.split(',')
-                if len(cols) > 15:
-                    sym_ticker, underlying, strike, opt_type, expiry_epoch = cols[9], cols[13], cols[14], cols[15], cols[8]
-                    if opt_type in ("CE", "PE") and underlying not in EXCLUDED_INDICES:
-                        try:
-                            expiry_date = dt.fromtimestamp(int(expiry_epoch)).strftime("%Y-%m-%d")
-                            opt_inst.append({
-                                "symbol": sym_ticker, "key": sym_ticker, "underlying": underlying,
-                                "type": opt_type, "strike": float(strike), "expiry": expiry_date
-                            })
-                        except: pass
+            # Pandas handles quoted commas perfectly
+            df_fo = pd.read_csv(io.StringIO(res_fo.text), header=None)
+            df_cm = pd.read_csv(io.StringIO(res_cm.text), header=None)
             
+            # Instrument Type 14 = OPTSTK (Stock Options Only)
+            df_optstk = df_fo[df_fo[2] == 14].copy()
+            
+            for _, row in df_optstk.iterrows():
+                try:
+                    # Extract the pure base symbol (e.g. "RELIANCE 29 AUG..." -> "RELIANCE")
+                    base_symbol = str(row[1]).split()[0].strip()
+                    expiry_date = dt.fromtimestamp(int(row[8])).strftime("%Y-%m-%d")
+                    opt_inst.append({
+                        "symbol": str(row[9]), 
+                        "key": str(row[9]), 
+                        "underlying": base_symbol,
+                        "type": str(row[15]), 
+                        "strike": float(row[14]), 
+                        "expiry": expiry_date
+                    })
+                except: pass
+                
             valid_underlyings = {o["underlying"] for o in opt_inst}
-            for line in req_cm.text.strip().split('\n'):
-                cols = line.split(',')
-                if len(cols) > 13:
-                    sym_ticker, underlying = cols[9], cols[13]
-                    if underlying in valid_underlyings:
-                        spot_inst.append({"symbol": sym_ticker, "key": sym_ticker, "underlying": underlying})
+            
+            # Instrument Type 10 = EQ (Equities)
+            df_eq = df_cm[df_cm[2] == 10].copy()
+            
+            for _, row in df_eq.iterrows():
+                try:
+                    ticker = str(row[9]) # e.g. "NSE:RELIANCE-EQ"
+                    base_symbol = ticker.replace("NSE:", "").replace("-EQ", "").strip()
+                    if base_symbol in valid_underlyings:
+                        spot_inst.append({
+                            "symbol": ticker, 
+                            "key": ticker, 
+                            "underlying": base_symbol
+                        })
+                except: pass
+                
         except Exception as e:
             print(f"{COLOR_RED}[Error] FYERS CSV fetch failed: {e}{COLOR_RESET}")
 
     print(f"  ├─ 🎯 Mapped {len(spot_inst)} Spot Instruments & {len(opt_inst)} Options Contracts.")
     return spot_inst, opt_inst
+
+
 
 def fetch_broker_data(key, tf_type, start_dt, end_dt, is_live=False):
     """Universal safe fetcher that routes requests cleanly without crashing"""
