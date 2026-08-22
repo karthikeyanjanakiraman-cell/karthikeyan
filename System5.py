@@ -22,6 +22,7 @@ import gzip
 import io
 import json
 import os
+import random
 import sys
 import time
 import urllib.parse
@@ -45,8 +46,62 @@ COLOR_DIM = "\033[2m"
 COLOR_RESET = "\033[0m"
 COLOR_BOLD = "\033[1m"
 
-BACKTRACE_DAYS = 100
-API_ERROR_LOGGED = False
+BACKTRACE_DAYS = 15
+
+EXCLUDED_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "NIFTY50", "NIFTYBANK"}
+
+# 🌟 DIAGNOSTICS: surfaces the FIRST few real Fyers API errors (status code,
+# error code/message) instead of silently swallowing them, which previously
+# made "zero data" failures (expired token, bad symbol, etc.) invisible.
+_FYERS_ERROR_LOG_CAP = 5
+_fyers_error_log_count = 0
+
+
+def _log_fyers_error(context, status_code=None, body=None):
+    global _fyers_error_log_count
+    if _fyers_error_log_count >= _FYERS_ERROR_LOG_CAP:
+        return
+    _fyers_error_log_count += 1
+    snippet = str(body)[:300] if body is not None else ""
+    print(f"{COLOR_YELLOW}  [Fyers Diagnostic #{_fyers_error_log_count}] {context}"
+          f"{' | HTTP ' + str(status_code) if status_code else ''} {snippet}{COLOR_RESET}")
+
+
+def get_fyers_auth_headers():
+    return {"Authorization": f"{os.environ.get('FYERS_CLIENT_ID', '')}:{os.environ.get('FYERS_ACCESS_TOKEN', '')}"}
+
+
+def validate_fyers_token():
+    """Real token validation via Fyers' /profile endpoint (not just an env-var
+    presence check). Fyers access tokens expire daily — a stale token makes
+    every fetch fail silently, so this fails fast with a clear reason instead
+    of crashing downstream on an empty dataframe."""
+    if not os.environ.get("FYERS_CLIENT_ID") or not os.environ.get("FYERS_ACCESS_TOKEN"):
+        print(f"❌ {COLOR_RED}Error: FYERS_CLIENT_ID or FYERS_ACCESS_TOKEN environment variables not found.{COLOR_RESET}")
+        return False
+
+    try:
+        headers = get_fyers_auth_headers()
+        res = requests.get("https://api-t1.fyers.in/api/v3/profile", headers=headers, timeout=10)
+        body = {}
+        try:
+            body = res.json()
+        except Exception:
+            pass
+
+        if res.status_code != 200 or body.get("s") != "ok":
+            print(f"{COLOR_RED}❌ Fyers token validation FAILED before starting the sweep.{COLOR_RESET}")
+            print(f"{COLOR_RED}   HTTP {res.status_code} | Response: {str(body)[:300] or res.text[:300]}{COLOR_RESET}")
+            print(f"{COLOR_YELLOW}   -> Your FYERS_ACCESS_TOKEN is almost certainly expired/invalid. "
+                  f"Fyers access tokens expire daily and must be regenerated each trading day.{COLOR_RESET}")
+            return False
+
+        fy_name = body.get("data", {}).get("name", "Unknown")
+        print(f"{COLOR_GREEN}✅ Fyers token validated OK (Account: {fy_name}){COLOR_RESET}")
+        return True
+    except requests.exceptions.RequestException as e:
+        print(f"{COLOR_RED}❌ Could not reach Fyers to validate the token: {e}{COLOR_RESET}")
+        return False
 
 # ==============================================================================
 # GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS
@@ -114,27 +169,107 @@ MIN_OPT_PREMIUM_SANITY = 0.5        # Skip a trade if the fetched premium looks 
 
 
 # ==============================================================================
-# 1. LIVE INGESTION (F&O Universe & Parallel Bulk Fetching)
+# 1. LIVE INGESTION (FYERS): F&O Universe + Options Chain in one CSV pass
 # ==============================================================================
-def get_dynamic_fno_universe():
-    nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
+def get_fno_universe_and_options():
+    """Downloads Fyers' NSE_CM.csv (equities) and NSE_FO.csv (F&O) once, and
+    returns (spot_instruments, options_by_underlying) for the signal engine
+    and the ATM strike selector respectively."""
+    print("📡 Fetching Master Instrument Matrix via FYERS...")
+    spot_inst, opt_inst = [], []
     try:
-        response = requests.get(nse_url, timeout=15)
-        if response.status_code != 200: return []
-        nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
-        fno_underlying = {
-            item.get("underlying_symbol") for item in nse_data
-            if item.get("segment") == "NSE_FO" and item.get("underlying_symbol")
-        }
-        return [
-            {"symbol": item.get("trading_symbol"), "key": item.get("instrument_key")}
-            for item in nse_data
-            if item.get("segment") in ("NSE_EQ", "NSE_INDEX")
-            and item.get("trading_symbol") in fno_underlying
-        ]
+        print("  ├─ Downloading & Parsing FYERS F&O Data...")
+        headers = {"User-Agent": "Mozilla/5.0"}
+
+        res_cm = requests.get("https://public.fyers.in/sym_details/NSE_CM.csv", headers=headers, timeout=15)
+        spot_key_map = {}
+        if res_cm.status_code == 200:
+            for line in res_cm.text.strip().split("\n"):
+                cols = [c.strip() for c in line.split(",")]
+                for c in cols:
+                    if c.startswith("NSE:") and c.endswith("-EQ"):
+                        base = c.replace("NSE:", "").replace("-EQ", "")
+                        spot_key_map[base] = c
+                        break
+
+        res_fo = requests.get("https://public.fyers.in/sym_details/NSE_FO.csv", headers=headers, timeout=15)
+        valid_underlyings = set()
+
+        for line in res_fo.text.strip().split("\n"):
+            cols = [c.strip() for c in line.split(",")]
+
+            opt_type = None
+            type_idx = -1
+            for i in range(len(cols) - 1, -1, -1):
+                if cols[i] in ("CE", "PE"):
+                    opt_type = cols[i]
+                    type_idx = i
+                    break
+
+            if not opt_type or type_idx < 3:
+                continue
+
+            try:
+                strike_val = float(cols[type_idx - 1])
+                # Symbol name sits 3 columns left of CE/PE (NOT 2 — that column
+                # is a raw numeric underlying instrument token, e.g. 26037 =
+                # NIFTY FIN SERVICE, which used to leak through as a bogus name).
+                base_symbol = cols[type_idx - 3].strip()
+
+                if base_symbol in EXCLUDED_INDICES or base_symbol.isdigit() or not base_symbol:
+                    continue
+
+                sym_ticker = None
+                for c in cols:
+                    if c.startswith("NSE:") and opt_type in c:
+                        sym_ticker = c
+                        break
+                if not sym_ticker:
+                    continue
+
+                expiry_date = None
+                for c in cols:
+                    try:
+                        num = int(float(c))
+                        if 1.5e9 < num < 3e9:
+                            expiry_date = datetime.fromtimestamp(num).strftime("%Y-%m-%d")
+                            break
+                    except Exception:
+                        pass
+                if not expiry_date:
+                    continue
+
+                opt_inst.append({
+                    "symbol": sym_ticker,
+                    "key": sym_ticker,
+                    "underlying": base_symbol,
+                    "type": opt_type,
+                    "strike": strike_val,
+                    "expiry": expiry_date
+                })
+
+                if base_symbol not in valid_underlyings:
+                    valid_underlyings.add(base_symbol)
+                    # Only trust a CONFIRMED equity ticker from the CM file —
+                    # never guess a fallback "-EQ" symbol (that let non-equity
+                    # index names like NIFTYNXT50/NIFTYFPI leak into the universe).
+                    spot_ticker = spot_key_map.get(base_symbol)
+                    if spot_ticker:
+                        spot_inst.append({"symbol": base_symbol, "key": spot_ticker, "underlying": base_symbol})
+            except Exception:
+                pass
     except Exception as e:
-        print(f"{COLOR_RED}[API Error] Failed to fetch F&O universe: {e}{COLOR_RESET}")
-        return []
+        print(f"{COLOR_RED}[Error] FYERS CSV fetch failed: {e}{COLOR_RESET}")
+        return [], {}
+
+    options_by_underlying = {}
+    for o in opt_inst:
+        options_by_underlying.setdefault(o["underlying"], []).append(o)
+
+    print(f"  ├─ Mapped {len(spot_inst)} Spot Instruments & {len(opt_inst)} Options Contracts "
+          f"across {len(options_by_underlying)} underlyings.")
+    return spot_inst, options_by_underlying
+
 
 def get_past_trading_days(target_date_str, num_days=20):
     try:
@@ -151,46 +286,61 @@ def get_past_trading_days(target_date_str, num_days=20):
 
 
 # ==============================================================================
-# 1B. OPTIONS TRANSLATION LAYER: MASTER, ATM SELECTION, PREMIUM FETCH
+# 1B. FYERS CANDLE FETCHER (shared by stock signal engine + option premiums)
 # ==============================================================================
-def get_fno_options_master():
-    """Fetch the full UPSTOX instrument master and group CE/PE contracts by
-    underlying symbol, for ATM strike selection. Only called once per run."""
-    url = "https://assets.upstox.com/market-quote/instruments/exchange/complete.json.gz"
-    print("📡 Fetching Options Instrument Master (for strike selection)...")
-    try:
-        response = requests.get(url, timeout=45)
-        if response.status_code != 200:
-            print(f"{COLOR_RED}[API Error] Options master fetch returned HTTP {response.status_code}{COLOR_RESET}")
-            return {}
-        master_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
-    except Exception as e:
-        print(f"{COLOR_RED}[API Error] Failed to fetch options master: {e}{COLOR_RESET}")
-        return {}
+def fetch_fyers_candles(key, start_dt, end_dt):
+    """Fetch 1-min candles for a Fyers symbol over a date range. Returns a
+    DataFrame with a 'Datetime' column, or None. Retries on 429/5xx, surfaces
+    real API errors, and short-circuits on auth failures (code -16)."""
+    headers = get_fyers_auth_headers()
+    for attempt in range(3):
+        try:
+            time.sleep(0.2)
+            encoded_symbol = urllib.parse.quote(key, safe=":")
+            url = (f"https://api-t1.fyers.in/data/history?symbol={encoded_symbol}"
+                   f"&resolution=1&date_format=1&range_from={start_dt}&range_to={end_dt}")
+            res = requests.get(url, headers=headers, timeout=10)
 
-    options_by_underlying = {}
-    for item in master_data:
-        if item.get("instrument_type") in ("CE", "PE") and item.get("underlying_symbol"):
-            strike_raw = item.get("strike_price", item.get("strike"))
-            try:
-                strike_val = float(strike_raw)
-            except (TypeError, ValueError):
+            if res.status_code == 200:
+                try:
+                    data = res.json()
+                except ValueError:
+                    _log_fyers_error(f"Non-JSON response for {key}", res.status_code, res.text[:300])
+                    return None
+                if not data:
+                    return None
+
+                status = data.get("s")
+                if status == "ok":
+                    candles = data.get("candles")
+                    if not candles:
+                        return None
+                    df = pd.DataFrame(candles, columns=["Epoch", "Open", "High", "Low", "Close", "Volume"])
+                    df["Datetime"] = pd.to_datetime(df["Epoch"], unit="s", utc=True) \
+                        .dt.tz_convert("Asia/Kolkata").dt.tz_localize(None).astype("datetime64[ns]")
+                    return df
+                if status == "no_data":
+                    return None
+
+                _log_fyers_error(f"API error for {key} (code={data.get('code')}, msg={data.get('message')})", res.status_code)
+                if data.get("code") == -16:
+                    return None  # auth error — retrying won't help
+
+            elif res.status_code in (429, 500, 502, 503):
+                time.sleep(random.uniform(1.0, 3.0) * (attempt + 1))
                 continue
-            expiry = item.get("expiry")
-            if not expiry or not item.get("instrument_key"):
-                continue
-            options_by_underlying.setdefault(item["underlying_symbol"], []).append({
-                "symbol": item.get("trading_symbol", "UNKNOWN"),
-                "key": item["instrument_key"],
-                "type": item.get("instrument_type"),
-                "strike": strike_val,
-                "expiry": expiry
-            })
-
-    print(f"  ├─ Mapped option chains for {len(options_by_underlying)} underlyings.")
-    return options_by_underlying
+            else:
+                _log_fyers_error(f"HTTP failure for {key}", res.status_code, res.text[:300])
+                return None
+        except requests.exceptions.RequestException as e:
+            _log_fyers_error(f"Network exception on attempt {attempt + 1}: {e}")
+            time.sleep(1)
+    return None
 
 
+# ==============================================================================
+# 1C. OPTIONS TRANSLATION LAYER: ATM SELECTION, PREMIUM FETCH
+# ==============================================================================
 def select_atm_option(symbol, spot_price, opt_type, options_by_underlying, target_date_str):
     """Pick the ATM contract of the requested type (CE/PE) on the nearest
     tradable expiry (>= target date) for a given underlying and spot price."""
@@ -202,7 +352,7 @@ def select_atm_option(symbol, spot_price, opt_type, options_by_underlying, targe
     target_dt = pd.to_datetime(target_date_str)
     valid = [o for o in same_type if pd.to_datetime(o["expiry"]) >= target_dt]
     if not valid:
-        valid = same_type  # fallback: nothing unexpired found, use whatever exists
+        valid = same_type
 
     expiries_sorted = sorted(set(pd.to_datetime(o["expiry"]) for o in valid))
     if not expiries_sorted:
@@ -217,53 +367,15 @@ def select_atm_option(symbol, spot_price, opt_type, options_by_underlying, targe
     return min(same_expiry, key=lambda o: abs(o["strike"] - spot_price))
 
 
-def fetch_option_day_series(option_key, target_date_str, is_live_today, current_now):
+def fetch_option_day_series(option_key, target_date_str, is_live_today=None, current_now=None):
     """Fetch 1-min premium candles for a single option contract on the target
-    date. Returns (sorted_timestamps_list, {timestamp: close}) — empty if no data."""
-    access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
-    headers = {"Accept": "application/json", "Authorization": f"Bearer {access_token}"}
-    key = urllib.parse.quote(option_key)
-    dfs = []
-
-    hist_end = target_date_str if not is_live_today else (current_now - timedelta(days=1)).strftime("%Y-%m-%d")
-    for attempt in range(3):
-        try:
-            res = requests.get(
-                f"https://api.upstox.com/v2/historical-candle/{key}/1minute/{hist_end}/{target_date_str}",
-                headers=headers, timeout=15
-            )
-            if res.status_code == 200:
-                data = res.json().get("data", {}).get("candles")
-                if data:
-                    dfs.append(pd.DataFrame(data, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume", "OI"]))
-                break
-            elif res.status_code == 429:
-                time.sleep(1.5)
-            else:
-                break
-        except Exception:
-            time.sleep(1)
-
-    if is_live_today:
-        for attempt in range(3):
-            try:
-                res = requests.get(
-                    f"https://api.upstox.com/v2/historical-candle/intraday/{key}/1minute",
-                    headers=headers, timeout=15
-                )
-                if res.status_code == 200:
-                    data = res.json().get("data", {}).get("candles")
-                    if data:
-                        dfs.append(pd.DataFrame(data, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume", "OI"]))
-                break
-            except Exception:
-                time.sleep(1)
-
-    if not dfs:
+    date. Returns (sorted_timestamps_list, {timestamp: close}) — empty if no data.
+    (is_live_today/current_now kept as optional args for call-site compatibility;
+    Fyers' date-range API returns live-forming candles automatically when the
+    range includes today, so no separate "intraday" endpoint is needed.)"""
+    df = fetch_fyers_candles(option_key, target_date_str, target_date_str)
+    if df is None or df.empty:
         return [], {}
-
-    df = pd.concat(dfs, ignore_index=True)
-    df["Datetime"] = pd.to_datetime(df["Timestamp"]).dt.tz_localize(None)
     df = df.drop_duplicates(subset=["Datetime"]).sort_values("Datetime")
     price_map = dict(zip(df["Datetime"], df["Close"]))
     sorted_ts = sorted(price_map.keys())
@@ -571,14 +683,12 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
 # 5. TRADE MANAGEMENT: STOCK SIGNAL -> ATM OPTION TRANSLATION -> EXIT TRACKING
 # ==============================================================================
 def scan_institutional_tape(target_date_str):
-    global API_ERROR_LOGGED
 
     print(f"\n📡 Initiating Dual-Tier Execution & Exit Engine for {target_date_str}...")
-    universe = get_dynamic_fno_universe()
-    if not universe: return
-
-    # 🌟 Options translation layer: fetch the option chain map ONCE up front.
-    options_by_underlying = get_fno_options_master()
+    universe, options_by_underlying = get_fno_universe_and_options()
+    if not universe:
+        print(f"{COLOR_RED}[Error] No spot instruments mapped — cannot proceed.{COLOR_RESET}")
+        return
     if not options_by_underlying:
         print(f"{COLOR_RED}[Error] No options chain data available — cannot translate stock signals into strikes.{COLOR_RESET}")
         return
@@ -591,45 +701,20 @@ def scan_institutional_tape(target_date_str):
     is_live_today = target_date_str == current_now.strftime("%Y-%m-%d")
 
     print(f"🚀 Multithreading Bulk Ingestion for {len(universe)} symbols (stock chart = signal engine)...")
-    fetch_tasks = [(item, trading_days[0], target_date_str, is_live_today) for item in universe]
+    fetch_tasks = [(item, trading_days[0], target_date_str) for item in universe]
     historical_dfs = []
 
     def fetch_worker(task):
-        global API_ERROR_LOGGED
-        item, start_date, end_date, live = task
-        key = urllib.parse.quote(item["key"])
-        access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
-        headers = {"Accept": "application/json", "Authorization": f"Bearer {access_token}"}
-        dfs = []
-        hist_end = end_date if not live else (current_now - timedelta(days=1)).strftime("%Y-%m-%d")
-
-        for attempt in range(3):
-            try:
-                res = requests.get(f"https://api.upstox.com/v2/historical-candle/{key}/1minute/{hist_end}/{start_date}", headers=headers, timeout=15)
-                if res.status_code == 200:
-                    data = res.json().get("data", {}).get("candles")
-                    if data: dfs.append(pd.DataFrame(data, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume", "OI"]))
-                    break
-                elif res.status_code == 429: time.sleep(1.5)
-                else: break
-            except Exception: time.sleep(1)
-
-        if live:
-            for attempt in range(3):
-                try:
-                    res = requests.get(f"https://api.upstox.com/v2/historical-candle/intraday/{key}/1minute", headers=headers, timeout=15)
-                    if res.status_code == 200 and res.json().get("data", {}).get("candles"):
-                        dfs.append(pd.DataFrame(res.json()["data"]["candles"], columns=["Timestamp", "Open", "High", "Low", "Close", "Volume", "OI"]))
-                    break
-                except Exception: time.sleep(1)
-
-        if dfs:
-            df = pd.concat(dfs, ignore_index=True)
-            df["Datetime"] = pd.to_datetime(df["Timestamp"]).dt.tz_localize(None).astype("datetime64[ns]")
-            df = df.drop_duplicates(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
-            df["Symbol"] = item["symbol"]
-            return df
-        return None
+        item, start_date, end_date = task
+        # Fyers' date-range history endpoint returns live-forming candles
+        # automatically when the range includes "today" — no separate
+        # intraday endpoint needed (unlike Upstox).
+        df = fetch_fyers_candles(item["key"], start_date, end_date)
+        if df is None or df.empty:
+            return None
+        df = df.drop_duplicates(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
+        df["Symbol"] = item["symbol"]
+        return df
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
         futures = {executor.submit(fetch_worker, task): task for task in fetch_tasks}
@@ -643,7 +728,12 @@ def scan_institutional_tape(target_date_str):
     print()
 
     if not historical_dfs:
-        print(f"{COLOR_RED}No historical stock data retrieved.{COLOR_RESET}")
+        if _fyers_error_log_count > 0:
+            print(f"{COLOR_RED}No historical stock data retrieved. See the [Fyers Diagnostic] lines above for the exact API error.{COLOR_RESET}")
+        else:
+            print(f"{COLOR_RED}No historical stock data retrieved, but no API errors were logged.{COLOR_RESET}")
+            print(f"{COLOR_YELLOW}This usually means: the target date is a market holiday/weekend with no candles, "
+                  f"or every request returned an empty candle set for some other silent reason.{COLOR_RESET}")
         return
 
     rolling_master_df = pd.concat(historical_dfs, ignore_index=True)
@@ -894,8 +984,7 @@ def run_production_sweep():
     else:
         target_date_str = datetime.strptime(raw_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
 
-    if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
-        print(f"❌ {COLOR_RED}Error: UPSTOX_ACCESS_TOKEN environment variable not found.{COLOR_RESET}")
+    if not validate_fyers_token():
         return
 
     scan_institutional_tape(target_date_str)
