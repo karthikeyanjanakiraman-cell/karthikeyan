@@ -129,7 +129,7 @@ def get_auth_headers():
     if ACTIVE_BROKER == "UPSTOX":
         return {"Accept": "application/json", "Authorization": f"Bearer {os.environ.get('UPSTOX_ACCESS_TOKEN', '')}"}
     elif ACTIVE_BROKER == "FYERS":
-        return {"Authorization": f"{os.environ.get('FYERS_CLIENT_ID', '')}:{os.environ.get('FYERS_ACCESS_TOKEN', '')}"}
+        return {"Authorization": f"{os.environ.get('CLIENT_ID', '')}:{os.environ.get('ACCESS_TOKEN', '')}"}
     return {}
 
 def fetch_json_gz(url):
