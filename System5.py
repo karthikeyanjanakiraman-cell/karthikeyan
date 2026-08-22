@@ -49,8 +49,8 @@ TARGET_EXPIRY = "CURRENT"    # "CURRENT" or "NEXT"
 BACKTRACE_DAYS = 15          # Default historical reach for Macro TFs
 
 # 🌟 NEW PRE-FILTER VARIABLES (The Speed Enablers)
-MIN_OPT_PREMIUM = 50.0        # Option must close >= ₹5.00 on the previous day
-MIN_PREV_DAY_VOLUME = 10000  # Option must have traded >= 10,000 contracts on the previous day
+MIN_OPT_PREMIUM = 15.0        # Option must close >= ₹5.00 on the previous day
+MIN_PREV_DAY_VOLUME = 250000  # Option must have traded >= 10,000 contracts on the previous day
 
 MAX_API_WORKERS = 40         # Aggressive threading worker count
 
