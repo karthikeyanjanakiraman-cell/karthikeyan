@@ -52,7 +52,7 @@ BACKTRACE_DAYS = 15
 MIN_OPT_PREMIUM = 15.0
 MIN_PREV_DAY_VOLUME = 250000
 
-MAX_API_WORKERS = 40 if ACTIVE_BROKER == "UPSTOX" else 50
+MAX_API_WORKERS = 40 if ACTIVE_BROKER == "UPSTOX" else 2
 
 MICRO_TIMEFRAME = "1min"
 MACRO_TIMEFRAMES = ["20min"]
@@ -342,7 +342,7 @@ def fetch_broker_data(key, tf_type, start_dt, end_dt, is_live=False):
 
                     if not candles: return None
                     df = pd.DataFrame(candles, columns=["Timestamp", "Open", "High", "Low", "Close", "Volume", "OI"])
-                    df["Datetime"] = pd.to_datetime(df["Timestamp"]).dt.tz_localize(None)
+                    df["Datetime"] = pd.to_datetime(df["Timestamp"]).dt.tz_localize(None).astype("datetime64[ns]")
                     return df
 
             elif ACTIVE_BROKER == "FYERS":
@@ -376,7 +376,7 @@ def fetch_broker_data(key, tf_type, start_dt, end_dt, is_live=False):
                             # Valid response, genuinely no candles in this range (e.g. holiday/no trades).
                             return None
                         df = pd.DataFrame(candles, columns=["Epoch", "Open", "High", "Low", "Close", "Volume"])
-                        df["Datetime"] = pd.to_datetime(df["Epoch"], unit='s', utc=True).dt.tz_convert('Asia/Kolkata').dt.tz_localize(None)
+                        df["Datetime"] = pd.to_datetime(df["Epoch"], unit='s', utc=True).dt.tz_convert('Asia/Kolkata').dt.tz_localize(None).astype("datetime64[ns]")
                         return df
 
                     if status == "no_data":
@@ -746,7 +746,7 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
 
     df_tf = apply_dual_tier_scorecard(df_tf, tf_str, "MACRO")
 
-    df_tf["Eval_Time"] = df_tf["Datetime"] + pd.to_timedelta(tf_str)
+    df_tf["Eval_Time"] = (df_tf["Datetime"] + pd.to_timedelta(tf_str)).astype("datetime64[ns]")
 
     export_cols = [
         "Symbol", "Eval_Time",
@@ -788,6 +788,13 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
         bull_gate_cols.append(bull_col)
         bear_gate_cols.append(bear_col)
 
+        # 🌟 Defensive cast: pandas 2.x can produce mixed datetime64 precisions
+        # ([s] vs [us] vs [ns]) depending on how a column was derived (raw epoch
+        # conversion vs. arithmetic vs. groupby resampling). merge_asof requires
+        # both join keys to share the exact same dtype, so we pin both explicitly
+        # right before merging rather than relying on it matching by accident.
+        df_micro["Datetime"] = df_micro["Datetime"].astype("datetime64[ns]")
+        env_df["Datetime"] = env_df["Datetime"].astype("datetime64[ns]")
         df_micro = pd.merge_asof(df_micro, env_df, on="Datetime", by="Symbol", direction="backward")
         df_micro[bull_col] = df_micro[bull_col].fillna(False)
         df_micro[bear_col] = df_micro[bear_col].fillna(False)
