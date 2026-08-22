@@ -294,12 +294,19 @@ def get_universe_data():
 
                     if base_symbol not in valid_underlyings:
                         valid_underlyings.add(base_symbol)
-                        spot_ticker = spot_key_map.get(base_symbol, f"NSE:{base_symbol}-EQ")
-                        spot_inst.append({
-                            "symbol": base_symbol,
-                            "key": spot_ticker,
-                            "underlying": base_symbol
-                        })
+                        # 🌟 FIX: only trust a symbol that's a CONFIRMED equity ticker
+                        # from the NSE_CM.csv map. The old fallback f"NSE:{base_symbol}-EQ"
+                        # blindly guessed a ticker for anything not found there — which is
+                        # exactly how non-equity index names (NIFTYNXT50, NIFTYFPI, etc.,
+                        # which have F&O contracts but no underlying "-EQ" stock) leaked
+                        # into the spot universe and got rejected by Fyers as invalid.
+                        spot_ticker = spot_key_map.get(base_symbol)
+                        if spot_ticker:
+                            spot_inst.append({
+                                "symbol": base_symbol,
+                                "key": spot_ticker,
+                                "underlying": base_symbol
+                            })
 
                 except Exception:
                     pass
@@ -342,7 +349,13 @@ def fetch_broker_data(key, tf_type, start_dt, end_dt, is_live=False):
                 time.sleep(0.2)
                 res_tf = "1" if tf_type == "1minute" else "D"
 
-                url = f"https://api-t1.fyers.in/data/history?symbol={key}&resolution={res_tf}&date_format=1&range_from={start_dt}&range_to={end_dt}"
+                # 🌟 FIX: symbols like "NSE:GVT&D-EQ" contain a literal "&", which — left
+                # unescaped — gets parsed by the HTTP layer as a query-string delimiter,
+                # silently truncating/corrupting the request (Fyers then rejects it as an
+                # "Invalid symbol"). We escape everything except ':' (Fyers' endpoint
+                # rejects an encoded colon, per their API's documented quirk).
+                encoded_symbol = urllib.parse.quote(key, safe=':')
+                url = f"https://api-t1.fyers.in/data/history?symbol={encoded_symbol}&resolution={res_tf}&date_format=1&range_from={start_dt}&range_to={end_dt}"
                 res = requests.get(url, headers=headers, timeout=10)
 
                 if res.status_code == 200:
