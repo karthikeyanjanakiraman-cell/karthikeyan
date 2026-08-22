@@ -185,8 +185,20 @@ def fetch_latest_spot_prices(spot_instruments, headers):
     
     def worker(inst):
         key = urllib.parse.quote(inst["instrument_key"])
+        
+        # ATTEMPT 1: Intraday API (Fastest during live market hours/weekdays)
         data = safe_api_request(f"https://api.upstox.com/v2/historical-candle/intraday/{key}/1minute", headers)
-        if data: return inst["trading_symbol"], data[0][4] 
+        if data: 
+            return inst["trading_symbol"], data[0][4] 
+            
+        # ATTEMPT 2: Weekend/Holiday Fallback (Grab the last known daily close)
+        today_str = dt.utcnow().strftime("%Y-%m-%d")
+        seven_days_ago = (dt.utcnow() - timedelta(days=7)).strftime("%Y-%m-%d")
+        daily_data = safe_api_request(f"https://api.upstox.com/v2/historical-candle/{key}/day/{today_str}/{seven_days_ago}", headers)
+        
+        if daily_data:
+            return inst["trading_symbol"], daily_data[0][4] # latest close from the last active trading day
+            
         return inst["trading_symbol"], None
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=MAX_API_WORKERS) as executor:
@@ -196,6 +208,7 @@ def fetch_latest_spot_prices(spot_instruments, headers):
             if price: spot_prices[sym] = price
             
     return spot_prices
+
 
 def build_options_matrix(spot_prices, options_instruments):
     print(f"⚙️ Building Options Contract Matrix (Offset: ±{STRIKE_RANGE_OFFSET}, Expiry: {TARGET_EXPIRY})...")
