@@ -164,7 +164,7 @@ MICRO_EXIT_VOL_BRICKS   = 5
 MACRO_EXIT_PRICE_BRICKS = 1
 MACRO_EXIT_VOL_BRICKS   = 1
 
-RENKO_VELOCITY_MAX_BARS = 12
+RENKO_VELOCITY_MAX_BARS = 120
 ENTRY_CUTOFF_TIME = "15:00"
 
 # ==============================================================================
