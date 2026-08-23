@@ -149,7 +149,10 @@ MICRO_MANDATORY_RSI_BB         = False
 MICRO_MANDATORY_ADX_DMI        = False
 MICRO_MANDATORY_EMA_SPREAD     = False
 MICRO_MANDATORY_STOCHASTIC     = True
-MICRO_MANDATORY_ATR_BB         = True   # 9th Pillar: Non-Exhaustion Guard
+
+# 🌟 ADD THESE TWO LINES BACK IF THEY ARE MISSING:
+MICRO_MANDATORY_ATR_BB         = False  
+MICRO_MANDATORY_RENKO_BB       = True   # 9th Pillar: Non-Exhaustion Guard
 MICRO_MINIMUM_SCORE            = 2      # Out of 9
 
 # ==============================================================================
