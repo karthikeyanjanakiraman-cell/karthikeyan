@@ -69,9 +69,9 @@ GLOBAL_MACRO_STRATEGY_2D = "BOTH"  # "BULLISH", "BEARISH", or "BOTH"
 # ==============================================================================
 # 🎛️ TIER 1: MACRO CONTEXT SWITCHBOARD (THE GENERAL) - 9 PILLARS
 # ==============================================================================
-MACRO_MANDATORY_PRICE_RENKO    = True
-MACRO_MANDATORY_VOL_RENKO      = True
-MACRO_MANDATORY_RENKO_VELOCITY = True   
+MACRO_MANDATORY_PRICE_RENKO    = False
+MACRO_MANDATORY_VOL_RENKO      = False
+MACRO_MANDATORY_RENKO_VELOCITY = False   
 MACRO_MANDATORY_RSI_BB         = False
 MACRO_MANDATORY_ADX_DMI        = False
 MACRO_MANDATORY_EMA_SPREAD     = False
@@ -80,25 +80,25 @@ MACRO_MANDATORY_STOCHASTIC     = False
 # 🌟 NEW VETO PILLARS
 MACRO_MANDATORY_ATR_BB         = True   # 8th Pillar: Vetoes if ATR is NOT expanding (> Upper BB)
 MACRO_MANDATORY_RENKO_BB       = True   # 9th Pillar: Vetoes if Renko Count IS exhausted (> Upper BB)
-MACRO_MINIMUM_SCORE            = 4      # Out of 9
+MACRO_MINIMUM_SCORE            = 2      # Out of 9
 
 # ==============================================================================
 # 🎛️ TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
 # ==============================================================================
 SYNC_MICRO_WITH_MACRO          = False  # If True, Micro overrides to match Macro
 
-MICRO_MANDATORY_PRICE_RENKO    = True
-MICRO_MANDATORY_VOL_RENKO      = True
-MICRO_MANDATORY_RENKO_VELOCITY = True   
+MICRO_MANDATORY_PRICE_RENKO    = False
+MICRO_MANDATORY_VOL_RENKO      = False
+MICRO_MANDATORY_RENKO_VELOCITY = False   
 MICRO_MANDATORY_RSI_BB         = False
 MICRO_MANDATORY_ADX_DMI        = False
-MICRO_MANDATORY_EMA_SPREAD     = True
-MICRO_MANDATORY_STOCHASTIC     = True
+MICRO_MANDATORY_EMA_SPREAD     = False
+MICRO_MANDATORY_STOCHASTIC     = False
 
 # 🌟 NEW VETO PILLARS
-MICRO_MANDATORY_ATR_BB         = False  # (Set True if you only want to snipe on micro volatility expansions)
+MICRO_MANDATORY_ATR_BB         = True  # (Set True if you only want to snipe on micro volatility expansions)
 MICRO_MANDATORY_RENKO_BB       = True   # 9th Pillar: Exhaustion Veto Guard
-MICRO_MINIMUM_SCORE            = 5      # Out of 9
+MICRO_MINIMUM_SCORE            = 2      # Out of 9
 
 # ==============================================================================
 # 🎛️ TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
