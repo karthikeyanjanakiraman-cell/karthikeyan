@@ -37,7 +37,7 @@ warnings.filterwarnings("ignore")
 # 🔖 BUILD MARKER — if this line does NOT appear at the very top of your CI
 # log, the workflow is not running this file. Check this FIRST before
 # re-reporting any traceback.
-print("🔖 SYSTEM3 BUILD: fyers-options-translation-v3 (2026-08-22) — "
+print("🔖 SYSTEM3 BUILD: fyers-options-translation-v4-SMA-FIX (2026-08-23) — "
       "if you don't see this line, your CI is running a different/stale file.")
 
 # ==============================================================================
@@ -52,7 +52,8 @@ COLOR_DIM = "\033[2m"
 COLOR_RESET = "\033[0m"
 COLOR_BOLD = "\033[1m"
 
-BACKTRACE_DAYS = 10
+# 🌟 FIXED: Bumped from 10 to 60. Provides enough warmup candles for SMAs on high timeframes.
+BACKTRACE_DAYS = 60
 
 EXCLUDED_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "NIFTY50", "NIFTYBANK"}
 
@@ -224,9 +225,6 @@ def get_fno_universe_and_options():
 
             try:
                 strike_val = float(cols[type_idx - 1])
-                # Symbol name sits 3 columns left of CE/PE (NOT 2 — that column
-                # is a raw numeric underlying instrument token, e.g. 26037 =
-                # NIFTY FIN SERVICE, which used to leak through as a bogus name).
                 base_symbol = cols[type_idx - 3].strip()
 
                 if base_symbol in EXCLUDED_INDICES or base_symbol.isdigit() or not base_symbol:
@@ -263,9 +261,6 @@ def get_fno_universe_and_options():
 
                 if base_symbol not in valid_underlyings:
                     valid_underlyings.add(base_symbol)
-                    # Only trust a CONFIRMED equity ticker from the CM file —
-                    # never guess a fallback "-EQ" symbol (that let non-equity
-                    # index names like NIFTYNXT50/NIFTYFPI leak into the universe).
                     spot_ticker = spot_key_map.get(base_symbol)
                     if spot_ticker:
                         spot_inst.append({"symbol": base_symbol, "key": spot_ticker, "underlying": base_symbol})
@@ -419,18 +414,23 @@ def filter_liquid_contracts(contracts, target_date_str):
 # 2. CORE TECHNICAL & 45-DEGREE RENKO ENGINES
 # ==============================================================================
 def calculate_core_technicals(df_tf):
+    # 🌟 FIXED: All `.ewm()` replaced with `.rolling()` SMA logic
+    # This mathematically prevents the rolling-window start-date from shifting intermediate values
+    
     df_tf["H-L"] = df_tf["High"] - df_tf["Low"]
     df_tf["H-PC"] = (df_tf["High"] - df_tf.groupby("Symbol")["Close"].shift(1)).abs()
     df_tf["L-PC"] = (df_tf["Low"] - df_tf.groupby("Symbol")["Close"].shift(1)).abs()
     df_tf["TR"] = df_tf[["H-L", "H-PC", "L-PC"]].max(axis=1)
-    df_tf["ATR"] = df_tf.groupby("Symbol")["TR"].transform(lambda x: x.ewm(alpha=1 / ATR_PERIOD, adjust=False).mean())
+    
+    df_tf["ATR"] = df_tf.groupby("Symbol")["TR"].transform(lambda x: x.rolling(window=ATR_PERIOD, min_periods=1).mean())
     df_tf["ATR"] = df_tf["ATR"].fillna(df_tf["Close"] * RENKO_DEFAULT_PCT)
 
     delta = df_tf.groupby("Symbol")["Close"].diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.groupby(df_tf["Symbol"]).transform(lambda x: x.ewm(alpha=1 / RSI_PERIOD, adjust=False).mean())
-    avg_loss = loss.groupby(df_tf["Symbol"]).transform(lambda x: x.ewm(alpha=1 / RSI_PERIOD, adjust=False).mean())
+    
+    avg_gain = gain.groupby(df_tf["Symbol"]).transform(lambda x: x.rolling(window=RSI_PERIOD, min_periods=1).mean())
+    avg_loss = loss.groupby(df_tf["Symbol"]).transform(lambda x: x.rolling(window=RSI_PERIOD, min_periods=1).mean())
     df_tf["RSI"] = 100 - (100 / (1 + (avg_gain / (avg_loss + 1e-8))))
     df_tf["RSI_SMA"] = df_tf.groupby("Symbol")["RSI"].transform(lambda x: x.rolling(BB_SMA_PERIOD, min_periods=1).mean())
 
@@ -439,14 +439,16 @@ def calculate_core_technicals(df_tf):
     df_tf["+DM"] = np.where((high_d > low_d) & (high_d > 0), high_d, 0)
     df_tf["-DM"] = np.where((low_d > high_d) & (low_d > 0), low_d, 0)
 
-    df_tf["+DI"] = (100 * (df_tf.groupby("Symbol")["+DM"].transform(lambda x: x.ewm(alpha=1 / ADX_PERIOD, adjust=False).mean()) / (df_tf["ATR"] + 1e-8)))
-    df_tf["-DI"] = (100 * (df_tf.groupby("Symbol")["-DM"].transform(lambda x: x.ewm(alpha=1 / ADX_PERIOD, adjust=False).mean()) / (df_tf["ATR"] + 1e-8)))
+    df_tf["+DI"] = (100 * (df_tf.groupby("Symbol")["+DM"].transform(lambda x: x.rolling(window=ADX_PERIOD, min_periods=1).mean()) / (df_tf["ATR"] + 1e-8)))
+    df_tf["-DI"] = (100 * (df_tf.groupby("Symbol")["-DM"].transform(lambda x: x.rolling(window=ADX_PERIOD, min_periods=1).mean()) / (df_tf["ATR"] + 1e-8)))
     df_tf["DX"] = (100 * abs(df_tf["+DI"] - df_tf["-DI"]) / (df_tf["+DI"] + df_tf["-DI"] + 1e-8))
-    df_tf["ADX"] = df_tf.groupby("Symbol")["DX"].transform(lambda x: x.ewm(alpha=1 / ADX_PERIOD, adjust=False).mean())
+    df_tf["ADX"] = df_tf.groupby("Symbol")["DX"].transform(lambda x: x.rolling(window=ADX_PERIOD, min_periods=1).mean())
 
-    df_tf["EMA_8"] = df_tf.groupby("Symbol")["Close"].transform(lambda x: x.ewm(span=8, adjust=False).mean())
-    df_tf["EMA_21"] = df_tf.groupby("Symbol")["Close"].transform(lambda x: x.ewm(span=21, adjust=False).mean())
+    # Keeping column names as EMA_8/21 for downstream compat, but calculating as strict SMAs
+    df_tf["EMA_8"] = df_tf.groupby("Symbol")["Close"].transform(lambda x: x.rolling(window=8, min_periods=1).mean())
+    df_tf["EMA_21"] = df_tf.groupby("Symbol")["Close"].transform(lambda x: x.rolling(window=21, min_periods=1).mean())
     df_tf["EMA_Spread"] = abs(df_tf["EMA_8"] - df_tf["EMA_21"])
+    
     spread_thresh = df_tf.groupby("Symbol")["EMA_Spread"].transform(lambda x: x.rolling(window=20, min_periods=1).mean()) * 0.20
     df_tf["EMA_Bull_Expanded"] = (df_tf["EMA_8"] > df_tf["EMA_21"]) & (df_tf["EMA_Spread"] >= spread_thresh)
     df_tf["EMA_Bear_Expanded"] = (df_tf["EMA_8"] < df_tf["EMA_21"]) & (df_tf["EMA_Spread"] >= spread_thresh)
@@ -454,6 +456,7 @@ def calculate_core_technicals(df_tf):
     lowest_low = df_tf.groupby("Symbol")["Low"].transform(lambda x: x.rolling(window=STOCH_PERIOD, min_periods=1).min())
     highest_high = df_tf.groupby("Symbol")["High"].transform(lambda x: x.rolling(window=STOCH_PERIOD, min_periods=1).max())
     df_tf["Stoch_K"] = ((df_tf["Close"] - lowest_low) / (highest_high - lowest_low + 1e-9)) * 100
+    
     atr_median = df_tf.groupby("Symbol")["ATR"].transform(lambda x: x.rolling(window=50, min_periods=1).median())
     df_tf["Vol_Pass"] = df_tf["ATR"] >= (atr_median * 0.75)
     df_tf["Stoch_Bull_Pass"] = (df_tf["Stoch_K"] >= 50) & df_tf["Vol_Pass"]
@@ -565,17 +568,6 @@ def construct_renko_velocity_engine(df, tf_name):
 
 
 def construct_bb_meta_pillars(df, tf_name):
-    """8th Pillar (ATR-BB): Bollinger Bands wrapped around ATR, not price.
-    Direction-agnostic — flags genuine volatility EXPANSION (ATR breaking
-    above its own upper band) vs. an average-volatility day. Mandatory =
-    veto unless ATR is actually expanding.
-
-    9th Pillar (Renko-BB): Bollinger Bands wrapped around the SIGNED Renko
-    brick count. Direction-specific — flags a trend run that is statistically
-    OVER-EXTENDED (exhausted) relative to its own typical run-length.
-    Mandatory = veto if the run IS exhausted (opposite polarity from a normal
-    confirm pillar: this one blocks continuation once the run is beyond its
-    own historical range, rather than requiring a condition to be true)."""
     # --- ATR-BB ---
     atr_mean = df.groupby("Symbol")["ATR"].transform(lambda x: x.rolling(BB_SMA_PERIOD, min_periods=1).mean())
     atr_std = df.groupby("Symbol")["ATR"].transform(lambda x: x.rolling(BB_SMA_PERIOD, min_periods=1).std()).fillna(0)
@@ -583,7 +575,7 @@ def construct_bb_meta_pillars(df, tf_name):
     df[f"ATR_BB_Upper_{tf_name}"] = atr_upper
     is_expanding = df["ATR"] > atr_upper
     df[f"ATR_BB_Bull_{tf_name}"] = is_expanding
-    df[f"ATR_BB_Bear_{tf_name}"] = is_expanding  # volatility expansion helps both directions equally
+    df[f"ATR_BB_Bear_{tf_name}"] = is_expanding  
 
     # --- Renko-BB ---
     renko_col = f"Renko_Count_{tf_name}"
@@ -593,7 +585,6 @@ def construct_bb_meta_pillars(df, tf_name):
     renko_lower = renko_mean - BB_STD_DEV * renko_std
     df[f"Renko_BB_Upper_{tf_name}"] = renko_upper
     df[f"Renko_BB_Lower_{tf_name}"] = renko_lower
-    # True = NOT exhausted = healthy = passes the veto
     df[f"Renko_BB_Bull_{tf_name}"] = df[renko_col] <= renko_upper
     df[f"Renko_BB_Bear_{tf_name}"] = df[renko_col] >= renko_lower
     return df
@@ -629,7 +620,6 @@ def apply_dual_tier_scorecard(df, tf_str, tier_type):
     c_adx_bull, c_adx_bear = ((df["ADX"] >= ADX_THRESHOLD) & (df["+DI"] > df["-DI"])).astype(int), ((df["ADX"] >= ADX_THRESHOLD) & (df["-DI"] > df["+DI"])).astype(int)
     c_ema_bull, c_ema_bear = df["EMA_Bull_Expanded"].astype(int), df["EMA_Bear_Expanded"].astype(int)
     c_stoch_bull, c_stoch_bear = df["Stoch_Bull_Pass"].astype(int), df["Stoch_Bear_Pass"].astype(int)
-    # 8th/9th pillars: BB-on-ATR (expansion) and BB-on-Renko-Count (exhaustion)
     c_atr_bb_bull, c_atr_bb_bear = df[f"ATR_BB_Bull_{tf_str}"].astype(int), df[f"ATR_BB_Bear_{tf_str}"].astype(int)
     c_renko_bb_bull, c_renko_bb_bear = df[f"Renko_BB_Bull_{tf_str}"].astype(int), df[f"Renko_BB_Bear_{tf_str}"].astype(int)
 
@@ -724,8 +714,6 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
     df_micro["Master_Armed_Bull"] = df_micro[bull_gate_cols].any(axis=1)
     df_micro["Master_Armed_Bear"] = df_micro[bear_gate_cols].any(axis=1)
 
-    # Applied HERE (before Trigger/Direction are derived) so the mode switch
-    # actually takes effect, rather than being overwritten too late downstream.
     if strategy_mode == "BULLISH":
         df_micro["Master_Armed_Bear"] = False
     elif strategy_mode == "BEARISH":
@@ -813,12 +801,7 @@ def scan_institutional_tape(target_date_str):
         print(f"\n{COLOR_YELLOW}[Terminal Silent] STAGE 1: No stocks triggered micro+macro conditions today.{COLOR_RESET}\n")
         return
 
-    # A stock "qualifies" (enters Basket 1/2 at the stock level) the moment it
-    # has AT LEAST ONE confirmed trigger before the entry cutoff — that's what
-    # determines basket membership, independent of how/when it later exits.
     qualifying_symbols = sorted(stock_anomalies["Symbol"].unique().tolist())
-    # Reference spot price per qualified stock (its most recent trigger price)
-    # used purely to center the ATM strike-range selection in Stage 2.
     spot_ref = stock_anomalies.sort_values("Datetime").groupby("Symbol")["Close"].last().to_dict()
 
     print(f"{COLOR_GREEN}✅ STAGE 1 complete: {len(qualifying_symbols)}/{len(universe)} stocks qualified "
@@ -854,7 +837,8 @@ def scan_institutional_tape(target_date_str):
     option_dfs = []
 
     def option_fetch_worker(contract):
-        df = fetch_fyers_candles(contract["key"], target_date_str, target_date_str, resolution="1")
+        # 🌟 FIXED: Use trading_days[0] to give the option chart historical warmup bars identically to the stocks
+        df = fetch_fyers_candles(contract["key"], trading_days[0], target_date_str, resolution="1")
         if df is None or df.empty:
             return None
         df = df.drop_duplicates(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
@@ -878,8 +862,6 @@ def scan_institutional_tape(target_date_str):
 
     option_master_df = pd.concat(option_dfs, ignore_index=True)
     print("⚙️ Computing 7-Pillar Scorecards & Velocity Matrices on OPTION PREMIUM charts...")
-    # Buy-only: only rising-premium triggers are actionable, whether CE or PE —
-    # this is the final gate that decides Basket 1 / Basket 2 membership.
     tape_exec_opt = prepare_unified_execution_tape(option_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, strategy_mode=OPTIONS_STRATEGY_2D)
 
     memory_bank = _run_dual_layer_trade_management(tape_exec_opt, MICRO_TIMEFRAME, MACRO_TIMEFRAMES)
@@ -941,9 +923,6 @@ def scan_institutional_tape(target_date_str):
 
 
 def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframes):
-    """Shared dual-layer (macro + micro) exit engine with velocity-stall cutoff
-    and EOD force-exit. Operates directly on tape_exec's own Close price.
-    Returns memory_bank: Symbol -> list of trade episodes (multi-trigger safe)."""
     all_anomalies = tape_exec[tape_exec["Direction"] != 0].copy()
     anomalies_by_time = all_anomalies.groupby("Datetime")
 
