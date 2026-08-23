@@ -112,8 +112,8 @@ def validate_fyers_token():
 # ==============================================================================
 # GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS
 # ==============================================================================
-MICRO_TIMEFRAME = "1min"
-MACRO_TIMEFRAMES = ["5min"]
+MICRO_TIMEFRAME = "240min"
+MACRO_TIMEFRAMES = ["2400min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
