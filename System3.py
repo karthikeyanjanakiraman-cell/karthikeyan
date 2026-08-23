@@ -42,7 +42,7 @@ COLOR_DIM = "\033[2m"
 COLOR_RESET = "\033[0m"
 COLOR_BOLD = "\033[1m"
 
-BACKTRACE_DAYS = 100
+BACKTRACE_DAYS = 15
 API_ERROR_LOGGED = False
 
 # ==============================================================================
