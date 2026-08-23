@@ -106,7 +106,7 @@ MICRO_MINIMUM_SCORE            = 2      # Out of 9
 MICRO_EXIT_PRICE_BRICKS = 50  
 MICRO_EXIT_VOL_BRICKS   = 50  
 MACRO_EXIT_PRICE_BRICKS = 2
-MACRO_EXIT_VOL_BRICKS   = 2  
+MACRO_EXIT_VOL_BRICKS   = 5  
 
 # 🛑 Renko-Velocity Stagnation Guard
 RENKO_VELOCITY_MAX_BARS = 12  # Max bars allowed without a new brick before forced exit
