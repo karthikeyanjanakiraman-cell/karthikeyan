@@ -71,7 +71,7 @@ GLOBAL_MACRO_STRATEGY_2D = "BOTH"  # "BULLISH", "BEARISH", or "BOTH"
 # ==============================================================================
 MACRO_MANDATORY_PRICE_RENKO    = True
 MACRO_MANDATORY_VOL_RENKO      = True
-MACRO_MANDATORY_RENKO_VELOCITY = False   
+MACRO_MANDATORY_RENKO_VELOCITY = True   
 MACRO_MANDATORY_RSI_BB         = False
 MACRO_MANDATORY_ADX_DMI        = False
 MACRO_MANDATORY_EMA_SPREAD     = False
@@ -89,7 +89,7 @@ SYNC_MICRO_WITH_MACRO          = False  # If True, Micro overrides to match Macr
 
 MICRO_MANDATORY_PRICE_RENKO    = True
 MICRO_MANDATORY_VOL_RENKO      = True
-MICRO_MANDATORY_RENKO_VELOCITY = False   
+MICRO_MANDATORY_RENKO_VELOCITY = True   
 MICRO_MANDATORY_RSI_BB         = False
 MICRO_MANDATORY_ADX_DMI        = False
 MICRO_MANDATORY_EMA_SPREAD     = True
@@ -105,8 +105,8 @@ MICRO_MINIMUM_SCORE            = 5      # Out of 9
 # ==============================================================================
 MICRO_EXIT_PRICE_BRICKS = 5  
 MICRO_EXIT_VOL_BRICKS   = 5  
-MACRO_EXIT_PRICE_BRICKS = 1
-MACRO_EXIT_VOL_BRICKS   = 1  
+MACRO_EXIT_PRICE_BRICKS = 2
+MACRO_EXIT_VOL_BRICKS   = 2  
 
 # 🛑 Renko-Velocity Stagnation Guard
 RENKO_VELOCITY_MAX_BARS = 12  # Max bars allowed without a new brick before forced exit
