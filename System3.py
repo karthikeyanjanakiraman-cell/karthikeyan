@@ -53,7 +53,7 @@ COLOR_RESET = "\033[0m"
 COLOR_BOLD = "\033[1m"
 
 # 🌟 FIXED: Bumped from 10 to 60. Provides enough warmup candles for SMAs on high timeframes.
-BACKTRACE_DAYS = 60
+BACKTRACE_DAYS = 90
 
 EXCLUDED_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "NIFTY50", "NIFTYBANK"}
 
@@ -113,8 +113,8 @@ def validate_fyers_token():
 # ==============================================================================
 # GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS
 # ==============================================================================
-MICRO_TIMEFRAME = "1min"
-MACRO_TIMEFRAMES = ["20min"]
+MICRO_TIMEFRAME = "240min"
+MACRO_TIMEFRAMES = ["2400min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -165,11 +165,11 @@ MICRO_MINIMUM_SCORE            = 1      # Out of 9
 # TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
 # ==============================================================================
 MICRO_EXIT_PRICE_BRICKS = 5
-MICRO_EXIT_VOL_BRICKS   = 5
+MICRO_EXIT_VOL_BRICKS   = 50
 MACRO_EXIT_PRICE_BRICKS = 1
-MACRO_EXIT_VOL_BRICKS   = 1
+MACRO_EXIT_VOL_BRICKS   = 10
 
-RENKO_VELOCITY_MAX_BARS = 12
+RENKO_VELOCITY_MAX_BARS = 6
 ENTRY_CUTOFF_TIME = "15:00"
 
 # ==============================================================================
