@@ -49,7 +49,7 @@ API_ERROR_LOGGED = False
 # ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
 MICRO_TIMEFRAME = "5min"  # Micro Execution & Tactical Trigger
-MACRO_TIMEFRAMES = ["150min"]  # Macro Structural Tiers
+MACRO_TIMEFRAMES = ["240min"]  # Macro Structural Tiers
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -103,8 +103,8 @@ MICRO_MINIMUM_SCORE            = 2      # Out of 9
 # ==============================================================================
 # 🎛️ TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
 # ==============================================================================
-MICRO_EXIT_PRICE_BRICKS = 5  
-MICRO_EXIT_VOL_BRICKS   = 5  
+MICRO_EXIT_PRICE_BRICKS = 50  
+MICRO_EXIT_VOL_BRICKS   = 50  
 MACRO_EXIT_PRICE_BRICKS = 2
 MACRO_EXIT_VOL_BRICKS   = 2  
 
