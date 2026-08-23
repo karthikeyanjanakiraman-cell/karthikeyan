@@ -42,14 +42,14 @@ COLOR_DIM = "\033[2m"
 COLOR_RESET = "\033[0m"
 COLOR_BOLD = "\033[1m"
 
-BACKTRACE_DAYS = 20
+DEFAULT_ANCHOR_START_DATE = "2026-01-01"  # Fixed baseline date for Renko grid & EMA warm-up
 API_ERROR_LOGGED = False
 
 # ==============================================================================
 # ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
-MICRO_TIMEFRAME = "240min"  # Micro Execution & Tactical Trigger
-MACRO_TIMEFRAMES = ["241min"]  # Macro Structural Tiers
+MICRO_TIMEFRAME = "1min"  # Micro Execution & Tactical Trigger
+MACRO_TIMEFRAMES = ["20min"]  # Macro Structural Tiers
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -59,8 +59,8 @@ ADX_PERIOD = 14
 ADX_THRESHOLD = 20
 STOCH_PERIOD = 14
 
-MICRO_RENKO_CONFIRM_BRICKS = 1  # Micro Tactical Trigger (2-Brick Rule)
-MACRO_RENKO_CONFIRM_BRICKS = 0  # Macro Structural Trend Confirmation
+MICRO_RENKO_CONFIRM_BRICKS = 1  # Micro Tactical Trigger
+MACRO_RENKO_CONFIRM_BRICKS = 1  # Macro Structural Trend Confirmation
 RENKO_MIN_BRICK = 0.05
 RENKO_DEFAULT_PCT = 0.005
 
@@ -69,9 +69,9 @@ GLOBAL_MACRO_STRATEGY_2D = "BOTH"  # "BULLISH", "BEARISH", or "BOTH"
 # ==============================================================================
 # 🎛️ TIER 1: MACRO CONTEXT SWITCHBOARD (THE GENERAL) - 9 PILLARS
 # ==============================================================================
-MACRO_MANDATORY_PRICE_RENKO    = False
-MACRO_MANDATORY_VOL_RENKO      = False
-MACRO_MANDATORY_RENKO_VELOCITY = False   
+MACRO_MANDATORY_PRICE_RENKO    = True
+MACRO_MANDATORY_VOL_RENKO      = True
+MACRO_MANDATORY_RENKO_VELOCITY = True   
 MACRO_MANDATORY_RSI_BB         = False
 MACRO_MANDATORY_ADX_DMI        = False
 MACRO_MANDATORY_EMA_SPREAD     = False
@@ -80,36 +80,36 @@ MACRO_MANDATORY_STOCHASTIC     = False
 # 🌟 NEW VETO PILLARS
 MACRO_MANDATORY_ATR_BB         = True   # 8th Pillar: Vetoes if ATR is NOT expanding (> Upper BB)
 MACRO_MANDATORY_RENKO_BB       = True   # 9th Pillar: Vetoes if Renko Count IS exhausted (> Upper BB)
-MACRO_MINIMUM_SCORE            = 2      # Out of 9
+MACRO_MINIMUM_SCORE            = 3      # Out of 9
 
 # ==============================================================================
 # 🎛️ TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
 # ==============================================================================
 SYNC_MICRO_WITH_MACRO          = False  # If True, Micro overrides to match Macro
 
-MICRO_MANDATORY_PRICE_RENKO    = False
-MICRO_MANDATORY_VOL_RENKO      = False
-MICRO_MANDATORY_RENKO_VELOCITY = False   
+MICRO_MANDATORY_PRICE_RENKO    = True
+MICRO_MANDATORY_VOL_RENKO      = True
+MICRO_MANDATORY_RENKO_VELOCITY = True   
 MICRO_MANDATORY_RSI_BB         = False
 MICRO_MANDATORY_ADX_DMI        = False
-MICRO_MANDATORY_EMA_SPREAD     = False
+MICRO_MANDATORY_EMA_SPREAD     = True
 MICRO_MANDATORY_STOCHASTIC     = False
 
 # 🌟 NEW VETO PILLARS
-MICRO_MANDATORY_ATR_BB         = True  # (Set True if you only want to snipe on micro volatility expansions)
-MICRO_MANDATORY_RENKO_BB       = True   # 9th Pillar: Exhaustion Veto Guard
-MICRO_MINIMUM_SCORE            = 2      # Out of 9
+MICRO_MANDATORY_ATR_BB         = False  # Set True to only enter on micro volatility expansions
+MICRO_MANDATORY_RENKO_BB       = True   # 9th Pillar: Non-Exhaustion Guard
+MICRO_MINIMUM_SCORE            = 4      # Out of 9
 
 # ==============================================================================
 # 🎛️ TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
 # ==============================================================================
-MICRO_EXIT_PRICE_BRICKS = 50  
-MICRO_EXIT_VOL_BRICKS   = 50  
-MACRO_EXIT_PRICE_BRICKS = 2
-MACRO_EXIT_VOL_BRICKS   = 5  
+MICRO_EXIT_PRICE_BRICKS = 5  
+MICRO_EXIT_VOL_BRICKS   = 5  
+MACRO_EXIT_PRICE_BRICKS = 1
+MACRO_EXIT_VOL_BRICKS   = 1  
 
 # 🛑 Renko-Velocity Stagnation Guard
-RENKO_VELOCITY_MAX_BARS = 120  # Max bars allowed without a new brick before forced exit
+RENKO_VELOCITY_MAX_BARS = 12  # Max bars allowed without a new brick before forced exit
 
 # 🛑 Strict Session Cutoff
 ENTRY_CUTOFF_TIME = "15:00"
@@ -137,19 +137,6 @@ def get_dynamic_fno_universe():
     except Exception as e:
         print(f"{COLOR_RED}[API Error] Failed to fetch F&O universe: {e}{COLOR_RESET}")
         return []
-
-def get_past_trading_days(target_date_str, num_days=20):
-    try:
-        target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
-        trading_days = []
-        current_dt = target_dt
-        while len(trading_days) < num_days:
-            if current_dt.weekday() < 5:
-                trading_days.append(current_dt.strftime("%Y-%m-%d"))
-            current_dt -= timedelta(days=1)
-        trading_days.reverse()
-        return trading_days
-    except Exception: return []
 
 
 # ==============================================================================
@@ -302,10 +289,9 @@ def construct_renko_velocity_engine(df, tf_name):
 
 
 # ==============================================================================
-# 3. DUAL-TIER SCORECARD SYSTEM (NOW 9 PILLARS W/ VOLATILITY & EXHAUSTION)
+# 3. DUAL-TIER SCORECARD SYSTEM (9 PILLARS W/ VOLATILITY & EXHAUSTION)
 # ==============================================================================
 def apply_dual_tier_scorecard(df, tf_str, tier_type):
-    # 1. Fetch Global Settings dynamically
     if SYNC_MICRO_WITH_MACRO and tier_type == "MICRO":
         req_price = MACRO_MANDATORY_PRICE_RENKO
         req_vol = MACRO_MANDATORY_VOL_RENKO
@@ -314,8 +300,8 @@ def apply_dual_tier_scorecard(df, tf_str, tier_type):
         req_adx = MACRO_MANDATORY_ADX_DMI
         req_ema = MACRO_MANDATORY_EMA_SPREAD
         req_stoch = MACRO_MANDATORY_STOCHASTIC
-        req_atr_bb = MACRO_MANDATORY_ATR_BB          # 🌟 NEW VETO TOGGLE
-        req_renko_bb = MACRO_MANDATORY_RENKO_BB      # 🌟 NEW VETO TOGGLE
+        req_atr_bb = MACRO_MANDATORY_ATR_BB          # 🌟 Pillar 8 Toggle
+        req_renko_bb = MACRO_MANDATORY_RENKO_BB      # 🌟 Pillar 9 Toggle
         min_score = MACRO_MINIMUM_SCORE
     else:
         req_price = globals()[f"{tier_type}_MANDATORY_PRICE_RENKO"]
@@ -325,11 +311,11 @@ def apply_dual_tier_scorecard(df, tf_str, tier_type):
         req_adx = globals()[f"{tier_type}_MANDATORY_ADX_DMI"]
         req_ema = globals()[f"{tier_type}_MANDATORY_EMA_SPREAD"]
         req_stoch = globals()[f"{tier_type}_MANDATORY_STOCHASTIC"]
-        req_atr_bb = globals()[f"{tier_type}_MANDATORY_ATR_BB"]       # 🌟 NEW VETO TOGGLE
-        req_renko_bb = globals()[f"{tier_type}_MANDATORY_RENKO_BB"]   # 🌟 NEW VETO TOGGLE
+        req_atr_bb = globals()[f"{tier_type}_MANDATORY_ATR_BB"]       # 🌟 Pillar 8 Toggle
+        req_renko_bb = globals()[f"{tier_type}_MANDATORY_RENKO_BB"]   # 🌟 Pillar 9 Toggle
         min_score = globals()[f"{tier_type}_MINIMUM_SCORE"]
 
-    # 2. Base 7 Pillars logic
+    # Base Pillars
     c_price_bull, c_price_bear = df[f"Renko_Bull_{tf_str}"].astype(int), df[f"Renko_Bear_{tf_str}"].astype(int)
     c_vol_bull, c_vol_bear = df[f"Vol_Renko_Bull_{tf_str}"].astype(int), df[f"Vol_Renko_Bear_{tf_str}"].astype(int)
     c_vel_bull, c_vel_bear = df[f"Velocity_Bull_{tf_str}"].astype(int), df[f"Velocity_Bear_{tf_str}"].astype(int)
@@ -338,19 +324,16 @@ def apply_dual_tier_scorecard(df, tf_str, tier_type):
     c_ema_bull, c_ema_bear = df["EMA_Bull_Expanded"].astype(int), df["EMA_Bear_Expanded"].astype(int)
     c_stoch_bull, c_stoch_bear = df["Stoch_Bull_Pass"].astype(int), df["Stoch_Bear_Pass"].astype(int)
 
-    # 3. 🌟 PILLAR 8: ATR on BB (Structural Volatility Breakout)
+    # 🌟 PILLAR 8: ATR on BB (Volatility Expansion Breakout)
     df['ATR_SMA20'] = df.groupby("Symbol")["ATR"].transform(lambda x: x.rolling(window=BB_SMA_PERIOD, min_periods=1).mean())
     df['ATR_STD20'] = df.groupby("Symbol")["ATR"].transform(lambda x: x.rolling(window=BB_SMA_PERIOD, min_periods=1).std(ddof=0))
     df['BB_ATR_Upper'] = df['ATR_SMA20'] + (BB_STD_DEV * df['ATR_STD20'])
-    
-    # Must expand above Upper BB to pass (Volatility Breakout)
     c_atr_bb_bull = (df['ATR'] > df['BB_ATR_Upper']).astype(int)
     c_atr_bb_bear = (df['ATR'] > df['BB_ATR_Upper']).astype(int)
 
-    # 4. 🌟 PILLAR 9: Renko Count on BB (Non-Exhaustion Guard / Capitulation Filter)
+    # 🌟 PILLAR 9: Renko Count on BB (Non-Exhaustion Guard / Capitulation Filter)
     df[f'Renko_Count_SMA20_{tf_str}'] = df.groupby("Symbol")[f"Renko_Count_{tf_str}"].transform(lambda x: x.rolling(window=BB_SMA_PERIOD, min_periods=1).mean())
     df[f'Renko_Count_STD20_{tf_str}'] = df.groupby("Symbol")[f"Renko_Count_{tf_str}"].transform(lambda x: x.rolling(window=BB_SMA_PERIOD, min_periods=1).std(ddof=0))
-    
     df[f'BB_Renko_Upper_{tf_str}'] = df[f'Renko_Count_SMA20_{tf_str}'] + (BB_STD_DEV * df[f'Renko_Count_STD20_{tf_str}'])
     df[f'BB_Renko_Lower_{tf_str}'] = df[f'Renko_Count_SMA20_{tf_str}'] - (BB_STD_DEV * df[f'Renko_Count_STD20_{tf_str}'])
     
@@ -358,15 +341,14 @@ def apply_dual_tier_scorecard(df, tf_str, tier_type):
     c_renko_bb_bull = (df[f"Renko_Count_{tf_str}"] <= df[f'BB_Renko_Upper_{tf_str}']).astype(int)
     c_renko_bb_bear = (df[f"Renko_Count_{tf_str}"] >= df[f'BB_Renko_Lower_{tf_str}']).astype(int)
 
-    # 5. Calculate Score out of 9
+    # Calculate Score out of 9
     df[f"Score_Bull_{tf_str}"] = (c_price_bull + c_vol_bull + c_vel_bull + c_rsi_bull + 
                                   c_adx_bull + c_ema_bull + c_stoch_bull + c_atr_bb_bull + c_renko_bb_bull)
     df[f"Score_Bear_{tf_str}"] = (c_price_bear + c_vol_bear + c_vel_bear + c_rsi_bear + 
                                   c_adx_bear + c_ema_bear + c_stoch_bear + c_atr_bb_bear + c_renko_bb_bear)
 
-    # 6. Global Veto Engine (Now tracking 9 distinct kill-switches)
+    # Global Veto Engine (9 Distinct Switches)
     bull_veto, bear_veto = pd.Series(False, index=df.index), pd.Series(False, index=df.index)
-    
     if req_price:    bull_veto, bear_veto = bull_veto | (c_price_bull == 0), bear_veto | (c_price_bear == 0)
     if req_vol:      bull_veto, bear_veto = bull_veto | (c_vol_bull == 0), bear_veto | (c_vol_bear == 0)
     if req_vel:      bull_veto, bear_veto = bull_veto | (c_vel_bull == 0), bear_veto | (c_vel_bear == 0)
@@ -374,12 +356,10 @@ def apply_dual_tier_scorecard(df, tf_str, tier_type):
     if req_adx:      bull_veto, bear_veto = bull_veto | (c_adx_bull == 0), bear_veto | (c_adx_bear == 0)
     if req_ema:      bull_veto, bear_veto = bull_veto | (c_ema_bull == 0), bear_veto | (c_ema_bear == 0)
     if req_stoch:    bull_veto, bear_veto = bull_veto | (c_stoch_bull == 0), bear_veto | (c_stoch_bear == 0)
-    
-    # 🌟 NEW VETO TRIGGERS
     if req_atr_bb:   bull_veto, bear_veto = bull_veto | (c_atr_bb_bull == 0), bear_veto | (c_atr_bb_bear == 0)
     if req_renko_bb: bull_veto, bear_veto = bull_veto | (c_renko_bb_bull == 0), bear_veto | (c_renko_bb_bear == 0)
 
-    # 7. Final Armed Status
+    # Final Armed Status
     df[f"Armed_Bull_{tf_str}"] = (df[f"Score_Bull_{tf_str}"] >= min_score) & (~bull_veto)
     df[f"Armed_Bear_{tf_str}"] = (df[f"Score_Bear_{tf_str}"] >= min_score) & (~bear_veto)
     
@@ -471,22 +451,20 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
 # ==============================================================================
 # 5. TRADE MANAGEMENT: QUALIFYING MACRO EXIT & VELOCITY STALL TRACKING
 # ==============================================================================
-def scan_institutional_tape(target_date_str):
+def scan_institutional_tape(target_date_str, anchor_date_str=DEFAULT_ANCHOR_START_DATE):
     global API_ERROR_LOGGED
 
     print(f"\n📡 Initiating Dual-Tier Execution & Exit Engine for {target_date_str}...")
     universe = get_dynamic_fno_universe()
     if not universe: return
 
-    trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
-    if not trading_days: return
-
     target_dt = pd.to_datetime(target_date_str)
     current_now = datetime.utcnow() + timedelta(hours=5, minutes=30)
     is_live_today = target_date_str == current_now.strftime("%Y-%m-%d")
 
-    print(f"🚀 Multithreading Bulk Ingestion for {len(universe)} symbols (20 days lookback)...")
-    fetch_tasks = [(item, trading_days[0], target_date_str, is_live_today) for item in universe]
+    # 🌟 Fixed Anchor Date Fetch
+    print(f"🚀 Multithreading Bulk Ingestion for {len(universe)} symbols (Anchored to {anchor_date_str})...")
+    fetch_tasks = [(item, anchor_date_str, target_date_str, is_live_today) for item in universe]
     historical_dfs = []
 
     def fetch_worker(task):
@@ -536,6 +514,14 @@ def scan_institutional_tape(target_date_str):
             res = future.result()
             if res is not None: historical_dfs.append(res)
     print()
+
+    # 🛑 CRITICAL SAFETY GUARD: Prevent ValueError if API returns empty
+    if not historical_dfs:
+        print(f"\n{COLOR_RED}❌ CRITICAL ERROR: No historical data returned from Upstox API.{COLOR_RESET}")
+        print(f"{COLOR_YELLOW}Troubleshooting:{COLOR_RESET}")
+        print("  1. Verify UPSTOX_ACCESS_TOKEN is valid and active.")
+        print(f"  2. Verify anchor date range: {anchor_date_str} to {target_date_str}")
+        return
 
     rolling_master_df = pd.concat(historical_dfs, ignore_index=True)
     print("⚙️ Computing 9-Pillar Scorecards & Velocity Matrices...")
@@ -695,15 +681,18 @@ def scan_institutional_tape(target_date_str):
     if not active_runners and not closed_trades:
         print(f"{COLOR_DIM}[Terminal Silent] No trades triggered today.{COLOR_RESET}\n")
 
+
 # ==============================================================================
 # 7. RUN EXECUTOR
 # ==============================================================================
 def run_production_sweep():
     parser = argparse.ArgumentParser()
-    parser.add_argument("-d", "--date", type=str, default="")
+    parser.add_argument("-d", "--date", type=str, default="", help="Target execution date (YYYY-MM-DD), default is today")
+    parser.add_argument("-a", "--anchor", type=str, default="", help="Static anchor start date (YYYY-MM-DD)")
     args, _ = parser.parse_known_args()
+    
+    # 1. Target Date Resolution (defaults to current active trading day)
     raw_date_str = args.date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
-
     if not raw_date_str:
         target_dt = datetime.utcnow() + timedelta(hours=5, minutes=30)
         if target_dt.weekday() == 5: target_dt -= timedelta(days=1)
@@ -712,11 +701,19 @@ def run_production_sweep():
     else:
         target_date_str = datetime.strptime(raw_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
 
+    # 2. Anchor Date Resolution (defaults to DEFAULT_ANCHOR_START_DATE)
+    raw_anchor_str = args.anchor or os.environ.get("PARAM_ANCHOR_DATE", "").strip()
+    if not raw_anchor_str:
+        anchor_date_str = DEFAULT_ANCHOR_START_DATE
+    else:
+        anchor_date_str = datetime.strptime(raw_anchor_str, "%Y-%m-%d").strftime("%Y-%m-%d")
+
     if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
         print(f"❌ {COLOR_RED}Error: UPSTOX_ACCESS_TOKEN environment variable not found.{COLOR_RESET}")
         return
 
-    scan_institutional_tape(target_date_str)
+    scan_institutional_tape(target_date_str, anchor_date_str)
+
 
 if __name__ == "__main__":
     run_production_sweep()
