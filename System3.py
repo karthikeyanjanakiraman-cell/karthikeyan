@@ -42,7 +42,7 @@ COLOR_DIM = "\033[2m"
 COLOR_RESET = "\033[0m"
 COLOR_BOLD = "\033[1m"
 
-DEFAULT_ANCHOR_START_DATE = "2026-08-17"  # Fixed baseline date for Renko grid & EMA warm-up
+DEFAULT_ANCHOR_START_DATE = "2026-08-01"  # Fixed baseline date for Renko grid & EMA warm-up
 API_ERROR_LOGGED = False
 
 # ==============================================================================
