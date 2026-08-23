@@ -42,14 +42,14 @@ COLOR_DIM = "\033[2m"
 COLOR_RESET = "\033[0m"
 COLOR_BOLD = "\033[1m"
 
-DEFAULT_ANCHOR_START_DATE = "2026-01-01"  # Fixed baseline date for Renko grid & EMA warm-up
+DEFAULT_ANCHOR_START_DATE = "2026-08-24"  # Fixed baseline date for Renko grid & EMA warm-up
 API_ERROR_LOGGED = False
 
 # ==============================================================================
 # ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
-MICRO_TIMEFRAME = "1min"  # Micro Execution & Tactical Trigger
-MACRO_TIMEFRAMES = ["20min"]  # Macro Structural Tiers
+MICRO_TIMEFRAME = "240min"  # Micro Execution & Tactical Trigger
+MACRO_TIMEFRAMES = ["241min"]  # Macro Structural Tiers
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -60,7 +60,7 @@ ADX_THRESHOLD = 20
 STOCH_PERIOD = 14
 
 MICRO_RENKO_CONFIRM_BRICKS = 1  # Micro Tactical Trigger
-MACRO_RENKO_CONFIRM_BRICKS = 1  # Macro Structural Trend Confirmation
+MACRO_RENKO_CONFIRM_BRICKS = 0  # Macro Structural Trend Confirmation
 RENKO_MIN_BRICK = 0.05
 RENKO_DEFAULT_PCT = 0.005
 
@@ -69,9 +69,9 @@ GLOBAL_MACRO_STRATEGY_2D = "BOTH"  # "BULLISH", "BEARISH", or "BOTH"
 # ==============================================================================
 # 🎛️ TIER 1: MACRO CONTEXT SWITCHBOARD (THE GENERAL) - 9 PILLARS
 # ==============================================================================
-MACRO_MANDATORY_PRICE_RENKO    = True
-MACRO_MANDATORY_VOL_RENKO      = True
-MACRO_MANDATORY_RENKO_VELOCITY = True   
+MACRO_MANDATORY_PRICE_RENKO    = False
+MACRO_MANDATORY_VOL_RENKO      = False
+MACRO_MANDATORY_RENKO_VELOCITY = False   
 MACRO_MANDATORY_RSI_BB         = False
 MACRO_MANDATORY_ADX_DMI        = False
 MACRO_MANDATORY_EMA_SPREAD     = False
@@ -80,33 +80,33 @@ MACRO_MANDATORY_STOCHASTIC     = False
 # 🌟 NEW VETO PILLARS
 MACRO_MANDATORY_ATR_BB         = True   # 8th Pillar: Vetoes if ATR is NOT expanding (> Upper BB)
 MACRO_MANDATORY_RENKO_BB       = True   # 9th Pillar: Vetoes if Renko Count IS exhausted (> Upper BB)
-MACRO_MINIMUM_SCORE            = 3      # Out of 9
+MACRO_MINIMUM_SCORE            = 2      # Out of 9
 
 # ==============================================================================
 # 🎛️ TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
 # ==============================================================================
 SYNC_MICRO_WITH_MACRO          = False  # If True, Micro overrides to match Macro
 
-MICRO_MANDATORY_PRICE_RENKO    = True
-MICRO_MANDATORY_VOL_RENKO      = True
-MICRO_MANDATORY_RENKO_VELOCITY = True   
+MICRO_MANDATORY_PRICE_RENKO    = False
+MICRO_MANDATORY_VOL_RENKO      = False
+MICRO_MANDATORY_RENKO_VELOCITY = False   
 MICRO_MANDATORY_RSI_BB         = False
 MICRO_MANDATORY_ADX_DMI        = False
-MICRO_MANDATORY_EMA_SPREAD     = True
+MICRO_MANDATORY_EMA_SPREAD     = False
 MICRO_MANDATORY_STOCHASTIC     = False
 
 # 🌟 NEW VETO PILLARS
 MICRO_MANDATORY_ATR_BB         = False  # Set True to only enter on micro volatility expansions
 MICRO_MANDATORY_RENKO_BB       = True   # 9th Pillar: Non-Exhaustion Guard
-MICRO_MINIMUM_SCORE            = 4      # Out of 9
+MICRO_MINIMUM_SCORE            = 1      # Out of 9
 
 # ==============================================================================
 # 🎛️ TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
 # ==============================================================================
 MICRO_EXIT_PRICE_BRICKS = 5  
-MICRO_EXIT_VOL_BRICKS   = 5  
+MICRO_EXIT_VOL_BRICKS   = 50  
 MACRO_EXIT_PRICE_BRICKS = 1
-MACRO_EXIT_VOL_BRICKS   = 1  
+MACRO_EXIT_VOL_BRICKS   = 10  
 
 # 🛑 Renko-Velocity Stagnation Guard
 RENKO_VELOCITY_MAX_BARS = 12  # Max bars allowed without a new brick before forced exit
