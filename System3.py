@@ -48,8 +48,8 @@ API_ERROR_LOGGED = False
 # ==============================================================================
 # ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
-MICRO_TIMEFRAME = "240min"  # Micro Execution & Tactical Trigger
-MACRO_TIMEFRAMES = ["241min"]  # Macro Structural Tiers
+MICRO_TIMEFRAME = "5min"  # Micro Execution & Tactical Trigger
+MACRO_TIMEFRAMES = ["20min"]  # Macro Structural Tiers
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -60,7 +60,7 @@ ADX_THRESHOLD = 20
 STOCH_PERIOD = 14
 
 MICRO_RENKO_CONFIRM_BRICKS = 1  # Micro Tactical Trigger
-MACRO_RENKO_CONFIRM_BRICKS = 0  # Macro Structural Trend Confirmation
+MACRO_RENKO_CONFIRM_BRICKS = 1  # Macro Structural Trend Confirmation
 RENKO_MIN_BRICK = 0.05
 RENKO_DEFAULT_PCT = 0.005
 
@@ -103,9 +103,9 @@ MICRO_MINIMUM_SCORE            = 1      # Out of 9
 # ==============================================================================
 # 🎛️ TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
 # ==============================================================================
-MICRO_EXIT_PRICE_BRICKS = 5  
+MICRO_EXIT_PRICE_BRICKS = 50  
 MICRO_EXIT_VOL_BRICKS   = 50  
-MACRO_EXIT_PRICE_BRICKS = 1
+MACRO_EXIT_PRICE_BRICKS = 10
 MACRO_EXIT_VOL_BRICKS   = 10  
 
 # 🛑 Renko-Velocity Stagnation Guard
