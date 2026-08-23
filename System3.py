@@ -53,7 +53,7 @@ COLOR_RESET = "\033[0m"
 COLOR_BOLD = "\033[1m"
 
 # 🌟 FIXED: Bumped from 10 to 60. Provides enough warmup candles for SMAs on high timeframes.
-BACKTRACE_DAYS = 90
+BACKTRACE_DAYS = 60
 
 EXCLUDED_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "NIFTY50", "NIFTYBANK"}
 
