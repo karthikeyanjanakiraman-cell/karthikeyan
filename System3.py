@@ -49,7 +49,7 @@ API_ERROR_LOGGED = False
 # ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
 # ==============================================================================
 MICRO_TIMEFRAME = "1min"  # Micro Execution & Tactical Trigger
-MACRO_TIMEFRAMES = ["20min"]  # Macro Structural Tiers
+MACRO_TIMEFRAMES = ["5min"]  # Macro Structural Tiers
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -71,7 +71,7 @@ GLOBAL_MACRO_STRATEGY_2D = "BOTH"  # "BULLISH", "BEARISH", or "BOTH"
 # ==============================================================================
 MACRO_MANDATORY_PRICE_RENKO    = True
 MACRO_MANDATORY_VOL_RENKO      = True
-MACRO_MANDATORY_RENKO_VELOCITY = True   
+MACRO_MANDATORY_RENKO_VELOCITY = False   
 MACRO_MANDATORY_RSI_BB         = False
 MACRO_MANDATORY_ADX_DMI        = False
 MACRO_MANDATORY_EMA_SPREAD     = False
@@ -89,16 +89,16 @@ SYNC_MICRO_WITH_MACRO          = False  # If True, Micro overrides to match Macr
 
 MICRO_MANDATORY_PRICE_RENKO    = True
 MICRO_MANDATORY_VOL_RENKO      = True
-MICRO_MANDATORY_RENKO_VELOCITY = True   
+MICRO_MANDATORY_RENKO_VELOCITY = False   
 MICRO_MANDATORY_RSI_BB         = False
 MICRO_MANDATORY_ADX_DMI        = False
 MICRO_MANDATORY_EMA_SPREAD     = True
-MICRO_MANDATORY_STOCHASTIC     = False
+MICRO_MANDATORY_STOCHASTIC     = True
 
 # 🌟 NEW VETO PILLARS
 MICRO_MANDATORY_ATR_BB         = False  # (Set True if you only want to snipe on micro volatility expansions)
 MICRO_MANDATORY_RENKO_BB       = True   # 9th Pillar: Exhaustion Veto Guard
-MICRO_MINIMUM_SCORE            = 4      # Out of 9
+MICRO_MINIMUM_SCORE            = 5      # Out of 9
 
 # ==============================================================================
 # 🎛️ TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
