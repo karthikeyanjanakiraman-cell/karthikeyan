@@ -3,14 +3,12 @@
 Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
 - Configurable Micro Execution Timeframe (e.g., "1min", "3min", "5min")
 - Configurable Macro Hierarchy Array (e.g., ["15min", "60min", "1D"])
-- Phase 1 Blueprint: Dual-Tier Scorecard (7 Pillars) & Global Mandatory Veto Switches
+- Phase 1 Blueprint: Dual-Tier Scorecard (9 Pillars) & Global Mandatory Veto Switches
 - Phase 1 Blueprint: Order Flow / Cumulative Volume Delta 45-Degree Renko
 - Phase 1 Blueprint: Renko-Velocity Engine (Time-Distance Momentum Tracking)
 - EXIT STRATEGY: Dual-Layered (Triggering Macro + Micro) + Velocity Stall Cutoff
 - TRUE BIRTH TIME TRACKING: Locks in the original structural ignition timestamp and qualifying macro TFs
-- OPTIONS TRANSLATION LAYER: Stock-chart signals are translated into ATM CE/PE
-  contracts (CE on bullish, PE on bearish) so Basket 1/2 report real option premium
-  P&L, not stock P&L, while the signal engine itself still runs on the stock chart.
+- PIPELINE ROUTING TOGGLE: Option to filter via Stage 1 stock charts OR scan all F&O options directly.
 """
 
 import argparse
@@ -34,11 +32,7 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-# 🔖 BUILD MARKER — if this line does NOT appear at the very top of your CI
-# log, the workflow is not running this file. Check this FIRST before
-# re-reporting any traceback.
-print("🔖 SYSTEM3 BUILD: fyers-options-translation-v4-SMA-FIX (2026-08-23) — "
-      "if you don't see this line, your CI is running a different/stale file.")
+print("🔖 SYSTEM3 BUILD: fyers-options-translation-v5-ROUTING (2026-08-23)")
 
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
@@ -52,14 +46,9 @@ COLOR_DIM = "\033[2m"
 COLOR_RESET = "\033[0m"
 COLOR_BOLD = "\033[1m"
 
-# 🌟 FIXED: Bumped from 10 to 60. Provides enough warmup candles for SMAs on high timeframes.
 BACKTRACE_DAYS = 60
-
 EXCLUDED_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "NIFTY50", "NIFTYBANK"}
 
-# 🌟 DIAGNOSTICS: surfaces the FIRST few real Fyers API errors (status code,
-# error code/message) instead of silently swallowing them, which previously
-# made "zero data" failures (expired token, bad symbol, etc.) invisible.
 _FYERS_ERROR_LOG_CAP = 5
 _fyers_error_log_count = 0
 
@@ -79,10 +68,6 @@ def get_fyers_auth_headers():
 
 
 def validate_fyers_token():
-    """Real token validation via Fyers' /profile endpoint (not just an env-var
-    presence check). Fyers access tokens expire daily — a stale token makes
-    every fetch fail silently, so this fails fast with a clear reason instead
-    of crashing downstream on an empty dataframe."""
     if not os.environ.get("FYERS_CLIENT_ID") or not os.environ.get("FYERS_ACCESS_TOKEN"):
         print(f"❌ {COLOR_RED}Error: FYERS_CLIENT_ID or FYERS_ACCESS_TOKEN environment variables not found.{COLOR_RESET}")
         return False
@@ -99,22 +84,29 @@ def validate_fyers_token():
         if res.status_code != 200 or body.get("s") != "ok":
             print(f"{COLOR_RED}❌ Fyers token validation FAILED before starting the sweep.{COLOR_RESET}")
             print(f"{COLOR_RED}   HTTP {res.status_code} | Response: {str(body)[:300] or res.text[:300]}{COLOR_RESET}")
-            print(f"{COLOR_YELLOW}   -> Your FYERS_ACCESS_TOKEN is almost certainly expired/invalid. "
-                  f"Fyers access tokens expire daily and must be regenerated each trading day.{COLOR_RESET}")
+            print(f"{COLOR_YELLOW}   -> Your FYERS_ACCESS_TOKEN is expired/invalid. Please regenerate it for today.{COLOR_RESET}")
             return False
 
         fy_name = body.get("data", {}).get("name", "Unknown")
         print(f"{COLOR_GREEN}✅ Fyers token validated OK (Account: {fy_name}){COLOR_RESET}")
         return True
     except requests.exceptions.RequestException as e:
-        print(f"{COLOR_RED}❌ Could not reach Fyers to validate the token: {e}{COLOR_RESET}")
+        print(f"{COLOR_RED}❌ Could not reach Fyers to validate token: {e}{COLOR_RESET}")
         return False
+
+
+# ==============================================================================
+# 🎛️ TIER 0: PIPELINE ROUTING SWITCH (NEW)
+# ==============================================================================
+# True  -> Run Stage 1 (Stock-level 9-pillar scan) -> Pick options ONLY from qualified stocks
+# False -> Bypass Stage 1 -> Directly process ATM ± STRIKE_RANGE_OFFSET CE/PE for ALL F&O stocks
+ENABLE_STAGE1_STOCK_FILTER = True  
 
 # ==============================================================================
 # GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS
 # ==============================================================================
-MICRO_TIMEFRAME = "60min"
-MACRO_TIMEFRAMES = ["600min"]
+MICRO_TIMEFRAME = "1min"
+MACRO_TIMEFRAMES = ["20min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -143,7 +135,7 @@ MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
 MACRO_MANDATORY_ATR_BB         = True   # 8th Pillar: Vetoes if ATR is NOT expanding (> Upper BB)
 MACRO_MANDATORY_RENKO_BB       = True   # 9th Pillar: Vetoes if Renko Count IS exhausted (> Upper BB)
-MACRO_MINIMUM_SCORE            = 2      # Out of 9
+MACRO_MINIMUM_SCORE            = 3      # Out of 9
 
 # ==============================================================================
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
@@ -157,38 +149,35 @@ MICRO_MANDATORY_RSI_BB         = False
 MICRO_MANDATORY_ADX_DMI        = False
 MICRO_MANDATORY_EMA_SPREAD     = False
 MICRO_MANDATORY_STOCHASTIC     = False
-MICRO_MANDATORY_ATR_BB         = True  # Set True to only enter on micro volatility expansions
+MICRO_MANDATORY_ATR_BB         = False  
 MICRO_MANDATORY_RENKO_BB       = True   # 9th Pillar: Non-Exhaustion Guard
-MICRO_MINIMUM_SCORE            = 2      # Out of 9
+MICRO_MINIMUM_SCORE            = 3      # Out of 9
 
 # ==============================================================================
 # TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
 # ==============================================================================
-MICRO_EXIT_PRICE_BRICKS = 3
-MICRO_EXIT_VOL_BRICKS   = 10
+MICRO_EXIT_PRICE_BRICKS = 5
+MICRO_EXIT_VOL_BRICKS   = 5
 MACRO_EXIT_PRICE_BRICKS = 1
-MACRO_EXIT_VOL_BRICKS   = 10
+MACRO_EXIT_VOL_BRICKS   = 1
 
-RENKO_VELOCITY_MAX_BARS = 5
+RENKO_VELOCITY_MAX_BARS = 12
 ENTRY_CUTOFF_TIME = "15:00"
 
 # ==============================================================================
 # TIER 4: STAGE 2 (OPTION-LEVEL RE-SCORING) CONFIG
 # ==============================================================================
 OPTIONS_TARGET_EXPIRY = "CURRENT"   # "CURRENT" or "NEXT"
-STRIKE_RANGE_OFFSET = 2             # Strikes above/below ATM to include per qualified stock (both CE & PE)
-MIN_OPT_PREMIUM = 15.0              # Previous trading day's Close must be >= this (liquidity/price filter)
-MIN_OPT_VOLUME = 250000             # Previous trading day's Volume must be >= this (liquidity filter)
-OPTIONS_STRATEGY_2D = "BULLISH"     # Buy-only: only rising-premium (CE or PE) triggers are actionable
+STRIKE_RANGE_OFFSET = 2             # Strikes above/below ATM (Level up/down)
+MIN_OPT_PREMIUM = 15.0              # Previous trading day's Close must be >= this
+MIN_OPT_VOLUME = 250000             # Previous trading day's Volume must be >= this
+OPTIONS_STRATEGY_2D = "BULLISH"     # Buy-only: only rising-premium triggers actionable
 
 
 # ==============================================================================
 # 1. LIVE INGESTION (FYERS): F&O Universe + Options Chain in one CSV pass
 # ==============================================================================
 def get_fno_universe_and_options():
-    """Downloads Fyers' NSE_CM.csv (equities) and NSE_FO.csv (F&O) once, and
-    returns (spot_instruments, options_by_underlying) for the signal engine
-    and the ATM strike selector respectively."""
     print("📡 Fetching Master Instrument Matrix via FYERS...")
     spot_inst, opt_inst = [], []
     try:
@@ -294,13 +283,9 @@ def get_past_trading_days(target_date_str, num_days=20):
 
 
 # ==============================================================================
-# 1B. FYERS CANDLE FETCHER (shared by stock signal engine + option premiums)
+# 1B. FYERS CANDLE FETCHER
 # ==============================================================================
 def fetch_fyers_candles(key, start_dt, end_dt, resolution="1"):
-    """Fetch candles for a Fyers symbol over a date range at the given
-    resolution ("1" = 1-min, "D" = daily). Returns a DataFrame with a
-    'Datetime' column, or None. Retries on 429/5xx, surfaces real API
-    errors, and short-circuits on auth failures (code -16)."""
     headers = get_fyers_auth_headers()
     for attempt in range(3):
         try:
@@ -333,7 +318,7 @@ def fetch_fyers_candles(key, start_dt, end_dt, resolution="1"):
 
                 _log_fyers_error(f"API error for {key} (code={data.get('code')}, msg={data.get('message')})", res.status_code)
                 if data.get("code") == -16:
-                    return None  # auth error — retrying won't help
+                    return None
 
             elif res.status_code in (429, 500, 502, 503):
                 time.sleep(random.uniform(1.0, 3.0) * (attempt + 1))
@@ -351,8 +336,6 @@ def fetch_fyers_candles(key, start_dt, end_dt, resolution="1"):
 # 1C. STAGE 2 SUPPORT: STRIKE-RANGE BUILDER + LIQUIDITY PRE-FILTER
 # ==============================================================================
 def build_strike_range(symbol, spot_price, options_by_underlying, target_date_str, offset):
-    """For ONE qualified stock: return every CE & PE contract within
-    ±offset strikes of ATM, on the nearest tradable expiry (>= target date)."""
     opts = options_by_underlying.get(symbol, [])
     if not opts:
         return []
@@ -382,9 +365,6 @@ def build_strike_range(symbol, spot_price, options_by_underlying, target_date_st
 
 
 def filter_liquid_contracts(contracts, target_date_str):
-    """Daily-candle liquidity pre-filter: previous trading day's Close and
-    Volume must clear MIN_OPT_PREMIUM / MIN_OPT_VOLUME before we bother
-    pulling 1-min data for a contract."""
     if not contracts:
         return []
 
@@ -410,13 +390,32 @@ def filter_liquid_contracts(contracts, target_date_str):
     return [r for r in results if r is not None]
 
 
+def fetch_all_spot_reference_prices(spot_universe, target_date_str):
+    """Quickly fetches reference spot price for all F&O stocks when Stage 1 is bypassed."""
+    target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
+    lookback_start = (target_dt - timedelta(days=5)).strftime("%Y-%m-%d")
+    spot_ref = {}
+
+    def worker(item):
+        df = fetch_fyers_candles(item["key"], lookback_start, target_date_str, resolution="D")
+        if df is not None and not df.empty:
+            last_close = df.sort_values("Datetime").iloc[-1]["Close"]
+            return item["symbol"], float(last_close)
+        return item["symbol"], None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        results = list(executor.map(worker, spot_universe))
+
+    for sym, price in results:
+        if price is not None:
+            spot_ref[sym] = price
+    return spot_ref
+
+
 # ==============================================================================
-# 2. CORE TECHNICAL & 45-DEGREE RENKO ENGINES
+# 2. CORE TECHNICAL & 45-DEGREE RENKO ENGINES (SMA BASED)
 # ==============================================================================
 def calculate_core_technicals(df_tf):
-    # 🌟 FIXED: All `.ewm()` replaced with `.rolling()` SMA logic
-    # This mathematically prevents the rolling-window start-date from shifting intermediate values
-    
     df_tf["H-L"] = df_tf["High"] - df_tf["Low"]
     df_tf["H-PC"] = (df_tf["High"] - df_tf.groupby("Symbol")["Close"].shift(1)).abs()
     df_tf["L-PC"] = (df_tf["Low"] - df_tf.groupby("Symbol")["Close"].shift(1)).abs()
@@ -444,7 +443,6 @@ def calculate_core_technicals(df_tf):
     df_tf["DX"] = (100 * abs(df_tf["+DI"] - df_tf["-DI"]) / (df_tf["+DI"] + df_tf["-DI"] + 1e-8))
     df_tf["ADX"] = df_tf.groupby("Symbol")["DX"].transform(lambda x: x.rolling(window=ADX_PERIOD, min_periods=1).mean())
 
-    # Keeping column names as EMA_8/21 for downstream compat, but calculating as strict SMAs
     df_tf["EMA_8"] = df_tf.groupby("Symbol")["Close"].transform(lambda x: x.rolling(window=8, min_periods=1).mean())
     df_tf["EMA_21"] = df_tf.groupby("Symbol")["Close"].transform(lambda x: x.rolling(window=21, min_periods=1).mean())
     df_tf["EMA_Spread"] = abs(df_tf["EMA_8"] - df_tf["EMA_21"])
@@ -505,6 +503,7 @@ def construct_45deg_renko_matrix(df, tf_name, confirm_bricks):
     df[f"Renko_Bear_{tf_name}"] = renko_counts <= -confirm_bricks
     return df
 
+
 def construct_volume_delta_renko_matrix(df, tf_name, confirm_bricks):
     df['Wick_Spread'] = df['High'] - df['Low']
     df['Wick_Spread'] = df['Wick_Spread'].replace(0, 1e-9)
@@ -537,7 +536,7 @@ def construct_volume_delta_renko_matrix(df, tf_name, confirm_bricks):
                     if move <= -bs:
                         bricks = int(abs(move) // bs)
                         curr_trend = -1
-                        curr_count = curr_count - bricks if curr_count < 0 else -bricks
+                        curr_count = -bricks
                         curr_delta -= bricks * bs
                     elif move >= (2 * bs):
                         bricks = int(move // bs)
@@ -550,6 +549,7 @@ def construct_volume_delta_renko_matrix(df, tf_name, confirm_bricks):
     df[f"Vol_Renko_Bull_{tf_name}"] = vol_renko_counts >= confirm_bricks
     df[f"Vol_Renko_Bear_{tf_name}"] = vol_renko_counts <= -confirm_bricks
     return df
+
 
 def construct_renko_velocity_engine(df, tf_name):
     brick_diff = df.groupby("Symbol")[f"Renko_Count_{tf_name}"].diff().fillna(1)
@@ -640,6 +640,7 @@ def apply_dual_tier_scorecard(df, tf_str, tier_type):
     df[f"Armed_Bull_{tf_str}"] = (df[f"Score_Bull_{tf_str}"] >= min_score) & (~bull_veto)
     df[f"Armed_Bear_{tf_str}"] = (df[f"Score_Bear_{tf_str}"] >= min_score) & (~bear_veto)
     return df
+
 
 def evaluate_single_timeframe_gates(df_base, tf_str):
     df_tf = (
@@ -735,10 +736,10 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
 
 
 # ==============================================================================
-# 5. TRADE MANAGEMENT: STOCK SIGNAL -> ATM OPTION TRANSLATION -> EXIT TRACKING
+# 5. TRADE MANAGEMENT & STAGE 1 / STAGE 2 ENGINE
 # ==============================================================================
 def scan_institutional_tape(target_date_str):
-    print(f"\n📡 Initiating Two-Stage Engine for {target_date_str}...")
+    print(f"\n📡 Initiating Pipeline Engine for {target_date_str}...")
     universe, options_by_underlying = get_fno_universe_and_options()
     if not universe:
         print(f"{COLOR_RED}[Error] No spot instruments mapped — cannot proceed.{COLOR_RESET}")
@@ -753,65 +754,70 @@ def scan_institutional_tape(target_date_str):
     target_dt = pd.to_datetime(target_date_str)
     cutoff_time_obj = pd.to_datetime(ENTRY_CUTOFF_TIME).time()
 
-    # ==========================================================================
-    # STAGE 1: RUN MICRO+MACRO ON ALL F&O STOCKS -> SHORTLIST QUALIFIED STOCKS
-    # ==========================================================================
-    print(f"\n{COLOR_BOLD}── STAGE 1: STOCK-LEVEL SCAN ({len(universe)} F&O stocks) ──{COLOR_RESET}")
-    print(f"🚀 Multithreading Bulk Ingestion for {len(universe)} symbols...")
-    fetch_tasks = [(item, trading_days[0], target_date_str) for item in universe]
-    stock_dfs = []
-
-    def stock_fetch_worker(task):
-        item, start_date, end_date = task
-        df = fetch_fyers_candles(item["key"], start_date, end_date, resolution="1")
-        if df is None or df.empty:
-            return None
-        df = df.drop_duplicates(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
-        df["Symbol"] = item["symbol"]
-        return df
-
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-        futures = {executor.submit(stock_fetch_worker, task): task for task in fetch_tasks}
-        completed = 0
-        for future in concurrent.futures.as_completed(futures):
-            completed += 1
-            sys.stdout.write(f"\r📡 Fetching Stock Data... {completed}/{len(fetch_tasks)} symbols processed")
-            sys.stdout.flush()
-            res = future.result()
-            if res is not None: stock_dfs.append(res)
-    print()
-
-    if not stock_dfs:
-        if _fyers_error_log_count > 0:
-            print(f"{COLOR_RED}No historical stock data retrieved. See the [Fyers Diagnostic] lines above for the exact API error.{COLOR_RESET}")
-        else:
-            print(f"{COLOR_RED}No historical stock data retrieved, but no API errors were logged "
-                  f"(likely a market holiday/weekend for {target_date_str}).{COLOR_RESET}")
-        return
-
-    stock_master_df = pd.concat(stock_dfs, ignore_index=True)
-    print("⚙️ Computing 7-Pillar Scorecards & Velocity Matrices on STOCK charts...")
-    tape_exec_stock = prepare_unified_execution_tape(stock_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, strategy_mode=GLOBAL_MACRO_STRATEGY_2D)
-
-    stock_anomalies = tape_exec_stock[
-        (tape_exec_stock["Direction"] != 0) & (tape_exec_stock["Datetime"].dt.time <= cutoff_time_obj)
-    ].copy()
-
-    if stock_anomalies.empty:
-        print(f"\n{COLOR_YELLOW}[Terminal Silent] STAGE 1: No stocks triggered micro+macro conditions today.{COLOR_RESET}\n")
-        return
-
-    qualifying_symbols = sorted(stock_anomalies["Symbol"].unique().tolist())
-    spot_ref = stock_anomalies.sort_values("Datetime").groupby("Symbol")["Close"].last().to_dict()
-
-    print(f"{COLOR_GREEN}✅ STAGE 1 complete: {len(qualifying_symbols)}/{len(universe)} stocks qualified "
-          f"(Basket 1/2 eligible): {', '.join(qualifying_symbols)}{COLOR_RESET}")
+    qualifying_symbols = []
+    spot_ref = {}
 
     # ==========================================================================
-    # STAGE 2: FOR QUALIFIED STOCKS ONLY -> ATM ± N STRIKES -> LIQUIDITY FILTER
-    #          -> RE-RUN MICRO+MACRO ON THE OPTION'S OWN PREMIUM CHART
+    # STAGE 1: ROUTING CHECK (FILTER VIA STOCKS VS DIRECT OPTION SCAN)
     # ==========================================================================
-    print(f"\n{COLOR_BOLD}── STAGE 2: OPTION-LEVEL RE-SCORING (ATM ±{STRIKE_RANGE_OFFSET} strikes) ──{COLOR_RESET}")
+    if ENABLE_STAGE1_STOCK_FILTER:
+        print(f"\n{COLOR_BOLD}── STAGE 1: STOCK-LEVEL CONFLUENCE SCAN ({len(universe)} F&O stocks) ──{COLOR_RESET}")
+        print(f"🚀 Multithreading Bulk Ingestion for {len(universe)} symbols...")
+        fetch_tasks = [(item, trading_days[0], target_date_str) for item in universe]
+        stock_dfs = []
+
+        def stock_fetch_worker(task):
+            item, start_date, end_date = task
+            df = fetch_fyers_candles(item["key"], start_date, end_date, resolution="1")
+            if df is None or df.empty:
+                return None
+            df = df.drop_duplicates(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
+            df["Symbol"] = item["symbol"]
+            return df
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            futures = {executor.submit(stock_fetch_worker, task): task for task in fetch_tasks}
+            completed = 0
+            for future in concurrent.futures.as_completed(futures):
+                completed += 1
+                sys.stdout.write(f"\r📡 Fetching Stock Data... {completed}/{len(fetch_tasks)} symbols processed")
+                sys.stdout.flush()
+                res = future.result()
+                if res is not None: stock_dfs.append(res)
+        print()
+
+        if not stock_dfs:
+            print(f"{COLOR_RED}No historical stock data retrieved.{COLOR_RESET}")
+            return
+
+        stock_master_df = pd.concat(stock_dfs, ignore_index=True)
+        print("⚙️ Computing 9-Pillar Scorecards & Velocity Matrices on STOCK charts...")
+        tape_exec_stock = prepare_unified_execution_tape(stock_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, strategy_mode=GLOBAL_MACRO_STRATEGY_2D)
+
+        stock_anomalies = tape_exec_stock[
+            (tape_exec_stock["Direction"] != 0) & (tape_exec_stock["Datetime"].dt.time <= cutoff_time_obj)
+        ].copy()
+
+        if stock_anomalies.empty:
+            print(f"\n{COLOR_YELLOW}[Terminal Silent] STAGE 1: No stocks qualified today under the strict confluence filter.{COLOR_RESET}\n")
+            return
+
+        qualifying_symbols = sorted(stock_anomalies["Symbol"].unique().tolist())
+        spot_ref = stock_anomalies.sort_values("Datetime").groupby("Symbol")["Close"].last().to_dict()
+
+        print(f"{COLOR_GREEN}✅ STAGE 1 complete: {len(qualifying_symbols)}/{len(universe)} stocks qualified "
+              f"(Basket eligible): {', '.join(qualifying_symbols)}{COLOR_RESET}")
+    else:
+        print(f"\n{COLOR_BOLD}── STAGE 1 BYPASSED: Direct Option Scan for ALL {len(universe)} F&O Stocks ──{COLOR_RESET}")
+        print("🚀 Fetching spot reference prices across entire F&O Universe to center ATM strikes...")
+        spot_ref = fetch_all_spot_reference_prices(universe, target_date_str)
+        qualifying_symbols = [item["symbol"] for item in universe if item["symbol"] in spot_ref]
+        print(f"  ├─ Successfully locked ATM centers for {len(qualifying_symbols)} symbols.")
+
+    # ==========================================================================
+    # STAGE 2: BUILD STRIKES -> LIQUIDITY FILTER -> RE-SCORE ON OPTION CHARTS
+    # ==========================================================================
+    print(f"\n{COLOR_BOLD}── STAGE 2: OPTION-LEVEL SCAN (ATM ±{STRIKE_RANGE_OFFSET} strikes) ──{COLOR_RESET}")
 
     candidate_contracts = []
     for sym in qualifying_symbols:
@@ -821,7 +827,7 @@ def scan_institutional_tape(target_date_str):
         candidate_contracts.extend(build_strike_range(sym, spot_price, options_by_underlying, target_date_str, STRIKE_RANGE_OFFSET))
 
     if not candidate_contracts:
-        print(f"{COLOR_YELLOW}[Terminal Silent] No option chain coverage found for the qualified stocks.{COLOR_RESET}\n")
+        print(f"{COLOR_YELLOW}[Terminal Silent] No option chain coverage found.{COLOR_RESET}\n")
         return
 
     print(f"⚙️ Candidate contracts: {len(candidate_contracts)} (CE+PE, ±{STRIKE_RANGE_OFFSET} strikes × {len(qualifying_symbols)} stocks)")
@@ -837,7 +843,6 @@ def scan_institutional_tape(target_date_str):
     option_dfs = []
 
     def option_fetch_worker(contract):
-        # 🌟 FIXED: Use trading_days[0] to give the option chart historical warmup bars identically to the stocks
         df = fetch_fyers_candles(contract["key"], trading_days[0], target_date_str, resolution="1")
         if df is None or df.empty:
             return None
@@ -861,7 +866,7 @@ def scan_institutional_tape(target_date_str):
         return
 
     option_master_df = pd.concat(option_dfs, ignore_index=True)
-    print("⚙️ Computing 7-Pillar Scorecards & Velocity Matrices on OPTION PREMIUM charts...")
+    print("⚙️ Computing 9-Pillar Scorecards & Velocity Matrices on OPTION PREMIUM charts...")
     tape_exec_opt = prepare_unified_execution_tape(option_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, strategy_mode=OPTIONS_STRATEGY_2D)
 
     memory_bank = _run_dual_layer_trade_management(tape_exec_opt, MICRO_TIMEFRAME, MACRO_TIMEFRAMES)
@@ -873,7 +878,7 @@ def scan_institutional_tape(target_date_str):
     final_ltp_dict = today_master.groupby("Symbol")["Close"].last().to_dict()
 
     # ==========================================================================
-    # FINAL OUTPUT — this IS Basket 1 / Basket 2, at the option-premium level
+    # FINAL OUTPUT: BASKET 1 & BASKET 2
     # ==========================================================================
     active_runners = []
     closed_trades = []
@@ -887,7 +892,7 @@ def scan_institutional_tape(target_date_str):
 
     tf_display_str = " | ".join(MACRO_TIMEFRAMES)
     print(f"\n{COLOR_CYAN}================================================================================================{COLOR_RESET}")
-    print(f"{COLOR_BOLD}9-PILLAR OPTION-LEVEL EXIT ENGINE [{MICRO_TIMEFRAME} Micro ⚡ Macro: {tf_display_str}] — STAGE 2 RESULTS{COLOR_RESET}")
+    print(f"{COLOR_BOLD}9-PILLAR OPTION-LEVEL EXIT ENGINE [{MICRO_TIMEFRAME} Micro ⚡ Macro: {tf_display_str}] — RESULTS{COLOR_RESET}")
     print(f"{COLOR_CYAN}================================================================================================{COLOR_RESET}\n")
 
     if active_runners:
@@ -898,7 +903,7 @@ def scan_institutional_tape(target_date_str):
             color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
             d_str = "BULLISH" if st["dir"] == 1 else "BEARISH"
 
-            print(f"  {color}⚡ {st['sym']:<24} Open P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
+            print(f"  {color}⚡ {st['sym']:<26} Open P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
             print(f"      └─ ⚓ Qualifying Macro TFs        : {', '.join(st['triggering_macro_tfs'])}")
             print(f"      └─ 🔫 Micro Execution [{MICRO_TIMEFRAME}] : Score >= {MICRO_MINIMUM_SCORE}/9 (Score={st['micro_score']})")
             print(f"      └─ ⚓ True Birth Anchor           : {st['date']} @ {st['time']} | Premium: ₹{st['origin']:.2f}")
@@ -911,7 +916,7 @@ def scan_institutional_tape(target_date_str):
             color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
             d_str = "BULLISH" if st["dir"] == 1 else "BEARISH"
 
-            print(f"  {color}🛑 {st['sym']:<24} Final P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
+            print(f"  {color}🛑 {st['sym']:<26} Final P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
             print(f"      └─ ⚓ Qualifying Macro TFs        : {', '.join(st['triggering_macro_tfs'])}")
             print(f"      └─ 🔫 Micro Execution [{MICRO_TIMEFRAME}] : Score >= {MICRO_MINIMUM_SCORE}/9 (Score={st['micro_score']})")
             print(f"      └─ ⚓ True Birth Anchor           : {st['date']} @ {st['time']} | Premium: ₹{st['origin']:.2f}")
@@ -919,7 +924,7 @@ def scan_institutional_tape(target_date_str):
             print(f"      └─ 📉 Reason                      : {st['exit_reason']}\n")
 
     if not active_runners and not closed_trades:
-        print(f"{COLOR_DIM}[Terminal Silent] STAGE 2: No option contracts triggered micro+macro conditions today.{COLOR_RESET}\n")
+        print(f"{COLOR_DIM}[Terminal Silent] No option contracts triggered micro+macro conditions today.{COLOR_RESET}\n")
 
 
 def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframes):
@@ -1026,6 +1031,7 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
 
     return memory_bank
 
+
 def run_production_sweep():
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--date", type=str, default="")
@@ -1044,6 +1050,7 @@ def run_production_sweep():
         return
 
     scan_institutional_tape(target_date_str)
+
 
 if __name__ == "__main__":
     run_production_sweep()
