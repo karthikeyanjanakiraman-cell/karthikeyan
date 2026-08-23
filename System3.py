@@ -100,23 +100,23 @@ def validate_fyers_token():
 # ==============================================================================
 # "F_AND_O_OPTIONS" -> Scans F&O stocks -> Translates to ATM CE/PE option premiums
 # "CASH_EQUITY"     -> Trades cash equities directly (No CE/PE fetch) with price range filters
-TRADING_MODE = "F_AND_O_OPTIONS"  
+TRADING_MODE = "CASH_EQUITY"  
 
 # Active only when TRADING_MODE == "F_AND_O_OPTIONS":
 # True  -> Run Stage 1 (Stock-level 9-pillar scan) -> Pick options ONLY from qualified stocks
 # False -> Bypass Stage 1 -> Directly process ATM ± STRIKE_RANGE_OFFSET CE/PE for ALL F&O stocks
-ENABLE_STAGE1_STOCK_FILTER = True  
+ENABLE_STAGE1_STOCK_FILTER = False
 
 # Active only when TRADING_MODE == "CASH_EQUITY":
 MIN_STOCK_PRICE = 100.0
-MAX_STOCK_PRICE = 5000.0
-MIN_STOCK_VOLUME = 500000
+MAX_STOCK_PRICE = 500.0
+MIN_STOCK_VOLUME = 5000000
 
 # ==============================================================================
 # GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS
 # ==============================================================================
-MICRO_TIMEFRAME = "1min"
-MACRO_TIMEFRAMES = ["20min"]
+MICRO_TIMEFRAME = "240min"
+MACRO_TIMEFRAMES = ["2400min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -145,7 +145,7 @@ MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
 MACRO_MANDATORY_ATR_BB         = True   
 MACRO_MANDATORY_RENKO_BB       = True   
-MACRO_MINIMUM_SCORE            = 3      
+MACRO_MINIMUM_SCORE            = 2      
 
 # ==============================================================================
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
@@ -159,18 +159,18 @@ MICRO_MANDATORY_RSI_BB         = False
 MICRO_MANDATORY_ADX_DMI        = False
 MICRO_MANDATORY_EMA_SPREAD     = False
 MICRO_MANDATORY_STOCHASTIC     = False
-MICRO_MANDATORY_ATR_BB         = False  
+MICRO_MANDATORY_ATR_BB         = True  
 MICRO_MANDATORY_RENKO_BB       = True   
 
-MICRO_MINIMUM_SCORE            = 3      
+MICRO_MINIMUM_SCORE            = 2      
 
 # ==============================================================================
 # TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
 # ==============================================================================
 MICRO_EXIT_PRICE_BRICKS = 5
-MICRO_EXIT_VOL_BRICKS   = 5
-MACRO_EXIT_PRICE_BRICKS = 1
-MACRO_EXIT_VOL_BRICKS   = 1
+MICRO_EXIT_VOL_BRICKS   = 50
+MACRO_EXIT_PRICE_BRICKS = 5
+MACRO_EXIT_VOL_BRICKS   = 10
 
 RENKO_VELOCITY_MAX_BARS = 12
 ENTRY_CUTOFF_TIME = "15:00"
