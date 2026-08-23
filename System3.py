@@ -114,7 +114,7 @@ def validate_fyers_token():
 # GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS
 # ==============================================================================
 MICRO_TIMEFRAME = "60min"
-MACRO_TIMEFRAMES = ["2400min"]
+MACRO_TIMEFRAMES = ["600min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -125,7 +125,7 @@ ADX_THRESHOLD = 20
 STOCH_PERIOD = 14
 
 MICRO_RENKO_CONFIRM_BRICKS = 1
-MACRO_RENKO_CONFIRM_BRICKS = 1
+MACRO_RENKO_CONFIRM_BRICKS = 0
 RENKO_MIN_BRICK = 0.05
 RENKO_DEFAULT_PCT = 0.005
 
@@ -143,7 +143,7 @@ MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
 MACRO_MANDATORY_ATR_BB         = True   # 8th Pillar: Vetoes if ATR is NOT expanding (> Upper BB)
 MACRO_MANDATORY_RENKO_BB       = True   # 9th Pillar: Vetoes if Renko Count IS exhausted (> Upper BB)
-MACRO_MINIMUM_SCORE            = 6      # Out of 9
+MACRO_MINIMUM_SCORE            = 2      # Out of 9
 
 # ==============================================================================
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
