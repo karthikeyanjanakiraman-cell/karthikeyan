@@ -109,7 +109,7 @@ MACRO_EXIT_PRICE_BRICKS = 2
 MACRO_EXIT_VOL_BRICKS   = 5  
 
 # 🛑 Renko-Velocity Stagnation Guard
-RENKO_VELOCITY_MAX_BARS = 12  # Max bars allowed without a new brick before forced exit
+RENKO_VELOCITY_MAX_BARS = 120  # Max bars allowed without a new brick before forced exit
 
 # 🛑 Strict Session Cutoff
 ENTRY_CUTOFF_TIME = "15:00"
