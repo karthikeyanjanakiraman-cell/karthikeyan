@@ -3,9 +3,10 @@
 Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
 - Configurable Micro Execution Timeframe (e.g., "1min", "3min", "5min")
 - Configurable Macro Hierarchy Array (e.g., ["15min", "60min", "1D"])
-- Phase 1 Blueprint: Dual-Tier Scorecard (7 Pillars) & Global Mandatory Veto Switches
-- Phase 1 Blueprint: Order Flow / Cumulative Volume Delta 45-Degree Renko
-- Phase 1 Blueprint: Renko-Velocity Engine (Time-Distance Momentum Tracking)
+- Phase 2 Blueprint: Dual-Tier Scorecard (9 Pillars) & Global Mandatory Veto Switches
+- Phase 2 Blueprint: Order Flow / Cumulative Volume Delta 45-Degree Renko
+- Phase 2 Blueprint: Renko-Velocity Engine (Time-Distance Momentum Tracking)
+- Phase 2 Blueprint: ATR Volatility Breakout & Renko Capitulation Guards
 - EXIT STRATEGY: Dual-Layered (Triggering Macro + Micro) + Velocity Stall Cutoff
 - TRUE BIRTH TIME TRACKING: Locks in the original structural ignition timestamp and qualifying macro TFs
 """
@@ -66,30 +67,38 @@ RENKO_DEFAULT_PCT = 0.005
 GLOBAL_MACRO_STRATEGY_2D = "BOTH"  # "BULLISH", "BEARISH", or "BOTH"
 
 # ==============================================================================
-# 🎛️ TIER 1: MACRO CONTEXT SWITCHBOARD (THE GENERAL) - 7 PILLARS
+# 🎛️ TIER 1: MACRO CONTEXT SWITCHBOARD (THE GENERAL) - 9 PILLARS
 # ==============================================================================
 MACRO_MANDATORY_PRICE_RENKO    = True
 MACRO_MANDATORY_VOL_RENKO      = True
-MACRO_MANDATORY_RENKO_VELOCITY = True   # 🌟 7th Pillar: Momentum Velocity
+MACRO_MANDATORY_RENKO_VELOCITY = True   
 MACRO_MANDATORY_RSI_BB         = False
 MACRO_MANDATORY_ADX_DMI        = False
 MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
-MACRO_MINIMUM_SCORE            = 3      # Out of 7
+
+# 🌟 NEW VETO PILLARS
+MACRO_MANDATORY_ATR_BB         = True   # 8th Pillar: Vetoes if ATR is NOT expanding (> Upper BB)
+MACRO_MANDATORY_RENKO_BB       = True   # 9th Pillar: Vetoes if Renko Count IS exhausted (> Upper BB)
+MACRO_MINIMUM_SCORE            = 3      # Out of 9
 
 # ==============================================================================
-# 🎛️ TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 7 PILLARS
+# 🎛️ TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
 # ==============================================================================
 SYNC_MICRO_WITH_MACRO          = False  # If True, Micro overrides to match Macro
 
 MICRO_MANDATORY_PRICE_RENKO    = True
 MICRO_MANDATORY_VOL_RENKO      = True
-MICRO_MANDATORY_RENKO_VELOCITY = True   # 🌟 7th Pillar: Momentum Velocity
+MICRO_MANDATORY_RENKO_VELOCITY = True   
 MICRO_MANDATORY_RSI_BB         = False
 MICRO_MANDATORY_ADX_DMI        = False
 MICRO_MANDATORY_EMA_SPREAD     = True
 MICRO_MANDATORY_STOCHASTIC     = False
-MICRO_MINIMUM_SCORE            = 4      # Out of 7
+
+# 🌟 NEW VETO PILLARS
+MICRO_MANDATORY_ATR_BB         = False  # (Set True if you only want to snipe on micro volatility expansions)
+MICRO_MANDATORY_RENKO_BB       = True   # 9th Pillar: Exhaustion Veto Guard
+MICRO_MINIMUM_SCORE            = 4      # Out of 9
 
 # ==============================================================================
 # 🎛️ TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
@@ -100,7 +109,7 @@ MACRO_EXIT_PRICE_BRICKS = 1
 MACRO_EXIT_VOL_BRICKS   = 1  
 
 # 🛑 Renko-Velocity Stagnation Guard
-RENKO_VELOCITY_MAX_BARS = 12  # Max bars allowed without a new brick before forced exit (e.g., 12 bars on 5min = 60 mins)
+RENKO_VELOCITY_MAX_BARS = 12  # Max bars allowed without a new brick before forced exit
 
 # 🛑 Strict Session Cutoff
 ENTRY_CUTOFF_TIME = "15:00"
@@ -277,14 +286,12 @@ def construct_volume_delta_renko_matrix(df, tf_name, confirm_bricks):
     return df
 
 def construct_renko_velocity_engine(df, tf_name):
-    # 🌟 Calculate Time (Bars) Elapsed Since Last Brick Formation
     brick_diff = df.groupby("Symbol")[f"Renko_Count_{tf_name}"].diff().fillna(1)
     brick_changed = (brick_diff != 0)
     df["Brick_ID"] = brick_changed.cumsum()
     df[f"Bars_Since_Brick_{tf_name}"] = df.groupby(["Symbol", "Brick_ID"]).cumcount()
     df.drop("Brick_ID", axis=1, inplace=True)
     
-    # 🌟 Velocity Condition: Price is trending AND it hasn't stagnated beyond max bars
     is_trending_bull = df[f"Renko_Count_{tf_name}"] > 0
     is_trending_bear = df[f"Renko_Count_{tf_name}"] < 0
     has_velocity = df[f"Bars_Since_Brick_{tf_name}"] <= RENKO_VELOCITY_MAX_BARS
@@ -295,14 +302,20 @@ def construct_renko_velocity_engine(df, tf_name):
 
 
 # ==============================================================================
-# 3. DUAL-TIER SCORECARD SYSTEM (NOW OUT OF 7 PILLARS)
+# 3. DUAL-TIER SCORECARD SYSTEM (NOW 9 PILLARS W/ VOLATILITY & EXHAUSTION)
 # ==============================================================================
 def apply_dual_tier_scorecard(df, tf_str, tier_type):
+    # 1. Fetch Global Settings dynamically
     if SYNC_MICRO_WITH_MACRO and tier_type == "MICRO":
-        req_price, req_vol = MACRO_MANDATORY_PRICE_RENKO, MACRO_MANDATORY_VOL_RENKO
+        req_price = MACRO_MANDATORY_PRICE_RENKO
+        req_vol = MACRO_MANDATORY_VOL_RENKO
         req_vel = MACRO_MANDATORY_RENKO_VELOCITY
-        req_rsi, req_adx = MACRO_MANDATORY_RSI_BB, MACRO_MANDATORY_ADX_DMI
-        req_ema, req_stoch = MACRO_MANDATORY_EMA_SPREAD, MACRO_MANDATORY_STOCHASTIC
+        req_rsi = MACRO_MANDATORY_RSI_BB
+        req_adx = MACRO_MANDATORY_ADX_DMI
+        req_ema = MACRO_MANDATORY_EMA_SPREAD
+        req_stoch = MACRO_MANDATORY_STOCHASTIC
+        req_atr_bb = MACRO_MANDATORY_ATR_BB          # 🌟 NEW VETO TOGGLE
+        req_renko_bb = MACRO_MANDATORY_RENKO_BB      # 🌟 NEW VETO TOGGLE
         min_score = MACRO_MINIMUM_SCORE
     else:
         req_price = globals()[f"{tier_type}_MANDATORY_PRICE_RENKO"]
@@ -312,9 +325,11 @@ def apply_dual_tier_scorecard(df, tf_str, tier_type):
         req_adx = globals()[f"{tier_type}_MANDATORY_ADX_DMI"]
         req_ema = globals()[f"{tier_type}_MANDATORY_EMA_SPREAD"]
         req_stoch = globals()[f"{tier_type}_MANDATORY_STOCHASTIC"]
+        req_atr_bb = globals()[f"{tier_type}_MANDATORY_ATR_BB"]       # 🌟 NEW VETO TOGGLE
+        req_renko_bb = globals()[f"{tier_type}_MANDATORY_RENKO_BB"]   # 🌟 NEW VETO TOGGLE
         min_score = globals()[f"{tier_type}_MINIMUM_SCORE"]
 
-    # Calculate individual pillar logic
+    # 2. Base 7 Pillars logic
     c_price_bull, c_price_bear = df[f"Renko_Bull_{tf_str}"].astype(int), df[f"Renko_Bear_{tf_str}"].astype(int)
     c_vol_bull, c_vol_bear = df[f"Vol_Renko_Bull_{tf_str}"].astype(int), df[f"Vol_Renko_Bear_{tf_str}"].astype(int)
     c_vel_bull, c_vel_bear = df[f"Velocity_Bull_{tf_str}"].astype(int), df[f"Velocity_Bear_{tf_str}"].astype(int)
@@ -323,21 +338,51 @@ def apply_dual_tier_scorecard(df, tf_str, tier_type):
     c_ema_bull, c_ema_bear = df["EMA_Bull_Expanded"].astype(int), df["EMA_Bear_Expanded"].astype(int)
     c_stoch_bull, c_stoch_bear = df["Stoch_Bull_Pass"].astype(int), df["Stoch_Bear_Pass"].astype(int)
 
-    # 🌟 Score out of 7
-    df[f"Score_Bull_{tf_str}"] = c_price_bull + c_vol_bull + c_vel_bull + c_rsi_bull + c_adx_bull + c_ema_bull + c_stoch_bull
-    df[f"Score_Bear_{tf_str}"] = c_price_bear + c_vol_bear + c_vel_bear + c_rsi_bear + c_adx_bear + c_ema_bear + c_stoch_bear
+    # 3. 🌟 PILLAR 8: ATR on BB (Structural Volatility Breakout)
+    df['ATR_SMA20'] = df.groupby("Symbol")["ATR"].transform(lambda x: x.rolling(window=BB_SMA_PERIOD, min_periods=1).mean())
+    df['ATR_STD20'] = df.groupby("Symbol")["ATR"].transform(lambda x: x.rolling(window=BB_SMA_PERIOD, min_periods=1).std(ddof=0))
+    df['BB_ATR_Upper'] = df['ATR_SMA20'] + (BB_STD_DEV * df['ATR_STD20'])
+    
+    # Must expand above Upper BB to pass (Volatility Breakout)
+    c_atr_bb_bull = (df['ATR'] > df['BB_ATR_Upper']).astype(int)
+    c_atr_bb_bear = (df['ATR'] > df['BB_ATR_Upper']).astype(int)
 
+    # 4. 🌟 PILLAR 9: Renko Count on BB (Non-Exhaustion Guard / Capitulation Filter)
+    df[f'Renko_Count_SMA20_{tf_str}'] = df.groupby("Symbol")[f"Renko_Count_{tf_str}"].transform(lambda x: x.rolling(window=BB_SMA_PERIOD, min_periods=1).mean())
+    df[f'Renko_Count_STD20_{tf_str}'] = df.groupby("Symbol")[f"Renko_Count_{tf_str}"].transform(lambda x: x.rolling(window=BB_SMA_PERIOD, min_periods=1).std(ddof=0))
+    
+    df[f'BB_Renko_Upper_{tf_str}'] = df[f'Renko_Count_SMA20_{tf_str}'] + (BB_STD_DEV * df[f'Renko_Count_STD20_{tf_str}'])
+    df[f'BB_Renko_Lower_{tf_str}'] = df[f'Renko_Count_SMA20_{tf_str}'] - (BB_STD_DEV * df[f'Renko_Count_STD20_{tf_str}'])
+    
+    # Must NOT be exhausted (Count must remain <= Upper BB for Bulls, >= Lower BB for Bears)
+    c_renko_bb_bull = (df[f"Renko_Count_{tf_str}"] <= df[f'BB_Renko_Upper_{tf_str}']).astype(int)
+    c_renko_bb_bear = (df[f"Renko_Count_{tf_str}"] >= df[f'BB_Renko_Lower_{tf_str}']).astype(int)
+
+    # 5. Calculate Score out of 9
+    df[f"Score_Bull_{tf_str}"] = (c_price_bull + c_vol_bull + c_vel_bull + c_rsi_bull + 
+                                  c_adx_bull + c_ema_bull + c_stoch_bull + c_atr_bb_bull + c_renko_bb_bull)
+    df[f"Score_Bear_{tf_str}"] = (c_price_bear + c_vol_bear + c_vel_bear + c_rsi_bear + 
+                                  c_adx_bear + c_ema_bear + c_stoch_bear + c_atr_bb_bear + c_renko_bb_bear)
+
+    # 6. Global Veto Engine (Now tracking 9 distinct kill-switches)
     bull_veto, bear_veto = pd.Series(False, index=df.index), pd.Series(False, index=df.index)
-    if req_price: bull_veto, bear_veto = bull_veto | (c_price_bull == 0), bear_veto | (c_price_bear == 0)
-    if req_vol: bull_veto, bear_veto = bull_veto | (c_vol_bull == 0), bear_veto | (c_vol_bear == 0)
-    if req_vel: bull_veto, bear_veto = bull_veto | (c_vel_bull == 0), bear_veto | (c_vel_bear == 0)
-    if req_rsi: bull_veto, bear_veto = bull_veto | (c_rsi_bull == 0), bear_veto | (c_rsi_bear == 0)
-    if req_adx: bull_veto, bear_veto = bull_veto | (c_adx_bull == 0), bear_veto | (c_adx_bear == 0)
-    if req_ema: bull_veto, bear_veto = bull_veto | (c_ema_bull == 0), bear_veto | (c_ema_bear == 0)
-    if req_stoch: bull_veto, bear_veto = bull_veto | (c_stoch_bull == 0), bear_veto | (c_stoch_bear == 0)
+    
+    if req_price:    bull_veto, bear_veto = bull_veto | (c_price_bull == 0), bear_veto | (c_price_bear == 0)
+    if req_vol:      bull_veto, bear_veto = bull_veto | (c_vol_bull == 0), bear_veto | (c_vol_bear == 0)
+    if req_vel:      bull_veto, bear_veto = bull_veto | (c_vel_bull == 0), bear_veto | (c_vel_bear == 0)
+    if req_rsi:      bull_veto, bear_veto = bull_veto | (c_rsi_bull == 0), bear_veto | (c_rsi_bear == 0)
+    if req_adx:      bull_veto, bear_veto = bull_veto | (c_adx_bull == 0), bear_veto | (c_adx_bear == 0)
+    if req_ema:      bull_veto, bear_veto = bull_veto | (c_ema_bull == 0), bear_veto | (c_ema_bear == 0)
+    if req_stoch:    bull_veto, bear_veto = bull_veto | (c_stoch_bull == 0), bear_veto | (c_stoch_bear == 0)
+    
+    # 🌟 NEW VETO TRIGGERS
+    if req_atr_bb:   bull_veto, bear_veto = bull_veto | (c_atr_bb_bull == 0), bear_veto | (c_atr_bb_bear == 0)
+    if req_renko_bb: bull_veto, bear_veto = bull_veto | (c_renko_bb_bull == 0), bear_veto | (c_renko_bb_bear == 0)
 
+    # 7. Final Armed Status
     df[f"Armed_Bull_{tf_str}"] = (df[f"Score_Bull_{tf_str}"] >= min_score) & (~bull_veto)
     df[f"Armed_Bear_{tf_str}"] = (df[f"Score_Bear_{tf_str}"] >= min_score) & (~bear_veto)
+    
     return df
 
 def evaluate_single_timeframe_gates(df_base, tf_str):
@@ -349,7 +394,6 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
     df_tf = df_tf.dropna(subset=["Close"]).sort_values(["Symbol", "Datetime"])
     df_tf = calculate_core_technicals(df_tf)
     
-    # 🌟 Calculate all 3 Renko Pillars
     df_tf = construct_45deg_renko_matrix(df_tf, tf_str, MACRO_RENKO_CONFIRM_BRICKS)
     df_tf = construct_volume_delta_renko_matrix(df_tf, tf_str, MACRO_RENKO_CONFIRM_BRICKS)
     df_tf = construct_renko_velocity_engine(df_tf, tf_str)
@@ -387,7 +431,7 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
     df_micro = calculate_core_technicals(df_micro)
     df_micro = construct_45deg_renko_matrix(df_micro, micro_tf, MICRO_RENKO_CONFIRM_BRICKS)
     df_micro = construct_volume_delta_renko_matrix(df_micro, micro_tf, MICRO_RENKO_CONFIRM_BRICKS)
-    df_micro = construct_renko_velocity_engine(df_micro, micro_tf)  # 🌟 Apply to Micro Tape
+    df_micro = construct_renko_velocity_engine(df_micro, micro_tf) 
     df_micro = apply_dual_tier_scorecard(df_micro, micro_tf, "MICRO")
     df_micro = df_micro.sort_values("Datetime").reset_index(drop=True)
 
@@ -407,7 +451,6 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
         df_micro[f"Renko_Count_{tf}"] = df_micro[f"Renko_Count_{tf}"].fillna(0).astype(int)
         df_micro[f"Vol_Renko_Count_{tf}"] = df_micro[f"Vol_Renko_Count_{tf}"].fillna(0).astype(int)
 
-    # 🌟 MULTI-TIMEFRAME MACRO "ANY" LOGIC
     df_micro["Master_Armed_Bull"] = df_micro[bull_gate_cols].any(axis=1)
     df_micro["Master_Armed_Bear"] = df_micro[bear_gate_cols].any(axis=1)
     df_micro = df_micro.sort_values(["Symbol", "Datetime"]).reset_index(drop=True)
@@ -495,7 +538,7 @@ def scan_institutional_tape(target_date_str):
     print()
 
     rolling_master_df = pd.concat(historical_dfs, ignore_index=True)
-    print("⚙️ Computing 7-Pillar Scorecards & Velocity Matrices...")
+    print("⚙️ Computing 9-Pillar Scorecards & Velocity Matrices...")
 
     tape_exec = prepare_unified_execution_tape(rolling_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES)
     if GLOBAL_MACRO_STRATEGY_2D == "BULLISH": tape_exec["Master_Armed_Bear"] = False
@@ -509,7 +552,6 @@ def scan_institutional_tape(target_date_str):
     micro_vol_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{MICRO_TIMEFRAME}"].to_dict()
     micro_vel_bars = tape_exec.set_index(["Datetime", "Symbol"])[f"Bars_Since_Brick_{MICRO_TIMEFRAME}"].to_dict()
     
-    # Caches for all macro timeframes
     macro_price_renkos = {tf: tape_exec.set_index(["Datetime", "Symbol"])[f"Renko_Count_{tf}"].to_dict() for tf in MACRO_TIMEFRAMES}
     macro_vol_renkos = {tf: tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{tf}"].to_dict() for tf in MACRO_TIMEFRAMES}
     
@@ -520,7 +562,7 @@ def scan_institutional_tape(target_date_str):
     for t in all_times:
         t_dt = pd.to_datetime(t)
         
-        # 1. Manage Active Trades (Velocity Stall Exit + Dual-Layered Trailing)
+        # 1. Manage Active Trades
         for sym, st in memory_bank.items():
             if st["state"] == "ACTIVE":
                 ltp = closes_dict.get((t_dt, sym))
@@ -531,7 +573,6 @@ def scan_institutional_tape(target_date_str):
                 if ltp is not None:
                     exit_reason = None
                     
-                    # 🌟 INERTIA GUARD: If the micro timeframe hasn't printed a brick in X bars, cut the dead weight.
                     if mi_bars_stalled > RENKO_VELOCITY_MAX_BARS:
                         exit_reason = f"Velocity Stall (No brick in {RENKO_VELOCITY_MAX_BARS} bars)"
                     
@@ -569,13 +610,12 @@ def scan_institutional_tape(target_date_str):
                         st["exit_price"] = ltp
                         st["exit_reason"] = exit_reason
 
-        # 2. Process New Entrances & Capture Qualifying Macro TFs
+        # 2. Process New Entrances
         if t_dt in anomalies_by_time.groups and t_dt.time() <= cutoff_time_obj:
             for _, row in anomalies_by_time.get_group(t_dt).iterrows():
                 sym = row["Symbol"]
                 direction = row["Direction"]
                 
-                # Identify which exact macro timeframe(s) approved this entry at birth time
                 triggered_m_tfs = []
                 for tf in MACRO_TIMEFRAMES:
                     armed_col = f"Armed_Bull_{tf}" if direction == 1 else f"Armed_Bear_{tf}"
@@ -597,7 +637,7 @@ def scan_institutional_tape(target_date_str):
                         "micro_score": row.get(f"Score_Bull_{MICRO_TIMEFRAME}" if direction == 1 else f"Score_Bear_{MICRO_TIMEFRAME}", 0)
                     }
 
-        # 3. EOD Force Exit (15:15)
+        # 3. EOD Force Exit
         if t_dt.hour == 15 and t_dt.minute >= 15:
             for sym, st in memory_bank.items():
                 if st["state"] == "ACTIVE":
@@ -614,14 +654,14 @@ def scan_institutional_tape(target_date_str):
     final_ltp_dict = today_master.groupby("Symbol")["Close"].last().to_dict()
 
     # ==============================================================================
-    # 6. TERMINAL OUTPUT (NOW SCORING OUT OF 7)
+    # 6. TERMINAL OUTPUT
     # ==============================================================================
     active_runners = {sym: st for sym, st in memory_bank.items() if st["state"] == "ACTIVE"}
     closed_trades = [{**st, "sym": sym} for sym, st in memory_bank.items() if st["state"] == "EXITED" and st["date"] == target_date_str]
 
     tf_display_str = " | ".join(MACRO_TIMEFRAMES)
     print(f"\n{COLOR_CYAN}================================================================================================{COLOR_RESET}")
-    print(f"{COLOR_BOLD}7-PILLAR QUALIFYING-TF EXIT ENGINE [{MICRO_TIMEFRAME} Micro ⚡ Macro: {tf_display_str}]{COLOR_RESET}")
+    print(f"{COLOR_BOLD}9-PILLAR QUALIFYING-TF EXIT ENGINE [{MICRO_TIMEFRAME} Micro ⚡ Macro: {tf_display_str}]{COLOR_RESET}")
     print(f"{COLOR_CYAN}================================================================================================{COLOR_RESET}\n")
 
     if active_runners:
@@ -634,7 +674,7 @@ def scan_institutional_tape(target_date_str):
             
             print(f"  {color}⚡ {sym:<12} Open P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
             print(f"      └─ ⚓ Qualifying Macro TFs        : {', '.join(st['triggering_macro_tfs'])}")
-            print(f"      └─ 🔫 Micro Execution [{MICRO_TIMEFRAME}] : Score >= {MICRO_MINIMUM_SCORE}/7 (Score={st['micro_score']})")
+            print(f"      └─ 🔫 Micro Execution [{MICRO_TIMEFRAME}] : Score >= {MICRO_MINIMUM_SCORE}/9 (Score={st['micro_score']})")
             print(f"      └─ ⚓ True Birth Anchor           : {st['date']} @ {st['time']} | Price: ₹{st['origin']:.2f}")
             print(f"      └─ 🎯 Latest LTP                 : {target_date_str} @ EOD   | Price: ₹{ltp:.2f}\n")
 
@@ -647,7 +687,7 @@ def scan_institutional_tape(target_date_str):
 
             print(f"  {color}🛑 {st['sym']:<12} Final P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
             print(f"      └─ ⚓ Qualifying Macro TFs        : {', '.join(st['triggering_macro_tfs'])}")
-            print(f"      └─ 🔫 Micro Execution [{MICRO_TIMEFRAME}] : Score >= {MICRO_MINIMUM_SCORE}/7 (Score={st['micro_score']})")
+            print(f"      └─ 🔫 Micro Execution [{MICRO_TIMEFRAME}] : Score >= {MICRO_MINIMUM_SCORE}/9 (Score={st['micro_score']})")
             print(f"      └─ ⚓ True Birth Anchor           : {st['date']} @ {st['time']} | Price: ₹{st['origin']:.2f}")
             print(f"      └─ 🎯 Exit Time & Price           : {st['exit_time']} | Price: ₹{st['exit_price']:.2f}")
             print(f"      └─ 📉 Reason                      : {st['exit_reason']}\n")
