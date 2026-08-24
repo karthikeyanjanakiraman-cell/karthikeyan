@@ -31,7 +31,7 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-print("🔖 SYSTEM3 BUILD: trading-mode-routing-v7-ULTRA-ROBUST-PARSER (2026-08-23)")
+print("🔖 SYSTEM3 BUILD: v8-PROVE-IT-UPDATED (2026-08-24)")
 
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
@@ -1106,32 +1106,45 @@ def run_production_sweep():
     parser.add_argument("-t", "--time", type=str, default="")
     args, _ = parser.parse_known_args()
     
-    raw_date_str = args.date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
-    raw_time_str = args.time or os.environ.get("PARAM_BACKTEST_TIME", "").strip()
+    raw_date = args.date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
+    raw_time = args.time or os.environ.get("PARAM_BACKTEST_TIME", "").strip()
 
-    # 🌟 ULTRA-ROBUST PARSING: Safely extract EXACTLY "YYYY-MM-DD" and "HH:MM"
-    if raw_date_str:
-        raw_date_str = raw_date_str.replace("T", " ").strip()
-        tokens = raw_date_str.split()
-        if tokens:
-            raw_date_str = tokens[0][:10]  # Force exact 10 chars (YYYY-MM-DD)
-            if not raw_time_str and len(tokens) > 1:
-                raw_time_str = tokens[1]
+    print(f"\n⚙️ Raw Input Detected -> Date: '{raw_date}', Time: '{raw_time}'")
 
-    if raw_time_str:
-        raw_time_str = raw_time_str.replace(".", ":").strip()
-        if len(raw_time_str) >= 5 and ":" in raw_time_str:
-            raw_time_str = raw_time_str[:5]
+    # ==========================================
+    # ABSOLUTE BULLETPROOF DATE/TIME CLEANING
+    # ==========================================
+    if raw_date:
+        # Standardize any separators to spaces
+        raw_date = raw_date.replace("T", " ")
+        # If there's a space, aggressively split the time out of the date string
+        if " " in raw_date:
+            parts = raw_date.split()
+            raw_date = parts[0]
+            # If no time was explicitly provided, steal it from the date string
+            if not raw_time and len(parts) > 1:
+                raw_time = parts[1]
+        
+        # Hard lock the date string to exactly 10 characters (YYYY-MM-DD)
+        raw_date = raw_date[:10]  
 
-    if not raw_date_str:
+    if raw_time:
+        raw_time = raw_time.replace(".", ":").strip()
+        raw_time = raw_time[:5]  # Hard lock to 5 chars (HH:MM)
+
+    print(f"⚙️ Cleaned Input      -> Date: '{raw_date}', Time: '{raw_time}'")
+    # ==========================================
+
+    if not raw_date:
         target_dt = datetime.utcnow() + timedelta(hours=5, minutes=30)
         if target_dt.weekday() == 5: target_dt -= timedelta(days=1)
         elif target_dt.weekday() == 6: target_dt -= timedelta(days=2)
         target_date_str = target_dt.strftime("%Y-%m-%d")
     else:
-        target_date_str = datetime.strptime(raw_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
+        # This will NEVER crash now because raw_date is guaranteed to be "YYYY-MM-DD"
+        target_date_str = datetime.strptime(raw_date, "%Y-%m-%d").strftime("%Y-%m-%d")
 
-    cutoff_time_str = raw_time_str if raw_time_str else ENTRY_CUTOFF_TIME
+    cutoff_time_str = raw_time if raw_time else ENTRY_CUTOFF_TIME
 
     if not validate_fyers_token():
         return
