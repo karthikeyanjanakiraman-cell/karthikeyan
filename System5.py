@@ -7,7 +7,7 @@ Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
 - Phase 1 Blueprint: Order Flow / Cumulative Volume Delta 45-Degree Renko
 - Phase 1 Blueprint: Renko-Velocity Engine (Time-Distance Momentum Tracking)
 - EXIT STRATEGY: Dual-Layered (Triggering Macro + Micro) + Velocity Stall Cutoff
-- TRADING MODE & PIPELINE ROUTING SWITCHES: Fully configurable asset universe and filter paths.
+- CLI & ENV ARGS: Supports custom date (-d) and entry cutoff time (-t) arguments.
 """
 
 import argparse
@@ -31,7 +31,7 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-print("🔖 SYSTEM3 BUILD: trading-mode-routing-v3-REPORTING-FIX (2026-08-23)")
+print("🔖 SYSTEM3 BUILD: trading-mode-routing-v4-TIME-ARG (2026-08-23)")
 
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
@@ -794,13 +794,13 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
 # ==============================================================================
 # 5. TRADE MANAGEMENT & EXECUTION ENGINE
 # ==============================================================================
-def scan_institutional_tape(target_date_str):
-    print(f"\n📡 Initiating Pipeline Engine [{TRADING_MODE}] for {target_date_str}...")
+def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_TIME):
+    print(f"\n📡 Initiating Pipeline Engine [{TRADING_MODE}] for {target_date_str} (Cutoff: {entry_cutoff_time_str})...")
     trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
     if not trading_days: return
 
     target_dt = pd.to_datetime(target_date_str)
-    cutoff_time_obj = pd.to_datetime(ENTRY_CUTOFF_TIME).time()
+    cutoff_time_obj = pd.to_datetime(entry_cutoff_time_str).time()
 
     # ==========================================================================
     # MODE ROUTING: CASH EQUITIES VS F&O OPTIONS TRANSLATION
@@ -938,7 +938,7 @@ def scan_institutional_tape(target_date_str):
         option_master_df = pd.concat(option_dfs, ignore_index=True)
         tape_exec = prepare_unified_execution_tape(option_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, strategy_mode=OPTIONS_STRATEGY_2D)
 
-    memory_bank = _run_dual_layer_trade_management(tape_exec, MICRO_TIMEFRAME, MACRO_TIMEFRAMES)
+    memory_bank = _run_dual_layer_trade_management(tape_exec, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, cutoff_time_obj)
 
     today_master = tape_exec[tape_exec["Datetime"].dt.date == target_dt.date()]
     if today_master.empty:
@@ -996,7 +996,7 @@ def scan_institutional_tape(target_date_str):
         print(f"{COLOR_DIM}[Terminal Silent] No instruments triggered micro+macro conditions today.{COLOR_RESET}\n")
 
 
-def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframes):
+def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframes, cutoff_time_obj):
     all_anomalies = tape_exec[tape_exec["Direction"] != 0].copy()
     anomalies_by_time = all_anomalies.groupby("Datetime")
 
@@ -1009,7 +1009,6 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
 
     all_times = np.sort(tape_exec["Datetime"].unique())
     memory_bank = {}
-    cutoff_time_obj = pd.to_datetime(ENTRY_CUTOFF_TIME).time()
 
     for t in all_times:
         t_dt = pd.to_datetime(t)
@@ -1104,8 +1103,11 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
 def run_production_sweep():
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--date", type=str, default="")
+    parser.add_argument("-t", "--time", type=str, default="")
     args, _ = parser.parse_known_args()
+    
     raw_date_str = args.date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
+    raw_time_str = args.time or os.environ.get("PARAM_BACKTEST_TIME", "").strip()
 
     if not raw_date_str:
         target_dt = datetime.utcnow() + timedelta(hours=5, minutes=30)
@@ -1115,10 +1117,12 @@ def run_production_sweep():
     else:
         target_date_str = datetime.strptime(raw_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
 
+    cutoff_time_str = raw_time_str if raw_time_str else ENTRY_CUTOFF_TIME
+
     if not validate_fyers_token():
         return
 
-    scan_institutional_tape(target_date_str)
+    scan_institutional_tape(target_date_str, cutoff_time_str)
 
 
 if __name__ == "__main__":
