@@ -108,8 +108,8 @@ MIN_STOCK_VOLUME = 500000
 # ==============================================================================
 # GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS
 # ==============================================================================
-MICRO_TIMEFRAME = "1min"
-MACRO_TIMEFRAMES = ["20min"]
+MICRO_TIMEFRAME = "240min"
+MACRO_TIMEFRAMES = ["2400min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -138,7 +138,7 @@ MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
 MACRO_MANDATORY_ATR_BB         = True   
 MACRO_MANDATORY_RENKO_BB       = True   
-MACRO_MINIMUM_SCORE            = 3      
+MACRO_MINIMUM_SCORE            = 2      
 
 # ==============================================================================
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
@@ -152,20 +152,20 @@ MICRO_MANDATORY_RSI_BB         = False
 MICRO_MANDATORY_ADX_DMI        = False
 MICRO_MANDATORY_EMA_SPREAD     = False
 MICRO_MANDATORY_STOCHASTIC     = False
-MICRO_MANDATORY_ATR_BB         = False  
+MICRO_MANDATORY_ATR_BB         = True  
 MICRO_MANDATORY_RENKO_BB       = True   
 
-MICRO_MINIMUM_SCORE            = 3      
+MICRO_MINIMUM_SCORE            = 2      
 
 # ==============================================================================
 # TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
 # ==============================================================================
 MICRO_EXIT_PRICE_BRICKS = 5
-MICRO_EXIT_VOL_BRICKS   = 5
+MICRO_EXIT_VOL_BRICKS   = 50
 MACRO_EXIT_PRICE_BRICKS = 1
-MACRO_EXIT_VOL_BRICKS   = 1
+MACRO_EXIT_VOL_BRICKS   = 10
 
-RENKO_VELOCITY_MAX_BARS = 12
+RENKO_VELOCITY_MAX_BARS = 6
 ENTRY_CUTOFF_TIME = "15:00"
 
 # ==============================================================================
