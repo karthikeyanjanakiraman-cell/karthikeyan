@@ -1109,18 +1109,18 @@ def run_production_sweep():
     raw_date_str = args.date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
     raw_time_str = args.time or os.environ.get("PARAM_BACKTEST_TIME", "").strip()
 
-    # 🌟 BULLETPROOF TOKENIZED PARSING: Cleanly isolates date and time
+    # 🌟 ULTRA-ROBUST PARSING: Safely extract EXACTLY "YYYY-MM-DD" and "HH:MM"
     if raw_date_str:
         raw_date_str = raw_date_str.replace("T", " ").strip()
         tokens = raw_date_str.split()
         if tokens:
-            raw_date_str = tokens[0][:10]  # Hard lock to 10 chars (YYYY-MM-DD)
+            raw_date_str = tokens[0][:10]  # Force exact 10 chars (YYYY-MM-DD)
             if not raw_time_str and len(tokens) > 1:
                 raw_time_str = tokens[1]
 
     if raw_time_str:
         raw_time_str = raw_time_str.replace(".", ":").strip()
-        if len(raw_time_str) > 5 and ":" in raw_time_str:
+        if len(raw_time_str) >= 5 and ":" in raw_time_str:
             raw_time_str = raw_time_str[:5]
 
     if not raw_date_str:
@@ -1129,7 +1129,6 @@ def run_production_sweep():
         elif target_dt.weekday() == 6: target_dt -= timedelta(days=2)
         target_date_str = target_dt.strftime("%Y-%m-%d")
     else:
-        # We know raw_date_str is exactly "YYYY-MM-DD" now
         target_date_str = datetime.strptime(raw_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
 
     cutoff_time_str = raw_time_str if raw_time_str else ENTRY_CUTOFF_TIME
