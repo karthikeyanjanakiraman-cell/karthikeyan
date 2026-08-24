@@ -7,7 +7,7 @@ Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
 - Phase 1 Blueprint: Order Flow / Cumulative Volume Delta 45-Degree Renko
 - Phase 1 Blueprint: Renko-Velocity Engine (Time-Distance Momentum Tracking)
 - EXIT STRATEGY: Dual-Layered (Triggering Macro + Micro) + Velocity Stall Cutoff
-- CLI & ENV ARGS: Supports custom date (-d) and entry cutoff time (-t) arguments.
+- CLI & ENV ARGS: Bulletproof date and time parsing supporting spaces, T-separators, and dots.
 """
 
 import argparse
@@ -31,7 +31,7 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-print("🔖 SYSTEM3 BUILD: trading-mode-routing-v4-TIME-ARG (2026-08-23)")
+print("🔖 SYSTEM3 BUILD: trading-mode-routing-v6-BULLETPROOF-PARSER (2026-08-23)")
 
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
@@ -1109,13 +1109,27 @@ def run_production_sweep():
     raw_date_str = args.date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
     raw_time_str = args.time or os.environ.get("PARAM_BACKTEST_TIME", "").strip()
 
+    # 🌟 BULLETPROOF PARSING: Handle combined date/time strings cleanly
+    if raw_date_str:
+        raw_date_str = raw_date_str.replace("T", " ")
+        if " " in raw_date_str:
+            parts = raw_date_str.split()
+            raw_date_str = parts[0]
+            if not raw_time_str and len(parts) > 1:
+                raw_time_str = parts[1]
+
+    if raw_time_str:
+        raw_time_str = raw_time_str.replace(".", ":")
+        if len(raw_time_str) > 5 and ":" in raw_time_str:
+            raw_time_str = raw_time_str[:5]
+
     if not raw_date_str:
         target_dt = datetime.utcnow() + timedelta(hours=5, minutes=30)
         if target_dt.weekday() == 5: target_dt -= timedelta(days=1)
         elif target_dt.weekday() == 6: target_dt -= timedelta(days=2)
         target_date_str = target_dt.strftime("%Y-%m-%d")
     else:
-        target_date_str = datetime.strptime(raw_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
+        target_date_str = datetime.strptime(raw_date_str[:10], "%Y-%m-%d").strftime("%Y-%m-%d")
 
     cutoff_time_str = raw_time_str if raw_time_str else ENTRY_CUTOFF_TIME
 
