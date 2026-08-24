@@ -7,7 +7,7 @@ Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
 - Phase 1 Blueprint: Order Flow / Cumulative Volume Delta 45-Degree Renko
 - Phase 1 Blueprint: Renko-Velocity Engine (Time-Distance Momentum Tracking)
 - EXIT STRATEGY: Dual-Layered (Triggering Macro + Micro) + Velocity Stall Cutoff
-- TRADING MODE & PIPELINE ROUTING SWITCHES: Fully configurable asset universe and filter paths.
+- CLI & ENV ARGS: Ultra-robust tokenized date and time parsing.
 """
 
 import argparse
@@ -31,7 +31,7 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-print("🔖 SYSTEM3 BUILD: trading-mode-routing-v2 (2026-08-23)")
+print("🔖 SYSTEM3 BUILD: v8-PROVE-IT-UPDATED (2026-08-24)")
 
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
@@ -98,25 +98,18 @@ def validate_fyers_token():
 # ==============================================================================
 # 🎛️ TIER 0: TRADING MODE & PIPELINE ROUTING SWITCHES
 # ==============================================================================
-# "F_AND_O_OPTIONS" -> Scans F&O stocks -> Translates to ATM CE/PE option premiums
-# "CASH_EQUITY"     -> Trades cash equities directly (No CE/PE fetch) with price range filters
-TRADING_MODE = "CASH_EQUITY"  
+TRADING_MODE = "F_AND_O_OPTIONS"  
+ENABLE_STAGE1_STOCK_FILTER = True  
 
-# Active only when TRADING_MODE == "F_AND_O_OPTIONS":
-# True  -> Run Stage 1 (Stock-level 9-pillar scan) -> Pick options ONLY from qualified stocks
-# False -> Bypass Stage 1 -> Directly process ATM ± STRIKE_RANGE_OFFSET CE/PE for ALL F&O stocks
-ENABLE_STAGE1_STOCK_FILTER = False
-
-# Active only when TRADING_MODE == "CASH_EQUITY":
-MIN_STOCK_PRICE = 50.0
-MAX_STOCK_PRICE = 100.0
+MIN_STOCK_PRICE = 100.0
+MAX_STOCK_PRICE = 5000.0
 MIN_STOCK_VOLUME = 500000
 
 # ==============================================================================
 # GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS
 # ==============================================================================
-MICRO_TIMEFRAME = "240min"
-MACRO_TIMEFRAMES = ["2400min"]
+MICRO_TIMEFRAME = "1min"
+MACRO_TIMEFRAMES = ["20min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -145,7 +138,7 @@ MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
 MACRO_MANDATORY_ATR_BB         = True   
 MACRO_MANDATORY_RENKO_BB       = True   
-MACRO_MINIMUM_SCORE            = 2      
+MACRO_MINIMUM_SCORE            = 3      
 
 # ==============================================================================
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
@@ -159,18 +152,18 @@ MICRO_MANDATORY_RSI_BB         = False
 MICRO_MANDATORY_ADX_DMI        = False
 MICRO_MANDATORY_EMA_SPREAD     = False
 MICRO_MANDATORY_STOCHASTIC     = False
-MICRO_MANDATORY_ATR_BB         = True  
+MICRO_MANDATORY_ATR_BB         = False  
 MICRO_MANDATORY_RENKO_BB       = True   
 
-MICRO_MINIMUM_SCORE            = 2      
+MICRO_MINIMUM_SCORE            = 3      
 
 # ==============================================================================
 # TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
 # ==============================================================================
 MICRO_EXIT_PRICE_BRICKS = 5
-MICRO_EXIT_VOL_BRICKS   = 50
-MACRO_EXIT_PRICE_BRICKS = 5
-MACRO_EXIT_VOL_BRICKS   = 10
+MICRO_EXIT_VOL_BRICKS   = 5
+MACRO_EXIT_PRICE_BRICKS = 1
+MACRO_EXIT_VOL_BRICKS   = 1
 
 RENKO_VELOCITY_MAX_BARS = 12
 ENTRY_CUTOFF_TIME = "15:00"
@@ -186,7 +179,7 @@ OPTIONS_STRATEGY_2D = "BULLISH"
 
 
 # ==============================================================================
-# 1. LIVE INGESTION (FYERS): Cash Equities vs F&O Universe Loader
+# 1. LIVE INGESTION (FYERS)
 # ==============================================================================
 def get_cash_equity_universe():
     print("📡 Fetching Cash Equity Universe via FYERS (NSE_CM.csv)...")
@@ -801,13 +794,13 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
 # ==============================================================================
 # 5. TRADE MANAGEMENT & EXECUTION ENGINE
 # ==============================================================================
-def scan_institutional_tape(target_date_str):
-    print(f"\n📡 Initiating Pipeline Engine [{TRADING_MODE}] for {target_date_str}...")
+def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_TIME):
+    print(f"\n📡 Initiating Pipeline Engine [{TRADING_MODE}] for {target_date_str} (Cutoff: {entry_cutoff_time_str})...")
     trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
     if not trading_days: return
 
     target_dt = pd.to_datetime(target_date_str)
-    cutoff_time_obj = pd.to_datetime(ENTRY_CUTOFF_TIME).time()
+    cutoff_time_obj = pd.to_datetime(entry_cutoff_time_str).time()
 
     # ==========================================================================
     # MODE ROUTING: CASH EQUITIES VS F&O OPTIONS TRANSLATION
@@ -945,7 +938,7 @@ def scan_institutional_tape(target_date_str):
         option_master_df = pd.concat(option_dfs, ignore_index=True)
         tape_exec = prepare_unified_execution_tape(option_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, strategy_mode=OPTIONS_STRATEGY_2D)
 
-    memory_bank = _run_dual_layer_trade_management(tape_exec, MICRO_TIMEFRAME, MACRO_TIMEFRAMES)
+    memory_bank = _run_dual_layer_trade_management(tape_exec, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, cutoff_time_obj)
 
     today_master = tape_exec[tape_exec["Datetime"].dt.date == target_dt.date()]
     if today_master.empty:
@@ -954,7 +947,7 @@ def scan_institutional_tape(target_date_str):
     final_ltp_dict = today_master.groupby("Symbol")["Close"].last().to_dict()
 
     # ==========================================================================
-    # FINAL OUTPUT: BASKET 1 & BASKET 2
+    # FINAL OUTPUT: BASKET 1 & BASKET 2 
     # ==========================================================================
     active_runners = []
     closed_trades = []
@@ -962,7 +955,7 @@ def scan_institutional_tape(target_date_str):
         for st in episodes:
             if st["state"] == "ACTIVE":
                 active_runners.append({**st, "sym": sym})
-            elif st["state"] == "EXITED" and st["date"] == target_date_str:
+            elif st["state"] == "EXITED" and st["exit_time"] and st["exit_time"].startswith(target_date_str):
                 closed_trades.append({**st, "sym": sym})
     closed_trades.sort(key=lambda x: (x["sym"], x["time"]))
 
@@ -1003,7 +996,7 @@ def scan_institutional_tape(target_date_str):
         print(f"{COLOR_DIM}[Terminal Silent] No instruments triggered micro+macro conditions today.{COLOR_RESET}\n")
 
 
-def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframes):
+def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframes, cutoff_time_obj):
     all_anomalies = tape_exec[tape_exec["Direction"] != 0].copy()
     anomalies_by_time = all_anomalies.groupby("Datetime")
 
@@ -1016,7 +1009,6 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
 
     all_times = np.sort(tape_exec["Datetime"].unique())
     memory_bank = {}
-    cutoff_time_obj = pd.to_datetime(ENTRY_CUTOFF_TIME).time()
 
     for t in all_times:
         t_dt = pd.to_datetime(t)
@@ -1111,21 +1103,53 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
 def run_production_sweep():
     parser = argparse.ArgumentParser()
     parser.add_argument("-d", "--date", type=str, default="")
+    parser.add_argument("-t", "--time", type=str, default="")
     args, _ = parser.parse_known_args()
-    raw_date_str = args.date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
+    
+    raw_date = args.date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
+    raw_time = args.time or os.environ.get("PARAM_BACKTEST_TIME", "").strip()
 
-    if not raw_date_str:
+    print(f"\n⚙️ Raw Input Detected -> Date: '{raw_date}', Time: '{raw_time}'")
+
+    # ==========================================
+    # ABSOLUTE BULLETPROOF DATE/TIME CLEANING
+    # ==========================================
+    if raw_date:
+        # Standardize any separators to spaces
+        raw_date = raw_date.replace("T", " ")
+        # If there's a space, aggressively split the time out of the date string
+        if " " in raw_date:
+            parts = raw_date.split()
+            raw_date = parts[0]
+            # If no time was explicitly provided, steal it from the date string
+            if not raw_time and len(parts) > 1:
+                raw_time = parts[1]
+        
+        # Hard lock the date string to exactly 10 characters (YYYY-MM-DD)
+        raw_date = raw_date[:10]  
+
+    if raw_time:
+        raw_time = raw_time.replace(".", ":").strip()
+        raw_time = raw_time[:5]  # Hard lock to 5 chars (HH:MM)
+
+    print(f"⚙️ Cleaned Input      -> Date: '{raw_date}', Time: '{raw_time}'")
+    # ==========================================
+
+    if not raw_date:
         target_dt = datetime.utcnow() + timedelta(hours=5, minutes=30)
         if target_dt.weekday() == 5: target_dt -= timedelta(days=1)
         elif target_dt.weekday() == 6: target_dt -= timedelta(days=2)
         target_date_str = target_dt.strftime("%Y-%m-%d")
     else:
-        target_date_str = datetime.strptime(raw_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
+        # This will NEVER crash now because raw_date is guaranteed to be "YYYY-MM-DD"
+        target_date_str = datetime.strptime(raw_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+
+    cutoff_time_str = raw_time if raw_time else ENTRY_CUTOFF_TIME
 
     if not validate_fyers_token():
         return
 
-    scan_institutional_tape(target_date_str)
+    scan_institutional_tape(target_date_str, cutoff_time_str)
 
 
 if __name__ == "__main__":
