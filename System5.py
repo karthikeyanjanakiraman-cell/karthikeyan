@@ -947,7 +947,7 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
     final_ltp_dict = today_master.groupby("Symbol")["Close"].last().to_dict()
 
     # ==========================================================================
-    # FINAL OUTPUT: BASKET 1 & BASKET 2 (BUGFIX APPLIED)
+    # FINAL OUTPUT: BASKET 1 & BASKET 2 
     # ==========================================================================
     active_runners = []
     closed_trades = []
@@ -1114,7 +1114,7 @@ def run_production_sweep():
         raw_date_str = raw_date_str.replace("T", " ").strip()
         tokens = raw_date_str.split()
         if tokens:
-            raw_date_str = tokens[0]
+            raw_date_str = tokens[0][:10]  # Hard lock to 10 chars (YYYY-MM-DD)
             if not raw_time_str and len(tokens) > 1:
                 raw_time_str = tokens[1]
 
@@ -1129,9 +1129,8 @@ def run_production_sweep():
         elif target_dt.weekday() == 6: target_dt -= timedelta(days=2)
         target_date_str = target_dt.strftime("%Y-%m-%d")
     else:
-        # Guarantee we only parse the YYYY-MM-DD portion
-        clean_date = raw_date_str[:10]
-        target_date_str = datetime.strptime(clean_date, "%Y-%m-%d").strftime("%Y-%m-%d")
+        # We know raw_date_str is exactly "YYYY-MM-DD" now
+        target_date_str = datetime.strptime(raw_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
 
     cutoff_time_str = raw_time_str if raw_time_str else ENTRY_CUTOFF_TIME
 
