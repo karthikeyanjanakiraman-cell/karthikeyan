@@ -121,7 +121,7 @@ ADX_THRESHOLD = 20
 STOCH_PERIOD = 14
 
 MICRO_RENKO_CONFIRM_BRICKS = 1
-MACRO_RENKO_CONFIRM_BRICKS = 0
+MACRO_RENKO_CONFIRM_BRICKS = 1
 RENKO_MIN_BRICK = 0.05
 RENKO_DEFAULT_PCT = 0.005
 
@@ -156,14 +156,14 @@ MICRO_MANDATORY_STOCHASTIC     = False
 MICRO_MANDATORY_ATR_BB         = True  
 MICRO_MANDATORY_RENKO_BB       = True   
 
-MICRO_MINIMUM_SCORE            = 7      # UPDATED to filter out chop
+MICRO_MINIMUM_SCORE            = 2      # UPDATED to filter out chop
 
 # ==============================================================================
 # TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
 # ==============================================================================
-MICRO_EXIT_PRICE_BRICKS = 5
+MICRO_EXIT_PRICE_BRICKS = 50
 MICRO_EXIT_VOL_BRICKS   = 50
-MACRO_EXIT_PRICE_BRICKS = 1
+MACRO_EXIT_PRICE_BRICKS = 10
 MACRO_EXIT_VOL_BRICKS   = 10
 
 # Dynamic Velocity Engine
