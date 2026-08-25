@@ -7,6 +7,7 @@ Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
 - Phase 1 Blueprint: Order Flow / Cumulative Volume Delta 45-Degree Renko
 - Phase 1 Blueprint: Renko-Velocity Engine (Time-Distance Momentum Tracking)
 - EXIT STRATEGY: Dual-Layered (Triggering Macro + Micro) + Velocity Stall Cutoff
+- NEW: Strict Macro Renko Polarity Gatekeeper (Green=Calls Only, Red=Puts Only)
 - CLI & ENV ARGS: Ultra-robust tokenized date and time parsing.
 """
 
@@ -31,7 +32,7 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-print("🔖 SYSTEM3 BUILD: v9-FINAL-LOGIC-FIXES (2026-08-25)")
+print("🔖 SYSTEM3 BUILD: v10-ULTIMATE-POLARITY-GATEKEEPER (2026-08-25)")
 
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
@@ -299,9 +300,7 @@ def get_past_trading_days(target_date_str, num_days=20):
 
 
 def truncate_to_cutoff(df, target_date_str, cutoff_dt):
-    """Drops bars on the TARGET DATE that fall after cutoff_dt (a full
-    pd.Timestamp combining date + the -t/--time cutoff). Bars on earlier
-    days (indicator warm-up history) are left untouched."""
+    """Drops bars on the TARGET DATE that fall after cutoff_dt."""
     if df is None or df.empty:
         return df
     target_date = pd.to_datetime(target_date_str).date()
@@ -319,9 +318,7 @@ def get_nse_aligned_grouper(tf_str):
 
 
 def fetch_stock_bars_worker(task):
-    """Shared fetch worker for 1-min stock bars — used by both the CASH_EQUITY
-    path and the optional F&O Stage-1 stock filter, so the fetch logic only
-    exists in one place."""
+    """Shared fetch worker for 1-min stock bars."""
     item, start_date, end_date = task
     df = fetch_fyers_candles(item["key"], start_date, end_date, resolution="1")
     if df is None or df.empty:
@@ -495,8 +492,7 @@ def build_strike_range(symbol, spot_price, options_by_underlying, target_date_st
 
 
 def fetch_all_spot_reference_prices(spot_universe, target_date_str):
-    """Reference spot price used purely to center the ATM strike range.
-    Uses the PREVIOUS trading day's close to prevent any future information leak."""
+    """Reference spot price used purely to center the ATM strike range."""
     target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
     prev_dt = target_dt - timedelta(days=1)
     while prev_dt.weekday() >= 5:
@@ -812,6 +808,27 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
     df_micro["Master_Armed_Bull"] = df_micro[bull_gate_cols].any(axis=1)
     df_micro["Master_Armed_Bear"] = df_micro[bear_gate_cols].any(axis=1)
 
+    # =========================================================================
+    # 🛑 STRICT MACRO/MICRO POLARITY GATEKEEPER (RENKO STATE ALIGNMENT)
+    # =========================================================================
+    # 🟢 Active Green Sequence (Macro Renko > 0) ────────▶ LONG CALLS ONLY
+    # 🔴 Active Red Sequence   (Macro Renko < 0) ────────▶ LONG PUTS ONLY
+    # 🟡 Flat / 0-State        (Macro Renko ==0) ────────▶ STANDBY
+    # =========================================================================
+    macro_is_green = pd.Series(True, index=df_micro.index)
+    macro_is_red = pd.Series(True, index=df_micro.index)
+
+    for tf in macro_timeframes:
+        renko_col = f"Renko_Count_{tf}"
+        # Force strict alignment: All mapped macro timeframes must match polarity
+        macro_is_green = macro_is_green & (df_micro[renko_col] > 0)
+        macro_is_red = macro_is_red & (df_micro[renko_col] < 0)
+
+    # Apply strict veto: Micro triggers are killed if Macro Renko opposes them
+    df_micro["Master_Armed_Bull"] = df_micro["Master_Armed_Bull"] & macro_is_green
+    df_micro["Master_Armed_Bear"] = df_micro["Master_Armed_Bear"] & macro_is_red
+    # =========================================================================
+
     if strategy_mode == "BULLISH":
         df_micro["Master_Armed_Bear"] = False
     elif strategy_mode == "BEARISH":
@@ -1017,7 +1034,6 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
     print(f"{COLOR_BOLD}9-PILLAR ENGINE [{MICRO_TIMEFRAME} Micro ⚡ Macro: {tf_display_str}] — RESULTS [{TRADING_MODE}]{COLOR_RESET}")
     print(f"{COLOR_CYAN}================================================================================================{COLOR_RESET}\n")
 
-    # Determine if we should print "EOD" or the cutoff time based on execution rules
     is_eod = (cutoff_time_obj >= datetime.strptime("15:15", "%H:%M").time())
     target_time_display = "EOD" if is_eod else entry_cutoff_time_str
 
@@ -1028,7 +1044,6 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
             pnl_pct = ((ltp - st["origin"]) / st["origin"]) * 100
             color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
             
-            # Smart Option Type Labeling
             if TRADING_MODE == "F_AND_O_OPTIONS":
                 if "CE" in st["sym"]:
                     d_str = "LONG CALL (Bullish Setup)" if st["dir"] == 1 else "SHORT CALL (Bearish Setup)"
@@ -1051,7 +1066,6 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
             pnl_pct = ((st["exit_price"] - st["origin"]) / st["origin"]) * 100
             color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
             
-            # Smart Option Type Labeling
             if TRADING_MODE == "F_AND_O_OPTIONS":
                 if "CE" in st["sym"]:
                     d_str = "LONG CALL (Bullish Setup)" if st["dir"] == 1 else "SHORT CALL (Bearish Setup)"
