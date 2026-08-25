@@ -31,7 +31,7 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-print("🔖 SYSTEM3 BUILD: v8-PROVE-IT-UPDATED (2026-08-24)")
+print("🔖 SYSTEM3 BUILD: v9-FINAL-LOGIC-FIXES (2026-08-25)")
 
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
@@ -222,7 +222,6 @@ def get_fno_universe_and_options():
                         break
 
         res_fo = requests.get("https://public.fyers.in/sym_details/NSE_FO.csv", headers=headers, timeout=15)
-        valid_underlyings = set()
 
         for line in res_fo.text.strip().split("\n"):
             cols = [c.strip() for c in line.split(",")]
@@ -262,10 +261,10 @@ def get_fno_universe_and_options():
                     "symbol": sym_ticker, "key": sym_ticker, "underlying": base_symbol,
                     "type": opt_type, "strike": strike_val, "expiry": expiry_date
                 })
-                if base_symbol not in valid_underlyings:
-                    valid_underlyings.add(base_symbol)
-                    spot_ticker = spot_key_map.get(base_symbol)
-                    if spot_ticker:
+                # Add to spot map if matched in CM
+                spot_ticker = spot_key_map.get(base_symbol)
+                if spot_ticker:
+                    if not any(s["symbol"] == base_symbol for s in spot_inst):
                         spot_inst.append({"symbol": base_symbol, "key": spot_ticker, "underlying": base_symbol})
             except Exception:
                 pass
@@ -273,11 +272,14 @@ def get_fno_universe_and_options():
         print(f"{COLOR_RED}[Error] FYERS CSV fetch failed: {e}{COLOR_RESET}")
         return [], {}
 
+    # Strict reconciliation filter to avoid underlying count mismatches
+    valid_spot_bases = {s["underlying"] for s in spot_inst}
     options_by_underlying = {}
     for o in opt_inst:
-        options_by_underlying.setdefault(o["underlying"], []).append(o)
+        if o["underlying"] in valid_spot_bases:
+            options_by_underlying.setdefault(o["underlying"], []).append(o)
 
-    print(f"  ├─ Mapped {len(spot_inst)} Spot Instruments & {len(opt_inst)} Options Contracts "
+    print(f"  ├─ Mapped {len(spot_inst)} Spot Instruments & {sum(len(v) for v in options_by_underlying.values())} Options Contracts "
           f"across {len(options_by_underlying)} underlyings.")
     return spot_inst, options_by_underlying
 
@@ -299,18 +301,21 @@ def get_past_trading_days(target_date_str, num_days=20):
 def truncate_to_cutoff(df, target_date_str, cutoff_dt):
     """Drops bars on the TARGET DATE that fall after cutoff_dt (a full
     pd.Timestamp combining date + the -t/--time cutoff). Bars on earlier
-    days (indicator warm-up history) are left untouched.
-
-    This is what makes '-t/--time' actually mean 'process the data as of
-    that moment' — without this, the cutoff only filtered which NEW trades
-    could start, while exit checks, EOD force-exit, and the final displayed
-    price all still saw bars from AFTER the requested cutoff (look-ahead)."""
+    days (indicator warm-up history) are left untouched."""
     if df is None or df.empty:
         return df
     target_date = pd.to_datetime(target_date_str).date()
     is_target_day = df["Datetime"].dt.date == target_date
     is_after_cutoff = df["Datetime"] > cutoff_dt
     return df[~(is_target_day & is_after_cutoff)].reset_index(drop=True)
+
+
+def get_nse_aligned_grouper(tf_str):
+    """Helper to perfectly align pandas grouping with the NSE 09:15 market open."""
+    kwargs = {"key": "Datetime", "freq": tf_str, "closed": "left", "label": "left"}
+    if tf_str.endswith("min") or tf_str.endswith("h") or tf_str.endswith("H"):
+        kwargs["origin"] = pd.Timestamp("2010-01-01 09:15:00")
+    return pd.Grouper(**kwargs)
 
 
 def fetch_stock_bars_worker(task):
@@ -491,10 +496,7 @@ def build_strike_range(symbol, spot_price, options_by_underlying, target_date_st
 
 def fetch_all_spot_reference_prices(spot_universe, target_date_str):
     """Reference spot price used purely to center the ATM strike range.
-    Uses the PREVIOUS trading day's close, never target_date_str's own daily
-    candle — a same-day daily candle represents the FULL day's closing price,
-    which would leak future information when running with an intraday cutoff
-    (e.g. -t 12:00 shouldn't be able to see how the stock closed at 15:30)."""
+    Uses the PREVIOUS trading day's close to prevent any future information leak."""
     target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
     prev_dt = target_dt - timedelta(days=1)
     while prev_dt.weekday() >= 5:
@@ -741,7 +743,7 @@ def apply_dual_tier_scorecard(df, tf_str, tier_type):
 
 def evaluate_single_timeframe_gates(df_base, tf_str):
     df_tf = (
-        df_base.groupby(["Symbol", pd.Grouper(key="Datetime", freq=tf_str, closed="left", label="left")])
+        df_base.groupby(["Symbol", get_nse_aligned_grouper(tf_str)])
         .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
         .reset_index()
     )
@@ -773,7 +775,7 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
 def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes, strategy_mode="BOTH"):
     if micro_tf != "1min":
         df_micro = (
-            rolling_master_df.groupby(["Symbol", pd.Grouper(key="Datetime", freq=micro_tf, closed="left", label="left")])
+            rolling_master_df.groupby(["Symbol", get_nse_aligned_grouper(micro_tf)])
             .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
             .reset_index()
         )
@@ -840,8 +842,6 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
 
     target_dt = pd.to_datetime(target_date_str)
     cutoff_time_obj = pd.to_datetime(entry_cutoff_time_str).time()
-    # Full timestamp boundary — this is what actually enforces "process the
-    # data until that time" everywhere downstream, not just at entry.
     cutoff_dt = pd.to_datetime(f"{target_date_str} {entry_cutoff_time_str}")
 
     # ==========================================================================
@@ -934,9 +934,12 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
                   f"(Basket eligible): {', '.join(qualifying_symbols)}{COLOR_RESET}")
         else:
             print(f"\n{COLOR_BOLD}── STAGE 1 BYPASSED: Direct Option Scan for ALL {len(universe)} F&O Stocks ──{COLOR_RESET}")
-            print("🚀 Fetching spot reference prices across entire F&O Universe to center ATM strikes...")
+            print("🚀 Fetching spot reference prices solely to center ATM strikes (Skipping 9-pillar stock confluence)...")
             spot_ref = fetch_all_spot_reference_prices(universe, target_date_str)
             qualifying_symbols = [item["symbol"] for item in universe if item["symbol"] in spot_ref]
+            dropped_spot = len(universe) - len(qualifying_symbols)
+            if dropped_spot > 0:
+                print(f"  ├─ ⚠️  Dropped {dropped_spot} spot symbols due to missing/insufficient Fyers API data.")
             print(f"  ├─ Successfully locked ATM centers for {len(qualifying_symbols)} symbols.")
 
         print(f"\n{COLOR_BOLD}── STAGE 2: OPTION-LEVEL SCAN (ATM ±{STRIKE_RANGE_OFFSET} strikes) ──{COLOR_RESET}")
@@ -950,6 +953,10 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
             return
 
         liquid_contracts = filter_liquid_contracts(candidate_contracts, target_date_str)
+        dropped_opts = len(candidate_contracts) - len(liquid_contracts)
+        if dropped_opts > 0:
+            print(f"  ├─ 🧹 Dropped {dropped_opts} option contracts due to liquidity/premium filters.")
+            
         if not liquid_contracts:
             print(f"{COLOR_YELLOW}[Terminal Silent] No option contracts passed liquidity filter.{COLOR_RESET}\n")
             return
@@ -1010,26 +1017,50 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
     print(f"{COLOR_BOLD}9-PILLAR ENGINE [{MICRO_TIMEFRAME} Micro ⚡ Macro: {tf_display_str}] — RESULTS [{TRADING_MODE}]{COLOR_RESET}")
     print(f"{COLOR_CYAN}================================================================================================{COLOR_RESET}\n")
 
+    # Determine if we should print "EOD" or the cutoff time based on execution rules
+    is_eod = (cutoff_time_obj >= datetime.strptime("15:15", "%H:%M").time())
+    target_time_display = "EOD" if is_eod else entry_cutoff_time_str
+
     if active_runners:
         print(f"{COLOR_BOLD}🟢 BASKET 1: ACTIVE RUNNERS (Riding the Trend){COLOR_RESET}")
         for st in active_runners:
             ltp = final_ltp_dict.get(st["sym"], st["origin"])
             pnl_pct = ((ltp - st["origin"]) / st["origin"]) * 100
             color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
-            d_str = "BULLISH" if st["dir"] == 1 else "BEARISH"
+            
+            # Smart Option Type Labeling
+            if TRADING_MODE == "F_AND_O_OPTIONS":
+                if "CE" in st["sym"]:
+                    d_str = "LONG CALL (Bullish Setup)" if st["dir"] == 1 else "SHORT CALL (Bearish Setup)"
+                elif "PE" in st["sym"]:
+                    d_str = "LONG PUT (Bearish Setup)" if st["dir"] == 1 else "SHORT PUT (Bullish Setup)"
+                else:
+                    d_str = "BULLISH" if st["dir"] == 1 else "BEARISH"
+            else:
+                d_str = "BULLISH" if st["dir"] == 1 else "BEARISH"
 
             print(f"  {color}⚡ {st['sym']:<26} Open P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
             print(f"      └─ ⚓ Qualifying Macro TFs        : {', '.join(st['triggering_macro_tfs'])}")
             print(f"      └─ 🔫 Micro Execution [{MICRO_TIMEFRAME}] : Score >= {MICRO_MINIMUM_SCORE}/9 (Score={st['micro_score']})")
             print(f"      └─ ⚓ True Birth Anchor           : {st['date']} @ {st['time']} | Price: ₹{st['origin']:.2f}")
-            print(f"      └─ 🎯 Latest Price               : {target_date_str} @ EOD   | Price: ₹{ltp:.2f}\n")
+            print(f"      └─ 🎯 Latest Price               : {target_date_str} @ {target_time_display}   | Price: ₹{ltp:.2f}\n")
 
     if closed_trades:
         print(f"{COLOR_BOLD}🛑 BASKET 2: CLOSED TRADES (Renko Structure Broken / Stagnation){COLOR_RESET}")
         for st in closed_trades:
             pnl_pct = ((st["exit_price"] - st["origin"]) / st["origin"]) * 100
             color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
-            d_str = "BULLISH" if st["dir"] == 1 else "BEARISH"
+            
+            # Smart Option Type Labeling
+            if TRADING_MODE == "F_AND_O_OPTIONS":
+                if "CE" in st["sym"]:
+                    d_str = "LONG CALL (Bullish Setup)" if st["dir"] == 1 else "SHORT CALL (Bearish Setup)"
+                elif "PE" in st["sym"]:
+                    d_str = "LONG PUT (Bearish Setup)" if st["dir"] == 1 else "SHORT PUT (Bullish Setup)"
+                else:
+                    d_str = "BULLISH" if st["dir"] == 1 else "BEARISH"
+            else:
+                d_str = "BULLISH" if st["dir"] == 1 else "BEARISH"
 
             print(f"  {color}🛑 {st['sym']:<26} Final P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
             print(f"      └─ ⚓ Qualifying Macro TFs        : {', '.join(st['triggering_macro_tfs'])}")
@@ -1139,7 +1170,7 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
                 if episodes and episodes[-1]["state"] == "ACTIVE":
                     st = episodes[-1]
                     st["state"] = "EXITED"
-                    st["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M") + " (EOD)"
+                    st["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M") + " (EOD forced)"
                     st["exit_price"] = closes_dict.get((t_dt, sym), st["origin"])
                     st["exit_reason"] = "End of Day Market Close"
 
@@ -1155,31 +1186,22 @@ def run_production_sweep():
     raw_date = args.date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
     raw_time = args.time or os.environ.get("PARAM_BACKTEST_TIME", "").strip()
 
-    print(f"\n⚙️ Raw Input Detected -> Date: '{raw_date}', Time: '{raw_time}'")
-
     # ==========================================
     # ABSOLUTE BULLETPROOF DATE/TIME CLEANING
     # ==========================================
     if raw_date:
-        # Standardize any separators to spaces
-        raw_date = raw_date.replace("T", " ")
-        # If there's a space, aggressively split the time out of the date string
+        raw_date = raw_date.replace("T", " ").strip()
         if " " in raw_date:
             parts = raw_date.split()
             raw_date = parts[0]
-            # If no time was explicitly provided, steal it from the date string
             if not raw_time and len(parts) > 1:
                 raw_time = parts[1]
-        
-        # Hard lock the date string to exactly 10 characters (YYYY-MM-DD)
         raw_date = raw_date[:10]  
 
     if raw_time:
         raw_time = raw_time.replace(".", ":").strip()
-        raw_time = raw_time[:5]  # Hard lock to 5 chars (HH:MM)
-
-    print(f"⚙️ Cleaned Input      -> Date: '{raw_date}', Time: '{raw_time}'")
-    # ==========================================
+        if len(raw_time) > 5 and ":" in raw_time:
+            raw_time = raw_time[:5]
 
     if not raw_date:
         target_dt = datetime.utcnow() + timedelta(hours=5, minutes=30)
@@ -1187,7 +1209,6 @@ def run_production_sweep():
         elif target_dt.weekday() == 6: target_dt -= timedelta(days=2)
         target_date_str = target_dt.strftime("%Y-%m-%d")
     else:
-        # This will NEVER crash now because raw_date is guaranteed to be "YYYY-MM-DD"
         target_date_str = datetime.strptime(raw_date, "%Y-%m-%d").strftime("%Y-%m-%d")
 
     cutoff_time_str = raw_time if raw_time else ENTRY_CUTOFF_TIME
