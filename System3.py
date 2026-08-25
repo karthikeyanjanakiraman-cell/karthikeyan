@@ -156,7 +156,7 @@ MICRO_MANDATORY_STOCHASTIC     = False
 MICRO_MANDATORY_ATR_BB         = True  
 MICRO_MANDATORY_RENKO_BB       = True   
 
-MICRO_MINIMUM_SCORE            = 2      
+MICRO_MINIMUM_SCORE            = 7      
 
 # ==============================================================================
 # TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
