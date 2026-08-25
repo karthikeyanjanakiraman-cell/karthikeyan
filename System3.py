@@ -5,9 +5,9 @@ Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
 - Configurable Macro Hierarchy Array (e.g., ["15min", "60min", "1D"])
 - Phase 1 Blueprint: Dual-Tier Scorecard (9 Pillars) & Global Mandatory Veto Switches
 - Phase 1 Blueprint: Order Flow / Cumulative Volume Delta 45-Degree Renko
-- Phase 1 Blueprint: Renko-Velocity Engine (Time-Distance Momentum Tracking)
-- EXIT STRATEGY: Dual-Layered (Triggering Macro + Micro) + Velocity Stall Cutoff
+- EXIT STRATEGY: Dual-Layered (Triggering Macro + Micro) + Dynamic Velocity Stall Cutoff
 - NEW: Strict Macro Renko Polarity Gatekeeper (Green=Calls Only, Red=Puts Only)
+- NEW: Dynamic Velocity Engine ("Earned Patience" for winning trades)
 - CLI & ENV ARGS: Ultra-robust tokenized date and time parsing.
 """
 
@@ -32,7 +32,7 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-print("🔖 SYSTEM3 BUILD: v10-ULTIMATE-POLARITY-GATEKEEPER (2026-08-25)")
+print("🔖 SYSTEM3 BUILD: v11-DYNAMIC-VELOCITY-ENGINE (2026-08-25)")
 
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
@@ -156,7 +156,7 @@ MICRO_MANDATORY_STOCHASTIC     = False
 MICRO_MANDATORY_ATR_BB         = True  
 MICRO_MANDATORY_RENKO_BB       = True   
 
-MICRO_MINIMUM_SCORE            = 7      
+MICRO_MINIMUM_SCORE            = 7      # UPDATED to filter out chop
 
 # ==============================================================================
 # TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
@@ -166,7 +166,11 @@ MICRO_EXIT_VOL_BRICKS   = 50
 MACRO_EXIT_PRICE_BRICKS = 1
 MACRO_EXIT_VOL_BRICKS   = 10
 
-RENKO_VELOCITY_MAX_BARS = 6
+# Dynamic Velocity Engine
+RENKO_VELOCITY_BASE_BARS = 6       # Fail fast (30 mins) if trade is flat/losing
+RENKO_VELOCITY_PROFIT_BARS = 12    # Give room (60 mins) if trade is in high profit
+VELOCITY_PROFIT_THRESHOLD = 15.0   # Trade must be up +15% to earn extra time
+
 ENTRY_CUTOFF_TIME = "15:00"
 
 # ==============================================================================
@@ -262,7 +266,6 @@ def get_fno_universe_and_options():
                     "symbol": sym_ticker, "key": sym_ticker, "underlying": base_symbol,
                     "type": opt_type, "strike": strike_val, "expiry": expiry_date
                 })
-                # Add to spot map if matched in CM
                 spot_ticker = spot_key_map.get(base_symbol)
                 if spot_ticker:
                     if not any(s["symbol"] == base_symbol for s in spot_inst):
@@ -273,7 +276,6 @@ def get_fno_universe_and_options():
         print(f"{COLOR_RED}[Error] FYERS CSV fetch failed: {e}{COLOR_RESET}")
         return [], {}
 
-    # Strict reconciliation filter to avoid underlying count mismatches
     valid_spot_bases = {s["underlying"] for s in spot_inst}
     options_by_underlying = {}
     for o in opt_inst:
@@ -300,7 +302,6 @@ def get_past_trading_days(target_date_str, num_days=20):
 
 
 def truncate_to_cutoff(df, target_date_str, cutoff_dt):
-    """Drops bars on the TARGET DATE that fall after cutoff_dt."""
     if df is None or df.empty:
         return df
     target_date = pd.to_datetime(target_date_str).date()
@@ -310,7 +311,6 @@ def truncate_to_cutoff(df, target_date_str, cutoff_dt):
 
 
 def get_nse_aligned_grouper(tf_str):
-    """Helper to perfectly align pandas grouping with the NSE 09:15 market open."""
     kwargs = {"key": "Datetime", "freq": tf_str, "closed": "left", "label": "left"}
     if tf_str.endswith("min") or tf_str.endswith("h") or tf_str.endswith("H"):
         kwargs["origin"] = pd.Timestamp("2010-01-01 09:15:00")
@@ -318,7 +318,6 @@ def get_nse_aligned_grouper(tf_str):
 
 
 def fetch_stock_bars_worker(task):
-    """Shared fetch worker for 1-min stock bars."""
     item, start_date, end_date = task
     df = fetch_fyers_candles(item["key"], start_date, end_date, resolution="1")
     if df is None or df.empty:
@@ -492,7 +491,6 @@ def build_strike_range(symbol, spot_price, options_by_underlying, target_date_st
 
 
 def fetch_all_spot_reference_prices(spot_universe, target_date_str):
-    """Reference spot price used purely to center the ATM strike range."""
     target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
     prev_dt = target_dt - timedelta(days=1)
     while prev_dt.weekday() >= 5:
@@ -665,7 +663,8 @@ def construct_renko_velocity_engine(df, tf_name):
 
     is_trending_bull = df[f"Renko_Count_{tf_name}"] > 0
     is_trending_bear = df[f"Renko_Count_{tf_name}"] < 0
-    has_velocity = df[f"Bars_Since_Brick_{tf_name}"] <= RENKO_VELOCITY_MAX_BARS
+    # Use BASE_BARS to qualify new entries
+    has_velocity = df[f"Bars_Since_Brick_{tf_name}"] <= RENKO_VELOCITY_BASE_BARS
 
     df[f"Velocity_Bull_{tf_name}"] = is_trending_bull & has_velocity
     df[f"Velocity_Bear_{tf_name}"] = is_trending_bear & has_velocity
@@ -808,26 +807,16 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
     df_micro["Master_Armed_Bull"] = df_micro[bull_gate_cols].any(axis=1)
     df_micro["Master_Armed_Bear"] = df_micro[bear_gate_cols].any(axis=1)
 
-    # =========================================================================
-    # 🛑 STRICT MACRO/MICRO POLARITY GATEKEEPER (RENKO STATE ALIGNMENT)
-    # =========================================================================
-    # 🟢 Active Green Sequence (Macro Renko > 0) ────────▶ LONG CALLS ONLY
-    # 🔴 Active Red Sequence   (Macro Renko < 0) ────────▶ LONG PUTS ONLY
-    # 🟡 Flat / 0-State        (Macro Renko ==0) ────────▶ STANDBY
-    # =========================================================================
     macro_is_green = pd.Series(True, index=df_micro.index)
     macro_is_red = pd.Series(True, index=df_micro.index)
 
     for tf in macro_timeframes:
         renko_col = f"Renko_Count_{tf}"
-        # Force strict alignment: All mapped macro timeframes must match polarity
         macro_is_green = macro_is_green & (df_micro[renko_col] > 0)
         macro_is_red = macro_is_red & (df_micro[renko_col] < 0)
 
-    # Apply strict veto: Micro triggers are killed if Macro Renko opposes them
     df_micro["Master_Armed_Bull"] = df_micro["Master_Armed_Bull"] & macro_is_green
     df_micro["Master_Armed_Bear"] = df_micro["Master_Armed_Bear"] & macro_is_red
-    # =========================================================================
 
     if strategy_mode == "BULLISH":
         df_micro["Master_Armed_Bear"] = False
@@ -861,9 +850,6 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
     cutoff_time_obj = pd.to_datetime(entry_cutoff_time_str).time()
     cutoff_dt = pd.to_datetime(f"{target_date_str} {entry_cutoff_time_str}")
 
-    # ==========================================================================
-    # MODE ROUTING: CASH EQUITIES VS F&O OPTIONS TRANSLATION
-    # ==========================================================================
     if TRADING_MODE == "CASH_EQUITY":
         raw_universe = get_cash_equity_universe()
         if not raw_universe:
@@ -901,7 +887,6 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
         tape_exec = prepare_unified_execution_tape(stock_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, strategy_mode=GLOBAL_MACRO_STRATEGY_2D)
 
     else:
-        # F&O Options Translation Mode
         universe, options_by_underlying = get_fno_universe_and_options()
         if not universe or not options_by_underlying:
             print(f"{COLOR_RED}[Error] F&O universe or options chain data unavailable.{COLOR_RESET}")
@@ -1016,9 +1001,6 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
         return
     final_ltp_dict = today_master.groupby("Symbol")["Close"].last().to_dict()
 
-    # ==========================================================================
-    # FINAL OUTPUT: BASKET 1 & BASKET 2 
-    # ==========================================================================
     active_runners = []
     closed_trades = []
     for sym, episodes in memory_bank.items():
@@ -1061,7 +1043,7 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
             print(f"      └─ 🎯 Latest Price               : {target_date_str} @ {target_time_display}   | Price: ₹{ltp:.2f}\n")
 
     if closed_trades:
-        print(f"{COLOR_BOLD}🛑 BASKET 2: CLOSED TRADES (Renko Structure Broken / Stagnation){COLOR_RESET}")
+        print(f"{COLOR_BOLD}🛑 BASKET 2: CLOSED TRADES (Renko Structure Broken / Dynamic Velocity Stall){COLOR_RESET}")
         for st in closed_trades:
             pnl_pct = ((st["exit_price"] - st["origin"]) / st["origin"]) * 100
             color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
@@ -1116,9 +1098,19 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
 
                 if ltp is not None:
                     exit_reason = None
-                    if mi_bars_stalled > RENKO_VELOCITY_MAX_BARS:
-                        exit_reason = f"Velocity Stall (No brick in {RENKO_VELOCITY_MAX_BARS} bars)"
+                    
+                    # --- NEW: DYNAMIC PROFIT-AWARE VELOCITY STALL ---
+                    current_pnl_pct = ((ltp - st["origin"]) / st["origin"]) * 100 if st["origin"] > 0 else 0
+                    
+                    if current_pnl_pct >= VELOCITY_PROFIT_THRESHOLD:
+                        allowed_stall_bars = RENKO_VELOCITY_PROFIT_BARS
+                    else:
+                        allowed_stall_bars = RENKO_VELOCITY_BASE_BARS
 
+                    if mi_bars_stalled > allowed_stall_bars:
+                        exit_reason = f"Velocity Stall (No brick in {allowed_stall_bars} bars / PnL: {current_pnl_pct:+.1f}%)"
+                    # ------------------------------------------------
+                    
                     if not exit_reason:
                         if st["dir"] == 1:
                             if mi_p_count <= -MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
@@ -1200,9 +1192,6 @@ def run_production_sweep():
     raw_date = args.date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
     raw_time = args.time or os.environ.get("PARAM_BACKTEST_TIME", "").strip()
 
-    # ==========================================
-    # ABSOLUTE BULLETPROOF DATE/TIME CLEANING
-    # ==========================================
     if raw_date:
         raw_date = raw_date.replace("T", " ").strip()
         if " " in raw_date:
