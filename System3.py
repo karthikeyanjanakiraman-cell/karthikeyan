@@ -171,7 +171,7 @@ ENTRY_CUTOFF_TIME = "15:00"
 # ==============================================================================
 # TIER 4: OPTIONS STAGE 2 CONFIG (Ignored if TRADING_MODE == "CASH_EQUITY")
 # ==============================================================================
-OPTIONS_TARGET_EXPIRY = "CURRENT"   
+OPTIONS_TARGET_EXPIRY = "NEXT"   
 STRIKE_RANGE_OFFSET = 2             
 MIN_OPT_PREMIUM = 15.0              
 MIN_OPT_VOLUME = 250000             
