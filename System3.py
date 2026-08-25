@@ -296,6 +296,36 @@ def get_past_trading_days(target_date_str, num_days=20):
     except Exception: return []
 
 
+def truncate_to_cutoff(df, target_date_str, cutoff_dt):
+    """Drops bars on the TARGET DATE that fall after cutoff_dt (a full
+    pd.Timestamp combining date + the -t/--time cutoff). Bars on earlier
+    days (indicator warm-up history) are left untouched.
+
+    This is what makes '-t/--time' actually mean 'process the data as of
+    that moment' — without this, the cutoff only filtered which NEW trades
+    could start, while exit checks, EOD force-exit, and the final displayed
+    price all still saw bars from AFTER the requested cutoff (look-ahead)."""
+    if df is None or df.empty:
+        return df
+    target_date = pd.to_datetime(target_date_str).date()
+    is_target_day = df["Datetime"].dt.date == target_date
+    is_after_cutoff = df["Datetime"] > cutoff_dt
+    return df[~(is_target_day & is_after_cutoff)].reset_index(drop=True)
+
+
+def fetch_stock_bars_worker(task):
+    """Shared fetch worker for 1-min stock bars — used by both the CASH_EQUITY
+    path and the optional F&O Stage-1 stock filter, so the fetch logic only
+    exists in one place."""
+    item, start_date, end_date = task
+    df = fetch_fyers_candles(item["key"], start_date, end_date, resolution="1")
+    if df is None or df.empty:
+        return None
+    df = df.drop_duplicates(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
+    df["Symbol"] = item["symbol"]
+    return df
+
+
 # ==============================================================================
 # 1B. FYERS CANDLE FETCHER & FILTERS
 # ==============================================================================
@@ -460,12 +490,21 @@ def build_strike_range(symbol, spot_price, options_by_underlying, target_date_st
 
 
 def fetch_all_spot_reference_prices(spot_universe, target_date_str):
+    """Reference spot price used purely to center the ATM strike range.
+    Uses the PREVIOUS trading day's close, never target_date_str's own daily
+    candle — a same-day daily candle represents the FULL day's closing price,
+    which would leak future information when running with an intraday cutoff
+    (e.g. -t 12:00 shouldn't be able to see how the stock closed at 15:30)."""
     target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
-    lookback_start = (target_dt - timedelta(days=5)).strftime("%Y-%m-%d")
+    prev_dt = target_dt - timedelta(days=1)
+    while prev_dt.weekday() >= 5:
+        prev_dt -= timedelta(days=1)
+    prev_day = prev_dt.strftime("%Y-%m-%d")
+    lookback_start = (prev_dt - timedelta(days=7)).strftime("%Y-%m-%d")
     spot_ref = {}
 
     def worker(item):
-        df = fetch_fyers_candles(item["key"], lookback_start, target_date_str, resolution="D")
+        df = fetch_fyers_candles(item["key"], lookback_start, prev_day, resolution="D")
         if df is not None and not df.empty:
             last_close = df.sort_values("Datetime").iloc[-1]["Close"]
             return item["symbol"], float(last_close)
@@ -801,6 +840,9 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
 
     target_dt = pd.to_datetime(target_date_str)
     cutoff_time_obj = pd.to_datetime(entry_cutoff_time_str).time()
+    # Full timestamp boundary — this is what actually enforces "process the
+    # data until that time" everywhere downstream, not just at entry.
+    cutoff_dt = pd.to_datetime(f"{target_date_str} {entry_cutoff_time_str}")
 
     # ==========================================================================
     # MODE ROUTING: CASH EQUITIES VS F&O OPTIONS TRANSLATION
@@ -821,17 +863,8 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
         fetch_tasks = [(item, trading_days[0], target_date_str) for item in universe]
         stock_dfs = []
 
-        def stock_fetch_worker(task):
-            item, start_date, end_date = task
-            df = fetch_fyers_candles(item["key"], start_date, end_date, resolution="1")
-            if df is None or df.empty:
-                return None
-            df = df.drop_duplicates(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
-            df["Symbol"] = item["symbol"]
-            return df
-
         with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {executor.submit(stock_fetch_worker, task): task for task in fetch_tasks}
+            futures = {executor.submit(fetch_stock_bars_worker, task): task for task in fetch_tasks}
             completed = 0
             for future in concurrent.futures.as_completed(futures):
                 completed += 1
@@ -846,6 +879,7 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
             return
 
         stock_master_df = pd.concat(stock_dfs, ignore_index=True)
+        stock_master_df = truncate_to_cutoff(stock_master_df, target_date_str, cutoff_dt)
         print("⚙️ Computing 9-Pillar Scorecards & Velocity Matrices on CASH EQUITIES...")
         tape_exec = prepare_unified_execution_tape(stock_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, strategy_mode=GLOBAL_MACRO_STRATEGY_2D)
 
@@ -865,17 +899,8 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
             fetch_tasks = [(item, trading_days[0], target_date_str) for item in universe]
             stock_dfs = []
 
-            def stock_fetch_worker(task):
-                item, start_date, end_date = task
-                df = fetch_fyers_candles(item["key"], start_date, end_date, resolution="1")
-                if df is None or df.empty:
-                    return None
-                df = df.drop_duplicates(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
-                df["Symbol"] = item["symbol"]
-                return df
-
             with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-                futures = {executor.submit(stock_fetch_worker, task): task for task in fetch_tasks}
+                futures = {executor.submit(fetch_stock_bars_worker, task): task for task in fetch_tasks}
                 completed = 0
                 for future in concurrent.futures.as_completed(futures):
                     completed += 1
@@ -890,6 +915,7 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
                 return
 
             stock_master_df = pd.concat(stock_dfs, ignore_index=True)
+            stock_master_df = truncate_to_cutoff(stock_master_df, target_date_str, cutoff_dt)
             print("⚙️ Computing 9-Pillar Scorecards & Velocity Matrices on STOCK charts...")
             tape_exec_stock = prepare_unified_execution_tape(stock_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, strategy_mode=GLOBAL_MACRO_STRATEGY_2D)
 
@@ -928,14 +954,34 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
             print(f"{COLOR_YELLOW}[Terminal Silent] No option contracts passed liquidity filter.{COLOR_RESET}\n")
             return
 
+        print(f"🚀 Fetching 1-min premium data for {len(liquid_contracts)} liquid contracts...")
         option_dfs = []
-        for c in liquid_contracts:
+
+        def option_fetch_worker(c):
             df = fetch_fyers_candles(c["key"], trading_days[0], target_date_str, resolution="1")
-            if df is not None and not df.empty:
-                df["Symbol"] = c["symbol"]
-                option_dfs.append(df)
+            if df is None or df.empty:
+                return None
+            df["Symbol"] = c["symbol"]
+            return df
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+            futures = {executor.submit(option_fetch_worker, c): c for c in liquid_contracts}
+            completed = 0
+            for future in concurrent.futures.as_completed(futures):
+                completed += 1
+                sys.stdout.write(f"\r📡 Fetching Option Premiums... {completed}/{len(liquid_contracts)} contracts processed")
+                sys.stdout.flush()
+                res = future.result()
+                if res is not None: option_dfs.append(res)
+        print()
+
+        if not option_dfs:
+            print(f"{COLOR_RED}No option premium data retrieved for the liquid contracts.{COLOR_RESET}")
+            return
 
         option_master_df = pd.concat(option_dfs, ignore_index=True)
+        option_master_df = truncate_to_cutoff(option_master_df, target_date_str, cutoff_dt)
+        print("⚙️ Computing 9-Pillar Scorecards & Velocity Matrices on OPTION PREMIUM charts...")
         tape_exec = prepare_unified_execution_tape(option_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, strategy_mode=OPTIONS_STRATEGY_2D)
 
     memory_bank = _run_dual_layer_trade_management(tape_exec, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, cutoff_time_obj)
@@ -1154,4 +1200,3 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
-
