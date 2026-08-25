@@ -98,7 +98,7 @@ def validate_fyers_token():
 # ==============================================================================
 # 🎛️ TIER 0: TRADING MODE & PIPELINE ROUTING SWITCHES CASH_EQUITY F_AND_O_OPTIONS
 # ==============================================================================
-TRADING_MODE = "F_AND_O_OPTIONS"  
+TRADING_MODE = "CASH_EQUITY"  
 ENABLE_STAGE1_STOCK_FILTER = False  
 
 MIN_STOCK_PRICE = 100.0
