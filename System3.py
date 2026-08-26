@@ -9,6 +9,7 @@ Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
 - EXIT STRATEGY: Dual-Layered (Triggering Macro + Micro) + Velocity Stall Cutoff (Time-Based)
 - CLI & ENV ARGS: Ultra-robust tokenized date and time parsing.
 - LIQUIDITY ARMOR: Continuous Time Grid Injection & Stale-State Tolerance for F&O Options.
+- HYBRID DATA ROUTING: Global switch for REST (Historical) vs WEBSOCKET (Live Ticks).
 """
 
 import argparse
@@ -25,6 +26,7 @@ import sys
 import time
 import urllib.parse
 import warnings
+import threading  # Added for WebSocket background processing
 
 import numpy as np
 import pandas as pd
@@ -32,7 +34,7 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-print("🔖 SYSTEM3 BUILD: v9-LIQUIDITY-ARMOR-PATCHED (2026-08-26)")
+print("🔖 SYSTEM3 BUILD: v10-HYBRID-ROUTER (2026-08-26)")
 
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
@@ -97,8 +99,9 @@ def validate_fyers_token():
 
 
 # ==============================================================================
-# 🎛️ TIER 0: TRADING MODE & PIPELINE ROUTING SWITCHES 
+# 🎛️ TIER 0: TRADING MODE, PIPELINE ROUTING & DATA FEED SWITCH
 # ==============================================================================
+DATA_FEED_MODE = "REST"           # Set to "WEBSOCKET" for live tick-by-tick streaming
 TRADING_MODE = "F_AND_O_OPTIONS"  # "CASH_EQUITY" or "F_AND_O_OPTIONS"
 ENABLE_STAGE1_STOCK_FILTER = False  
 
@@ -188,7 +191,41 @@ def _parse_tf_to_minutes(tf_str):
     return int(tf_str)
 
 # ==============================================================================
-# 1. LIVE INGESTION (FYERS)
+# 1A. LIVE WEBSOCKET ENGINE (STUB FOR FUTURE PHASE)
+# ==============================================================================
+class LiveWebSocketEngine:
+    """
+    Architectural scaffolding for live tick-by-tick processing.
+    When DATA_FEED_MODE = "WEBSOCKET", this engine takes over.
+    """
+    def __init__(self, symbols):
+        self.symbols = symbols
+        self.is_running = False
+        self.tick_database = {sym: pd.DataFrame(columns=["Epoch", "LTP", "Vol_Traded"]) for sym in symbols}
+
+    def start_stream(self):
+        print(f"\n{COLOR_CYAN}📡 Initializing WebSocket Feed for {len(self.symbols)} symbols...{COLOR_RESET}")
+        self.is_running = True
+        
+        # In a real implementation, you would use fyers_apiv3.FyersDataSocket here.
+        # This thread would continuously receive ticks, append them to self.tick_database,
+        # and rebuild the 1-minute OHLCV candles on the fly to feed into the tape execution.
+        print(f"{COLOR_YELLOW}[Stub] WebSocket connected. Listening for ticks... (Press Ctrl+C to stop){COLOR_RESET}")
+        
+        try:
+            while self.is_running:
+                # Simulate waiting for ticks
+                time.sleep(1)
+        except KeyboardInterrupt:
+            self.stop_stream()
+
+    def stop_stream(self):
+        self.is_running = False
+        print(f"\n{COLOR_CYAN}🛑 WebSocket Feed Terminated.{COLOR_RESET}")
+
+
+# ==============================================================================
+# 1B. LIVE INGESTION (REST FYERS)
 # ==============================================================================
 def get_cash_equity_universe():
     print("📡 Fetching Cash Equity Universe via FYERS (NSE_CM.csv)...")
@@ -238,7 +275,7 @@ def get_fno_universe_and_options():
             opt_type = None
             type_idx = -1
             for i in range(len(cols) - 1, -1, -1):
-                if cols[i in ("CE", "PE")]:
+                if cols[i] in ("CE", "PE"):
                     opt_type = cols[i]
                     type_idx = i
                     break
@@ -323,15 +360,11 @@ def regularize_intraday_tape(df, freq="1min"):
     if df is None or df.empty:
         return df
         
-    # 🔥 FIX: Remove duplicate timestamps and sort before setting index
     df = df.drop_duplicates(subset=["Datetime"], keep="last").sort_values("Datetime")
         
     df = df.set_index("Datetime")
     
-    # Create continuous grid
     full_idx = pd.date_range(start=df.index.min(), end=df.index.max(), freq=freq)
-    
-    # Restrict to NSE standard market hours
     full_idx = full_idx[(full_idx.time >= pd.Timestamp("09:15").time()) & 
                         (full_idx.time <= pd.Timestamp("15:30").time())]
     
@@ -344,7 +377,7 @@ def regularize_intraday_tape(df, freq="1min"):
     df["Volume"] = df["Volume"].fillna(0)
     df["Symbol"] = df["Symbol"].ffill().bfill()
     
-    df = df.dropna(subset=["Close"]) # Drop leading NaNs if data started after 9:15 on day 1
+    df = df.dropna(subset=["Close"]) 
     
     return df.reset_index().rename(columns={"index": "Datetime"})
 
@@ -356,13 +389,12 @@ def fetch_stock_bars_worker(task):
         return None
     df = df.drop_duplicates(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
     df["Symbol"] = item["symbol"]
-    # Armor: Prevent Stale Gaps
     df = regularize_intraday_tape(df, freq="1min")
     return df
 
 
 # ==============================================================================
-# 1B. FYERS CANDLE FETCHER & FILTERS
+# 1C. FYERS REST CANDLE FETCHER
 # ==============================================================================
 def fetch_fyers_candles(key, start_dt, end_dt, resolution="1"):
     headers = get_fyers_auth_headers()
@@ -692,16 +724,12 @@ def construct_renko_velocity_engine(df, tf_name):
     brick_diff = df.groupby("Symbol")[f"Renko_Count_{tf_name}"].diff().fillna(1)
     brick_changed = (brick_diff != 0)
     
-    # Capture precise clock-time of the last formed brick
     df["Last_Brick_Time"] = df["Datetime"].where(brick_changed).groupby(df["Symbol"]).ffill()
-    
-    # Compute exact minutes passed since that clock-time
     df[f"Minutes_Since_Brick_{tf_name}"] = (df["Datetime"] - df["Last_Brick_Time"]).dt.total_seconds() / 60
     
     is_trending_bull = df[f"Renko_Count_{tf_name}"] > 0
     is_trending_bear = df[f"Renko_Count_{tf_name}"] < 0
     
-    # Dynamic timeframe scaling based on user config (e.g., 240min config)
     tf_mins = _parse_tf_to_minutes(tf_name)
     has_velocity = df[f"Minutes_Since_Brick_{tf_name}"] <= (RENKO_VELOCITY_MAX_BARS * tf_mins)
 
@@ -797,7 +825,7 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
         f"Armed_Bull_{tf_str}", f"Armed_Bear_{tf_str}",
         f"Score_Bull_{tf_str}", f"Score_Bear_{tf_str}",
         f"Renko_Count_{tf_str}", f"Vol_Renko_Count_{tf_str}",
-        f"Minutes_Since_Brick_{tf_str}", "ATR", "ADX"  # Replaced Bars_ with Minutes_
+        f"Minutes_Since_Brick_{tf_str}", "ATR", "ADX"
     ]
     env_df = df_tf[export_cols].copy().rename(columns={"Eval_Time": "Datetime", "ATR": f"ATR_{tf_str}", "ADX": f"ADX_{tf_str}"})
     return env_df.sort_values("Datetime").reset_index(drop=True)
@@ -836,7 +864,6 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
         df_micro["Datetime"] = df_micro["Datetime"].astype("datetime64[ns]")
         env_df["Datetime"] = env_df["Datetime"].astype("datetime64[ns]")
         
-        # STALE TOLERANCE ARMOR: Drops macro signal if gap is larger than timeframe size
         tf_mins = _parse_tf_to_minutes(tf)
         df_micro = pd.merge_asof(
             df_micro, 
@@ -851,7 +878,7 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
         df_micro[bear_col] = df_micro[bear_col].fillna(False)
         df_micro[f"Score_Bull_{tf}"] = df_micro[f"Score_Bull_{tf}"].fillna(0).astype(int)
         df_micro[f"Score_Bear_{tf}"] = df_micro[f"Score_Bear_{tf}"].fillna(0).astype(int)
-        df_micro[f"Renko_Count_{tf}"] = df_micro[f"Renko_Count_{tf}"] .fillna(0).astype(int)
+        df_micro[f"Renko_Count_{tf}"] = df_micro[f"Renko_Count_{tf}"].fillna(0).astype(int)
         df_micro[f"Vol_Renko_Count_{tf}"] = df_micro[f"Vol_Renko_Count_{tf}"].fillna(0).astype(int)
 
     df_micro["Master_Armed_Bull"] = df_micro[bull_gate_cols].any(axis=1)
@@ -881,7 +908,7 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
 # 5. TRADE MANAGEMENT & EXECUTION ENGINE
 # ==============================================================================
 def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_TIME):
-    print(f"\n📡 Initiating Pipeline Engine [{TRADING_MODE}] for {target_date_str} (Cutoff: {entry_cutoff_time_str})...")
+    print(f"\n📡 Initiating REST Pipeline Engine [{TRADING_MODE}] for {target_date_str} (Cutoff: {entry_cutoff_time_str})...")
     trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
     if not trading_days: return
 
@@ -889,22 +916,14 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
     cutoff_time_obj = pd.to_datetime(entry_cutoff_time_str).time()
     cutoff_dt = pd.to_datetime(f"{target_date_str} {entry_cutoff_time_str}")
 
-    # ==========================================================================
-    # MODE ROUTING: CASH EQUITIES VS F&O OPTIONS TRANSLATION
-    # ==========================================================================
     if TRADING_MODE == "CASH_EQUITY":
         raw_universe = get_cash_equity_universe()
-        if not raw_universe:
-            print(f"{COLOR_RED}[Error] No cash equity instruments mapped.{COLOR_RESET}")
-            return
+        if not raw_universe: return
         
         universe = filter_cash_equities_by_price_range(raw_universe, target_date_str)
-        if not universe:
-            print(f"{COLOR_YELLOW}[Terminal Silent] No equities matched the price range (₹{MIN_STOCK_PRICE} - ₹{MAX_STOCK_PRICE}).{COLOR_RESET}\n")
-            return
+        if not universe: return
 
         print(f"\n{COLOR_BOLD}── EXECUTING DIRECT CASH EQUITY SCAN ({len(universe)} stocks) ──{COLOR_RESET}")
-        print(f"🚀 Multithreading Bulk Ingestion for {len(universe)} symbols...")
         fetch_tasks = [(item, trading_days[0], target_date_str) for item in universe]
         stock_dfs = []
 
@@ -919,70 +938,45 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
                 if res is not None: stock_dfs.append(res)
         print()
 
-        if not stock_dfs:
-            print(f"{COLOR_RED}No historical stock data retrieved.{COLOR_RESET}")
-            return
+        if not stock_dfs: return
 
         stock_master_df = pd.concat(stock_dfs, ignore_index=True)
         stock_master_df = truncate_to_cutoff(stock_master_df, target_date_str, cutoff_dt)
-        print("⚙️ Computing 9-Pillar Scorecards & Velocity Matrices on CASH EQUITIES...")
         tape_exec = prepare_unified_execution_tape(stock_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, strategy_mode=GLOBAL_MACRO_STRATEGY_2D)
 
     else:
-        # F&O Options Translation Mode
         universe, options_by_underlying = get_fno_universe_and_options()
-        if not universe or not options_by_underlying:
-            print(f"{COLOR_RED}[Error] F&O universe or options chain data unavailable.{COLOR_RESET}")
-            return
+        if not universe or not options_by_underlying: return
 
         qualifying_symbols = []
         spot_ref = {}
 
         if ENABLE_STAGE1_STOCK_FILTER:
             print(f"\n{COLOR_BOLD}── STAGE 1: STOCK-LEVEL CONFLUENCE SCAN ({len(universe)} F&O stocks) ──{COLOR_RESET}")
-            print(f"🚀 Multithreading Bulk Ingestion for {len(universe)} symbols...")
             fetch_tasks = [(item, trading_days[0], target_date_str) for item in universe]
             stock_dfs = []
 
             with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
                 futures = {executor.submit(fetch_stock_bars_worker, task): task for task in fetch_tasks}
-                completed = 0
                 for future in concurrent.futures.as_completed(futures):
-                    completed += 1
-                    sys.stdout.write(f"\r📡 Fetching Stock Data... {completed}/{len(fetch_tasks)} symbols processed")
-                    sys.stdout.flush()
                     res = future.result()
                     if res is not None: stock_dfs.append(res)
-            print()
 
-            if not stock_dfs:
-                print(f"{COLOR_RED}No historical stock data retrieved.{COLOR_RESET}")
-                return
-
+            if not stock_dfs: return
             stock_master_df = pd.concat(stock_dfs, ignore_index=True)
             stock_master_df = truncate_to_cutoff(stock_master_df, target_date_str, cutoff_dt)
-            print("⚙️ Computing 9-Pillar Scorecards & Velocity Matrices on STOCK charts...")
             tape_exec_stock = prepare_unified_execution_tape(stock_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, strategy_mode=GLOBAL_MACRO_STRATEGY_2D)
 
-            stock_anomalies = tape_exec_stock[
-                (tape_exec_stock["Direction"] != 0) & (tape_exec_stock["Datetime"].dt.time <= cutoff_time_obj)
-            ].copy()
-
-            if stock_anomalies.empty:
-                print(f"\n{COLOR_YELLOW}[Terminal Silent] STAGE 1: No stocks qualified today under the strict confluence filter.{COLOR_RESET}\n")
-                return
+            stock_anomalies = tape_exec_stock[(tape_exec_stock["Direction"] != 0) & (tape_exec_stock["Datetime"].dt.time <= cutoff_time_obj)]
+            if stock_anomalies.empty: return
 
             qualifying_symbols = sorted(stock_anomalies["Symbol"].unique().tolist())
             spot_ref = stock_anomalies.sort_values("Datetime").groupby("Symbol")["Close"].last().to_dict()
 
-            print(f"{COLOR_GREEN}✅ STAGE 1 complete: {len(qualifying_symbols)}/{len(universe)} stocks qualified "
-                  f"(Basket eligible): {', '.join(qualifying_symbols)}{COLOR_RESET}")
         else:
             print(f"\n{COLOR_BOLD}── STAGE 1 BYPASSED: Direct Option Scan for ALL {len(universe)} F&O Stocks ──{COLOR_RESET}")
-            print("🚀 Fetching spot reference prices across entire F&O Universe to center ATM strikes...")
             spot_ref = fetch_all_spot_reference_prices(universe, target_date_str)
             qualifying_symbols = [item["symbol"] for item in universe if item["symbol"] in spot_ref]
-            print(f"  ├─ Successfully locked ATM centers for {len(qualifying_symbols)} symbols.")
 
         print(f"\n{COLOR_BOLD}── STAGE 2: OPTION-LEVEL SCAN (ATM ±{STRIKE_RANGE_OFFSET} strikes) ──{COLOR_RESET}")
         candidate_contracts = []
@@ -990,24 +984,15 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
             sp = spot_ref.get(sym)
             if sp: candidate_contracts.extend(build_strike_range(sym, sp, options_by_underlying, target_date_str, STRIKE_RANGE_OFFSET))
 
-        if not candidate_contracts:
-            print(f"{COLOR_YELLOW}[Terminal Silent] No option chain coverage found.{COLOR_RESET}\n")
-            return
-
+        if not candidate_contracts: return
         liquid_contracts = filter_liquid_contracts(candidate_contracts, target_date_str)
-        if not liquid_contracts:
-            print(f"{COLOR_YELLOW}[Terminal Silent] No option contracts passed liquidity filter.{COLOR_RESET}\n")
-            return
+        if not liquid_contracts: return
 
-        print(f"🚀 Fetching 1-min premium data for {len(liquid_contracts)} liquid contracts...")
         option_dfs = []
-
         def option_fetch_worker(c):
             df = fetch_fyers_candles(c["key"], trading_days[0], target_date_str, resolution="1")
-            if df is None or df.empty:
-                return None
+            if df is None or df.empty: return None
             df["Symbol"] = c["symbol"]
-            # Armor: Prevent Stale Gaps
             df = regularize_intraday_tape(df, freq="1min")
             return df
 
@@ -1022,26 +1007,17 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
                 if res is not None: option_dfs.append(res)
         print()
 
-        if not option_dfs:
-            print(f"{COLOR_RED}No option premium data retrieved for the liquid contracts.{COLOR_RESET}")
-            return
-
+        if not option_dfs: return
         option_master_df = pd.concat(option_dfs, ignore_index=True)
         option_master_df = truncate_to_cutoff(option_master_df, target_date_str, cutoff_dt)
-        print("⚙️ Computing 9-Pillar Scorecards & Velocity Matrices on OPTION PREMIUM charts...")
         tape_exec = prepare_unified_execution_tape(option_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, strategy_mode=OPTIONS_STRATEGY_2D)
 
     memory_bank = _run_dual_layer_trade_management(tape_exec, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, cutoff_time_obj)
 
     today_master = tape_exec[tape_exec["Datetime"].dt.date == target_dt.date()]
-    if today_master.empty:
-        print(f"\n{COLOR_YELLOW}[Terminal Standby] Market data for {target_date_str} is empty.{COLOR_RESET}\n")
-        return
+    if today_master.empty: return
     final_ltp_dict = today_master.groupby("Symbol")["Close"].last().to_dict()
 
-    # ==========================================================================
-    # FINAL OUTPUT: BASKET 1 & BASKET 2 
-    # ==========================================================================
     active_runners = []
     closed_trades = []
     for sym, episodes in memory_bank.items():
@@ -1103,7 +1079,6 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
     all_times = np.sort(tape_exec["Datetime"].unique())
     memory_bank = {}
     
-    # Calculate exact stall timeout in minutes
     micro_tf_mins = _parse_tf_to_minutes(micro_timeframe)
     max_stall_mins = RENKO_VELOCITY_MAX_BARS * micro_tf_mins
 
@@ -1122,7 +1097,6 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
 
                 if ltp is not None:
                     exit_reason = None
-                    # Time-Based Stagnation Engine
                     if mi_mins_stalled > max_stall_mins:
                         exit_reason = f"Velocity Stall (No brick in {max_stall_mins} minutes)"
 
@@ -1207,11 +1181,6 @@ def run_production_sweep():
     raw_date = args.date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
     raw_time = args.time or os.environ.get("PARAM_BACKTEST_TIME", "").strip()
 
-    print(f"\n⚙️ Raw Input Detected -> Date: '{raw_date}', Time: '{raw_time}'")
-
-    # ==========================================
-    # ABSOLUTE BULLETPROOF DATE/TIME CLEANING
-    # ==========================================
     if raw_date:
         raw_date = raw_date.replace("T", " ")
         if " " in raw_date:
@@ -1224,9 +1193,6 @@ def run_production_sweep():
     if raw_time:
         raw_time = raw_time.replace(".", ":").strip()
         raw_time = raw_time[:5]
-
-    print(f"⚙️ Cleaned Input      -> Date: '{raw_date}', Time: '{raw_time}'")
-    # ==========================================
 
     if not raw_date:
         target_dt = datetime.utcnow() + timedelta(hours=5, minutes=30)
@@ -1241,7 +1207,16 @@ def run_production_sweep():
     if not validate_fyers_token():
         return
 
-    scan_institutional_tape(target_date_str, cutoff_time_str)
+    # ==========================================
+    # 🔀 HYBRID ROUTER: REST VS WEBSOCKET
+    # ==========================================
+    if DATA_FEED_MODE == "WEBSOCKET":
+        # Placeholder for extracting symbols before launching WS
+        symbols_to_stream = ["NSE:NIFTY24DEC20000CE", "NSE:NIFTY24DEC20000PE"]
+        engine = LiveWebSocketEngine(symbols_to_stream)
+        engine.start_stream()
+    else:
+        scan_institutional_tape(target_date_str, cutoff_time_str)
 
 
 if __name__ == "__main__":
