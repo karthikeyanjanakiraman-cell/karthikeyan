@@ -32,7 +32,7 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-print("🔖 SYSTEM3 BUILD: v9-LIQUIDITY-ARMOR (2026-08-26)")
+print("🔖 SYSTEM3 BUILD: v9-LIQUIDITY-ARMOR-PATCHED (2026-08-26)")
 
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
@@ -238,7 +238,7 @@ def get_fno_universe_and_options():
             opt_type = None
             type_idx = -1
             for i in range(len(cols) - 1, -1, -1):
-                if cols[i] in ("CE", "PE"):
+                if cols[i in ("CE", "PE")]:
                     opt_type = cols[i]
                     type_idx = i
                     break
@@ -322,6 +322,9 @@ def regularize_intraday_tape(df, freq="1min"):
     """
     if df is None or df.empty:
         return df
+        
+    # 🔥 FIX: Remove duplicate timestamps and sort before setting index
+    df = df.drop_duplicates(subset=["Datetime"], keep="last").sort_values("Datetime")
         
     df = df.set_index("Datetime")
     
@@ -848,7 +851,7 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
         df_micro[bear_col] = df_micro[bear_col].fillna(False)
         df_micro[f"Score_Bull_{tf}"] = df_micro[f"Score_Bull_{tf}"].fillna(0).astype(int)
         df_micro[f"Score_Bear_{tf}"] = df_micro[f"Score_Bear_{tf}"].fillna(0).astype(int)
-        df_micro[f"Renko_Count_{tf}"] = df_micro[f"Renko_Count_{tf}"].fillna(0).astype(int)
+        df_micro[f"Renko_Count_{tf}"] = df_micro[f"Renko_Count_{tf}"] .fillna(0).astype(int)
         df_micro[f"Vol_Renko_Count_{tf}"] = df_micro[f"Vol_Renko_Count_{tf}"].fillna(0).astype(int)
 
     df_micro["Master_Armed_Bull"] = df_micro[bull_gate_cols].any(axis=1)
