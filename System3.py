@@ -25,14 +25,22 @@ import sys
 import time
 import urllib.parse
 import warnings
+import threading  # ### NEW: Required for WebSocket background thread ###
 
 import numpy as np
 import pandas as pd
 import requests
 
+# ### NEW: Fyers WebSocket Import ###
+try:
+    from fyers_apiv3.FyersWebsocket import data_ws
+except ImportError:
+    print("Warning: fyers-apiv3 not installed. Live WebSocket tick streaming will be disabled.")
+    data_ws = None
+
 warnings.filterwarnings("ignore")
 
-print("🔖 SYSTEM3 BUILD: v10-ULTIMATE-POLARITY-GATEKEEPER (2026-08-25)")
+print("🔖 SYSTEM3 BUILD: v11-ULTIMATE-WITH-LIQUIDITY-AND-WEBSOCKET (2026-08-26)")
 
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
@@ -53,7 +61,6 @@ EXCLUDED_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "B
 _FYERS_ERROR_LOG_CAP = 5
 _fyers_error_log_count = 0
 
-
 def _log_fyers_error(context, status_code=None, body=None):
     global _fyers_error_log_count
     if _fyers_error_log_count >= _FYERS_ERROR_LOG_CAP:
@@ -63,10 +70,8 @@ def _log_fyers_error(context, status_code=None, body=None):
     print(f"{COLOR_YELLOW}  [Fyers Diagnostic #{_fyers_error_log_count}] {context}"
           f"{' | HTTP ' + str(status_code) if status_code else ''} {snippet}{COLOR_RESET}")
 
-
 def get_fyers_auth_headers():
     return {"Authorization": f"{os.environ.get('FYERS_CLIENT_ID', '')}:{os.environ.get('FYERS_ACCESS_TOKEN', '')}"}
-
 
 def validate_fyers_token():
     if not os.environ.get("FYERS_CLIENT_ID") or not os.environ.get("FYERS_ACCESS_TOKEN"):
@@ -97,7 +102,7 @@ def validate_fyers_token():
 
 
 # ==============================================================================
-# 🎛️ TIER 0: TRADING MODE & PIPELINE ROUTING SWITCHES CASH_EQUITY F_AND_O_OPTIONS
+# 🎛️ TIER 0: TRADING MODE & PIPELINE ROUTING SWITCHES 
 # ==============================================================================
 TRADING_MODE = "F_AND_O_OPTIONS"  
 ENABLE_STAGE1_STOCK_FILTER = False  
@@ -105,6 +110,11 @@ ENABLE_STAGE1_STOCK_FILTER = False
 MIN_STOCK_PRICE = 100.0
 MAX_STOCK_PRICE = 500.0
 MIN_STOCK_VOLUME = 500000
+
+# ### NEW: WebSocket Master Toggle & Global Cache ###
+ENABLE_LIVE_TICK_WEBSOCKET = True  
+_LIVE_TICK_CACHE = {}
+_fyers_ws_instance = None
 
 # ==============================================================================
 # GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS
@@ -130,6 +140,11 @@ GLOBAL_MACRO_STRATEGY_2D = "BOTH"  # "BULLISH", "BEARISH", or "BOTH"
 # ==============================================================================
 # TIER 1: MACRO CONTEXT SWITCHBOARD (THE GENERAL) - 9 PILLARS
 # ==============================================================================
+# ### NEW: Macro Liquidity Guards ###
+MACRO_LIQUIDITY_WINDOW_BARS    = 3       
+MACRO_MIN_ROLLING_VOLUME       = 15000   
+MACRO_MIN_ACTIVE_BARS          = 2       
+
 MACRO_MANDATORY_PRICE_RENKO    = False
 MACRO_MANDATORY_VOL_RENKO      = False
 MACRO_MANDATORY_RENKO_VELOCITY = False
@@ -144,6 +159,11 @@ MACRO_MINIMUM_SCORE            = 2
 # ==============================================================================
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
 # ==============================================================================
+# ### NEW: Micro Liquidity Guards ###
+MICRO_LIQUIDITY_WINDOW_BARS    = 5       
+MICRO_MIN_ROLLING_VOLUME       = 5000    
+MICRO_MIN_ACTIVE_BARS          = 3       
+
 SYNC_MICRO_WITH_MACRO          = False
 
 MICRO_MANDATORY_PRICE_RENKO    = False
@@ -180,8 +200,58 @@ OPTIONS_STRATEGY_2D = "BULLISH"
 
 
 # ==============================================================================
-# 1. LIVE INGESTION (FYERS)
+# 1. LIVE INGESTION (FYERS) & TICK WEBSOCKET
 # ==============================================================================
+# ### NEW: WebSocket Handlers & Spawner ###
+def _on_tick_message(message):
+    """Callback triggered every time a new tick arrives from the exchange."""
+    global _LIVE_TICK_CACHE
+    if isinstance(message, list):
+        for tick in message:
+            symbol = tick.get('symbol')
+            if symbol and 'ltp' in tick:
+                _LIVE_TICK_CACHE[symbol] = {
+                    "ltp": tick['ltp'],
+                    "volume_today": tick.get('vol_traded_today', 0),
+                    "bid": tick.get('bid_price', 0),
+                    "ask": tick.get('ask_price', 0),
+                    "timestamp": time.time()
+                }
+
+def _on_ws_error(message):
+    print(f"{COLOR_RED}[WebSocket Error] {message}{COLOR_RESET}")
+
+def _on_ws_close(message):
+    print(f"{COLOR_YELLOW}[WebSocket Closed] {message}{COLOR_RESET}")
+
+def start_tick_stream(symbols_to_track):
+    """Starts the Fyers WebSocket on a background thread."""
+    if not ENABLE_LIVE_TICK_WEBSOCKET or not symbols_to_track or data_ws is None:
+        return
+        
+    global _fyers_ws_instance
+    print(f"🔌 Starting WebSocket Stream for {len(symbols_to_track)} symbols...")
+
+    access_token = f"{os.environ.get('FYERS_CLIENT_ID')}:{os.environ.get('FYERS_ACCESS_TOKEN')}"
+    
+    _fyers_ws_instance = data_ws.FyersDataSocket(
+        access_token=access_token,
+        log_path="", 
+        litemode=False,
+        write_to_file=False,
+        reconnect=True,
+        on_connect=lambda: _fyers_ws_instance.subscribe(symbols=symbols_to_track, data_type="SymbolUpdate"),
+        on_close=_on_ws_close,
+        on_error=_on_ws_error,
+        on_message=_on_tick_message
+    )
+
+    ws_thread = threading.Thread(target=_fyers_ws_instance.connect, daemon=True)
+    ws_thread.start()
+    time.sleep(2)  # Give connection time to establish
+    print(f"{COLOR_GREEN}✅ WebSocket Stream Active.{COLOR_RESET}")
+
+
 def get_cash_equity_universe():
     print("📡 Fetching Cash Equity Universe via FYERS (NSE_CM.csv)...")
     spot_inst = []
@@ -692,6 +762,24 @@ def construct_bb_meta_pillars(df, tf_name):
     df[f"Renko_BB_Bear_{tf_name}"] = df[renko_col] >= renko_lower
     return df
 
+# ### NEW: Rolling Liquidity Guard Function ###
+def construct_rolling_liquidity_guard(df, tf_name, window_bars, min_vol, min_active):
+    """
+    Prevents entering dead zones caused by isolated block prints.
+    Requires both a minimum rolling volume and consistent participation across the window.
+    """
+    df[f"Rolling_Vol_{tf_name}"] = df.groupby("Symbol")["Volume"].transform(
+        lambda x: x.rolling(window=window_bars, min_periods=1).sum()
+    )
+    
+    active_threshold = max(1, min_vol * 0.05) 
+    df[f"Active_Bars_{tf_name}"] = df.groupby("Symbol")["Volume"].transform(
+        lambda x: (x >= active_threshold).rolling(window=window_bars, min_periods=1).sum()
+    )
+    
+    df[f"Liquidity_Pass_{tf_name}"] = (df[f"Rolling_Vol_{tf_name}"] >= min_vol) & (df[f"Active_Bars_{tf_name}"] >= min_active)
+    return df
+
 
 # ==============================================================================
 # 3. DUAL-TIER SCORECARD SYSTEM (OUT OF 9 PILLARS)
@@ -734,6 +822,13 @@ def apply_dual_tier_scorecard(df, tf_str, tier_type):
 
     df[f"Armed_Bull_{tf_str}"] = (df[f"Score_Bull_{tf_str}"] >= min_score) & (~bull_veto)
     df[f"Armed_Bear_{tf_str}"] = (df[f"Score_Bear_{tf_str}"] >= min_score) & (~bear_veto)
+
+    # ### NEW: Apply Strict Rolling Liquidity Veto ###
+    liq_col = f"Liquidity_Pass_{tf_str}"
+    if liq_col in df.columns:
+        df[f"Armed_Bull_{tf_str}"] = df[f"Armed_Bull_{tf_str}"] & df[liq_col]
+        df[f"Armed_Bear_{tf_str}"] = df[f"Armed_Bear_{tf_str}"] & df[liq_col]
+        
     return df
 
 
@@ -750,6 +845,12 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
     df_tf = construct_volume_delta_renko_matrix(df_tf, tf_str, MACRO_RENKO_CONFIRM_BRICKS)
     df_tf = construct_renko_velocity_engine(df_tf, tf_str)
     df_tf = construct_bb_meta_pillars(df_tf, tf_str)
+
+    # ### NEW: Wire in Macro Liquidity Guard ###
+    df_tf = construct_rolling_liquidity_guard(
+        df_tf, tf_str, MACRO_LIQUIDITY_WINDOW_BARS, MACRO_MIN_ROLLING_VOLUME, MACRO_MIN_ACTIVE_BARS
+    )
+
     df_tf = apply_dual_tier_scorecard(df_tf, tf_str, "MACRO")
 
     df_tf["Eval_Time"] = (df_tf["Datetime"] + pd.to_timedelta(tf_str)).astype("datetime64[ns]")
@@ -759,7 +860,8 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
         f"Armed_Bull_{tf_str}", f"Armed_Bear_{tf_str}",
         f"Score_Bull_{tf_str}", f"Score_Bear_{tf_str}",
         f"Renko_Count_{tf_str}", f"Vol_Renko_Count_{tf_str}",
-        f"Bars_Since_Brick_{tf_str}", "ATR", "ADX"
+        f"Bars_Since_Brick_{tf_str}", "ATR", "ADX",
+        f"Liquidity_Pass_{tf_str}"  # ### NEW: Exporting Liquidity status ###
     ]
     env_df = df_tf[export_cols].copy().rename(columns={"Eval_Time": "Datetime", "ATR": f"ATR_{tf_str}", "ADX": f"ADX_{tf_str}"})
     return env_df.sort_values("Datetime").reset_index(drop=True)
@@ -784,6 +886,12 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
     df_micro = construct_volume_delta_renko_matrix(df_micro, micro_tf, MICRO_RENKO_CONFIRM_BRICKS)
     df_micro = construct_renko_velocity_engine(df_micro, micro_tf)
     df_micro = construct_bb_meta_pillars(df_micro, micro_tf)
+
+    # ### NEW: Wire in Micro Liquidity Guard ###
+    df_micro = construct_rolling_liquidity_guard(
+        df_micro, micro_tf, MICRO_LIQUIDITY_WINDOW_BARS, MICRO_MIN_ROLLING_VOLUME, MICRO_MIN_ACTIVE_BARS
+    )
+
     df_micro = apply_dual_tier_scorecard(df_micro, micro_tf, "MICRO")
     df_micro = df_micro.sort_values("Datetime").reset_index(drop=True)
 
@@ -808,26 +916,16 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
     df_micro["Master_Armed_Bull"] = df_micro[bull_gate_cols].any(axis=1)
     df_micro["Master_Armed_Bear"] = df_micro[bear_gate_cols].any(axis=1)
 
-    # =========================================================================
-    # 🛑 STRICT MACRO/MICRO POLARITY GATEKEEPER (RENKO STATE ALIGNMENT)
-    # =========================================================================
-    # 🟢 Active Green Sequence (Macro Renko > 0) ────────▶ LONG CALLS ONLY
-    # 🔴 Active Red Sequence   (Macro Renko < 0) ────────▶ LONG PUTS ONLY
-    # 🟡 Flat / 0-State        (Macro Renko ==0) ────────▶ STANDBY
-    # =========================================================================
     macro_is_green = pd.Series(True, index=df_micro.index)
     macro_is_red = pd.Series(True, index=df_micro.index)
 
     for tf in macro_timeframes:
         renko_col = f"Renko_Count_{tf}"
-        # Force strict alignment: All mapped macro timeframes must match polarity
         macro_is_green = macro_is_green & (df_micro[renko_col] > 0)
         macro_is_red = macro_is_red & (df_micro[renko_col] < 0)
 
-    # Apply strict veto: Micro triggers are killed if Macro Renko opposes them
     df_micro["Master_Armed_Bull"] = df_micro["Master_Armed_Bull"] & macro_is_green
     df_micro["Master_Armed_Bear"] = df_micro["Master_Armed_Bear"] & macro_is_red
-    # =========================================================================
 
     if strategy_mode == "BULLISH":
         df_micro["Master_Armed_Bear"] = False
@@ -874,6 +972,11 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
         if not universe:
             print(f"{COLOR_YELLOW}[Terminal Silent] No equities matched the price range (₹{MIN_STOCK_PRICE} - ₹{MAX_STOCK_PRICE}).{COLOR_RESET}\n")
             return
+
+        # ### NEW: Start the WebSocket Stream for qualifying equities ###
+        if target_date_str == datetime.now().strftime("%Y-%m-%d"):
+            keys_to_track = [item["key"] for item in universe]
+            start_tick_stream(keys_to_track)
 
         print(f"\n{COLOR_BOLD}── EXECUTING DIRECT CASH EQUITY SCAN ({len(universe)} stocks) ──{COLOR_RESET}")
         print(f"🚀 Multithreading Bulk Ingestion for {len(universe)} symbols...")
@@ -978,6 +1081,11 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
             print(f"{COLOR_YELLOW}[Terminal Silent] No option contracts passed liquidity filter.{COLOR_RESET}\n")
             return
 
+        # ### NEW: Start the WebSocket Stream for qualifying options contracts ###
+        if target_date_str == datetime.now().strftime("%Y-%m-%d"):
+            keys_to_track = [c["key"] for c in liquid_contracts]
+            start_tick_stream(keys_to_track)
+
         print(f"🚀 Fetching 1-min premium data for {len(liquid_contracts)} liquid contracts...")
         option_dfs = []
 
@@ -1040,7 +1148,14 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
     if active_runners:
         print(f"{COLOR_BOLD}🟢 BASKET 1: ACTIVE RUNNERS (Riding the Trend){COLOR_RESET}")
         for st in active_runners:
-            ltp = final_ltp_dict.get(st["sym"], st["origin"])
+            # ### NEW: Optional fallback to Live Websocket Cache for terminal output ###
+            live_data = _LIVE_TICK_CACHE.get(st["sym"])
+            if live_data and ENABLE_LIVE_TICK_WEBSOCKET:
+                ltp = live_data["ltp"]
+                target_time_display = "LIVE TICK"
+            else:
+                ltp = final_ltp_dict.get(st["sym"], st["origin"])
+                
             pnl_pct = ((ltp - st["origin"]) / st["origin"]) * 100
             color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
             
