@@ -102,7 +102,7 @@ def validate_fyers_token():
 # ==============================================================================
 # 🎛️ TIER 0: TRADING MODE, PIPELINE ROUTING & DATA FEED SWITCH
 # ==============================================================================
-DATA_FEED_MODE = "REST"           # Set to "REST" "WEBSOCKET" for live tick-by-tick streaming
+DATA_FEED_MODE = "WEBSOCKET"           # Set to "REST" "WEBSOCKET" for live tick-by-tick streaming
 TRADING_MODE = "F_AND_O_OPTIONS"  # "CASH_EQUITY" or "F_AND_O_OPTIONS"
 ENABLE_STAGE1_STOCK_FILTER = False  
 
