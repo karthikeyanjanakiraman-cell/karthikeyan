@@ -138,7 +138,7 @@ GLOBAL_MACRO_STRATEGY_2D = "BOTH"  # "BULLISH", "BEARISH", or "BOTH"
 # ==============================================================================
 # TIER 1: MACRO CONTEXT SWITCHBOARD (THE GENERAL) - 9 PILLARS
 # ==============================================================================
-MACRO_MANDATORY_LIVE_PERCENTILE = 15.0   # Enforces top X% Net Delta for the Macro period
+MACRO_MANDATORY_LIVE_PERCENTILE = 5.0   # Enforces top X% Net Delta for the Macro period
 MACRO_MANDATORY_PRICE_RENKO    = False
 MACRO_MANDATORY_VOL_RENKO      = False
 MACRO_MANDATORY_RENKO_VELOCITY = False
@@ -154,7 +154,7 @@ MACRO_MINIMUM_SCORE            = 4
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
 # ==============================================================================
 SYNC_MICRO_WITH_MACRO          = False
-MICRO_MANDATORY_LIVE_PERCENTILE = 10.0   # Enforces top X% Net Delta for the Micro period
+MICRO_MANDATORY_LIVE_PERCENTILE = 5.0   # Enforces top X% Net Delta for the Micro period
 MICRO_MANDATORY_PRICE_RENKO    = False
 MICRO_MANDATORY_VOL_RENKO      = False
 MICRO_MANDATORY_RENKO_VELOCITY = False
