@@ -11,6 +11,7 @@ Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
 - LIQUIDITY ARMOR: Continuous Time Grid Injection & Stale-State Tolerance for F&O Options.
 - HYBRID DATA ROUTING: Global switch for REST (Historical) vs WEBSOCKET (Live Ticks).
 - PERCENTILE ARMOR: Dynamic cross-chain Net Delta (Up-Ticks vs Down-Ticks) percentile tracking.
+- BASKET 3 DIAGNOSTICS: Extensive funnel logging for rejected candidates.
 """
 
 import argparse
@@ -27,7 +28,8 @@ import sys
 import time
 import urllib.parse
 import warnings
-import threading  
+import threading
+from collections import defaultdict
 
 import numpy as np
 import pandas as pd
@@ -35,7 +37,7 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-print("🔖 SYSTEM3 BUILD: v12-DYNAMIC-DELTA-ARMOR-PATCHED (2026-08-27)")
+print("🔖 SYSTEM3 BUILD: v13-BASKET3-DIAGNOSTICS (2026-08-27)")
 
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
@@ -103,7 +105,7 @@ def validate_fyers_token():
 # 🎛️ TIER 0: TRADING MODE, PIPELINE ROUTING & DATA FEED SWITCH
 # ==============================================================================
 DATA_FEED_MODE = "REST"           # Set to "WEBSOCKET" for live tick-by-tick streaming
-TRADING_MODE = "CASH_EQUITY"  # "CASH_EQUITY" or "F_AND_O_OPTIONS"
+TRADING_MODE = "CASH_EQUITY"      # "CASH_EQUITY" or "F_AND_O_OPTIONS"
 ENABLE_STAGE1_STOCK_FILTER = False  
 
 MIN_STOCK_PRICE = 100.0
@@ -515,7 +517,7 @@ def filter_liquid_contracts(contracts, target_date_str):
             cache_needs_update = True
             
         if close_price is not None and volume is not None:
-            # Baseline Daily Gate -> Real filtering happens per-bar dynamically
+            # Baseline Daily Gate
             if close_price >= MIN_OPT_PREMIUM and volume >= MIN_OPT_VOLUME:
                 valid_contracts.append(c)
 
@@ -674,6 +676,7 @@ def construct_45deg_renko_matrix(df, tf_name, confirm_bricks):
     df[f"Renko_Bear_{tf_name}"] = renko_counts <= -confirm_bricks
     return df
 
+
 def construct_volume_delta_renko_matrix(df, tf_name, confirm_bricks):
     df['Wick_Spread'] = df['High'] - df['Low']
     df['Wick_Spread'] = df['Wick_Spread'].replace(0, 1e-9)
@@ -759,6 +762,10 @@ def construct_bb_meta_pillars(df, tf_name):
     df[f"Renko_BB_Bear_{tf_name}"] = df[renko_col] >= renko_lower
     return df
 
+
+# ==============================================================================
+# 3. DUAL-TIER SCORECARD SYSTEM (OUT OF 9 PILLARS) + DYNAMIC DELTA VETO
+# ==============================================================================
 def apply_dual_tier_scorecard(df, tf_str, tier_type):
     req_price = globals()[f"{tier_type}_MANDATORY_PRICE_RENKO"]
     req_vol = globals()[f"{tier_type}_MANDATORY_VOL_RENKO"]
@@ -932,8 +939,9 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
     return df_micro.sort_values("Datetime").reset_index(drop=True)
 
 
-# ============================
-
+# ==============================================================================
+# 5. TRADE MANAGEMENT & EXECUTION ENGINE
+# ==============================================================================
 def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_TIME):
     print(f"\n📡 Initiating REST Pipeline Engine [{TRADING_MODE}] for {target_date_str} (Cutoff: {entry_cutoff_time_str})...")
     trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
@@ -943,33 +951,41 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
     cutoff_time_obj = pd.to_datetime(entry_cutoff_time_str).time()
     cutoff_dt = pd.to_datetime(f"{target_date_str} {entry_cutoff_time_str}")
 
+    dropped_liquidity_syms = set()
+    tape_exec = pd.DataFrame()
+
     if TRADING_MODE == "CASH_EQUITY":
         raw_universe = get_cash_equity_universe()
         if not raw_universe: return
         
         universe = filter_cash_equities_by_price_range(raw_universe, target_date_str)
-        if not universe: return
+        
+        raw_syms = [u['symbol'] for u in raw_universe]
+        filt_syms = [u['symbol'] for u in universe] if universe else []
+        dropped_liquidity_syms = set(raw_syms) - set(filt_syms)
 
-        print(f"\n{COLOR_BOLD}── EXECUTING DIRECT CASH EQUITY SCAN ({len(universe)} stocks) ──{COLOR_RESET}")
-        fetch_tasks = [(item, trading_days[0], target_date_str) for item in universe]
-        stock_dfs = []
+        if not universe: 
+            tape_exec = pd.DataFrame()
+        else:
+            print(f"\n{COLOR_BOLD}── EXECUTING DIRECT CASH EQUITY SCAN ({len(universe)} stocks) ──{COLOR_RESET}")
+            fetch_tasks = [(item, trading_days[0], target_date_str) for item in universe]
+            stock_dfs = []
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {executor.submit(fetch_stock_bars_worker, task): task for task in fetch_tasks}
-            completed = 0
-            for future in concurrent.futures.as_completed(futures):
-                completed += 1
-                sys.stdout.write(f"\r📡 Fetching Stock Data... {completed}/{len(fetch_tasks)} symbols processed")
-                sys.stdout.flush()
-                res = future.result()
-                if res is not None: stock_dfs.append(res)
-        print()
+            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+                futures = {executor.submit(fetch_stock_bars_worker, task): task for task in fetch_tasks}
+                completed = 0
+                for future in concurrent.futures.as_completed(futures):
+                    completed += 1
+                    sys.stdout.write(f"\r📡 Fetching Stock Data... {completed}/{len(fetch_tasks)} symbols processed")
+                    sys.stdout.flush()
+                    res = future.result()
+                    if res is not None: stock_dfs.append(res)
+            print()
 
-        if not stock_dfs: return
-
-        stock_master_df = pd.concat(stock_dfs, ignore_index=True)
-        stock_master_df = truncate_to_cutoff(stock_master_df, target_date_str, cutoff_dt)
-        tape_exec = prepare_unified_execution_tape(stock_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, strategy_mode=GLOBAL_MACRO_STRATEGY_2D)
+            if stock_dfs:
+                stock_master_df = pd.concat(stock_dfs, ignore_index=True)
+                stock_master_df = truncate_to_cutoff(stock_master_df, target_date_str, cutoff_dt)
+                tape_exec = prepare_unified_execution_tape(stock_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, strategy_mode=GLOBAL_MACRO_STRATEGY_2D)
 
     else:
         universe, options_by_underlying = get_fno_universe_and_options()
@@ -989,63 +1005,71 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
                     res = future.result()
                     if res is not None: stock_dfs.append(res)
 
-            if not stock_dfs: return
-            stock_master_df = pd.concat(stock_dfs, ignore_index=True)
-            stock_master_df = truncate_to_cutoff(stock_master_df, target_date_str, cutoff_dt)
-            tape_exec_stock = prepare_unified_execution_tape(stock_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, strategy_mode=GLOBAL_MACRO_STRATEGY_2D)
+            if stock_dfs:
+                stock_master_df = pd.concat(stock_dfs, ignore_index=True)
+                stock_master_df = truncate_to_cutoff(stock_master_df, target_date_str, cutoff_dt)
+                tape_exec_stock = prepare_unified_execution_tape(stock_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, strategy_mode=GLOBAL_MACRO_STRATEGY_2D)
 
-            stock_anomalies = tape_exec_stock[(tape_exec_stock["Direction"] != 0) & (tape_exec_stock["Datetime"].dt.time <= cutoff_time_obj)]
-            if stock_anomalies.empty: return
-
-            qualifying_symbols = sorted(stock_anomalies["Symbol"].unique().tolist())
-            spot_ref = stock_anomalies.sort_values("Datetime").groupby("Symbol")["Close"].last().to_dict()
+                stock_anomalies = tape_exec_stock[(tape_exec_stock["Direction"] != 0) & (tape_exec_stock["Datetime"].dt.time <= cutoff_time_obj)]
+                if not stock_anomalies.empty:
+                    qualifying_symbols = sorted(stock_anomalies["Symbol"].unique().tolist())
+                    spot_ref = stock_anomalies.sort_values("Datetime").groupby("Symbol")["Close"].last().to_dict()
 
         else:
             print(f"\n{COLOR_BOLD}── STAGE 1 BYPASSED: Direct Option Scan for ALL {len(universe)} F&O Stocks ──{COLOR_RESET}")
             spot_ref = fetch_all_spot_reference_prices(universe, target_date_str)
             qualifying_symbols = [item["symbol"] for item in universe if item["symbol"] in spot_ref]
 
-        print(f"\n{COLOR_BOLD}── STAGE 2: OPTION-LEVEL SCAN (ATM ±{STRIKE_RANGE_OFFSET} strikes) ──{COLOR_RESET}")
-        candidate_contracts = []
-        for sym in qualifying_symbols:
-            sp = spot_ref.get(sym)
-            if sp: candidate_contracts.extend(build_strike_range(sym, sp, options_by_underlying, target_date_str, STRIKE_RANGE_OFFSET))
+        if qualifying_symbols:
+            print(f"\n{COLOR_BOLD}── STAGE 2: OPTION-LEVEL SCAN (ATM ±{STRIKE_RANGE_OFFSET} strikes) ──{COLOR_RESET}")
+            candidate_contracts = []
+            for sym in qualifying_symbols:
+                sp = spot_ref.get(sym)
+                if sp: candidate_contracts.extend(build_strike_range(sym, sp, options_by_underlying, target_date_str, STRIKE_RANGE_OFFSET))
 
-        if not candidate_contracts: return
-        liquid_contracts = filter_liquid_contracts(candidate_contracts, target_date_str)
-        if not liquid_contracts: return
+            liquid_contracts = filter_liquid_contracts(candidate_contracts, target_date_str)
+            
+            cand_syms = [c['symbol'] for c in candidate_contracts]
+            liq_syms = [c['symbol'] for c in liquid_contracts] if liquid_contracts else []
+            dropped_liquidity_syms = set(cand_syms) - set(liq_syms)
 
-        option_dfs = []
-        def option_fetch_worker(c):
-            df = fetch_fyers_candles(c["key"], trading_days[0], target_date_str, resolution="1")
-            if df is None or df.empty: return None
-            df["Symbol"] = c["symbol"]
-            df = regularize_intraday_tape(df, freq="1min")
-            if DATA_FEED_MODE == "REST":
-                df = compute_base_net_delta(df)
-            return df
+            if liquid_contracts:
+                option_dfs = []
+                def option_fetch_worker(c):
+                    df = fetch_fyers_candles(c["key"], trading_days[0], target_date_str, resolution="1")
+                    if df is None or df.empty: return None
+                    df["Symbol"] = c["symbol"]
+                    df = regularize_intraday_tape(df, freq="1min")
+                    if DATA_FEED_MODE == "REST":
+                        df = compute_base_net_delta(df)
+                    return df
 
-        with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-            futures = {executor.submit(option_fetch_worker, c): c for c in liquid_contracts}
-            completed = 0
-            for future in concurrent.futures.as_completed(futures):
-                completed += 1
-                sys.stdout.write(f"\r📡 Fetching Option Premiums... {completed}/{len(liquid_contracts)} contracts processed")
-                sys.stdout.flush()
-                res = future.result()
-                if res is not None: option_dfs.append(res)
-        print()
+                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                    futures = {executor.submit(option_fetch_worker, c): c for c in liquid_contracts}
+                    completed = 0
+                    for future in concurrent.futures.as_completed(futures):
+                        completed += 1
+                        sys.stdout.write(f"\r📡 Fetching Option Premiums... {completed}/{len(liquid_contracts)} contracts processed")
+                        sys.stdout.flush()
+                        res = future.result()
+                        if res is not None: option_dfs.append(res)
+                print()
 
-        if not option_dfs: return
-        option_master_df = pd.concat(option_dfs, ignore_index=True)
-        option_master_df = truncate_to_cutoff(option_master_df, target_date_str, cutoff_dt)
-        tape_exec = prepare_unified_execution_tape(option_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, strategy_mode=OPTIONS_STRATEGY_2D)
+                if option_dfs:
+                    option_master_df = pd.concat(option_dfs, ignore_index=True)
+                    option_master_df = truncate_to_cutoff(option_master_df, target_date_str, cutoff_dt)
+                    tape_exec = prepare_unified_execution_tape(option_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, strategy_mode=OPTIONS_STRATEGY_2D)
 
-    memory_bank = _run_dual_layer_trade_management(tape_exec, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, cutoff_time_obj)
-
-    today_master = tape_exec[tape_exec["Datetime"].dt.date == target_dt.date()]
-    if today_master.empty: return
-    final_ltp_dict = today_master.groupby("Symbol")["Close"].last().to_dict()
+    # ---------------------------------------------------------
+    # Execute Memory Bank
+    # ---------------------------------------------------------
+    if not tape_exec.empty:
+        memory_bank = _run_dual_layer_trade_management(tape_exec, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, cutoff_time_obj)
+        today_master = tape_exec[tape_exec["Datetime"].dt.date == target_dt.date()]
+        final_ltp_dict = today_master.groupby("Symbol")["Close"].last().to_dict() if not today_master.empty else {}
+    else:
+        memory_bank = {}
+        final_ltp_dict = {}
 
     active_runners = []
     closed_trades = []
@@ -1057,6 +1081,45 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
                 closed_trades.append({**st, "sym": sym})
     closed_trades.sort(key=lambda x: (x["sym"], x["time"]))
 
+    # ---------------------------------------------------------
+    # Analyze Basket 3 (Diagnostic Rejections)
+    # ---------------------------------------------------------
+    basket3_diagnostics = []
+    if not tape_exec.empty:
+        basket3_symbols = set(tape_exec["Symbol"].unique()) - set(memory_bank.keys())
+        for sym in basket3_symbols:
+            df_sym = tape_exec[tape_exec["Symbol"] == sym]
+            
+            macro_armed = df_sym["Master_Armed_Bull"].any() or df_sym["Master_Armed_Bear"].any()
+            micro_armed = df_sym[f"Armed_Bull_{MICRO_TIMEFRAME}"].any() or df_sym[f"Armed_Bear_{MICRO_TIMEFRAME}"].any()
+            
+            if not macro_armed:
+                max_mac_score = 0
+                for tf in MACRO_TIMEFRAMES:
+                    m1 = df_sym[f"Score_Bull_{tf}"].max()
+                    m2 = df_sym[f"Score_Bear_{tf}"].max()
+                    max_mac_score = max(max_mac_score, m1, m2)
+                
+                if max_mac_score >= MACRO_MINIMUM_SCORE:
+                    reason = f"Macro Vetoed (Score {int(max_mac_score)}/9 met, but blocked by Mandatory Pillar or {MACRO_MANDATORY_LIVE_PERCENTILE}th Pct Net Delta)"
+                else:
+                    reason = f"Failed Macro Score (Max achieved {int(max_mac_score)}/9, Required {MACRO_MINIMUM_SCORE})"
+            elif not micro_armed:
+                m1 = df_sym[f"Score_Bull_{MICRO_TIMEFRAME}"].max()
+                m2 = df_sym[f"Score_Bear_{MICRO_TIMEFRAME}"].max()
+                max_mic_score = max(m1, m2)
+                if max_mic_score >= MICRO_MINIMUM_SCORE:
+                    reason = f"Micro Vetoed (Score {int(max_mic_score)}/9 met, but blocked by Mandatory Pillar or {MICRO_MANDATORY_LIVE_PERCENTILE}th Pct Net Delta)"
+                else:
+                    reason = f"Failed Micro Score (Max achieved {int(max_mic_score)}/9, Required {MICRO_MINIMUM_SCORE})"
+            else:
+                reason = "Temporal Mismatch (Macro & Micro met requirements, but NEVER aligned at the exact same minute)"
+                
+            basket3_diagnostics.append({"sym": sym, "reason": reason})
+
+    # ---------------------------------------------------------
+    # Final Output Display
+    # ---------------------------------------------------------
     tf_display_str = " | ".join(MACRO_TIMEFRAMES)
     print(f"\n{COLOR_CYAN}================================================================================================{COLOR_RESET}")
     print(f"{COLOR_BOLD}9-PILLAR ENGINE [{MICRO_TIMEFRAME} Micro ⚡ Macro: {tf_display_str}] — RESULTS [{TRADING_MODE}]{COLOR_RESET}")
@@ -1092,6 +1155,33 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
 
     if not active_runners and not closed_trades:
         print(f"{COLOR_DIM}[Terminal Silent] No instruments triggered micro+macro conditions today.{COLOR_RESET}\n")
+
+    # Basket 3 Print Block
+    if dropped_liquidity_syms or basket3_diagnostics:
+        print(f"\n{COLOR_DIM}================================================================================================{COLOR_RESET}")
+        print(f"{COLOR_BOLD}🟡 BASKET 3: REJECTED CANDIDATES (Diagnostic Funnel Log){COLOR_RESET}")
+        print(f"{COLOR_DIM}================================================================================================{COLOR_RESET}\n")
+        
+        if dropped_liquidity_syms:
+            print(f"  {COLOR_YELLOW}⚠️ Failed Initial Baseline Filters (Price Range / Daily Volume / Premium){COLOR_RESET}")
+            sym_list = sorted(list(dropped_liquidity_syms))
+            display = sym_list[:15]
+            rem = len(sym_list) - 15
+            print(f"      └─ {', '.join(display)}" + (f" ... (+{rem} more)" if rem > 0 else ""))
+            print()
+            
+        if basket3_diagnostics:
+            grouped_b3 = defaultdict(list)
+            for b3 in basket3_diagnostics:
+                grouped_b3[b3['reason']].append(b3['sym'])
+                
+            for reason, syms in sorted(grouped_b3.items()):
+                print(f"  {COLOR_YELLOW}⚠️ {reason}{COLOR_RESET}")
+                sym_list = sorted(syms)
+                display = sym_list[:15]
+                rem = len(sym_list) - 15
+                print(f"      └─ {', '.join(display)}" + (f" ... (+{rem} more)" if rem > 0 else ""))
+                print()
 
 
 def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframes, cutoff_time_obj):
