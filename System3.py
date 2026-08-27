@@ -35,7 +35,7 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-print("🔖 SYSTEM3 BUILD: v12-DYNAMIC-DELTA-ARMOR (2026-08-27)")
+print("🔖 SYSTEM3 BUILD: v12-DYNAMIC-DELTA-ARMOR-PATCHED (2026-08-27)")
 
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
@@ -102,8 +102,8 @@ def validate_fyers_token():
 # ==============================================================================
 # 🎛️ TIER 0: TRADING MODE, PIPELINE ROUTING & DATA FEED SWITCH
 # ==============================================================================
-DATA_FEED_MODE = "REST"           # Set to "REST" "WEBSOCKET" for live tick-by-tick streaming
-TRADING_MODE = "CASH_EQUITY"  # "CASH_EQUITY" or "F_AND_O_OPTIONS"
+DATA_FEED_MODE = "REST"           # Set to "WEBSOCKET" for live tick-by-tick streaming
+TRADING_MODE = "F_AND_O_OPTIONS"  # "CASH_EQUITY" or "F_AND_O_OPTIONS"
 ENABLE_STAGE1_STOCK_FILTER = False  
 
 MIN_STOCK_PRICE = 100.0
@@ -113,8 +113,8 @@ MIN_STOCK_VOLUME = 500000
 # ==============================================================================
 # GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS
 # ==============================================================================
-MICRO_TIMEFRAME = "5min"
-MACRO_TIMEFRAMES = ["20min"]
+MICRO_TIMEFRAME = "240min"
+MACRO_TIMEFRAMES = ["2400min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -144,7 +144,7 @@ MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
 MACRO_MANDATORY_ATR_BB         = True   
 MACRO_MANDATORY_RENKO_BB       = True   
-MACRO_MINIMUM_SCORE            = 3      
+MACRO_MINIMUM_SCORE            = 2      
 
 # ==============================================================================
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
@@ -160,7 +160,7 @@ MICRO_MANDATORY_EMA_SPREAD     = False
 MICRO_MANDATORY_STOCHASTIC     = False
 MICRO_MANDATORY_ATR_BB         = True  
 MICRO_MANDATORY_RENKO_BB       = True   
-MICRO_MINIMUM_SCORE            = 3      
+MICRO_MINIMUM_SCORE            = 2      
 
 # ==============================================================================
 # TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
@@ -441,6 +441,35 @@ def fetch_fyers_candles(key, start_dt, end_dt, resolution="1"):
     return None
 
 
+def filter_cash_equities_by_price_range(universe, target_date_str):
+    target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
+    prev_dt = target_dt - timedelta(days=1)
+    while prev_dt.weekday() >= 5:
+        prev_dt -= timedelta(days=1)
+    prev_day = prev_dt.strftime("%Y-%m-%d")
+    lookback_start = (prev_dt - timedelta(days=7)).strftime("%Y-%m-%d")
+
+    print(f"🧹 Applying Price Range Filter (₹{MIN_STOCK_PRICE} - ₹{MAX_STOCK_PRICE}) & Volume Filter...")
+
+    def worker(item):
+        df = fetch_fyers_candles(item["key"], lookback_start, prev_day, resolution="D")
+        if df is None or df.empty:
+            return None
+        last = df.sort_values("Datetime").iloc[-1]
+        close_price = last["Close"]
+        volume = last["Volume"]
+        if MIN_STOCK_PRICE <= close_price <= MAX_STOCK_PRICE and volume >= MIN_STOCK_VOLUME:
+            return item
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+        results = list(executor.map(worker, universe))
+
+    filtered = [r for r in results if r is not None]
+    print(f"  ├─ ✅ {len(filtered)}/{len(universe)} cash equities passed price & volume filters.")
+    return filtered
+
+
 def filter_liquid_contracts(contracts, target_date_str):
     if not contracts:
         return []
@@ -645,7 +674,6 @@ def construct_45deg_renko_matrix(df, tf_name, confirm_bricks):
     df[f"Renko_Bear_{tf_name}"] = renko_counts <= -confirm_bricks
     return df
 
-
 def construct_volume_delta_renko_matrix(df, tf_name, confirm_bricks):
     df['Wick_Spread'] = df['High'] - df['Low']
     df['Wick_Spread'] = df['Wick_Spread'].replace(0, 1e-9)
@@ -731,10 +759,6 @@ def construct_bb_meta_pillars(df, tf_name):
     df[f"Renko_BB_Bear_{tf_name}"] = df[renko_col] >= renko_lower
     return df
 
-
-# ==============================================================================
-# 3. DUAL-TIER SCORECARD SYSTEM (OUT OF 9 PILLARS) + DYNAMIC DELTA VETO
-# ==============================================================================
 def apply_dual_tier_scorecard(df, tf_str, tier_type):
     req_price = globals()[f"{tier_type}_MANDATORY_PRICE_RENKO"]
     req_vol = globals()[f"{tier_type}_MANDATORY_VOL_RENKO"]
@@ -773,7 +797,6 @@ def apply_dual_tier_scorecard(df, tf_str, tier_type):
     if req_atr_bb: bull_veto, bear_veto = bull_veto | (c_atr_bb_bull == 0), bear_veto | (c_atr_bb_bear == 0)
     if req_renko_bb: bull_veto, bear_veto = bull_veto | (c_renko_bb_bull == 0), bear_veto | (c_renko_bb_bear == 0)
 
-    # DYNAMIC CROSS-CHAIN NET DELTA VETO
     percentile_req = globals().get(f"{tier_type}_MANDATORY_LIVE_PERCENTILE", 0.0)
     if percentile_req > 0.0 and "Net_Delta_Pct" in df.columns:
         pct_veto = df["Net_Delta_Pct"] < percentile_req
@@ -794,14 +817,13 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
             "Low": "min", 
             "Close": "last", 
             "Volume": "sum",
-            "Net_Delta_1m": "sum"  # Aggregate Net Delta proxy for the timeframe
+            "Net_Delta_1m": "sum"  
         })
         .reset_index()
     )
     df_tf.rename(columns={"Net_Delta_1m": "Timeframe_Net_Delta"}, inplace=True)
     df_tf = df_tf.dropna(subset=["Close"]).sort_values(["Symbol", "Datetime"])
     
-    # Calculate cross-chain relative buying/selling pressure percentile for this specific timeframe block
     df_tf["Net_Delta_Pct"] = df_tf.groupby("Datetime")["Timeframe_Net_Delta"].rank(pct=True, method='min') * 100
     
     df_tf = calculate_core_technicals(df_tf)
@@ -810,7 +832,6 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
     df_tf = construct_renko_velocity_engine(df_tf, tf_str)
     df_tf = construct_bb_meta_pillars(df_tf, tf_str)
     
-    # Passing to scorecard, which now enforces MACRO_MANDATORY_LIVE_PERCENTILE
     df_tf = apply_dual_tier_scorecard(df_tf, tf_str, "MACRO")
 
     df_tf["Eval_Time"] = (df_tf["Datetime"] + pd.to_timedelta(tf_str)).astype("datetime64[ns]")
@@ -849,7 +870,6 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
         df_micro = rolling_master_df.sort_values(["Symbol", "Datetime"]).copy()
         df_micro["Timeframe_Net_Delta"] = df_micro["Net_Delta_1m"]
 
-    # Calculate cross-chain relative pressure percentile for the Micro execution bar
     df_micro["Net_Delta_Pct"] = df_micro.groupby("Datetime")["Timeframe_Net_Delta"].rank(pct=True, method='min') * 100
 
     df_micro = calculate_core_technicals(df_micro)
@@ -858,7 +878,6 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
     df_micro = construct_renko_velocity_engine(df_micro, micro_tf)
     df_micro = construct_bb_meta_pillars(df_micro, micro_tf)
     
-    # Enforces MICRO_MANDATORY_LIVE_PERCENTILE
     df_micro = apply_dual_tier_scorecard(df_micro, micro_tf, "MICRO")
     df_micro = df_micro.sort_values("Datetime").reset_index(drop=True)
 
@@ -913,9 +932,8 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
     return df_micro.sort_values("Datetime").reset_index(drop=True)
 
 
-# ==============================================================================
-# 5. TRADE MANAGEMENT & EXECUTION ENGINE
-# ==============================================================================
+# ============================
+
 def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_TIME):
     print(f"\n📡 Initiating REST Pipeline Engine [{TRADING_MODE}] for {target_date_str} (Cutoff: {entry_cutoff_time_str})...")
     trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
