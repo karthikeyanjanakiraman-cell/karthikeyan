@@ -12,6 +12,7 @@ Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
 - HYBRID DATA ROUTING: Global switch for REST (Historical) vs WEBSOCKET (Live Ticks).
 - PERCENTILE ARMOR: Dynamic cross-chain Net Delta (Up-Ticks vs Down-Ticks) percentile tracking.
 - BASKET 3 DIAGNOSTICS: Extensive funnel logging for rejected candidates.
+- PERFORMANCE BOOST: 5-Day optimized warmup window & 15-thread concurrent fetchers.
 """
 
 import argparse
@@ -37,7 +38,7 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-print("🔖 SYSTEM3 BUILD: v13-BASKET3-DIAGNOSTICS (2026-08-27)")
+print("🔖 SYSTEM3 BUILD: v14-PERFORMANCE-BOOST (2026-08-27)")
 
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
@@ -51,7 +52,8 @@ COLOR_DIM = "\033[2m"
 COLOR_RESET = "\033[0m"
 COLOR_BOLD = "\033[1m"
 
-BACKTRACE_DAYS = 60
+# PERFORMANCE FIX: Only download exactly what is needed for indicator warmup (~1 week)
+BACKTRACE_DAYS = 5
 LIQUIDITY_CACHE_FILE = "liquidity_cache.json"
 EXCLUDED_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "NIFTY50", "NIFTYBANK"}
 
@@ -104,7 +106,7 @@ def validate_fyers_token():
 # ==============================================================================
 # 🎛️ TIER 0: TRADING MODE, PIPELINE ROUTING & DATA FEED SWITCH
 # ==============================================================================
-DATA_FEED_MODE = "WEBSOCKET"           # Set to "WEBSOCKET" for live tick-by-tick streaming
+DATA_FEED_MODE = "REST"           # Set to "WEBSOCKET" for live tick-by-tick streaming
 TRADING_MODE = "CASH_EQUITY"      # "CASH_EQUITY" or "F_AND_O_OPTIONS"
 ENABLE_STAGE1_STOCK_FILTER = False  
 
@@ -115,8 +117,8 @@ MIN_STOCK_VOLUME = 500000
 # ==============================================================================
 # GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS
 # ==============================================================================
-MICRO_TIMEFRAME = "240min"
-MACRO_TIMEFRAMES = ["2400min"]
+MICRO_TIMEFRAME = "5min"
+MACRO_TIMEFRAMES = ["20min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -136,7 +138,7 @@ GLOBAL_MACRO_STRATEGY_2D = "BOTH"  # "BULLISH", "BEARISH", or "BOTH"
 # ==============================================================================
 # TIER 1: MACRO CONTEXT SWITCHBOARD (THE GENERAL) - 9 PILLARS
 # ==============================================================================
-MACRO_MANDATORY_LIVE_PERCENTILE = 30.0   # Enforces top X% Net Delta for the Macro period
+MACRO_MANDATORY_LIVE_PERCENTILE = 35.0   # Enforces top X% Net Delta for the Macro period
 MACRO_MANDATORY_PRICE_RENKO    = False
 MACRO_MANDATORY_VOL_RENKO      = False
 MACRO_MANDATORY_RENKO_VELOCITY = False
@@ -146,14 +148,13 @@ MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
 MACRO_MANDATORY_ATR_BB         = True   
 MACRO_MANDATORY_RENKO_BB       = True   
-MACRO_MINIMUM_SCORE            = 3      
+MACRO_MINIMUM_SCORE            = 4      
 
 # ==============================================================================
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
 # ==============================================================================
 SYNC_MICRO_WITH_MACRO          = False
-
-MICRO_MANDATORY_LIVE_PERCENTILE = 30.0   # Enforces top X% Net Delta for the Micro period
+MICRO_MANDATORY_LIVE_PERCENTILE = 50.0   # Enforces top X% Net Delta for the Micro period
 MICRO_MANDATORY_PRICE_RENKO    = False
 MICRO_MANDATORY_VOL_RENKO      = False
 MICRO_MANDATORY_RENKO_VELOCITY = False
@@ -163,14 +164,14 @@ MICRO_MANDATORY_EMA_SPREAD     = False
 MICRO_MANDATORY_STOCHASTIC     = False
 MICRO_MANDATORY_ATR_BB         = True  
 MICRO_MANDATORY_RENKO_BB       = True   
-MICRO_MINIMUM_SCORE            = 2      
+MICRO_MINIMUM_SCORE            = 3      
 
 # ==============================================================================
 # TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
 # ==============================================================================
 MICRO_EXIT_PRICE_BRICKS = 5
 MICRO_EXIT_VOL_BRICKS   = 50
-MACRO_EXIT_PRICE_BRICKS = 2
+MACRO_EXIT_PRICE_BRICKS = 1
 MACRO_EXIT_VOL_BRICKS   = 10
 
 RENKO_VELOCITY_MAX_BARS = 6
@@ -465,7 +466,7 @@ def filter_cash_equities_by_price_range(universe, target_date_str):
             return item
         return None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
         results = list(executor.map(worker, universe))
 
     filtered = [r for r in results if r is not None]
@@ -506,7 +507,7 @@ def filter_liquid_contracts(contracts, target_date_str):
         last = df.sort_values("Datetime").iloc[-1]
         return (c, cache_key, float(last["Close"]), float(last["Volume"]), True)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
         results = list(executor.map(worker, contracts))
 
     valid_contracts = []
@@ -577,7 +578,7 @@ def fetch_all_spot_reference_prices(spot_universe, target_date_str):
             return item["symbol"], float(last_close)
         return item["symbol"], None
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
         results = list(executor.map(worker, spot_universe))
 
     for sym, price in results:
@@ -677,7 +678,6 @@ def construct_45deg_renko_matrix(df, tf_name, confirm_bricks):
     df[f"Renko_Bear_{tf_name}"] = renko_counts <= -confirm_bricks
     return df
 
-
 def construct_volume_delta_renko_matrix(df, tf_name, confirm_bricks):
     df['Wick_Spread'] = df['High'] - df['Low']
     df['Wick_Spread'] = df['Wick_Spread'].replace(0, 1e-9)
@@ -763,10 +763,6 @@ def construct_bb_meta_pillars(df, tf_name):
     df[f"Renko_BB_Bear_{tf_name}"] = df[renko_col] >= renko_lower
     return df
 
-
-# ==============================================================================
-# 3. DUAL-TIER SCORECARD SYSTEM (OUT OF 9 PILLARS) + DYNAMIC DELTA VETO
-# ==============================================================================
 def apply_dual_tier_scorecard(df, tf_str, tier_type):
     req_price = globals()[f"{tier_type}_MANDATORY_PRICE_RENKO"]
     req_vol = globals()[f"{tier_type}_MANDATORY_VOL_RENKO"]
@@ -940,9 +936,8 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
     return df_micro.sort_values("Datetime").reset_index(drop=True)
 
 
-# ==============================================================================
-# 5. TRADE MANAGEMENT & EXECUTION ENGINE
-# ==============================================================================
+# ============================
+
 def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_TIME):
     print(f"\n📡 Initiating REST Pipeline Engine [{TRADING_MODE}] for {target_date_str} (Cutoff: {entry_cutoff_time_str})...")
     trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
@@ -972,7 +967,7 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
             fetch_tasks = [(item, trading_days[0], target_date_str) for item in universe]
             stock_dfs = []
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
                 futures = {executor.submit(fetch_stock_bars_worker, task): task for task in fetch_tasks}
                 completed = 0
                 for future in concurrent.futures.as_completed(futures):
@@ -1000,7 +995,7 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
             fetch_tasks = [(item, trading_days[0], target_date_str) for item in universe]
             stock_dfs = []
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
                 futures = {executor.submit(fetch_stock_bars_worker, task): task for task in fetch_tasks}
                 for future in concurrent.futures.as_completed(futures):
                     res = future.result()
@@ -1045,7 +1040,7 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
                         df = compute_base_net_delta(df)
                     return df
 
-                with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=15) as executor:
                     futures = {executor.submit(option_fetch_worker, c): c for c in liquid_contracts}
                     completed = 0
                     for future in concurrent.futures.as_completed(futures):
