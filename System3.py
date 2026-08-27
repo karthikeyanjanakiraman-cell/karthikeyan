@@ -144,7 +144,7 @@ MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
 MACRO_MANDATORY_ATR_BB         = True   
 MACRO_MANDATORY_RENKO_BB       = True   
-MACRO_MINIMUM_SCORE            = 2      
+MACRO_MINIMUM_SCORE            = 4      
 
 # ==============================================================================
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
@@ -160,7 +160,7 @@ MICRO_MANDATORY_EMA_SPREAD     = False
 MICRO_MANDATORY_STOCHASTIC     = False
 MICRO_MANDATORY_ATR_BB         = True  
 MICRO_MANDATORY_RENKO_BB       = True   
-MICRO_MINIMUM_SCORE            = 2      
+MICRO_MINIMUM_SCORE            = 3      
 
 # ==============================================================================
 # TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
