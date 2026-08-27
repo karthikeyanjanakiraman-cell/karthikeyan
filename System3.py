@@ -136,7 +136,7 @@ GLOBAL_MACRO_STRATEGY_2D = "BOTH"  # "BULLISH", "BEARISH", or "BOTH"
 # ==============================================================================
 # TIER 1: MACRO CONTEXT SWITCHBOARD (THE GENERAL) - 9 PILLARS
 # ==============================================================================
-MACRO_MANDATORY_LIVE_PERCENTILE = 50.0   # Enforces top X% Net Delta for the Macro period
+MACRO_MANDATORY_LIVE_PERCENTILE = 30.0   # Enforces top X% Net Delta for the Macro period
 MACRO_MANDATORY_PRICE_RENKO    = False
 MACRO_MANDATORY_VOL_RENKO      = False
 MACRO_MANDATORY_RENKO_VELOCITY = False
@@ -146,14 +146,14 @@ MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
 MACRO_MANDATORY_ATR_BB         = True   
 MACRO_MANDATORY_RENKO_BB       = True   
-MACRO_MINIMUM_SCORE            = 4      
+MACRO_MINIMUM_SCORE            = 3      
 
 # ==============================================================================
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
 # ==============================================================================
 SYNC_MICRO_WITH_MACRO          = False
 
-MICRO_MANDATORY_LIVE_PERCENTILE = 50.0   # Enforces top X% Net Delta for the Micro period
+MICRO_MANDATORY_LIVE_PERCENTILE = 30.0   # Enforces top X% Net Delta for the Micro period
 MICRO_MANDATORY_PRICE_RENKO    = False
 MICRO_MANDATORY_VOL_RENKO      = False
 MICRO_MANDATORY_RENKO_VELOCITY = False
@@ -163,12 +163,12 @@ MICRO_MANDATORY_EMA_SPREAD     = False
 MICRO_MANDATORY_STOCHASTIC     = False
 MICRO_MANDATORY_ATR_BB         = True  
 MICRO_MANDATORY_RENKO_BB       = True   
-MICRO_MINIMUM_SCORE            = 3      
+MICRO_MINIMUM_SCORE            = 2      
 
 # ==============================================================================
 # TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
 # ==============================================================================
-MICRO_EXIT_PRICE_BRICKS = 2
+MICRO_EXIT_PRICE_BRICKS = 5
 MICRO_EXIT_VOL_BRICKS   = 50
 MACRO_EXIT_PRICE_BRICKS = 2
 MACRO_EXIT_VOL_BRICKS   = 10
