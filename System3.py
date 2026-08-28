@@ -11,6 +11,7 @@ Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
 - Re-Entry Churn Guard & Basket 3 Diagnostic Engine
 - Relative Post-Entry Structure Breaks (No 5-min churn loops)
 - STALE MOMENTUM & PRICE PROGRESSION GUARDS (Zero Flatline Churn)
+- STRICT CUTOFFS (09:15 Overnight Flush & Absolute 14:15 Cutoff)
 """
 
 import argparse
@@ -36,7 +37,7 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-print("🔖 SYSTEM3 BUILD: v17-STERILIZED-CHURN (2026-08-28)")
+print("🔖 SYSTEM3 BUILD: v18-FINAL-CUTOFFS (2026-08-28)")
 
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
@@ -111,7 +112,7 @@ TRADING_MODE = "CASH_EQUITY"
 ENABLE_STAGE1_STOCK_FILTER = False  
 
 MIN_STOCK_PRICE = 100.0
-MAX_STOCK_PRICE = 200.0
+MAX_STOCK_PRICE = 150.0
 MIN_STOCK_VOLUME = 3000000
 
 # ==============================================================================
@@ -905,6 +906,7 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
     if not trading_days: return
 
     target_dt = pd.to_datetime(target_date_str)
+    cutoff_time_obj = pd.to_datetime(f"{target_date_str} {entry_cutoff_time_str}").time()
     cutoff_dt = pd.to_datetime(f"{target_date_str} 15:30:00")
 
     dropped_liquidity_syms = set()
@@ -1018,7 +1020,7 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
     # Execute Memory Bank
     # ---------------------------------------------------------
     if not tape_exec.empty:
-        memory_bank = _run_dual_layer_trade_management(tape_exec, MICRO_TIMEFRAME, MACRO_TIMEFRAMES)
+        memory_bank = _run_dual_layer_trade_management(tape_exec, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, cutoff_time_obj)
         today_master = tape_exec[tape_exec["Datetime"].dt.date == target_dt.date()]
         final_ltp_dict = today_master.groupby("Symbol")["Close"].last().to_dict() if not today_master.empty else {}
     else:
@@ -1137,7 +1139,7 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
                 print()
 
 
-def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframes):
+def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframes, cutoff_time_obj):
     all_anomalies = tape_exec[tape_exec["Direction"] != 0].copy()
     anomalies_by_time = all_anomalies.groupby("Datetime")
 
@@ -1159,6 +1161,15 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
 
     for t in all_times:
         t_dt = pd.to_datetime(t)
+
+        # 0. INTRADAY OVERNIGHT FLUSH (BUG FIX: Kills Gap Leaks like WEL)
+        if t_dt.time() == pd.Timestamp("09:15").time():
+            for sym, episodes in memory_bank.items():
+                if episodes and episodes[-1]["state"] == "ACTIVE":
+                    episodes[-1]["state"] = "EXITED"
+                    episodes[-1]["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M")
+                    episodes[-1]["exit_price"] = closes_dict.get((t_dt, sym), episodes[-1]["origin"])
+                    episodes[-1]["exit_reason"] = "Overnight Gap Flush"
 
         # 1. EVALUATE ACTIVE TRADES FOR EXITS
         for sym, episodes in memory_bank.items():
@@ -1225,8 +1236,8 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
 
         # 2. EVALUATE NEW ENTRIES
         if t_dt in anomalies_by_time.groups:
-            # BUG FIX: 14:15 absolute entry shutdown
-            if t_dt.hour >= 14 and t_dt.minute >= 15:
+            # BUG FIX: True 14:15 absolute entry shutdown
+            if t_dt.time() >= cutoff_time_obj:
                 continue
 
             for _, row in anomalies_by_time.get_group(t_dt).iterrows():
@@ -1237,12 +1248,10 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
                 if existing and existing[-1]["state"] == "ACTIVE":
                     continue
                 
-                # BUG FIX: Stale Momentum Guard (Zero Flatlining Churn)
                 last_brick = row.get("Last_Brick_Time")
                 if pd.isna(last_brick) or last_brick.date() != t_dt.date():
                     continue
 
-                # BUG FIX: Price Progression Guard (Zero Re-Entry Whipsaw)
                 if sym in last_exit_price and last_exit_dir.get(sym) == direction:
                     if direction == 1 and row["Close"] <= last_exit_price[sym]:
                         continue
