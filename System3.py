@@ -53,7 +53,7 @@ COLOR_RESET = "\033[0m"
 COLOR_BOLD = "\033[1m"
 
 # PERFORMANCE FIX: Only download exactly what is needed for indicator warmup (~1 week)
-BACKTRACE_DAYS = 5
+BACKTRACE_DAYS = 30
 LIQUIDITY_CACHE_FILE = "liquidity_cache.json"
 EXCLUDED_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "NIFTY50", "NIFTYBANK"}
 
