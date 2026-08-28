@@ -117,7 +117,7 @@ MIN_STOCK_VOLUME = 500000
 # ==============================================================================
 # GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS
 # ==============================================================================
-MICRO_TIMEFRAME = "30min"
+MICRO_TIMEFRAME = "3min"
 MACRO_TIMEFRAMES = ["240min"]
 
 ATR_PERIOD = 14
@@ -154,7 +154,7 @@ MACRO_MINIMUM_SCORE            = 4
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
 # ==============================================================================
 SYNC_MICRO_WITH_MACRO          = False
-MICRO_MANDATORY_LIVE_PERCENTILE = 5.0   # Enforces top X% Net Delta for the Micro period
+MICRO_MANDATORY_LIVE_PERCENTILE = 50.0   # Enforces top X% Net Delta for the Micro period
 MICRO_MANDATORY_PRICE_RENKO    = False
 MICRO_MANDATORY_VOL_RENKO      = False
 MICRO_MANDATORY_RENKO_VELOCITY = False
