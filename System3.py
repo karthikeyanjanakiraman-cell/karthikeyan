@@ -9,6 +9,7 @@ Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
 - Cross-Session Macro State Inheritance (No 09:15 AM tolerance blindness)
 - Directional Percentile Delta Filter (Proper Bull/Bear Asymmetry)
 - Re-Entry Churn Guard & Basket 3 Diagnostic Engine
+- Relative Post-Entry Structure Breaks (No 5-min churn loops)
 """
 
 import argparse
@@ -34,7 +35,7 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-print("🔖 SYSTEM3 BUILD: v15-EXECUTION-ENGINE-PATCHED (2026-08-28)")
+print("🔖 SYSTEM3 BUILD: v16-STABLE-MOMENTUM (2026-08-28)")
 
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
@@ -109,8 +110,8 @@ TRADING_MODE = "CASH_EQUITY"      # "CASH_EQUITY" or "F_AND_O_OPTIONS"
 ENABLE_STAGE1_STOCK_FILTER = False  
 
 MIN_STOCK_PRICE = 100.0
-MAX_STOCK_PRICE = 600.0
-MIN_STOCK_VOLUME = 300000
+MAX_STOCK_PRICE = 200.0
+MIN_STOCK_VOLUME = 3000000
 
 # ==============================================================================
 # GLOBAL CONFIGURATION: BALANCED TIMEFRAMES & INDICATORS
@@ -136,25 +137,25 @@ GLOBAL_MACRO_STRATEGY_2D = "BOTH"  # "BULLISH", "BEARISH", or "BOTH"
 # ==============================================================================
 # TIER 1: MACRO CONTEXT SWITCHBOARD (THE GENERAL) - 9 PILLARS
 # ==============================================================================
-MACRO_MANDATORY_LIVE_PERCENTILE = 0.0     # 0.0 = Off, >0 checks directional delta ranking
-MACRO_MANDATORY_PRICE_RENKO    = False
+MACRO_MANDATORY_LIVE_PERCENTILE = 0.0     
+MACRO_MANDATORY_PRICE_RENKO    = True    # Ensures macro is directionally aligned
 MACRO_MANDATORY_VOL_RENKO      = False
 MACRO_MANDATORY_RENKO_VELOCITY = False
 MACRO_MANDATORY_RSI_BB         = False
 MACRO_MANDATORY_ADX_DMI        = False
 MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
-MACRO_MANDATORY_ATR_BB         = False   # Set to False to unblock 8/9 & 9/9 momentum leaders
+MACRO_MANDATORY_ATR_BB         = False   
 MACRO_MANDATORY_RENKO_BB       = False   
-MACRO_MINIMUM_SCORE            = 3       # Requires solid macro foundation
+MACRO_MINIMUM_SCORE            = 3       
 
 # ==============================================================================
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
 # ==============================================================================
 SYNC_MICRO_WITH_MACRO          = False
-MICRO_MANDATORY_LIVE_PERCENTILE = 0.0     # 0.0 = Off
-MICRO_MANDATORY_PRICE_RENKO    = True    # Price Renko must confirm
-MICRO_MANDATORY_VOL_RENKO      = True    # Volume Renko must confirm
+MICRO_MANDATORY_LIVE_PERCENTILE = 50.0    # Protects order flow
+MICRO_MANDATORY_PRICE_RENKO    = True    
+MICRO_MANDATORY_VOL_RENKO      = True    
 MICRO_MANDATORY_RENKO_VELOCITY = False
 MICRO_MANDATORY_RSI_BB         = False
 MICRO_MANDATORY_ADX_DMI        = False
@@ -162,18 +163,18 @@ MICRO_MANDATORY_EMA_SPREAD     = False
 MICRO_MANDATORY_STOCHASTIC     = False
 MICRO_MANDATORY_ATR_BB         = False   
 MICRO_MANDATORY_RENKO_BB       = False   
-MICRO_MINIMUM_SCORE            = 3       # Price + Vol + at least 1 momentum indicator
+MICRO_MINIMUM_SCORE            = 3       
 
 # ==============================================================================
 # TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
 # ==============================================================================
-MICRO_EXIT_PRICE_BRICKS = 3
+MICRO_EXIT_PRICE_BRICKS = 5              # Widened to survive standard intraday pullbacks
 MICRO_EXIT_VOL_BRICKS   = 30
-MACRO_EXIT_PRICE_BRICKS = 2
+MACRO_EXIT_PRICE_BRICKS = 2              # Real structural macro break
 MACRO_EXIT_VOL_BRICKS   = 20
 
 RENKO_VELOCITY_MAX_BARS = 8              # 8 bars x 5min = 40 mins stall window
-ENTRY_CUTOFF_TIME = "15:00"
+ENTRY_CUTOFF_TIME = "14:15"              # Allow minimum 75 min runway
 
 # ==============================================================================
 # TIER 4: OPTIONS STAGE 2 CONFIG (Ignored if TRADING_MODE == "CASH_EQUITY")
@@ -760,7 +761,6 @@ def apply_dual_tier_scorecard(df, tf_str, tier_type):
     if req_atr_bb: bull_veto, bear_veto = bull_veto | (c_atr_bb_bull == 0), bear_veto | (c_atr_bb_bear == 0)
     if req_renko_bb: bull_veto, bear_veto = bull_veto | (c_renko_bb_bull == 0), bear_veto | (c_renko_bb_bear == 0)
 
-    # DIRECTIONAL PERCENTILE DELTA FILTER (BUG FIX 3)
     percentile_req = globals().get(f"{tier_type}_MANDATORY_LIVE_PERCENTILE", 0.0)
     if percentile_req > 0.0 and "Net_Delta_Pct" in df.columns:
         bull_pct_veto = df["Net_Delta_Pct"] < percentile_req
@@ -857,7 +857,6 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
         df_micro["Datetime"] = df_micro["Datetime"].astype("datetime64[ns]")
         env_df["Datetime"] = env_df["Datetime"].astype("datetime64[ns]")
         
-        # REMOVED TOLERANCE LIMIT: Fixes Morning 09:15 AM Blindness (BUG FIX 2)
         df_micro = pd.merge_asof(
             df_micro.sort_values("Datetime"), 
             env_df.sort_values("Datetime"), 
@@ -1171,42 +1170,48 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
                 if ltp is not None:
                     exit_reason = None
                     
-                    # TRUE POST-ENTRY VELOCITY STALL (BUG FIX 1)
+                    # POST-ENTRY VELOCITY STALL
                     entry_dt = pd.to_datetime(f"{st['date']} {st['time']}")
                     mins_in_trade = (t_dt - entry_dt).total_seconds() / 60
                     
                     # Check if renko count changed from entry
-                    if mi_p_count != st["entry_renko_count"]:
+                    if mi_p_count != st["current_renko_count"]:
                         st["last_brick_formed_dt"] = t_dt
-                        st["entry_renko_count"] = mi_p_count
+                        st["current_renko_count"] = mi_p_count
                     
                     mins_since_last_progress = (t_dt - st["last_brick_formed_dt"]).total_seconds() / 60
 
                     if mins_in_trade >= max_stall_mins and mins_since_last_progress >= max_stall_mins:
                         exit_reason = f"Velocity Stall (No new brick in {max_stall_mins}m post-entry)"
 
+                    # RELATIVE STRUCTURAL BREAKS (BUG FIX)
                     if not exit_reason:
                         if st["dir"] == 1:
-                            if mi_p_count <= -MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
-                            elif mi_v_count <= -MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
+                            if mi_p_count <= (st["entry_renko_count"] - MICRO_EXIT_PRICE_BRICKS): 
+                                exit_reason = "Micro Price Reversal"
+                            elif mi_v_count <= (st["entry_vol_renko_count"] - MICRO_EXIT_VOL_BRICKS): 
+                                exit_reason = "Micro Volume Reversal"
                             else:
                                 for tf in st["triggering_macro_tfs"]:
                                     ma_p = macro_price_renkos[tf].get((t_dt, sym), 0)
                                     ma_v = macro_vol_renkos[tf].get((t_dt, sym), 0)
-                                    if ma_p <= -MACRO_EXIT_PRICE_BRICKS:
+                                    if ma_p <= (st["entry_macro_renkos"][tf] - MACRO_EXIT_PRICE_BRICKS):
                                         exit_reason = f"Macro [{tf}] Price Break"; break
-                                    if ma_v <= -MACRO_EXIT_VOL_BRICKS:
+                                    if ma_v <= (st["entry_macro_vol_renkos"][tf] - MACRO_EXIT_VOL_BRICKS):
                                         exit_reason = f"Macro [{tf}] Volume Break"; break
+                                        
                         elif st["dir"] == -1:
-                            if mi_p_count >= MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
-                            elif mi_v_count >= MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
+                            if mi_p_count >= (st["entry_renko_count"] + MICRO_EXIT_PRICE_BRICKS): 
+                                exit_reason = "Micro Price Reversal"
+                            elif mi_v_count >= (st["entry_vol_renko_count"] + MICRO_EXIT_VOL_BRICKS): 
+                                exit_reason = "Micro Volume Reversal"
                             else:
                                 for tf in st["triggering_macro_tfs"]:
                                     ma_p = macro_price_renkos[tf].get((t_dt, sym), 0)
                                     ma_v = macro_vol_renkos[tf].get((t_dt, sym), 0)
-                                    if ma_p >= MACRO_EXIT_PRICE_BRICKS:
+                                    if ma_p >= (st["entry_macro_renkos"][tf] + MACRO_EXIT_PRICE_BRICKS):
                                         exit_reason = f"Macro [{tf}] Price Break"; break
-                                    if ma_v >= MACRO_EXIT_VOL_BRICKS:
+                                    if ma_v >= (st["entry_macro_vol_renkos"][tf] + MACRO_EXIT_VOL_BRICKS):
                                         exit_reason = f"Macro [{tf}] Volume Break"; break
 
                     if exit_reason:
@@ -1226,7 +1231,6 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
                 if existing and existing[-1]["state"] == "ACTIVE":
                     continue
 
-                # RE-ENTRY CHURN GUARD (BUG FIX 4)
                 if sym in last_exit_time and last_exit_time[sym] == t_dt:
                     continue
 
@@ -1243,6 +1247,10 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
                     "time": t_dt.strftime("%H:%M"),
                     "dir": direction,
                     "entry_renko_count": row.get(f"Renko_Count_{micro_timeframe}", 0),
+                    "entry_vol_renko_count": row.get(f"Vol_Renko_Count_{micro_timeframe}", 0),
+                    "current_renko_count": row.get(f"Renko_Count_{micro_timeframe}", 0),
+                    "entry_macro_renkos": {tf: row.get(f"Renko_Count_{tf}", 0) for tf in macro_timeframes},
+                    "entry_macro_vol_renkos": {tf: row.get(f"Vol_Renko_Count_{tf}", 0) for tf in macro_timeframes},
                     "last_brick_formed_dt": t_dt,
                     "exit_time": None,
                     "exit_price": None,
