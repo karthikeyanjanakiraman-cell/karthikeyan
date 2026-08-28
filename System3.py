@@ -117,8 +117,8 @@ MIN_STOCK_VOLUME = 500000
 # ==============================================================================
 # GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS
 # ==============================================================================
-MICRO_TIMEFRAME = "5min"
-MACRO_TIMEFRAMES = ["20min"]
+MICRO_TIMEFRAME = "30min"
+MACRO_TIMEFRAMES = ["240min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
