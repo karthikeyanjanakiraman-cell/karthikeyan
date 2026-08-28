@@ -10,6 +10,7 @@ Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
 - Directional Percentile Delta Filter (Proper Bull/Bear Asymmetry)
 - Re-Entry Churn Guard & Basket 3 Diagnostic Engine
 - Relative Post-Entry Structure Breaks (No 5-min churn loops)
+- STALE MOMENTUM & PRICE PROGRESSION GUARDS (Zero Flatline Churn)
 """
 
 import argparse
@@ -35,7 +36,7 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-print("🔖 SYSTEM3 BUILD: v16-STABLE-MOMENTUM (2026-08-28)")
+print("🔖 SYSTEM3 BUILD: v17-STERILIZED-CHURN (2026-08-28)")
 
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
@@ -105,8 +106,8 @@ def validate_fyers_token():
 # ==============================================================================
 # 🎛️ TIER 0: TRADING MODE, PIPELINE ROUTING & DATA FEED SWITCH
 # ==============================================================================
-DATA_FEED_MODE = "REST"           # Set to "WEBSOCKET" for live tick streaming
-TRADING_MODE = "CASH_EQUITY"      # "CASH_EQUITY" or "F_AND_O_OPTIONS"
+DATA_FEED_MODE = "REST"           
+TRADING_MODE = "CASH_EQUITY"      
 ENABLE_STAGE1_STOCK_FILTER = False  
 
 MIN_STOCK_PRICE = 100.0
@@ -132,13 +133,13 @@ MACRO_RENKO_CONFIRM_BRICKS = 0
 RENKO_MIN_BRICK = 0.05
 RENKO_DEFAULT_PCT = 0.005
 
-GLOBAL_MACRO_STRATEGY_2D = "BOTH"  # "BULLISH", "BEARISH", or "BOTH"
+GLOBAL_MACRO_STRATEGY_2D = "BOTH"
 
 # ==============================================================================
 # TIER 1: MACRO CONTEXT SWITCHBOARD (THE GENERAL) - 9 PILLARS
 # ==============================================================================
 MACRO_MANDATORY_LIVE_PERCENTILE = 0.0     
-MACRO_MANDATORY_PRICE_RENKO    = True    # Ensures macro is directionally aligned
+MACRO_MANDATORY_PRICE_RENKO    = True    
 MACRO_MANDATORY_VOL_RENKO      = False
 MACRO_MANDATORY_RENKO_VELOCITY = False
 MACRO_MANDATORY_RSI_BB         = False
@@ -153,7 +154,7 @@ MACRO_MINIMUM_SCORE            = 3
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
 # ==============================================================================
 SYNC_MICRO_WITH_MACRO          = False
-MICRO_MANDATORY_LIVE_PERCENTILE = 50.0    # Protects order flow
+MICRO_MANDATORY_LIVE_PERCENTILE = 50.0    
 MICRO_MANDATORY_PRICE_RENKO    = True    
 MICRO_MANDATORY_VOL_RENKO      = True    
 MICRO_MANDATORY_RENKO_VELOCITY = False
@@ -168,13 +169,13 @@ MICRO_MINIMUM_SCORE            = 3
 # ==============================================================================
 # TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
 # ==============================================================================
-MICRO_EXIT_PRICE_BRICKS = 5              # Widened to survive standard intraday pullbacks
+MICRO_EXIT_PRICE_BRICKS = 5              
 MICRO_EXIT_VOL_BRICKS   = 30
-MACRO_EXIT_PRICE_BRICKS = 2              # Real structural macro break
+MACRO_EXIT_PRICE_BRICKS = 2              
 MACRO_EXIT_VOL_BRICKS   = 20
 
-RENKO_VELOCITY_MAX_BARS = 8              # 8 bars x 5min = 40 mins stall window
-ENTRY_CUTOFF_TIME = "14:15"              # Allow minimum 75 min runway
+RENKO_VELOCITY_MAX_BARS = 8              
+ENTRY_CUTOFF_TIME = "14:15"              
 
 # ==============================================================================
 # TIER 4: OPTIONS STAGE 2 CONFIG (Ignored if TRADING_MODE == "CASH_EQUITY")
@@ -904,8 +905,7 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
     if not trading_days: return
 
     target_dt = pd.to_datetime(target_date_str)
-    cutoff_time_obj = pd.to_datetime(entry_cutoff_time_str).time()
-    cutoff_dt = pd.to_datetime(f"{target_date_str} {entry_cutoff_time_str}")
+    cutoff_dt = pd.to_datetime(f"{target_date_str} 15:30:00")
 
     dropped_liquidity_syms = set()
     tape_exec = pd.DataFrame()
@@ -964,7 +964,7 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
                 stock_master_df = truncate_to_cutoff(stock_master_df, target_date_str, cutoff_dt)
                 tape_exec_stock = prepare_unified_execution_tape(stock_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, strategy_mode=GLOBAL_MACRO_STRATEGY_2D)
 
-                stock_anomalies = tape_exec_stock[(tape_exec_stock["Direction"] != 0) & (tape_exec_stock["Datetime"].dt.time <= cutoff_time_obj)]
+                stock_anomalies = tape_exec_stock[(tape_exec_stock["Direction"] != 0)]
                 if not stock_anomalies.empty:
                     qualifying_symbols = sorted(stock_anomalies["Symbol"].unique().tolist())
                     spot_ref = stock_anomalies.sort_values("Datetime").groupby("Symbol")["Close"].last().to_dict()
@@ -1018,7 +1018,7 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
     # Execute Memory Bank
     # ---------------------------------------------------------
     if not tape_exec.empty:
-        memory_bank = _run_dual_layer_trade_management(tape_exec, MICRO_TIMEFRAME, MACRO_TIMEFRAMES, cutoff_time_obj)
+        memory_bank = _run_dual_layer_trade_management(tape_exec, MICRO_TIMEFRAME, MACRO_TIMEFRAMES)
         today_master = tape_exec[tape_exec["Datetime"].dt.date == target_dt.date()]
         final_ltp_dict = today_master.groupby("Symbol")["Close"].last().to_dict() if not today_master.empty else {}
     else:
@@ -1137,7 +1137,7 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
                 print()
 
 
-def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframes, cutoff_time_obj):
+def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframes):
     all_anomalies = tape_exec[tape_exec["Direction"] != 0].copy()
     anomalies_by_time = all_anomalies.groupby("Datetime")
 
@@ -1149,7 +1149,10 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
 
     all_times = np.sort(tape_exec["Datetime"].unique())
     memory_bank = {}
+    
     last_exit_time = {}
+    last_exit_price = {}
+    last_exit_dir = {}
     
     micro_tf_mins = _parse_tf_to_minutes(micro_timeframe)
     max_stall_mins = RENKO_VELOCITY_MAX_BARS * micro_tf_mins
@@ -1170,11 +1173,9 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
                 if ltp is not None:
                     exit_reason = None
                     
-                    # POST-ENTRY VELOCITY STALL
                     entry_dt = pd.to_datetime(f"{st['date']} {st['time']}")
                     mins_in_trade = (t_dt - entry_dt).total_seconds() / 60
                     
-                    # Check if renko count changed from entry
                     if mi_p_count != st["current_renko_count"]:
                         st["last_brick_formed_dt"] = t_dt
                         st["current_renko_count"] = mi_p_count
@@ -1184,7 +1185,6 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
                     if mins_in_trade >= max_stall_mins and mins_since_last_progress >= max_stall_mins:
                         exit_reason = f"Velocity Stall (No new brick in {max_stall_mins}m post-entry)"
 
-                    # RELATIVE STRUCTURAL BREAKS (BUG FIX)
                     if not exit_reason:
                         if st["dir"] == 1:
                             if mi_p_count <= (st["entry_renko_count"] - MICRO_EXIT_PRICE_BRICKS): 
@@ -1220,9 +1220,15 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
                         st["exit_price"] = ltp
                         st["exit_reason"] = exit_reason
                         last_exit_time[sym] = t_dt
+                        last_exit_price[sym] = ltp
+                        last_exit_dir[sym] = st["dir"]
 
         # 2. EVALUATE NEW ENTRIES
-        if t_dt in anomalies_by_time.groups and t_dt.time() <= cutoff_time_obj:
+        if t_dt in anomalies_by_time.groups:
+            # BUG FIX: 14:15 absolute entry shutdown
+            if t_dt.hour >= 14 and t_dt.minute >= 15:
+                continue
+
             for _, row in anomalies_by_time.get_group(t_dt).iterrows():
                 sym = row["Symbol"]
                 direction = row["Direction"]
@@ -1230,9 +1236,18 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
                 existing = memory_bank.get(sym, [])
                 if existing and existing[-1]["state"] == "ACTIVE":
                     continue
-
-                if sym in last_exit_time and last_exit_time[sym] == t_dt:
+                
+                # BUG FIX: Stale Momentum Guard (Zero Flatlining Churn)
+                last_brick = row.get("Last_Brick_Time")
+                if pd.isna(last_brick) or last_brick.date() != t_dt.date():
                     continue
+
+                # BUG FIX: Price Progression Guard (Zero Re-Entry Whipsaw)
+                if sym in last_exit_price and last_exit_dir.get(sym) == direction:
+                    if direction == 1 and row["Close"] <= last_exit_price[sym]:
+                        continue
+                    if direction == -1 and row["Close"] >= last_exit_price[sym]:
+                        continue
 
                 triggered_m_tfs = []
                 for tf in macro_timeframes:
