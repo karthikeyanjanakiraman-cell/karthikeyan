@@ -1,18 +1,14 @@
 """system3.py - Asit Baran Pati Multi-Timeframe Trading System Implementation
 
 Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
-- Configurable Micro Execution Timeframe (e.g., "1min", "3min", "5min")
-- Configurable Macro Hierarchy Array (e.g., ["15min", "60min", "1D"])
-- Phase 1 Blueprint: Dual-Tier Scorecard (9 Pillars) & Global Mandatory Veto Switches
-- Phase 1 Blueprint: Order Flow / Cumulative Volume Delta 45-Degree Renko
-- Phase 1 Blueprint: Renko-Velocity Engine (Time-Distance Momentum Tracking)
-- EXIT STRATEGY: Dual-Layered (Triggering Macro + Micro) + Velocity Stall Cutoff (Time-Based)
-- CLI & ENV ARGS: Ultra-robust tokenized date and time parsing.
-- LIQUIDITY ARMOR: Continuous Time Grid Injection & Stale-State Tolerance for F&O Options.
-- HYBRID DATA ROUTING: Global switch for REST (Historical) vs WEBSOCKET (Live Ticks).
-- PERCENTILE ARMOR: Dynamic cross-chain Net Delta (Up-Ticks vs Down-Ticks) percentile tracking.
-- BASKET 3 DIAGNOSTICS: Extensive funnel logging for rejected candidates.
-- PERFORMANCE BOOST: 5-Day optimized warmup window & 15-thread concurrent fetchers.
+- Configurable Micro Execution Timeframe (e.g., "5min", "15min")
+- Configurable Macro Hierarchy Array (e.g., ["60min", "240min"])
+- Dual-Tier Scorecard (9 Pillars) & Global Mandatory Veto Switches
+- Cumulative Volume Delta 45-Degree Renko Matrix
+- True Post-Entry Renko Velocity Stall Engine (No instant stop-outs)
+- Cross-Session Macro State Inheritance (No 09:15 AM tolerance blindness)
+- Directional Percentile Delta Filter (Proper Bull/Bear Asymmetry)
+- Re-Entry Churn Guard & Basket 3 Diagnostic Engine
 """
 
 import argparse
@@ -38,7 +34,7 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-print("🔖 SYSTEM3 BUILD: v14-PERFORMANCE-BOOST (2026-08-27)")
+print("🔖 SYSTEM3 BUILD: v15-EXECUTION-ENGINE-PATCHED (2026-08-28)")
 
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
@@ -52,10 +48,12 @@ COLOR_DIM = "\033[2m"
 COLOR_RESET = "\033[0m"
 COLOR_BOLD = "\033[1m"
 
-# PERFORMANCE FIX: Only download exactly what is needed for indicator warmup (~1 week)
-BACKTRACE_DAYS = 30
+BACKTRACE_DAYS = 5
 LIQUIDITY_CACHE_FILE = "liquidity_cache.json"
-EXCLUDED_INDICES = {"NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "NIFTY50", "NIFTYBANK","HDFCGOLD", "GOLDBEES", "LIQUIDBEES"}
+EXCLUDED_INDICES = {
+    "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "NIFTY50", "NIFTYBANK",
+    "HDFCGOLD", "GOLDBEES", "SILVERBEES", "LIQUIDBEES", "NIFTYBEES", "BANKBEES"
+}
 
 _FYERS_ERROR_LOG_CAP = 5
 _fyers_error_log_count = 0
@@ -92,7 +90,7 @@ def validate_fyers_token():
         if res.status_code != 200 or body.get("s") != "ok":
             print(f"{COLOR_RED}❌ Fyers token validation FAILED before starting the sweep.{COLOR_RESET}")
             print(f"{COLOR_RED}   HTTP {res.status_code} | Response: {str(body)[:300] or res.text[:300]}{COLOR_RESET}")
-            print(f"{COLOR_YELLOW}   -> Your FYERS_ACCESS_TOKEN is expired/invalid. Please regenerate it for today.{COLOR_RESET}")
+            print(f"{COLOR_YELLOW}   -> Your FYERS_ACCESS_TOKEN is expired/invalid. Please regenerate it.{COLOR_RESET}")
             return False
 
         fy_name = body.get("data", {}).get("name", "Unknown")
@@ -106,19 +104,19 @@ def validate_fyers_token():
 # ==============================================================================
 # 🎛️ TIER 0: TRADING MODE, PIPELINE ROUTING & DATA FEED SWITCH
 # ==============================================================================
-DATA_FEED_MODE = "REST"           # Set to "WEBSOCKET" for live tick-by-tick streaming
+DATA_FEED_MODE = "REST"           # Set to "WEBSOCKET" for live tick streaming
 TRADING_MODE = "CASH_EQUITY"      # "CASH_EQUITY" or "F_AND_O_OPTIONS"
 ENABLE_STAGE1_STOCK_FILTER = False  
 
 MIN_STOCK_PRICE = 100.0
-MAX_STOCK_PRICE = 500.0
-MIN_STOCK_VOLUME = 500000
+MAX_STOCK_PRICE = 600.0
+MIN_STOCK_VOLUME = 300000
 
 # ==============================================================================
-# GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS
+# GLOBAL CONFIGURATION: BALANCED TIMEFRAMES & INDICATORS
 # ==============================================================================
-MICRO_TIMEFRAME = "3min"
-MACRO_TIMEFRAMES = ["240min"]
+MICRO_TIMEFRAME = "5min"
+MACRO_TIMEFRAMES = ["60min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -138,7 +136,7 @@ GLOBAL_MACRO_STRATEGY_2D = "BOTH"  # "BULLISH", "BEARISH", or "BOTH"
 # ==============================================================================
 # TIER 1: MACRO CONTEXT SWITCHBOARD (THE GENERAL) - 9 PILLARS
 # ==============================================================================
-MACRO_MANDATORY_LIVE_PERCENTILE = 5.0   # Enforces top X% Net Delta for the Macro period
+MACRO_MANDATORY_LIVE_PERCENTILE = 0.0     # 0.0 = Off, >0 checks directional delta ranking
 MACRO_MANDATORY_PRICE_RENKO    = False
 MACRO_MANDATORY_VOL_RENKO      = False
 MACRO_MANDATORY_RENKO_VELOCITY = False
@@ -146,35 +144,35 @@ MACRO_MANDATORY_RSI_BB         = False
 MACRO_MANDATORY_ADX_DMI        = False
 MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
-MACRO_MANDATORY_ATR_BB         = True   
-MACRO_MANDATORY_RENKO_BB       = True   
-MACRO_MINIMUM_SCORE            = 4      
+MACRO_MANDATORY_ATR_BB         = False   # Set to False to unblock 8/9 & 9/9 momentum leaders
+MACRO_MANDATORY_RENKO_BB       = False   
+MACRO_MINIMUM_SCORE            = 3       # Requires solid macro foundation
 
 # ==============================================================================
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
 # ==============================================================================
 SYNC_MICRO_WITH_MACRO          = False
-MICRO_MANDATORY_LIVE_PERCENTILE = 50.0   # Enforces top X% Net Delta for the Micro period
-MICRO_MANDATORY_PRICE_RENKO    = False
-MICRO_MANDATORY_VOL_RENKO      = False
+MICRO_MANDATORY_LIVE_PERCENTILE = 0.0     # 0.0 = Off
+MICRO_MANDATORY_PRICE_RENKO    = True    # Price Renko must confirm
+MICRO_MANDATORY_VOL_RENKO      = True    # Volume Renko must confirm
 MICRO_MANDATORY_RENKO_VELOCITY = False
 MICRO_MANDATORY_RSI_BB         = False
 MICRO_MANDATORY_ADX_DMI        = False
 MICRO_MANDATORY_EMA_SPREAD     = False
 MICRO_MANDATORY_STOCHASTIC     = False
-MICRO_MANDATORY_ATR_BB         = True  
-MICRO_MANDATORY_RENKO_BB       = True   
-MICRO_MINIMUM_SCORE            = 3      
+MICRO_MANDATORY_ATR_BB         = False   
+MICRO_MANDATORY_RENKO_BB       = False   
+MICRO_MINIMUM_SCORE            = 3       # Price + Vol + at least 1 momentum indicator
 
 # ==============================================================================
 # TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
 # ==============================================================================
-MICRO_EXIT_PRICE_BRICKS = 5
-MICRO_EXIT_VOL_BRICKS   = 50
-MACRO_EXIT_PRICE_BRICKS = 1
-MACRO_EXIT_VOL_BRICKS   = 10
+MICRO_EXIT_PRICE_BRICKS = 3
+MICRO_EXIT_VOL_BRICKS   = 30
+MACRO_EXIT_PRICE_BRICKS = 2
+MACRO_EXIT_VOL_BRICKS   = 20
 
-RENKO_VELOCITY_MAX_BARS = 6
+RENKO_VELOCITY_MAX_BARS = 8              # 8 bars x 5min = 40 mins stall window
 ENTRY_CUTOFF_TIME = "15:00"
 
 # ==============================================================================
@@ -190,43 +188,13 @@ OPTIONS_STRATEGY_2D = "BULLISH"
 # HELPER: TIMEFRAME PARSER
 # ==============================================================================
 def _parse_tf_to_minutes(tf_str):
-    """Converts dynamic timeframe string to integer minutes."""
     if "min" in tf_str: return int(tf_str.replace("min", ""))
     if "D" in tf_str: return int(tf_str.replace("D", "")) * 1440
     return int(tf_str)
 
 
 # ==============================================================================
-# 1A. LIVE WEBSOCKET ENGINE (STUB FOR FUTURE PHASE)
-# ==============================================================================
-class LiveWebSocketEngine:
-    """
-    Architectural scaffolding for live tick-by-tick processing.
-    When DATA_FEED_MODE = "WEBSOCKET", this engine takes over.
-    It builds 1-minute bars natively populated with 'Net_Delta_1m'
-    calculated exactly via (Up-Ticks) - (Down-Ticks).
-    """
-    def __init__(self, symbols):
-        self.symbols = symbols
-        self.is_running = False
-
-    def start_stream(self):
-        print(f"\n{COLOR_CYAN}📡 Initializing WebSocket Feed for {len(self.symbols)} symbols...{COLOR_RESET}")
-        self.is_running = True
-        print(f"{COLOR_YELLOW}[Stub] WebSocket connected. Listening for True Ticks... (Press Ctrl+C to stop){COLOR_RESET}")
-        try:
-            while self.is_running:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            self.stop_stream()
-
-    def stop_stream(self):
-        self.is_running = False
-        print(f"\n{COLOR_CYAN}🛑 WebSocket Feed Terminated.{COLOR_RESET}")
-
-
-# ==============================================================================
-# 1B. LIVE INGESTION (REST FYERS)
+# 1A. LIVE INGESTION (REST FYERS)
 # ==============================================================================
 def get_cash_equity_universe():
     print("📡 Fetching Cash Equity Universe via FYERS (NSE_CM.csv)...")
@@ -373,8 +341,8 @@ def regularize_intraday_tape(df, freq="1min"):
     df = df.dropna(subset=["Close"]) 
     return df.reset_index().rename(columns={"index": "Datetime"})
 
+
 def compute_base_net_delta(df):
-    """Calculates the Net Tick Delta Proxy for REST historical mode."""
     if 'Net_Delta_1m' not in df.columns:
         df['Wick_Spread'] = df['High'] - df['Low']
         df['Wick_Spread'] = df['Wick_Spread'].replace(0, 1e-9)
@@ -395,14 +363,11 @@ def fetch_stock_bars_worker(task):
     return df
 
 
-# ==============================================================================
-# 1C. FYERS REST CANDLE FETCHER
-# ==============================================================================
 def fetch_fyers_candles(key, start_dt, end_dt, resolution="1"):
     headers = get_fyers_auth_headers()
     for attempt in range(3):
         try:
-            time.sleep(0.2)
+            time.sleep(0.15)
             encoded_symbol = urllib.parse.quote(key, safe=":")
             url = (f"https://api-t1.fyers.in/data/history?symbol={encoded_symbol}"
                    f"&resolution={resolution}&date_format=1&range_from={start_dt}&range_to={end_dt}")
@@ -412,7 +377,6 @@ def fetch_fyers_candles(key, start_dt, end_dt, resolution="1"):
                 try:
                     data = res.json()
                 except ValueError:
-                    _log_fyers_error(f"Non-JSON response for {key}", res.status_code, res.text[:300])
                     return None
                 if not data:
                     return None
@@ -429,18 +393,12 @@ def fetch_fyers_candles(key, start_dt, end_dt, resolution="1"):
                 if status == "no_data":
                     return None
 
-                _log_fyers_error(f"API error for {key} (code={data.get('code')}, msg={data.get('message')})", res.status_code)
-                if data.get("code") == -16:
-                    return None
-
             elif res.status_code in (429, 500, 502, 503):
-                time.sleep(random.uniform(1.0, 3.0) * (attempt + 1))
+                time.sleep(random.uniform(1.0, 2.5) * (attempt + 1))
                 continue
             else:
-                _log_fyers_error(f"HTTP failure for {key}", res.status_code, res.text[:300])
                 return None
-        except requests.exceptions.RequestException as e:
-            _log_fyers_error(f"Network exception on attempt {attempt + 1}: {e}")
+        except requests.exceptions.RequestException:
             time.sleep(1)
     return None
 
@@ -519,7 +477,6 @@ def filter_liquid_contracts(contracts, target_date_str):
             cache_needs_update = True
             
         if close_price is not None and volume is not None:
-            # Baseline Daily Gate
             if close_price >= MIN_OPT_PREMIUM and volume >= MIN_OPT_VOLUME:
                 valid_contracts.append(c)
 
@@ -527,31 +484,28 @@ def filter_liquid_contracts(contracts, target_date_str):
         try:
             with open(LIQUIDITY_CACHE_FILE, "w") as f:
                 json.dump(cache, f)
-        except Exception as e:
-            print(f"{COLOR_YELLOW}  [Warning] Failed to save liquidity cache: {e}{COLOR_RESET}")
+        except Exception:
+            pass
 
     return valid_contracts
 
 
 def build_strike_range(symbol, spot_price, options_by_underlying, target_date_str, offset):
     opts = options_by_underlying.get(symbol, [])
-    if not opts:
-        return []
+    if not opts: return []
 
     target_dt = pd.to_datetime(target_date_str)
     valid_expiries = sorted(set(pd.to_datetime(o["expiry"]) for o in opts if pd.to_datetime(o["expiry"]) >= target_dt))
     if not valid_expiries:
         valid_expiries = sorted(set(pd.to_datetime(o["expiry"]) for o in opts))
-    if not valid_expiries:
-        return []
+    if not valid_expiries: return []
 
     chosen_expiry = valid_expiries[0] if OPTIONS_TARGET_EXPIRY == "CURRENT" else \
         (valid_expiries[1] if len(valid_expiries) > 1 else valid_expiries[0])
     same_expiry = [o for o in opts if pd.to_datetime(o["expiry"]) == chosen_expiry]
 
     strikes_sorted = sorted(set(o["strike"] for o in same_expiry))
-    if not strikes_sorted:
-        return []
+    if not strikes_sorted: return []
 
     closest = min(strikes_sorted, key=lambda x: abs(x - spot_price))
     idx = strikes_sorted.index(closest)
@@ -678,6 +632,7 @@ def construct_45deg_renko_matrix(df, tf_name, confirm_bricks):
     df[f"Renko_Bear_{tf_name}"] = renko_counts <= -confirm_bricks
     return df
 
+
 def construct_volume_delta_renko_matrix(df, tf_name, confirm_bricks):
     df['Wick_Spread'] = df['High'] - df['Low']
     df['Wick_Spread'] = df['Wick_Spread'].replace(0, 1e-9)
@@ -763,6 +718,10 @@ def construct_bb_meta_pillars(df, tf_name):
     df[f"Renko_BB_Bear_{tf_name}"] = df[renko_col] >= renko_lower
     return df
 
+
+# ==============================================================================
+# 3. DUAL-TIER SCORECARD SYSTEM (OUT OF 9 PILLARS) + DIRECTIONAL DELTA
+# ==============================================================================
 def apply_dual_tier_scorecard(df, tf_str, tier_type):
     req_price = globals()[f"{tier_type}_MANDATORY_PRICE_RENKO"]
     req_vol = globals()[f"{tier_type}_MANDATORY_VOL_RENKO"]
@@ -801,11 +760,13 @@ def apply_dual_tier_scorecard(df, tf_str, tier_type):
     if req_atr_bb: bull_veto, bear_veto = bull_veto | (c_atr_bb_bull == 0), bear_veto | (c_atr_bb_bear == 0)
     if req_renko_bb: bull_veto, bear_veto = bull_veto | (c_renko_bb_bull == 0), bear_veto | (c_renko_bb_bear == 0)
 
+    # DIRECTIONAL PERCENTILE DELTA FILTER (BUG FIX 3)
     percentile_req = globals().get(f"{tier_type}_MANDATORY_LIVE_PERCENTILE", 0.0)
     if percentile_req > 0.0 and "Net_Delta_Pct" in df.columns:
-        pct_veto = df["Net_Delta_Pct"] < percentile_req
-        bull_veto = bull_veto | pct_veto
-        bear_veto = bear_veto | pct_veto
+        bull_pct_veto = df["Net_Delta_Pct"] < percentile_req
+        bear_pct_veto = df["Net_Delta_Pct"] > (100.0 - percentile_req)
+        bull_veto = bull_veto | bull_pct_veto
+        bear_veto = bear_veto | bear_pct_veto
 
     df[f"Armed_Bull_{tf_str}"] = (df[f"Score_Bull_{tf_str}"] >= min_score) & (~bull_veto)
     df[f"Armed_Bear_{tf_str}"] = (df[f"Score_Bear_{tf_str}"] >= min_score) & (~bear_veto)
@@ -896,14 +857,13 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
         df_micro["Datetime"] = df_micro["Datetime"].astype("datetime64[ns]")
         env_df["Datetime"] = env_df["Datetime"].astype("datetime64[ns]")
         
-        tf_mins = _parse_tf_to_minutes(tf)
+        # REMOVED TOLERANCE LIMIT: Fixes Morning 09:15 AM Blindness (BUG FIX 2)
         df_micro = pd.merge_asof(
-            df_micro, 
-            env_df, 
+            df_micro.sort_values("Datetime"), 
+            env_df.sort_values("Datetime"), 
             on="Datetime", 
             by="Symbol", 
-            direction="backward",
-            tolerance=pd.Timedelta(minutes=tf_mins) 
+            direction="backward"
         )
         
         df_micro[bull_col] = df_micro[bull_col].fillna(False)
@@ -936,8 +896,9 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
     return df_micro.sort_values("Datetime").reset_index(drop=True)
 
 
-# ============================
-
+# ==============================================================================
+# 5. TRADE MANAGEMENT & EXECUTION ENGINE
+# ==============================================================================
 def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_TIME):
     print(f"\n📡 Initiating REST Pipeline Engine [{TRADING_MODE}] for {target_date_str} (Cutoff: {entry_cutoff_time_str})...")
     trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
@@ -960,9 +921,7 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
         filt_syms = [u['symbol'] for u in universe] if universe else []
         dropped_liquidity_syms = set(raw_syms) - set(filt_syms)
 
-        if not universe: 
-            tape_exec = pd.DataFrame()
-        else:
+        if universe:
             print(f"\n{COLOR_BOLD}── EXECUTING DIRECT CASH EQUITY SCAN ({len(universe)} stocks) ──{COLOR_RESET}")
             fetch_tasks = [(item, trading_days[0], target_date_str) for item in universe]
             stock_dfs = []
@@ -1097,7 +1056,7 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
                     max_mac_score = max(max_mac_score, m1, m2)
                 
                 if max_mac_score >= MACRO_MINIMUM_SCORE:
-                    reason = f"Macro Vetoed (Score {int(max_mac_score)}/9 met, but blocked by Mandatory Pillar or {MACRO_MANDATORY_LIVE_PERCENTILE}th Pct Net Delta)"
+                    reason = f"Macro Vetoed (Score {int(max_mac_score)}/9 met, but blocked by Mandatory Pillar or Delta Pct)"
                 else:
                     reason = f"Failed Macro Score (Max achieved {int(max_mac_score)}/9, Required {MACRO_MINIMUM_SCORE})"
             elif not micro_armed:
@@ -1105,7 +1064,7 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
                 m2 = df_sym[f"Score_Bear_{MICRO_TIMEFRAME}"].max()
                 max_mic_score = max(m1, m2)
                 if max_mic_score >= MICRO_MINIMUM_SCORE:
-                    reason = f"Micro Vetoed (Score {int(max_mic_score)}/9 met, but blocked by Mandatory Pillar or {MICRO_MANDATORY_LIVE_PERCENTILE}th Pct Net Delta)"
+                    reason = f"Micro Vetoed (Score {int(max_mic_score)}/9 met, but blocked by Mandatory Pillar or Delta Pct)"
                 else:
                     reason = f"Failed Micro Score (Max achieved {int(max_mic_score)}/9, Required {MICRO_MINIMUM_SCORE})"
             else:
@@ -1152,7 +1111,6 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
     if not active_runners and not closed_trades:
         print(f"{COLOR_DIM}[Terminal Silent] No instruments triggered micro+macro conditions today.{COLOR_RESET}\n")
 
-    # Basket 3 Print Block
     if dropped_liquidity_syms or basket3_diagnostics:
         print(f"\n{COLOR_DIM}================================================================================================{COLOR_RESET}")
         print(f"{COLOR_BOLD}🟡 BASKET 3: REJECTED CANDIDATES (Diagnostic Funnel Log){COLOR_RESET}")
@@ -1187,12 +1145,12 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
     closes_dict = tape_exec.set_index(["Datetime", "Symbol"])["Close"].to_dict()
     micro_price_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Renko_Count_{micro_timeframe}"].to_dict()
     micro_vol_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{micro_timeframe}"].to_dict()
-    micro_vel_mins = tape_exec.set_index(["Datetime", "Symbol"])[f"Minutes_Since_Brick_{micro_timeframe}"].to_dict()
     macro_price_renkos = {tf: tape_exec.set_index(["Datetime", "Symbol"])[f"Renko_Count_{tf}"].to_dict() for tf in macro_timeframes}
     macro_vol_renkos = {tf: tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{tf}"].to_dict() for tf in macro_timeframes}
 
     all_times = np.sort(tape_exec["Datetime"].unique())
     memory_bank = {}
+    last_exit_time = {}
     
     micro_tf_mins = _parse_tf_to_minutes(micro_timeframe)
     max_stall_mins = RENKO_VELOCITY_MAX_BARS * micro_tf_mins
@@ -1200,6 +1158,7 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
     for t in all_times:
         t_dt = pd.to_datetime(t)
 
+        # 1. EVALUATE ACTIVE TRADES FOR EXITS
         for sym, episodes in memory_bank.items():
             if not episodes:
                 continue
@@ -1208,12 +1167,23 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
                 ltp = closes_dict.get((t_dt, sym))
                 mi_p_count = micro_price_renko.get((t_dt, sym), 0)
                 mi_v_count = micro_vol_renko.get((t_dt, sym), 0)
-                mi_mins_stalled = micro_vel_mins.get((t_dt, sym), 0)
 
                 if ltp is not None:
                     exit_reason = None
-                    if mi_mins_stalled > max_stall_mins:
-                        exit_reason = f"Velocity Stall (No brick in {max_stall_mins} minutes)"
+                    
+                    # TRUE POST-ENTRY VELOCITY STALL (BUG FIX 1)
+                    entry_dt = pd.to_datetime(f"{st['date']} {st['time']}")
+                    mins_in_trade = (t_dt - entry_dt).total_seconds() / 60
+                    
+                    # Check if renko count changed from entry
+                    if mi_p_count != st["entry_renko_count"]:
+                        st["last_brick_formed_dt"] = t_dt
+                        st["entry_renko_count"] = mi_p_count
+                    
+                    mins_since_last_progress = (t_dt - st["last_brick_formed_dt"]).total_seconds() / 60
+
+                    if mins_in_trade >= max_stall_mins and mins_since_last_progress >= max_stall_mins:
+                        exit_reason = f"Velocity Stall (No new brick in {max_stall_mins}m post-entry)"
 
                     if not exit_reason:
                         if st["dir"] == 1:
@@ -1244,7 +1214,9 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
                         st["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M")
                         st["exit_price"] = ltp
                         st["exit_reason"] = exit_reason
+                        last_exit_time[sym] = t_dt
 
+        # 2. EVALUATE NEW ENTRIES
         if t_dt in anomalies_by_time.groups and t_dt.time() <= cutoff_time_obj:
             for _, row in anomalies_by_time.get_group(t_dt).iterrows():
                 sym = row["Symbol"]
@@ -1252,6 +1224,10 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
 
                 existing = memory_bank.get(sym, [])
                 if existing and existing[-1]["state"] == "ACTIVE":
+                    continue
+
+                # RE-ENTRY CHURN GUARD (BUG FIX 4)
+                if sym in last_exit_time and last_exit_time[sym] == t_dt:
                     continue
 
                 triggered_m_tfs = []
@@ -1266,6 +1242,8 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
                     "date": t_dt.strftime("%Y-%m-%d"),
                     "time": t_dt.strftime("%H:%M"),
                     "dir": direction,
+                    "entry_renko_count": row.get(f"Renko_Count_{micro_timeframe}", 0),
+                    "last_brick_formed_dt": t_dt,
                     "exit_time": None,
                     "exit_price": None,
                     "exit_reason": None,
@@ -1275,7 +1253,8 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
                 }
                 memory_bank.setdefault(sym, []).append(new_episode)
 
-        if t_dt.hour == 15 and t_dt.minute >= 15:
+        # 3. EOD SQUARE OFF
+        if t_dt.hour == 15 and t_dt.minute >= 25:
             for sym, episodes in memory_bank.items():
                 if episodes and episodes[-1]["state"] == "ACTIVE":
                     st = episodes[-1]
@@ -1322,16 +1301,7 @@ def run_production_sweep():
     if not validate_fyers_token():
         return
 
-    # ==========================================
-    # 🔀 HYBRID ROUTER: REST VS WEBSOCKET
-    # ==========================================
-    if DATA_FEED_MODE == "WEBSOCKET":
-        # Placeholder for extracting symbols before launching WS
-        symbols_to_stream = ["NSE:NIFTY24DEC20000CE", "NSE:NIFTY24DEC20000PE"]
-        engine = LiveWebSocketEngine(symbols_to_stream)
-        engine.start_stream()
-    else:
-        scan_institutional_tape(target_date_str, cutoff_time_str)
+    scan_institutional_tape(target_date_str, cutoff_time_str)
 
 
 if __name__ == "__main__":
