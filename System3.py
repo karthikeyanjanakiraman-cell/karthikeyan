@@ -7,7 +7,7 @@ Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine:
 - Cumulative Volume Delta 45-Degree Renko Matrix
 - True Post-Entry Renko Velocity Stall Engine (No instant stop-outs)
 - Cross-Session Macro State Inheritance (No 09:15 AM tolerance blindness)
-- Directional Percentile Delta Filter (Proper Bull/Bear Asymmetry)
+- Internal Delta Percentage (Absolute Order Flow Conviction)
 - Re-Entry Churn Guard & Basket 3 Diagnostic Engine
 - Relative Post-Entry Structure Breaks (No 5-min churn loops)
 - STALE MOMENTUM & PRICE PROGRESSION GUARDS (Zero Flatline Churn)
@@ -37,7 +37,7 @@ import requests
 
 warnings.filterwarnings("ignore")
 
-print("🔖 SYSTEM3 BUILD: v18-FINAL-CUTOFFS (2026-08-28)")
+print("🔖 SYSTEM3 BUILD: v19-TRUE-INSTITUTIONAL-DELTA (2026-08-29)")
 
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
@@ -112,8 +112,8 @@ TRADING_MODE = "CASH_EQUITY"
 ENABLE_STAGE1_STOCK_FILTER = False  
 
 MIN_STOCK_PRICE = 100.0
-MAX_STOCK_PRICE = 150.0
-MIN_STOCK_VOLUME = 3000000
+MAX_STOCK_PRICE = 600.0
+MIN_STOCK_VOLUME = 300000
 
 # ==============================================================================
 # GLOBAL CONFIGURATION: BALANCED TIMEFRAMES & INDICATORS
@@ -155,7 +155,7 @@ MACRO_MINIMUM_SCORE            = 3
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
 # ==============================================================================
 SYNC_MICRO_WITH_MACRO          = False
-MICRO_MANDATORY_LIVE_PERCENTILE = 25.0    
+MICRO_MANDATORY_LIVE_PERCENTILE = 50.0    
 MICRO_MANDATORY_PRICE_RENKO    = True    
 MICRO_MANDATORY_VOL_RENKO      = True    
 MICRO_MANDATORY_RENKO_VELOCITY = False
@@ -763,10 +763,11 @@ def apply_dual_tier_scorecard(df, tf_str, tier_type):
     if req_atr_bb: bull_veto, bear_veto = bull_veto | (c_atr_bb_bull == 0), bear_veto | (c_atr_bb_bear == 0)
     if req_renko_bb: bull_veto, bear_veto = bull_veto | (c_renko_bb_bull == 0), bear_veto | (c_renko_bb_bear == 0)
 
+    # BUG FIX: TRUE INTERNAL DELTA PERCENTAGE (Absolute conviction instead of relative rank)
     percentile_req = globals().get(f"{tier_type}_MANDATORY_LIVE_PERCENTILE", 0.0)
     if percentile_req > 0.0 and "Net_Delta_Pct" in df.columns:
         bull_pct_veto = df["Net_Delta_Pct"] < percentile_req
-        bear_pct_veto = df["Net_Delta_Pct"] > (100.0 - percentile_req)
+        bear_pct_veto = df["Net_Delta_Pct"] > -percentile_req
         bull_veto = bull_veto | bull_pct_veto
         bear_veto = bear_veto | bear_pct_veto
 
@@ -791,7 +792,8 @@ def evaluate_single_timeframe_gates(df_base, tf_str):
     df_tf.rename(columns={"Net_Delta_1m": "Timeframe_Net_Delta"}, inplace=True)
     df_tf = df_tf.dropna(subset=["Close"]).sort_values(["Symbol", "Datetime"])
     
-    df_tf["Net_Delta_Pct"] = df_tf.groupby("Datetime")["Timeframe_Net_Delta"].rank(pct=True, method='min') * 100
+    # BUG FIX: Delta as % of Candle Volume
+    df_tf["Net_Delta_Pct"] = (df_tf["Timeframe_Net_Delta"] / (df_tf["Volume"] + 1e-9)) * 100
     
     df_tf = calculate_core_technicals(df_tf)
     df_tf = construct_45deg_renko_matrix(df_tf, tf_str, MACRO_RENKO_CONFIRM_BRICKS)
@@ -837,7 +839,8 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
         df_micro = rolling_master_df.sort_values(["Symbol", "Datetime"]).copy()
         df_micro["Timeframe_Net_Delta"] = df_micro["Net_Delta_1m"]
 
-    df_micro["Net_Delta_Pct"] = df_micro.groupby("Datetime")["Timeframe_Net_Delta"].rank(pct=True, method='min') * 100
+    # BUG FIX: Delta as % of Candle Volume
+    df_micro["Net_Delta_Pct"] = (df_micro["Timeframe_Net_Delta"] / (df_micro["Volume"] + 1e-9)) * 100
 
     df_micro = calculate_core_technicals(df_micro)
     df_micro = construct_45deg_renko_matrix(df_micro, micro_tf, MICRO_RENKO_CONFIRM_BRICKS)
@@ -1085,7 +1088,14 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
         print(f"{COLOR_BOLD}🟢 BASKET 1: ACTIVE RUNNERS (Riding the Trend){COLOR_RESET}")
         for st in active_runners:
             ltp = final_ltp_dict.get(st["sym"], st["origin"])
-            pnl_pct = ((ltp - st["origin"]) / st["origin"]) * 100
+            
+            # --- BUG FIX: SHORT TRADE P&L INVERSION ---
+            if st["dir"] == 1:
+                pnl_pct = ((ltp - st["origin"]) / st["origin"]) * 100
+            else:
+                pnl_pct = ((st["origin"] - ltp) / st["origin"]) * 100
+            # ------------------------------------------
+
             color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
             d_str = "BULLISH" if st["dir"] == 1 else "BEARISH"
 
@@ -1098,7 +1108,13 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
     if closed_trades:
         print(f"{COLOR_BOLD}🛑 BASKET 2: CLOSED TRADES (Renko Structure Broken / Stagnation){COLOR_RESET}")
         for st in closed_trades:
-            pnl_pct = ((st["exit_price"] - st["origin"]) / st["origin"]) * 100
+            # --- BUG FIX: SHORT TRADE P&L INVERSION ---
+            if st["dir"] == 1:
+                pnl_pct = ((st["exit_price"] - st["origin"]) / st["origin"]) * 100
+            else:
+                pnl_pct = ((st["origin"] - st["exit_price"]) / st["origin"]) * 100
+            # ------------------------------------------
+
             color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
             d_str = "BULLISH" if st["dir"] == 1 else "BEARISH"
 
@@ -1162,7 +1178,7 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
     for t in all_times:
         t_dt = pd.to_datetime(t)
 
-        # 0. INTRADAY OVERNIGHT FLUSH (BUG FIX: Kills Gap Leaks like WEL)
+        # 0. INTRADAY OVERNIGHT FLUSH
         if t_dt.time() == pd.Timestamp("09:15").time():
             for sym, episodes in memory_bank.items():
                 if episodes and episodes[-1]["state"] == "ACTIVE":
@@ -1236,7 +1252,7 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
 
         # 2. EVALUATE NEW ENTRIES
         if t_dt in anomalies_by_time.groups:
-            # BUG FIX: True 14:15 absolute entry shutdown
+            # 14:15 absolute entry shutdown
             if t_dt.time() >= cutoff_time_obj:
                 continue
 
