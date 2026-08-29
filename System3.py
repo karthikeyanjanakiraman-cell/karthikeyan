@@ -113,7 +113,7 @@ ENABLE_STAGE1_STOCK_FILTER = False
 
 MIN_STOCK_PRICE = 100.0
 MAX_STOCK_PRICE = 600.0
-MIN_STOCK_VOLUME = 300000
+MIN_STOCK_VOLUME = 1500000
 
 # ==============================================================================
 # GLOBAL CONFIGURATION: BALANCED TIMEFRAMES & INDICATORS
@@ -144,12 +144,12 @@ MACRO_MANDATORY_PRICE_RENKO    = True
 MACRO_MANDATORY_VOL_RENKO      = False
 MACRO_MANDATORY_RENKO_VELOCITY = False
 MACRO_MANDATORY_RSI_BB         = False
-MACRO_MANDATORY_ADX_DMI        = False
+MACRO_MANDATORY_ADX_DMI        = True
 MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
 MACRO_MANDATORY_ATR_BB         = False   
 MACRO_MANDATORY_RENKO_BB       = False   
-MACRO_MINIMUM_SCORE            = 3       
+MACRO_MINIMUM_SCORE            = 5       
 
 # ==============================================================================
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
@@ -165,7 +165,7 @@ MICRO_MANDATORY_EMA_SPREAD     = False
 MICRO_MANDATORY_STOCHASTIC     = False
 MICRO_MANDATORY_ATR_BB         = False   
 MICRO_MANDATORY_RENKO_BB       = False   
-MICRO_MINIMUM_SCORE            = 3       
+MICRO_MINIMUM_SCORE            = 5       
 
 # ==============================================================================
 # TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
