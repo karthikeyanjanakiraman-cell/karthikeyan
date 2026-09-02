@@ -86,7 +86,7 @@ ENABLE_STAGE1_STOCK_FILTER = False
 
 MIN_STOCK_PRICE = 100.0
 MAX_STOCK_PRICE = 150.0
-MIN_STOCK_VOLUME = 1500000
+MIN_STOCK_VOLUME = 500000
 
 # ==============================================================================
 # GLOBAL CONFIGURATION
@@ -148,7 +148,7 @@ MICRO_EXIT_VOL_BRICKS   = 30
 MACRO_EXIT_PRICE_BRICKS = 2              
 MACRO_EXIT_VOL_BRICKS   = 20
 RENKO_VELOCITY_MAX_BARS = 8              
-ENTRY_CUTOFF_TIME = "14:15"              
+ENTRY_CUTOFF_TIME = "15:15"              
 MAX_DAILY_TRADES_PER_SYMBOL = 2
 
 # ==============================================================================
