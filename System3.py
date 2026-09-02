@@ -85,7 +85,7 @@ TRADING_MODE = "CASH_EQUITY"
 ENABLE_STAGE1_STOCK_FILTER = False  
 
 MIN_STOCK_PRICE = 100.0
-MAX_STOCK_PRICE = 150.0
+MAX_STOCK_PRICE = 400.0
 MIN_STOCK_VOLUME = 500000
 
 # ==============================================================================
