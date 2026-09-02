@@ -80,8 +80,8 @@ def _log_fyers_error(context, status_code=None, body=None):
 # ==============================================================================
 # 🎛️ TIER 0: TRADING MODE, PIPELINE ROUTING & DATA FEED SWITCH
 # ==============================================================================
-DATA_FEED_MODE = "WEB_SOCKET"           
-TRADING_MODE = "ACASH_EQUITY"      
+DATA_FEED_MODE = "REST"           
+TRADING_MODE = "aCASH_EQUITY"      
 ENABLE_STAGE1_STOCK_FILTER = False  
 
 MIN_STOCK_PRICE = 100.0
