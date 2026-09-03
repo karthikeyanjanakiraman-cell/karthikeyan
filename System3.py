@@ -92,7 +92,7 @@ MIN_STOCK_VOLUME = 500000
 # GLOBAL CONFIGURATION
 # ==============================================================================
 MICRO_TIMEFRAME = "5min"
-MACRO_TIMEFRAMES = ["60min"]
+MACRO_TIMEFRAMES = ["15min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
