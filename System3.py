@@ -87,13 +87,13 @@ ENABLE_STAGE1_STOCK_FILTER = False
 
 MIN_STOCK_PRICE = 100.0
 MAX_STOCK_PRICE = 400.0
-MIN_STOCK_VOLUME = 500000
+MIN_STOCK_VOLUME = 5000000
 
 # ==============================================================================
 # GLOBAL CONFIGURATION
 # ==============================================================================
 MICRO_TIMEFRAME = "5min"
-MACRO_TIMEFRAMES = ["15min"]
+MACRO_TIMEFRAMES = ["60min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -114,8 +114,8 @@ GLOBAL_MACRO_STRATEGY_2D = "BOTH"
 # TIER 1: MACRO CONTEXT SWITCHBOARD (THE GENERAL) - 9 PILLARS
 # ==============================================================================
 MACRO_MANDATORY_LIVE_PERCENTILE = 0.0     
-MACRO_MANDATORY_PRICE_RENKO    = False    
-MACRO_MANDATORY_VOL_RENKO      = False
+MACRO_MANDATORY_PRICE_RENKO    = True    
+MACRO_MANDATORY_VOL_RENKO      = True
 MACRO_MANDATORY_RENKO_VELOCITY = False
 MACRO_MANDATORY_RSI_BB         = False
 MACRO_MANDATORY_ADX_DMI        = True
@@ -123,13 +123,13 @@ MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
 MACRO_MANDATORY_ATR_BB         = False   
 MACRO_MANDATORY_RENKO_BB       = False   
-MACRO_MINIMUM_SCORE            = 1       
+MACRO_MINIMUM_SCORE            = 3       
 
 # ==============================================================================
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
 # ==============================================================================
 SYNC_MICRO_WITH_MACRO          = False
-MICRO_MANDATORY_LIVE_PERCENTILE = 0.0    
+MICRO_MANDATORY_LIVE_PERCENTILE = 20.0    
 MICRO_MANDATORY_PRICE_RENKO    = False    
 MICRO_MANDATORY_VOL_RENKO      = False    
 MICRO_MANDATORY_RENKO_VELOCITY = False
