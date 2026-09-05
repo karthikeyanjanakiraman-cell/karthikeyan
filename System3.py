@@ -80,10 +80,10 @@ def _log_fyers_error(context, status_code=None, body=None):
           f"{' | HTTP ' + str(status_code) if status_code else ''} {snippet}{COLOR_RESET}")
 
 # ==============================================================================
-# 🎛️ TIER 0: TRADING MODE, PIPELINE ROUTING & DATA FEED SWITCH
+# 🎛️ TIER 0: TRADING MODE, PIPELINE ROUTING & DATA FEED SWITCH WEBSOCKET REST
 # ==============================================================================
-DATA_FEED_MODE = "WEBSOCKET"       
-TRADING_MODE = "CASH_EQUITY"       
+DATA_FEED_MODE = "REST"       
+TRADING_MODE = "CAASH_EQUITY"       
 ENABLE_STAGE1_STOCK_FILTER = False  
 
 MIN_STOCK_PRICE = 100.0
@@ -94,7 +94,7 @@ MIN_STOCK_VOLUME = 500000
 # GLOBAL CONFIGURATION
 # ==============================================================================
 MICRO_TIMEFRAME = "5min"
-MACRO_TIMEFRAMES = ["15min"]
+MACRO_TIMEFRAMES = ["60min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -115,8 +115,8 @@ GLOBAL_MACRO_STRATEGY_2D = "BOTH"
 # TIER 1: MACRO CONTEXT SWITCHBOARD (THE GENERAL) - 9 PILLARS
 # ==============================================================================
 MACRO_MANDATORY_LIVE_PERCENTILE = 0.0     
-MACRO_MANDATORY_PRICE_RENKO    = False    
-MACRO_MANDATORY_VOL_RENKO      = False
+MACRO_MANDATORY_PRICE_RENKO    = True    
+MACRO_MANDATORY_VOL_RENKO      = True
 MACRO_MANDATORY_RENKO_VELOCITY = False
 MACRO_MANDATORY_RSI_BB         = False
 MACRO_MANDATORY_ADX_DMI        = True
@@ -124,7 +124,7 @@ MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
 MACRO_MANDATORY_ATR_BB         = False   
 MACRO_MANDATORY_RENKO_BB       = False   
-MACRO_MINIMUM_SCORE            = 1       
+MACRO_MINIMUM_SCORE            = 3       
 
 # ==============================================================================
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
