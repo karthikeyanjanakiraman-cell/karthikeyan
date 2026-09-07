@@ -82,7 +82,7 @@ def _log_fyers_error(context, status_code=None, body=None):
 # ==============================================================================
 # 🎛️ TIER 0: TRADING MODE, PIPELINE ROUTING & DATA FEED SWITCH WEBSOCKET REST
 # ==============================================================================
-DATA_FEED_MODE = "REST"       
+DATA_FEED_MODE = "WEBSOCKET"       
 TRADING_MODE = "CAASH_EQUITY"       
 ENABLE_STAGE1_STOCK_FILTER = False  
 
