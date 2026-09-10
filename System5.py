@@ -74,16 +74,11 @@ BACKTRACE_DAYS = 5
 LIQUIDITY_CACHE_FILE = "liquidity_cache.json"
 LIQUIDITY_CACHE_RETENTION_DAYS = 30   # fix #14: prune entries older than this
 
-
-
 EXCLUDED_INDICES = {
-    "NIFTY", "BANKNIFTY", "SENSEX" }
-
-# EXCLUDED_INDICES = {
-#    "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "NIFTY50", "NIFTYBANK",
-#    "HDFCGOLD", "GOLDBEES", "SILVERBEES", "LIQUIDBEES", "NIFTYBEES", "BANKBEES",
-#    "LIQUIDCASE", "LIQUIDETF", "SETFGOLD", "GOLDIETF", "MON100", "MAFANG"
-# }
+    "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "NIFTY50", "NIFTYBANK",
+    "HDFCGOLD", "GOLDBEES", "SILVERBEES", "LIQUIDBEES", "NIFTYBEES", "BANKBEES",
+    "LIQUIDCASE", "LIQUIDETF", "SETFGOLD", "GOLDIETF", "MON100", "MAFANG"
+}
 
 
 
@@ -99,9 +94,8 @@ def _log_fyers_error(context, status_code=None, body=None):
           f"{' | HTTP ' + str(status_code) if status_code else ''} {snippet}{COLOR_RESET}")
 
 # ==============================================================================
-# 🎛️ TIER 0: TRADING MODE, PIPELINE ROUTING & DATA FEED SWITCH WEBSOCKET, REST
+# 🎛️ TIER 0: TRADING MODE, PIPELINE ROUTING & DATA FEED SWITCH
 # ==============================================================================
-# DATA_FEED_MODE WEBSOCKET  REST
 DATA_FEED_MODE = "REST"       
 # TRADING_MODE options: "CASH_EQUITY" | "INDEX_OPTIONS" | anything else falls
 # back to the generic stock-options branch (get_fno_universe_and_options).
@@ -1032,13 +1026,20 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframe, macro_timeframe
 
 def _extract_underlying(sym):
     """
-    Strips an NSE/BSE option contract down to its underlying symbol, e.g.
-    'NSE:360ONE26SEP1140PE' -> '360ONE', 'NSE:NIFTY26SEP24000CE' -> 'NIFTY'.
-    Cash-equity symbols (no option suffix) are returned unchanged. Used for
-    the basket summary counts.
+    Strips an NSE/BSE option contract down to its underlying symbol.
+    Handles both NSE symbol formats, confirmed against Fyers/Zerodha
+    documentation:
+      - Monthly:  <underlying><YY><MON><strike><CE|PE>   e.g. NIFTY26SEP24000CE
+      - Weekly:   <underlying><YY><M><DD><strike><CE|PE> e.g. NIFTY2691523350PE
+        (YY=2 digits, M=single char: 1-9 for Jan-Sep, O/N/D for Oct/Nov/Dec, DD=2 digits)
+    Only NIFTY currently has weekly index-option expiries on NSE; BANKNIFTY is
+    monthly-only, which is why the monthly-only pattern worked for BANKNIFTY
+    but silently failed to group NIFTY's weekly contracts.
+    Cash-equity symbols (no option suffix) are returned unchanged.
     """
     s = sym.replace("NSE:", "").replace("BSE:", "")
-    return re.sub(r"\d{2}[A-Z]{3}\d+(?:CE|PE)$", "", s) or s
+    stripped = re.sub(r"\d{2}(?:[A-Z]{3}|[1-9OND]\d{2})\d+(?:CE|PE)$", "", s)
+    return stripped or s
 
 def _extract_option_type(sym):
     """Returns 'CE', 'PE', or None (cash equity / non-option symbol)."""
