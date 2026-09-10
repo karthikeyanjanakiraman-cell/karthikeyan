@@ -136,8 +136,8 @@ GLOBAL_MACRO_STRATEGY_2D = "BOTH"
 # TIER 1: MACRO CONTEXT SWITCHBOARD (THE GENERAL) - 9 PILLARS
 # ==============================================================================
 MACRO_MANDATORY_LIVE_PERCENTILE = 0.0     
-MACRO_MANDATORY_PRICE_RENKO    = False    
-MACRO_MANDATORY_VOL_RENKO      = False
+MACRO_MANDATORY_PRICE_RENKO    = True    
+MACRO_MANDATORY_VOL_RENKO      = True
 MACRO_MANDATORY_RENKO_VELOCITY = False
 MACRO_MANDATORY_RSI_BB         = False
 MACRO_MANDATORY_ADX_DMI        = True
@@ -145,7 +145,7 @@ MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
 MACRO_MANDATORY_ATR_BB         = False   
 MACRO_MANDATORY_RENKO_BB       = False   
-MACRO_MINIMUM_SCORE            = 1       
+MACRO_MINIMUM_SCORE            = 3       
 
 # ==============================================================================
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
@@ -180,7 +180,7 @@ MAX_DAILY_TRADES_PER_SYMBOL = 2
 OPTIONS_TARGET_EXPIRY = "CURRENT"   
 STRIKE_RANGE_OFFSET = 2             
 MIN_OPT_PREMIUM = 15.0              
-MIN_OPT_VOLUME = 50000             
+MIN_OPT_VOLUME = 500000             
 OPTIONS_STRATEGY_2D = "BULLISH"     
 
 # ==============================================================================
