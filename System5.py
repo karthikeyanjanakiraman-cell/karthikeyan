@@ -177,8 +177,8 @@ MAX_DAILY_TRADES_PER_SYMBOL = 2
 # ==============================================================================
 # TIER 4: OPTIONS STAGE 2 CONFIG
 # ==============================================================================
-OPTIONS_TARGET_EXPIRY = "NEXT"   
-STRIKE_RANGE_OFFSET = 2             
+OPTIONS_TARGET_EXPIRY = "CURRENT"   
+STRIKE_RANGE_OFFSET = 5             
 MIN_OPT_PREMIUM = 15.0              
 MIN_OPT_VOLUME = 500000             
 OPTIONS_STRATEGY_2D = "BULLISH"     
