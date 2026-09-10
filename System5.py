@@ -96,10 +96,10 @@ def _log_fyers_error(context, status_code=None, body=None):
 # ==============================================================================
 # 🎛️ TIER 0: TRADING MODE, PIPELINE ROUTING & DATA FEED SWITCH
 # ==============================================================================
-DATA_FEED_MODE = "WEBSOCKET"       
+DATA_FEED_MODE = "REST"       
 # TRADING_MODE options: "CASH_EQUITY" | "INDEX_OPTIONS" | anything else falls
 # back to the generic stock-options branch (get_fno_universe_and_options).
-TRADING_MODE = "CASH_EQUITY"       
+TRADING_MODE = "INDEX_OPTIONS"       
 ENABLE_STAGE1_STOCK_FILTER = False  
 
 MIN_STOCK_PRICE = 100.0
