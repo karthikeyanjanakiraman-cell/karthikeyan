@@ -70,7 +70,7 @@ COLOR_DIM = "\033[2m"
 COLOR_RESET = "\033[0m"
 COLOR_BOLD = "\033[1m"
 
-BACKTRACE_DAYS = 5
+BACKTRACE_DAYS = 15
 LIQUIDITY_CACHE_FILE = "liquidity_cache.json"
 LIQUIDITY_CACHE_RETENTION_DAYS = 30   # fix #14: prune entries older than this
 
@@ -114,8 +114,8 @@ MIN_STOCK_VOLUME = 500000
 # per micro timeframe, each pass evaluated against every listed macro
 # timeframe (unchanged multi-macro behavior). Each micro timeframe's results
 # print as its own labeled Basket 1 / Basket 2 / summary block.
-MICRO_TIMEFRAMES = ["5min"]
-MACRO_TIMEFRAMES = ["15min"]
+MICRO_TIMEFRAMES = ["60min"]
+MACRO_TIMEFRAMES = ["240min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -135,7 +135,7 @@ GLOBAL_MACRO_STRATEGY_2D = "BOTH"
 # ==============================================================================
 # TIER 1: MACRO CONTEXT SWITCHBOARD (THE GENERAL) - 9 PILLARS
 # ==============================================================================
-MACRO_MANDATORY_LIVE_PERCENTILE = 0.0     
+MACRO_MANDATORY_LIVE_PERCENTILE = 20.0     
 MACRO_MANDATORY_PRICE_RENKO    = True    
 MACRO_MANDATORY_VOL_RENKO      = True
 MACRO_MANDATORY_RENKO_VELOCITY = False
@@ -152,8 +152,8 @@ MACRO_MINIMUM_SCORE            = 3
 # ==============================================================================
 SYNC_MICRO_WITH_MACRO          = False
 MICRO_MANDATORY_LIVE_PERCENTILE = 0.0    
-MICRO_MANDATORY_PRICE_RENKO    = False    
-MICRO_MANDATORY_VOL_RENKO      = False    
+MICRO_MANDATORY_PRICE_RENKO    = True    
+MICRO_MANDATORY_VOL_RENKO      = True    
 MICRO_MANDATORY_RENKO_VELOCITY = False
 MICRO_MANDATORY_RSI_BB         = False
 MICRO_MANDATORY_ADX_DMI        = False
@@ -177,7 +177,7 @@ MAX_DAILY_TRADES_PER_SYMBOL = 2
 # ==============================================================================
 # TIER 4: OPTIONS STAGE 2 CONFIG
 # ==============================================================================
-OPTIONS_TARGET_EXPIRY = "CURRENT"   
+OPTIONS_TARGET_EXPIRY = "NEXT"   
 STRIKE_RANGE_OFFSET = 2             
 MIN_OPT_PREMIUM = 15.0              
 MIN_OPT_VOLUME = 500000             
