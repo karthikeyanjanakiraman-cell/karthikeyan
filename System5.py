@@ -117,7 +117,7 @@ MIN_STOCK_VOLUME = 500000
 # timeframe (unchanged multi-macro behavior). Each micro timeframe's results
 # print as its own labeled Basket 1 / Basket 2 / summary block.
 MICRO_TIMEFRAMES = ["5min"]
-MACRO_TIMEFRAMES = ["15min,"60min","120min","240min"]
+MACRO_TIMEFRAMES = ["15min", "60min", "120min", "240min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
