@@ -70,7 +70,7 @@ COLOR_DIM = "\033[2m"
 COLOR_RESET = "\033[0m"
 COLOR_BOLD = "\033[1m"
 
-BACKTRACE_DAYS = 15
+BACKTRACE_DAYS = 5
 LIQUIDITY_CACHE_FILE = "liquidity_cache.json"
 LIQUIDITY_CACHE_RETENTION_DAYS = 30   # fix #14: prune entries older than this
 
@@ -136,8 +136,8 @@ GLOBAL_MACRO_STRATEGY_2D = "BOTH"
 # TIER 1: MACRO CONTEXT SWITCHBOARD (THE GENERAL) - 9 PILLARS
 # ==============================================================================
 MACRO_MANDATORY_LIVE_PERCENTILE = 0.0     
-MACRO_MANDATORY_PRICE_RENKO    = True    
-MACRO_MANDATORY_VOL_RENKO      = True
+MACRO_MANDATORY_PRICE_RENKO    = False    
+MACRO_MANDATORY_VOL_RENKO      = False
 MACRO_MANDATORY_RENKO_VELOCITY = False
 MACRO_MANDATORY_RSI_BB         = False
 MACRO_MANDATORY_ADX_DMI        = True
@@ -145,15 +145,15 @@ MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
 MACRO_MANDATORY_ATR_BB         = False   
 MACRO_MANDATORY_RENKO_BB       = False   
-MACRO_MINIMUM_SCORE            = 3       
+MACRO_MINIMUM_SCORE            = 1       
 
 # ==============================================================================
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
 # ==============================================================================
 SYNC_MICRO_WITH_MACRO          = False
 MICRO_MANDATORY_LIVE_PERCENTILE = 0.0    
-MICRO_MANDATORY_PRICE_RENKO    = True    
-MICRO_MANDATORY_VOL_RENKO      = True    
+MICRO_MANDATORY_PRICE_RENKO    = False    
+MICRO_MANDATORY_VOL_RENKO      = False    
 MICRO_MANDATORY_RENKO_VELOCITY = False
 MICRO_MANDATORY_RSI_BB         = False
 MICRO_MANDATORY_ADX_DMI        = False
@@ -167,9 +167,9 @@ MICRO_MINIMUM_SCORE            = 2
 # TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
 # ==============================================================================
 MICRO_EXIT_PRICE_BRICKS = 5              
-MICRO_EXIT_VOL_BRICKS   = 3
+MICRO_EXIT_VOL_BRICKS   = 30
 MACRO_EXIT_PRICE_BRICKS = 2              
-MACRO_EXIT_VOL_BRICKS   = 2
+MACRO_EXIT_VOL_BRICKS   = 20
 RENKO_VELOCITY_MAX_BARS = 8              
 ENTRY_CUTOFF_TIME = "15:15"              
 MAX_DAILY_TRADES_PER_SYMBOL = 2
@@ -178,7 +178,7 @@ MAX_DAILY_TRADES_PER_SYMBOL = 2
 # TIER 4: OPTIONS STAGE 2 CONFIG
 # ==============================================================================
 OPTIONS_TARGET_EXPIRY = "CURRENT"   
-STRIKE_RANGE_OFFSET = 5             
+STRIKE_RANGE_OFFSET = 2             
 MIN_OPT_PREMIUM = 15.0              
 MIN_OPT_VOLUME = 50000             
 OPTIONS_STRATEGY_2D = "BULLISH"     
@@ -189,7 +189,7 @@ OPTIONS_STRATEGY_2D = "BULLISH"
 # Pick any subset of the recognized index names below - multiple indices can
 # be scanned in the same run, each with its own strike-range/liquidity/trade
 # pipeline, same as multiple stocks are scanned in CASH_EQUITY mode.
-TARGET_INDICES = ["NIFTY", "BANKNIFTY"]
+TARGET_INDICES = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50", "SENSEX", "BANKEX"]
 
 # Fyers' spot/index quote symbol convention is EXCHANGE:NAME-INDEX. This
 # mapping is cross-verified against multiple independent sources (a public
@@ -1155,11 +1155,12 @@ def display_final_results(tape_exec, memory_bank, target_dt, target_date_str, mi
     print(f"{COLOR_CYAN}------------------------------------------------------------------------------------------------{COLOR_RESET}")
     print(f"{COLOR_BOLD}📊 SUMMARY — Trade Count by Strike [{micro_tf}]{COLOR_RESET}")
     if all_rows:
-        print(f"  {'Underlying':<24}{'B1':<8}{'B2':<8}")
+        label_width = max(len("Underlying"), len("TOTAL"), *(len(k) for k in all_rows)) + 2
+        print(f"  {'Underlying':<{label_width}}{'B1':<8}{'B2':<8}")
         for k in all_rows:
-            print(f"  {k:<24}{active_counts.get(k, 0):<8}{closed_counts.get(k, 0):<8}")
-        print(f"  {'-'*40}")
-        print(f"  {'TOTAL':<24}{sum(active_counts.values()):<8}{sum(closed_counts.values()):<8}")
+            print(f"  {k:<{label_width}}{active_counts.get(k, 0):<8}{closed_counts.get(k, 0):<8}")
+        print(f"  {'-' * (label_width + 16)}")
+        print(f"  {'TOTAL':<{label_width}}{sum(active_counts.values()):<8}{sum(closed_counts.values()):<8}")
     else:
         print("  No trades in either basket for this run.")
     print(f"{COLOR_CYAN}------------------------------------------------------------------------------------------------{COLOR_RESET}\n")
