@@ -116,8 +116,8 @@ MIN_STOCK_VOLUME = 500000
 # per micro timeframe, each pass evaluated against every listed macro
 # timeframe (unchanged multi-macro behavior). Each micro timeframe's results
 # print as its own labeled Basket 1 / Basket 2 / summary block.
-MICRO_TIMEFRAMES = ["5min"]
-MACRO_TIMEFRAMES = ["15min", "60min", "120min", "240min"]
+MICRO_TIMEFRAMES = ["15min"]
+MACRO_TIMEFRAMES = ["60min", "120min", "240min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -150,8 +150,8 @@ MACRO_CONFIRMATION_MODE = "ALL"
 # TIER 1: MACRO CONTEXT SWITCHBOARD (THE GENERAL) - 9 PILLARS
 # ==============================================================================
 MACRO_MANDATORY_LIVE_PERCENTILE = 0.0     
-MACRO_MANDATORY_PRICE_RENKO    = False    
-MACRO_MANDATORY_VOL_RENKO      = False
+MACRO_MANDATORY_PRICE_RENKO    = True    
+MACRO_MANDATORY_VOL_RENKO      = True
 MACRO_MANDATORY_RENKO_VELOCITY = False
 MACRO_MANDATORY_RSI_BB         = False
 MACRO_MANDATORY_ADX_DMI        = True
@@ -159,15 +159,15 @@ MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
 MACRO_MANDATORY_ATR_BB         = False   
 MACRO_MANDATORY_RENKO_BB       = False   
-MACRO_MINIMUM_SCORE            = 1       
+MACRO_MINIMUM_SCORE            = 3       
 
 # ==============================================================================
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
 # ==============================================================================
 SYNC_MICRO_WITH_MACRO          = False
-MICRO_MANDATORY_LIVE_PERCENTILE = 0.0    
-MICRO_MANDATORY_PRICE_RENKO    = False    
-MICRO_MANDATORY_VOL_RENKO      = False    
+MICRO_MANDATORY_LIVE_PERCENTILE = 20.0    
+MICRO_MANDATORY_PRICE_RENKO    = True    
+MICRO_MANDATORY_VOL_RENKO      = True    
 MICRO_MANDATORY_RENKO_VELOCITY = False
 MICRO_MANDATORY_RSI_BB         = False
 MICRO_MANDATORY_ADX_DMI        = False
