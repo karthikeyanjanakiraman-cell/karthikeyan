@@ -96,10 +96,10 @@ def _log_fyers_error(context, status_code=None, body=None):
 # ==============================================================================
 # 🎛️ TIER 0: TRADING MODE, PIPELINE ROUTING & DATA FEED SWITCH
 # ==============================================================================
-DATA_FEED_MODE = "WEBSOCKET"       
+DATA_FEED_MODE = "REST"       
 # TRADING_MODE options: "CASH_EQUITY" | "INDEX_OPTIONS" | anything else falls
 # back to the generic stock-options branch (get_fno_universe_and_options).
-TRADING_MODE = "CASH_EQUITY"       
+TRADING_MODE = "INDEX_OPTIONS"       
 ENABLE_STAGE1_STOCK_FILTER = False  
 
 MIN_STOCK_PRICE = 100.0
@@ -114,8 +114,8 @@ MIN_STOCK_VOLUME = 500000
 # per micro timeframe, each pass evaluated against every listed macro
 # timeframe (unchanged multi-macro behavior). Each micro timeframe's results
 # print as its own labeled Basket 1 / Basket 2 / summary block.
-MICRO_TIMEFRAMES = ["5min"]
-MACRO_TIMEFRAMES = ["15min"]
+MICRO_TIMEFRAMES = ["60min"]
+MACRO_TIMEFRAMES = ["240min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -178,7 +178,7 @@ MAX_DAILY_TRADES_PER_SYMBOL = 2
 # TIER 4: OPTIONS STAGE 2 CONFIG
 # ==============================================================================
 OPTIONS_TARGET_EXPIRY = "CURRENT"   
-STRIKE_RANGE_OFFSET = 2             
+STRIKE_RANGE_OFFSET = 5             
 MIN_OPT_PREMIUM = 15.0              
 MIN_OPT_VOLUME = 50000             
 OPTIONS_STRATEGY_2D = "BULLISH"     
