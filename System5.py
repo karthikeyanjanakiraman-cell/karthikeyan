@@ -96,6 +96,8 @@ def _log_fyers_error(context, status_code=None, body=None):
 # ==============================================================================
 # 🎛️ TIER 0: TRADING MODE, PIPELINE ROUTING & DATA FEED SWITCH
 # ==============================================================================
+# WEBSOCKET | REST
+
 DATA_FEED_MODE = "REST"       
 # TRADING_MODE options: "CASH_EQUITY" | "INDEX_OPTIONS" | anything else falls
 # back to the generic stock-options branch (get_fno_universe_and_options).
@@ -115,7 +117,7 @@ MIN_STOCK_VOLUME = 500000
 # timeframe (unchanged multi-macro behavior). Each micro timeframe's results
 # print as its own labeled Basket 1 / Basket 2 / summary block.
 MICRO_TIMEFRAMES = ["5min"]
-MACRO_TIMEFRAMES = ["15min"]
+MACRO_TIMEFRAMES = ["15min,"60min","120min","240min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -131,6 +133,18 @@ RENKO_MIN_BRICK = 0.05
 RENKO_DEFAULT_PCT = 0.005
 
 GLOBAL_MACRO_STRATEGY_2D = "BOTH"
+
+# How multiple MACRO_TIMEFRAMES must agree before a macro gate is considered
+# "armed" for a symbol at a given moment:
+#   "ANY"      - at least one macro timeframe armed (old behavior: OR across
+#                timeframes - a single noisy short timeframe can trigger
+#                entries even if longer timeframes disagree)
+#   "MAJORITY" - more than half of the configured macro timeframes must be
+#                armed simultaneously
+#   "ALL"      - every configured macro timeframe must agree (strictest,
+#                fewest but highest-conviction entries)
+# With only one macro timeframe configured, all three modes behave identically.
+MACRO_CONFIRMATION_MODE = "ALL"
 
 # ==============================================================================
 # TIER 1: MACRO CONTEXT SWITCHBOARD (THE GENERAL) - 9 PILLARS
@@ -928,8 +942,21 @@ def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes
         df_micro[b_col] = df_micro[b_col].fillna(False)
         df_micro[br_col] = df_micro[br_col].fillna(False)
 
-    df_micro["Master_Armed_Bull"] = df_micro[bull_gates].any(axis=1)
-    df_micro["Master_Armed_Bear"] = df_micro[bear_gates].any(axis=1)
+    # Macro confirmation across all configured macro timeframes - configurable
+    # via MACRO_CONFIRMATION_MODE rather than always OR-ing every timeframe
+    # together (which let a single noisy short macro timeframe trigger entries
+    # even when longer timeframes disagreed).
+    n_macro_tfs = len(bull_gates)
+    bull_agree_count = df_micro[bull_gates].sum(axis=1)
+    bear_agree_count = df_micro[bear_gates].sum(axis=1)
+    if MACRO_CONFIRMATION_MODE == "ALL":
+        required = n_macro_tfs
+    elif MACRO_CONFIRMATION_MODE == "MAJORITY":
+        required = (n_macro_tfs // 2) + 1
+    else:  # "ANY" - original behavior
+        required = 1
+    df_micro["Master_Armed_Bull"] = bull_agree_count >= required
+    df_micro["Master_Armed_Bear"] = bear_agree_count >= required
     if strategy_mode == "BULLISH": df_micro["Master_Armed_Bear"] = False
     elif strategy_mode == "BEARISH": df_micro["Master_Armed_Bull"] = False
 
