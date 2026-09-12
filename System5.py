@@ -124,7 +124,7 @@ MIN_STOCK_VOLUME = 500000
 # (not one full pipeline pass per micro timeframe) - see the performance note
 # near MACRO_EXIT_CONFIRMATION_MODE below.
 MICRO_TIMEFRAMES = ["240min","480min"]
-MACRO_TIMEFRAMES = ["480min"]
+MACRO_TIMEFRAMES = ["481min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
