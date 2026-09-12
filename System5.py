@@ -70,7 +70,7 @@ COLOR_DIM = "\033[2m"
 COLOR_RESET = "\033[0m"
 COLOR_BOLD = "\033[1m"
 
-BACKTRACE_DAYS = 5
+BACKTRACE_DAYS = 25
 LIQUIDITY_CACHE_FILE = "liquidity_cache.json"
 LIQUIDITY_CACHE_RETENTION_DAYS = 30   # fix #14: prune entries older than this
 
@@ -123,8 +123,8 @@ MIN_STOCK_VOLUME = 500000
 # MACRO_EXIT_CONFIRMATION_MODE. One unified execution tape is built per run
 # (not one full pipeline pass per micro timeframe) - see the performance note
 # near MACRO_EXIT_CONFIRMATION_MODE below.
-MICRO_TIMEFRAMES = ["5min","15min"]
-MACRO_TIMEFRAMES = ["240min"]
+MICRO_TIMEFRAMES = ["240min","480min"]
+MACRO_TIMEFRAMES = ["480min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
