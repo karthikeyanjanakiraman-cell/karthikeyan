@@ -96,14 +96,14 @@ def _log_fyers_error(context, status_code=None, body=None):
 # ==============================================================================
 # 🎛️ TIER 0: TRADING MODE, PIPELINE ROUTING & DATA FEED SWITCH
 # ==============================================================================
-DATA_FEED_MODE = "WEBSOCKET"       
+DATA_FEED_MODE = "REST"       
 # TRADING_MODE options: "CASH_EQUITY" | "INDEX_OPTIONS" | "STOCK_FNO" (stock
 # F&O only - skips indexes and cash equities entirely). Explicit dispatch, not
 # a silent catch-all - an unrecognized value now errors out instead of
 # silently falling into stock-options mode (that silent fallback is exactly
 # how the original "CAASH_EQUITY" typo went unnoticed for so long earlier in
 # this file's history).
-TRADING_MODE = "CASH_EQUITY"       
+TRADING_MODE = "STOCK_FNO"       
 ENABLE_STAGE1_STOCK_FILTER = False  
 
 MIN_STOCK_PRICE = 100.0
@@ -123,8 +123,8 @@ MIN_STOCK_VOLUME = 500000
 # MACRO_EXIT_CONFIRMATION_MODE. One unified execution tape is built per run
 # (not one full pipeline pass per micro timeframe) - see the performance note
 # near MACRO_EXIT_CONFIRMATION_MODE below.
-MICRO_TIMEFRAMES = ["5min"]
-MACRO_TIMEFRAMES = ["15min"]
+MICRO_TIMEFRAMES = ["5min","15min"]
+MACRO_TIMEFRAMES = ["240min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
@@ -177,8 +177,8 @@ MICRO_EXIT_CONFIRMATION_MODE = "MAJORITY"
 # TIER 1: MACRO CONTEXT SWITCHBOARD (THE GENERAL) - 9 PILLARS
 # ==============================================================================
 MACRO_MANDATORY_LIVE_PERCENTILE = 0.0     
-MACRO_MANDATORY_PRICE_RENKO    = False    
-MACRO_MANDATORY_VOL_RENKO      = False
+MACRO_MANDATORY_PRICE_RENKO    = True    
+MACRO_MANDATORY_VOL_RENKO      = True
 MACRO_MANDATORY_RENKO_VELOCITY = False
 MACRO_MANDATORY_RSI_BB         = False
 MACRO_MANDATORY_ADX_DMI        = True
@@ -186,31 +186,31 @@ MACRO_MANDATORY_EMA_SPREAD     = False
 MACRO_MANDATORY_STOCHASTIC     = False
 MACRO_MANDATORY_ATR_BB         = False   
 MACRO_MANDATORY_RENKO_BB       = False   
-MACRO_MINIMUM_SCORE            = 1       
+MACRO_MINIMUM_SCORE            = 3       
 
 # ==============================================================================
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
 # ==============================================================================
 SYNC_MICRO_WITH_MACRO          = False
 MICRO_MANDATORY_LIVE_PERCENTILE = 0.0    
-MICRO_MANDATORY_PRICE_RENKO    = False    
-MICRO_MANDATORY_VOL_RENKO      = False    
+MICRO_MANDATORY_PRICE_RENKO    = True    
+MICRO_MANDATORY_VOL_RENKO      = True    
 MICRO_MANDATORY_RENKO_VELOCITY = False
 MICRO_MANDATORY_RSI_BB         = False
-MICRO_MANDATORY_ADX_DMI        = False
+MICRO_MANDATORY_ADX_DMI        = True
 MICRO_MANDATORY_EMA_SPREAD     = False
 MICRO_MANDATORY_STOCHASTIC     = False
 MICRO_MANDATORY_ATR_BB         = False   
 MICRO_MANDATORY_RENKO_BB       = False   
-MICRO_MINIMUM_SCORE            = 2       
+MICRO_MINIMUM_SCORE            = 3       
 
 # ==============================================================================
 # TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
 # ==============================================================================
 MICRO_EXIT_PRICE_BRICKS = 5              
-MICRO_EXIT_VOL_BRICKS   = 30
+MICRO_EXIT_VOL_BRICKS   = 10
 MACRO_EXIT_PRICE_BRICKS = 2              
-MACRO_EXIT_VOL_BRICKS   = 20
+MACRO_EXIT_VOL_BRICKS   = 2
 RENKO_VELOCITY_MAX_BARS = 8              
 ENTRY_CUTOFF_TIME = "15:15"              
 MAX_DAILY_TRADES_PER_SYMBOL = 2
