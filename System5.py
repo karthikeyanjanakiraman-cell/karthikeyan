@@ -123,8 +123,8 @@ MIN_STOCK_VOLUME = 500000
 # MACRO_EXIT_CONFIRMATION_MODE. One unified execution tape is built per run
 # (not one full pipeline pass per micro timeframe) - see the performance note
 # near MACRO_EXIT_CONFIRMATION_MODE below.
-MICRO_TIMEFRAMES = ["240min","480min"]
-MACRO_TIMEFRAMES = ["481min"]
+MICRO_TIMEFRAMES = ["60min","480min"]
+MACRO_TIMEFRAMES = ["240min"]
 
 ATR_PERIOD = 14
 RSI_PERIOD = 14
