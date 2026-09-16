@@ -101,7 +101,7 @@ MIN_STOCK_VOLUME = 500000
 #     diff are computed, so a window that reaches back across the day
 #     boundary to stay mature never mistakes the overnight gap for intraday
 #     movement - this is the actual fix for the bug above.
-MICRO_LOOKBACKS = [60]
+MICRO_LOOKBACKS = [15]
 MACRO_LOOKBACKS = [420]   # active 1-min candles - "whole session so far" macro context
 GAP_EXCLUDE_OVERNIGHT = True
 
