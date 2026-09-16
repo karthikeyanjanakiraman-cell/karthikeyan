@@ -104,7 +104,7 @@ MIN_STOCK_VOLUME = 500000
 # the maximum "macro" timeframe usable from a single trading day - anything
 # wider either doesn't evenly divide the session or doesn't close until the
 # market's shut.
-MACRO_CLOCK_TIMEFRAMES = [125]   # session-anchored clock-time bar width, in minutes
+MACRO_CLOCK_TIMEFRAMES = [16]   # session-anchored clock-time bar width, in minutes
 MICRO_LOOKBACKS = [5,15]
 GAP_EXCLUDE_OVERNIGHT = True
 
@@ -143,7 +143,7 @@ MICRO_MANDATORY_LIVE_PERCENTILE = 10.0
 MICRO_MANDATORY_PRICE_RENKO    = False    
 MICRO_MANDATORY_VOL_RENKO      = False    
 MICRO_MANDATORY_RENKO_VELOCITY = False    
-MICRO_MANDATORY_RSI_BB         = True
+MICRO_MANDATORY_RSI_BB         = False
 MICRO_MANDATORY_ADX_DMI        = False   
 MICRO_MANDATORY_EMA_SPREAD     = False
 MICRO_MANDATORY_STOCHASTIC     = False
