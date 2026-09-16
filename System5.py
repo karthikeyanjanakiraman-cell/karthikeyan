@@ -90,7 +90,7 @@ MIN_STOCK_VOLUME = 500000
 # GLOBAL CONFIGURATION
 # ==============================================================================
 # Aggressive Zero-Lag Setup
-MICRO_TIMEFRAMES = ["1min"]
+MICRO_TIMEFRAMES = ["15min"]
 MACRO_TIMEFRAMES = ["240min"]
 
 ATR_PERIOD = 14
