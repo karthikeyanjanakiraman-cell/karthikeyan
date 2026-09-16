@@ -1,19 +1,11 @@
 """system3.py - Asit Baran Pati Multi-Timeframe Trading System Implementation
 
-Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine (v21)
+Production-Grade Universal N-Timeframe & Dual-Tier 45-Degree Renko Engine (v22 - UPDATED)
 - True Live WebSocket Integration (Tick-by-Tick Institutional Delta)
-- Configurable Micro Execution Timeframe (e.g., "5min", "15min")
-- Configurable Macro Hierarchy Array (e.g., ["60min", "240min"])
-- Dual-Tier Scorecard (9 Pillars) & Global Mandatory Veto Switches
-- Cumulative Volume Delta 45-Degree Renko Matrix
-- True Post-Entry Renko Velocity Stall Engine (No instant stop-outs)
-- Internal Delta Percentage (Absolute Order Flow Conviction)
-- 09:15 Overnight Flush & Configurable Entry Cutoff (see ENTRY_CUTOFF_TIME)
-
-NOTE: A "stale momentum / chop guard" is referenced in earlier design notes but is
-NOT implemented in this file. The only stall protection is the post-entry Renko
-Velocity Stall exit inside _run_dual_layer_trade_management. If a chop/stale-momentum
-entry filter is required, it needs to be added explicitly.
+- True 45-Degree Fractal Breakout Engine (Structural Resistance Breach)
+- True BB-RSI Volatility Bands (Momentum Expansion)
+- Corrected BB Renko Breakout Logic
+- Zero-Lag Micro Execution Configured (1-minute, 0 Confirm Bricks, Live Pct)
 """
 
 import concurrent.futures
@@ -42,21 +34,13 @@ except ImportError:
 
 warnings.filterwarnings("ignore")
 
-# CRITICAL: when stdout isn't attached to a real terminal - exactly the case on
-# a GitHub Actions runner - Python silently switches stdout from line-buffered
-# to fully block-buffered. Every print() then sits in an internal buffer that
-# only gets flushed to the log when it fills up or the process exits. Since
-# WEBSOCKET mode can legitimately run for hours, this made the entire run
-# appear to produce "no output" even while it was working correctly, and any
-# output buffered before a workflow timeout kill was lost entirely. Forcing
-# line buffering here makes every print() show up in the log immediately.
 try:
     sys.stdout.reconfigure(line_buffering=True)
     sys.stderr.reconfigure(line_buffering=True)
 except Exception:
     pass
 
-print("🔖 SYSTEM3 BUILD: v21-RESTORED-LIVE-WS (2026-08-29)")
+print("🔖 SYSTEM3 BUILD: v22-RESTORED-LIVE-WS-FRACTAL-UPDATE (2026-09-16)")
 
 # ==============================================================================
 # 0. ENGINE CONSTANTS & TERMINAL COLORS
@@ -72,15 +56,13 @@ COLOR_BOLD = "\033[1m"
 
 BACKTRACE_DAYS = 25
 LIQUIDITY_CACHE_FILE = "liquidity_cache.json"
-LIQUIDITY_CACHE_RETENTION_DAYS = 30   # fix #14: prune entries older than this
+LIQUIDITY_CACHE_RETENTION_DAYS = 30
 
 EXCLUDED_INDICES = {
     "NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "SENSEX", "BANKEX", "NIFTY50", "NIFTYBANK",
     "HDFCGOLD", "GOLDBEES", "SILVERBEES", "LIQUIDBEES", "NIFTYBEES", "BANKBEES",
     "LIQUIDCASE", "LIQUIDETF", "SETFGOLD", "GOLDIETF", "MON100", "MAFANG"
 }
-
-
 
 _FYERS_ERROR_LOG_CAP = 5
 _fyers_error_log_count = 0
@@ -97,12 +79,6 @@ def _log_fyers_error(context, status_code=None, body=None):
 # 🎛️ TIER 0: TRADING MODE, PIPELINE ROUTING & DATA FEED SWITCH
 # ==============================================================================
 DATA_FEED_MODE = "REST"       
-# TRADING_MODE options: "CASH_EQUITY" | "INDEX_OPTIONS" | "STOCK_FNO" (stock
-# F&O only - skips indexes and cash equities entirely). Explicit dispatch, not
-# a silent catch-all - an unrecognized value now errors out instead of
-# silently falling into stock-options mode (that silent fallback is exactly
-# how the original "CAASH_EQUITY" typo went unnoticed for so long earlier in
-# this file's history).
 TRADING_MODE = "STOCK_FNO"       
 ENABLE_STAGE1_STOCK_FILTER = False  
 
@@ -113,17 +89,8 @@ MIN_STOCK_VOLUME = 500000
 # ==============================================================================
 # GLOBAL CONFIGURATION
 # ==============================================================================
-# MICRO_TIMEFRAMES and MACRO_TIMEFRAMES both accept multiple values and both
-# work the same way now: MICRO_TIMEFRAMES[0] is the execution/pricing
-# granularity (the bars entries/exits are timed and priced against); every
-# timeframe in the list (including [0]) is also evaluated as a confirmation
-# gate and combined via MICRO_CONFIRMATION_MODE (entries) / 
-# MICRO_EXIT_CONFIRMATION_MODE (exits) - mirroring exactly how
-# MACRO_TIMEFRAMES already combines via MACRO_CONFIRMATION_MODE /
-# MACRO_EXIT_CONFIRMATION_MODE. One unified execution tape is built per run
-# (not one full pipeline pass per micro timeframe) - see the performance note
-# near MACRO_EXIT_CONFIRMATION_MODE below.
-MICRO_TIMEFRAMES = ["60min","480min"]
+# Aggressive Zero-Lag Setup
+MICRO_TIMEFRAMES = ["1min"]
 MACRO_TIMEFRAMES = ["240min"]
 
 ATR_PERIOD = 14
@@ -134,42 +101,15 @@ ADX_PERIOD = 14
 ADX_THRESHOLD = 20
 STOCH_PERIOD = 14
 
-MICRO_RENKO_CONFIRM_BRICKS = 1
+MICRO_RENKO_CONFIRM_BRICKS = 0
 MACRO_RENKO_CONFIRM_BRICKS = 0
 RENKO_MIN_BRICK = 0.05
 RENKO_DEFAULT_PCT = 0.005
 
 GLOBAL_MACRO_STRATEGY_2D = "BOTH"
 
-# How multiple MACRO_TIMEFRAMES must agree before a macro gate is considered
-# "armed" for a symbol at a given moment:
-#   "ANY"      - at least one macro timeframe armed (old behavior: OR across
-#                timeframes - a single noisy short timeframe can trigger
-#                entries even if longer timeframes disagree)
-#   "MAJORITY" - more than half of the configured macro timeframes must be
-#                armed simultaneously
-#   "ALL"      - every configured macro timeframe must agree (strictest,
-#                fewest but highest-conviction entries)
-# With only one macro timeframe configured, all three modes behave identically.
 MACRO_CONFIRMATION_MODE = "MAJORITY"
-
-# Same idea, applied to macro-tier EXITS: how many of the macro timeframes
-# that originally triggered a trade's entry must show a reversal before the
-# macro tier calls for an exit.
-#   "ANY"      - old behavior: the instant a single triggering macro timeframe
-#                reverses, exit immediately
-#   "MAJORITY" - more than half of the triggering macro timeframes must show
-#                reversal simultaneously before exiting
-#   "ALL"      - every triggering macro timeframe must agree the trend has
-#                reversed (most patient, holds through more noise, but risks
-#                giving back more profit on a genuine reversal)
 MACRO_EXIT_CONFIRMATION_MODE = "MAJORITY"
-
-# Exact same ANY/MAJORITY/ALL voting scheme, now applied across MICRO_TIMEFRAMES
-# too (previously there was nothing to vote across since only one micro
-# timeframe existed at a time; now MICRO_TIMEFRAMES can hold several, each
-# evaluated as its own confirmation gate - identical in spirit to how macro
-# timeframes are combined above).
 MICRO_CONFIRMATION_MODE = "MAJORITY"
 MICRO_EXIT_CONFIRMATION_MODE = "MAJORITY"
 
@@ -192,12 +132,12 @@ MACRO_MINIMUM_SCORE            = 3
 # TIER 2: MICRO EXECUTION SWITCHBOARD (THE SNIPER) - 9 PILLARS
 # ==============================================================================
 SYNC_MICRO_WITH_MACRO          = False
-MICRO_MANDATORY_LIVE_PERCENTILE = 0.0    
+MICRO_MANDATORY_LIVE_PERCENTILE = 25.0   # Front-running institutional accumulation
 MICRO_MANDATORY_PRICE_RENKO    = True    
 MICRO_MANDATORY_VOL_RENKO      = True    
-MICRO_MANDATORY_RENKO_VELOCITY = False
+MICRO_MANDATORY_RENKO_VELOCITY = True    # Demand rapid momentum
 MICRO_MANDATORY_RSI_BB         = False
-MICRO_MANDATORY_ADX_DMI        = True
+MICRO_MANDATORY_ADX_DMI        = False   # Disable lagging indicator
 MICRO_MANDATORY_EMA_SPREAD     = False
 MICRO_MANDATORY_STOCHASTIC     = False
 MICRO_MANDATORY_ATR_BB         = False   
@@ -207,11 +147,12 @@ MICRO_MINIMUM_SCORE            = 3
 # ==============================================================================
 # TIER 3: TRADE MANAGEMENT & TEMPORAL GATES (EXIT & TIMING)
 # ==============================================================================
-MICRO_EXIT_PRICE_BRICKS = 5              
-MICRO_EXIT_VOL_BRICKS   = 10
-MACRO_EXIT_PRICE_BRICKS = 2              
-MACRO_EXIT_VOL_BRICKS   = 2
-RENKO_VELOCITY_MAX_BARS = 8              
+# Fast Micro Exits (Trailing Stop via Renko Bricks)
+MICRO_EXIT_PRICE_BRICKS = 2              
+MICRO_EXIT_VOL_BRICKS   = 2
+MACRO_EXIT_PRICE_BRICKS = 99 # Artificially high to let micro rule        
+MACRO_EXIT_VOL_BRICKS   = 99 # Artificially high to let micro rule
+RENKO_VELOCITY_MAX_BARS = 3  # Scratch trade if momentum stalls for 3 bars
 ENTRY_CUTOFF_TIME = "15:15"              
 MAX_DAILY_TRADES_PER_SYMBOL = 2
 
@@ -225,22 +166,10 @@ MIN_OPT_VOLUME = 50000
 OPTIONS_STRATEGY_2D = "BULLISH"     
 
 # ==============================================================================
-# TIER 5: INDEX OPTIONS CONFIG (used when TRADING_MODE = "INDEX_OPTIONS")
+# TIER 5: INDEX OPTIONS CONFIG
 # ==============================================================================
-# Pick any subset of the recognized index names below - multiple indices can
-# be scanned in the same run, each with its own strike-range/liquidity/trade
-# pipeline, same as multiple stocks are scanned in CASH_EQUITY mode.
 TARGET_INDICES = ["NIFTY", "BANKNIFTY", "FINNIFTY", "MIDCPNIFTY", "NIFTYNXT50", "SENSEX", "BANKEX"]
 
-# Fyers' spot/index quote symbol convention is EXCHANGE:NAME-INDEX. This
-# mapping is cross-verified against multiple independent sources (a public
-# Fyers-integration package's hardcoded index map, consistent with the same
-# EXCLUDED_INDICES underlying names already used elsewhere in this file for
-# NSE_FO.csv parsing). Fyers' own community forum does have reports of older
-# API-v2 index history calls failing - if a given index errors out at
-# runtime, the Fyers diagnostic log (_log_fyers_error) will print the exact
-# HTTP status/response body so the symbol can be corrected from real evidence
-# rather than guessed at again.
 INDEX_SPOT_KEY_MAP = {
     "NIFTY": "NSE:NIFTY50-INDEX",
     "BANKNIFTY": "NSE:NIFTYBANK-INDEX",
@@ -251,15 +180,10 @@ INDEX_SPOT_KEY_MAP = {
     "BANKEX": "BSE:BANKEX-INDEX",
 }
 
-# ==============================================================================
-# HELPER: TIMEFRAME PARSER
-# ==============================================================================
 def _parse_tf_to_minutes(tf_str):
     if "min" in tf_str: return int(tf_str.replace("min", ""))
     if "D" in tf_str: return int(tf_str.replace("D", "")) * 1440
     return int(tf_str)
-
-
 # ==============================================================================
 # 1. LIVE INGESTION (REST FYERS)
 # ==============================================================================
@@ -401,11 +325,6 @@ def fetch_stock_bars_worker(task):
     df = df.drop_duplicates(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
     df["Symbol"] = item["symbol"]
     df = regularize_intraday_tape(df, freq="1min")
-    # Always compute the historical delta proxy here (compute_base_net_delta is a
-    # no-op if Net_Delta_1m already exists). Previously this only ran in REST mode,
-    # so WEBSOCKET mode's warm-up history had no Net_Delta_1m while live ticks did -
-    # causing the CVD Renko series to jump between two different calculation
-    # methods right at the point live data starts.
     df = compute_base_net_delta(df)
     return df
 
@@ -424,11 +343,6 @@ def fetch_fyers_candles(key, start_dt, end_dt, resolution="1"):
                     df = pd.DataFrame(data["candles"], columns=["Epoch", "Open", "High", "Low", "Close", "Volume"])
                     df["Datetime"] = pd.to_datetime(df["Epoch"], unit="s", utc=True).dt.tz_convert("Asia/Kolkata").dt.tz_localize(None).astype("datetime64[ns]")
                     return df
-                # HTTP 200 but Fyers rejected the request at the API level (e.g. the
-                # documented -300 "Please provide a valid symbol" error some index
-                # symbols return). This is NOT a transient/retryable failure, so
-                # log it once and stop retrying rather than burning 3 attempts on
-                # a symbol that will never succeed.
                 last_body = data
                 _log_fyers_error(f"history({key}, res={resolution})", res.status_code, data)
                 break
@@ -445,18 +359,6 @@ def fetch_fyers_candles(key, start_dt, end_dt, resolution="1"):
     return None
 
 def fetch_bulk_quotes_batch(symbol_keys):
-    """
-    Fyers' quotes endpoint accepts up to 50 comma-separated symbols per call
-    and returns each symbol's prev_close_price in one round trip. This is the
-    real fix for the 30+ minute hang in filter_cash_equities_by_price_range:
-    that function was already threaded (ThreadPoolExecutor, 15 workers), so
-    adding more threads wasn't the answer - the problem was firing ~2600
-    individual /data/history requests, each carrying a mandatory 150ms
-    throttle plus exponential retry backoff whenever concurrency tripped
-    Fyers' rate limit. More threads would only have caused more 429s and made
-    it slower, not faster. Batching cuts the price-filter stage from ~2600
-    requests down to roughly len(universe)/50.
-    """
     headers = get_fyers_auth_headers()
     symbols_param = ",".join(symbol_keys)
     url = f"https://api-t1.fyers.in/data/quotes?symbols={urllib.parse.quote(symbols_param, safe=':,')}"
@@ -487,7 +389,6 @@ def filter_cash_equities_by_price_range(universe, target_date_str):
 
     print(f"🧹 Applying Price Range Filter (₹{MIN_STOCK_PRICE} - ₹{MAX_STOCK_PRICE}) & Volume Filter...")
 
-    # Stage 1: bulk quotes (50 symbols/call) to get previous close price cheaply.
     batches = [universe[i:i + 50] for i in range(0, len(universe), 50)]
     prev_close_map = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
@@ -499,11 +400,6 @@ def filter_cash_equities_by_price_range(universe, target_date_str):
                          and MIN_STOCK_PRICE <= pc <= MAX_STOCK_PRICE]
     print(f"  ├─ ✅ {len(price_candidates)}/{len(universe)} passed price filter via {len(batches)} batched quote calls.")
 
-    # Stage 2: real prior-day EOD volume still requires the daily-candle endpoint
-    # (quotes' live 'volume' field is today's running volume, not the prior
-    # day's total, so it can't be substituted without changing what the filter
-    # means) - but now only for the much smaller price-qualified set, not all
-    # 2643 symbols.
     def volume_worker(item):
         df = fetch_fyers_candles(item["key"], lookback_start, prev_day, resolution="D")
         if df is not None and not df.empty:
@@ -531,10 +427,6 @@ def filter_liquid_contracts(contracts, target_date_str):
             with open(LIQUIDITY_CACHE_FILE, "r") as f: cache = json.load(f)
         except Exception: pass
 
-    # Fix #14: nothing previously purged old entries, so liquidity_cache.json grew
-    # unbounded across months of daily runs and was fully read/written every run.
-    # Keep only entries whose embedded date (last 10 chars of the key, "YYYY-MM-DD")
-    # falls within a rolling retention window.
     retention_cutoff = (prev_dt - timedelta(days=LIQUIDITY_CACHE_RETENTION_DAYS)).strftime("%Y-%m-%d")
     pruned_cache = {}
     for k, v in cache.items():
@@ -542,7 +434,7 @@ def filter_liquid_contracts(contracts, target_date_str):
         try:
             datetime.strptime(date_part, "%Y-%m-%d")
         except ValueError:
-            continue  # malformed/legacy key - drop it
+            continue  
         if date_part >= retention_cutoff:
             pruned_cache[k] = v
     if len(pruned_cache) != len(cache):
@@ -607,13 +499,6 @@ def fetch_all_spot_reference_prices(spot_universe, target_date_str):
     return spot_ref
 
 def _parse_fo_csv_for_indices(csv_text, target_indices):
-    """
-    Shared column-parsing logic for both NSE_FO.csv and BSE_FO.csv - same
-    layout convention (Fyers confirmed on their own forum that the column
-    immediately after the underlying symbol is an exchange token, then
-    strike, matching the type_idx-3/-1 indexing below). Returns a list of
-    option-contract dicts for whichever target_indices are found.
-    """
     opt_inst = []
     for line in csv_text.strip().split("\n"):
         cols = [c.strip() for c in line.split(",")]
@@ -643,21 +528,6 @@ def _parse_fo_csv_for_indices(csv_text, target_indices):
     return opt_inst
 
 def get_index_universe_and_options(target_indices):
-    """
-    Like get_fno_universe_and_options(), but INCLUDES only the caller-selected
-    index underlyings (target_indices) instead of excluding all indices via
-    EXCLUDED_INDICES.
-
-    Fetches from whichever instrument master file(s) each target index
-    actually lives on: NSE-listed indices (NIFTY, BANKNIFTY, FINNIFTY,
-    MIDCPNIFTY, NIFTYNXT50) are in NSE_FO.csv; BSE-listed indices (SENSEX,
-    BANKEX) are in a SEPARATE file, BSE_FO.csv - confirmed as a real, distinct
-    Fyers instrument file via Fyers' own community forum and a public
-    credentials listing (both URLs documented side by side). The previous
-    version of this function only ever fetched NSE_FO.csv, so SENSEX/BANKEX
-    could never be found regardless of what was in TARGET_INDICES - that
-    wasn't a parsing bug, it was simply never looking at the right file.
-    """
     nse_indices = [i for i in target_indices if not INDEX_SPOT_KEY_MAP.get(i, "").startswith("BSE:")]
     bse_indices = [i for i in target_indices if INDEX_SPOT_KEY_MAP.get(i, "").startswith("BSE:")]
     print(f"📡 Fetching Index Options Matrix for {', '.join(target_indices)} via FYERS...")
@@ -683,19 +553,10 @@ def get_index_universe_and_options(target_indices):
     found, missing = list(options_by_underlying.keys()), [i for i in target_indices if i not in options_by_underlying]
     print(f"  ├─ ✅ Found option chains for: {', '.join(found) if found else 'NONE'} ({len(opt_inst)} contracts total).")
     if missing:
-        print(f"  ├─ {COLOR_YELLOW}⚠️ No option chain found for: {', '.join(missing)}. "
-              f"Check the exact underlying name as it appears in {'NSE_FO.csv' if any(m in nse_indices for m in missing) else ''}"
-              f"{'/' if any(m in nse_indices for m in missing) and any(m in bse_indices for m in missing) else ''}"
-              f"{'BSE_FO.csv' if any(m in bse_indices for m in missing) else ''}.{COLOR_RESET}")
+        print(f"  ├─ {COLOR_YELLOW}⚠️ No option chain found for: {', '.join(missing)}.{COLOR_RESET}")
     return options_by_underlying
 
 def fetch_index_spot_prices(target_indices, target_date_str):
-    """
-    Fetches each target index's prior trading day close via INDEX_SPOT_KEY_MAP,
-    used as the ATM reference price for build_strike_range() - mirrors
-    fetch_all_spot_reference_prices()'s use of prior-day close for stock
-    underlyings, so strike selection behaves consistently across both modes.
-    """
     target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
     prev_dt = target_dt - timedelta(days=1)
     while prev_dt.weekday() >= 5: prev_dt -= timedelta(days=1)
@@ -705,14 +566,14 @@ def fetch_index_spot_prices(target_indices, target_date_str):
     for idx_name in target_indices:
         key = INDEX_SPOT_KEY_MAP.get(idx_name)
         if not key:
-            print(f"  ├─ {COLOR_YELLOW}⚠️ '{idx_name}' has no entry in INDEX_SPOT_KEY_MAP - add its Fyers spot symbol there first.{COLOR_RESET}")
+            print(f"  ├─ {COLOR_YELLOW}⚠️ '{idx_name}' has no entry in INDEX_SPOT_KEY_MAP.{COLOR_RESET}")
             continue
         df = fetch_fyers_candles(key, lookback_start, prev_day, resolution="D")
         if df is not None and not df.empty:
             spot_ref[idx_name] = float(df.sort_values("Datetime").iloc[-1]["Close"])
             print(f"  ├─ ✅ {idx_name} spot reference ({key}): ₹{spot_ref[idx_name]:.2f}")
         else:
-            print(f"  ├─ {COLOR_YELLOW}⚠️ Could not fetch spot price for {idx_name} ({key}) - see Fyers diagnostic above if shown.{COLOR_RESET}")
+            print(f"  ├─ {COLOR_YELLOW}⚠️ Could not fetch spot price for {idx_name} ({key}).{COLOR_RESET}")
     return spot_ref
 
 
@@ -730,8 +591,15 @@ def calculate_core_technicals(df_tf):
     gain, loss = delta.where(delta > 0, 0), -delta.where(delta < 0, 0)
     avg_gain = gain.groupby(df_tf["Symbol"]).transform(lambda x: x.rolling(window=RSI_PERIOD, min_periods=1).mean())
     avg_loss = loss.groupby(df_tf["Symbol"]).transform(lambda x: x.rolling(window=RSI_PERIOD, min_periods=1).mean())
+    
+    # Base RSI
     df_tf["RSI"] = 100 - (100 / (1 + (avg_gain / (avg_loss + 1e-8))))
+    
+    # TRUE BB-RSI: Bollinger Bands applied directly to RSI
     df_tf["RSI_SMA"] = df_tf.groupby("Symbol")["RSI"].transform(lambda x: x.rolling(BB_SMA_PERIOD, min_periods=1).mean())
+    df_tf["RSI_STD"] = df_tf.groupby("Symbol")["RSI"].transform(lambda x: x.rolling(BB_SMA_PERIOD, min_periods=1).std()).fillna(0)
+    df_tf["RSI_Upper_BB"] = df_tf["RSI_SMA"] + (BB_STD_DEV * df_tf["RSI_STD"])
+    df_tf["RSI_Lower_BB"] = df_tf["RSI_SMA"] - (BB_STD_DEV * df_tf["RSI_STD"])
 
     high_d = df_tf["High"] - df_tf.groupby("Symbol")["High"].shift(1)
     low_d = df_tf.groupby("Symbol")["Low"].shift(1) - df_tf["Low"]
@@ -758,45 +626,91 @@ def calculate_core_technicals(df_tf):
     return df_tf
 
 def construct_45deg_renko_matrix(df, tf_name, confirm_bricks):
+    # TRUE FRACTAL BREAKOUT ENGINE
     renko_counts = np.zeros(len(df))
+    fractal_bull = np.zeros(len(df), dtype=bool)
+    fractal_bear = np.zeros(len(df), dtype=bool)
+    
     for sym, indices in df.groupby("Symbol").indices.items():
         sub_closes = df["Close"].values[indices]
         sub_atrs = df["ATR"].values[indices]
+        
         if len(sub_closes) > 0:
             counts = np.zeros(len(sub_closes))
+            bull_breaks = np.zeros(len(sub_closes), dtype=bool)
+            bear_breaks = np.zeros(len(sub_closes), dtype=bool)
+            
             curr_trend, curr_count, curr_price = 0, 0, sub_closes[0]
+            
+            # Fractal memory variables
+            last_peak = np.nan
+            last_valley = np.nan
+            extreme_px = sub_closes[0]
+            is_bull_breakout = False
+            is_bear_breakout = False
+            
             for i in range(1, len(sub_closes)):
                 bs = max(sub_atrs[i], RENKO_MIN_BRICK)
                 move = sub_closes[i] - curr_price
-                # Hysteresis (2x brick) only applies when reversing an ESTABLISHED
-                # trend. A neutral (curr_trend == 0) start requires just 1x brick
-                # in either direction, so the first move of the day isn't biased bullish.
+                
                 if curr_trend == 0:
                     if move >= bs:
                         bricks = int(move // bs); curr_trend = 1; curr_count = bricks; curr_price += bricks * bs
+                        extreme_px = curr_price
                     elif move <= -bs:
                         bricks = int(abs(move) // bs); curr_trend = -1; curr_count = -bricks; curr_price -= bricks * bs
+                        extreme_px = curr_price
+                        
                 elif curr_trend > 0:
                     if move >= bs:
-                        bricks = int(move // bs); curr_count = curr_count + bricks; curr_price += bricks * bs
+                        bricks = int(move // bs); curr_count += bricks; curr_price += bricks * bs
+                        extreme_px = max(extreme_px, curr_price)
+                        
+                        # 45-DEGREE FRACTAL CHECK: Did we break the prior peak?
+                        if not np.isnan(last_peak) and curr_price > last_peak:
+                            is_bull_breakout = True
+                            
                     elif move <= -(2 * bs):
+                        # Trend Reverses Down: Lock in the Peak
+                        last_peak = extreme_px
+                        is_bull_breakout = False # Breakout state invalidated
                         bricks = int(abs(move) // bs); curr_trend = -1; curr_count = -bricks; curr_price -= bricks * bs
-                else:
+                        extreme_px = curr_price
+                        
+                else: # curr_trend < 0
                     if move <= -bs:
-                        bricks = int(abs(move) // bs); curr_count = curr_count - bricks; curr_price -= bricks * bs
+                        bricks = int(abs(move) // bs); curr_count -= bricks; curr_price -= bricks * bs
+                        extreme_px = min(extreme_px, curr_price)
+                        
+                        # 45-DEGREE FRACTAL CHECK: Did we break the prior valley?
+                        if not np.isnan(last_valley) and curr_price < last_valley:
+                            is_bear_breakout = True
+                            
                     elif move >= (2 * bs):
+                        # Trend Reverses Up: Lock in the Valley
+                        last_valley = extreme_px
+                        is_bear_breakout = False # Breakout state invalidated
                         bricks = int(move // bs); curr_trend = 1; curr_count = bricks; curr_price += bricks * bs
+                        extreme_px = curr_price
+                        
                 counts[i] = curr_count
+                bull_breaks[i] = is_bull_breakout
+                bear_breaks[i] = is_bear_breakout
+                
             renko_counts[indices] = counts
+            fractal_bull[indices] = bull_breaks
+            fractal_bear[indices] = bear_breaks
+
     df[f"Renko_Count_{tf_name}"] = renko_counts
+    
+    # We now demand the fractal breakout (structural breach) to validate the price pillar
     if confirm_bricks > 0:
-        df[f"Renko_Bull_{tf_name}"] = renko_counts >= confirm_bricks
-        df[f"Renko_Bear_{tf_name}"] = renko_counts <= -confirm_bricks
+        df[f"Renko_Bull_{tf_name}"] = (renko_counts >= confirm_bricks) & fractal_bull
+        df[f"Renko_Bear_{tf_name}"] = (renko_counts <= -confirm_bricks) & fractal_bear
     else:
-        # confirm_bricks == 0: use strict inequality so a flat count of exactly 0
-        # cannot satisfy both Bull and Bear simultaneously.
-        df[f"Renko_Bull_{tf_name}"] = renko_counts > 0
-        df[f"Renko_Bear_{tf_name}"] = renko_counts < 0
+        df[f"Renko_Bull_{tf_name}"] = (renko_counts > 0) & fractal_bull
+        df[f"Renko_Bear_{tf_name}"] = (renko_counts < 0) & fractal_bear
+        
     return df
 
 def construct_volume_delta_renko_matrix(df, tf_name, confirm_bricks):
@@ -855,15 +769,20 @@ def construct_renko_velocity_engine(df, tf_name):
     return df
 
 def construct_bb_meta_pillars(df, tf_name):
+    # ATR Bollinger Bands
     atr_mean = df.groupby("Symbol")["ATR"].transform(lambda x: x.rolling(BB_SMA_PERIOD, min_periods=1).mean())
     atr_std = df.groupby("Symbol")["ATR"].transform(lambda x: x.rolling(BB_SMA_PERIOD, min_periods=1).std()).fillna(0)
     df[f"ATR_BB_Bull_{tf_name}"] = df["ATR"] > (atr_mean + BB_STD_DEV * atr_std)
     df[f"ATR_BB_Bear_{tf_name}"] = df["ATR"] < (atr_mean - BB_STD_DEV * atr_std)
+    
+    # FIXED: Renko Count Bollinger Bands
     r_col = f"Renko_Count_{tf_name}"
     r_m = df.groupby("Symbol")[r_col].transform(lambda x: x.rolling(BB_SMA_PERIOD, min_periods=1).mean())
     r_s = df.groupby("Symbol")[r_col].transform(lambda x: x.rolling(BB_SMA_PERIOD, min_periods=1).std()).fillna(0)
-    df[f"Renko_BB_Bull_{tf_name}"] = df[r_col] <= (r_m + BB_STD_DEV * r_s)
-    df[f"Renko_BB_Bear_{tf_name}"] = df[r_col] >= (r_m - BB_STD_DEV * r_s)
+    
+    df[f"Renko_BB_Bull_{tf_name}"] = df[r_col] > (r_m + (BB_STD_DEV * r_s))
+    df[f"Renko_BB_Bear_{tf_name}"] = df[r_col] < (r_m - (BB_STD_DEV * r_s))
+    
     return df
 
 def apply_dual_tier_scorecard(df, tf_str, tier_type):
@@ -881,7 +800,11 @@ def apply_dual_tier_scorecard(df, tf_str, tier_type):
     c_price_b, c_price_br = df[f"Renko_Bull_{tf_str}"].astype(int), df[f"Renko_Bear_{tf_str}"].astype(int)
     c_vol_b, c_vol_br = df[f"Vol_Renko_Bull_{tf_str}"].astype(int), df[f"Vol_Renko_Bear_{tf_str}"].astype(int)
     c_vel_b, c_vel_br = df[f"Velocity_Bull_{tf_str}"].astype(int), df[f"Velocity_Bear_{tf_str}"].astype(int)
-    c_rsi_b, c_rsi_br = (df["RSI"] >= df["RSI_SMA"]).astype(int), (df["RSI"] <= df["RSI_SMA"]).astype(int)
+    
+    # FIXED: True BB-RSI Breakout Check
+    c_rsi_b = (df["RSI"] > df["RSI_Upper_BB"]).astype(int)
+    c_rsi_br = (df["RSI"] < df["RSI_Lower_BB"]).astype(int)
+    
     c_adx_b, c_adx_br = ((df["ADX"] >= ADX_THRESHOLD) & (df["+DI"] > df["-DI"])).astype(int), ((df["ADX"] >= ADX_THRESHOLD) & (df["-DI"] > df["+DI"])).astype(int)
     c_ema_b, c_ema_br = df["EMA_Bull_Expanded"].astype(int), df["EMA_Bear_Expanded"].astype(int)
     c_stoch_b, c_stoch_br = df["Stoch_Bull_Pass"].astype(int), df["Stoch_Bear_Pass"].astype(int)
@@ -911,25 +834,12 @@ def apply_dual_tier_scorecard(df, tf_str, tier_type):
     df[f"Armed_Bear_{tf_str}"] = (df[f"Score_Bear_{tf_str}"] >= min_score) & (~bear_veto)
     return df
 
+
 def _session_grouper_origin(df_base):
-    """
-    Anchors pd.Grouper bin edges to the 09:15 session open instead of midnight.
-    Without this, timeframes that don't evenly divide into 09:15 (e.g. "60min",
-    "240min") produce a truncated/misaligned first bar of the day (bins land at
-    00:00, 04:00, 08:00, 12:00... instead of 09:15, 13:15...), which distorts
-    Open/ATR/Renko for that first bar every single day.
-    """
     first_day = pd.to_datetime(df_base["Datetime"]).dt.normalize().min()
     return first_day + pd.Timedelta(hours=9, minutes=15)
 
 def evaluate_single_timeframe_gates(df_base, tf_str, tier_type="MACRO"):
-    """
-    Builds Armed_Bull/Armed_Bear/Score/Renko columns for a single timeframe,
-    evaluated against the given tier's scorecard thresholds (MACRO or MICRO -
-    see apply_dual_tier_scorecard). Used both for macro confirmation gates and
-    (since tier_type became a parameter) for evaluating any additional micro
-    timeframe beyond MICRO_TIMEFRAMES[0] as its own confirmation gate.
-    """
     origin = _session_grouper_origin(df_base)
     df_tf = df_base.groupby(["Symbol", pd.Grouper(key="Datetime", freq=tf_str, closed="left", label="left", origin=origin)]).agg(
         {"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum", "Net_Delta_1m": "sum"}
@@ -948,7 +858,7 @@ def evaluate_single_timeframe_gates(df_base, tf_str, tier_type="MACRO"):
     return df_tf[cols].copy().rename(columns={"Eval_Time": "Datetime"}).sort_values("Datetime").reset_index(drop=True)
 
 def prepare_unified_execution_tape(rolling_master_df, micro_timeframes, macro_timeframes, strategy_mode="BOTH"):
-    exec_tf = micro_timeframes[0]  # execution/pricing granularity - see MICRO_TIMEFRAMES config comment
+    exec_tf = micro_timeframes[0]  
 
     if exec_tf != "1min":
         origin = _session_grouper_origin(rolling_master_df)
@@ -969,7 +879,6 @@ def prepare_unified_execution_tape(rolling_master_df, micro_timeframes, macro_ti
     df_micro = apply_dual_tier_scorecard(df_micro, exec_tf, "MICRO").sort_values("Datetime").reset_index(drop=True)
     df_micro["Datetime"] = df_micro["Datetime"].astype("datetime64[ns]")
 
-    # Macro confirmation gates (unchanged) - vote via MACRO_CONFIRMATION_MODE.
     bull_gates, bear_gates = [], []
     for tf in macro_timeframes:
         env_df = evaluate_single_timeframe_gates(rolling_master_df, tf, "MACRO")
@@ -987,20 +896,13 @@ def prepare_unified_execution_tape(rolling_master_df, micro_timeframes, macro_ti
         required = n_macro_tfs
     elif MACRO_CONFIRMATION_MODE == "MAJORITY":
         required = (n_macro_tfs // 2) + 1
-    else:  # "ANY" - original behavior
+    else:  
         required = 1
     df_micro["Master_Armed_Bull"] = bull_agree_count >= required
     df_micro["Master_Armed_Bear"] = bear_agree_count >= required
     if strategy_mode == "BULLISH": df_micro["Master_Armed_Bear"] = False
     elif strategy_mode == "BEARISH": df_micro["Master_Armed_Bull"] = False
 
-    # Micro confirmation gates - exec_tf's own Armed_Bull/Armed_Bear were
-    # already computed directly above (same granularity, no merge needed).
-    # Any additional micro timeframes are evaluated the same way macro
-    # timeframes are, then combined via MICRO_CONFIRMATION_MODE - previously
-    # there was only ever one micro timeframe, so this vote didn't exist;
-    # now MICRO_TIMEFRAMES can hold several and they're combined identically
-    # to how macro timeframes already were.
     micro_bull_gates, micro_bear_gates = [f"Armed_Bull_{exec_tf}"], [f"Armed_Bear_{exec_tf}"]
     for tf in micro_timeframes[1:]:
         env_df = evaluate_single_timeframe_gates(rolling_master_df, tf, "MICRO")
@@ -1018,7 +920,7 @@ def prepare_unified_execution_tape(rolling_master_df, micro_timeframes, macro_ti
         required_micro = n_micro_tfs
     elif MICRO_CONFIRMATION_MODE == "MAJORITY":
         required_micro = (n_micro_tfs // 2) + 1
-    else:  # "ANY"
+    else: 
         required_micro = 1
     df_micro["Master_Armed_Micro_Bull"] = micro_bull_agree >= required_micro
     df_micro["Master_Armed_Micro_Bear"] = micro_bear_agree >= required_micro
@@ -1037,7 +939,7 @@ def prepare_unified_execution_tape(rolling_master_df, micro_timeframes, macro_ti
 # TRADE MANAGEMENT ENGINE
 # ==============================================================================
 def _run_dual_layer_trade_management(tape_exec, micro_timeframes, macro_timeframes, cutoff_time_obj):
-    exec_tf = micro_timeframes[0]  # execution/pricing granularity - same convention as prepare_unified_execution_tape
+    exec_tf = micro_timeframes[0]
     all_anomalies = tape_exec[tape_exec["Direction"] != 0].copy()
     anomalies_by_time = all_anomalies.groupby("Datetime")
     closes_dict = tape_exec.set_index(["Datetime", "Symbol"])["Close"].to_dict()
@@ -1047,14 +949,14 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframes, macro_timefram
     mac_v_renkos = {tf: tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{tf}"].to_dict() for tf in macro_timeframes}
 
     memory_bank, last_exit_price, last_exit_dir = {}, {}, {}
-    daily_trade_count = defaultdict(int)  # per-symbol count, reset every trading day (fix #9)
+    daily_trade_count = defaultdict(int)
     micro_tf_mins = _parse_tf_to_minutes(exec_tf)
     max_stall_mins = RENKO_VELOCITY_MAX_BARS * micro_tf_mins
 
     def _vote_required(mode, n):
         if mode == "ALL": return n
         if mode == "MAJORITY": return (n // 2) + 1
-        return 1  # "ANY"
+        return 1
 
     for t in np.sort(tape_exec["Datetime"].unique()):
         t_dt = pd.to_datetime(t)
@@ -1063,11 +965,6 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframes, macro_timefram
             for sym, episodes in memory_bank.items():
                 if episodes and episodes[-1]["state"] == "ACTIVE":
                     episodes[-1]["state"], episodes[-1]["exit_time"], episodes[-1]["exit_price"], episodes[-1]["exit_reason"] = "EXITED", t_dt.strftime("%Y-%m-%d %H:%M"), closes_dict.get((t_dt, sym), episodes[-1]["origin"]), "Overnight Gap Flush"
-            # New trading day: MAX_DAILY_TRADES_PER_SYMBOL and the "don't re-enter
-            # same direction after a stop" memory must reset per day. Previously
-            # these persisted across the whole multi-day backtrace window, so a
-            # stop-out or trade cap hit on day 1 could silently veto legitimate
-            # signals on the actual target day (fix #9 / #10).
             last_exit_price.clear()
             last_exit_dir.clear()
             daily_trade_count.clear()
@@ -1078,20 +975,11 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframes, macro_timefram
                 if (ltp := closes_dict.get((t_dt, sym))) is not None:
                     exit_reason = None
                     mins_in_trade = (t_dt - pd.to_datetime(f"{st['date']} {st['time']}")).total_seconds() / 60
-                    # Velocity stall stays tied to exec_tf only - "no new brick in
-                    # X minutes" is inherently about one specific timeframe's brick
-                    # cadence, not something to vote across multiple timeframes.
                     exec_p_count = micro_p_renkos[exec_tf].get((t_dt, sym), 0)
                     if exec_p_count != st["current_renko_count"]: st["last_brick_formed_dt"], st["current_renko_count"] = t_dt, exec_p_count
                     if mins_in_trade >= max_stall_mins and (t_dt - st["last_brick_formed_dt"]).total_seconds()/60 >= max_stall_mins:
                         exit_reason = f"Velocity Stall (No new brick in {max_stall_mins}m post-entry)"
 
-                    # Micro-tier exits: ANY/MAJORITY/ALL vote across ALL configured
-                    # MICRO_TIMEFRAMES (MICRO_EXIT_CONFIRMATION_MODE), mirroring
-                    # the macro-tier exit voting exactly. Previously there was
-                    # only ever one micro timeframe, so this was a plain
-                    # ANY-of-one check; now it's a real vote when multiple micro
-                    # timeframes are configured.
                     if not exit_reason:
                         reversed_micro_tfs = []
                         for tf in micro_timeframes:
@@ -1109,10 +997,6 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframes, macro_timefram
                         if len(reversed_micro_tfs) >= required_micro_exit:
                             exit_reason = f"Micro Reversal [{MICRO_EXIT_CONFIRMATION_MODE}] ({', '.join(reversed_micro_tfs)})"
 
-                    # Macro-tier exits (fix #5), using the same ANY/MAJORITY/ALL
-                    # voting scheme as entry confirmation (MACRO_EXIT_CONFIRMATION_MODE)
-                    # instead of exiting the instant a single triggering macro
-                    # timeframe reverses.
                     if not exit_reason:
                         triggering_tfs = st.get("triggering_macro_tfs", [])
                         reversed_tfs = []
@@ -1178,21 +1062,6 @@ def _run_dual_layer_trade_management(tape_exec, micro_timeframes, macro_timefram
 _WEEKLY_MONTH_CHAR = {'1':'Jan','2':'Feb','3':'Mar','4':'Apr','5':'May','6':'Jun','7':'Jul','8':'Aug','9':'Sep','O':'Oct','N':'Nov','D':'Dec'}
 
 def _parse_option_symbol(sym):
-    """
-    Parses a full NSE/BSE option contract symbol into
-    (underlying, strike, option_type, expiry_label). Handles both NSE/BSE
-    symbol formats, confirmed against Fyers/Zerodha documentation and a real
-    captured Fyers symbol master row (BSE:BANKEX23N0645700PE):
-      - Monthly:  <underlying><YY><MON><strike><CE|PE>   e.g. NIFTY26SEP24000CE
-      - Weekly:   <underlying><YY><M><DD><strike><CE|PE> e.g. NIFTY2691523350PE
-        (YY=2 digits, M=single char: 1-9 for Jan-Sep, O/N/D for Oct/Nov/Dec, DD=2 digits)
-    expiry_label distinguishes "15-Sep-26 Weekly" from "SEP'26 Monthly" so two
-    contracts at the same strike but different expiry types never silently
-    collapse into a single summary row.
-    The underlying group uses a non-greedy match, so leading digits in a
-    ticker (e.g. "360ONE") resolve correctly via normal regex backtracking.
-    For cash-equity symbols (no option suffix), returns (symbol, None, None, None).
-    """
     s = sym.replace("NSE:", "").replace("BSE:", "")
     m = re.match(r"^(?P<underlying>.+?)(?P<yy>\d{2})(?:(?P<mon3>[A-Z]{3})|(?P<mchar>[1-9OND])(?P<dd>\d{2}))(?P<strike>\d+)(?P<type>CE|PE)$", s)
     if not m:
@@ -1205,11 +1074,8 @@ def _parse_option_symbol(sym):
         expiry_label = f"{m.group('dd')}-{mon_name}-{m.group('yy')} Weekly"
     return underlying, strike, opt_type, expiry_label
 
+
 def display_final_results(tape_exec, memory_bank, target_dt, target_date_str, micro_tfs=None, macro_tfs=None):
-    # micro_tfs/macro_tfs are explicit params (rather than reading the
-    # MICRO_TIMEFRAMES/MACRO_TIMEFRAMES globals directly) purely for testability;
-    # the pipeline now builds ONE unified execution tape per run (not one pass
-    # per micro timeframe), so this is just the label for that single run.
     micro_tfs = micro_tfs if micro_tfs is not None else MICRO_TIMEFRAMES
     macro_tfs = macro_tfs if macro_tfs is not None else MACRO_TIMEFRAMES
 
@@ -1232,10 +1098,6 @@ def display_final_results(tape_exec, memory_bank, target_dt, target_date_str, mi
     if active_runners:
         print(f"{COLOR_BOLD}🟢 BASKET 1: ACTIVE RUNNERS (Riding the Trend){COLOR_RESET}")
         for st in active_runners:
-            # Fix #15: a runner opened on an earlier backtrace day, for a symbol
-            # with no rows yet in today's tape, previously fell back to `origin`
-            # and silently printed a misleading "0.00%" P&L instead of flagging
-            # that there's simply no live data for it yet.
             if st["sym"] not in final_ltp_dict:
                 print(f"  {COLOR_CYAN}⚡ {st['sym']:<26} Open P&L: N/A — no data yet for {target_date_str} ({'BULLISH' if st['dir']==1 else 'BEARISH'}){COLOR_RESET}")
                 print(f"      └─ 🎯 Anchor: {st['time']} | Price: ₹{st['origin']:.2f}\n")
@@ -1254,10 +1116,6 @@ def display_final_results(tape_exec, memory_bank, target_dt, target_date_str, mi
             print(f"  {color}🛑 {st['sym']:<26} Final P&L: {pnl_pct:+.2f}% ({'BULLISH' if st['dir']==1 else 'BEARISH'}){COLOR_RESET}")
             print(f"      └─ 🎯 Anchor: {st['time']} | Exit: {st['exit_time']} | Price: ₹{st['exit_price']:.2f} | Reason: {st['exit_reason']}\n")
 
-    # ---- Per-strike summary: each row is a specific contract (underlying +
-    # strike + CE/PE), not the whole index/underlying collapsed together.
-    # e.g. "NIFTY 23350 PE" and "NIFTY 23400 CE" are separate rows. Cash-equity
-    # symbols (no strike) just show the plain ticker as the row label. ----
     def _row_label(sym):
         und, strike, opt_type, expiry_label = _parse_option_symbol(sym)
         return f"{und} {strike} {opt_type} [{expiry_label}]" if strike else und
@@ -1288,18 +1146,6 @@ def display_final_results(tape_exec, memory_bank, target_dt, target_date_str, mi
 # LIVE WEBSOCKET STREAMING ENGINE
 # ==============================================================================
 def _now_ist():
-    """
-    Returns the current naive datetime in IST (Asia/Kolkata), independent of the
-    host machine's system timezone. GitHub Actions runners default to UTC.
-    Mixing a UTC datetime.now() with IST-stamped historical data (see the
-    tz_convert("Asia/Kolkata") on load) caused two compounding bugs in
-    LiveWebsocketEngine: (1) live candles were timestamped ~5.5h away from
-    where they belonged relative to the historical tape, corrupting the merge
-    and starving entry signals, and (2) the market-close stop check compared a
-    UTC clock against an IST cutoff, so the loop kept running long past actual
-    15:30 IST close - it wouldn't hit "15:30" on its own clock until ~21:00
-    UTC (02:30 IST the next day). Mirrors the existing target_dt convention.
-    """
     return datetime.utcnow() + timedelta(hours=5, minutes=30)
 
 class LiveWebsocketEngine:
@@ -1314,37 +1160,13 @@ class LiveWebsocketEngine:
         self.access_token = f"{os.environ.get('FYERS_CLIENT_ID')}:{os.environ.get('FYERS_ACCESS_TOKEN')}"
         self.symbols = list(historical_df["Symbol"].unique())
         if TRADING_MODE == "CASH_EQUITY":
-            # historical_df["Symbol"] holds bare tickers (e.g. "360ONE") for cash
-            # equities - Fyers WS needs the fully-qualified "NSE:<TICKER>-EQ" key.
             self.ws_symbols = [f"NSE:{s}-EQ" for s in self.symbols]
             self._strip_ws_symbol = lambda s: s.replace("NSE:", "").replace("-EQ", "")
         else:
-            # OPTIONS / INDEX_OPTIONS: fetch_stock_bars_worker sets Symbol from
-            # item["symbol"], which for options IS the fully-qualified Fyers
-            # contract key already (e.g. "NSE:NIFTY26SEP24000CE"). Reconstructing
-            # it as f"NSE:{s}-EQ" would double-prefix and corrupt every contract
-            # symbol, so use it exactly as-is for both subscription and lookup.
             self.ws_symbols = list(self.symbols)
             self._strip_ws_symbol = lambda s: s
 
     def onmessage(self, message):
-        """
-        Fyers' on_message callback delivers ONE tick dict per invocation, not a
-        list of messages - confirmed against Fyers' own official sample code
-        (def onmessage(message): ...) and multiple real captured payloads from
-        their community forum, e.g.
-        {'ltp': 3110.3, 'vol_traded_today': 6570195, 'symbol': 'NSE:RELIANCE-EQ', ...}
-        This method previously took the argument as `messages` and did
-        `for msg in messages:` - since iterating a dict yields its own KEYS,
-        every `msg` was actually just a string like 'ltp' or 'symbol', so the
-        `'symbol' not in msg` guard was checking a substring match on a field
-        name, not looking up an actual key - meaning it hit `continue` (or,
-        after this fix, would have silently mis-processed data) for literally
-        every tick of the entire session. This was a complete no-op, on top of
-        the separate subscribe() bug: even fixing subscribe() alone would not
-        have produced a single working candle, because this handler discarded
-        everything it received regardless.
-        """
         with self.lock:
             msg = message
             if 'symbol' not in msg or 'ltp' not in msg: return
@@ -1352,9 +1174,6 @@ class LiveWebsocketEngine:
             if sym_raw not in self.symbols: return
 
             ltp, vol_today = float(msg['ltp']), float(msg.get('vol_traded_today', 0))
-            # Fyers' own community forum documents transient ltp=0.0/vol_traded_today=0
-            # glitch ticks on some symbols; a real 0 price would corrupt the candle
-            # (and any downstream % change math), so skip rather than record it.
             if ltp <= 0: return
 
             prev_ltp, prev_vol = self.last_tick_ltp.get(sym_raw, ltp), self.last_tick_vol.get(sym_raw, vol_today)
@@ -1373,16 +1192,6 @@ class LiveWebsocketEngine:
     def onclose(self, message): print(f"{COLOR_YELLOW}[WS Closed] Reconnecting...{COLOR_RESET}")
     def onopen(self): 
         print(f"{COLOR_GREEN}[WS Connected] Subscribing to {len(self.ws_symbols)} instruments.{COLOR_RESET}")
-        # Verified against Fyers' official sample code (FyersDev/fyers-api-sample-code)
-        # and SDK usage examples - two real defects here, not assumptions:
-        # 1) subscribe()'s actual parameter is `symbols` (plural). This code was
-        #    calling it with `symbol=` (singular), which throws a TypeError inside
-        #    the on_connect callback on every single connection attempt - meaning
-        #    the socket never actually subscribed to anything, ever. No
-        #    subscription -> no ticks -> onmessage never fires -> live_candles
-        #    stays empty for the entire session, regardless of anything else.
-        # 2) keep_running() was never called. Every reference example calls this
-        #    immediately after subscribe() to keep the socket in its receive loop.
         self.fyers_ws.subscribe(data_type="SymbolUpdate", symbols=self.ws_symbols)
         self.fyers_ws.keep_running()
 
@@ -1397,15 +1206,6 @@ class LiveWebsocketEngine:
         print(f"\n{COLOR_CYAN}⚡ LIVE ENGINE ARMED. Awaiting candle closes...{COLOR_RESET}")
         threading.Thread(target=self.start_socket, daemon=True).start()
         current_minute = _now_ist().minute
-        # Bug fix: this loop previously had no exit condition at all - not even
-        # at market close - so on a CI runner (GitHub Actions) it would just run
-        # until the workflow's own job timeout killed the process mid-loop. That
-        # produced exactly the "takes the whole day and never finishes" symptom.
-        # It ALSO used datetime.now() (runner's UTC clock) instead of IST, so
-        # even with a close-time check it wouldn't fire until ~5.5h after real
-        # market close, and live candle timestamps didn't line up with the
-        # IST-stamped historical tape. Now uses _now_ist() throughout, stops
-        # cleanly at 15:30 IST, prints one final snapshot, and returns.
         market_close_t = datetime.strptime("15:30:00", "%H:%M:%S").time()
         while True:
             now = _now_ist()
@@ -1420,15 +1220,6 @@ class LiveWebsocketEngine:
                 with self.lock:
                     ticked_syms = set(self.live_candles.keys())
                     new_rows = [{"Datetime": rounded_dt, "Symbol": sym, **c} for sym, c in self.live_candles.items()]
-                    # Fix #12: REST mode forward-fills every quiet minute via
-                    # regularize_intraday_tape so every symbol has a continuous
-                    # 1-min series. WS mode previously only emitted a row for
-                    # symbols that actually ticked that minute, so a thin/quiet
-                    # symbol just got no row at all - downstream rolling-window
-                    # indicators (ATR/RSI/EMA, shift(1)) then computed across
-                    # unevenly-spaced bars for that symbol only in live mode.
-                    # Emit an explicit flat (zero-volume) candle at the last known
-                    # price for any subscribed symbol that stayed silent this minute.
                     for sym in self.symbols:
                         if sym in ticked_syms or sym not in self.last_tick_ltp:
                             continue
@@ -1444,14 +1235,10 @@ class LiveWebsocketEngine:
                     strat = GLOBAL_MACRO_STRATEGY_2D if TRADING_MODE == "CASH_EQUITY" else OPTIONS_STRATEGY_2D
                     os.system('cls' if os.name == 'nt' else 'clear')
                     print(f"📡 Last Update: {now.strftime('%H:%M:%S')} | Mode: WEBSOCKET LIVE TICK")
-                    # Single unified tape per tick cycle across ALL configured
-                    # MICRO_TIMEFRAMES (voted via MICRO_CONFIRMATION_MODE) - was
-                    # previously re-running the entire pipeline once per micro
-                    # timeframe every single tick cycle, which directly multiplied
-                    # per-tick cost by len(MICRO_TIMEFRAMES).
                     tape_exec = prepare_unified_execution_tape(self.historical_df, MICRO_TIMEFRAMES, MACRO_TIMEFRAMES, strat)
                     memory_bank = _run_dual_layer_trade_management(tape_exec, MICRO_TIMEFRAMES, MACRO_TIMEFRAMES, self.cutoff_obj)
                     display_final_results(tape_exec, memory_bank, now, self.target_date_str, micro_tfs=MICRO_TIMEFRAMES, macro_tfs=MACRO_TIMEFRAMES)
+
 
 # ==============================================================================
 # PIPELINE ROUTER
@@ -1528,13 +1315,6 @@ def scan_institutional_tape(target_date_str, entry_cutoff_time_str=ENTRY_CUTOFF_
             engine.run_event_loop()
             return 
 
-    # REST HISTORICAL EXECUTION - single unified tape across ALL configured
-    # MICRO_TIMEFRAMES (voted via MICRO_CONFIRMATION_MODE) and MACRO_TIMEFRAMES
-    # (voted via MACRO_CONFIRMATION_MODE). Previously this re-ran the entire
-    # pipeline (technicals, Renko engines, scorecard, trade management) once
-    # per micro timeframe from scratch as fully separate passes - that
-    # directly multiplied total runtime by len(MICRO_TIMEFRAMES), which was
-    # one of the two concrete causes of the long run times being reported.
     master_df = truncate_to_cutoff(master_df, target_date_str, cutoff_dt)
     strat = GLOBAL_MACRO_STRATEGY_2D if TRADING_MODE == "CASH_EQUITY" else OPTIONS_STRATEGY_2D
     tape_exec = prepare_unified_execution_tape(master_df, MICRO_TIMEFRAMES, MACRO_TIMEFRAMES, strat)
@@ -1551,3 +1331,5 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
+
+
