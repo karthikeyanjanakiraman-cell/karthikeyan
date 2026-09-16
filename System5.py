@@ -73,7 +73,7 @@ MIN_STOCK_VOLUME = 500000
 # ==============================================================================
 # 🎛️ GLOBAL CONFIGURATION
 # ==============================================================================
-MICRO_TIMEFRAMES = ["1min"]
+MICRO_TIMEFRAMES = ["60min"]
 MACRO_TIMEFRAMES = ["420min"] # True Intraday Rolling Window
 
 ATR_PERIOD = 14
