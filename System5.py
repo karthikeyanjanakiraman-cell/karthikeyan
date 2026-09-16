@@ -63,7 +63,7 @@ def _log_fyers_error(context, status_code=None, body=None):
 # 🎛️ TIER 0: TRADING MODE & DATA FEED SWITCH
 # ==============================================================================
 DATA_FEED_MODE = "REST"       
-TRADING_MODE = "STOCK_FNO"       
+TRADING_MODE = "INDEX_OPTIONS"       
 ENABLE_STAGE1_STOCK_FILTER = False  
 
 MIN_STOCK_PRICE = 100.0
