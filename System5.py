@@ -105,7 +105,7 @@ MIN_STOCK_VOLUME = 500000
 # wider either doesn't evenly divide the session or doesn't close until the
 # market's shut.
 MACRO_CLOCK_TIMEFRAMES = [125]   # session-anchored clock-time bar width, in minutes
-MICRO_LOOKBACKS = [15]
+MICRO_LOOKBACKS = [5,15]
 GAP_EXCLUDE_OVERNIGHT = True
 
 ATR_PERIOD = 14
@@ -139,13 +139,13 @@ MACRO_MINIMUM_SCORE            = 3
 # --- Tier 2: Micro Execution ---
 MICRO_CONFIRMATION_MODE = "MAJORITY"
 SYNC_MICRO_WITH_MACRO          = False
-MICRO_MANDATORY_LIVE_PERCENTILE = 25.0   
-MICRO_MANDATORY_PRICE_RENKO    = True    
-MICRO_MANDATORY_VOL_RENKO      = True    
-MICRO_MANDATORY_RENKO_VELOCITY = True    
-MICRO_MANDATORY_RSI_BB         = False
-MICRO_MANDATORY_ADX_DMI        = False   
-MICRO_MANDATORY_EMA_SPREAD     = False
+MICRO_MANDATORY_LIVE_PERCENTILE = 45.0   
+MICRO_MANDATORY_PRICE_RENKO    = False    
+MICRO_MANDATORY_VOL_RENKO      = False    
+MICRO_MANDATORY_RENKO_VELOCITY = False    
+MICRO_MANDATORY_RSI_BB         = True
+MICRO_MANDATORY_ADX_DMI        = True   
+MICRO_MANDATORY_EMA_SPREAD     = True
 MICRO_MANDATORY_STOCHASTIC     = False
 MICRO_MANDATORY_ATR_BB         = False   
 MICRO_MANDATORY_RENKO_BB       = False   
