@@ -772,9 +772,37 @@ def display_final_results(tape, bank, target_dt, target_str):
             pnl = (((st["exit_price"] - st["origin"]) / st["origin"]) * 100) if st["dir"] == 1 else (((st["origin"] - st["exit_price"]) / st["origin"]) * 100)
             c = COLOR_GREEN if pnl >= 0 else COLOR_RED
             print(f"  {c}🛑 {st['sym']:<26} P&L: {pnl:+.2f}% | Entry: ₹{st['origin']:.2f} | Exit: ₹{st['exit_price']:.2f} | Reason: {st['exit_reason']}{COLOR_RESET}")
+
+    # =========================================================
+    # RESTORED SUMMARY TABLE
+    # =========================================================
+    def _row_label(sym):
+        und, strike, opt_type, expiry_label = _parse_option_symbol(sym)
+        return f"{und} {strike} {opt_type} [{expiry_label}]" if strike else und
+
+    active_counts, closed_counts = defaultdict(int), defaultdict(int)
+    for st in act: active_counts[_row_label(st["sym"])] += 1
+    for st in clo: closed_counts[_row_label(st["sym"])] += 1
+
+    all_rows = sorted(
+        set(active_counts) | set(closed_counts),
+        key=lambda k: (-active_counts.get(k, 0), -closed_counts.get(k, 0), k)
+    )
+
+    print(f"\n{COLOR_CYAN}------------------------------------------------------------------------------------------------{COLOR_RESET}")
+    print(f"{COLOR_BOLD}📊 SUMMARY — Trade Count by Strike{COLOR_RESET}")
+    if all_rows:
+        label_width = max(len("Underlying"), len("TOTAL"), *(len(k) for k in all_rows)) + 2
+        print(f"  {'Underlying':<{label_width}}{'Active':<8}{'Closed':<8}")
+        for k in all_rows:
+            print(f"  {k:<{label_width}}{active_counts.get(k, 0):<8}{closed_counts.get(k, 0):<8}")
+        print(f"  {'-' * (label_width + 16)}")
+        print(f"  {'TOTAL':<{label_width}}{sum(active_counts.values()):<8}{sum(closed_counts.values()):<8}")
+    else:
+        print("  No trades in either basket for this run.")
     print(f"{COLOR_CYAN}================================================================================================{COLOR_RESET}\n")
 
-
+    
 # ==============================================================================
 # 5. WEBSOCKET & PIPELINE ROUTER
 # ==============================================================================
