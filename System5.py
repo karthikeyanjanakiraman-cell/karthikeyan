@@ -682,6 +682,9 @@ def prepare_unified_execution_tape(master_df, micro_lookbacks, macro_clock_tfs, 
 
     df_micro = master_df.copy().sort_values(["Symbol", "Datetime"]).reset_index(drop=True)
     df_micro["Datetime"] = pd.to_datetime(df_micro["Datetime"]).astype("datetime64[ns]")
+    
+    # FIX: Calculate Net_Delta_Pct on the main execution tape so the trade ranker can use it
+    df_micro["Net_Delta_Pct"] = (df_micro["Net_Delta_1m"] / (df_micro["Volume"] + 1e-9)) * 100
 
     exec_env = build_rolling_lookback_gate(master_df, exec_lb, "MICRO")
     df_micro = pd.merge_asof(df_micro.sort_values("Datetime"), exec_env.sort_values("Datetime"), on="Datetime", by="Symbol", direction="backward")
