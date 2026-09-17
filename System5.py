@@ -63,7 +63,7 @@ def _log_fyers_error(context, status_code=None, body=None):
 # 🎛️ TIER 0: TRADING MODE & DATA FEED SWITCH
 # ==============================================================================
 DATA_FEED_MODE = "REST"       
-TRADING_MODE = "STOCK_FNO"       
+TRADING_MODE = "CASH_EQUITY"       # INDEX_OPTIONS STOCK_FNO CASH_EQUITY
 ENABLE_STAGE1_STOCK_FILTER = False  
 
 MIN_STOCK_PRICE = 100.0
@@ -73,39 +73,8 @@ MIN_STOCK_VOLUME = 500000
 # ==============================================================================
 # 🎛️ GLOBAL CONFIGURATION
 # ==============================================================================
-# v24 FIX - MACRO no longer uses a rolling active-minute lookback window
-# (v23). It's replaced by a fixed, session-anchored clock-time bar - see the
-# MACRO_CLOCK_TIMEFRAMES / MICRO_LOOKBACKS comment right below for the full
-# reasoning (why the rolling window was inconsistent, and how 125min was
-# chosen as the largest clean divisor of the 375-minute trading session).
-#
-# MICRO stays a rolling ACTIVE-minute lookback (see build_rolling_lookback_gate)
-# - that's working correctly and is left as-is.
-#
-# MACRO no longer uses a rolling active-minute window. In live use it kept
-# reaching back through prior sessions with a slightly different sample set
-# on every recompute (yesterday's active-candle count keeps changing as
-# today's data streams in, mid-window candles can be revised by late/
-# corrected prints, etc.), so the same moment in time could score a
-# different Armed_Bull/Armed_Bear state depending on exactly when the
-# pipeline ran - "inconsistent results". A plain clock-time bar doesn't have
-# that problem: once a bar closes, its OHLC/ATR/Renko state is fixed for
-# good, deterministic no matter when you look at it.
-#
-# What clock-time bar to use: the trading session is 09:15-15:30 = 375
-# minutes. Picking a bar width that evenly divides 375 means every bin lands
-# on a clean boundary (no truncated/misaligned final bar) and, critically,
-# closes for good BEFORE 15:30 - never spilling into after-hours like the
-# old "240min"/"480min" bars did. 375 = 3 x 5^3, so its divisors are
-# 1/3/5/15/25/75/125/375. 375 itself only closes once, at EOD (no intraday
-# updates at all - useless as a live macro filter). The largest divisor that
-# still closes MORE than once during the session is 125 minutes: 3 clean
-# closes per day at 11:20, 13:25 and 15:30, none of them after hours. That's
-# the maximum "macro" timeframe usable from a single trading day - anything
-# wider either doesn't evenly divide the session or doesn't close until the
-# market's shut.
 MACRO_CLOCK_TIMEFRAMES = [125]   # session-anchored clock-time bar width, in minutes
-MICRO_LOOKBACKS = [5]
+MICRO_LOOKBACKS = [15]
 GAP_EXCLUDE_OVERNIGHT = True
 
 ATR_PERIOD = 14
@@ -163,7 +132,7 @@ ENTRY_CUTOFF_TIME = "15:15"
 MAX_DAILY_TRADES_PER_SYMBOL = 2
 
 OPTIONS_TARGET_EXPIRY = "CURRENT"   
-STRIKE_RANGE_OFFSET = 2             
+STRIKE_RANGE_OFFSET = 0             # FIX: Strictly ATM to avoid spread slippage
 MIN_OPT_PREMIUM = 15.0              
 MIN_OPT_VOLUME = 50000             
 OPTIONS_STRATEGY_2D = "BULLISH"     
@@ -274,14 +243,6 @@ def get_fno_universe_and_options():
     return spot_inst, opts_by_und
 
 def _parse_fo_csv_for_underlyings(csv_text, allowed_underlyings, spot_key_map):
-    """
-    Shared NSE_FO.csv/BSE_FO.csv row-parsing logic used by both
-    get_fno_universe_and_options (stocks) and get_index_universe_and_options
-    (indices) - the two differ only in which underlyings they keep and where
-    the spot instrument key comes from (a "-EQ" cash symbol for stocks, a
-    fixed index key from INDEX_SPOT_KEY_MAP for indices), so that filtering
-    decision is the only thing callers pass in.
-    """
     spot_inst, opt_inst, valid_und = [], [], set()
     for line in csv_text.strip().split("\n"):
         cols = [c.strip() for c in line.split(",")]
@@ -307,18 +268,6 @@ def _parse_fo_csv_for_underlyings(csv_text, allowed_underlyings, spot_key_map):
     return spot_inst, opt_inst
 
 def get_index_universe_and_options():
-    """
-    Fills the previously-missing INDEX_OPTIONS pipeline. Mirrors
-    get_fno_universe_and_options' structure, but scoped to TARGET_INDICES
-    instead of individual stocks, and uses INDEX_SPOT_KEY_MAP for each
-    index's spot/underlying instrument key (indices aren't in NSE_CM.csv as
-    "-EQ" cash symbols, so there's no CSV lookup for the spot side - the key
-    is just the fixed map).
-
-    NIFTY/BANKNIFTY/FINNIFTY/MIDCPNIFTY trade on NSE (NSE_FO.csv);
-    SENSEX/BANKEX trade on BSE (BSE_FO.csv) - both feeds are fetched and
-    merged, each wrapped so one feed failing doesn't take down the other.
-    """
     print("📡 Fetching Index F&O Instrument Matrix via FYERS...")
     headers = {"User-Agent": "Mozilla/5.0"}
     spot_inst, opt_inst, valid_und = [], [], set()
@@ -416,6 +365,26 @@ def fetch_all_spot_reference_prices(spot_universe, target_date_str):
             if px is not None: spot_ref[sym] = px
     return spot_ref
 
+def filter_cash_equities_by_price_range(spot_universe, target_date_str):
+    target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
+    prev_dt = target_dt - timedelta(days=1)
+    while prev_dt.weekday() >= 5: prev_dt -= timedelta(days=1)
+    lookback = (prev_dt - timedelta(days=7)).strftime("%Y-%m-%d")
+    
+    valid = []
+    def worker(item):
+        df = fetch_fyers_candles(item["key"], lookback, prev_dt.strftime("%Y-%m-%d"), resolution="D")
+        if df is None or df.empty: return None
+        last = df.sort_values("Datetime").iloc[-1]
+        if MIN_STOCK_PRICE <= last["Close"] <= MAX_STOCK_PRICE and last["Volume"] >= MIN_STOCK_VOLUME:
+            return item
+        return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
+        for res in ex.map(worker, spot_universe):
+            if res: valid.append(res)
+    return valid
+
 def filter_liquid_contracts(contracts, target_date_str):
     if not contracts: return []
     target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
@@ -454,19 +423,6 @@ def build_strike_range(symbol, spot_price, opts_by_und, target_str, offset):
 # 2. CORE MATHEMATICAL & TECHNICAL ENGINES
 # ==============================================================================
 def calculate_core_technicals(frame_tf, period=None, gap_exclude=None):
-    """
-    period: overrides ATR_PERIOD/RSI_PERIOD/ADX_PERIOD with one characteristic
-    window (used by build_rolling_lookback_gate, where the lookback itself
-    IS the window). BB_SMA_PERIOD(20) and EMA 8/21 scale proportionally so a
-    lookback=60 gate stays fast and a lookback=420 gate stays slow, instead
-    of every gate sharing fixed 8/21/20-sample windows. None keeps the
-    original fixed constants (used for anything not lookback-scaled).
-    gap_exclude: blanks the "previous close/high/low" reference at each
-    Symbol's FIRST row of a new calendar day before TR/RSI-diff are computed,
-    so True Range and RSI momentum never count an overnight gap as intraday
-    movement. Defaults to GAP_EXCLUDE_OVERNIGHT. Requires "Date" (added here
-    if missing).
-    """
     if gap_exclude is None: gap_exclude = GAP_EXCLUDE_OVERNIGHT
     atr_p = period if period else ATR_PERIOD
     rsi_p = period if period else RSI_PERIOD
@@ -477,9 +433,6 @@ def calculate_core_technicals(frame_tf, period=None, gap_exclude=None):
 
     if "Date" not in frame_tf.columns:
         frame_tf["Date"] = frame_tf["Datetime"].dt.date
-    # True only at each Symbol's first row of a new calendar day - where a
-    # naive shift(1)/diff() would otherwise reach back across the overnight
-    # gap into the previous session's last print.
     is_new_day = gap_exclude & (frame_tf["Date"] != frame_tf.groupby("Symbol")["Date"].shift(1))
 
     prev_close = frame_tf.groupby("Symbol")["Close"].shift(1)
@@ -493,12 +446,10 @@ def calculate_core_technicals(frame_tf, period=None, gap_exclude=None):
     frame_tf["H-L"] = frame_tf["High"] - frame_tf["Low"]
     frame_tf["H-PC"] = (frame_tf["High"] - prev_close).abs()
     frame_tf["L-PC"] = (frame_tf["Low"] - prev_close).abs()
-    # NaN prev_close (gap-excluded first-of-day row) collapses TR to plain
-    # H-L for that one row instead of pulling in the overnight jump.
     frame_tf["TR"] = frame_tf[["H-L", "H-PC", "L-PC"]].max(axis=1, skipna=True).fillna(frame_tf["H-L"])
     frame_tf["ATR"] = frame_tf.groupby("Symbol")["TR"].transform(lambda x: x.rolling(atr_p, min_periods=1).mean()).fillna(frame_tf["Close"] * RENKO_DEFAULT_PCT)
 
-    delta = frame_tf["Close"] - prev_close  # NaN (gap-excluded) instead of overnight jump on day's first row
+    delta = frame_tf["Close"] - prev_close  
     gain, loss = delta.where(delta > 0, 0), -delta.where(delta < 0, 0)
     avg_gain = gain.groupby(frame_tf["Symbol"]).transform(lambda x: x.rolling(rsi_p, min_periods=1).mean())
     avg_loss = loss.groupby(frame_tf["Symbol"]).transform(lambda x: x.rolling(rsi_p, min_periods=1).mean())
@@ -529,7 +480,6 @@ def calculate_core_technicals(frame_tf, period=None, gap_exclude=None):
     return frame_tf
 
 def construct_45deg_renko_matrix(df, tf_name, confirm_bricks):
-    # 🔴 TRUE FRACTAL BREAKOUT ENGINE (Structural Swing Tracking)
     r_counts, f_bull, f_bear = np.zeros(len(df)), np.zeros(len(df), dtype=bool), np.zeros(len(df), dtype=bool)
     
     for sym, indices in df.groupby("Symbol").indices.items():
@@ -615,9 +565,6 @@ def construct_volume_delta_renko_matrix(df, tf_name, confirm_bricks, vol_sma_per
     return df
 
 def construct_renko_velocity_engine(df, tf_name, lookback_n):
-    """lookback_n: the active-minute lookback this gate represents (stands in
-    for what a bar's clock-minute width used to mean), so a macro gate is
-    still allowed proportionally longer to go quiet than a fast micro gate."""
     changed = df.groupby("Symbol")[f"Renko_Count_{tf_name}"].diff().fillna(1) != 0
     df[f"Last_Brick_Time_{tf_name}"] = df["Datetime"].where(changed).groupby(df["Symbol"]).ffill()
     df[f"Mins_Since_{tf_name}"] = (df["Datetime"] - df[f"Last_Brick_Time_{tf_name}"]).dt.total_seconds() / 60
@@ -628,7 +575,6 @@ def construct_renko_velocity_engine(df, tf_name, lookback_n):
 
 def construct_bb_meta_pillars(df, tf_name, bb_period=None):
     bb_p = bb_period if bb_period else BB_SMA_PERIOD
-    # 🔴 CORRECTED Bollinger Expansions (> <)
     atr_m = df.groupby("Symbol")["ATR"].transform(lambda x: x.rolling(bb_p, min_periods=1).mean())
     atr_s = df.groupby("Symbol")["ATR"].transform(lambda x: x.rolling(bb_p, min_periods=1).std()).fillna(0)
     df[f"ATR_BB_Bull_{tf_name}"] = df["ATR"] > (atr_m + BB_STD_DEV * atr_s)
@@ -677,29 +623,9 @@ def apply_dual_tier_scorecard(df, tf_str, tier_type):
 # 3. ROLLING ACTIVE-MINUTE LOOKBACK ENGINE
 # ==============================================================================
 def _scaled_bb_period(lookback_n):
-    """Same scaling ratio calculate_core_technicals uses internally, reused
-    here for the volume-brick SMA and the ATR/Renko Bollinger meta-pillars so
-    every window on a gate scales together with its lookback."""
     return max(2, round(lookback_n * BB_SMA_PERIOD / ATR_PERIOD))
 
 def build_rolling_lookback_gate(master_df, lookback_n, tier_type="MACRO"):
-    """
-    Builds Armed_Bull/Armed_Bear/Score/Renko columns from a ROLLING window of
-    the trailing `lookback_n` ACTIVE (Volume > 0) 1-minute candles per symbol
-    - replaces the raw `.rolling(window=tf_mins)` "Live Rolling Window"
-    (previous build), which operated on row count with no day-boundary
-    awareness and silently blended each day's opening minutes with the prior
-    day's close (see the MICRO_LOOKBACKS config comment).
-
-    Every genuinely-traded candle updates this gate's ATR/RSI/ADX/Renko/score
-    the instant it prints - Eval_Time is just the candle's own timestamp, no
-    forward shift. Because the window slides over ACTIVE candles only, it
-    automatically reaches back through the already-loaded BACKTRACE_DAYS
-    history to stay mature (full lookback_n samples) from the first minute of
-    the day. GAP_EXCLUDE_OVERNIGHT (via calculate_core_technicals) keeps the
-    overnight gap out of TR/RSI-diff when the window reaches across a day
-    boundary to do that.
-    """
     tag = lb_tag(lookback_n)
     df_active = master_df[master_df["Volume"] > 0].sort_values(["Symbol", "Datetime"]).reset_index(drop=True).copy()
     df_active["Net_Delta_Pct"] = (df_active["Net_Delta_1m"] / (df_active["Volume"] + 1e-9)) * 100
@@ -721,33 +647,9 @@ def build_rolling_lookback_gate(master_df, lookback_n, tier_type="MACRO"):
     return out
 
 def clock_tag(tf_minutes):
-    """Column-naming tag for a fixed clock-time macro bar, e.g. 125 -> 'C125'."""
     return f"C{tf_minutes}"
 
 def build_clock_time_macro_gate(master_df, tf_minutes, tier_type="MACRO"):
-    """
-    Deterministic replacement for the rolling active-minute macro gate: a
-    plain clock-time bar, independently anchored to EACH day's own 09:15
-    open (see MACRO_CLOCK_TIMEFRAMES config comment for why 125min was
-    chosen). Once a bar closes, its OHLC/ATR/Renko/score are fixed for good
-    - re-running the pipeline at a different moment can never produce a
-    different reading for an already-closed bar, which is what "inconsistent
-    results" from the rolling window meant.
-
-    Bins are computed as floor(minutes-since-THAT-DAY's-09:15 / tf_minutes),
-    per row - NOT via a single global pd.Grouper origin anchored to the
-    first day in the dataset. A single global origin drifts: each overnight
-    gap (15:30 -> next day's 09:15) is ~18.75 hours, which is not a multiple
-    of tf_minutes, so bin edges creep later and later every subsequent day
-    (verified: by day 3 a 125min-from-day-1-origin grouper closes at
-    11:15/13:20/15:25/17:30 instead of the clean 11:20/13:25/15:30). Binning
-    per-row against that row's own day keeps every day identically aligned,
-    with the 3rd bin always closing exactly at 15:30 - never after hours.
-
-    Eval_Time is each bar's own CLOSE (bin_start + tf_minutes), not its open,
-    so merge_asof(direction="backward") can only ever see a bar's state once
-    every row inside it has actually happened - no lookahead.
-    """
     tag = clock_tag(tf_minutes)
     src = master_df.copy()
     day_open = src["Datetime"].dt.normalize() + pd.Timedelta(hours=9, minutes=15)
@@ -778,32 +680,9 @@ def prepare_unified_execution_tape(master_df, micro_lookbacks, macro_clock_tfs, 
     exec_lb = micro_lookbacks[0]
     exec_tag = lb_tag(exec_lb)
 
-    # df_micro is the FULL raw 1-minute pricing tape (active AND zero-volume
-    # filler rows) - every row needs a Close price for trade management's
-    # continuous LTP lookups (closes_dict), even minutes nothing traded.
-    # pandas 3.x defaults new datetime columns to datetime64[us]; the clock-
-    # time macro gate explicitly casts to datetime64[ns] (see
-    # build_clock_time_macro_gate). merge_asof requires exact dtype matches
-    # on both sides of the join key, so standardize here rather than let a
-    # silent dtype drift between the two gate-building code paths surface as
-    # a MergeError deep inside pd.merge_asof.
     df_micro = master_df.copy().sort_values(["Symbol", "Datetime"]).reset_index(drop=True)
     df_micro["Datetime"] = pd.to_datetime(df_micro["Datetime"]).astype("datetime64[ns]")
 
-    # FRACTAL-BASED RENKO (45-DEGREE BREAKOUT) - execution tape's own gate.
-    # FIX (Active-Candle Micro Tape Bug): this used to run calculate_core_
-    # technicals/Renko directly on df_micro's raw rows, which include
-    # synthetic zero-volume filler candles (Open=High=Low=Close=prior price,
-    # Volume=0) inserted by regularize_intraday_tape for any minute an
-    # illiquid symbol didn't trade. Rolling those filler rows into the SAME
-    # window used for macro/secondary-micro gates (which are built from
-    # ACTIVE candles only, via build_rolling_lookback_gate) diluted ATR/RSI/
-    # ADX for illiquid names and silently gave the exec tag a different,
-    # inconsistent sample basis than every other gate on the same tape.
-    # Fix: build the exec tag's gate the exact same way as every other gate
-    # (active candles only), then merge it onto the full pricing tape below -
-    # between active prints, its Renko/score simply carries forward
-    # (merge_asof direction="backward"), which is correct: nothing changed.
     exec_env = build_rolling_lookback_gate(master_df, exec_lb, "MICRO")
     df_micro = pd.merge_asof(df_micro.sort_values("Datetime"), exec_env.sort_values("Datetime"), on="Datetime", by="Symbol", direction="backward")
     for c in [f"Armed_Bull_{exec_tag}", f"Armed_Bear_{exec_tag}"]:
@@ -852,19 +731,6 @@ def prepare_unified_execution_tape(master_df, micro_lookbacks, macro_clock_tfs, 
     df_micro["Trigger_Bull"] = df_micro["Master_Armed_Bull"] & df_micro["Master_Armed_Micro_Bull"]
     df_micro["Trigger_Bear"] = df_micro["Master_Armed_Bear"] & df_micro["Master_Armed_Micro_Bear"]
 
-    # FIX (Cross-Day Signal Bleed): New_Bull/New_Bear are edge-detected off
-    # Trigger_Bull/Trigger_Bear's PREVIOUS row via groupby("Symbol").shift(1).
-    # Grouping by Symbol alone reaches straight across the day boundary - if
-    # a symbol was still Trigger_Bull==True at yesterday's last printed
-    # minute and is Trigger_Bull==True again at today's first minute (a
-    # continuing trend), the shift(1) sees "already triggered" and New_Bull
-    # never fires, even though every actual position was already force-
-    # closed at 09:15 (Overnight Gap Flush) and the strategy has no open
-    # exposure to a continuing trend at all. A trend that never "flips"
-    # would then never get a fresh entry on day 2, 3, ... Grouping the shift
-    # by (Symbol, Date) instead makes each day's first row's "_Prev" reset to
-    # False regardless of how yesterday ended, matching the fact that every
-    # day starts flat.
     df_micro["Date"] = df_micro["Datetime"].dt.date
     df_micro["Trigger_Bull_Prev"] = df_micro.groupby(["Symbol", "Date"])["Trigger_Bull"].shift(1).fillna(False)
     df_micro["Trigger_Bear_Prev"] = df_micro.groupby(["Symbol", "Date"])["Trigger_Bear"].shift(1).fillna(False)
@@ -947,7 +813,17 @@ def _run_dual_layer_trade_management(tape, micro_lookbacks, macro_clock_tfs, cut
                         last_px[sym], last_dir[sym] = ltp, st["dir"]
 
         if t_dt in anom_by_time.groups and t_dt.time() < cutoff_time:
-            for _, row in anom_by_time.get_group(t_dt).iterrows():
+            group = anom_by_time.get_group(t_dt).copy()
+            
+            # FIX: Prioritized ranking system (Institutional Score + Delta Intensity)
+            exec_tag = lb_tag(exec_lb)
+            score_col = np.where(group["Direction"] == 1, group[f"Score_Bull_{exec_tag}"], group[f"Score_Bear_{exec_tag}"])
+            group["_rank_metric"] = score_col * 100 + group["Net_Delta_Pct"].abs()
+            
+            # Sort so high-momentum runners (Laurus Labs) execute before low-conviction drift (DMART)
+            group = group.sort_values(by="_rank_metric", ascending=False)
+            
+            for _, row in group.iterrows():
                 sym, d = row["Symbol"], row["Direction"]
                 if bank.get(sym) and bank[sym][-1]["state"] == "ACTIVE": continue
                 if daily_cnt[sym] >= MAX_DAILY_TRADES_PER_SYMBOL: continue
@@ -1179,20 +1055,16 @@ def run_production_sweep():
             candidates = []
             for u in univ:
                 if sp := spot_ref.get(u["symbol"]): candidates.extend(build_strike_range(u["symbol"], sp, opts, date_str, STRIKE_RANGE_OFFSET))
-            liquid = filter_liquid_contracts(candidates, date_str)
+            
+            # FIX: Bypass historical volume check for index weeklies
             with concurrent.futures.ThreadPoolExecutor(max_workers=15) as ex:
-                dfs = [df for df in ex.map(lambda c: fetch_stock_bars_worker((c, get_past_trading_days(date_str, BACKTRACE_DAYS)[0], date_str)), liquid) if df is not None]
+                dfs = [df for df in ex.map(lambda c: fetch_stock_bars_worker((c, get_past_trading_days(date_str, BACKTRACE_DAYS)[0], date_str)), candidates) if df is not None]
             if dfs: master_df = pd.concat(dfs, ignore_index=True)
         else:
             print(f"{COLOR_RED}❌ Failed to fetch Index F&O universe.{COLOR_RESET}")
             return
 
     else:
-        # Explicit dispatch, not a silent catch-all: an unrecognized
-        # TRADING_MODE used to fall straight through to the generic "Tape
-        # generation failed" message with misleading reasons (market closed /
-        # empty feed / no liquid contracts) when the real cause was simply
-        # that no routing branch existed for this mode at all.
         print(f"{COLOR_RED}❌ CRITICAL: Unrecognized TRADING_MODE '{TRADING_MODE}'. Expected one of: CASH_EQUITY, STOCK_FNO, INDEX_OPTIONS.{COLOR_RESET}")
         return
 
@@ -1214,4 +1086,3 @@ def run_production_sweep():
 
 if __name__ == "__main__":
     run_production_sweep()
-                                
