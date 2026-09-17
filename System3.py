@@ -121,9 +121,9 @@ def get_past_trading_days(target_date_str, num_days=5):
 # 2. COMBINED BB-RSI & ADX MATH
 # ==============================================================================
 def resample_tape(df_1m, tf_str):
-    tf = tf_str.replace("min", "T") 
+    # FIX: Pandas 2.2+ no longer accepts 'T' for minutes. Pass 'min' directly.
     df = df_1m.set_index('Datetime')
-    resampled = df.resample(tf).agg({
+    resampled = df.resample(tf_str).agg({
         'Open': 'first',
         'High': 'max',
         'Low': 'min',
