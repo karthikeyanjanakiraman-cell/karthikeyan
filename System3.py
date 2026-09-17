@@ -80,7 +80,8 @@ def get_dynamic_universe(mode):
         print(f"{COLOR_RED_FG}[API Error] Failed to fetch Universe: {e}{COLOR_RESET}")
         return []
 
-def fetch_upstox_candles_for_date(instrument_key, date_str):
+def fetch_upstox_candles_for_date(instrument_key, date_str, retries=3):
+    """Fetches 1-minute historical candles with Exponential Backoff for Rate Limits."""
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
     if not access_token: return None
     
@@ -92,16 +93,24 @@ def fetch_upstox_candles_for_date(instrument_key, date_str):
     else:
         url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{date_str}/{date_str}"
     
-    try:
-        response = requests.get(url, headers=headers, timeout=5)
-        if response.status_code != 200: return None
-        data = response.json().get('data', {}).get('candles', [])
-        if not data: return None
-        c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
-        c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).dt.tz_localize(None) 
-        return c_df.sort_values('Datetime').reset_index(drop=True)
-    except:
-        return None
+    for attempt in range(retries):
+        try:
+            response = requests.get(url, headers=headers, timeout=10)
+            if response.status_code == 200:
+                data = response.json().get('data', {}).get('candles', [])
+                if not data: return None
+                c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
+                c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).dt.tz_localize(None) 
+                return c_df.sort_values('Datetime').reset_index(drop=True)
+            elif response.status_code == 429:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            else:
+                return None
+        except:
+            time.sleep(1.0)
+            continue
+    return None
 
 def get_past_trading_days(target_date_str, num_days=5):
     try:
@@ -118,10 +127,9 @@ def get_past_trading_days(target_date_str, num_days=5):
         return []
 
 # ==============================================================================
-# 2. COMBINED BB-RSI & ADX MATH
+# 2. INDICATOR MATH (BB-RSI, BB-MACD, ADX)
 # ==============================================================================
 def resample_tape(df_1m, tf_str):
-    # FIX: Pandas 2.2+ no longer accepts 'T' for minutes. Pass 'min' directly.
     df = df_1m.set_index('Datetime')
     resampled = df.resample(tf_str).agg({
         'Open': 'first',
@@ -134,9 +142,9 @@ def resample_tape(df_1m, tf_str):
 
 def calculate_technical_signals(df):
     if len(df) < 30: 
-        return "Neutral", "Neutral"
+        return "Neutral", "Neutral", "Neutral"
 
-    # --- TRUE HYBRID BB-RSI MATH ---
+    # --- 1. TRUE HYBRID BB-RSI MATH ---
     delta = df['Close'].diff()
     gain = delta.where(delta > 0, 0)
     loss = -delta.where(delta < 0, 0)
@@ -152,7 +160,20 @@ def calculate_technical_signals(df):
     df['BB_Upper'] = df['RSI_SMA'] + (BB_STD * df['RSI_STD'])
     df['BB_Lower'] = df['RSI_SMA'] - (BB_STD * df['RSI_STD'])
 
-    # --- ADX / DMI MATH ---
+    # --- 2. TRUE HYBRID BB-MACD-HIST MATH ---
+    ema_12 = df['Close'].ewm(span=12, adjust=False).mean()
+    ema_26 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD_Line'] = ema_12 - ema_26
+    df['Signal_Line'] = df['MACD_Line'].ewm(span=9, adjust=False).mean()
+    df['MACD_Hist'] = df['MACD_Line'] - df['Signal_Line']
+    
+    # Calculate Bollinger Bands OF the MACD Histogram
+    df['MACD_Hist_SMA'] = df['MACD_Hist'].rolling(BB_PERIOD).mean()
+    df['MACD_Hist_STD'] = df['MACD_Hist'].rolling(BB_PERIOD).std()
+    df['MACD_BB_Upper'] = df['MACD_Hist_SMA'] + (BB_STD * df['MACD_Hist_STD'])
+    df['MACD_BB_Lower'] = df['MACD_Hist_SMA'] - (BB_STD * df['MACD_Hist_STD'])
+
+    # --- 3. ADX / DMI MATH ---
     df['up'] = df['High'].diff()
     df['down'] = df['Low'].shift(1) - df['Low']
     df['+DM'] = np.where((df['up'] > df['down']) & (df['up'] > 0), df['up'], 0)
@@ -174,14 +195,21 @@ def calculate_technical_signals(df):
     # --- EXTRACT LATEST SIGNALS ---
     latest = df.iloc[-1]
     
-    # Combined BB-RSI Breakout Signal
+    # Signal 1: BB-RSI Breakout
     bb_rsi_sig = "Neutral"
     if latest['RSI'] > latest['BB_Upper']:
         bb_rsi_sig = "Buy+"
     elif latest['RSI'] < latest['BB_Lower']:
         bb_rsi_sig = "Sell+"
         
-    # ADX Signal Generation
+    # Signal 2: BB-MACD-Hist Breakout
+    bb_macd_sig = "Neutral"
+    if latest['MACD_Hist'] > latest['MACD_BB_Upper']:
+        bb_macd_sig = "Buy+"
+    elif latest['MACD_Hist'] < latest['MACD_BB_Lower']:
+        bb_macd_sig = "Sell+"
+
+    # Signal 3: ADX Trend Strength
     adx_sig = "Neutral"
     if latest['ADX'] >= ADX_THRESHOLD:
         if latest['+DI'] > latest['-DI']:
@@ -189,7 +217,7 @@ def calculate_technical_signals(df):
         elif latest['-DI'] > latest['+DI']:
             adx_sig = "Sell"
 
-    return bb_rsi_sig, adx_sig
+    return bb_rsi_sig, bb_macd_sig, adx_sig
 
 # ==============================================================================
 # 3. PIPELINE EXECUTOR & UI DRAWING
@@ -221,7 +249,7 @@ def run_screener(timeframes):
         universe = universe_raw
     else:
         print(f"🔄 Filtering {len(universe_raw)} {TRADING_MODE} stocks for Volume & Price constraints...")
-        for item in universe_raw[:500]: # Capped to prevent aggressive Upstox rate limits
+        for item in universe_raw[:500]: 
             df = fetch_upstox_candles_for_date(item['key'], filter_date)
             if df is not None and not df.empty:
                 close_px = df['Close'].iloc[-1]
@@ -237,6 +265,7 @@ def run_screener(timeframes):
         for day in trading_days:
             d = fetch_upstox_candles_for_date(item['key'], day)
             if d is not None: dfs.append(d)
+            time.sleep(0.05) # MICRO-SLEEP: Prevents aggressive thread throttling
             
         if not dfs: return None
         master_1m = pd.concat(dfs, ignore_index=True)
@@ -248,13 +277,15 @@ def run_screener(timeframes):
         
         for tf in timeframes:
             resampled_df = resample_tape(master_1m, tf)
-            bb_sig, adx_sig = calculate_technical_signals(resampled_df)
-            row_data[f'BB_RSI_{tf}'] = bb_sig
+            bb_rsi_sig, bb_macd_sig, adx_sig = calculate_technical_signals(resampled_df)
+            row_data[f'BB_RSI_{tf}'] = bb_rsi_sig
+            row_data[f'BB_MACD_{tf}'] = bb_macd_sig
             row_data[f'ADX_{tf}'] = adx_sig
             
         return row_data
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
+    # THREAD LIMIT: Lowered to 5 to avoid Upstox 429 API rate limits
+    with concurrent.futures.ThreadPoolExecutor(max_workers=5) as executor:
         results = list(executor.map(process_stock, universe))
         
     dashboard_data = [r for r in results if r is not None]
@@ -267,11 +298,11 @@ def run_screener(timeframes):
     
     header_str = f" {COLOR_CYAN}{'Script':<16} {'LTP':<8}"
     for tf in timeframes:
-        header_str += f" | {'BB-RSI '+tf:^11} {'ADX '+tf:^9}"
+        header_str += f" | {'BB-RSI '+tf:^11} {'BB-MACD '+tf:^12} {'ADX '+tf:^9}"
     print(header_str + COLOR_RESET)
     
     # Calculate exact dynamic divider length
-    dash_len = 28 + len(timeframes) * 26
+    dash_len = 28 + len(timeframes) * 39
     print("-" * dash_len)
 
     # Sort Dashboard Alphabetically 
@@ -281,8 +312,9 @@ def run_screener(timeframes):
         row_str = f" {row['Symbol']:<16} {row['LTP']:<8.2f}"
         for tf in timeframes:
             bb_rsi_cell = format_cell(row[f'BB_RSI_{tf}'], 11)
+            bb_macd_cell = format_cell(row[f'BB_MACD_{tf}'], 12)
             adx_cell = format_cell(row[f'ADX_{tf}'], 9)
-            row_str += f" | {bb_rsi_cell} {adx_cell}"
+            row_str += f" | {bb_rsi_cell} {bb_macd_cell} {adx_cell}"
         print(row_str)
     print("\n")
 
