@@ -19,36 +19,42 @@ warnings.filterwarnings("ignore")
 # ==============================================================================
 # 0. ENGINE CONSTANTS & CONFIGURATION
 # ==============================================================================
-TRADING_MODE = "STOCK_FNO"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
+# --- ENGINE MODES ---
+TRADING_MODE = "CASH_EQUITY"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
 
-RENKO_GRANULARITIES = [1, 2, 3, 5]   
-RENKO_BRICK_ATR_PERIOD = 14          
-RENKO_BRICK_BASIS_TF = "15min"       
-RENKO_MIN_BRICK_PCT = 0.001          
+# --- MULTI-GRANULARITY HA-ATR (HEIKIN ASHI ATR RANGE BARS) ---
+HA_ATR_MULTIPLIERS = [1, 2, 3, 5]     # ATR Multipliers for dynamic range bars
+ATR_BASIS_PERIOD = 14                 # Lookback for base ATR sizing
+ATR_BASIS_TF = "15min"                # Timeframe to sample base ATR from
+MIN_ATR_PCT = 0.001                   # Minimum bar size as a percentage of price
 
+# --- OUTPUT LIMITS & CONFLUENCE ---
 TOP_N_BUYERS = 15
 TOP_N_SELLERS = 15
 MIN_CONFLUENCE_COUNT = 2
 
-COLOR_GREEN_BG = '\033[42m\033[30m'
-COLOR_RED_BG = '\033[41m\033[97m'
-COLOR_GRAY_BG = '\033[100m\033[97m'
+COLOR_GREEN_BG = '\033[42m\033[30m'  
+COLOR_RED_BG = '\033[41m\033[97m'    
+COLOR_GRAY_BG = '\033[100m\033[97m'  
 COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 COLOR_CYAN = '\033[96m'
 COLOR_RED_FG = '\033[91m'
 
+# --- UNIVERSE FILTERING ---
 MIN_PRICE = 50              
 MAX_PRICE = 10000           
-MIN_DAILY_VOLUME = 500000   
+MIN_DAILY_VOLUME = 100000   # Set to 100k to capture high-momentum small/mid-caps
 BACKTRACE_DAYS = 5          
 
+# --- INDICATOR PERIODS ---
 RSI_PERIOD = 14
 BB_PERIOD = 20
 BB_STD = 2.0
 ADX_PERIOD = 14
 ADX_THRESHOLD = 25
 
+# --- CONCURRENCY ---
 UNIVERSE_FILTER_WORKERS = 10
 STOCK_WORKERS = 10
 DAY_FETCH_WORKERS = 3
@@ -60,7 +66,8 @@ def get_dynamic_universe(mode):
     nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
     try:
         response = requests.get(nse_url, timeout=10)
-        if response.status_code != 200: return []
+        if response.status_code != 200:
+            return []
         nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
 
         if mode == "INDEX_OPTIONS":
@@ -128,25 +135,113 @@ def get_past_trading_days(target_date_str, num_days=5):
         return []
 
 # ==============================================================================
-# 2. INDICATOR MATH (SNAPSHOT METHOD)
+# 2. INDICATOR MATH (HEIKIN ASHI ATR ENGINE)
 # ==============================================================================
-def calculate_1m_indicators(df):
-    """Calculates true oscillating momentum on the 1-minute tape before compression."""
-    # 1. 1m RSI
-    delta = df['Close'].diff()
-    gain = delta.where(delta > 0, 0).ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
-    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
-    rs = gain / (loss + 1e-8)
-    df['RSI_1m'] = 100 - (100 / (1 + rs))
+def compute_base_atr(df_1m):
+    """Calculates the baseline ATR dynamically for the stock."""
+    resampled = df_1m.set_index('Datetime').resample(ATR_BASIS_TF).agg(
+        {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}
+    ).dropna().reset_index()
+    
+    if len(resampled) < 5:
+        return max(df_1m['Close'].iloc[-1] * MIN_ATR_PCT, 0.01)
 
-    # 2. 1m MACD Histogram
+    prev_close = resampled['Close'].shift(1)
+    tr = pd.concat([
+        resampled['High'] - resampled['Low'],
+        (resampled['High'] - prev_close).abs(),
+        (resampled['Low'] - prev_close).abs()
+    ], axis=1).max(axis=1)
+    
+    atr = tr.rolling(ATR_BASIS_PERIOD, min_periods=1).mean().iloc[-1]
+    price_floor = resampled['Close'].iloc[-1] * MIN_ATR_PCT
+    return max(atr, price_floor, 0.01)
+
+def build_ha_atr_bars(df_1m, target_range):
+    """Builds timeless Range Bars, then mathematically smooths them into Heikin Ashi."""
+    closes = df_1m['Close'].values
+    highs = df_1m['High'].values
+    lows = df_1m['Low'].values
+    times = df_1m['Datetime'].values
+
+    if len(closes) < 2: return pd.DataFrame()
+
+    raw_bars = []
+    curr_O = closes[0]
+    curr_H = highs[0]
+    curr_L = lows[0]
+    curr_T = times[0]
+
+    # 1. Build Raw Timeless Range Bars
+    for i in range(1, len(closes)):
+        curr_H = max(curr_H, highs[i])
+        curr_L = min(curr_L, lows[i])
+        curr_C = closes[i]
+
+        if (curr_H - curr_L) >= target_range:
+            raw_bars.append({'Datetime': curr_T, 'Open': curr_O, 'High': curr_H, 'Low': curr_L, 'Close': curr_C})
+            curr_O = curr_C
+            curr_H = curr_C
+            curr_L = curr_C
+            curr_T = times[i] if i < len(closes) - 1 else times[i]
+
+    df_raw = pd.DataFrame(raw_bars)
+    if df_raw.empty: return pd.DataFrame()
+
+    # 2. Convert to Heikin Ashi (Double Smoothing)
+    ha_closes = (df_raw['Open'] + df_raw['High'] + df_raw['Low'] + df_raw['Close']) / 4
+    ha_opens = np.zeros(len(df_raw))
+    ha_opens[0] = (df_raw['Open'].iloc[0] + df_raw['Close'].iloc[0]) / 2
+
+    for i in range(1, len(df_raw)):
+        ha_opens[i] = (ha_opens[i-1] + ha_closes.iloc[i-1]) / 2
+
+    ha_highs = np.maximum.reduce([df_raw['High'].values, ha_opens, ha_closes.values])
+    ha_lows = np.minimum.reduce([df_raw['Low'].values, ha_opens, ha_closes.values])
+
+    df_ha = pd.DataFrame({
+        'Datetime': df_raw['Datetime'],
+        'Open': ha_opens,
+        'High': ha_highs,
+        'Low': ha_lows,
+        'Close': ha_closes.values
+    })
+    
+    return df_ha
+
+def calculate_technical_signals(df):
+    """Executes Institutional Signal Logic on the HA-ATR structures."""
+    if len(df) < 5:
+        return "Neutral", "Neutral", "Neutral"
+
+    # --- 1. BB-RSI ---
+    delta = df['Close'].diff()
+    gain = delta.where(delta > 0, 0)
+    loss = -delta.where(delta < 0, 0)
+
+    avg_gain = gain.ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
+    avg_loss = loss.ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
+    rs = avg_gain / (avg_loss + 1e-8)
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    df['RSI_SMA'] = df['RSI'].rolling(BB_PERIOD, min_periods=1).mean()
+    df['RSI_STD'] = df['RSI'].rolling(BB_PERIOD, min_periods=1).std().fillna(0)
+    df['BB_Upper'] = df['RSI_SMA'] + (BB_STD * df['RSI_STD'])
+    df['BB_Lower'] = df['RSI_SMA'] - (BB_STD * df['RSI_STD'])
+
+    # --- 2. BB-MACD-HISTOGRAM ---
     ema_12 = df['Close'].ewm(span=12, adjust=False).mean()
     ema_26 = df['Close'].ewm(span=26, adjust=False).mean()
-    macd_line = ema_12 - ema_26
-    signal_line = macd_line.ewm(span=9, adjust=False).mean()
-    df['MACD_Hist_1m'] = macd_line - signal_line
+    df['MACD_Line'] = ema_12 - ema_26
+    df['Signal_Line'] = df['MACD_Line'].ewm(span=9, adjust=False).mean()
+    df['MACD_Hist'] = df['MACD_Line'] - df['Signal_Line']
 
-    # 3. 1m ADX & DMI
+    df['MACD_Hist_SMA'] = df['MACD_Hist'].rolling(BB_PERIOD, min_periods=1).mean()
+    df['MACD_Hist_STD'] = df['MACD_Hist'].rolling(BB_PERIOD, min_periods=1).std().fillna(0)
+    df['MACD_BB_Upper'] = df['MACD_Hist_SMA'] + (BB_STD * df['MACD_Hist_STD'])
+    df['MACD_BB_Lower'] = df['MACD_Hist_SMA'] - (BB_STD * df['MACD_Hist_STD'])
+
+    # --- 3. ADX / DMI ---
     df['up'] = df['High'].diff()
     df['down'] = df['Low'].shift(1) - df['Low']
     df['+DM'] = np.where((df['up'] > df['down']) & (df['up'] > 0), df['up'], 0)
@@ -158,100 +253,23 @@ def calculate_1m_indicators(df):
     df['TR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
 
     atr = df['TR'].ewm(alpha=1/ADX_PERIOD, adjust=False).mean()
-    df['+DI_1m'] = 100 * (df['+DM'].ewm(alpha=1/ADX_PERIOD, adjust=False).mean() / (atr + 1e-8))
-    df['-DI_1m'] = 100 * (df['-DM'].ewm(alpha=1/ADX_PERIOD, adjust=False).mean() / (atr + 1e-8))
-    dx = 100 * (df['+DI_1m'] - df['-DI_1m']).abs() / (df['+DI_1m'] + df['-DI_1m'] + 1e-8)
-    df['ADX_1m'] = dx.ewm(alpha=1/ADX_PERIOD, adjust=False).mean()
+    plus_di = 100 * (df['+DM'].ewm(alpha=1/ADX_PERIOD, adjust=False).mean() / (atr + 1e-8))
+    minus_di = 100 * (df['-DM'].ewm(alpha=1/ADX_PERIOD, adjust=False).mean() / (atr + 1e-8))
+    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-8)
+    df['ADX'] = dx.ewm(alpha=1/ADX_PERIOD, adjust=False).mean()
+    df['+DI'] = plus_di
+    df['-DI'] = minus_di
 
-    return df.fillna(0)
-
-def compute_fixed_brick_size(df_1m):
-    resampled = df_1m.set_index('Datetime').resample(RENKO_BRICK_BASIS_TF).agg(
-        {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}
-    ).dropna().reset_index()
-    if len(resampled) < 5:
-        return max(df_1m['Close'].iloc[-1] * RENKO_MIN_BRICK_PCT, 0.01)
-
-    prev_close = resampled['Close'].shift(1)
-    tr = pd.concat([
-        resampled['High'] - resampled['Low'],
-        (resampled['High'] - prev_close).abs(),
-        (resampled['Low'] - prev_close).abs()
-    ], axis=1).max(axis=1)
-    atr = tr.rolling(RENKO_BRICK_ATR_PERIOD, min_periods=1).mean().iloc[-1]
-    price_floor = resampled['Close'].iloc[-1] * RENKO_MIN_BRICK_PCT
-    return max(atr, price_floor, 0.01)
-
-def build_renko_bricks(df_1m, brick_size):
-    """Builds bricks but injects the 1m momentum snapshot at completion."""
-    closes = df_1m['Close'].values
-    times = df_1m['Datetime'].values
-    
-    rsi_1m = df_1m['RSI_1m'].values
-    macd_1m = df_1m['MACD_Hist_1m'].values
-    adx_1m = df_1m['ADX_1m'].values
-    pdi_1m = df_1m['+DI_1m'].values
-    mdi_1m = df_1m['-DI_1m'].values
-
-    if len(closes) < 2:
-        return pd.DataFrame()
-
-    bricks = []
-    anchor = closes[0]
-    direction = 0  
-    prev_brick_close = anchor
-
-    for i in range(1, len(closes)):
-        px, t = closes[i], times[i]
-        while True:
-            if direction >= 0 and px >= anchor + brick_size:
-                anchor += brick_size
-                direction = 1
-            elif direction <= 0 and px <= anchor - brick_size:
-                anchor -= brick_size
-                direction = -1
-            else:
-                break
-            o, c = prev_brick_close, anchor
-            
-            # THE SNAPSHOT: We grab the actual 1m momentum at the second this brick formed.
-            bricks.append({
-                'Datetime': t, 'Open': o, 'Close': c,
-                'RSI': rsi_1m[i], 
-                'MACD_Hist': macd_1m[i],
-                'ADX': adx_1m[i],
-                '+DI': pdi_1m[i],
-                '-DI': mdi_1m[i]
-            })
-            prev_brick_close = anchor
-
-    return pd.DataFrame(bricks)
-
-def calculate_technical_signals(df):
-    if len(df) < 5:
-        return "Neutral", "Neutral", "Neutral"
-
-    # BB applied to the sampled RSI sequence
-    df['RSI_SMA'] = df['RSI'].rolling(BB_PERIOD, min_periods=1).mean()
-    df['RSI_STD'] = df['RSI'].rolling(BB_PERIOD, min_periods=1).std().fillna(0)
-    df['BB_Upper'] = df['RSI_SMA'] + (BB_STD * df['RSI_STD'])
-    df['BB_Lower'] = df['RSI_SMA'] - (BB_STD * df['RSI_STD'])
-
-    # BB applied to the sampled MACD sequence
-    df['MACD_Hist_SMA'] = df['MACD_Hist'].rolling(BB_PERIOD, min_periods=1).mean()
-    df['MACD_Hist_STD'] = df['MACD_Hist'].rolling(BB_PERIOD, min_periods=1).std().fillna(0)
-    df['MACD_BB_Upper'] = df['MACD_Hist_SMA'] + (BB_STD * df['MACD_Hist_STD'])
-    df['MACD_BB_Lower'] = df['MACD_Hist_SMA'] - (BB_STD * df['MACD_Hist_STD'])
-
+    # --- 4. EXTRACT SIGNALS ---
     latest = df.iloc[-1]
 
     bb_rsi_sig = "Neutral"
-    if latest['RSI'] > latest['BB_Upper']: bb_rsi_sig = "Buy+"
-    elif latest['RSI'] < latest['BB_Lower']: bb_rsi_sig = "Sell+"
+    if latest['RSI'] > latest['BB_Upper'] and latest['RSI_STD'] > 0: bb_rsi_sig = "Buy+"
+    elif latest['RSI'] < latest['BB_Lower'] and latest['RSI_STD'] > 0: bb_rsi_sig = "Sell+"
 
     bb_macd_sig = "Neutral"
-    if latest['MACD_Hist'] > latest['MACD_BB_Upper']: bb_macd_sig = "Buy+"
-    elif latest['MACD_Hist'] < latest['MACD_BB_Lower']: bb_macd_sig = "Sell+"
+    if latest['MACD_Hist'] > latest['MACD_BB_Upper'] and latest['MACD_Hist_STD'] > 0: bb_macd_sig = "Buy+"
+    elif latest['MACD_Hist'] < latest['MACD_BB_Lower'] and latest['MACD_Hist_STD'] > 0: bb_macd_sig = "Sell+"
 
     adx_sig = "Neutral"
     if latest['ADX'] >= ADX_THRESHOLD:
@@ -292,17 +310,14 @@ def process_stock(args):
     master_1m = pd.concat(dfs, ignore_index=True).drop_duplicates(subset='Datetime').sort_values('Datetime').reset_index(drop=True)
     if len(master_1m) < 30: return None
 
-    # Step 1: Pre-calculate all 1m indicators
-    master_1m = calculate_1m_indicators(master_1m)
-
-    # Step 2: Sizing and Bricking
-    base_brick = compute_fixed_brick_size(master_1m)
+    base_atr = compute_base_atr(master_1m)
     row_data = {'Symbol': item['symbol'], 'LTP': master_1m['Close'].iloc[-1], 'Score': 0, 'BullGranularities': 0, 'BearGranularities': 0}
 
-    for mult in RENKO_GRANULARITIES:
-        gtag = f"{mult}B"
-        bricks = build_renko_bricks(master_1m, base_brick * mult)
-        bb_rsi_sig, bb_macd_sig, adx_sig = calculate_technical_signals(bricks)
+    for mult in HA_ATR_MULTIPLIERS:
+        gtag = f"{mult}X"
+        ha_atr_df = build_ha_atr_bars(master_1m, base_atr * mult)
+        
+        bb_rsi_sig, bb_macd_sig, adx_sig = calculate_technical_signals(ha_atr_df)
         
         row_data[f'BB_RSI_{gtag}'] = bb_rsi_sig
         row_data[f'BB_MACD_{gtag}'] = bb_macd_sig
@@ -339,7 +354,7 @@ def run_screener():
         print(f"🔄 Bypassing Price/Volume filters for Indices. Found {len(universe_raw)} major indices.")
         universe = universe_raw
     else:
-        # Full scan execution
+        # Full scan execution (Slice removed)
         candidates = universe_raw  
         print(f"🔄 Filtering {len(candidates)} {TRADING_MODE} stocks for Volume & Price constraints ({UNIVERSE_FILTER_WORKERS} parallel workers)...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=UNIVERSE_FILTER_WORKERS) as ex:
@@ -372,23 +387,23 @@ def run_screener():
     bulls = bulls[:TOP_N_BUYERS]
     bears = bears[:TOP_N_SELLERS]
 
-    print(f"{COLOR_BOLD}=== INSTITUTIONAL MULTI-GRANULARITY DASHBOARD [{TRADING_MODE}] ==={COLOR_RESET}\n")
-    dash_len = 28 + len(RENKO_GRANULARITIES) * 39
+    print(f"{COLOR_BOLD}=== INSTITUTIONAL HA-ATR DASHBOARD [{TRADING_MODE}] ==={COLOR_RESET}\n")
+    dash_len = 28 + len(HA_ATR_MULTIPLIERS) * 39
 
     def print_basket(title, icon, data_list):
         if not data_list: return
         print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
         header_str = f" {COLOR_CYAN}{'Script':<16} {'LTP':<8}"
-        for mult in RENKO_GRANULARITIES:
-            gtag = f"{mult}B"
+        for mult in HA_ATR_MULTIPLIERS:
+            gtag = f"{mult}X"
             header_str += f" | {'BB-RSI '+gtag:^11} {'BB-MACD '+gtag:^12} {'ADX '+gtag:^9}"
         print(header_str + COLOR_RESET)
         print("-" * dash_len)
 
         for row in data_list:
             row_str = f" {row['Symbol']:<16} {row['LTP']:<8.2f}"
-            for mult in RENKO_GRANULARITIES:
-                gtag = f"{mult}B"
+            for mult in HA_ATR_MULTIPLIERS:
+                gtag = f"{mult}X"
                 bb_rsi_cell = format_cell(row[f'BB_RSI_{gtag}'], 11)
                 bb_macd_cell = format_cell(row[f'BB_MACD_{gtag}'], 12)
                 adx_cell = format_cell(row[f'ADX_{gtag}'], 9)
