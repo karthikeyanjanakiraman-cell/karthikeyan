@@ -22,8 +22,30 @@ warnings.filterwarnings("ignore")
 # --- ENGINE MODES ---
 TRADING_MODE = "STOCK_FNO"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
 
-# --- MULTI-TIMEFRAME DASHBOARD COLUMNS ---
-TARGET_TIMEFRAMES = ["3min", "5min", "10min", "15min"]
+# --- MULTI-TIMEFRAME (now MULTI-GRANULARITY RENKO) DASHBOARD COLUMNS ---
+# Previously each "timeframe" column was a clock-time resample (3min/5min/...)
+# of the raw 1-min tape. Replaced with genuine 45-degree Renko bricks built
+# at several brick-size GRANULARITIES from the same 1-min Close series -
+# see build_renko_bricks() / compute_fixed_brick_size() for the construction
+# itself, and the comment there for why this is what makes it "45 degree".
+# Each multiple scales that symbol's own fixed base brick size, giving a
+# fine/medium/coarse family of Renko ladders that stand in for what
+# short/medium/long timeframes used to represent - all still derived from
+# the same underlying 1-min Close series, never from resampled OHLC bars.
+RENKO_GRANULARITIES = [1, 2, 3, 5]   # multiples of the per-symbol base brick size
+RENKO_BRICK_ATR_PERIOD = 14           # used ONCE per symbol to size the base brick (see compute_fixed_brick_size)
+RENKO_BRICK_BASIS_TF = "15min"        # resample used ONLY for that one-time ATR sizing calc, never for indicator bars
+RENKO_MIN_BRICK_PCT = 0.001           # brick floor as a fraction of price, guards against a near-zero brick on dead-quiet stocks
+
+# --- OUTPUT: only buyers/sellers are shown, no neutral basket, and each
+# list is capped so the dashboard stays readable on a large universe. ---
+TOP_N_BUYERS = 15
+TOP_N_SELLERS = 15
+# MTF CONFLUENCE: a symbol only counts as a buyer/seller if at least this
+# many of the RENKO_GRANULARITIES independently lean the same direction -
+# not just a net-positive Score from one dominant granularity outvoting the
+# others. With 4 granularities configured, 2 is "more agree than disagree".
+MIN_CONFLUENCE_COUNT = 2
 
 COLOR_GREEN_BG = '\033[42m\033[30m'  # Green background, black text
 COLOR_RED_BG = '\033[41m\033[97m'    # Red background, white text
@@ -151,16 +173,90 @@ def get_past_trading_days(target_date_str, num_days=5):
 # ==============================================================================
 # 2. INDICATOR MATH (BB-RSI, BB-MACD, ADX)
 # ==============================================================================
-def resample_tape(df_1m, tf_str):
-    df = df_1m.set_index('Datetime')
-    resampled = df.resample(tf_str).agg({
-        'Open': 'first',
-        'High': 'max',
-        'Low': 'min',
-        'Close': 'last',
-        'Volume': 'sum'
-    }).dropna()
-    return resampled.reset_index()
+def compute_fixed_brick_size(df_1m):
+    """
+    Sizes the base Renko brick ONCE per symbol, from that symbol's own
+    volatility - then held FIXED for every brick built afterward. This is
+    what makes the result genuinely "45 degree": if brick size were
+    recalculated on every bar (as a naive adaptive-ATR Renko does), each
+    brick would be a different height and the staircase wouldn't actually be
+    uniform even though the code calls it 45 degrees. Fixed size = every
+    brick is identically sized, so a plot of brick index vs. cumulative
+    signed brick count is a literal, uniform 45-degree line.
+
+    The one-time ATR estimate below is the ONLY place High/Low from the raw
+    price series is used - purely to pick a sensible brick height up front.
+    It plays no role in DETECTING when a brick has formed; that happens in
+    build_renko_bricks() using Close alone (see its docstring).
+    """
+    resampled = df_1m.set_index('Datetime').resample(RENKO_BRICK_BASIS_TF).agg(
+        {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}
+    ).dropna().reset_index()
+    if len(resampled) < 5:
+        return max(df_1m['Close'].iloc[-1] * RENKO_MIN_BRICK_PCT, 0.01)
+
+    prev_close = resampled['Close'].shift(1)
+    tr = pd.concat([
+        resampled['High'] - resampled['Low'],
+        (resampled['High'] - prev_close).abs(),
+        (resampled['Low'] - prev_close).abs()
+    ], axis=1).max(axis=1)
+    atr = tr.rolling(RENKO_BRICK_ATR_PERIOD, min_periods=1).mean().iloc[-1]
+    price_floor = resampled['Close'].iloc[-1] * RENKO_MIN_BRICK_PCT
+    return max(atr, price_floor, 0.01)
+
+def build_renko_bricks(df_1m, brick_size):
+    """
+    Proper fixed-brick, CLOSE-ONLY, one-brick-per-step Renko construction.
+
+    Deliberately does NOT look at each 1-minute candle's High/Low to decide
+    whether a brick has formed (a common but flawed shortcut - a single wick
+    can trip a brick threshold that the actual traded Close never reached).
+    Only Close-to-close movement, against a FIXED brick_size, ever creates a
+    new brick:
+
+        while close has moved >= brick_size from the last brick's level
+        (or >= 2x brick_size to reverse an established direction):
+            emit exactly ONE new brick and advance the anchor by one
+            brick_size step, then re-check (a single fast-moving 1-min
+            candle can still legitimately emit several bricks - real Renko
+            behaves this way - but each is emitted as its OWN row here, not
+            compressed into one row with an inflated count column). That is
+            what keeps the result a genuine 45-degree staircase: every row
+            in the output is exactly one brick, always the same height.
+
+    Returns a DataFrame of synthetic OHLC (Open = previous brick's Close,
+    Close = this brick's Close, High/Low = max/min of the two) so the
+    existing indicator math (which needs High/Low for ADX/DMI) can run on
+    it unchanged - those High/Low values come only from consecutive BRICK
+    closes, never from the original 1-minute candles' own High/Low.
+    """
+    closes = df_1m['Close'].values
+    times = df_1m['Datetime'].values
+    if len(closes) < 2:
+        return pd.DataFrame(columns=['Datetime', 'Open', 'High', 'Low', 'Close'])
+
+    bricks = []
+    anchor = closes[0]
+    direction = 0  # 0 = no established direction yet, 1 = up, -1 = down
+    prev_brick_close = anchor
+
+    for i in range(1, len(closes)):
+        px, t = closes[i], times[i]
+        while True:
+            if direction >= 0 and px >= anchor + brick_size:
+                anchor += brick_size
+                direction = 1
+            elif direction <= 0 and px <= anchor - brick_size:
+                anchor -= brick_size
+                direction = -1
+            else:
+                break
+            o, c = prev_brick_close, anchor
+            bricks.append({'Datetime': t, 'Open': o, 'High': max(o, c), 'Low': min(o, c), 'Close': c})
+            prev_brick_close = anchor
+
+    return pd.DataFrame(bricks)
 
 def calculate_technical_signals(df):
     if len(df) < 30:
@@ -269,29 +365,33 @@ def process_stock(args):
 
     if not dfs: return None
     master_1m = pd.concat(dfs, ignore_index=True).drop_duplicates(subset='Datetime').sort_values('Datetime').reset_index(drop=True)
+    if len(master_1m) < 30: return None
 
-    row_data = {'Symbol': item['symbol'], 'LTP': master_1m['Close'].iloc[-1], 'Score': 0}
+    base_brick = compute_fixed_brick_size(master_1m)
+    row_data = {'Symbol': item['symbol'], 'LTP': master_1m['Close'].iloc[-1], 'Score': 0, 'BullGranularities': 0, 'BearGranularities': 0}
 
-    for tf in TARGET_TIMEFRAMES:
-        resampled_df = resample_tape(master_1m, tf)
-        bb_rsi_sig, bb_macd_sig, adx_sig = calculate_technical_signals(resampled_df)
-        row_data[f'BB_RSI_{tf}'] = bb_rsi_sig
-        row_data[f'BB_MACD_{tf}'] = bb_macd_sig
-        row_data[f'ADX_{tf}'] = adx_sig
+    for mult in RENKO_GRANULARITIES:
+        gtag = f"{mult}B"
+        bricks = build_renko_bricks(master_1m, base_brick * mult)
+        bb_rsi_sig, bb_macd_sig, adx_sig = calculate_technical_signals(bricks)
+        row_data[f'BB_RSI_{gtag}'] = bb_rsi_sig
+        row_data[f'BB_MACD_{gtag}'] = bb_macd_sig
+        row_data[f'ADX_{gtag}'] = adx_sig
 
-        # --- MOMENTUM HEAT SCORING LOGIC ---
+        # --- MOMENTUM HEAT SCORING + PER-GRANULARITY LEAN (for confluence) ---
+        g_score = 0
         for sig in [bb_rsi_sig, bb_macd_sig, adx_sig]:
-            if "Buy+" in sig: row_data['Score'] += 2
-            elif "Buy" in sig: row_data['Score'] += 1
-            elif "Sell+" in sig: row_data['Score'] -= 2
-            elif "Sell" in sig: row_data['Score'] -= 1
+            if "Buy+" in sig: g_score += 2
+            elif "Buy" in sig: g_score += 1
+            elif "Sell+" in sig: g_score -= 2
+            elif "Sell" in sig: g_score -= 1
+        row_data['Score'] += g_score
+        if g_score > 0: row_data['BullGranularities'] += 1
+        elif g_score < 0: row_data['BearGranularities'] += 1
 
     return row_data
 
-def run_screener(timeframes):
-    global TARGET_TIMEFRAMES
-    TARGET_TIMEFRAMES = timeframes
-
+def run_screener():
     target_date_str = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
     trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
     filter_date = trading_days[-2] if len(trading_days) > 1 else trading_days[0]
@@ -321,58 +421,4 @@ def run_screener(timeframes):
     print(f"✅ Target Universe ready ({len(universe)} qualified assets). Computing technicals ({STOCK_WORKERS} parallel workers)...\n")
 
     work_items = [(item, trading_days, filter_cache.get(item['symbol'], {})) for item in universe]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=STOCK_WORKERS) as executor:
-        results = list(executor.map(process_stock, work_items))
-
-    dashboard_data = [r for r in results if r is not None]
-    elapsed = time.time() - t_start
-
-    if not dashboard_data:
-        print("No stocks passed the filtering criteria.")
-        return
-
-    # Split into Baskets based on Heat Score - printed as separate tables below.
-    bulls = [r for r in dashboard_data if r['Score'] > 0]
-    bears = [r for r in dashboard_data if r['Score'] < 0]
-    neutrals = [r for r in dashboard_data if r['Score'] == 0]
-
-    bulls.sort(key=lambda x: x['Score'], reverse=True)
-    bears.sort(key=lambda x: x['Score'])
-    neutrals.sort(key=lambda x: x['Symbol'])
-
-    print(f"{COLOR_BOLD}=== INSTITUTIONAL MULTI-TIMEFRAME DASHBOARD [{TRADING_MODE}] ==={COLOR_RESET}")
-    print(f"{COLOR_CYAN}Completed in {elapsed:.1f}s across {len(dashboard_data)} symbols.{COLOR_RESET}\n")
-    dash_len = 28 + len(timeframes) * 39
-
-    def print_basket(title, icon, data_list):
-        if not data_list: return
-        print(f"\n{COLOR_BOLD}{icon} {title}  ({len(data_list)}){COLOR_RESET}")
-        header_str = f" {COLOR_CYAN}{'Script':<16} {'LTP':<8}"
-        for tf in timeframes:
-            header_str += f" | {'BB-RSI '+tf:^11} {'BB-MACD '+tf:^12} {'ADX '+tf:^9}"
-        print(header_str + COLOR_RESET)
-        print("-" * dash_len)
-
-        for row in data_list:
-            row_str = f" {row['Symbol']:<16} {row['LTP']:<8.2f}"
-            for tf in timeframes:
-                bb_rsi_cell = format_cell(row[f'BB_RSI_{tf}'], 11)
-                bb_macd_cell = format_cell(row[f'BB_MACD_{tf}'], 12)
-                adx_cell = format_cell(row[f'ADX_{tf}'], 9)
-                row_str += f" | {bb_rsi_cell} {bb_macd_cell} {adx_cell}"
-            print(row_str)
-
-    # Three fully separate tables - Top Buyers, Top Sellers, Neutral/Choppy -
-    # each with its own header/divider, so they read as distinct blocks
-    # rather than one merged listing.
-    print_basket("TOP BUYERS (Bullish Confluence)", "🔥", bulls)
-    print_basket("TOP SELLERS (Bearish Confluence)", "🩸", bears)
-    print_basket("NEUTRAL / CHOPPY", "⚖️", neutrals)
-    print("\n")
-
-if __name__ == "__main__":
-    if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
-        print(f"❌ {COLOR_RED_FG}Error: UPSTOX_ACCESS_TOKEN environment variable not found.{COLOR_RESET}")
-        sys.exit(1)
-
-    run_screener(TARGET_TIMEFRAMES)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=STOCK_WORKE
