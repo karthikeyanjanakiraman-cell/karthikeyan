@@ -421,4 +421,4 @@ def run_screener():
     print(f"✅ Target Universe ready ({len(universe)} qualified assets). Computing technicals ({STOCK_WORKERS} parallel workers)...\n")
 
     work_items = [(item, trading_days, filter_cache.get(item['symbol'], {})) for item in universe]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=STOCK_WORKE)
+    with concurrent.futures.ThreadPoolExecutor(max_workers=STOCK_WORKE):
