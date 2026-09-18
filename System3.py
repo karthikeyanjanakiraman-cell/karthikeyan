@@ -422,3 +422,6 @@ def run_screener():
 
     work_items = [(item, trading_days, filter_cache.get(item['symbol'], {})) for item in universe]
     with concurrent.futures.ThreadPoolExecutor(max_workers=STOCK_WORKE):
+        pass
+
+    
