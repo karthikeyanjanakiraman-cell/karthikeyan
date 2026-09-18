@@ -22,16 +22,13 @@ warnings.filterwarnings("ignore")
 TRADING_MODE = "STOCK_FNO"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
 
 # --- DECOUPLED HA-ATR ENGINE MULTIPLIERS ---
-HA_ATR_MULTIPLIERS = [1, 2, 3, 4, 5]     
+HA_ATR_MULTIPLIERS = [1, 2, 3, 4, 5, 6, 7]     
 ATR_BASIS_PERIOD = 14                 
 ATR_BASIS_TF = "15min"                
-MIN_ATR_PCT = 0.001                   
 
 # --- OUTPUT LIMITS & CONFLUENCE ---
 TOP_N_BUYERS = 15
 TOP_N_SELLERS = 15
-# Because the Blackout Grid requires 100% perfect alignment to even register a block, 
-# requiring 1 perfect block is extremely strict. 
 MIN_PERFECT_BLOCKS = 1 
 
 COLOR_GREEN_BG = '\033[42m\033[30m'  
@@ -131,13 +128,29 @@ def get_past_trading_days(target_date_str, num_days=5):
         return []
 
 # ==============================================================================
-# 2. THE DECOUPLED HA-ATR ENGINE (WITH SESSION ISOLATION)
+# 2. THE DECOUPLED HA-ATR ENGINE (WITH ISOLATION & DYNAMIC VOLATILITY)
 # ==============================================================================
 def compute_base_atr(df_1m):
+    """Calculates Base 15m ATR protected by a Dynamic 2% Daily Volatility Floor"""
+    # 1. Calculate Dynamic Daily Floor (2% of 5-Day ATR)
+    daily_df = df_1m.set_index('Datetime').resample('D').agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna()
+    if len(daily_df) >= 2:
+        prev_close_d = daily_df['Close'].shift(1)
+        tr_d = pd.concat([
+            daily_df['High'] - daily_df['Low'],
+            (daily_df['High'] - prev_close_d).abs(),
+            (daily_df['Low'] - prev_close_d).abs()
+        ], axis=1).max(axis=1)
+        dynamic_floor = tr_d.mean() * 0.02
+    else:
+        dynamic_floor = df_1m['Close'].iloc[-1] * 0.001 # Absolute fallback
+
+    # 2. Calculate Intraday 15-Minute Base ATR
     resampled = df_1m.set_index('Datetime').resample(ATR_BASIS_TF).agg(
         {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}
     ).dropna().reset_index()
-    if len(resampled) < 5: return max(df_1m['Close'].iloc[-1] * MIN_ATR_PCT, 0.01)
+    
+    if len(resampled) < 5: return max(df_1m['Close'].iloc[-1] * 0.001, 0.01)
     
     prev_close = resampled['Close'].shift(1)
     tr = pd.concat([
@@ -145,35 +158,38 @@ def compute_base_atr(df_1m):
         (resampled['High'] - prev_close).abs(),
         (resampled['Low'] - prev_close).abs()
     ], axis=1).max(axis=1)
+    
     atr = tr.rolling(ATR_BASIS_PERIOD, min_periods=1).mean().iloc[-1]
-    return max(atr, resampled['Close'].iloc[-1] * MIN_ATR_PCT, 0.01)
+    
+    # Return the larger of the calculated Intraday ATR or the Dynamic Floor
+    return max(atr, dynamic_floor, 0.01)
 
 def build_isolated_range_bars(df_1m, target_range):
-    """Builds Raw ATR Range Bars, resetting at the open of each new day."""
+    """Builds Raw ATR Range Bars with Volume Accumulation, resetting at open."""
     df_1m['Date'] = df_1m['Datetime'].dt.date
     all_bars = []
 
-    # Session Isolation: Group by Day to kill Overnight Gaps
     for date, group in df_1m.groupby('Date'):
-        closes = group['Close'].values
-        highs = group['High'].values
-        lows = group['Low'].values
-        times = group['Datetime'].values
+        closes, highs, lows = group['Close'].values, group['High'].values, group['Low'].values
+        times, volumes = group['Datetime'].values, group['Volume'].values
         
         if len(closes) < 2: continue
 
         curr_O, curr_H, curr_L, curr_T = closes[0], highs[0], lows[0], times[0]
+        curr_V = volumes[0]
         raw_bars = []
 
-        # Phase 1: Build Raw ATR Range Bars (Zero Lag)
+        # Phase 1: Build Raw ATR Range Bars + Volume Accumulation (Zero Lag)
         for i in range(1, len(closes)):
             curr_H = max(curr_H, highs[i])
             curr_L = min(curr_L, lows[i])
             curr_C = closes[i]
+            curr_V += volumes[i]
 
             if (curr_H - curr_L) >= target_range:
-                raw_bars.append({'Datetime': curr_T, 'Open': curr_O, 'High': curr_H, 'Low': curr_L, 'Close': curr_C})
+                raw_bars.append({'Datetime': curr_T, 'Open': curr_O, 'High': curr_H, 'Low': curr_L, 'Close': curr_C, 'Volume': curr_V})
                 curr_O = curr_H = curr_L = curr_C
+                curr_V = 0
                 curr_T = times[i] if i < len(closes) - 1 else times[i]
 
         if not raw_bars: continue
@@ -194,11 +210,11 @@ def build_isolated_range_bars(df_1m, target_range):
     return pd.concat(all_bars, ignore_index=True)
 
 def calculate_strict_signals(df):
-    """Calculates zero-lag momentum on Raw Bars, protected by the HA filter."""
+    """Calculates OBV Squeeze, Price Squeeze, and enforces the Anti-Wick Filter."""
     if len(df) < 5:
         return "", "", "", "NONE"
 
-    # --- 1. RAW BB-RSI (Zero Lag) ---
+    # --- 1. RAW BB-RSI (Price Squeeze) ---
     delta = df['Close'].diff()
     gain = delta.where(delta > 0, 0).ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
     loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
@@ -209,15 +225,12 @@ def calculate_strict_signals(df):
     df['BB_Upper'] = df['RSI_SMA'] + (BB_STD * df['RSI_STD'])
     df['BB_Lower'] = df['RSI_SMA'] - (BB_STD * df['RSI_STD'])
 
-    # --- 2. RAW BB-MACD-HISTOGRAM (Zero Lag) ---
-    ema_12 = df['Close'].ewm(span=12, adjust=False).mean()
-    ema_26 = df['Close'].ewm(span=26, adjust=False).mean()
-    df['MACD_Hist'] = (ema_12 - ema_26) - (ema_12 - ema_26).ewm(span=9, adjust=False).mean()
-
-    df['MACD_Hist_SMA'] = df['MACD_Hist'].rolling(BB_PERIOD, min_periods=1).mean()
-    df['MACD_Hist_STD'] = df['MACD_Hist'].rolling(BB_PERIOD, min_periods=1).std().fillna(0)
-    df['MACD_BB_Upper'] = df['MACD_Hist_SMA'] + (BB_STD * df['MACD_Hist_STD'])
-    df['MACD_BB_Lower'] = df['MACD_Hist_SMA'] - (BB_STD * df['MACD_Hist_STD'])
+    # --- 2. RAW BB-OBV (Volume Squeeze) ---
+    df['OBV'] = (np.sign(df['Close'].diff()).fillna(0) * df['Volume']).cumsum()
+    df['OBV_SMA'] = df['OBV'].rolling(BB_PERIOD, min_periods=1).mean()
+    df['OBV_STD'] = df['OBV'].rolling(BB_PERIOD, min_periods=1).std().fillna(0)
+    df['OBV_BB_Upper'] = df['OBV_SMA'] + (BB_STD * df['OBV_STD'])
+    df['OBV_BB_Lower'] = df['OBV_SMA'] - (BB_STD * df['OBV_STD'])
 
     # --- 3. RAW ADX ---
     df['up'] = df['High'].diff()
@@ -233,9 +246,16 @@ def calculate_strict_signals(df):
     df['-DI'] = 100 * (df['-DM'].ewm(alpha=1/ADX_PERIOD, adjust=False).mean() / (atr + 1e-8))
     df['ADX'] = (100 * (df['+DI'] - df['-DI']).abs() / (df['+DI'] + df['-DI'] + 1e-8)).ewm(alpha=1/ADX_PERIOD, adjust=False).mean()
 
-    # --- 4. EXTRACT SIGNALS ---
+    # --- 4. EXTRACT SIGNALS & ANTI-WICK LOGIC ---
     latest = df.iloc[-1]
     ha_trend = latest['HA_Trend']
+
+    # Anti-Wick Close-Proximity Calculation
+    bar_range = latest['High'] - latest['Low']
+    if bar_range == 0: bar_range = 1e-8
+    close_pct = (latest['Close'] - latest['Low']) / bar_range
+    is_top_25 = close_pct >= 0.75   # Price closed near the absolute top
+    is_bot_25 = close_pct <= 0.25   # Price closed near the absolute bottom
 
     # BB-RSI Raw Signal
     bb_rsi = "Neutral"
@@ -244,12 +264,12 @@ def calculate_strict_signals(df):
     elif latest['RSI'] < latest['BB_Lower'] and latest['RSI_STD'] > 0: bb_rsi = "Sell+"
     elif latest['RSI'] < 45: bb_rsi = "Sell"
 
-    # BB-MACD Raw Signal
-    bb_macd = "Neutral"
-    if latest['MACD_Hist'] > latest['MACD_BB_Upper'] and latest['MACD_Hist_STD'] > 0: bb_macd = "Buy+"
-    elif latest['MACD_Hist'] > 0: bb_macd = "Buy"
-    elif latest['MACD_Hist'] < latest['MACD_BB_Lower'] and latest['MACD_Hist_STD'] > 0: bb_macd = "Sell+"
-    elif latest['MACD_Hist'] < 0: bb_macd = "Sell"
+    # BB-OBV Raw Signal
+    bb_obv = "Neutral"
+    if latest['OBV'] > latest['OBV_BB_Upper'] and latest['OBV_STD'] > 0: bb_obv = "Buy+"
+    elif latest['OBV'] > latest['OBV_SMA']: bb_obv = "Buy"
+    elif latest['OBV'] < latest['OBV_BB_Lower'] and latest['OBV_STD'] > 0: bb_obv = "Sell+"
+    elif latest['OBV'] < latest['OBV_SMA']: bb_obv = "Sell"
 
     # ADX Raw Signal
     adx_sig = "Neutral"
@@ -258,23 +278,20 @@ def calculate_strict_signals(df):
         elif latest['-DI'] > latest['+DI']: adx_sig = "Sell"
 
     # =========================================================================
-    # THE STRICT ALIGNMENT FILTER (BLACKOUT LOGIC)
+    # THE STRICT ALIGNMENT FILTER (WITH ANTI-WICK OVERRIDE)
     # =========================================================================
-    is_bull_aligned = ("Buy" in bb_rsi) and ("Buy" in bb_macd) and ("Buy" in adx_sig) and (ha_trend == 'Green')
-    is_bear_aligned = ("Sell" in bb_rsi) and ("Sell" in bb_macd) and ("Sell" in adx_sig) and (ha_trend == 'Red')
+    is_bull_aligned = ("Buy" in bb_rsi) and ("Buy" in bb_obv) and ("Buy" in adx_sig) and (ha_trend == 'Green') and is_top_25
+    is_bear_aligned = ("Sell" in bb_rsi) and ("Sell" in bb_obv) and ("Sell" in adx_sig) and (ha_trend == 'Red') and is_bot_25
 
-    # If the block isn't 100% perfectly aligned, it is SILENTLY blanked out.
-    if is_bull_aligned: return bb_rsi, bb_macd, adx_sig, "BULL"
-    elif is_bear_aligned: return bb_rsi, bb_macd, adx_sig, "BEAR"
+    if is_bull_aligned: return bb_rsi, bb_obv, adx_sig, "BULL"
+    elif is_bear_aligned: return bb_rsi, bb_obv, adx_sig, "BEAR"
     else: return "", "", "", "NONE"
 
 # ==============================================================================
 # 3. PIPELINE EXECUTOR & UI DRAWING
 # ==============================================================================
-def format_cell(text, width=10):
-    """Formats cells. If empty string is passed, renders empty space for the Blackout Grid."""
-    if not text:
-        return " " * width
+def format_cell(text, width=11):
+    if not text: return " " * width
     text_str = str(text)
     if "Buy" in text_str: return f"{COLOR_GREEN_BG}{text_str:^{width}}{COLOR_RESET}"
     elif "Sell" in text_str: return f"{COLOR_RED_BG}{text_str:^{width}}{COLOR_RESET}"
@@ -306,19 +323,18 @@ def process_stock(args):
         gtag = f"{mult}X"
         ha_atr_df = build_isolated_range_bars(master_1m, base_atr * mult)
         
-        bb_rsi, bb_macd, adx_sig, alignment = calculate_strict_signals(ha_atr_df)
+        bb_rsi, bb_obv, adx_sig, alignment = calculate_strict_signals(ha_atr_df)
         
         row_data[f'BB_RSI_{gtag}'] = bb_rsi
-        row_data[f'BB_MACD_{gtag}'] = bb_macd
+        row_data[f'BB_OBV_{gtag}'] = bb_obv
         row_data[f'ADX_{gtag}'] = adx_sig
 
-        # Scoring & Confluence
         if alignment == "BULL":
             row_data['PerfectBullBlocks'] += 1
-            row_data['Score'] += (bb_rsi.count('+') + bb_macd.count('+') + 1)
+            row_data['Score'] += (bb_rsi.count('+') + bb_obv.count('+') + 1)
         elif alignment == "BEAR":
             row_data['PerfectBearBlocks'] += 1
-            row_data['Score'] -= (bb_rsi.count('+') + bb_macd.count('+') + 1)
+            row_data['Score'] -= (bb_rsi.count('+') + bb_obv.count('+') + 1)
 
     return row_data
 
@@ -352,7 +368,7 @@ def run_screener():
         
     dashboard_data = [r for r in results if r is not None]
 
-    # Only keep stocks that have at least ONE perfectly aligned block
+    # Display Filter: Only show stocks with at least 1 perfect, anti-wick, OBV-backed block
     bulls = [r for r in dashboard_data if r['PerfectBullBlocks'] >= MIN_PERFECT_BLOCKS]
     bears = [r for r in dashboard_data if r['PerfectBearBlocks'] >= MIN_PERFECT_BLOCKS]
 
@@ -362,17 +378,16 @@ def run_screener():
     bulls = bulls[:TOP_N_BUYERS]
     bears = bears[:TOP_N_SELLERS]
 
-    print(f"{COLOR_BOLD}=== INSTITUTIONAL DECOUPLED HA-ATR DASHBOARD [{TRADING_MODE}] ==={COLOR_RESET}\n")
+    print(f"{COLOR_BOLD}=== INSTITUTIONAL DOUBLE-SQUEEZE DASHBOARD [{TRADING_MODE}] ==={COLOR_RESET}\n")
 
     def print_basket(title, icon, data_list):
         if not data_list: return
         print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
         
-        # Build strict dynamic header
         header_str = f" {COLOR_CYAN}{'Script':<16} {'LTP':<8} |"
         for mult in HA_ATR_MULTIPLIERS:
             gtag = f"{mult}X"
-            header_str += f"  {'BB-RSI '+gtag:^11} {'BB-MACD '+gtag:^12} {'ADX '+gtag:^9} |"
+            header_str += f"  {'BB-RSI '+gtag:^11} {'BB-OBV '+gtag:^11} {'ADX '+gtag:^9} |"
         
         dash_len = len(header_str) - 8
         print(header_str + COLOR_RESET)
@@ -382,15 +397,14 @@ def run_screener():
             row_str = f" {row['Symbol']:<16} {row['LTP']:<8.2f} |"
             for mult in HA_ATR_MULTIPLIERS:
                 gtag = f"{mult}X"
-                # Formatting handles empty strings by printing clean spaces
                 bb_rsi_cell = format_cell(row[f'BB_RSI_{gtag}'], 11)
-                bb_macd_cell = format_cell(row[f'BB_MACD_{gtag}'], 12)
+                bb_obv_cell = format_cell(row[f'BB_OBV_{gtag}'], 11)
                 adx_cell = format_cell(row[f'ADX_{gtag}'], 9)
-                row_str += f"  {bb_rsi_cell} {bb_macd_cell} {adx_cell} |"
+                row_str += f"  {bb_rsi_cell} {bb_obv_cell} {adx_cell} |"
             print(row_str)
 
-    print_basket(f"TOP BUYERS (Pure Alignment >= {MIN_PERFECT_BLOCKS} Block)", "🔥", bulls)
-    print_basket(f"TOP SELLERS (Pure Alignment >= {MIN_PERFECT_BLOCKS} Block)", "🩸", bears)
+    print_basket(f"TOP BUYERS (Wickless OBV Breakouts >= {MIN_PERFECT_BLOCKS} Block)", "🔥", bulls)
+    print_basket(f"TOP SELLERS (Wickless OBV Breakouts >= {MIN_PERFECT_BLOCKS} Block)", "🩸", bears)
     
     print(f"\n⏱️ Scan completed in {(time.time() - t_start):.2f} seconds.\n")
 
