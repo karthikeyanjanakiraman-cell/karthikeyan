@@ -43,8 +43,8 @@ COLOR_RED_FG = '\033[91m'
 
 # --- UNIVERSE FILTERING (Ignored for INDEX_OPTIONS) ---
 MIN_PRICE = 150              # Minimum stock price
-MAX_PRICE = 300           # Maximum stock price
-MIN_DAILY_VOLUME = 50000   # Minimum daily volume
+MAX_PRICE = 3000           # Maximum stock price
+MIN_DAILY_VOLUME = 100000   # Minimum daily volume
 BACKTRACE_DAYS = 5          # Days to fetch to ensure enough data for MAs
 
 # --- INDICATOR PERIODS ---
