@@ -20,7 +20,7 @@ warnings.filterwarnings("ignore")
 # 0. ENGINE CONSTANTS & CONFIGURATION
 # ==============================================================================
 # --- ENGINE MODES ---
-TRADING_MODE = "STOCK_FNO"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
+TRADING_MODE = "CASH_EQUITY"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
 
 # --- MULTI-TIMEFRAME (now MULTI-GRANULARITY RENKO) DASHBOARD COLUMNS ---
 RENKO_GRANULARITIES = [1, 2, 3, 5]   # multiples of the per-symbol base brick size
@@ -42,8 +42,8 @@ COLOR_CYAN = '\033[96m'
 COLOR_RED_FG = '\033[91m'
 
 # --- UNIVERSE FILTERING (Ignored for INDEX_OPTIONS) ---
-MIN_PRICE = 50              # Minimum stock price
-MAX_PRICE = 10000           # Maximum stock price
+MIN_PRICE = 150              # Minimum stock price
+MAX_PRICE = 300           # Maximum stock price
 MIN_DAILY_VOLUME = 500000   # Minimum daily volume
 BACKTRACE_DAYS = 5          # Days to fetch to ensure enough data for MAs
 
