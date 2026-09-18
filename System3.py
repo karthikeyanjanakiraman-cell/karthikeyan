@@ -22,7 +22,7 @@ warnings.filterwarnings("ignore")
 TRADING_MODE = "STOCK_FNO"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
 
 # --- DECOUPLED HA-ATR ENGINE MULTIPLIERS ---
-HA_ATR_MULTIPLIERS = [1, 2, 3, 4, 5]     
+HA_ATR_MULTIPLIERS = [1, 2, 3, 5]     
 ATR_BASIS_PERIOD = 14                 
 ATR_BASIS_TF = "15min"                
 MIN_ATR_PCT = 0.001                   
