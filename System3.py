@@ -20,7 +20,7 @@ warnings.filterwarnings("ignore")
 # 0. ENGINE CONSTANTS & CONFIGURATION
 # ==============================================================================
 # --- ENGINE MODES ---
-TRADING_MODE = "CASH_EQUITY"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
+TRADING_MODE = "STOCK_FNO"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
 
 # --- MULTI-GRANULARITY HA-ATR (HEIKIN ASHI ATR RANGE BARS) ---
 HA_ATR_MULTIPLIERS = [1, 2, 3, 5]     # ATR Multipliers for dynamic range bars
