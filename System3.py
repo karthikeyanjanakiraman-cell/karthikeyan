@@ -19,42 +19,36 @@ warnings.filterwarnings("ignore")
 # ==============================================================================
 # 0. ENGINE CONSTANTS & CONFIGURATION
 # ==============================================================================
-# --- ENGINE MODES ---
 TRADING_MODE = "STOCK_FNO"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
 
-# --- MULTI-TIMEFRAME (now MULTI-GRANULARITY RENKO) DASHBOARD COLUMNS ---
-RENKO_GRANULARITIES = [1, 2, 3, 5]   # multiples of the per-symbol base brick size
-RENKO_BRICK_ATR_PERIOD = 14           # used ONCE per symbol to size the base brick 
-RENKO_BRICK_BASIS_TF = "15min"        # resample used ONLY for that one-time ATR sizing calc
-RENKO_MIN_BRICK_PCT = 0.001           # brick floor as a fraction of price
+RENKO_GRANULARITIES = [1, 2, 3, 5]   
+RENKO_BRICK_ATR_PERIOD = 14          
+RENKO_BRICK_BASIS_TF = "15min"       
+RENKO_MIN_BRICK_PCT = 0.001          
 
-# --- OUTPUT LIMITS & CONFLUENCE ---
 TOP_N_BUYERS = 15
 TOP_N_SELLERS = 15
 MIN_CONFLUENCE_COUNT = 2
 
-COLOR_GREEN_BG = '\033[42m\033[30m'  # Green background, black text
-COLOR_RED_BG = '\033[41m\033[97m'    # Red background, white text
-COLOR_GRAY_BG = '\033[100m\033[97m'  # Dark gray background, white text
+COLOR_GREEN_BG = '\033[42m\033[30m'
+COLOR_RED_BG = '\033[41m\033[97m'
+COLOR_GRAY_BG = '\033[100m\033[97m'
 COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 COLOR_CYAN = '\033[96m'
 COLOR_RED_FG = '\033[91m'
 
-# --- UNIVERSE FILTERING (Ignored for INDEX_OPTIONS) ---
-MIN_PRICE = 150              # Minimum stock price
-MAX_PRICE = 3000           # Maximum stock price
-MIN_DAILY_VOLUME = 100000   # Minimum daily volume
-BACKTRACE_DAYS = 5          # Days to fetch to ensure enough data for MAs
+MIN_PRICE = 50              
+MAX_PRICE = 10000           
+MIN_DAILY_VOLUME = 500000   
+BACKTRACE_DAYS = 5          
 
-# --- INDICATOR PERIODS ---
 RSI_PERIOD = 14
 BB_PERIOD = 20
 BB_STD = 2.0
 ADX_PERIOD = 14
 ADX_THRESHOLD = 25
 
-# --- CONCURRENCY ---
 UNIVERSE_FILTER_WORKERS = 10
 STOCK_WORKERS = 10
 DAY_FETCH_WORKERS = 3
@@ -66,27 +60,23 @@ def get_dynamic_universe(mode):
     nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
     try:
         response = requests.get(nse_url, timeout=10)
-        if response.status_code != 200:
-            return []
+        if response.status_code != 200: return []
         nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
 
         if mode == "INDEX_OPTIONS":
             target_indices = ["Nifty 50", "Nifty Bank", "Nifty Fin Service", "Nifty Mid Select"]
             return [{"symbol": item["trading_symbol"], "key": item["instrument_key"]}
-                    for item in nse_data
-                    if item.get("segment") == "NSE_INDEX" and item.get("trading_symbol") in target_indices]
+                    for item in nse_data if item.get("segment") == "NSE_INDEX" and item.get("trading_symbol") in target_indices]
 
         fno_underlying = {item.get("underlying_symbol") for item in nse_data if item.get("segment") == "NSE_FO" and item.get("underlying_symbol")}
 
         if mode == "STOCK_FNO":
             return [{"symbol": item["trading_symbol"], "key": item["instrument_key"]}
-                    for item in nse_data
-                    if item.get("segment") == "NSE_EQ" and item.get("trading_symbol") in fno_underlying]
+                    for item in nse_data if item.get("segment") == "NSE_EQ" and item.get("trading_symbol") in fno_underlying]
 
         elif mode == "CASH_EQUITY":
             return [{"symbol": item["trading_symbol"], "key": item["instrument_key"]}
-                    for item in nse_data
-                    if item.get("segment") == "NSE_EQ" and item.get("trading_symbol") not in fno_underlying]
+                    for item in nse_data if item.get("segment") == "NSE_EQ" and item.get("trading_symbol") not in fno_underlying]
 
     except Exception as e:
         print(f"{COLOR_RED_FG}[API Error] Failed to fetch Universe: {e}{COLOR_RESET}")
@@ -138,8 +128,43 @@ def get_past_trading_days(target_date_str, num_days=5):
         return []
 
 # ==============================================================================
-# 2. INDICATOR MATH (BB-RSI, BB-MACD, ADX)
+# 2. INDICATOR MATH (SNAPSHOT METHOD)
 # ==============================================================================
+def calculate_1m_indicators(df):
+    """Calculates true oscillating momentum on the 1-minute tape before compression."""
+    # 1. 1m RSI
+    delta = df['Close'].diff()
+    gain = delta.where(delta > 0, 0).ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
+    loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
+    rs = gain / (loss + 1e-8)
+    df['RSI_1m'] = 100 - (100 / (1 + rs))
+
+    # 2. 1m MACD Histogram
+    ema_12 = df['Close'].ewm(span=12, adjust=False).mean()
+    ema_26 = df['Close'].ewm(span=26, adjust=False).mean()
+    macd_line = ema_12 - ema_26
+    signal_line = macd_line.ewm(span=9, adjust=False).mean()
+    df['MACD_Hist_1m'] = macd_line - signal_line
+
+    # 3. 1m ADX & DMI
+    df['up'] = df['High'].diff()
+    df['down'] = df['Low'].shift(1) - df['Low']
+    df['+DM'] = np.where((df['up'] > df['down']) & (df['up'] > 0), df['up'], 0)
+    df['-DM'] = np.where((df['down'] > df['up']) & (df['down'] > 0), df['down'], 0)
+
+    tr1 = df['High'] - df['Low']
+    tr2 = (df['High'] - df['Close'].shift(1)).abs()
+    tr3 = (df['Low'] - df['Close'].shift(1)).abs()
+    df['TR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+
+    atr = df['TR'].ewm(alpha=1/ADX_PERIOD, adjust=False).mean()
+    df['+DI_1m'] = 100 * (df['+DM'].ewm(alpha=1/ADX_PERIOD, adjust=False).mean() / (atr + 1e-8))
+    df['-DI_1m'] = 100 * (df['-DM'].ewm(alpha=1/ADX_PERIOD, adjust=False).mean() / (atr + 1e-8))
+    dx = 100 * (df['+DI_1m'] - df['-DI_1m']).abs() / (df['+DI_1m'] + df['-DI_1m'] + 1e-8)
+    df['ADX_1m'] = dx.ewm(alpha=1/ADX_PERIOD, adjust=False).mean()
+
+    return df.fillna(0)
+
 def compute_fixed_brick_size(df_1m):
     resampled = df_1m.set_index('Datetime').resample(RENKO_BRICK_BASIS_TF).agg(
         {'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}
@@ -158,10 +183,18 @@ def compute_fixed_brick_size(df_1m):
     return max(atr, price_floor, 0.01)
 
 def build_renko_bricks(df_1m, brick_size):
+    """Builds bricks but injects the 1m momentum snapshot at completion."""
     closes = df_1m['Close'].values
     times = df_1m['Datetime'].values
+    
+    rsi_1m = df_1m['RSI_1m'].values
+    macd_1m = df_1m['MACD_Hist_1m'].values
+    adx_1m = df_1m['ADX_1m'].values
+    pdi_1m = df_1m['+DI_1m'].values
+    mdi_1m = df_1m['-DI_1m'].values
+
     if len(closes) < 2:
-        return pd.DataFrame(columns=['Datetime', 'Open', 'High', 'Low', 'Close'])
+        return pd.DataFrame()
 
     bricks = []
     anchor = closes[0]
@@ -180,59 +213,35 @@ def build_renko_bricks(df_1m, brick_size):
             else:
                 break
             o, c = prev_brick_close, anchor
-            bricks.append({'Datetime': t, 'Open': o, 'High': max(o, c), 'Low': min(o, c), 'Close': c})
+            
+            # THE SNAPSHOT: We grab the actual 1m momentum at the second this brick formed.
+            bricks.append({
+                'Datetime': t, 'Open': o, 'Close': c,
+                'RSI': rsi_1m[i], 
+                'MACD_Hist': macd_1m[i],
+                'ADX': adx_1m[i],
+                '+DI': pdi_1m[i],
+                '-DI': mdi_1m[i]
+            })
             prev_brick_close = anchor
 
     return pd.DataFrame(bricks)
 
 def calculate_technical_signals(df):
-    # FIX: Lowered required length to 5 to accommodate highly-compressed Renko granularities
     if len(df) < 5:
         return "Neutral", "Neutral", "Neutral"
 
-    delta = df['Close'].diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-
-    avg_gain = gain.ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
-    avg_loss = loss.ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
-    rs = avg_gain / (avg_loss + 1e-8)
-    df['RSI'] = 100 - (100 / (1 + rs))
-
-    # FIX: Added min_periods=1 and fillna(0) to allow MAs to calculate on small datasets
+    # BB applied to the sampled RSI sequence
     df['RSI_SMA'] = df['RSI'].rolling(BB_PERIOD, min_periods=1).mean()
     df['RSI_STD'] = df['RSI'].rolling(BB_PERIOD, min_periods=1).std().fillna(0)
     df['BB_Upper'] = df['RSI_SMA'] + (BB_STD * df['RSI_STD'])
     df['BB_Lower'] = df['RSI_SMA'] - (BB_STD * df['RSI_STD'])
 
-    ema_12 = df['Close'].ewm(span=12, adjust=False).mean()
-    ema_26 = df['Close'].ewm(span=26, adjust=False).mean()
-    df['MACD_Line'] = ema_12 - ema_26
-    df['Signal_Line'] = df['MACD_Line'].ewm(span=9, adjust=False).mean()
-    df['MACD_Hist'] = df['MACD_Line'] - df['Signal_Line']
-
+    # BB applied to the sampled MACD sequence
     df['MACD_Hist_SMA'] = df['MACD_Hist'].rolling(BB_PERIOD, min_periods=1).mean()
     df['MACD_Hist_STD'] = df['MACD_Hist'].rolling(BB_PERIOD, min_periods=1).std().fillna(0)
     df['MACD_BB_Upper'] = df['MACD_Hist_SMA'] + (BB_STD * df['MACD_Hist_STD'])
     df['MACD_BB_Lower'] = df['MACD_Hist_SMA'] - (BB_STD * df['MACD_Hist_STD'])
-
-    df['up'] = df['High'].diff()
-    df['down'] = df['Low'].shift(1) - df['Low']
-    df['+DM'] = np.where((df['up'] > df['down']) & (df['up'] > 0), df['up'], 0)
-    df['-DM'] = np.where((df['down'] > df['up']) & (df['down'] > 0), df['down'], 0)
-
-    tr1 = df['High'] - df['Low']
-    tr2 = (df['High'] - df['Close'].shift(1)).abs()
-    tr3 = (df['Low'] - df['Close'].shift(1)).abs()
-    df['TR'] = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
-
-    atr = df['TR'].ewm(alpha=1/ADX_PERIOD, adjust=False).mean()
-    plus_di = 100 * (df['+DM'].ewm(alpha=1/ADX_PERIOD, adjust=False).mean() / (atr + 1e-8))
-    minus_di = 100 * (df['-DM'].ewm(alpha=1/ADX_PERIOD, adjust=False).mean() / (atr + 1e-8))
-    dx = 100 * (plus_di - minus_di).abs() / (plus_di + minus_di + 1e-8)
-    df['ADX'] = dx.ewm(alpha=1/ADX_PERIOD, adjust=False).mean()
-    df['+DI'] = plus_di
-    df['-DI'] = minus_di
 
     latest = df.iloc[-1]
 
@@ -283,6 +292,10 @@ def process_stock(args):
     master_1m = pd.concat(dfs, ignore_index=True).drop_duplicates(subset='Datetime').sort_values('Datetime').reset_index(drop=True)
     if len(master_1m) < 30: return None
 
+    # Step 1: Pre-calculate all 1m indicators
+    master_1m = calculate_1m_indicators(master_1m)
+
+    # Step 2: Sizing and Bricking
     base_brick = compute_fixed_brick_size(master_1m)
     row_data = {'Symbol': item['symbol'], 'LTP': master_1m['Close'].iloc[-1], 'Score': 0, 'BullGranularities': 0, 'BearGranularities': 0}
 
@@ -290,6 +303,7 @@ def process_stock(args):
         gtag = f"{mult}B"
         bricks = build_renko_bricks(master_1m, base_brick * mult)
         bb_rsi_sig, bb_macd_sig, adx_sig = calculate_technical_signals(bricks)
+        
         row_data[f'BB_RSI_{gtag}'] = bb_rsi_sig
         row_data[f'BB_MACD_{gtag}'] = bb_macd_sig
         row_data[f'ADX_{gtag}'] = adx_sig
@@ -325,7 +339,8 @@ def run_screener():
         print(f"🔄 Bypassing Price/Volume filters for Indices. Found {len(universe_raw)} major indices.")
         universe = universe_raw
     else:
-        candidates = universe_raw[:500]
+        # Full scan execution
+        candidates = universe_raw  
         print(f"🔄 Filtering {len(candidates)} {TRADING_MODE} stocks for Volume & Price constraints ({UNIVERSE_FILTER_WORKERS} parallel workers)...")
         with concurrent.futures.ThreadPoolExecutor(max_workers=UNIVERSE_FILTER_WORKERS) as ex:
             for result in ex.map(lambda it: _filter_worker(it, filter_date), candidates):
@@ -392,4 +407,3 @@ if __name__ == "__main__":
         sys.exit(1)
         
     run_screener()
-        
