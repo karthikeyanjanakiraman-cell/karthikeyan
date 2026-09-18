@@ -186,7 +186,8 @@ def build_renko_bricks(df_1m, brick_size):
     return pd.DataFrame(bricks)
 
 def calculate_technical_signals(df):
-    if len(df) < 30:
+    # FIX: Lowered required length to 5 to accommodate highly-compressed Renko granularities
+    if len(df) < 5:
         return "Neutral", "Neutral", "Neutral"
 
     delta = df['Close'].diff()
@@ -198,8 +199,9 @@ def calculate_technical_signals(df):
     rs = avg_gain / (avg_loss + 1e-8)
     df['RSI'] = 100 - (100 / (1 + rs))
 
-    df['RSI_SMA'] = df['RSI'].rolling(BB_PERIOD).mean()
-    df['RSI_STD'] = df['RSI'].rolling(BB_PERIOD).std()
+    # FIX: Added min_periods=1 and fillna(0) to allow MAs to calculate on small datasets
+    df['RSI_SMA'] = df['RSI'].rolling(BB_PERIOD, min_periods=1).mean()
+    df['RSI_STD'] = df['RSI'].rolling(BB_PERIOD, min_periods=1).std().fillna(0)
     df['BB_Upper'] = df['RSI_SMA'] + (BB_STD * df['RSI_STD'])
     df['BB_Lower'] = df['RSI_SMA'] - (BB_STD * df['RSI_STD'])
 
@@ -209,8 +211,8 @@ def calculate_technical_signals(df):
     df['Signal_Line'] = df['MACD_Line'].ewm(span=9, adjust=False).mean()
     df['MACD_Hist'] = df['MACD_Line'] - df['Signal_Line']
 
-    df['MACD_Hist_SMA'] = df['MACD_Hist'].rolling(BB_PERIOD).mean()
-    df['MACD_Hist_STD'] = df['MACD_Hist'].rolling(BB_PERIOD).std()
+    df['MACD_Hist_SMA'] = df['MACD_Hist'].rolling(BB_PERIOD, min_periods=1).mean()
+    df['MACD_Hist_STD'] = df['MACD_Hist'].rolling(BB_PERIOD, min_periods=1).std().fillna(0)
     df['MACD_BB_Upper'] = df['MACD_Hist_SMA'] + (BB_STD * df['MACD_Hist_STD'])
     df['MACD_BB_Lower'] = df['MACD_Hist_SMA'] - (BB_STD * df['MACD_Hist_STD'])
 
@@ -390,3 +392,4 @@ if __name__ == "__main__":
         sys.exit(1)
         
     run_screener()
+        
