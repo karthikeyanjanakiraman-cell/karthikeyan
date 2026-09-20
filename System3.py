@@ -48,7 +48,7 @@ BACKTRACE_DAYS = 5
 # --- INDICATOR PERIODS ---
 RSI_PERIOD = 14
 BB_PERIOD = 20
-BB_STD = 1.2
+BB_STD = 1.5           # Set to 1.5 to catch heavy institutional volume impulses
 ADX_PERIOD = 14
 ADX_THRESHOLD = 25
 
@@ -61,16 +61,21 @@ DAY_FETCH_WORKERS = 3
 # 1. UPSTOX API LIVE INGESTION & SETUP
 # ==============================================================================
 def get_dynamic_universe(mode):
+    if mode == "INDEX_OPTIONS":
+        # Direct static mapping avoids case-sensitivity issues and includes SENSEX
+        return [
+            {"symbol": "NIFTY 50", "key": "NSE_INDEX|Nifty 50"},
+            {"symbol": "BANKNIFTY", "key": "NSE_INDEX|Nifty Bank"},
+            {"symbol": "FINNIFTY", "key": "NSE_INDEX|Nifty Fin Service"},
+            {"symbol": "MIDCPNIFTY", "key": "NSE_INDEX|NIFTY MID SELECT"},
+            {"symbol": "SENSEX", "key": "BSE_INDEX|SENSEX"}
+        ]
+
     nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
     try:
         response = requests.get(nse_url, timeout=10)
         if response.status_code != 200: return []
         nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
-
-        if mode == "INDEX_OPTIONS":
-            target_indices = ["Nifty 50", "Nifty Bank", "Nifty Fin Service", "Nifty Mid Select"]
-            return [{"symbol": item["trading_symbol"], "key": item["instrument_key"]}
-                    for item in nse_data if item.get("segment") == "NSE_INDEX" and item.get("trading_symbol") in target_indices]
 
         fno_underlying = {item.get("underlying_symbol") for item in nse_data if item.get("segment") == "NSE_FO" and item.get("underlying_symbol")}
 
@@ -317,6 +322,10 @@ def format_cell(text, width=10):
 def _filter_worker(item, filter_date, latest_day):
     df = fetch_upstox_candles_for_date(item['key'], filter_date, is_latest_day=(filter_date == latest_day))
     if df is not None and not df.empty:
+        # Indices don't have share volume and trade well above equity MAX_PRICE
+        if TRADING_MODE == "INDEX_OPTIONS":
+            return item, df
+        # Equity validation
         if MIN_PRICE <= df['Close'].iloc[-1] <= MAX_PRICE and df['Volume'].sum() >= MIN_DAILY_VOLUME:
             return item, df
     return None
@@ -363,7 +372,7 @@ def process_stock(args):
 
         if alignment == "BULL":
             row_data['PerfectBullBlocks'] += 1
-            row_data['Score'] += 1 # Adds 1 point per perfect block
+            row_data['Score'] += 1 
         elif alignment == "BEAR":
             row_data['PerfectBearBlocks'] += 1
             row_data['Score'] -= 1
@@ -387,7 +396,7 @@ def run_screener():
 
     universe, filter_cache = [], {}
     candidates = universe_raw  
-    print(f"🔄 Filtering {len(candidates)} {TRADING_MODE} stocks for Volume & Price constraints...")
+    print(f"🔄 Filtering {len(candidates)} {TRADING_MODE} instruments...")
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=UNIVERSE_FILTER_WORKERS) as ex:
         for result in ex.map(lambda it: _filter_worker(it, filter_date, latest_day), candidates):
@@ -419,7 +428,7 @@ def run_screener():
         if not data_list: return
         print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
         
-        header_str = f" {COLOR_CYAN}{'Script':<16} {'LTP':<8} |"
+        header_str = f" {COLOR_CYAN}{'Script':<16} {'LTP':<10} |"
         for mult in HA_ATR_MULTIPLIERS:
             gtag = f"{mult}X"
             header_str += f"  {'BB-RSI '+gtag:^11} {'BB-MACD '+gtag:^12} {'BB-DI '+gtag:^9} |"
@@ -429,7 +438,7 @@ def run_screener():
         print("-" * dash_len)
 
         for row in data_list:
-            row_str = f" {row['Symbol']:<16} {row['LTP']:<8.2f} |"
+            row_str = f" {row['Symbol']:<16} {row['LTP']:<10.2f} |"
             for mult in HA_ATR_MULTIPLIERS:
                 gtag = f"{mult}X"
                 bb_rsi_cell = format_cell(row[f'BB_RSI_{gtag}'], 11)
@@ -448,4 +457,3 @@ if __name__ == "__main__":
         print(f"{COLOR_RED_FG}[!] Missing UPSTOX_ACCESS_TOKEN environment variable.{COLOR_RESET}")
         sys.exit(1)
     run_screener()
-    
