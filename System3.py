@@ -85,33 +85,44 @@ def get_dynamic_universe(mode):
         print(f"{COLOR_RED_FG}[API Error] Failed to fetch Universe: {e}{COLOR_RESET}")
         return []
 
-def fetch_upstox_candles_for_date(instrument_key, date_str, retries=3):
+def fetch_upstox_candles_for_date(instrument_key, date_str, is_latest_day=False, retries=3):
     access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
-    if not access_token: return None
+    if not access_token: 
+        return None
 
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
-    today_str = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
+    encoded_key = urllib.parse.quote(instrument_key)
 
-    if date_str == today_str:
-        url = f"https://api.upstox.com/v2/historical-candle/intraday/{urllib.parse.quote(instrument_key)}/1minute"
-    else:
-        url = f"https://api.upstox.com/v2/historical-candle/{urllib.parse.quote(instrument_key)}/1minute/{date_str}/{date_str}"
+    urls_to_try = []
+    # If it is the latest trading session, try the intraday endpoint first to avoid after-hours gaps
+    if is_latest_day:
+        urls_to_try.append(f"https://api.upstox.com/v2/historical-candle/intraday/{encoded_key}/1minute")
+    
+    # Historical date-range fallback
+    urls_to_try.append(f"https://api.upstox.com/v2/historical-candle/{encoded_key}/1minute/{date_str}/{date_str}")
 
-    for attempt in range(retries):
-        try:
-            response = requests.get(url, headers=headers, timeout=10)
-            if response.status_code == 200:
-                data = response.json().get('data', {}).get('candles', [])
-                if not data: return None
-                c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
-                c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).dt.tz_localize(None)
-                return c_df.sort_values('Datetime').reset_index(drop=True)
-            elif response.status_code == 429:
-                time.sleep(1.0 * (attempt + 1))
-            else:
-                return None
-        except Exception:
-            time.sleep(1.0)
+    for url in urls_to_try:
+        for attempt in range(retries):
+            try:
+                response = requests.get(url, headers=headers, timeout=10)
+                if response.status_code == 200:
+                    data = response.json().get('data', {}).get('candles', [])
+                    if data:
+                        c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
+                        c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).dt.tz_localize(None)
+                        
+                        # Filter to only the requested date if using intraday endpoint
+                        if "intraday" in url:
+                            c_df = c_df[c_df['Datetime'].dt.strftime("%Y-%m-%d") == date_str]
+                            if c_df.empty:
+                                break  # Move to next URL fallback
+                        
+                        return c_df.sort_values('Datetime').reset_index(drop=True)
+                elif response.status_code == 429:
+                    time.sleep(1.0 * (attempt + 1))
+            except Exception:
+                time.sleep(1.0)
+                
     return None
 
 def get_past_trading_days(target_date_str, num_days=5):
@@ -161,7 +172,6 @@ def build_isolated_range_bars(df_1m, target_range):
         
         if len(closes) == 0: continue
 
-        # FIXED: Start correctly from the OPEN of the session, not the close
         curr_O, curr_H, curr_L, curr_T = opens[0], highs[0], lows[0], times[0]
         curr_C = closes[0]
         raw_bars = []
@@ -179,8 +189,7 @@ def build_isolated_range_bars(df_1m, target_range):
                 curr_L = curr_C
                 curr_T = times[i+1] if i < len(closes) - 1 else times[i]
 
-        # FIXED: Core missing piece! Append the live, unclosed bar at the end of the day.
-        # This prevents falling back to yesterday's closing signal for strongly trending live charts.
+        # Phase 1b: Append the unclosed live bar to capture active trends
         if curr_H > curr_L: 
             raw_bars.append({'Datetime': curr_T, 'Open': curr_O, 'High': curr_H, 'Low': curr_L, 'Close': curr_C})
 
@@ -192,8 +201,10 @@ def build_isolated_range_bars(df_1m, target_range):
         ha_opens = np.zeros(len(df_raw))
         ha_opens[0] = (df_raw['Open'].iloc[0] + df_raw['Close'].iloc[0]) / 2
 
+        # Optimized iteration
+        ha_closes_arr = ha_closes.to_numpy()
         for i in range(1, len(df_raw)):
-            ha_opens[i] = (ha_opens[i-1] + ha_closes.iloc[i-1]) / 2
+            ha_opens[i] = (ha_opens[i-1] + ha_closes_arr[i-1]) / 2.0
 
         df_raw['HA_Trend'] = np.where(ha_closes >= ha_opens, 'Green', 'Red')
         all_bars.append(df_raw)
@@ -279,10 +290,6 @@ def calculate_strict_signals(df):
 # 3. PIPELINE EXECUTOR & UI DRAWING
 # ==============================================================================
 def format_cell(text, width=10):
-    """
-    FIXED FORMATTING: Manually calculates left/right padding so ANSI color codes 
-    wrap strictly around the text, preventing terminal rendering engines from breaking alignment.
-    """
     if not text:
         return " " * width
         
@@ -300,8 +307,8 @@ def format_cell(text, width=10):
         
     return f"{left_pad}{colored_text}{right_pad}"
 
-def _filter_worker(item, filter_date):
-    df = fetch_upstox_candles_for_date(item['key'], filter_date)
+def _filter_worker(item, filter_date, latest_day):
+    df = fetch_upstox_candles_for_date(item['key'], filter_date, is_latest_day=(filter_date == latest_day))
     if df is not None and not df.empty:
         if MIN_PRICE <= df['Close'].iloc[-1] <= MAX_PRICE and df['Volume'].sum() >= MIN_DAILY_VOLUME:
             return item, df
@@ -309,14 +316,29 @@ def _filter_worker(item, filter_date):
 
 def process_stock(args):
     item, trading_days, cached = args  
+    latest_day = trading_days[-1]
     days_needed = [d for d in trading_days if d not in cached]
     
+    fetched = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=DAY_FETCH_WORKERS) as ex:
-        fetched = [d for d in ex.map(lambda day: fetch_upstox_candles_for_date(item['key'], day), days_needed) if d is not None]
+        futures = {
+            ex.submit(fetch_upstox_candles_for_date, item['key'], day, (day == latest_day)): day 
+            for day in days_needed
+        }
+        for future in concurrent.futures.as_completed(futures):
+            res = future.result()
+            if res is not None and not res.empty:
+                fetched.append(res)
     
     dfs = list(cached.values()) + fetched
     if not dfs: return None
+    
     master_1m = pd.concat(dfs, ignore_index=True).drop_duplicates(subset='Datetime').sort_values('Datetime').reset_index(drop=True)
+    
+    # Data Integrity Guardrail: Discard stale data to prevent false signals
+    if master_1m['Datetime'].dt.strftime("%Y-%m-%d").max() != latest_day:
+        return None
+
     if len(master_1m) < 30: return None
 
     base_atr = compute_base_atr(master_1m)
@@ -345,6 +367,7 @@ def process_stock(args):
 def run_screener():
     target_date_str = (datetime.utcnow() + timedelta(hours=5, minutes=30)).strftime("%Y-%m-%d")
     trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
+    latest_day = trading_days[-1]
     filter_date = trading_days[-2] if len(trading_days) > 1 else trading_days[0]
 
     t_start = time.time()
@@ -358,7 +381,7 @@ def run_screener():
     print(f"🔄 Filtering {len(candidates)} {TRADING_MODE} stocks for Volume & Price constraints...")
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=UNIVERSE_FILTER_WORKERS) as ex:
-        for result in ex.map(lambda it: _filter_worker(it, filter_date), candidates):
+        for result in ex.map(lambda it: _filter_worker(it, filter_date, latest_day), candidates):
             if result is not None:
                 item, df = result
                 universe.append(item)
@@ -392,7 +415,7 @@ def run_screener():
             gtag = f"{mult}X"
             header_str += f"  {'BB-RSI '+gtag:^11} {'BB-MACD '+gtag:^12} {'ADX '+gtag:^9} |"
         
-        dash_len = len(header_str) - 8 # Subtract length of ANSI escape sequences in header setup
+        dash_len = len(header_str) - 8 
         print(header_str + COLOR_RESET)
         print("-" * dash_len)
 
