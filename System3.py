@@ -18,13 +18,13 @@ warnings.filterwarnings("ignore")
 # ==============================================================================
 # 0. ENGINE CONSTANTS & CONFIGURATION
 # ==============================================================================
-TRADING_MODE = "STOCK_FNO"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
+TRADING_MODE = "INDEX_OPTIONS"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
 
 # --- OPTIONS CHAIN CONFIGURATION ---
 EXPIRY_OFFSET = 0          # 0 = Current (Nearest) Expiry, 1 = Next Expiry
 STRIKES_FROM_ATM = 5       # Generates ATM + 5 OTM + 5 ITM (Total 11 strikes per CE and PE)
 OPT_MIN_PRICE = 5          # Filter out worthless deep OTM options below ₹5
-OPT_MIN_VOLUME = 50000     # Minimum previous-day volume for options liquidity
+OPT_MIN_VOLUME = 10000     # Lowered to 10k so newly active strikes aren't accidentally filtered
 
 # --- DECOUPLED HA-ATR ENGINE MULTIPLIERS ---
 HA_ATR_MULTIPLIERS = [1, 2, 3, 5]     
@@ -110,18 +110,20 @@ def get_past_trading_days(target_date_str, num_days=5):
         return []
 
 def get_dynamic_universe(mode, latest_day):
-    print(f"🔄 Downloading Live Exchange Master JSONs (NSE & BSE)...")
+    print(f"🔄 Downloading Live Exchange Master JSONs (NSE, NFO, BFO)...")
     try:
-        nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(requests.get("https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz", timeout=10).content)))
-        bse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(requests.get("https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz", timeout=10).content)))
+        # We must pull NFO and BFO to get Options contracts!
+        nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(requests.get("https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz", timeout=15).content)))
+        nfo_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(requests.get("https://assets.upstox.com/market-quote/instruments/exchange/NFO.json.gz", timeout=15).content)))
+        bfo_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(requests.get("https://assets.upstox.com/market-quote/instruments/exchange/BFO.json.gz", timeout=15).content)))
     except Exception as e:
         print(f"{COLOR_RED_FG}[API Error] Failed to fetch Universe: {e}{COLOR_RESET}")
         return []
 
     if mode == "INDEX_OPTIONS":
         universe = []
-        # Combine F&O segments across NSE and BSE
-        all_fo_data = [item for item in nse_data + bse_data if item.get("segment") in ["NSE_FO", "BFO", "BSE_FO"]]
+        # Merge NSE F&O and BSE F&O
+        all_fo_data = nfo_data + bfo_data
         
         index_config = {
             "NIFTY": {"spot_key": "NSE_INDEX|Nifty 50", "step": 50},
@@ -145,32 +147,51 @@ def get_dynamic_universe(mode, latest_day):
                 
             spot_price = spot_df['Close'].iloc[-1]
             step = config["step"]
-            atm_strike = round(spot_price / step) * step
+            atm_strike = int(round(spot_price / step) * step)
             
-            # Generate range of strikes
-            target_strikes = [float(atm_strike + (i * step)) for i in range(-STRIKES_FROM_ATM, STRIKES_FROM_ATM + 1)]
+            # Generate range of strikes (converted to integers for perfect matching)
+            target_strikes = [int(atm_strike + (i * step)) for i in range(-STRIKES_FROM_ATM, STRIKES_FROM_ATM + 1)]
             
-            # Bulletproof option filtering: Look for strike > 0 instead of fragile instrument_type tags
-            idx_opts = [
-                item for item in all_fo_data 
-                if (item.get("name") == idx_name or item.get("underlying_symbol") == idx_name)
-                and float(item.get("strike", 0)) > 0
-            ]
+            # Bulletproof Options Filter: Pure String Matching on the Trading Symbol in NFO/BFO
+            idx_opts = []
+            for item in all_fo_data:
+                name = str(item.get("name", "")).upper()
+                ts = str(item.get("trading_symbol", "")).upper()
+                
+                if (name == idx_name or ts.startswith(idx_name)) and (ts.endswith("CE") or ts.endswith("PE")):
+                    strike_val = item.get("strike") or item.get("strike_price")
+                    try:
+                        strike = int(float(strike_val))
+                        if strike > 0:
+                            item['clean_strike'] = strike
+                            idx_opts.append(item)
+                    except (ValueError, TypeError):
+                        continue
             
             if not idx_opts: 
-                print(f"   [!] {idx_name}: Could not find option chain in master JSON. Skipping.")
+                print(f"   [!] {idx_name}: Could not find option chain using Trading Symbol match. Skipping.")
                 continue
                 
-            # Extract and sort expirations
-            unique_expiries = sorted(list(set(item.get("expiry") for item in idx_opts if item.get("expiry"))))
+            # Extract and Sort Expirations Chronologically
+            expiries_set = set(item.get("expiry") for item in idx_opts if item.get("expiry"))
+            valid_expiries = []
+            for e in expiries_set:
+                try: valid_expiries.append((datetime.strptime(e, "%Y-%m-%d"), e))
+                except: 
+                    try: valid_expiries.append((datetime.strptime(e, "%d-%b-%Y"), e))
+                    except: valid_expiries.append((datetime.max, e))
+                    
+            valid_expiries.sort(key=lambda x: x[0])
+            unique_expiries = [x[1] for x in valid_expiries]
+
             if len(unique_expiries) <= EXPIRY_OFFSET: 
-                print(f"   [!] {idx_name}: Required expiry offset not available. Skipping.")
+                print(f"   [!] {idx_name}: Required expiry offset not available. Found {len(unique_expiries)}. Skipping.")
                 continue
             
             target_expiry = unique_expiries[EXPIRY_OFFSET]
             
-            # Filter exact options based on calculated targets
-            matched_options = [opt for opt in idx_opts if opt.get("expiry") == target_expiry and float(opt.get("strike", 0)) in target_strikes]
+            # Filter exact options based on calculated targets and chosen expiry
+            matched_options = [opt for opt in idx_opts if opt.get("expiry") == target_expiry and opt.get("clean_strike") in target_strikes]
             
             print(f"   => {idx_name:<10} | Spot: {spot_price:<8.2f} | ATM: {atm_strike:<6} | Expiry: {target_expiry} | Grabbed {len(matched_options)} CE/PE Contracts")
             
@@ -184,14 +205,13 @@ def get_dynamic_universe(mode, latest_day):
         return universe
 
     # --- Standard Equity Execution below ---
-    fno_underlying = {item.get("underlying_symbol") for item in nse_data if item.get("segment") == "NSE_FO" and item.get("underlying_symbol")}
+    fno_underlying = {item.get("underlying_symbol") for item in nfo_data if item.get("underlying_symbol")}
     if mode == "STOCK_FNO":
         return [{"symbol": item["trading_symbol"], "key": item["instrument_key"]} for item in nse_data if item.get("segment") == "NSE_EQ" and item.get("trading_symbol") in fno_underlying]
     elif mode == "CASH_EQUITY":
         return [{"symbol": item["trading_symbol"], "key": item["instrument_key"]} for item in nse_data if item.get("segment") == "NSE_EQ" and item.get("trading_symbol") not in fno_underlying]
 
     return []
-
 
 # ==============================================================================
 # 2. THE DECOUPLED HA-ATR ENGINE (STRICT BOLLINGER BAND BREAKOUTS)
@@ -318,11 +338,9 @@ def format_cell(text, width=10):
 def _filter_worker(item, filter_date, latest_day):
     df = fetch_upstox_candles_for_date(item['key'], filter_date, is_latest_day=(filter_date == latest_day))
     if df is not None and not df.empty:
-        # Options specific filtering
         if TRADING_MODE == "INDEX_OPTIONS":
             if df['Close'].iloc[-1] >= OPT_MIN_PRICE and df['Volume'].sum() >= OPT_MIN_VOLUME:
                 return item, df
-        # Equity specific filtering
         elif MIN_PRICE <= df['Close'].iloc[-1] <= MAX_PRICE and df['Volume'].sum() >= MIN_DAILY_VOLUME:
             return item, df
     return None
@@ -389,55 +407,4 @@ def run_screener():
                 universe.append(item)
                 filter_cache[item['symbol']] = {filter_date: df}
 
-    print(f"✅ Target Universe ready ({len(universe)} highly liquid Option Strikes). Computing technicals...\n")
-
-    work_items = [(item, trading_days, filter_cache.get(item['symbol'], {})) for item in universe]
-    with concurrent.futures.ThreadPoolExecutor(max_workers=STOCK_WORKERS) as executor:
-        results = list(executor.map(process_stock, work_items))
-        
-    dashboard_data = [r for r in results if r is not None]
-
-    bulls = [r for r in dashboard_data if r['PerfectBullBlocks'] >= MIN_PERFECT_BLOCKS]
-    bears = [r for r in dashboard_data if r['PerfectBearBlocks'] >= MIN_PERFECT_BLOCKS]
-
-    bulls.sort(key=lambda x: (x['PerfectBullBlocks'], x['Score']), reverse=True)
-    bears.sort(key=lambda x: (x['PerfectBearBlocks'], abs(x['Score'])), reverse=True)
-
-    bulls = bulls[:TOP_N_BUYERS]
-    bears = bears[:TOP_N_SELLERS]
-
-    print(f"{COLOR_BOLD}=== STRICT INSTITUTIONAL VOLATILITY DASHBOARD [{TRADING_MODE}] ==={COLOR_RESET}\n")
-
-    def print_basket(title, icon, data_list):
-        if not data_list: return
-        print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
-        
-        header_str = f" {COLOR_CYAN}{'Options Strike':<22} {'LTP':<8} |"
-        for mult in HA_ATR_MULTIPLIERS:
-            gtag = f"{mult}X"
-            header_str += f"  {'BB-RSI '+gtag:^11} {'BB-MACD '+gtag:^12} {'BB-DI '+gtag:^9} |"
-        
-        dash_len = len(header_str) - 8 
-        print(header_str + COLOR_RESET)
-        print("-" * dash_len)
-
-        for row in data_list:
-            row_str = f" {row['Symbol']:<22} {row['LTP']:<8.2f} |"
-            for mult in HA_ATR_MULTIPLIERS:
-                gtag = f"{mult}X"
-                bb_rsi_cell = format_cell(row[f'BB_RSI_{gtag}'], 11)
-                bb_macd_cell = format_cell(row[f'BB_MACD_{gtag}'], 12)
-                adx_cell = format_cell(row[f'ADX_{gtag}'], 9)
-                row_str += f"  {bb_rsi_cell} {bb_macd_cell} {adx_cell} |"
-            print(row_str)
-
-    print_basket(f"TOP PREMIUM BUYERS (Pure Alignment >= {MIN_PERFECT_BLOCKS} Block)", "🔥", bulls)
-    print_basket(f"TOP PREMIUM SELLERS (Pure Alignment >= {MIN_PERFECT_BLOCKS} Block)", "🩸", bears)
-    
-    print(f"\n⏱️ Scan completed in {(time.time() - t_start):.2f} seconds.\n")
-
-if __name__ == "__main__":
-    if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
-        print(f"{COLOR_RED_FG}[!] Missing UPSTOX_ACCESS_TOKEN environment variable.{COLOR_RESET}")
-        sys.exit(1)
-    run_screener()
+    print(f"✅ Target Universe ready ({
