@@ -24,7 +24,7 @@ TRADING_MODE = "INDEX_OPTIONS"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_O
 EXPIRY_OFFSET = 0          # 0 = Current (Nearest) Expiry, 1 = Next Expiry
 STRIKES_FROM_ATM = 5       # Generates ATM + 5 OTM + 5 ITM (Total 11 strikes per CE and PE)
 OPT_MIN_PRICE = 5          # Filter out worthless deep OTM options below ₹5
-OPT_MIN_VOLUME = 10000     # Lowered to 10k so newly active strikes aren't accidentally filtered
+OPT_MIN_VOLUME = 10000     # Minimum volume for options liquidity
 
 # --- DECOUPLED HA-ATR ENGINE MULTIPLIERS ---
 HA_ATR_MULTIPLIERS = [1, 2, 3, 5]     
@@ -119,17 +119,18 @@ def get_dynamic_universe(mode, latest_day):
         return json.load(gzip.GzipFile(fileobj=io.BytesIO(resp.content)))
 
     try:
-        # All NSE Equities, Indices, and F&O are bundled in this single file
+        # Upstox bundles ALL segments (EQ, FO, CUR) inside the primary exchange file.
         nse_data = fetch_gz_json("https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz")
-        # All BSE Equities, Indices, and F&O are bundled in this single file
         bse_data = fetch_gz_json("https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz")
     except Exception as e:
         print(f"{COLOR_RED_FG}[API Error] Failed to fetch Universe: {e}{COLOR_RESET}")
         return []
 
+    # Merge NSE and BSE to search globally
+    all_data = nse_data + bse_data
+
     if mode == "INDEX_OPTIONS":
         universe = []
-        all_fo_data = nse_data + bse_data
         
         index_config = {
             "NIFTY": {"spot_key": "NSE_INDEX|Nifty 50", "step": 50},
@@ -158,20 +159,22 @@ def get_dynamic_universe(mode, latest_day):
             # Generate range of strikes (converted to integers for perfect matching)
             target_strikes = [int(atm_strike + (i * step)) for i in range(-STRIKES_FROM_ATM, STRIKES_FROM_ATM + 1)]
             
-            # Bulletproof Options Filter: Pure String Matching on the Trading Symbol
+            # Bulletproof Options Filter: Handles missing underscores in JSON keys
             idx_opts = []
-            for item in all_fo_data:
+            for item in all_data:
                 name = str(item.get("name", "")).upper()
-                ts = str(item.get("trading_symbol", "")).upper()
+                # Check both tradingsymbol (JSON) and trading_symbol (CSV schema)
+                ts = str(item.get("tradingsymbol", item.get("trading_symbol", ""))).upper()
                 
-                # Check if it starts with index name and ends with CE or PE
                 if (name == idx_name or ts.startswith(idx_name)) and (ts.endswith("CE") or ts.endswith("PE")):
-                    strike_val = item.get("strike") or item.get("strike_price")
+                    strike_val = item.get("strike", item.get("strike_price", 0))
                     try:
-                        strike = int(float(strike_val))
-                        if strike > 0:
-                            item['clean_strike'] = strike
-                            idx_opts.append(item)
+                        if strike_val is not None:
+                            strike = int(float(strike_val))
+                            if strike > 0:
+                                item['clean_strike'] = strike
+                                item['clean_ts'] = ts
+                                idx_opts.append(item)
                     except (ValueError, TypeError):
                         continue
             
@@ -204,7 +207,7 @@ def get_dynamic_universe(mode, latest_day):
             
             for opt in matched_options:
                 universe.append({
-                    "symbol": opt.get("trading_symbol"), 
+                    "symbol": opt.get("clean_ts"), 
                     "key": opt.get("instrument_key")
                 })
         
@@ -214,9 +217,11 @@ def get_dynamic_universe(mode, latest_day):
     # --- Standard Equity Execution below ---
     fno_underlying = {item.get("underlying_symbol") for item in nse_data if item.get("segment") == "NSE_FO" and item.get("underlying_symbol")}
     if mode == "STOCK_FNO":
-        return [{"symbol": item["trading_symbol"], "key": item["instrument_key"]} for item in nse_data if item.get("segment") == "NSE_EQ" and item.get("trading_symbol") in fno_underlying]
+        return [{"symbol": item.get("tradingsymbol", item.get("trading_symbol")), "key": item.get("instrument_key")} 
+                for item in nse_data if item.get("segment") == "NSE_EQ" and item.get("tradingsymbol", item.get("trading_symbol")) in fno_underlying]
     elif mode == "CASH_EQUITY":
-        return [{"symbol": item["trading_symbol"], "key": item["instrument_key"]} for item in nse_data if item.get("segment") == "NSE_EQ" and item.get("trading_symbol") not in fno_underlying]
+        return [{"symbol": item.get("tradingsymbol", item.get("trading_symbol")), "key": item.get("instrument_key")} 
+                for item in nse_data if item.get("segment") == "NSE_EQ" and item.get("tradingsymbol", item.get("trading_symbol")) not in fno_underlying]
 
     return []
 
@@ -407,17 +412,8 @@ def run_screener():
         return
 
     universe, filter_cache = [], {}
-    print(f"🔄 Filtering {len(universe_raw)} Options Strikes for Minimum Premium (₹{OPT_MIN_PRICE}) & Liquidity...")
-    
-    with concurrent.futures.ThreadPoolExecutor(max_workers=UNIVERSE_FILTER_WORKERS) as ex:
-        for result in ex.map(lambda it: _filter_worker(it, filter_date, latest_day), universe_raw):
-            if result is not None:
-                item, df = result
-                universe.append(item)
-                filter_cache[item['symbol']] = {filter_date: df}
-
     print(f"✅ Target Universe ready ({len(universe)} highly liquid Option Strikes). Computing technicals...\n")
-
+    
     work_items = [(item, trading_days, filter_cache.get(item['symbol'], {})) for item in universe]
     with concurrent.futures.ThreadPoolExecutor(max_workers=STOCK_WORKERS) as executor:
         results = list(executor.map(process_stock, work_items))
