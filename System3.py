@@ -2,6 +2,10 @@ import os
 import sys
 import argparse
 import time
+import urllib.parse
+import json
+import gzip
+import io
 from datetime import datetime, timedelta
 import concurrent.futures
 
@@ -57,37 +61,37 @@ DAY_FETCH_WORKERS = 3
 # 1. FYERS API LIVE INGESTION & SETUP
 # ==============================================================================
 def get_dynamic_universe(mode):
-    """Fetches and builds the instrument universe directly from FYERS CSV masters."""
+    """Uses the reliable JSON feed to map the Universe, formatted for FYERS API."""
+    nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
     try:
-        cm_url = "https://public.fyers.in/sym_details/NSE_CM.csv"
-        cm_df = pd.read_csv(cm_url, header=None)
-        
-        if mode == "INDEX_OPTIONS":
-            target_indices = ["NSE:NIFTY50-INDEX", "NSE:NIFTYBANK-INDEX", "NSE:FINNIFTY-INDEX", "NSE:MIDCPNIFTY-INDEX"]
-            return [{"symbol": idx.split(":")[1].split("-")[0], "key": idx} for idx in target_indices]
-
-        fo_url = "https://public.fyers.in/sym_details/NSE_FO.csv"
-        fo_df = pd.read_csv(fo_url, header=None)
-        
-        # Column 12 in FYERS FO CSV contains the underlying short symbol (e.g., RELIANCE)
-        fno_underlying = set(fo_df[12].dropna().unique())
-        
-        universe = []
-        for _, row in cm_df.iterrows():
-            sym_key = str(row[8])   # Column 8: FYERS format e.g., NSE:RELIANCE-EQ
-            short_sym = str(row[12]) # Column 12: Short name e.g., RELIANCE
+        response = requests.get(nse_url, timeout=10)
+        if response.status_code != 200: 
+            return []
             
-            if not sym_key.endswith("-EQ"):
-                continue
-                
-            if mode == "STOCK_FNO" and short_sym in fno_underlying:
-                universe.append({"symbol": short_sym, "key": sym_key})
-            elif mode == "CASH_EQUITY" and short_sym not in fno_underlying:
-                universe.append({"symbol": short_sym, "key": sym_key})
-                
-        return universe
+        nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
+
+        if mode == "INDEX_OPTIONS":
+            target_indices = {
+                "Nifty 50": "NSE:NIFTY50-INDEX", 
+                "Nifty Bank": "NSE:NIFTYBANK-INDEX", 
+                "Nifty Fin Service": "NSE:FINNIFTY-INDEX", 
+                "Nifty Mid Select": "NSE:MIDCPNIFTY-INDEX"
+            }
+            return [{"symbol": item["trading_symbol"], "key": target_indices[item["trading_symbol"]]}
+                    for item in nse_data if item.get("segment") == "NSE_INDEX" and item.get("trading_symbol") in target_indices]
+
+        fno_underlying = {item.get("underlying_symbol") for item in nse_data if item.get("segment") == "NSE_FO" and item.get("underlying_symbol")}
+
+        if mode == "STOCK_FNO":
+            return [{"symbol": item["trading_symbol"], "key": f"NSE:{item['trading_symbol']}-EQ"}
+                    for item in nse_data if item.get("segment") == "NSE_EQ" and item.get("trading_symbol") in fno_underlying]
+
+        elif mode == "CASH_EQUITY":
+            return [{"symbol": item["trading_symbol"], "key": f"NSE:{item['trading_symbol']}-EQ"}
+                    for item in nse_data if item.get("segment") == "NSE_EQ" and item.get("trading_symbol") not in fno_underlying]
+                    
     except Exception as e:
-        print(f"{COLOR_RED_FG}[API Error] Failed to fetch Universe from FYERS: {e}{COLOR_RESET}")
+        print(f"{COLOR_RED_FG}[API Error] Failed to fetch Universe: {e}{COLOR_RESET}")
         return []
 
 def fetch_fyers_candles_for_date(instrument_key, date_str, retries=3):
@@ -114,12 +118,8 @@ def fetch_fyers_candles_for_date(instrument_key, date_str, retries=3):
             if response.status_code == 200:
                 data = response.json()
                 if data.get("s") == "ok" and "candles" in data and len(data["candles"]) > 0:
-                    # FYERS output columns: Timestamp(epoch), Open, High, Low, Close, Volume
                     c_df = pd.DataFrame(data["candles"], columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-                    
-                    # Convert FYERS UTC epoch directly into local IST Pandas Datetime
                     c_df['Datetime'] = pd.to_datetime(c_df['Timestamp'], unit='s', utc=True).dt.tz_convert('Asia/Kolkata').dt.tz_localize(None)
-                    
                     return c_df.sort_values('Datetime').reset_index(drop=True)
                 else:
                     return None
@@ -298,7 +298,6 @@ def format_cell(text, width=10):
     return f"{left_pad}{colored_text}{right_pad}"
 
 def _filter_worker(item, filter_date, latest_day):
-    # Fyers doesn't need an 'is_latest_day' flag, the endpoint naturally covers it
     df = fetch_fyers_candles_for_date(item['key'], filter_date)
     if df is not None and not df.empty:
         if MIN_PRICE <= df['Close'].iloc[-1] <= MAX_PRICE and df['Volume'].sum() >= MIN_DAILY_VOLUME:
@@ -326,7 +325,6 @@ def process_stock(args):
     
     master_1m = pd.concat(dfs, ignore_index=True).drop_duplicates(subset='Datetime').sort_values('Datetime').reset_index(drop=True)
     
-    # Data Integrity Guardrail
     if master_1m['Datetime'].dt.strftime("%Y-%m-%d").max() != latest_day:
         return None
 
@@ -362,9 +360,12 @@ def run_screener():
 
     t_start = time.time()
     print(f"\n{COLOR_CYAN}📡 Initializing Screener Pipeline [{TRADING_MODE}] via FYERS API...{COLOR_RESET}")
+    
     universe_raw = get_dynamic_universe(TRADING_MODE)
 
-    if not universe_raw: return
+    if not universe_raw: 
+        print(f"{COLOR_RED_FG}[!] Failed to generate the Universe list. Exiting.{COLOR_RESET}")
+        return
 
     universe, filter_cache = [], {}
     candidates = universe_raw  
@@ -426,6 +427,6 @@ def run_screener():
 
 if __name__ == "__main__":
     if not os.environ.get("FYERS_CLIENT_ID") or not os.environ.get("FYERS_ACCESS_TOKEN"):
-        print(f"{COLOR_RED_FG}[!] Missing CLIENT_ID or ACCESS_TOKEN environment variables.{COLOR_RESET}")
+        print(f"{COLOR_RED_FG}[!] Missing FYERS_CLIENT_ID or FYERS_ACCESS_TOKEN environment variables.{COLOR_RESET}")
         sys.exit(1)
     run_screener()
