@@ -30,8 +30,6 @@ MIN_ATR_PCT = 0.001
 # --- OUTPUT LIMITS & CONFLUENCE ---
 TOP_N_BUYERS = 15
 TOP_N_SELLERS = 15
-# Because the Blackout Grid requires 100% perfect alignment to even register a block, 
-# requiring 1 perfect block is extremely strict. 
 MIN_PERFECT_BLOCKS = 1 
 
 COLOR_GREEN_BG = '\033[42m\033[30m'  
@@ -155,26 +153,36 @@ def build_isolated_range_bars(df_1m, target_range):
 
     # Session Isolation: Group by Day to kill Overnight Gaps
     for date, group in df_1m.groupby('Date'):
+        opens = group['Open'].values
         closes = group['Close'].values
         highs = group['High'].values
         lows = group['Low'].values
         times = group['Datetime'].values
         
-        if len(closes) < 2: continue
+        if len(closes) == 0: continue
 
-        curr_O, curr_H, curr_L, curr_T = closes[0], highs[0], lows[0], times[0]
+        # FIXED: Start correctly from the OPEN of the session, not the close
+        curr_O, curr_H, curr_L, curr_T = opens[0], highs[0], lows[0], times[0]
+        curr_C = closes[0]
         raw_bars = []
 
         # Phase 1: Build Raw ATR Range Bars (Zero Lag)
-        for i in range(1, len(closes)):
+        for i in range(len(closes)):
             curr_H = max(curr_H, highs[i])
             curr_L = min(curr_L, lows[i])
             curr_C = closes[i]
 
             if (curr_H - curr_L) >= target_range:
                 raw_bars.append({'Datetime': curr_T, 'Open': curr_O, 'High': curr_H, 'Low': curr_L, 'Close': curr_C})
-                curr_O = curr_H = curr_L = curr_C
-                curr_T = times[i] if i < len(closes) - 1 else times[i]
+                curr_O = curr_C
+                curr_H = curr_C
+                curr_L = curr_C
+                curr_T = times[i+1] if i < len(closes) - 1 else times[i]
+
+        # FIXED: Core missing piece! Append the live, unclosed bar at the end of the day.
+        # This prevents falling back to yesterday's closing signal for strongly trending live charts.
+        if curr_H > curr_L: 
+            raw_bars.append({'Datetime': curr_T, 'Open': curr_O, 'High': curr_H, 'Low': curr_L, 'Close': curr_C})
 
         if not raw_bars: continue
         df_raw = pd.DataFrame(raw_bars)
@@ -187,7 +195,7 @@ def build_isolated_range_bars(df_1m, target_range):
         for i in range(1, len(df_raw)):
             ha_opens[i] = (ha_opens[i-1] + ha_closes.iloc[i-1]) / 2
 
-        df_raw['HA_Trend'] = np.where(ha_closes > ha_opens, 'Green', 'Red')
+        df_raw['HA_Trend'] = np.where(ha_closes >= ha_opens, 'Green', 'Red')
         all_bars.append(df_raw)
 
     if not all_bars: return pd.DataFrame()
@@ -263,7 +271,6 @@ def calculate_strict_signals(df):
     is_bull_aligned = ("Buy" in bb_rsi) and ("Buy" in bb_macd) and ("Buy" in adx_sig) and (ha_trend == 'Green')
     is_bear_aligned = ("Sell" in bb_rsi) and ("Sell" in bb_macd) and ("Sell" in adx_sig) and (ha_trend == 'Red')
 
-    # If the block isn't 100% perfectly aligned, it is SILENTLY blanked out.
     if is_bull_aligned: return bb_rsi, bb_macd, adx_sig, "BULL"
     elif is_bear_aligned: return bb_rsi, bb_macd, adx_sig, "BEAR"
     else: return "", "", "", "NONE"
@@ -272,13 +279,26 @@ def calculate_strict_signals(df):
 # 3. PIPELINE EXECUTOR & UI DRAWING
 # ==============================================================================
 def format_cell(text, width=10):
-    """Formats cells. If empty string is passed, renders empty space for the Blackout Grid."""
+    """
+    FIXED FORMATTING: Manually calculates left/right padding so ANSI color codes 
+    wrap strictly around the text, preventing terminal rendering engines from breaking alignment.
+    """
     if not text:
         return " " * width
+        
     text_str = str(text)
-    if "Buy" in text_str: return f"{COLOR_GREEN_BG}{text_str:^{width}}{COLOR_RESET}"
-    elif "Sell" in text_str: return f"{COLOR_RED_BG}{text_str:^{width}}{COLOR_RESET}"
-    return f"{text_str:^{width}}"
+    spaces = width - len(text_str)
+    left_pad = " " * (spaces // 2)
+    right_pad = " " * (spaces - (spaces // 2))
+    
+    if "Buy" in text_str: 
+        colored_text = f"{COLOR_GREEN_BG}{text_str}{COLOR_RESET}"
+    elif "Sell" in text_str: 
+        colored_text = f"{COLOR_RED_BG}{text_str}{COLOR_RESET}"
+    else:
+        colored_text = text_str
+        
+    return f"{left_pad}{colored_text}{right_pad}"
 
 def _filter_worker(item, filter_date):
     df = fetch_upstox_candles_for_date(item['key'], filter_date)
@@ -352,7 +372,6 @@ def run_screener():
         
     dashboard_data = [r for r in results if r is not None]
 
-    # Only keep stocks that have at least ONE perfectly aligned block
     bulls = [r for r in dashboard_data if r['PerfectBullBlocks'] >= MIN_PERFECT_BLOCKS]
     bears = [r for r in dashboard_data if r['PerfectBearBlocks'] >= MIN_PERFECT_BLOCKS]
 
@@ -368,13 +387,12 @@ def run_screener():
         if not data_list: return
         print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
         
-        # Build strict dynamic header
         header_str = f" {COLOR_CYAN}{'Script':<16} {'LTP':<8} |"
         for mult in HA_ATR_MULTIPLIERS:
             gtag = f"{mult}X"
             header_str += f"  {'BB-RSI '+gtag:^11} {'BB-MACD '+gtag:^12} {'ADX '+gtag:^9} |"
         
-        dash_len = len(header_str) - 8
+        dash_len = len(header_str) - 8 # Subtract length of ANSI escape sequences in header setup
         print(header_str + COLOR_RESET)
         print("-" * dash_len)
 
@@ -382,7 +400,6 @@ def run_screener():
             row_str = f" {row['Symbol']:<16} {row['LTP']:<8.2f} |"
             for mult in HA_ATR_MULTIPLIERS:
                 gtag = f"{mult}X"
-                # Formatting handles empty strings by printing clean spaces
                 bb_rsi_cell = format_cell(row[f'BB_RSI_{gtag}'], 11)
                 bb_macd_cell = format_cell(row[f'BB_MACD_{gtag}'], 12)
                 adx_cell = format_cell(row[f'ADX_{gtag}'], 9)
@@ -396,5 +413,6 @@ def run_screener():
 
 if __name__ == "__main__":
     if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
+        print(f"{COLOR_RED_FG}[!] Missing UPSTOX_ACCESS_TOKEN environment variable.{COLOR_RESET}")
         sys.exit(1)
     run_screener()
