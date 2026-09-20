@@ -407,4 +407,55 @@ def run_screener():
                 universe.append(item)
                 filter_cache[item['symbol']] = {filter_date: df}
 
-    print(f"✅ Target Universe ready ({
+    print(f"✅ Target Universe ready ({len(universe)} highly liquid Option Strikes). Computing technicals...\n")
+
+    work_items = [(item, trading_days, filter_cache.get(item['symbol'], {})) for item in universe]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=STOCK_WORKERS) as executor:
+        results = list(executor.map(process_stock, work_items))
+        
+    dashboard_data = [r for r in results if r is not None]
+
+    bulls = [r for r in dashboard_data if r['PerfectBullBlocks'] >= MIN_PERFECT_BLOCKS]
+    bears = [r for r in dashboard_data if r['PerfectBearBlocks'] >= MIN_PERFECT_BLOCKS]
+
+    bulls.sort(key=lambda x: (x['PerfectBullBlocks'], x['Score']), reverse=True)
+    bears.sort(key=lambda x: (x['PerfectBearBlocks'], abs(x['Score'])), reverse=True)
+
+    bulls = bulls[:TOP_N_BUYERS]
+    bears = bears[:TOP_N_SELLERS]
+
+    print(f"{COLOR_BOLD}=== STRICT INSTITUTIONAL VOLATILITY DASHBOARD [{TRADING_MODE}] ==={COLOR_RESET}\n")
+
+    def print_basket(title, icon, data_list):
+        if not data_list: return
+        print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
+        
+        header_str = f" {COLOR_CYAN}{'Options Strike':<22} {'LTP':<8} |"
+        for mult in HA_ATR_MULTIPLIERS:
+            gtag = f"{mult}X"
+            header_str += f"  {'BB-RSI '+gtag:^11} {'BB-MACD '+gtag:^12} {'BB-DI '+gtag:^9} |"
+        
+        dash_len = len(header_str) - 8 
+        print(header_str + COLOR_RESET)
+        print("-" * dash_len)
+
+        for row in data_list:
+            row_str = f" {row['Symbol']:<22} {row['LTP']:<8.2f} |"
+            for mult in HA_ATR_MULTIPLIERS:
+                gtag = f"{mult}X"
+                bb_rsi_cell = format_cell(row[f'BB_RSI_{gtag}'], 11)
+                bb_macd_cell = format_cell(row[f'BB_MACD_{gtag}'], 12)
+                adx_cell = format_cell(row[f'ADX_{gtag}'], 9)
+                row_str += f"  {bb_rsi_cell} {bb_macd_cell} {adx_cell} |"
+            print(row_str)
+
+    print_basket(f"TOP PREMIUM BUYERS (Pure Alignment >= {MIN_PERFECT_BLOCKS} Block)", "🔥", bulls)
+    print_basket(f"TOP PREMIUM SELLERS (Pure Alignment >= {MIN_PERFECT_BLOCKS} Block)", "🩸", bears)
+    
+    print(f"\n⏱️ Scan completed in {(time.time() - t_start):.2f} seconds.\n")
+
+if __name__ == "__main__":
+    if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
+        print(f"{COLOR_RED_FG}[!] Missing UPSTOX_ACCESS_TOKEN environment variable.{COLOR_RESET}")
+        sys.exit(1)
+    run_screener()
