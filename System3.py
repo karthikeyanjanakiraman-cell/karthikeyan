@@ -133,11 +133,11 @@ def get_dynamic_universe(mode, latest_day):
         universe = []
         
         index_config = {
-            "NIFTY": {"spot_key": "NSE_INDEX|Nifty 50", "step": 50},
-            "BANKNIFTY": {"spot_key": "NSE_INDEX|Nifty Bank", "step": 100},
-            "FINNIFTY": {"spot_key": "NSE_INDEX|Nifty Fin Service", "step": 50},
-            "MIDCPNIFTY": {"spot_key": "NSE_INDEX|NIFTY MID SELECT", "step": 25},
-            "SENSEX": {"spot_key": "BSE_INDEX|SENSEX", "step": 100}
+            "NIFTY": {"spot_key": "NSE_INDEX|Nifty 50", "step": 50, "match": ["NIFTY", "NIFTY 50"]},
+            "BANKNIFTY": {"spot_key": "NSE_INDEX|Nifty Bank", "step": 100, "match": ["BANKNIFTY", "NIFTY BANK"]},
+            "FINNIFTY": {"spot_key": "NSE_INDEX|Nifty Fin Service", "step": 50, "match": ["FINNIFTY", "NIFTY FIN SERVICE"]},
+            "MIDCPNIFTY": {"spot_key": "NSE_INDEX|NIFTY MID SELECT", "step": 25, "match": ["MIDCPNIFTY", "NIFTY MID SELECT"]},
+            "SENSEX": {"spot_key": "BSE_INDEX|SENSEX", "step": 100, "match": ["SENSEX", "BSE SENSEX"]}
         }
 
         print(f"🎯 Calculating ATM Strikes & Constructing Options Chain for {len(index_config)} Indices...\n")
@@ -156,40 +156,51 @@ def get_dynamic_universe(mode, latest_day):
             step = config["step"]
             atm_strike = int(round(spot_price / step) * step)
             
-            # Generate range of strikes (converted to integers for perfect matching)
+            # Generate range of strikes 
             target_strikes = [int(atm_strike + (i * step)) for i in range(-STRIKES_FROM_ATM, STRIKES_FROM_ATM + 1)]
             
-            # Bulletproof Options Filter: Handles missing underscores in JSON keys
+            # Bulletproof Options Filter: Direct API Tag validation
             idx_opts = []
+            valid_names = config["match"]
+            
             for item in all_data:
                 name = str(item.get("name", "")).upper()
-                # Check both tradingsymbol (JSON) and trading_symbol (CSV schema)
-                ts = str(item.get("tradingsymbol", item.get("trading_symbol", ""))).upper()
+                underlying = str(item.get("underlying_symbol", "")).upper()
+                inst_type = str(item.get("instrument_type", "")).upper()
                 
-                if (name == idx_name or ts.startswith(idx_name)) and (ts.endswith("CE") or ts.endswith("PE")):
-                    strike_val = item.get("strike", item.get("strike_price", 0))
+                # Verify it belongs to this index AND is mathematically flagged as an option
+                if (name in valid_names or underlying in valid_names) and inst_type in ["CE", "PE"]:
+                    strike_val = item.get("strike", item.get("strike_price"))
                     try:
                         if strike_val is not None:
                             strike = int(float(strike_val))
                             if strike > 0:
                                 item['clean_strike'] = strike
-                                item['clean_ts'] = ts
+                                item['clean_ts'] = str(item.get("tradingsymbol", item.get("trading_symbol", "")))
                                 idx_opts.append(item)
                     except (ValueError, TypeError):
                         continue
             
             if not idx_opts: 
-                print(f"   [!] {idx_name}: Could not find option chain using Trading Symbol match. Skipping.")
+                print(f"   [!] {idx_name}: Could not find option chain in JSON. Skipping.")
                 continue
                 
-            # Extract and Sort Expirations Chronologically
+            # Extract and Sort Expirations Chronologically (Handling Upstox Unix Timestamps)
             expiries_set = set(item.get("expiry") for item in idx_opts if item.get("expiry"))
             valid_expiries = []
             for e in expiries_set:
-                try: valid_expiries.append((datetime.strptime(e, "%Y-%m-%d"), e))
-                except: 
-                    try: valid_expiries.append((datetime.strptime(e, "%d-%b-%Y"), e))
-                    except: valid_expiries.append((datetime.max, e))
+                try:
+                    if isinstance(e, (int, float)) or (isinstance(e, str) and e.isdigit()):
+                        dt = datetime.fromtimestamp(int(e) / 1000.0)
+                        valid_expiries.append((dt, e))
+                    else:
+                        e_str = str(e).split('T')[0]
+                        try: valid_expiries.append((datetime.strptime(e_str, "%Y-%m-%d"), e))
+                        except: 
+                            try: valid_expiries.append((datetime.strptime(e_str, "%d-%b-%Y"), e))
+                            except: valid_expiries.append((datetime.max, e))
+                except:
+                    valid_expiries.append((datetime.max, e))
                     
             valid_expiries.sort(key=lambda x: x[0])
             unique_expiries = [x[1] for x in valid_expiries]
@@ -199,11 +210,13 @@ def get_dynamic_universe(mode, latest_day):
                 continue
             
             target_expiry = unique_expiries[EXPIRY_OFFSET]
+            target_dt = [x[0] for x in valid_expiries if x[1] == target_expiry][0]
+            expiry_str = target_dt.strftime("%d-%b-%Y") if target_dt != datetime.max else str(target_expiry)
             
             # Filter exact options based on calculated targets and chosen expiry
             matched_options = [opt for opt in idx_opts if opt.get("expiry") == target_expiry and opt.get("clean_strike") in target_strikes]
             
-            print(f"   => {idx_name:<10} | Spot: {spot_price:<8.2f} | ATM: {atm_strike:<6} | Expiry: {target_expiry} | Grabbed {len(matched_options)} CE/PE Contracts")
+            print(f"   => {idx_name:<10} | Spot: {spot_price:<8.2f} | ATM: {atm_strike:<6} | Expiry: {expiry_str} | Grabbed {len(matched_options)} CE/PE Contracts")
             
             for opt in matched_options:
                 universe.append({
@@ -412,8 +425,17 @@ def run_screener():
         return
 
     universe, filter_cache = [], {}
-    print(f"✅ Target Universe ready ({len(universe)} highly liquid Option Strikes). Computing technicals...\n")
+    print(f"🔄 Filtering {len(universe_raw)} Options Strikes for Minimum Premium (₹{OPT_MIN_PRICE}) & Liquidity...")
     
+    with concurrent.futures.ThreadPoolExecutor(max_workers=UNIVERSE_FILTER_WORKERS) as ex:
+        for result in ex.map(lambda it: _filter_worker(it, filter_date, latest_day), universe_raw):
+            if result is not None:
+                item, df = result
+                universe.append(item)
+                filter_cache[item['symbol']] = {filter_date: df}
+
+    print(f"✅ Target Universe ready ({len(universe)} highly liquid Option Strikes). Computing technicals...\n")
+
     work_items = [(item, trading_days, filter_cache.get(item['symbol'], {})) for item in universe]
     with concurrent.futures.ThreadPoolExecutor(max_workers=STOCK_WORKERS) as executor:
         results = list(executor.map(process_stock, work_items))
