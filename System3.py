@@ -92,8 +92,8 @@ def get_dynamic_universe(mode):
 
 def fetch_fyers_candles_for_date(instrument_key, date_str, retries=3):
     """Fetches 1-minute historical data seamlessly using FYERS API v3."""
-    client_id = os.environ.get("CLIENT_ID")
-    access_token = os.environ.get("ACCESS_TOKEN")
+    client_id = os.environ.get("FYERS_CLIENT_ID")
+    access_token = os.environ.get("FYERS_ACCESS_TOKEN")
     if not client_id or not access_token: 
         return None
 
@@ -425,7 +425,7 @@ def run_screener():
     print(f"\n⏱️ Scan completed in {(time.time() - t_start):.2f} seconds.\n")
 
 if __name__ == "__main__":
-    if not os.environ.get("CLIENT_ID") or not os.environ.get("ACCESS_TOKEN"):
+    if not os.environ.get("FYERS_CLIENT_ID") or not os.environ.get("FYERS_ACCESS_TOKEN"):
         print(f"{COLOR_RED_FG}[!] Missing CLIENT_ID or ACCESS_TOKEN environment variables.{COLOR_RESET}")
         sys.exit(1)
     run_screener()
