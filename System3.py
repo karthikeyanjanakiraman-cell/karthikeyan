@@ -23,7 +23,7 @@ TRADING_MODE = "INDEX_OPTIONS"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_O
 # --- OPTIONS CHAIN CONFIGURATION ---
 EXPIRY_OFFSET = 0          # 0 = Current (Nearest) Expiry, 1 = Next Expiry
 STRIKES_FROM_ATM = 5       # Generates ATM + 5 OTM + 5 ITM (Total 11 strikes per CE and PE)
-OPT_MIN_PRICE = 5          # Filter out worthless deep OTM options below ₹5
+OPT_MIN_PRICE = 30          # Filter out worthless deep OTM options below ₹5
 OPT_MIN_VOLUME = 10000     # Minimum volume for options liquidity
 
 # --- DECOUPLED HA-ATR ENGINE MULTIPLIERS ---
