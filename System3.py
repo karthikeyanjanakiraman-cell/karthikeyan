@@ -94,11 +94,9 @@ def fetch_upstox_candles_for_date(instrument_key, date_str, is_latest_day=False,
     encoded_key = urllib.parse.quote(instrument_key)
 
     urls_to_try = []
-    # If it is the latest trading session, try the intraday endpoint first to avoid after-hours gaps
+    # Intraday endpoint fallback to prevent weekend/after-hours gaps
     if is_latest_day:
         urls_to_try.append(f"https://api.upstox.com/v2/historical-candle/intraday/{encoded_key}/1minute")
-    
-    # Historical date-range fallback
     urls_to_try.append(f"https://api.upstox.com/v2/historical-candle/{encoded_key}/1minute/{date_str}/{date_str}")
 
     for url in urls_to_try:
@@ -111,11 +109,10 @@ def fetch_upstox_candles_for_date(instrument_key, date_str, is_latest_day=False,
                         c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
                         c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).dt.tz_localize(None)
                         
-                        # Filter to only the requested date if using intraday endpoint
                         if "intraday" in url:
                             c_df = c_df[c_df['Datetime'].dt.strftime("%Y-%m-%d") == date_str]
                             if c_df.empty:
-                                break  # Move to next URL fallback
+                                break  
                         
                         return c_df.sort_values('Datetime').reset_index(drop=True)
                 elif response.status_code == 429:
@@ -140,7 +137,7 @@ def get_past_trading_days(target_date_str, num_days=5):
         return []
 
 # ==============================================================================
-# 2. THE DECOUPLED HA-ATR ENGINE (WITH SESSION ISOLATION)
+# 2. THE DECOUPLED HA-ATR ENGINE (STRICT BOLLINGER BAND BREAKOUTS ONLY)
 # ==============================================================================
 def compute_base_atr(df_1m):
     resampled = df_1m.set_index('Datetime').resample(ATR_BASIS_TF).agg(
@@ -207,9 +204,12 @@ def build_isolated_range_bars(df_1m, target_range):
     return pd.concat(all_bars, ignore_index=True)
 
 def calculate_strict_signals(df):
+    """Calculates zero-lag momentum on Raw Bars, protected by the HA filter.
+       Requires strict Bollinger Band breakouts for RSI, MACD, +DI, and -DI."""
     if len(df) < 5:
         return "", "", "", "NONE"
 
+    # --- 1. RAW BB-RSI ---
     delta = df['Close'].diff()
     gain = delta.where(delta > 0, 0).ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
     loss = (-delta.where(delta < 0, 0)).ewm(alpha=1/RSI_PERIOD, adjust=False).mean()
@@ -220,6 +220,7 @@ def calculate_strict_signals(df):
     df['BB_Upper'] = df['RSI_SMA'] + (BB_STD * df['RSI_STD'])
     df['BB_Lower'] = df['RSI_SMA'] - (BB_STD * df['RSI_STD'])
 
+    # --- 2. RAW BB-MACD-HISTOGRAM ---
     ema_12 = df['Close'].ewm(span=12, adjust=False).mean()
     ema_26 = df['Close'].ewm(span=26, adjust=False).mean()
     df['MACD_Hist'] = (ema_12 - ema_26) - (ema_12 - ema_26).ewm(span=9, adjust=False).mean()
@@ -229,6 +230,7 @@ def calculate_strict_signals(df):
     df['MACD_BB_Upper'] = df['MACD_Hist_SMA'] + (BB_STD * df['MACD_Hist_STD'])
     df['MACD_BB_Lower'] = df['MACD_Hist_SMA'] - (BB_STD * df['MACD_Hist_STD'])
 
+    # --- 3. RAW BB-DI (+DI and -DI) ---
     df['up'] = df['High'].diff()
     df['down'] = df['Low'].shift(1) - df['Low']
     df['+DM'] = np.where((df['up'] > df['down']) & (df['up'] > 0), df['up'], 0)
@@ -242,28 +244,50 @@ def calculate_strict_signals(df):
     df['-DI'] = 100 * (df['-DM'].ewm(alpha=1/ADX_PERIOD, adjust=False).mean() / (atr + 1e-8))
     df['ADX'] = (100 * (df['+DI'] - df['-DI']).abs() / (df['+DI'] + df['-DI'] + 1e-8)).ewm(alpha=1/ADX_PERIOD, adjust=False).mean()
 
+    # Wrap Bollinger Bands around the +DI line
+    df['+DI_SMA'] = df['+DI'].rolling(BB_PERIOD, min_periods=1).mean()
+    df['+DI_STD'] = df['+DI'].rolling(BB_PERIOD, min_periods=1).std().fillna(0)
+    df['+DI_BB_Upper'] = df['+DI_SMA'] + (BB_STD * df['+DI_STD'])
+
+    # Wrap Bollinger Bands around the -DI line (Used for Sell breakouts)
+    df['-DI_SMA'] = df['-DI'].rolling(BB_PERIOD, min_periods=1).mean()
+    df['-DI_STD'] = df['-DI'].rolling(BB_PERIOD, min_periods=1).std().fillna(0)
+    df['-DI_BB_Upper'] = df['-DI_SMA'] + (BB_STD * df['-DI_STD'])
+
+    # --- 4. EXTRACT SIGNALS ---
     latest = df.iloc[-1]
     ha_trend = latest['HA_Trend']
 
+    # BB-RSI: STRICT BAND BREAKOUT ONLY
     bb_rsi = "Neutral"
-    if latest['RSI'] > latest['BB_Upper'] and latest['RSI_STD'] > 0: bb_rsi = "Buy+"
-    elif latest['RSI'] > 55: bb_rsi = "Buy"
-    elif latest['RSI'] < latest['BB_Lower'] and latest['RSI_STD'] > 0: bb_rsi = "Sell+"
-    elif latest['RSI'] < 45: bb_rsi = "Sell"
+    if latest['RSI_STD'] > 0:
+        if latest['RSI'] > latest['BB_Upper']:
+            bb_rsi = "Buy"
+        elif latest['RSI'] < latest['BB_Lower']:
+            bb_rsi = "Sell"
 
+    # BB-MACD: STRICT BAND BREAKOUT ONLY
     bb_macd = "Neutral"
-    if latest['MACD_Hist'] > latest['MACD_BB_Upper'] and latest['MACD_Hist_STD'] > 0: bb_macd = "Buy+"
-    elif latest['MACD_Hist'] > 0: bb_macd = "Buy"
-    elif latest['MACD_Hist'] < latest['MACD_BB_Lower'] and latest['MACD_Hist_STD'] > 0: bb_macd = "Sell+"
-    elif latest['MACD_Hist'] < 0: bb_macd = "Sell"
+    if latest['MACD_Hist_STD'] > 0:
+        if latest['MACD_Hist'] > latest['MACD_BB_Upper']:
+            bb_macd = "Buy"
+        elif latest['MACD_Hist'] < latest['MACD_BB_Lower']:
+            bb_macd = "Sell"
 
+    # BB-DI: STRICT BAND BREAKOUT ON THE DIRECTIONAL INDICATORS
     adx_sig = "Neutral"
-    if latest['ADX'] >= ADX_THRESHOLD:
-        if latest['+DI'] > latest['-DI']: adx_sig = "Buy"
-        elif latest['-DI'] > latest['+DI']: adx_sig = "Sell"
+    # Buy: +DI must pierce its Upper BB, +DI > -DI, and ADX >= 25
+    if latest['+DI_STD'] > 0 and latest['+DI'] > latest['+DI_BB_Upper'] and latest['+DI'] > latest['-DI'] and latest['ADX'] >= ADX_THRESHOLD:
+        adx_sig = "Buy"
+    # Sell: -DI must pierce its Upper BB, -DI > +DI, and ADX >= 25
+    elif latest['-DI_STD'] > 0 and latest['-DI'] > latest['-DI_BB_Upper'] and latest['-DI'] > latest['+DI'] and latest['ADX'] >= ADX_THRESHOLD:
+        adx_sig = "Sell"
 
-    is_bull_aligned = ("Buy" in bb_rsi) and ("Buy" in bb_macd) and ("Buy" in adx_sig) and (ha_trend == 'Green')
-    is_bear_aligned = ("Sell" in bb_rsi) and ("Sell" in bb_macd) and ("Sell" in adx_sig) and (ha_trend == 'Red')
+    # =========================================================================
+    # STRICT ALIGNMENT FILTER (BLACKOUT LOGIC)
+    # =========================================================================
+    is_bull_aligned = (bb_rsi == "Buy") and (bb_macd == "Buy") and (adx_sig == "Buy") and (ha_trend == 'Green')
+    is_bear_aligned = (bb_rsi == "Sell") and (bb_macd == "Sell") and (adx_sig == "Sell") and (ha_trend == 'Red')
 
     if is_bull_aligned: return bb_rsi, bb_macd, adx_sig, "BULL"
     elif is_bear_aligned: return bb_rsi, bb_macd, adx_sig, "BEAR"
@@ -281,9 +305,9 @@ def format_cell(text, width=10):
     left_pad = " " * (spaces // 2)
     right_pad = " " * (spaces - (spaces // 2))
     
-    if "Buy" in text_str: 
+    if text_str == "Buy": 
         colored_text = f"{COLOR_GREEN_BG}{text_str}{COLOR_RESET}"
-    elif "Sell" in text_str: 
+    elif text_str == "Sell": 
         colored_text = f"{COLOR_RED_BG}{text_str}{COLOR_RESET}"
     else:
         colored_text = text_str
@@ -339,10 +363,10 @@ def process_stock(args):
 
         if alignment == "BULL":
             row_data['PerfectBullBlocks'] += 1
-            row_data['Score'] += (bb_rsi.count('+') + bb_macd.count('+') + 1)
+            row_data['Score'] += 1 # Adds 1 point per perfect block
         elif alignment == "BEAR":
             row_data['PerfectBearBlocks'] += 1
-            row_data['Score'] -= (bb_rsi.count('+') + bb_macd.count('+') + 1)
+            row_data['Score'] -= 1
 
     return row_data
 
@@ -389,7 +413,7 @@ def run_screener():
     bulls = bulls[:TOP_N_BUYERS]
     bears = bears[:TOP_N_SELLERS]
 
-    print(f"{COLOR_BOLD}=== INSTITUTIONAL DECOUPLED HA-ATR DASHBOARD [{TRADING_MODE}] ==={COLOR_RESET}\n")
+    print(f"{COLOR_BOLD}=== STRICT INSTITUTIONAL VOLATILITY DASHBOARD [{TRADING_MODE}] ==={COLOR_RESET}\n")
 
     def print_basket(title, icon, data_list):
         if not data_list: return
@@ -398,7 +422,7 @@ def run_screener():
         header_str = f" {COLOR_CYAN}{'Script':<16} {'LTP':<8} |"
         for mult in HA_ATR_MULTIPLIERS:
             gtag = f"{mult}X"
-            header_str += f"  {'BB-RSI '+gtag:^11} {'BB-MACD '+gtag:^12} {'ADX '+gtag:^9} |"
+            header_str += f"  {'BB-RSI '+gtag:^11} {'BB-MACD '+gtag:^12} {'BB-DI '+gtag:^9} |"
         
         dash_len = len(header_str) - 8 
         print(header_str + COLOR_RESET)
@@ -424,3 +448,4 @@ if __name__ == "__main__":
         print(f"{COLOR_RED_FG}[!] Missing UPSTOX_ACCESS_TOKEN environment variable.{COLOR_RESET}")
         sys.exit(1)
     run_screener()
+    
