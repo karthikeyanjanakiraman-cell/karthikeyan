@@ -110,7 +110,7 @@ def get_past_trading_days(target_date_str, num_days=5):
         return []
 
 def get_dynamic_universe(mode, latest_day):
-    print(f"🔄 Downloading Live Exchange Master JSONs (NSE, NSE_FO, BSE_FO)...")
+    print(f"🔄 Downloading Live Exchange Master JSONs (NSE & BSE)...")
     
     def fetch_gz_json(url):
         resp = requests.get(url, timeout=15)
@@ -119,17 +119,17 @@ def get_dynamic_universe(mode, latest_day):
         return json.load(gzip.GzipFile(fileobj=io.BytesIO(resp.content)))
 
     try:
+        # All NSE Equities, Indices, and F&O are bundled in this single file
         nse_data = fetch_gz_json("https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz")
-        nfo_data = fetch_gz_json("https://assets.upstox.com/market-quote/instruments/exchange/NSE_FO.json.gz")
-        bfo_data = fetch_gz_json("https://assets.upstox.com/market-quote/instruments/exchange/BSE_FO.json.gz")
+        # All BSE Equities, Indices, and F&O are bundled in this single file
+        bse_data = fetch_gz_json("https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz")
     except Exception as e:
         print(f"{COLOR_RED_FG}[API Error] Failed to fetch Universe: {e}{COLOR_RESET}")
         return []
 
     if mode == "INDEX_OPTIONS":
         universe = []
-        # Merge NSE F&O and BSE F&O
-        all_fo_data = nfo_data + bfo_data
+        all_fo_data = nse_data + bse_data
         
         index_config = {
             "NIFTY": {"spot_key": "NSE_INDEX|Nifty 50", "step": 50},
@@ -158,12 +158,13 @@ def get_dynamic_universe(mode, latest_day):
             # Generate range of strikes (converted to integers for perfect matching)
             target_strikes = [int(atm_strike + (i * step)) for i in range(-STRIKES_FROM_ATM, STRIKES_FROM_ATM + 1)]
             
-            # Bulletproof Options Filter: Pure String Matching on the Trading Symbol in NFO/BFO
+            # Bulletproof Options Filter: Pure String Matching on the Trading Symbol
             idx_opts = []
             for item in all_fo_data:
                 name = str(item.get("name", "")).upper()
                 ts = str(item.get("trading_symbol", "")).upper()
                 
+                # Check if it starts with index name and ends with CE or PE
                 if (name == idx_name or ts.startswith(idx_name)) and (ts.endswith("CE") or ts.endswith("PE")):
                     strike_val = item.get("strike") or item.get("strike_price")
                     try:
@@ -211,7 +212,7 @@ def get_dynamic_universe(mode, latest_day):
         return universe
 
     # --- Standard Equity Execution below ---
-    fno_underlying = {item.get("underlying_symbol") for item in nfo_data if item.get("underlying_symbol")}
+    fno_underlying = {item.get("underlying_symbol") for item in nse_data if item.get("segment") == "NSE_FO" and item.get("underlying_symbol")}
     if mode == "STOCK_FNO":
         return [{"symbol": item["trading_symbol"], "key": item["instrument_key"]} for item in nse_data if item.get("segment") == "NSE_EQ" and item.get("trading_symbol") in fno_underlying]
     elif mode == "CASH_EQUITY":
