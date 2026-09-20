@@ -44,4 +44,7 @@ jobs:
         
         PARAM_BACKTEST_DATE: ${{ github.event.inputs.backtest_date }}
       run: |
-        python System3.py  
+        python System3.py
+        env:
+          CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
