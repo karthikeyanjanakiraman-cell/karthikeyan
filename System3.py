@@ -1,11 +1,11 @@
 import os
 import sys
 import argparse
-import time
 import urllib.parse
 import json
 import gzip
 import io
+import time
 from datetime import datetime, timedelta
 import concurrent.futures
 
@@ -58,78 +58,71 @@ STOCK_WORKERS = 10
 DAY_FETCH_WORKERS = 3
 
 # ==============================================================================
-# 1. FYERS API LIVE INGESTION & SETUP
+# 1. UPSTOX API LIVE INGESTION & SETUP
 # ==============================================================================
 def get_dynamic_universe(mode):
-    """Uses the reliable JSON feed to map the Universe, formatted for FYERS API."""
     nse_url = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
     try:
         response = requests.get(nse_url, timeout=10)
-        if response.status_code != 200: 
-            return []
-            
+        if response.status_code != 200: return []
         nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(response.content)))
 
         if mode == "INDEX_OPTIONS":
-            target_indices = {
-                "Nifty 50": "NSE:NIFTY50-INDEX", 
-                "Nifty Bank": "NSE:NIFTYBANK-INDEX", 
-                "Nifty Fin Service": "NSE:FINNIFTY-INDEX", 
-                "Nifty Mid Select": "NSE:MIDCPNIFTY-INDEX"
-            }
-            return [{"symbol": item["trading_symbol"], "key": target_indices[item["trading_symbol"]]}
+            target_indices = ["Nifty 50", "Nifty Bank", "Nifty Fin Service", "Nifty Mid Select"]
+            return [{"symbol": item["trading_symbol"], "key": item["instrument_key"]}
                     for item in nse_data if item.get("segment") == "NSE_INDEX" and item.get("trading_symbol") in target_indices]
 
         fno_underlying = {item.get("underlying_symbol") for item in nse_data if item.get("segment") == "NSE_FO" and item.get("underlying_symbol")}
 
         if mode == "STOCK_FNO":
-            return [{"symbol": item["trading_symbol"], "key": f"NSE:{item['trading_symbol']}-EQ"}
+            return [{"symbol": item["trading_symbol"], "key": item["instrument_key"]}
                     for item in nse_data if item.get("segment") == "NSE_EQ" and item.get("trading_symbol") in fno_underlying]
 
         elif mode == "CASH_EQUITY":
-            return [{"symbol": item["trading_symbol"], "key": f"NSE:{item['trading_symbol']}-EQ"}
+            return [{"symbol": item["trading_symbol"], "key": item["instrument_key"]}
                     for item in nse_data if item.get("segment") == "NSE_EQ" and item.get("trading_symbol") not in fno_underlying]
-                    
     except Exception as e:
         print(f"{COLOR_RED_FG}[API Error] Failed to fetch Universe: {e}{COLOR_RESET}")
         return []
 
-def fetch_fyers_candles_for_date(instrument_key, date_str, retries=3):
-    """Fetches 1-minute historical data seamlessly using FYERS API v3."""
-    client_id = os.environ.get("FYERS_CLIENT_ID")
-    access_token = os.environ.get("FYERS_ACCESS_TOKEN")
-    if not client_id or not access_token: 
+def fetch_upstox_candles_for_date(instrument_key, date_str, is_latest_day=False, retries=3):
+    access_token = os.environ.get("UPSTOX_ACCESS_TOKEN")
+    if not access_token: 
         return None
 
-    headers = {'Authorization': f"{client_id}:{access_token}"}
-    url = "https://api-t1.fyers.in/data/history"
-    
-    params = {
-        "symbol": instrument_key,
-        "resolution": "1",
-        "date_format": "1",
-        "range_from": date_str,
-        "range_to": date_str
-    }
+    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {access_token}'}
+    encoded_key = urllib.parse.quote(instrument_key)
 
-    for attempt in range(retries):
-        try:
-            response = requests.get(url, headers=headers, params=params, timeout=10)
-            if response.status_code == 200:
-                data = response.json()
-                if data.get("s") == "ok" and "candles" in data and len(data["candles"]) > 0:
-                    c_df = pd.DataFrame(data["candles"], columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume'])
-                    c_df['Datetime'] = pd.to_datetime(c_df['Timestamp'], unit='s', utc=True).dt.tz_convert('Asia/Kolkata').dt.tz_localize(None)
-                    return c_df.sort_values('Datetime').reset_index(drop=True)
-                else:
-                    return None
-            elif response.status_code == 429:
-                time.sleep(1.0 * (attempt + 1))
-            else:
-                return None
-        except Exception:
-            time.sleep(1.0)
-            
+    urls_to_try = []
+    # If it is the latest trading session, try the intraday endpoint first to avoid after-hours gaps
+    if is_latest_day:
+        urls_to_try.append(f"https://api.upstox.com/v2/historical-candle/intraday/{encoded_key}/1minute")
+    
+    # Historical date-range fallback
+    urls_to_try.append(f"https://api.upstox.com/v2/historical-candle/{encoded_key}/1minute/{date_str}/{date_str}")
+
+    for url in urls_to_try:
+        for attempt in range(retries):
+            try:
+                response = requests.get(url, headers=headers, timeout=10)
+                if response.status_code == 200:
+                    data = response.json().get('data', {}).get('candles', [])
+                    if data:
+                        c_df = pd.DataFrame(data, columns=['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume', 'OI'])
+                        c_df['Datetime'] = pd.to_datetime(c_df['Timestamp']).dt.tz_localize(None)
+                        
+                        # Filter to only the requested date if using intraday endpoint
+                        if "intraday" in url:
+                            c_df = c_df[c_df['Datetime'].dt.strftime("%Y-%m-%d") == date_str]
+                            if c_df.empty:
+                                break  # Move to next URL fallback
+                        
+                        return c_df.sort_values('Datetime').reset_index(drop=True)
+                elif response.status_code == 429:
+                    time.sleep(1.0 * (attempt + 1))
+            except Exception:
+                time.sleep(1.0)
+                
     return None
 
 def get_past_trading_days(target_date_str, num_days=5):
@@ -298,7 +291,7 @@ def format_cell(text, width=10):
     return f"{left_pad}{colored_text}{right_pad}"
 
 def _filter_worker(item, filter_date, latest_day):
-    df = fetch_fyers_candles_for_date(item['key'], filter_date)
+    df = fetch_upstox_candles_for_date(item['key'], filter_date, is_latest_day=(filter_date == latest_day))
     if df is not None and not df.empty:
         if MIN_PRICE <= df['Close'].iloc[-1] <= MAX_PRICE and df['Volume'].sum() >= MIN_DAILY_VOLUME:
             return item, df
@@ -312,7 +305,7 @@ def process_stock(args):
     fetched = []
     with concurrent.futures.ThreadPoolExecutor(max_workers=DAY_FETCH_WORKERS) as ex:
         futures = {
-            ex.submit(fetch_fyers_candles_for_date, item['key'], day): day 
+            ex.submit(fetch_upstox_candles_for_date, item['key'], day, is_latest_day=(day == latest_day)): day 
             for day in days_needed
         }
         for future in concurrent.futures.as_completed(futures):
@@ -325,6 +318,7 @@ def process_stock(args):
     
     master_1m = pd.concat(dfs, ignore_index=True).drop_duplicates(subset='Datetime').sort_values('Datetime').reset_index(drop=True)
     
+    # Data Integrity Guardrail
     if master_1m['Datetime'].dt.strftime("%Y-%m-%d").max() != latest_day:
         return None
 
@@ -359,7 +353,7 @@ def run_screener():
     filter_date = trading_days[-2] if len(trading_days) > 1 else trading_days[0]
 
     t_start = time.time()
-    print(f"\n{COLOR_CYAN}📡 Initializing Screener Pipeline [{TRADING_MODE}] via FYERS API...{COLOR_RESET}")
+    print(f"\n{COLOR_CYAN}📡 Initializing Screener Pipeline [{TRADING_MODE}] via UPSTOX API...{COLOR_RESET}")
     
     universe_raw = get_dynamic_universe(TRADING_MODE)
 
@@ -426,7 +420,7 @@ def run_screener():
     print(f"\n⏱️ Scan completed in {(time.time() - t_start):.2f} seconds.\n")
 
 if __name__ == "__main__":
-    if not os.environ.get("FYERS_CLIENT_ID") or not os.environ.get("FYERS_ACCESS_TOKEN"):
-        print(f"{COLOR_RED_FG}[!] Missing FYERS_CLIENT_ID or FYERS_ACCESS_TOKEN environment variables.{COLOR_RESET}")
+    if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
+        print(f"{COLOR_RED_FG}[!] Missing UPSTOX_ACCESS_TOKEN environment variable.{COLOR_RESET}")
         sys.exit(1)
     run_screener()
