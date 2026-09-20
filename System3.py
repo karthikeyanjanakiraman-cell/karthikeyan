@@ -1,6 +1,5 @@
 import os
 import sys
-import argparse
 import urllib.parse
 import json
 import gzip
@@ -24,8 +23,8 @@ TRADING_MODE = "INDEX_OPTIONS"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_O
 # --- OPTIONS CHAIN CONFIGURATION ---
 EXPIRY_OFFSET = 0          # 0 = Current (Nearest) Expiry, 1 = Next Expiry
 STRIKES_FROM_ATM = 5       # Generates ATM + 5 OTM + 5 ITM (Total 11 strikes per CE and PE)
-OPT_MIN_PRICE = 50          # Filter out worthless deep OTM options below ₹5
-OPT_MIN_VOLUME = 50000     # Minimum volume for options liquidity
+OPT_MIN_PRICE = 5          # Filter out worthless deep OTM options below ₹5
+OPT_MIN_VOLUME = 50000     # Minimum previous-day volume for options liquidity
 
 # --- DECOUPLED HA-ATR ENGINE MULTIPLIERS ---
 HA_ATR_MULTIPLIERS = [1, 2, 3, 5]     
@@ -59,7 +58,7 @@ ADX_PERIOD = 14
 ADX_THRESHOLD = 25
 
 # --- CONCURRENCY ---
-UNIVERSE_FILTER_WORKERS = 8
+UNIVERSE_FILTER_WORKERS = 10
 STOCK_WORKERS = 10
 DAY_FETCH_WORKERS = 3
 
@@ -121,9 +120,9 @@ def get_dynamic_universe(mode, latest_day):
 
     if mode == "INDEX_OPTIONS":
         universe = []
-        all_fo_data = [item for item in nse_data if item.get("instrument_type") == "OPTIDX"] + \
-                      [item for item in bse_data if item.get("instrument_type") == "OPTIDX"]
-
+        # Combine F&O segments across NSE and BSE
+        all_fo_data = [item for item in nse_data + bse_data if item.get("segment") in ["NSE_FO", "BFO", "BSE_FO"]]
+        
         index_config = {
             "NIFTY": {"spot_key": "NSE_INDEX|Nifty 50", "step": 50},
             "BANKNIFTY": {"spot_key": "NSE_INDEX|Nifty Bank", "step": 100},
@@ -132,17 +131,16 @@ def get_dynamic_universe(mode, latest_day):
             "SENSEX": {"spot_key": "BSE_INDEX|SENSEX", "step": 100}
         }
 
-        print(f"🎯 Calculating ATM Strikes & Constructing Options Chain for {len(index_config)} Indices...")
+        print(f"🎯 Calculating ATM Strikes & Constructing Options Chain for {len(index_config)} Indices...\n")
         
         for idx_name, config in index_config.items():
             # 1. Get exact current spot price
             spot_df = fetch_upstox_candles_for_date(config["spot_key"], latest_day, is_latest_day=True)
             if spot_df is None or spot_df.empty:
-                # Weekend fallback
                 spot_df = fetch_upstox_candles_for_date(config["spot_key"], get_past_trading_days(latest_day, 2)[-2])
             
             if spot_df is None or spot_df.empty:
-                print(f"   [!] Could not fetch spot price for {idx_name}. Skipping.")
+                print(f"   [!] {idx_name}: Could not fetch live spot price. Skipping.")
                 continue
                 
             spot_price = spot_df['Close'].iloc[-1]
@@ -150,20 +148,31 @@ def get_dynamic_universe(mode, latest_day):
             atm_strike = round(spot_price / step) * step
             
             # Generate range of strikes
-            target_strikes = [atm_strike + (i * step) for i in range(-STRIKES_FROM_ATM, STRIKES_FROM_ATM + 1)]
+            target_strikes = [float(atm_strike + (i * step)) for i in range(-STRIKES_FROM_ATM, STRIKES_FROM_ATM + 1)]
             
-            # Filter JSON for specific index
-            idx_opts = [item for item in all_fo_data if item.get("name") == idx_name]
-            if not idx_opts: continue
+            # Bulletproof option filtering: Look for strike > 0 instead of fragile instrument_type tags
+            idx_opts = [
+                item for item in all_fo_data 
+                if (item.get("name") == idx_name or item.get("underlying_symbol") == idx_name)
+                and float(item.get("strike", 0)) > 0
+            ]
+            
+            if not idx_opts: 
+                print(f"   [!] {idx_name}: Could not find option chain in master JSON. Skipping.")
+                continue
                 
             # Extract and sort expirations
             unique_expiries = sorted(list(set(item.get("expiry") for item in idx_opts if item.get("expiry"))))
-            if len(unique_expiries) <= EXPIRY_OFFSET: continue
+            if len(unique_expiries) <= EXPIRY_OFFSET: 
+                print(f"   [!] {idx_name}: Required expiry offset not available. Skipping.")
+                continue
             
             target_expiry = unique_expiries[EXPIRY_OFFSET]
             
-            # Filter exact options
-            matched_options = [opt for opt in idx_opts if opt.get("expiry") == target_expiry and opt.get("strike") in target_strikes]
+            # Filter exact options based on calculated targets
+            matched_options = [opt for opt in idx_opts if opt.get("expiry") == target_expiry and float(opt.get("strike", 0)) in target_strikes]
+            
+            print(f"   => {idx_name:<10} | Spot: {spot_price:<8.2f} | ATM: {atm_strike:<6} | Expiry: {target_expiry} | Grabbed {len(matched_options)} CE/PE Contracts")
             
             for opt in matched_options:
                 universe.append({
@@ -171,6 +180,7 @@ def get_dynamic_universe(mode, latest_day):
                     "key": opt.get("instrument_key")
                 })
         
+        print("\n")
         return universe
 
     # --- Standard Equity Execution below ---
@@ -184,7 +194,7 @@ def get_dynamic_universe(mode, latest_day):
 
 
 # ==============================================================================
-# 2. THE DECOUPLED HA-ATR ENGINE (STRICT BOLLINGER BAND BREAKOUTS ONLY)
+# 2. THE DECOUPLED HA-ATR ENGINE (STRICT BOLLINGER BAND BREAKOUTS)
 # ==============================================================================
 def compute_base_atr(df_1m):
     resampled = df_1m.set_index('Datetime').resample(ATR_BASIS_TF).agg({'Open': 'first', 'High': 'max', 'Low': 'min', 'Close': 'last'}).dropna().reset_index()
@@ -402,7 +412,6 @@ def run_screener():
         if not data_list: return
         print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
         
-        # Widened the Script column to 22 spaces to fit longer Option names neatly
         header_str = f" {COLOR_CYAN}{'Options Strike':<22} {'LTP':<8} |"
         for mult in HA_ATR_MULTIPLIERS:
             gtag = f"{mult}X"
