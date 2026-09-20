@@ -110,12 +110,18 @@ def get_past_trading_days(target_date_str, num_days=5):
         return []
 
 def get_dynamic_universe(mode, latest_day):
-    print(f"🔄 Downloading Live Exchange Master JSONs (NSE, NFO, BFO)...")
+    print(f"🔄 Downloading Live Exchange Master JSONs (NSE, NSE_FO, BSE_FO)...")
+    
+    def fetch_gz_json(url):
+        resp = requests.get(url, timeout=15)
+        if resp.status_code != 200:
+            raise Exception(f"HTTP {resp.status_code} for {url}")
+        return json.load(gzip.GzipFile(fileobj=io.BytesIO(resp.content)))
+
     try:
-        # We must pull NFO and BFO to get Options contracts!
-        nse_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(requests.get("https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz", timeout=15).content)))
-        nfo_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(requests.get("https://assets.upstox.com/market-quote/instruments/exchange/NFO.json.gz", timeout=15).content)))
-        bfo_data = json.load(gzip.GzipFile(fileobj=io.BytesIO(requests.get("https://assets.upstox.com/market-quote/instruments/exchange/BFO.json.gz", timeout=15).content)))
+        nse_data = fetch_gz_json("https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz")
+        nfo_data = fetch_gz_json("https://assets.upstox.com/market-quote/instruments/exchange/NSE_FO.json.gz")
+        bfo_data = fetch_gz_json("https://assets.upstox.com/market-quote/instruments/exchange/BSE_FO.json.gz")
     except Exception as e:
         print(f"{COLOR_RED_FG}[API Error] Failed to fetch Universe: {e}{COLOR_RESET}")
         return []
@@ -338,9 +344,11 @@ def format_cell(text, width=10):
 def _filter_worker(item, filter_date, latest_day):
     df = fetch_upstox_candles_for_date(item['key'], filter_date, is_latest_day=(filter_date == latest_day))
     if df is not None and not df.empty:
+        # Options specific filtering
         if TRADING_MODE == "INDEX_OPTIONS":
             if df['Close'].iloc[-1] >= OPT_MIN_PRICE and df['Volume'].sum() >= OPT_MIN_VOLUME:
                 return item, df
+        # Equity specific filtering
         elif MIN_PRICE <= df['Close'].iloc[-1] <= MAX_PRICE and df['Volume'].sum() >= MIN_DAILY_VOLUME:
             return item, df
     return None
