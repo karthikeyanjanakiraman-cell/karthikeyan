@@ -427,6 +427,5 @@ def run_screener():
 if __name__ == "__main__":
     if not os.environ.get("CLIENT_ID") or not os.environ.get("ACCESS_TOKEN"):
         print(f"{COLOR_RED_FG}[!] Missing CLIENT_ID or ACCESS_TOKEN environment variables.{COLOR_RESET}")
-        print(f"Please set them using: export CLIENT_ID='your_id' and export ACCESS_TOKEN='your_token'")
         sys.exit(1)
     run_screener()
