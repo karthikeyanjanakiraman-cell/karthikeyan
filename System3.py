@@ -19,7 +19,7 @@ warnings.filterwarnings("ignore")
 # ==============================================================================
 # 0. ENGINE CONSTANTS & CONFIGURATION
 # ==============================================================================
-TRADING_MODE = "STOCK_FNO"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
+TRADING_MODE = "CASH_EQUITY"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
 
 # --- DECOUPLED HA-ATR ENGINE MULTIPLIERS ---
 HA_ATR_MULTIPLIERS = [1, 2, 3, 5]     
