@@ -53,9 +53,9 @@ BACKTRACE_DAYS = 5
 # --- INDICATOR PERIODS ---
 RSI_PERIOD = 14
 BB_PERIOD = 20
-BB_STD = 1.5           # Set to 1.5 to catch heavy institutional volume impulses
+BB_STD = 1           # Set to 1.5 to catch heavy institutional volume impulses
 ADX_PERIOD = 14
-ADX_THRESHOLD = 25
+ADX_THRESHOLD = 20
 
 # --- CONCURRENCY ---
 UNIVERSE_FILTER_WORKERS = 10
