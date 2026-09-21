@@ -46,7 +46,7 @@ COLOR_RED_FG = '\033[91m'
 
 # --- EQUITY UNIVERSE FILTERING (Only applies if not in OPTIONS mode) ---
 MIN_PRICE = 50              
-MAX_PRICE = 10000           
+MAX_PRICE = 400           
 MIN_DAILY_VOLUME = 100000   
 BACKTRACE_DAYS = 5          
 
