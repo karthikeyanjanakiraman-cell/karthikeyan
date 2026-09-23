@@ -43,7 +43,7 @@ warnings.filterwarnings("ignore")
 # ==============================================================================
 # 0. ENGINE CONSTANTS & CONFIGURATION  (your values, unchanged)
 # ==============================================================================
-TRADING_MODE = "STOCK_FNO"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
+TRADING_MODE = "INDEX_OPTIONS"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
 
 # --- OPTIONS CHAIN CONFIGURATION ---
 EXPIRY_OFFSET = 0          # 0 = Current (Nearest) Expiry, 1 = Next Expiry
@@ -72,9 +72,9 @@ COLOR_YELLOW = '\033[93m'
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 
 # --- EQUITY UNIVERSE FILTERING (Only applies if not in OPTIONS mode) ---
-MIN_PRICE = 100
+MIN_PRICE = 50
 MAX_PRICE = 300
-MIN_DAILY_VOLUME = 1000000
+MIN_DAILY_VOLUME = 100000
 BACKTRACE_DAYS = 5
 
 # --- INDICATOR PERIODS ---
