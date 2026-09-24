@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """
 Strict Institutional Volatility Screener (Upstox) - v4  (SPEED rewrite, logic untouched).
++ Result ordering by distance beyond the Bollinger band (RSI, MACD histogram, +DI/-DI), in sigmas.
 
 WHY THE OLD VERSION TOOK HOURS
   Upstox caps historical-candle calls at 50/sec, 500/min and 2000 per 30 min. The old flow made
@@ -13,6 +14,8 @@ WHAT THIS VERSION DOES
   3. History = ONE multi-day call per stock (cached on disk for the day), live = ONE intraday call.
   4. A global limiter that respects 50/s, 500/min AND 2000/30-min (remembered across runs).
   5. Indicator math in numpy (same numbers as the pandas version) - ~4x less CPU.
+  6. Results are ordered by how far RSI / MACD-hist / DI have pushed past their Bollinger band
+     (buy: beyond the upper band, sell: beyond the lower band), shown in the "BB Δσ" column.
 
     export UPSTOX_ACCESS_TOKEN=...
     python screener_v4.py --mode CASH_EQUITY
@@ -61,6 +64,10 @@ MIN_ATR_PCT = 0.001
 TOP_N_BUYERS = 15
 TOP_N_SELLERS = 15
 MIN_PERFECT_BLOCKS = 1
+
+# --- RESULT ORDERING (distance beyond the Bollinger band, in sigmas) ---
+SORT_ASCENDING = True        # True = closest to the band first (fresh breakouts); False = most extended first
+SORT_BLOCKS_FIRST = False    # True = rank by number of aligned blocks first, then by distance
 
 COLOR_GREEN_BG = '\033[42m\033[30m'
 COLOR_RED_BG = '\033[41m\033[97m'
@@ -744,9 +751,13 @@ def _last_bb(series):
 
 
 def calculate_strict_signals(bars):
-    """Strict Bollinger-band breakouts for RSI, MACD-hist and +DI/-DI, protected by the HA filter."""
+    """
+    Strict Bollinger-band breakouts for RSI, MACD-hist and +DI/-DI, protected by the HA filter.
+    Returns (bb_rsi, bb_macd, adx_sig, alignment, dist) where `dist` is the average distance the
+    three band-tested indicators have pushed beyond their band, in sigmas (0.0 if not aligned).
+    """
     if bars is None or len(bars['Close']) < 5:
-        return "", "", "", "NONE"
+        return "", "", "", "NONE", 0.0
     close, high, low = bars['Close'], bars['High'], bars['Low']
     n = len(close)
 
@@ -800,9 +811,22 @@ def calculate_strict_signals(bars):
     is_bull = bb_rsi == "Buy" and bb_macd == "Buy" and adx_sig == "Buy" and ha_trend == 'Green'
     is_bear = bb_rsi == "Sell" and bb_macd == "Sell" and adx_sig == "Sell" and ha_trend == 'Red'
 
-    if is_bull: return bb_rsi, bb_macd, adx_sig, "BULL"
-    elif is_bear: return bb_rsi, bb_macd, adx_sig, "BEAR"
-    else: return "", "", "", "NONE"
+    # Distance beyond the band in sigmas (all stds are > 0 here, since a signal requires it).
+    if is_bull:
+        dist = np.mean([
+            (rsi[-1] - (r_mean + BB_STD * r_std)) / r_std,
+            (hist[-1] - (h_mean + BB_STD * h_std)) / h_std,
+            (plus_di[-1] - (p_mean + BB_STD * p_std)) / p_std,
+        ])
+        return bb_rsi, bb_macd, adx_sig, "BULL", float(dist)
+    if is_bear:
+        dist = np.mean([
+            ((r_mean - BB_STD * r_std) - rsi[-1]) / r_std,
+            ((h_mean - BB_STD * h_std) - hist[-1]) / h_std,
+            ((m_mean - BB_STD * m_std) - minus_di[-1]) / m_std,
+        ])
+        return bb_rsi, bb_macd, adx_sig, "BEAR", float(dist)
+    return "", "", "", "NONE", 0.0
 
 
 def compute_row(symbol, master_1m):
@@ -810,18 +834,23 @@ def compute_row(symbol, master_1m):
     base_atr = compute_base_atr(master_1m)
     sessions = split_sessions(master_1m)
     row = {'Symbol': symbol, 'LTP': float(master_1m['Close'].iloc[-1]), 'LastSession': master_1m['Session'].iloc[-1],
-           'Score': 0, 'PerfectBullBlocks': 0, 'PerfectBearBlocks': 0}
+           'Score': 0, 'PerfectBullBlocks': 0, 'PerfectBearBlocks': 0, 'BullDist': 0.0, 'BearDist': 0.0}
+    bull_d, bear_d = [], []
     for mult in HA_ATR_MULTIPLIERS:
         gtag = f"{mult}X"
         bars = build_isolated_range_bars(sessions, base_atr * mult)
-        bb_rsi, bb_macd, adx_sig, alignment = calculate_strict_signals(bars)
+        bb_rsi, bb_macd, adx_sig, alignment, dist = calculate_strict_signals(bars)
         row[f'BB_RSI_{gtag}'], row[f'BB_MACD_{gtag}'], row[f'ADX_{gtag}'] = bb_rsi, bb_macd, adx_sig
         if alignment == "BULL":
             row['PerfectBullBlocks'] += 1
             row['Score'] += 1
+            bull_d.append(dist)
         elif alignment == "BEAR":
             row['PerfectBearBlocks'] += 1
             row['Score'] -= 1
+            bear_d.append(dist)
+    row['BullDist'] = float(np.mean(bull_d)) if bull_d else 0.0
+    row['BearDist'] = float(np.mean(bear_d)) if bear_d else 0.0
     return row
 
 
@@ -972,8 +1001,17 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
 
     bulls = [r for r in dashboard_data if r['PerfectBullBlocks'] >= min_blocks]
     bears = [r for r in dashboard_data if r['PerfectBearBlocks'] >= min_blocks]
-    bulls.sort(key=lambda x: (x['PerfectBullBlocks'], x['Score']), reverse=True)
-    bears.sort(key=lambda x: (x['PerfectBearBlocks'], abs(x['Score'])), reverse=True)
+
+    # ---- Ordering: distance beyond the Bollinger band (sigmas) ----
+    # Buy  = how far RSI / MACD-hist / +DI sit ABOVE their upper band.
+    # Sell = how far RSI / MACD-hist / -DI sit BELOW their lower band.
+    sign = 1 if SORT_ASCENDING else -1
+
+    def order(blocks_key, dist_key):
+        return lambda r: ((-r[blocks_key]) if SORT_BLOCKS_FIRST else 0, sign * r[dist_key])
+
+    bulls.sort(key=order('PerfectBullBlocks', 'BullDist'))
+    bears.sort(key=order('PerfectBearBlocks', 'BearDist'))
     bulls, bears = bulls[:TOP_N_BUYERS], bears[:TOP_N_SELLERS]
 
     print(f"{COLOR_BOLD}=== STRICT INSTITUTIONAL VOLATILITY DASHBOARD [{mode}] ==={COLOR_RESET}")
@@ -982,13 +1020,14 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
     sym_title = "Options Strike" if mode == "INDEX_OPTIONS" else "Script"
     prem = "PREMIUM " if mode == "INDEX_OPTIONS" else ""
 
-    def print_basket(title, icon, data_list):
+    def print_basket(title, icon, data_list, dist_key):
         if not data_list: return
         print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
         header_str = f" {COLOR_CYAN}{sym_title:<22} {'LTP':<8} |"
         for mult in HA_ATR_MULTIPLIERS:
             gtag = f"{mult}X"
             header_str += f"  {'BB-RSI ' + gtag:^11} {'BB-MACD ' + gtag:^12} {'BB-DI ' + gtag:^9} |"
+        header_str += f" {'BB Δσ':>7}"
         print(header_str + COLOR_RESET)
         print("-" * len(ANSI_RE.sub("", header_str)))
         for row in data_list:
@@ -998,10 +1037,11 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
                 row_str += (f"  {format_cell(row[f'BB_RSI_{gtag}'], 11)}"
                             f" {format_cell(row[f'BB_MACD_{gtag}'], 12)}"
                             f" {format_cell(row[f'ADX_{gtag}'], 9)} |")
+            row_str += f" {row[dist_key]:>7.2f}"
             print(row_str)
 
-    print_basket(f"TOP {prem}BUYERS (Pure Alignment >= {min_blocks} Block)", "🔥", bulls)
-    print_basket(f"TOP {prem}SELLERS (Pure Alignment >= {min_blocks} Block)", "🩸", bears)
+    print_basket(f"TOP {prem}BUYERS (Pure Alignment >= {min_blocks} Block)", "🔥", bulls, 'BullDist')
+    print_basket(f"TOP {prem}SELLERS (Pure Alignment >= {min_blocks} Block)", "🩸", bears, 'BearDist')
     if not bulls and not bears:
         print(f"{COLOR_YELLOW}No instrument has a perfectly aligned block right now.{COLOR_RESET}")
     if STATS.failed:
