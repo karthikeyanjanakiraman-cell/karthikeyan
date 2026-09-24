@@ -57,7 +57,7 @@ OPT_MIN_VOLUME = 10000
 # --- DECOUPLED HA-ATR ENGINE MULTIPLIERS ---
 HA_ATR_MULTIPLIERS = [1, 2, 3, 5]
 ATR_BASIS_PERIOD = 14
-ATR_BASIS_TF = "15min"     # (15-minute buckets are hard-wired in the numpy ATR)
+ATR_BASIS_TF = "240min"     # (15-minute buckets are hard-wired in the numpy ATR)
 MIN_ATR_PCT = 0.001
 
 # --- OUTPUT LIMITS & CONFLUENCE ---
