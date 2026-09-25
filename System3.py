@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-Strict Institutional Volatility Screener (Upstox) - STATELESS EDITION
+Strict Institutional Volatility Screener (Upstox) - STATELESS INTRADAY EDITION
 + Zero Disk Caching (100% Live API fetches)
-+ Prime Sorting: BB/KC Crossover (TTM Squeeze) Fresh Breakouts
++ 1X Mandatory Anchor Rule (No hollow core breakouts)
++ Two-Tier Prime Sorting: Confluence (Blocks) -> Freshness (BB/KC % Crossover)
++ High-Res Intraday Optimizations (1-min candles, 15-min ATR baseline)
 """
 import os
 import sys
@@ -40,7 +42,7 @@ OPT_MIN_VOLUME = 10000
 # --- DECOUPLED HA-ATR ENGINE MULTIPLIERS ---
 HA_ATR_MULTIPLIERS = [1, 2, 3, 5]
 ATR_BASIS_PERIOD = 14
-ATR_BASIS_TF = "240min"     
+ATR_BASIS_TF = "15min"      # 15-minute baseline for Intraday Institutional Volume
 MIN_ATR_PCT = 0.001
 
 # --- OUTPUT LIMITS & CONFLUENCE ---
@@ -61,7 +63,7 @@ ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 MIN_PRICE = 100
 MAX_PRICE = 5000
 MIN_DAILY_VOLUME = 100000
-BACKTRACE_DAYS = 120       # 120 Days for Swing Trading
+BACKTRACE_DAYS = 30        # Reduced for pure intraday speed
 
 # --- INDICATOR PERIODS ---
 RSI_PERIOD = 14
@@ -92,12 +94,10 @@ SESSION_CLOSE_MIN = 15 * 60 + 30
 def now_ist():
     return datetime.now(IST).replace(tzinfo=None)
 
-
 def market_is_open():
     n = now_ist()
     m = n.hour * 60 + n.minute
     return n.weekday() < 5 and SESSION_OPEN_MIN <= m < SESSION_CLOSE_MIN
-
 
 class BudgetLimiter:
     """In-memory sliding window rate limiter. Loses history on script exit."""
@@ -143,7 +143,6 @@ class BudgetLimiter:
                       f"waiting {notice[1]:.0f}s to stay under the cap...", file=sys.stderr, flush=True)
             time.sleep(min(wait, 1.0) + 0.005)
 
-
 class FetchStats:
     def __init__(self):
         self.lock = threading.Lock()
@@ -158,7 +157,6 @@ class FetchStats:
         with self.lock:
             self.auth_failed = True
 
-
 STATS = FetchStats()
 LIMITERS = {
     "quotes": BudgetLimiter(RATE_CAPS),
@@ -168,14 +166,12 @@ LIMITERS = {
 LIMITER = LIMITERS["history"]   
 _TLS = threading.local()
 
-
 def _limiter_for(url):
     if "market-quote/quotes" in url:
         return LIMITERS["quotes"]
     if "/intraday/" in url:
         return LIMITERS["intraday"]
     return LIMITERS["history"]
-
 
 def _session():
     s = getattr(_TLS, "s", None)
@@ -184,7 +180,6 @@ def _session():
         s.mount("https://", HTTPAdapter(pool_connections=2, pool_maxsize=2))
         _TLS.s = s
     return s
-
 
 class Progress:
     def __init__(self, label, total):
@@ -200,7 +195,6 @@ class Progress:
 
     def done(self):
         print("", file=sys.stderr)
-
 
 # ==============================================================================
 # 1. UPSTOX API: quotes, candles, universe & dynamic options strikes
@@ -235,7 +229,6 @@ def _get(url, params=None, retries=4):
     STATS.fail()
     return 0, None
 
-
 def _to_frame(candles):
     if not candles:
         return None
@@ -254,36 +247,29 @@ def _to_frame(candles):
             .sort_values('Datetime').reset_index(drop=True))
     return df if not df.empty else None
 
-
 def _candles(url):
     status, js = _get(url)
     if status != 200 or not js:
         return status, None
     return 200, _to_frame((js.get('data') or {}).get('candles') or [])
 
-
 def _url_range(key, start, end):       
     return (f"{API_HOST}/v2/historical-candle/{urllib.parse.quote(key)}/day/"
             f"{end:%Y-%m-%d}/{start:%Y-%m-%d}")
 
-
 def _url_intraday(key):
+    # INTRADAY OPTIMIZATION: Switched to /1minute for precise range bar resolution
     return f"{API_HOST}/v2/historical-candle/intraday/{urllib.parse.quote(key)}/1minute"
 
-
 def _date_chunks(start, end, span=365):
-    """Daily fetch permits up to 365 days per API call."""
     cur = end
     while cur >= start:
         c_start = max(start, cur - timedelta(days=span - 1))
         yield c_start, cur
         cur = c_start - timedelta(days=1)
 
-
 def fetch_quotes(items, batch=200):
-    """Batch size locked to 200 to prevent HTTP 414 URI Too Long errors."""
     batches = [items[i:i + batch] for i in range(0, len(items), batch)]
-
     def one(b):
         status, js = _get(f"{API_HOST}/v2/market-quote/quotes",
                           params={"instrument_key": ",".join(x['key'] for x in b)})
@@ -304,7 +290,6 @@ def fetch_quotes(items, batch=200):
             res.update(part)
     return res
 
-
 def fetch_today(key):
     if now_ist().weekday() >= 5:
         return None
@@ -314,9 +299,7 @@ def fetch_today(key):
     df = df[df['Datetime'].dt.date == now_ist().date()]     
     return df if not df.empty else None
 
-
 BASE_COLS = ['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume']
-
 
 def prepare_master(dfs):
     master = (pd.concat([d[BASE_COLS] for d in dfs], ignore_index=True)
@@ -329,11 +312,9 @@ def prepare_master(dfs):
     master['Session'] = day.dt.date
     return master
 
-
 def keep_last_sessions(master, days):
     sessions = sorted(master['Session'].unique())[-days:]
     return master[master['Session'].isin(sessions)].reset_index(drop=True)
-
 
 def load_history(item, start, end, days):
     frames = []
@@ -350,7 +331,6 @@ def load_history(item, start, end, days):
         return None
     return hist
 
-
 # ---------------- universe -----------------------------------------------------
 INDEX_CONFIG = {
     "NIFTY": {"spot_key": "NSE_INDEX|Nifty 50", "step": 50, "match": ["NIFTY", "NIFTY 50"]},
@@ -359,7 +339,6 @@ INDEX_CONFIG = {
     "MIDCPNIFTY": {"spot_key": "NSE_INDEX|NIFTY MID SELECT", "step": 25, "match": ["MIDCPNIFTY", "NIFTY MID SELECT"]},
     "SENSEX": {"spot_key": "BSE_INDEX|SENSEX", "step": 100, "match": ["SENSEX", "BSE SENSEX"]},
 }
-
 
 def _download_master(name):
     url = f"https://assets.upstox.com/market-quote/instruments/exchange/{name}.json.gz"
@@ -372,7 +351,6 @@ def _download_master(name):
             print(f"{COLOR_RED_FG}[API Error] {name} master attempt {attempt + 1}: {e}{COLOR_RESET}")
         time.sleep(1.0 * (attempt + 1))
     return None
-
 
 def _equity_universe(mode):
     print("🔄 Downloading NSE instrument master Live...")
@@ -394,7 +372,6 @@ def _equity_universe(mode):
         rows = [i for i in nse if plain(i) and ts_of(i) not in fno]
     universe = list({i["instrument_key"]: {"symbol": ts_of(i), "key": i["instrument_key"]} for i in rows}.values())
     return universe
-
 
 def _option_master():
     print("🔄 Downloading NSE & BSE instrument masters Live...")
@@ -425,7 +402,6 @@ def _option_master():
                              "key": item.get("instrument_key")})
     return out
 
-
 def _parse_expiry(e):
     try:
         if isinstance(e, (int, float)) or (isinstance(e, str) and e.isdigit()):
@@ -439,7 +415,6 @@ def _parse_expiry(e):
     except Exception:
         pass
     return datetime.max
-
 
 def _options_universe():
     opt_master = _option_master()
@@ -490,14 +465,12 @@ def _options_universe():
     print("\n")
     return universe
 
-
 def get_dynamic_universe(mode):
     if mode == "INDEX_OPTIONS":
         return _options_universe()
     if mode in ("STOCK_FNO", "CASH_EQUITY"):
         return _equity_universe(mode)
     return []
-
 
 # ==============================================================================
 # 2. THE DECOUPLED HA-ATR ENGINE 
@@ -506,7 +479,9 @@ def compute_base_atr(m):
     hi, lo, cl = m['High'].values, m['Low'].values, m['Close'].values
     sid, mins = m['SessId'].values, m['Min'].values
 
-    bucket = sid * 100 + mins // 15
+    # Uses the configured ATR_BASIS_TF (now 15min)
+    tf_minutes = int(ATR_BASIS_TF.replace("min", ""))
+    bucket = sid * 100 + mins // tf_minutes
     starts = np.concatenate(([0], np.flatnonzero(np.diff(bucket)) + 1))
     ends = np.concatenate((starts[1:], [len(bucket)])) - 1
     b_high = np.maximum.reduceat(hi, starts)
@@ -520,7 +495,6 @@ def compute_base_atr(m):
     atr = float(tr[-ATR_BASIS_PERIOD:].mean())
     return max(atr, b_close[-1] * MIN_ATR_PCT, 0.01)
 
-
 def split_sessions(m):
     sid = m['SessId'].values
     cuts = np.flatnonzero(np.diff(sid)) + 1
@@ -528,7 +502,6 @@ def split_sessions(m):
     ends = np.concatenate((cuts, [len(sid)]))
     o, h, l, c = (m[k].tolist() for k in ('Open', 'High', 'Low', 'Close'))
     return [(o[s:e], h[s:e], l[s:e], c[s:e]) for s, e in zip(starts, ends)]
-
 
 def build_isolated_range_bars(sessions, target_range):
     B_O, B_H, B_L, B_C = [], [], [], []
@@ -565,7 +538,6 @@ def build_isolated_range_bars(sessions, target_range):
 
     return {'High': np.asarray(B_H), 'Low': np.asarray(B_L), 'Close': np.asarray(B_C), 'HA_Trend': ha_trend}
 
-
 def _ewm(x, alpha):
     xs = x.tolist()
     out = [0.0] * len(xs)
@@ -577,14 +549,11 @@ def _ewm(x, alpha):
         out[i] = prev
     return np.asarray(out)
 
-
 def _last_bb(series):
-    """Mean/std of the latest rolling window. ddof=0 matches True charting platforms."""
     w = series[-BB_PERIOD:]
     mean = float(w.mean())
     std = float(w.std(ddof=0)) if len(w) > 1 else 0.0
     return mean, std
-
 
 def calculate_strict_signals(bars):
     if bars is None or len(bars['Close']) < 5:
@@ -592,26 +561,22 @@ def calculate_strict_signals(bars):
     close, high, low = bars['Close'], bars['High'], bars['Low']
     n = len(close)
 
-    # --- RSI ---
     delta = np.diff(close, prepend=close[0])
     gain = _ewm(np.where(delta > 0, delta, 0.0), 1 / RSI_PERIOD)
     loss = _ewm(np.where(delta < 0, -delta, 0.0), 1 / RSI_PERIOD)
     rsi = 100 - (100 / (1 + (gain / (loss + 1e-8))))
     r_mean, r_std = _last_bb(rsi)
 
-    # --- MACD histogram ---
     macd = _ewm(close, 2 / 13) - _ewm(close, 2 / 27)
     hist = macd - _ewm(macd, 2 / 10)
     h_mean, h_std = _last_bb(hist)
 
-    # --- +DI / -DI / ADX ---
     up = np.zeros(n); down = np.zeros(n)
     up[1:] = high[1:] - high[:-1]
     down[1:] = low[:-1] - low[1:]
     plus_dm = np.where((up > down) & (up > 0), up, 0.0)
     minus_dm = np.where((down > up) & (down > 0), down, 0.0)
     
-    # Fix Memory Issue: .copy() prevents 'assignment destination is read-only' crash
     tr = (high - low).copy()
     tr[1:] = np.maximum(tr[1:], np.maximum(np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])))
 
@@ -623,7 +588,6 @@ def calculate_strict_signals(bars):
     p_mean, p_std = _last_bb(plus_di)
     m_mean, m_std = _last_bb(minus_di)
 
-    # --- signals ---
     bb_rsi = "Neutral"
     if r_std > 0:
         if rsi[-1] > r_mean + BB_STD * r_std: bb_rsi = "Buy"
@@ -652,12 +616,10 @@ def calculate_strict_signals(bars):
 
 
 def compute_row(symbol, master_1m):
-    # Prime Sorter Math: Bollinger Bands vs. Keltner Channels (TTM Squeeze Overlay)
     close = master_1m['Close'].values
     high = master_1m['High'].values
     low = master_1m['Low'].values
     
-    # 20-Period Overlays
     sma20 = pd.Series(close).rolling(20, min_periods=1).mean().values
     std20 = pd.Series(close).rolling(20, min_periods=1).std(ddof=0).values
     
@@ -671,8 +633,9 @@ def compute_row(symbol, master_1m):
     kc_upper = sma20[-1] + 1.5 * atr20[-1]
     kc_lower = sma20[-1] - 1.5 * atr20[-1]
     
-    bull_bb_kc_delta = float(bb_upper - kc_upper)
-    bear_bb_kc_delta = float(kc_lower - bb_lower)
+    # PERCENTAGE DELTA MATH (Normalizing output to a percentage scale instead of raw rupees)
+    bull_bb_kc_delta = float((bb_upper - kc_upper) / kc_upper * 100) if kc_upper > 0 else 0.0
+    bear_bb_kc_delta = float((kc_lower - bb_lower) / kc_lower * 100) if kc_lower > 0 else 0.0
 
     base_atr = compute_base_atr(master_1m)
     sessions = split_sessions(master_1m)
@@ -693,7 +656,6 @@ def compute_row(symbol, master_1m):
             row['Score'] -= 1
     
     return row
-
 
 # ==============================================================================
 # 3. PIPELINE EXECUTOR & UI DRAWING
@@ -736,7 +698,6 @@ def _history_worker(args):
         hist = load_history(item, start, end, days)
         if hist is None or hist.empty:
             return None
-        # Verify volume using total fetched volume to fix 0DTE bug
         close, vol = hist['Close'].iloc[-1], hist['Volume'].sum()
         if mode == "INDEX_OPTIONS":
             ok = close >= OPT_MIN_PRICE and vol >= OPT_MIN_VOLUME
@@ -787,7 +748,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
     end = now_ist().date() - timedelta(days=1)
     start = end - timedelta(days=days * 2 + 6)
 
-    # ---- Stage 0: batch-quote price pre-filter (equities) ----
     candidates = universe_raw
     if mode != "INDEX_OPTIONS":
         candidates = prefilter_by_quotes(universe_raw)
@@ -797,7 +757,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
             print(f"{COLOR_RED_FG}[Auth Error] Upstox rejected the token (401). Refresh UPSTOX_ACCESS_TOKEN.{COLOR_RESET}")
             return
 
-    # ---- Stage 1: history (Live Fetch) + exact volume/price filter ----
     what = "Options Strikes for Minimum Premium & Liquidity" if mode == "INDEX_OPTIONS" \
         else "stocks for Volume & Price constraints"
     print(f"🔄 Fetching Live History for {len(candidates)} {what}...  [{_eta(len(candidates))}]")
@@ -817,7 +776,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
     print(f"✅ Target Universe ready ({len(stage1)} {liq}). Fetching live candles "
           f"[{len(stage1)} calls, {_eta(len(stage1))}; {LIMITER.used(1800)}/{RATE_CAPS[-1][1]} used in last 30 min]...\n")
 
-    # ---- Stage 2: today's candles (1 call each) + indicators ----
     prog = Progress("signals", len(stage1))
     work = [(item, hist, days, prog) for item, hist in stage1]
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
@@ -831,19 +789,27 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
     latest_session = max(r['LastSession'] for r in results)         
     dashboard_data = [r for r in results if r['LastSession'] == latest_session]
 
-    bulls = [r for r in dashboard_data if r['PerfectBullBlocks'] >= min_blocks]
-    bears = [r for r in dashboard_data if r['PerfectBearBlocks'] >= min_blocks]
+    # THE 1X ANCHOR RULE (Mandatory alignment on lowest timeframe)
+    bulls = [r for r in dashboard_data if r['PerfectBullBlocks'] >= min_blocks 
+             and r.get('BB_RSI_1X') == 'Buy' 
+             and r.get('BB_MACD_1X') == 'Buy' 
+             and r.get('ADX_1X') == 'Buy']
+             
+    bears = [r for r in dashboard_data if r['PerfectBearBlocks'] >= min_blocks 
+             and r.get('BB_RSI_1X') == 'Sell' 
+             and r.get('BB_MACD_1X') == 'Sell' 
+             and r.get('ADX_1X') == 'Sell']
 
-    # ---- PRIME SORTING: BB/KC Fresh Breakout priority ----
-    # Category 0 (Fresh): BB-KC Δ > 0.00 -> Sorted Ascending (smallest positive first)
-    # Category 1 (Squeeze): BB-KC Δ <= 0.00 -> Pushed to bottom, sorted closest to zero
+    # TWO-TIER PRIME SORTING: 1. Perfect Blocks (Descending) -> 2. Freshness % (Ascending, >0.00 first)
     def order_bull(r):
         d = r['Bull_BB_KC_Delta']
-        return (0, d) if d > 0 else (1, -d)
+        tier2 = d if d > 0 else float('inf') # Force non-breakouts (inside squeeze) to bottom
+        return (-r['PerfectBullBlocks'], tier2)
 
     def order_bear(r):
         d = r['Bear_BB_KC_Delta']
-        return (0, d) if d > 0 else (1, -d)
+        tier2 = d if d > 0 else float('inf')
+        return (-r['PerfectBearBlocks'], tier2)
 
     bulls.sort(key=order_bull)
     bears.sort(key=order_bear)
@@ -863,24 +829,26 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
         for mult in HA_ATR_MULTIPLIERS:
             gtag = f"{mult}X"
             header_str += f"  {'BB-RSI ' + gtag:^11} {'BB-MACD ' + gtag:^12} {'BB-DI ' + gtag:^9} |"
-        header_str += f" {'BB-KC Δ':>7}"
+        header_str += f" {'BB-KC Δ%':>8}"
         print(header_str + COLOR_RESET)
         print("-" * len(ANSI_RE.sub("", header_str)))
         for row in data_list:
             row_str = f" {row['Symbol']:<22} {row['LTP']:<8.2f} |"
             for mult in HA_ATR_MULTIPLIERS:
                 gtag = f"{mult}X"
-                row_str += (f"  {format_cell(row[f'BB_RSI_{gtag}'], 11)}"
-                            f" {format_cell(row[f'BB_MACD_{gtag}'], 12)}"
-                            f" {format_cell(row[f'ADX_{gtag}'], 9)} |")
-            row_str += f" {row[dist_key]:>7.2f}"
+                row_str += (f"  {format_cell(row.get(f'BB_RSI_{gtag}'), 11)}"
+                            f" {format_cell(row.get(f'BB_MACD_{gtag}'), 12)}"
+                            f" {format_cell(row.get(f'ADX_{gtag}'), 9)} |")
+            val = row[dist_key]
+            val_str = f"{val:>7.2f}%" if val > 0 else f"{val:>7.2f}%"
+            row_str += f" {val_str}"
             print(row_str)
 
     print_basket(f"TOP {prem}BUYERS (Freshest BB/KC Breakouts Sorted First)", "🔥", bulls, 'Bull_BB_KC_Delta')
     print_basket(f"TOP {prem}SELLERS (Freshest BB/KC Breakdowns Sorted First)", "🩸", bears, 'Bear_BB_KC_Delta')
     
     if not bulls and not bears:
-        print(f"{COLOR_YELLOW}No instrument has a perfectly aligned block right now.{COLOR_RESET}")
+        print(f"{COLOR_YELLOW}No instrument has a perfectly aligned block (with active 1X Anchor) right now.{COLOR_RESET}")
     if STATS.failed:
         print(f"\n{COLOR_YELLOW}⚠️ {STATS.failed} request(s) failed after retries; results may be incomplete.{COLOR_RESET}")
 
@@ -888,14 +856,12 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
     print(f"\n⏱️ Scan completed in {(time.time() - t_start):.2f} seconds "
           f"({total_calls} API calls this run).\n")
 
-
 def parse_args():
     p = argparse.ArgumentParser(description="Strict institutional volatility screener (Upstox)")
     p.add_argument("--mode", choices=["STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"], default=TRADING_MODE)
     p.add_argument("--days", type=int, default=BACKTRACE_DAYS, help="trading sessions of history (min 2)")
     p.add_argument("--min-blocks", type=int, default=MIN_PERFECT_BLOCKS)
     return p.parse_args()
-
 
 if __name__ == "__main__":
     if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
