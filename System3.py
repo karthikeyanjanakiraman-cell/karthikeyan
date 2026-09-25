@@ -48,9 +48,10 @@ MIN_ATR_PCT = 0.001
 # --- CLEAN-SURGE / DIRTY-BLOCK AUDIT ---
 # While a range block is being built from 1-minute candles, track the worst move
 # against the emerging trend (peak->trough for an up-move, trough->peak for a
-# down-move). If that internal reverse move reaches this fraction of the Base
-# ATR before the block closes, the block is "Dirty/Exhausted" and its Buy/Sell
-# signal is killed, regardless of how the block eventually closed.
+# down-move). If that internal reverse move reaches this FRACTION OF THE BLOCK'S
+# OWN TARGET RANGE (not a flat ATR amount) before the block closes, the block is
+# "Dirty/Exhausted" and its Buy/Sell signal is killed. Being relative to each
+# block's own range keeps the bar equally strict at 1X and at 5X.
 DIRTY_MOVE_ATR_FRACTION = 0.4
 
 # --- OUTPUT LIMITS & CONFLUENCE ---
@@ -513,6 +514,9 @@ def split_sessions(m):
 
 def build_isolated_range_bars(sessions, target_range, base_atr=None,
                                dirty_fraction=None):
+    # NOTE: base_atr is accepted for call-site compatibility / potential future
+    # diagnostics, but is no longer used to size the dirty threshold -- that is
+    # now target_range * dirty_fraction (see docstring below).
     """
     Builds range bars from 1-minute (opens, highs, lows, closes) tuples per session.
 
@@ -523,9 +527,13 @@ def build_isolated_range_bars(sessions, target_range, base_atr=None,
         the move on the way up.
       - block_min_low / high_since_min: mirror image for the downside -> "bounce"
         = how hard buyers hit the move on the way down.
-    If pullback (or bounce) reaches dirty_fraction * base_atr before the block
-    closes, that block is flagged Dirty for that direction. A block can be dirty
-    for Bulls, dirty for Bears, both, or neither.
+    If pullback (or bounce) reaches dirty_fraction * target_range before the
+    block closes, that block is flagged Dirty for that direction. Using the
+    block's OWN target_range (rather than a flat multiple of Base ATR) keeps the
+    bar equally strict at every multiplier: a 1X block and a 5X block both fail
+    only if they retrace the same PROPORTION of their own range, so the
+    mandatory 1X anchor isn't disproportionately punished just for being small.
+    A block can be dirty for Bulls, dirty for Bears, both, or neither.
     """
     if dirty_fraction is None:
         dirty_fraction = DIRTY_MOVE_ATR_FRACTION      # re-read live so --dirty-fraction works
@@ -533,7 +541,7 @@ def build_isolated_range_bars(sessions, target_range, base_atr=None,
     B_O, B_H, B_L, B_C = [], [], [], []
     B_DIRTY_BULL, B_DIRTY_BEAR = [], []
     seg_start = 0
-    dirty_thresh = (base_atr * dirty_fraction) if base_atr else None
+    dirty_thresh = target_range * dirty_fraction
 
     for opens, highs, lows, closes in sessions:
         if not closes:
@@ -572,11 +580,10 @@ def build_isolated_range_bars(sessions, target_range, base_atr=None,
             else:
                 blk_high_since_min = max(blk_high_since_min, hi)
 
-            if dirty_thresh is not None:
-                if (blk_max_high - blk_low_since_max) >= dirty_thresh:
-                    dirty_bull = True
-                if (blk_high_since_min - blk_min_low) >= dirty_thresh:
-                    dirty_bear = True
+            if (blk_max_high - blk_low_since_max) >= dirty_thresh:
+                dirty_bull = True
+            if (blk_high_since_min - blk_min_low) >= dirty_thresh:
+                dirty_bear = True
 
             if curr_H - curr_L >= target_range:
                 B_O.append(curr_O); B_H.append(curr_H); B_L.append(curr_L); B_C.append(curr_C)
@@ -676,7 +683,7 @@ def calculate_strict_signals(bars):
 
     # CLEAN-SURGE AUDIT: a block that technically closed Bull/Bear but only did so
     # after a chaotic internal fight (price reversed >= DIRTY_MOVE_ATR_FRACTION of
-    # Base ATR against the trend mid-block) is "Dirty/Exhausted" -> kill the signal.
+    # THAT BLOCK'S OWN RANGE mid-block) is "Dirty/Exhausted" -> kill the signal.
     dirty_killed = False
     if is_bull and bars.get('Dirty_Bull'):
         is_bull = False
@@ -931,8 +938,8 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
         print(f"{COLOR_YELLOW}No instrument has a perfectly aligned block (with active 1X Anchor) right now.{COLOR_RESET}")
         if dirty_vetoed:
             print(f"{COLOR_YELLOW}   ↳ {dirty_vetoed}/{len(dashboard_data)} instrument(s) had a perfect 1X alignment "
-                  f"that was vetoed as Dirty/Exhausted (internal reverse >= {DIRTY_MOVE_ATR_FRACTION:.2f}x Base ATR). "
-                  f"Try a looser --dirty-fraction if this feels too strict.{COLOR_RESET}")
+                  f"that was vetoed as Dirty/Exhausted (internal reverse >= {DIRTY_MOVE_ATR_FRACTION:.2f}x that "
+                  f"block's own range). Try a looser --dirty-fraction if this feels too strict.{COLOR_RESET}")
     elif dirty_vetoed:
         print(f"{COLOR_YELLOW}ℹ️  {dirty_vetoed} additional instrument(s) had a perfect 1X alignment but were "
               f"vetoed as Dirty/Exhausted.{COLOR_RESET}")
@@ -949,12 +956,12 @@ def parse_args():
     p.add_argument("--days", type=int, default=BACKTRACE_DAYS, help="trading sessions of history (min 2)")
     p.add_argument("--min-blocks", type=int, default=MIN_PERFECT_BLOCKS)
     p.add_argument("--dirty-fraction", type=float, default=DIRTY_MOVE_ATR_FRACTION,
-                    help="Fraction of Base ATR an internal reverse move must reach, mid-block, "
-                         "to mark that block Dirty/Exhausted and kill its signal (default: "
-                         f"{DIRTY_MOVE_ATR_FRACTION}). Note this is measured against the flat "
-                         "Base ATR, so it bites hardest on the 1X anchor block (whose entire "
-                         "range IS 1x Base ATR) and barely at all on 5X blocks. Raise it "
-                         "(e.g. 0.6-0.8) if the 1X anchor is vetoing almost everything.")
+                    help="Fraction of a BLOCK'S OWN TARGET RANGE an internal reverse move "
+                         "must reach, mid-block, to mark that block Dirty/Exhausted and kill "
+                         f"its signal (default: {DIRTY_MOVE_ATR_FRACTION}). This is relative "
+                         "to each block's own range, so 1X and 5X blocks are held to the same "
+                         "proportional standard. Lower = stricter (fewer, cleaner signals); "
+                         "higher = looser (more signals allowed through).")
     return p.parse_args()
 
 if __name__ == "__main__":
