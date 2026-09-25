@@ -268,7 +268,7 @@ def _url_range(key, start, end):
 
 
 def _url_intraday(key):
-    return f"{API_HOST}/v2/historical-candle/intraday/{urllib.parse.quote(key)}/30minute"
+    return f"{API_HOST}/v2/historical-candle/intraday/{urllib.parse.quote(key)}/1minute"
 
 
 def _date_chunks(start, end, span=365):
