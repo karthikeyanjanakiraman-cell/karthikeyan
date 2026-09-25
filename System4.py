@@ -1,784 +1,867 @@
+#!/usr/bin/env python3
 """
-system3.py - NIFTY & SENSEX Options Multi-Timeframe Renko Execution Engine
-Fyers API Implementation (Production-Grade & CI/CD Resilient)
-
-Key Features:
-- FYERS NIFTY 50 & SENSEX CE / PE Options Dynamic Extraction
-- STRICTLY OPTION BUYING ONLY (Long CE / Long PE)
-- SNIPER ENTRY MANDATE (Requires exact-minute fresh brick to enter)
-- 14:30 PM Cutoff Time to avoid EOD Theta Traps
-- Indestructible Fuzzy Parser (100% Immune to Fyers Data Schema Shifts)
-- Datetime Resolution Normalization (Fixes Pandas MergeErrors)
-- Dual-Tier 7-Pillar Scorecard & 45-Degree Price/Volume/Velocity Renko Engine
-- Sequential True Trade Ledger (Logs multiple entries/exits per strike)
+Strict Institutional Volatility Screener (Upstox) - STATELESS EDITION
++ Zero Disk Caching (100% Live API fetches)
++ 1X Mandatory Anchor Rule (No hollow core breakouts)
++ Two-Tier Prime Sorting: Confluence (Blocks) -> Freshness (BB/KC % Crossover)
 """
-
-import argparse
-import concurrent.futures
-import datetime
-from datetime import datetime, timedelta
 import os
 import sys
+import re
+import argparse
+import urllib.parse
+import json
+import gzip
+import io
 import time
-import warnings
-import traceback
+import threading
+from bisect import bisect_left
+from datetime import datetime, timedelta, timezone
+import concurrent.futures
 
-import numpy as np
-import pandas as pd
 import requests
+from requests.adapters import HTTPAdapter
+import pandas as pd
+import numpy as np
+import warnings
 
 warnings.filterwarnings("ignore")
 
 # ==============================================================================
-# 0. ENGINE CONSTANTS & TERMINAL COLORS
+# 0. ENGINE CONSTANTS & CONFIGURATION 
 # ==============================================================================
-COLOR_GREEN = "\033[92m"
-COLOR_RED = "\033[91m"
-COLOR_CYAN = "\033[96m"
-COLOR_YELLOW = "\033[93m"
-COLOR_DIM = "\033[2m"
-COLOR_RESET = "\033[0m"
-COLOR_BOLD = "\033[1m"
+TRADING_MODE = "STOCK_FNO"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
 
-BACKTRACE_DAYS = 1
+# --- OPTIONS CHAIN CONFIGURATION ---
+EXPIRY_OFFSET = 0          
+STRIKES_FROM_ATM = 5       
+OPT_MIN_PRICE = 30
+OPT_MIN_VOLUME = 10000
 
-# ==============================================================================
-# ★ GLOBAL CONFIGURATION: INDEX OPTIONS & STRIKE PROCESSING ★
-# ==============================================================================
-NUM_STRIKES_PER_SIDE = 4
+# --- DECOUPLED HA-ATR ENGINE MULTIPLIERS ---
+HA_ATR_MULTIPLIERS = [1, 2, 3, 5]
+ATR_BASIS_PERIOD = 14
+ATR_BASIS_TF = "15min"     
+MIN_ATR_PCT = 0.001
 
-INDEX_CONFIG = {
-    "NIFTY": {
-        "segment_file": "NSE_FO",
-        "spot_key": "NSE:NIFTY50-INDEX",
-        "strike_step": 50,
-        "underlying_symbol": "NIFTY"
-    },
-    "SENSEX": {
-        "segment_file": "BSE_FO",
-        "spot_key": "BSE:SENSEX-INDEX",
-        "strike_step": 100,
-        "underlying_symbol": "SENSEX"
-    }
-}
+# --- OUTPUT LIMITS & CONFLUENCE ---
+TOP_N_BUYERS = 15
+TOP_N_SELLERS = 15
+MIN_PERFECT_BLOCKS = 1
 
-# ==============================================================================
-# ★ GLOBAL CONFIGURATION: DYNAMIC TIMEFRAMES & INDICATORS ★
-# ==============================================================================
-MICRO_TIMEFRAME = "3min"
-MACRO_TIMEFRAMES = ["15min"]
+COLOR_GREEN_BG = '\033[42m\033[30m'
+COLOR_RED_BG = '\033[41m\033[97m'
+COLOR_RESET = '\033[0m'
+COLOR_BOLD = '\033[1m'
+COLOR_CYAN = '\033[96m'
+COLOR_RED_FG = '\033[91m'
+COLOR_YELLOW = '\033[93m'
+ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 
-ATR_PERIOD = 14
+# --- EQUITY UNIVERSE FILTERING ---
+MIN_PRICE = 100
+MAX_PRICE = 5000
+MIN_DAILY_VOLUME = 100000
+BACKTRACE_DAYS = 5       # 120 Days for Swing Trading
+
+# --- INDICATOR PERIODS ---
 RSI_PERIOD = 14
-BB_SMA_PERIOD = 20
+BB_PERIOD = 20
+BB_STD = 1
 ADX_PERIOD = 14
 ADX_THRESHOLD = 20
-STOCH_PERIOD = 14
 
-MICRO_RENKO_CONFIRM_BRICKS = 1
-MACRO_RENKO_CONFIRM_BRICKS = 1
-RENKO_MIN_BRICK = 0.50
-RENKO_DEFAULT_PCT = 0.005
+# --- SPEED KNOBS ---
+WORKERS = 16                       
+INCLUDE_NON_EQ_SERIES = False      
+PREFILTER_PRICE_SLACK = 0.25
+PREFILTER_MIN_TODAY_VOLUME = 0     
+PREFILTER_MIN_ABS_MOVE_PCT = 0.0   
 
-GLOBAL_MACRO_STRATEGY_2D = "BOTH"  
+# --- API RATE LIMITS ---
+RATE_CAPS = ((1.0, 22), (60.0, 220), (1800.0, 900))
 
-# ==============================================================================
-# 🎛️ TIER 1 & 2: MACRO & MICRO CONTEXT SWITCHBOARDS
-# ==============================================================================
-MACRO_MANDATORY_PRICE_RENKO    = True
-MACRO_MANDATORY_VOL_RENKO      = True
-MACRO_MANDATORY_RENKO_VELOCITY = True
-MACRO_MANDATORY_RSI_BB         = False
-MACRO_MANDATORY_ADX_DMI        = False
-MACRO_MANDATORY_EMA_SPREAD     = False
-MACRO_MANDATORY_STOCHASTIC     = False
-MACRO_MINIMUM_SCORE            = 3
-
-SYNC_MICRO_WITH_MACRO          = False
-MICRO_MANDATORY_PRICE_RENKO    = True
-MICRO_MANDATORY_VOL_RENKO      = True
-MICRO_MANDATORY_RENKO_VELOCITY = True
-MICRO_MANDATORY_RSI_BB         = False
-MICRO_MANDATORY_ADX_DMI        = False
-MICRO_MANDATORY_EMA_SPREAD     = True
-MICRO_MANDATORY_STOCHASTIC     = False
-MICRO_MINIMUM_SCORE            = 4
-
-# ==============================================================================
-# 🎛️ TIER 3: TRADE MANAGEMENT & TEMPORAL GATES
-# ==============================================================================
-MICRO_EXIT_PRICE_BRICKS = 5  
-MICRO_EXIT_VOL_BRICKS   = 5  
-MACRO_EXIT_PRICE_BRICKS = 1
-MACRO_EXIT_VOL_BRICKS   = 1  
-RENKO_VELOCITY_MAX_BARS = 12
-ENTRY_CUTOFF_TIME = "14:30"  # Prevent EOD Theta traps
+API_HOST = "https://api.upstox.com"
+IST = timezone(timedelta(hours=5, minutes=30))
+SESSION_OPEN_MIN = 9 * 60 + 15
+SESSION_CLOSE_MIN = 15 * 60 + 30
 
 
 # ==============================================================================
-# 1. FYERS SPECIFIC INGESTION & 09:15 STRIKE SELECTION
+# HELPERS: clock, budgeted rate limiter, HTTP, progress
 # ==============================================================================
-def fetch_fyers_instruments(segment):
-    """
-    Indestructible Fuzzy Parser for Fyers CSV. 
-    Bypasses rigid column numbers and identifies data by its literal value structure.
-    """
-    url = f"https://public.fyers.in/sym_details/{segment}.csv"
-    try:
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"
-        }
-        res = requests.get(url, headers=headers, timeout=15)
-        if res.status_code != 200:
-            print(f"{COLOR_RED}[API Error] HTTP {res.status_code} fetching {segment}{COLOR_RESET}")
-            return []
-            
-        text_data = res.text.strip()
-        lines = text_data.split('\n')
-        print(f"   ├─ {COLOR_DIM}[Data Loader] Downloaded {len(lines)} raw lines from {segment}{COLOR_RESET}")
+def now_ist():
+    return datetime.now(IST).replace(tzinfo=None)
 
-        contracts = []
-        
-        for line in lines:
-            parts = line.split(',')
-            if len(parts) < 10:
+def market_is_open():
+    n = now_ist()
+    m = n.hour * 60 + n.minute
+    return n.weekday() < 5 and SESSION_OPEN_MIN <= m < SESSION_CLOSE_MIN
+
+class BudgetLimiter:
+    """In-memory sliding window rate limiter. Loses history on script exit."""
+    def __init__(self, caps):
+        self.caps = caps
+        self.horizon = max(s for s, _ in caps)
+        self.lock = threading.Lock()
+        self.stamps = []
+        self.block_until = 0.0
+        self.last_notice = 0.0
+        self.total_calls = 0
+
+    def used(self, span):
+        with self.lock:
+            return len(self.stamps) - bisect_left(self.stamps, time.time() - span)
+
+    def penalize(self, seconds):
+        with self.lock:
+            self.block_until = max(self.block_until, time.time() + seconds)
+
+    def acquire(self):
+        while True:
+            notice = None
+            with self.lock:
+                now = time.time()
+                cut = bisect_left(self.stamps, now - self.horizon)
+                if cut:
+                    del self.stamps[:cut]
+                n = len(self.stamps)
+                wait = max(0.0, self.block_until - now)
+                for span, cap in self.caps:
+                    if n >= cap and n - bisect_left(self.stamps, now - span) >= cap:
+                        wait = max(wait, self.stamps[n - cap] + span - now)
+                if wait <= 0:
+                    self.stamps.append(now)
+                    self.total_calls += 1
+                    return
+                if wait > 5 and now - self.last_notice > 20:
+                    self.last_notice = now
+                    notice = (n, wait)
+            if notice:
+                print(f"\n   ⏳ Upstox rate-limit window is full ({notice[0]} calls in the last 30 min); "
+                      f"waiting {notice[1]:.0f}s to stay under the cap...", file=sys.stderr, flush=True)
+            time.sleep(min(wait, 1.0) + 0.005)
+
+class FetchStats:
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.failed = 0
+        self.auth_failed = False
+
+    def fail(self):
+        with self.lock:
+            self.failed += 1
+
+    def mark_auth_failed(self):
+        with self.lock:
+            self.auth_failed = True
+
+STATS = FetchStats()
+LIMITERS = {
+    "quotes": BudgetLimiter(RATE_CAPS),
+    "history": BudgetLimiter(RATE_CAPS),
+    "intraday": BudgetLimiter(RATE_CAPS),
+}
+LIMITER = LIMITERS["history"]   
+_TLS = threading.local()
+
+def _limiter_for(url):
+    if "market-quote/quotes" in url:
+        return LIMITERS["quotes"]
+    if "/intraday/" in url:
+        return LIMITERS["intraday"]
+    return LIMITERS["history"]
+
+def _session():
+    s = getattr(_TLS, "s", None)
+    if s is None:
+        s = requests.Session()
+        s.mount("https://", HTTPAdapter(pool_connections=2, pool_maxsize=2))
+        _TLS.s = s
+    return s
+
+class Progress:
+    def __init__(self, label, total):
+        self.label, self.total, self.n = label, total, 0
+        self.step = max(1, total // 20)
+        self.lock = threading.Lock()
+
+    def tick(self):
+        with self.lock:
+            self.n += 1
+            if self.n == self.total or self.n % self.step == 0:
+                print(f"\r   {self.label}: {self.n}/{self.total}", end="", file=sys.stderr, flush=True)
+
+    def done(self):
+        print("", file=sys.stderr)
+
+# ==============================================================================
+# 1. UPSTOX API: quotes, candles, universe & dynamic options strikes
+# ==============================================================================
+def _get(url, params=None, retries=4):
+    token = os.environ.get("UPSTOX_ACCESS_TOKEN")
+    if not token or STATS.auth_failed:
+        return 401, None
+    headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
+    limiter = _limiter_for(url)
+    for attempt in range(retries):
+        limiter.acquire()
+        try:
+            r = _session().get(url, headers=headers, params=params, timeout=20)
+        except requests.RequestException:
+            time.sleep(0.5 * (attempt + 1))
+            continue
+        code = r.status_code
+        if code == 200:
+            try:
+                return 200, r.json()
+            except ValueError:
+                time.sleep(0.5 * (attempt + 1))
                 continue
-            
-            symbol = next((p for p in parts if p.startswith("NSE:") or p.startswith("BSE:")), None)
-            if not symbol: continue
-            
-            if "NIFTY" not in symbol and "SENSEX" not in symbol:
-                continue
+        if code == 401:
+            STATS.mark_auth_failed()
+            return 401, None
+        if code == 429 or code >= 500:
+            limiter.penalize(min(3.0 * (attempt + 1), 15.0))
+            continue
+        return code, None
+    STATS.fail()
+    return 0, None
 
-            opt_type = next((p.strip().upper() for p in parts if p.strip().upper() in ["CE", "PE"]), None)
-            if not opt_type:
-                if symbol.endswith("CE"): opt_type = "CE"
-                elif symbol.endswith("PE"): opt_type = "PE"
-                else: continue
-
-            valid_prefixes = tuple(str(i) for i in range(16, 22))
-            expiry_epoch_str = next((p for p in parts if p.isdigit() and len(p) == 10 and p.startswith(valid_prefixes)), None)
-            if not expiry_epoch_str: continue
-            
-            expiry_epoch = int(expiry_epoch_str)
-            expiry_date = datetime.utcfromtimestamp(expiry_epoch).strftime('%Y-%m-%d')
-
-            strike = None
-            for p in reversed(parts):
-                try:
-                    val = float(p)
-                    if 1000.0 <= val <= 200000.0 and val % 50 == 0:
-                        if str(int(val)) != expiry_epoch_str:
-                            strike = val
-                            break
-                except ValueError:
-                    pass
-                    
-            if not strike: continue
-
-            contracts.append({
-                "symbolDetails": symbol,
-                "expiry": expiry_date,
-                "strikePrice": strike,
-                "optionType": opt_type
-            })
-            
-        print(f"   ├─ {COLOR_DIM}[Data Loader] Successfully extracted {len(contracts)} Index Options from {segment}{COLOR_RESET}")
-        return contracts
-    except Exception as e:
-        print(f"{COLOR_RED}[API Error] Failed fetching/parsing {segment}: {e}{COLOR_RESET}")
-        return []
-
-
-def get_fyers_spot_opening_price_at_0915(spot_key, target_date_str, headers):
-    url = "https://api-t1.fyers.in/data/history"
-    params = {
-        "symbol": spot_key,
-        "resolution": "1",
-        "date_format": "1",
-        "range_from": target_date_str,
-        "range_to": target_date_str
-    }
+def _to_frame(candles):
+    if not candles:
+        return None
+    df = pd.DataFrame(candles).iloc[:, :6]
+    df.columns = ['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']
+    ts = df['Timestamp'].astype(str)
     try:
-        res = requests.get(url, headers=headers, params=params, timeout=10)
-        if res.status_code == 200:
-            data = res.json()
-            if data.get("s") == "ok" and data.get("candles") and len(data["candles"]) > 0:
-                first_candle_open = float(data["candles"][0][1])
-                return first_candle_open
-    except Exception:
-        pass
+        if not ts.str.endswith('+05:30').all():
+            raise ValueError("non-IST offset")
+        df['Datetime'] = pd.to_datetime(ts.str.slice(0, 19), format="%Y-%m-%dT%H:%M:%S")
+    except ValueError:
+        df['Datetime'] = pd.to_datetime(ts, utc=True).dt.tz_convert(IST).dt.tz_localize(None)
+    for c in ('Open', 'High', 'Low', 'Close', 'Volume'):
+        df[c] = df[c].astype(float)
+    df = (df.drop(columns='Timestamp').drop_duplicates(subset='Datetime')
+            .sort_values('Datetime').reset_index(drop=True))
+    return df if not df.empty else None
+
+def _candles(url):
+    status, js = _get(url)
+    if status != 200 or not js:
+        return status, None
+    return 200, _to_frame((js.get('data') or {}).get('candles') or [])
+
+def _url_range(key, start, end):       
+    return (f"{API_HOST}/v2/historical-candle/{urllib.parse.quote(key)}/day/"
+            f"{end:%Y-%m-%d}/{start:%Y-%m-%d}")
+
+def _url_intraday(key):
+    return f"{API_HOST}/v2/historical-candle/intraday/{urllib.parse.quote(key)}/30minute"
+
+def _date_chunks(start, end, span=365):
+    cur = end
+    while cur >= start:
+        c_start = max(start, cur - timedelta(days=span - 1))
+        yield c_start, cur
+        cur = c_start - timedelta(days=1)
+
+def fetch_quotes(items, batch=200):
+    batches = [items[i:i + batch] for i in range(0, len(items), batch)]
+    def one(b):
+        status, js = _get(f"{API_HOST}/v2/market-quote/quotes",
+                          params={"instrument_key": ",".join(x['key'] for x in b)})
+        if status != 200 or not js:
+            return {}
+        by_ts = {f"{x['key'].split('|')[0]}:{x['symbol']}": x['key'] for x in b}
+        out = {}
+        for k, v in (js.get('data') or {}).items():
+            key = v.get('instrument_token') or by_ts.get(k)
+            if key:
+                out[key] = {'ltp': v.get('last_price') or 0.0, 'vol': v.get('volume') or 0,
+                            'net': v.get('net_change') or 0.0}
+        return out
+
+    res = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(WORKERS, max(1, len(batches)))) as ex:
+        for part in ex.map(one, batches):
+            res.update(part)
+    return res
+
+def fetch_today(key):
+    if now_ist().weekday() >= 5:
+        return None
+    status, df = _candles(_url_intraday(key))
+    if status != 200 or df is None:
+        return None
+    df = df[df['Datetime'].dt.date == now_ist().date()]     
+    return df if not df.empty else None
+
+BASE_COLS = ['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume']
+
+def prepare_master(dfs):
+    master = (pd.concat([d[BASE_COLS] for d in dfs], ignore_index=True)
+              .drop_duplicates(subset='Datetime')
+              .sort_values('Datetime').reset_index(drop=True))
+    dt = master['Datetime']
+    day = dt.dt.normalize()
+    master['Min'] = dt.dt.hour.values * 60 + dt.dt.minute.values
+    master['SessId'] = day.values.astype('datetime64[D]').astype('int64')
+    master['Session'] = day.dt.date
+    return master
+
+def keep_last_sessions(master, days):
+    sessions = sorted(master['Session'].unique())[-days:]
+    return master[master['Session'].isin(sessions)].reset_index(drop=True)
+
+def load_history(item, start, end, days):
+    frames = []
+    for c_start, c_end in _date_chunks(start, end):
+        status, df = _candles(_url_range(item['key'], c_start, c_end))
+        if status != 200:
+            return None                     
+        if df is not None:
+            frames.append(df)
+    if not frames:
+        return None
+    hist = keep_last_sessions(prepare_master(frames), days)
+    if hist.empty:
+        return None
+    return hist
+
+# ---------------- universe -----------------------------------------------------
+INDEX_CONFIG = {
+    "NIFTY": {"spot_key": "NSE_INDEX|Nifty 50", "step": 50, "match": ["NIFTY", "NIFTY 50"]},
+    "BANKNIFTY": {"spot_key": "NSE_INDEX|Nifty Bank", "step": 100, "match": ["BANKNIFTY", "NIFTY BANK"]},
+    "FINNIFTY": {"spot_key": "NSE_INDEX|Nifty Fin Service", "step": 50, "match": ["FINNIFTY", "NIFTY FIN SERVICE"]},
+    "MIDCPNIFTY": {"spot_key": "NSE_INDEX|NIFTY MID SELECT", "step": 25, "match": ["MIDCPNIFTY", "NIFTY MID SELECT"]},
+    "SENSEX": {"spot_key": "BSE_INDEX|SENSEX", "step": 100, "match": ["SENSEX", "BSE SENSEX"]},
+}
+
+def _download_master(name):
+    url = f"https://assets.upstox.com/market-quote/instruments/exchange/{name}.json.gz"
+    for attempt in range(3):
+        try:
+            resp = requests.get(url, timeout=90)
+            if resp.status_code == 200:
+                return json.load(gzip.GzipFile(fileobj=io.BytesIO(resp.content)))
+        except Exception as e:
+            print(f"{COLOR_RED_FG}[API Error] {name} master attempt {attempt + 1}: {e}{COLOR_RESET}")
+        time.sleep(1.0 * (attempt + 1))
     return None
 
-def build_locked_options_universe(target_date_str, headers):
-    print(f"\n{COLOR_CYAN}🔍 Initializing Fyers Near-Index Option Strike Engine for {target_date_str}...{COLOR_RESET}")
-    nse_master = fetch_fyers_instruments("NSE_FO")
-    bse_master = fetch_fyers_instruments("BSE_FO")
-    
-    selected_option_universe = []
+def _equity_universe(mode):
+    print("🔄 Downloading NSE instrument master Live...")
+    nse = _download_master("NSE")
+    if not nse:
+        return []
 
-    for index_name, config in INDEX_CONFIG.items():
-        master_data = nse_master if index_name == "NIFTY" else bse_master
-        if not master_data:
-            continue
+    def ts_of(i):
+        return i.get("tradingsymbol", i.get("trading_symbol"))
 
-        underlying_tag = f":{config['underlying_symbol']}"
-        option_contracts = [
-            item for item in master_data
-            if underlying_tag in item["symbolDetails"].upper()
-        ]
+    def plain(i):
+        return (i.get("segment") == "NSE_EQ" and ts_of(i) and i.get("instrument_key")
+                and (INCLUDE_NON_EQ_SERIES or (i.get("instrument_type") or "EQ") == "EQ"))
 
-        if not option_contracts:
-            print(f"   ├─ [{index_name}] {COLOR_RED}Failed to match any contracts for {config['underlying_symbol']}.{COLOR_RESET}")
-            continue
-
-        all_expiries = sorted(list({item.get("expiry") for item in option_contracts if item.get("expiry") >= target_date_str}))
-        
-        if not all_expiries:
-            fallback_expiries = sorted(list({item.get("expiry") for item in option_contracts}))
-            if fallback_expiries:
-                target_expiry = fallback_expiries[0]
-                print(f"   ├─ [{index_name}] {COLOR_YELLOW}Warning: {target_date_str} not available. Auto-correcting to Nearest Expiry: {target_expiry}{COLOR_RESET}")
-            else:
-                continue
-        else:
-            if all_expiries[0] == target_date_str:
-                target_expiry = all_expiries[1] if len(all_expiries) > 1 else all_expiries[0]
-                print(f"   ├─ [{index_name}] Today is Expiry Day! ➔ {COLOR_YELLOW}Rolling to Next Week: {target_expiry}{COLOR_RESET}")
-            else:
-                target_expiry = all_expiries[0]
-                print(f"   ├─ [{index_name}] Near Expiry Selected: {COLOR_GREEN}{target_expiry}{COLOR_RESET}")
-
-        spot_price = get_fyers_spot_opening_price_at_0915(config["spot_key"], target_date_str, headers)
-        
-        if spot_price is None:
-            available_strikes = [float(item.get("strikePrice", 0)) for item in option_contracts if item.get("expiry") == target_expiry]
-            spot_price = float(np.median(available_strikes)) if available_strikes else (24000.0 if index_name == "NIFTY" else 79000.0)
-            print(f"   ├─ [{index_name}] {COLOR_YELLOW}Notice: 09:15 Spot API failed/unreached. Fallback Anchor @ ₹{spot_price:.2f}{COLOR_RESET}")
-        else:
-            print(f"   ├─ [{index_name}] ⚓ 09:15 AM Spot Index Price: ₹{spot_price:.2f}")
-
-        step = config["strike_step"]
-        atm_strike = round(spot_price / step) * step
-        selected_strikes = [atm_strike + (i * step) for i in range(-NUM_STRIKES_PER_SIDE, NUM_STRIKES_PER_SIDE + 1)]
-        
-        matched_count = 0
-        for item in option_contracts:
-            if item.get("expiry") == target_expiry and float(item.get("strikePrice", 0)) in selected_strikes:
-                selected_option_universe.append({
-                    "symbol": item.get("symbolDetails"),
-                    "underlying": index_name,
-                    "strike": float(item.get("strikePrice", 0)),
-                    "option_type": item.get("optionType"),
-                    "expiry": target_expiry
-                })
-                matched_count += 1
-
-        print(f"   └─ [{index_name}] Frozen Near-Index Contracts: {matched_count} (CE + PE)\n")
-
-    return selected_option_universe
-
-def get_past_trading_days(target_date_str, num_days=20):
-    target_dt = datetime.strptime(target_date_str, "%Y-%m-%d")
-    trading_days = []
-    current_dt = target_dt
-    while len(trading_days) < num_days:
-        if current_dt.weekday() < 5:
-            trading_days.append(current_dt.strftime("%Y-%m-%d"))
-        current_dt -= timedelta(days=1)
-    trading_days.reverse()
-    return trading_days
-
-
-# ==============================================================================
-# 2. CORE TECHNICAL & RENKO ENGINES
-# ==============================================================================
-def calculate_core_technicals(df_tf):
-    df_tf["H-L"] = df_tf["High"] - df_tf["Low"]
-    df_tf["H-PC"] = (df_tf["High"] - df_tf.groupby("Symbol")["Close"].shift(1)).abs()
-    df_tf["L-PC"] = (df_tf["Low"] - df_tf.groupby("Symbol")["Close"].shift(1)).abs()
-    df_tf["TR"] = df_tf[["H-L", "H-PC", "L-PC"]].max(axis=1)
-    df_tf["ATR"] = df_tf.groupby("Symbol")["TR"].transform(lambda x: x.ewm(alpha=1 / ATR_PERIOD, adjust=False).mean())
-    df_tf["ATR"] = df_tf["ATR"].fillna(df_tf["Close"] * RENKO_DEFAULT_PCT)
-
-    delta = df_tf.groupby("Symbol")["Close"].diff()
-    gain = delta.where(delta > 0, 0)
-    loss = -delta.where(delta < 0, 0)
-    avg_gain = gain.groupby(df_tf["Symbol"]).transform(lambda x: x.ewm(alpha=1 / RSI_PERIOD, adjust=False).mean())
-    avg_loss = loss.groupby(df_tf["Symbol"]).transform(lambda x: x.ewm(alpha=1 / RSI_PERIOD, adjust=False).mean())
-    df_tf["RSI"] = 100 - (100 / (1 + (avg_gain / (avg_loss + 1e-8))))
-    df_tf["RSI_SMA"] = df_tf.groupby("Symbol")["RSI"].transform(lambda x: x.rolling(BB_SMA_PERIOD, min_periods=1).mean())
-
-    high_d = df_tf["High"] - df_tf.groupby("Symbol")["High"].shift(1)
-    low_d = df_tf.groupby("Symbol")["Low"].shift(1) - df_tf["Low"]
-    df_tf["+DM"] = np.where((high_d > low_d) & (high_d > 0), high_d, 0)
-    df_tf["-DM"] = np.where((low_d > high_d) & (low_d > 0), low_d, 0)
-    df_tf["+DI"] = (100 * (df_tf.groupby("Symbol")["+DM"].transform(lambda x: x.ewm(alpha=1 / ADX_PERIOD, adjust=False).mean()) / (df_tf["ATR"] + 1e-8)))
-    df_tf["-DI"] = (100 * (df_tf.groupby("Symbol")["-DM"].transform(lambda x: x.ewm(alpha=1 / ADX_PERIOD, adjust=False).mean()) / (df_tf["ATR"] + 1e-8)))
-    df_tf["DX"] = (100 * abs(df_tf["+DI"] - df_tf["-DI"]) / (df_tf["+DI"] + df_tf["-DI"] + 1e-8))
-    df_tf["ADX"] = df_tf.groupby("Symbol")["DX"].transform(lambda x: x.ewm(alpha=1 / ADX_PERIOD, adjust=False).mean())
-
-    df_tf["EMA_8"] = df_tf.groupby("Symbol")["Close"].transform(lambda x: x.ewm(span=8, adjust=False).mean())
-    df_tf["EMA_21"] = df_tf.groupby("Symbol")["Close"].transform(lambda x: x.ewm(span=21, adjust=False).mean())
-    df_tf["EMA_Spread"] = abs(df_tf["EMA_8"] - df_tf["EMA_21"])
-    spread_thresh = df_tf.groupby("Symbol")["EMA_Spread"].transform(lambda x: x.rolling(window=20, min_periods=1).mean()) * 0.20
-    df_tf["EMA_Bull_Expanded"] = (df_tf["EMA_8"] > df_tf["EMA_21"]) & (df_tf["EMA_Spread"] >= spread_thresh)
-    df_tf["EMA_Bear_Expanded"] = (df_tf["EMA_8"] < df_tf["EMA_21"]) & (df_tf["EMA_Spread"] >= spread_thresh)
-
-    lowest_low = df_tf.groupby("Symbol")["Low"].transform(lambda x: x.rolling(window=STOCH_PERIOD, min_periods=1).min())
-    highest_high = df_tf.groupby("Symbol")["High"].transform(lambda x: x.rolling(window=STOCH_PERIOD, min_periods=1).max())
-    df_tf["Stoch_K"] = ((df_tf["Close"] - lowest_low) / (highest_high - lowest_low + 1e-9)) * 100
-    atr_median = df_tf.groupby("Symbol")["ATR"].transform(lambda x: x.rolling(window=50, min_periods=1).median())
-    df_tf["Vol_Pass"] = df_tf["ATR"] >= (atr_median * 0.75)
-    df_tf["Stoch_Bull_Pass"] = (df_tf["Stoch_K"] >= 50) & df_tf["Vol_Pass"]
-    df_tf["Stoch_Bear_Pass"] = (df_tf["Stoch_K"] <= 50) & df_tf["Vol_Pass"]
-    return df_tf
-
-def construct_45deg_renko_matrix(df, tf_name, confirm_bricks):
-    renko_counts = np.zeros(len(df))
-    for sym, indices in df.groupby("Symbol").indices.items():
-        sub_closes = df["Close"].values[indices]
-        sub_atrs = df["ATR"].values[indices]
-        if len(sub_closes) > 0:
-            counts = np.zeros(len(sub_closes))
-            curr_trend, curr_count, curr_price = 0, 0, sub_closes[0]
-            for i in range(1, len(sub_closes)):
-                bs = max(sub_atrs[i], RENKO_MIN_BRICK)
-                move = sub_closes[i] - curr_price
-                if curr_trend >= 0:
-                    if move >= bs:
-                        bricks = int(move // bs)
-                        curr_trend = 1
-                        curr_count = curr_count + bricks if curr_count > 0 else bricks
-                        curr_price += bricks * bs
-                    elif move <= -(2 * bs):
-                        bricks = int(abs(move) // bs)
-                        curr_trend = -1
-                        curr_count = -bricks
-                        curr_price -= bricks * bs
-                else:
-                    if move <= -bs:
-                        bricks = int(abs(move) // bs)
-                        curr_trend = -1
-                        curr_count = curr_count - bricks if curr_count < 0 else -bricks
-                        curr_price -= bricks * bs
-                    elif move >= (2 * bs):
-                        bricks = int(move // bs)
-                        curr_trend = 1
-                        curr_count = bricks
-                        curr_price += bricks * bs
-                counts[i] = curr_count
-            renko_counts[indices] = counts
-    df[f"Renko_Count_{tf_name}"] = renko_counts
-    df[f"Renko_Bull_{tf_name}"] = renko_counts >= confirm_bricks
-    df[f"Renko_Bear_{tf_name}"] = renko_counts <= -confirm_bricks
-    return df
-
-def construct_volume_delta_renko_matrix(df, tf_name, confirm_bricks):
-    df['Wick_Spread'] = df['High'] - df['Low']
-    df['Wick_Spread'] = df['Wick_Spread'].replace(0, 1e-9)
-    df['Delta_Vol'] = df['Volume'] * ((df['Close'] - df['Open']) / df['Wick_Spread'])
-    df['Cum_Delta'] = df.groupby('Symbol')['Delta_Vol'].cumsum()
-    df['Vol_SMA_20'] = df.groupby('Symbol')['Volume'].transform(lambda x: x.rolling(20, min_periods=1).mean()).fillna(1000)
-    
-    vol_renko_counts = np.zeros(len(df))
-    for sym, indices in df.groupby("Symbol").indices.items():
-        sub_delta = df["Cum_Delta"].values[indices]
-        sub_bs = df["Vol_SMA_20"].values[indices]
-        if len(sub_delta) > 0:
-            counts = np.zeros(len(sub_delta))
-            curr_trend, curr_count, curr_delta = 0, 0, sub_delta[0]
-            for i in range(1, len(sub_delta)):
-                bs = max(sub_bs[i], 1.0)
-                move = sub_delta[i] - curr_delta
-                if curr_trend >= 0:
-                    if move >= bs:
-                        bricks = int(move // bs)
-                        curr_trend = 1
-                        curr_count = curr_count + bricks if curr_count > 0 else bricks
-                        curr_delta += bricks * bs
-                    elif move <= -(2 * bs):
-                        bricks = int(abs(move) // bs)
-                        curr_trend = -1
-                        curr_count = -bricks
-                        curr_delta -= bricks * bs
-                else:
-                    if move <= -bs:
-                        bricks = int(abs(move) // bs)
-                        curr_trend = -1
-                        curr_count = curr_count - bricks if curr_count < 0 else -bricks
-                        curr_delta -= bricks * bs
-                    elif move >= (2 * bs):
-                        bricks = int(move // bs)
-                        curr_trend = 1
-                        curr_count = bricks
-                        curr_delta += bricks * bs
-                counts[i] = curr_count
-            vol_renko_counts[indices] = counts
-    df[f"Vol_Renko_Count_{tf_name}"] = vol_renko_counts
-    df[f"Vol_Renko_Bull_{tf_name}"] = vol_renko_counts >= confirm_bricks
-    df[f"Vol_Renko_Bear_{tf_name}"] = vol_renko_counts <= -confirm_bricks
-    return df
-
-def construct_renko_velocity_engine(df, tf_name):
-    brick_diff = df.groupby("Symbol")[f"Renko_Count_{tf_name}"].diff().fillna(1)
-    brick_changed = (brick_diff != 0)
-    df["Brick_ID"] = brick_changed.cumsum()
-    df[f"Bars_Since_Brick_{tf_name}"] = df.groupby(["Symbol", "Brick_ID"]).cumcount()
-    df.drop("Brick_ID", axis=1, inplace=True)
-    
-    is_trending_bull = df[f"Renko_Count_{tf_name}"] > 0
-    is_trending_bear = df[f"Renko_Count_{tf_name}"] < 0
-    has_velocity = df[f"Bars_Since_Brick_{tf_name}"] <= RENKO_VELOCITY_MAX_BARS
-    
-    df[f"Velocity_Bull_{tf_name}"] = is_trending_bull & has_velocity
-    df[f"Velocity_Bear_{tf_name}"] = is_trending_bear & has_velocity
-    return df
-
-
-# ==============================================================================
-# 3. DUAL-TIER SCORECARD SYSTEM
-# ==============================================================================
-def apply_dual_tier_scorecard(df, tf_str, tier_type):
-    req_price = globals()[f"{tier_type}_MANDATORY_PRICE_RENKO"]
-    req_vol = globals()[f"{tier_type}_MANDATORY_VOL_RENKO"]
-    req_vel = globals()[f"{tier_type}_MANDATORY_RENKO_VELOCITY"]
-    req_rsi = globals()[f"{tier_type}_MANDATORY_RSI_BB"]
-    req_adx = globals()[f"{tier_type}_MANDATORY_ADX_DMI"]
-    req_ema = globals()[f"{tier_type}_MANDATORY_EMA_SPREAD"]
-    req_stoch = globals()[f"{tier_type}_MANDATORY_STOCHASTIC"]
-    min_score = globals()[f"{tier_type}_MINIMUM_SCORE"]
-
-    c_price_bull, c_price_bear = df[f"Renko_Bull_{tf_str}"].astype(int), df[f"Renko_Bear_{tf_str}"].astype(int)
-    c_vol_bull, c_vol_bear = df[f"Vol_Renko_Bull_{tf_str}"].astype(int), df[f"Vol_Renko_Bear_{tf_str}"].astype(int)
-    c_vel_bull, c_vel_bear = df[f"Velocity_Bull_{tf_str}"].astype(int), df[f"Velocity_Bear_{tf_str}"].astype(int)
-    c_rsi_bull, c_rsi_bear = (df["RSI"] >= df["RSI_SMA"]).astype(int), (df["RSI"] <= df["RSI_SMA"]).astype(int)
-    c_adx_bull, c_adx_bear = ((df["ADX"] >= ADX_THRESHOLD) & (df["+DI"] > df["-DI"])).astype(int), ((df["ADX"] >= ADX_THRESHOLD) & (df["-DI"] > df["+DI"])).astype(int)
-    c_ema_bull, c_ema_bear = df["EMA_Bull_Expanded"].astype(int), df["EMA_Bear_Expanded"].astype(int)
-    c_stoch_bull, c_stoch_bear = df["Stoch_Bull_Pass"].astype(int), df["Stoch_Bear_Pass"].astype(int)
-
-    df[f"Score_Bull_{tf_str}"] = c_price_bull + c_vol_bull + c_vel_bull + c_rsi_bull + c_adx_bull + c_ema_bull + c_stoch_bull
-    df[f"Score_Bear_{tf_str}"] = c_price_bear + c_vol_bear + c_vel_bear + c_rsi_bear + c_adx_bear + c_ema_bear + c_stoch_bear
-
-    bull_veto, bear_veto = pd.Series(False, index=df.index), pd.Series(False, index=df.index)
-    if req_price: bull_veto, bear_veto = bull_veto | (c_price_bull == 0), bear_veto | (c_price_bear == 0)
-    if req_vol: bull_veto, bear_veto = bull_veto | (c_vol_bull == 0), bear_veto | (c_vol_bear == 0)
-    if req_vel: bull_veto, bear_veto = bull_veto | (c_vel_bull == 0), bear_veto | (c_vel_bear == 0)
-    if req_rsi: bull_veto, bear_veto = bull_veto | (c_rsi_bull == 0), bear_veto | (c_rsi_bear == 0)
-    if req_adx: bull_veto, bear_veto = bull_veto | (c_adx_bull == 0), bear_veto | (c_adx_bear == 0)
-    if req_ema: bull_veto, bear_veto = bull_veto | (c_ema_bull == 0), bear_veto | (c_ema_bear == 0)
-    if req_stoch: bull_veto, bear_veto = bull_veto | (c_stoch_bull == 0), bear_veto | (c_stoch_bear == 0)
-
-    df[f"Armed_Bull_{tf_str}"] = (df[f"Score_Bull_{tf_str}"] >= min_score) & (~bull_veto)
-    df[f"Armed_Bear_{tf_str}"] = (df[f"Score_Bear_{tf_str}"] >= min_score) & (~bear_veto)
-    return df
-
-def evaluate_single_timeframe_gates(df_base, tf_str):
-    df_tf = (
-        df_base.groupby(["Symbol", pd.Grouper(key="Datetime", freq=tf_str, closed="left", label="left")])
-        .agg({"Open": "first", "High": "max", "Low": "min", "Close": "last", "Volume": "sum"})
-        .reset_index()
-    )
-    df_tf = df_tf.dropna(subset=["Close"]).sort_values(["Symbol", "Datetime"])
-    df_tf = calculate_core_technicals(df_tf)
-    
-    df_tf = construct_45deg_renko_matrix(df_tf, tf_str, MACRO_RENKO_CONFIRM_BRICKS)
-    df_tf = construct_volume_delta_renko_matrix(df_tf, tf_str, MACRO_RENKO_CONFIRM_BRICKS)
-    df_tf = construct_renko_velocity_engine(df_tf, tf_str)
-    
-    df_tf = apply_dual_tier_scorecard(df_tf, tf_str, "MACRO")
-    df_tf["Eval_Time"] = df_tf["Datetime"] + pd.to_timedelta(tf_str)
-    
-    export_cols = [
-        "Symbol", "Eval_Time", 
-        f"Armed_Bull_{tf_str}", f"Armed_Bear_{tf_str}", 
-        f"Score_Bull_{tf_str}", f"Score_Bear_{tf_str}", 
-        f"Renko_Count_{tf_str}", f"Vol_Renko_Count_{tf_str}",
-        f"Bars_Since_Brick_{tf_str}"
-    ]
-    env_df = df_tf[export_cols].copy().rename(columns={"Eval_Time": "Datetime"})
-    return env_df.sort_values("Datetime").reset_index(drop=True)
-
-
-# ==============================================================================
-# 4. MICRO EXECUTION TAPE & CONFLUENCE MATCHER
-# ==============================================================================
-def prepare_unified_execution_tape(rolling_master_df, micro_tf, macro_timeframes):
-    df_micro = rolling_master_df.sort_values(["Symbol", "Datetime"]).copy()
-    
-    df_micro["Datetime"] = pd.to_datetime(df_micro["Datetime"]).astype("datetime64[ns]")
-
-    df_micro = calculate_core_technicals(df_micro)
-    df_micro = construct_45deg_renko_matrix(df_micro, micro_tf, MICRO_RENKO_CONFIRM_BRICKS)
-    df_micro = construct_volume_delta_renko_matrix(df_micro, micro_tf, MICRO_RENKO_CONFIRM_BRICKS)
-    df_micro = construct_renko_velocity_engine(df_micro, micro_tf)
-    df_micro = apply_dual_tier_scorecard(df_micro, micro_tf, "MICRO")
-    df_micro = df_micro.sort_values("Datetime").reset_index(drop=True)
-
-    bull_gate_cols, bear_gate_cols = [], []
-    for tf in macro_timeframes:
-        print(f"   ├─ Evaluating Macro Context Gates for Options [{tf}]...")
-        env_df = evaluate_single_timeframe_gates(rolling_master_df, tf)
-        
-        env_df["Datetime"] = pd.to_datetime(env_df["Datetime"]).astype("datetime64[ns]")
-
-        bull_col, bear_col = f"Armed_Bull_{tf}", f"Armed_Bear_{tf}"
-        bull_gate_cols.append(bull_col)
-        bear_gate_cols.append(bear_col)
-        
-        df_micro = pd.merge_asof(df_micro, env_df, on="Datetime", by="Symbol", direction="backward")
-        df_micro[bull_col] = df_micro[bull_col].fillna(False)
-        df_micro[bear_col] = df_micro[bear_col].fillna(False)
-
-    df_micro["Master_Armed_Bull"] = df_micro[bull_gate_cols].any(axis=1)
-    df_micro["Master_Armed_Bear"] = df_micro[bear_gate_cols].any(axis=1)
-    df_micro = df_micro.sort_values(["Symbol", "Datetime"]).reset_index(drop=True)
-
-    # 🔥 SNIPER MANDATE: Force execution exactly on the minute a new brick is born.
-    df_micro["Fresh_Brick"] = df_micro[f"Bars_Since_Brick_{micro_tf}"] == 0
-
-    df_micro["Trigger_Bull"] = df_micro["Master_Armed_Bull"] & df_micro[f"Armed_Bull_{micro_tf}"] & df_micro["Fresh_Brick"]
-    df_micro["Trigger_Bear"] = df_micro["Master_Armed_Bear"] & df_micro[f"Armed_Bear_{micro_tf}"] & df_micro["Fresh_Brick"]
-    
-    df_micro["Trigger_Bull_Prev"] = df_micro.groupby("Symbol")["Trigger_Bull"].shift(1).fillna(False)
-    df_micro["Trigger_Bear_Prev"] = df_micro.groupby("Symbol")["Trigger_Bear"].shift(1).fillna(False)
-
-    df_micro["New_Bull"] = df_micro["Trigger_Bull"] & ~df_micro["Trigger_Bull_Prev"]
-    
-    # 🔥 OPTIONS BUYING ONLY: Disables Shorting (-1) entirely
-    df_micro["Direction"] = np.where(df_micro["New_Bull"], 1, 0)
-
-    return df_micro.sort_values("Datetime").reset_index(drop=True)
-
-
-# ==============================================================================
-# 5. FYERS SCANNING & TRADE MANAGEMENT ENGINE
-# ==============================================================================
-def scan_fyers_institutional_tape(target_date_str):
-    try:
-        app_id = os.environ.get("FYERS_CLIENT_ID") or os.environ.get("FYERS_APP_ID")
-        access_token = os.environ.get("FYERS_ACCESS_TOKEN")
-        
-        print(f"\n{COLOR_DIM}[System Auth Check] Client ID Passed: {'Yes' if app_id else 'NO'} | Token Passed: {'Yes' if access_token else 'NO'}{COLOR_RESET}")
-
-        if not app_id or not access_token:
-            print(f"❌ {COLOR_RED}Error: FYERS_CLIENT_ID or FYERS_ACCESS_TOKEN environment variables not found.{COLOR_RESET}")
-            return
-
-        headers = {"Authorization": f"{app_id}:{access_token}"}
-        universe = build_locked_options_universe(target_date_str, headers)
-        
-        if not universe:
-            print(f"{COLOR_RED}❌ No valid option strikes generated for {target_date_str}.{COLOR_RESET}")
-            return
-
-        trading_days = get_past_trading_days(target_date_str, num_days=BACKTRACE_DAYS)
-        if not trading_days:
-            return
-
-        target_dt = pd.to_datetime(target_date_str)
-        print(f"🚀 Multithreading Bulk Ingestion for {len(universe)} Fyers Option Contracts...")
-        fetch_tasks = [(item, trading_days[0], target_date_str) for item in universe]
-        historical_dfs = []
-
-        def fetch_fyers_worker(task):
-            item, start_date, end_date = task
-            symbol = item["symbol"]
-            url = "https://api-t1.fyers.in/data/history"
-            params = {
-                "symbol": symbol,
-                "resolution": "1",
-                "date_format": "1",
-                "range_from": start_date,
-                "range_to": end_date
-            }
-            
-            for attempt in range(3):
-                try:
-                    res = requests.get(url, headers=headers, params=params, timeout=15)
-                    if res.status_code == 200:
-                        data = res.json()
-                        if data.get("s") == "ok" and data.get("candles"):
-                            df = pd.DataFrame(data["candles"], columns=["Epoch", "Open", "High", "Low", "Close", "Volume"])
-                            df["Datetime"] = pd.to_datetime(df["Epoch"], unit='s')
-                            df["Datetime"] = df["Datetime"].dt.tz_localize('UTC').dt.tz_convert('Asia/Kolkata').dt.tz_localize(None)
-                            
-                            df["Datetime"] = df["Datetime"].astype("datetime64[ns]")
-                            
-                            df = df.drop_duplicates(subset=["Datetime"]).sort_values("Datetime").reset_index(drop=True)
-                            df["Symbol"] = symbol
-                            return df
-                        break
-                    elif res.status_code == 429: time.sleep(1.5)
-                    else: break
-                except Exception: time.sleep(1)
-            return None
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=10) as executor:
-            futures = {executor.submit(fetch_fyers_worker, task): task for task in fetch_tasks}
-            completed = 0
-            for future in concurrent.futures.as_completed(futures):
-                completed += 1
-                sys.stdout.write(f"\r📡 Fetching Fyers History... {completed}/{len(fetch_tasks)} options contracts processed")
-                sys.stdout.flush()
-                res = future.result()
-                if res is not None: historical_dfs.append(res)
-        print()
-
-        if not historical_dfs:
-            print(f"{COLOR_YELLOW}[Warning] No candle data returned for the selected Fyers option strikes.{COLOR_RESET}")
-            return
-
-        rolling_master_df = pd.concat(historical_dfs, ignore_index=True)
-        print("⚙️ Computing Technicals, Velocity Matrices & Option Micro/Macro Tape...")
-
-        tape_exec = prepare_unified_execution_tape(rolling_master_df, MICRO_TIMEFRAME, MACRO_TIMEFRAMES)
-
-        all_anomalies = tape_exec[tape_exec["Direction"] != 0].copy()
-        anomalies_by_time = all_anomalies.groupby("Datetime")
-
-        closes_dict = tape_exec.set_index(["Datetime", "Symbol"])["Close"].to_dict()
-        micro_price_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Renko_Count_{MICRO_TIMEFRAME}"].to_dict()
-        micro_vol_renko = tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{MICRO_TIMEFRAME}"].to_dict()
-        micro_vel_bars = tape_exec.set_index(["Datetime", "Symbol"])[f"Bars_Since_Brick_{MICRO_TIMEFRAME}"].to_dict()
-        macro_price_renkos = {tf: tape_exec.set_index(["Datetime", "Symbol"])[f"Renko_Count_{tf}"].to_dict() for tf in MACRO_TIMEFRAMES}
-        macro_vol_renkos = {tf: tape_exec.set_index(["Datetime", "Symbol"])[f"Vol_Renko_Count_{tf}"].to_dict() for tf in MACRO_TIMEFRAMES}
-        
-        all_times = np.sort(tape_exec["Datetime"].unique())
-        
-        active_trades = {}
-        closed_trades_history = []
-        cutoff_time_obj = pd.to_datetime(ENTRY_CUTOFF_TIME).time()
-
-        for t in all_times:
-            t_dt = pd.to_datetime(t)
-            
-            # 1. Manage Active Trades (Checking for Exits)
-            for sym in list(active_trades.keys()):
-                st = active_trades[sym]
-                ltp = closes_dict.get((t_dt, sym))
-                mi_p_count = micro_price_renko.get((t_dt, sym), 0)
-                mi_v_count = micro_vol_renko.get((t_dt, sym), 0)
-                mi_bars_stalled = micro_vel_bars.get((t_dt, sym), 0)
-
-                if ltp is not None:
-                    exit_reason = None
-                    if mi_bars_stalled > RENKO_VELOCITY_MAX_BARS:
-                        exit_reason = f"Velocity Stall (No brick in {RENKO_VELOCITY_MAX_BARS} bars)"
-                    
-                    if not exit_reason:
-                        # Since we are Long Only, we only check for Bearish structure breaks (-1 values)
-                        if mi_p_count <= -MICRO_EXIT_PRICE_BRICKS: exit_reason = "Micro Price Reversal"
-                        elif mi_v_count <= -MICRO_EXIT_VOL_BRICKS: exit_reason = "Micro Volume Reversal"
-                        else:
-                            for tf in st["triggering_macro_tfs"]:
-                                if macro_price_renkos[tf].get((t_dt, sym), 0) <= -MACRO_EXIT_PRICE_BRICKS:
-                                    exit_reason = f"Macro [{tf}] Price Break"
-                                    break
-                                if macro_vol_renkos[tf].get((t_dt, sym), 0) <= -MACRO_EXIT_VOL_BRICKS:
-                                    exit_reason = f"Macro [{tf}] Volume Break"
-                                    break
-                    
-                    if exit_reason:
-                        st["state"] = "EXITED"
-                        st["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M")
-                        st["exit_price"] = ltp
-                        st["exit_reason"] = exit_reason
-                        closed_trades_history.append(st)
-                        del active_trades[sym]
-
-            # 2. Process New Entrances
-            if t_dt in anomalies_by_time.groups and t_dt.time() <= cutoff_time_obj:
-                for _, row in anomalies_by_time.get_group(t_dt).iterrows():
-                    sym = row["Symbol"]
-                    direction = row["Direction"]
-                    triggered_m_tfs = [tf for tf in MACRO_TIMEFRAMES if row.get(f"Armed_Bull_{tf}" if direction == 1 else f"Armed_Bear_{tf}", False)]
-
-                    if sym not in active_trades:
-                        active_trades[sym] = {
-                            "sym": sym,
-                            "state": "ACTIVE",
-                            "origin": row["Close"],              
-                            "date": t_dt.strftime("%Y-%m-%d"),
-                            "time": t_dt.strftime("%H:%M"),      
-                            "dir": direction,
-                            "exit_time": None,
-                            "exit_price": None,
-                            "exit_reason": None,
-                            "triggering_macro_tfs": triggered_m_tfs
-                        }
-
-            # 3. End of Day Forced Exit (14:30)
-            if t_dt.hour == 14 and t_dt.minute >= 30:
-                for sym in list(active_trades.keys()):
-                    st = active_trades[sym]
-                    st["state"] = "EXITED"
-                    st["exit_time"] = t_dt.strftime("%Y-%m-%d %H:%M") + " (EOD Cutoff)"
-                    st["exit_price"] = closes_dict.get((t_dt, sym), st["origin"])
-                    st["exit_reason"] = "End of Day Market Close"
-                    closed_trades_history.append(st)
-                    del active_trades[sym]
-
-        today_master = tape_exec[tape_exec["Datetime"].dt.date == target_dt.date()]
-        if today_master.empty: return
-            
-        final_ltp_dict = today_master.groupby("Symbol")["Close"].last().to_dict()
-
-        # ==============================================================================
-        # 6. TERMINAL OUTPUT DISPLAY
-        # ==============================================================================
-        current_active_runners = {sym: st for sym, st in active_trades.items() if st["state"] == "ACTIVE"}
-        today_closed_trades = [st for st in closed_trades_history if st["date"] == target_date_str]
-
-        tf_display_str = " | ".join(MACRO_TIMEFRAMES)
-        print(f"\n{COLOR_CYAN}================================================================================================{COLOR_RESET}")
-        print(f"{COLOR_BOLD}FYERS NIFTY & SENSEX DUAL-TIER ENGINE [{MICRO_TIMEFRAME} Micro ⚡ Macro: {tf_display_str}]{COLOR_RESET}")
-        print(f"{COLOR_CYAN}================================================================================================{COLOR_RESET}\n")
-
-        if current_active_runners:
-            print(f"{COLOR_BOLD}🟢 BASKET 1: ACTIVE OPTION RUNNERS{COLOR_RESET}")
-            for sym, st in current_active_runners.items():
-                ltp = final_ltp_dict.get(sym, st["origin"])
-                pnl_pct = ((ltp - st["origin"]) / st["origin"]) * 100
-                color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
-                d_str = "BUY/LONG"
-                print(f"  {color}⚡ {sym:<25} P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
-                print(f"      └─ ⚓ Qualifying Macro TFs : {', '.join(st['triggering_macro_tfs'])}")
-                print(f"      └─ 🎯 Entry Time / Premium : {st['time']} | ₹{st['origin']:.2f}")
-                print(f"      └─ 🎯 Latest Premium (LTP) : ₹{ltp:.2f}\n")
-
-        if today_closed_trades:
-            print(f"{COLOR_BOLD}🛑 BASKET 2: FULL DAY CLOSED TRADES LEDGER{COLOR_RESET}")
-            for st in today_closed_trades:
-                pnl_pct = ((st["exit_price"] - st["origin"]) / st["origin"]) * 100
-                color = COLOR_GREEN if pnl_pct >= 0 else COLOR_RED
-                d_str = "BUY/LONG"
-                print(f"  {color}🛑 {st['sym']:<25} Final P&L: {pnl_pct:+.2f}% ({d_str}){COLOR_RESET}")
-                print(f"      └─ ⚓ Entry Time / Premium : {st['time']} | ₹{st['origin']:.2f}")
-                print(f"      └─ 🎯 Exit Time / Premium  : {st['exit_time'][11:]} | ₹{st['exit_price']:.2f}")
-                print(f"      └─ 📉 Exit Reason          : {st['exit_reason']}\n")
-
-    except Exception as e:
-        print(f"\n{COLOR_RED}💥 CRITICAL ENGINE FAILURE: {e}{COLOR_RESET}")
-        traceback.print_exc()
-
-
-def run_production_sweep():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("-d", "--date", type=str, default="")
-    args, _ = parser.parse_known_args()
-    raw_date_str = args.date or os.environ.get("PARAM_BACKTEST_DATE", "").strip()
-
-    if not raw_date_str:
-        target_dt = datetime.utcnow() + timedelta(hours=5, minutes=30)
-        # Offset for weekends if backtest date isn't explicitly provided
-        if target_dt.weekday() == 5: target_dt -= timedelta(days=1)
-        elif target_dt.weekday() == 6: target_dt -= timedelta(days=2)
-        target_date_str = target_dt.strftime("%Y-%m-%d")
+    fno = {i.get("underlying_symbol") for i in nse if i.get("segment") == "NSE_FO" and i.get("underlying_symbol")}
+    if mode == "STOCK_FNO":
+        rows = [i for i in nse if plain(i) and ts_of(i) in fno]
     else:
-        target_date_str = datetime.strptime(raw_date_str, "%Y-%m-%d").strftime("%Y-%m-%d")
+        rows = [i for i in nse if plain(i) and ts_of(i) not in fno]
+    universe = list({i["instrument_key"]: {"symbol": ts_of(i), "key": i["instrument_key"]} for i in rows}.values())
+    return universe
 
-    scan_fyers_institutional_tape(target_date_str)
+def _option_master():
+    print("🔄 Downloading NSE & BSE instrument masters Live...")
+    nse, bse = _download_master("NSE"), _download_master("BSE")
+    if not nse or not bse:
+        return {}
+    name_to_idx = {}
+    for idx, cfg in INDEX_CONFIG.items():
+        for m in cfg["match"]:
+            name_to_idx[m] = idx
+
+    out = {idx: [] for idx in INDEX_CONFIG}
+    for item in nse + bse:                                       
+        if str(item.get("instrument_type", "")).upper() not in ("CE", "PE"):
+            continue
+        idx = name_to_idx.get(str(item.get("name", "")).upper()) or \
+              name_to_idx.get(str(item.get("underlying_symbol", "")).upper())
+        if not idx:
+            continue
+        strike_val = item.get("strike", item.get("strike_price"))
+        try:
+            strike = int(float(strike_val)) if strike_val is not None else 0
+        except (ValueError, TypeError):
+            continue
+        if strike > 0:
+            out[idx].append({"strike": strike, "expiry": item.get("expiry"),
+                             "ts": str(item.get("tradingsymbol", item.get("trading_symbol", ""))),
+                             "key": item.get("instrument_key")})
+    return out
+
+def _parse_expiry(e):
+    try:
+        if isinstance(e, (int, float)) or (isinstance(e, str) and e.isdigit()):
+            return datetime.fromtimestamp(int(e) / 1000.0, IST).replace(tzinfo=None)
+        e_str = str(e).split('T')[0]
+        for fmt in ("%Y-%m-%d", "%d-%b-%Y"):
+            try:
+                return datetime.strptime(e_str, fmt)
+            except ValueError:
+                pass
+    except Exception:
+        pass
+    return datetime.max
+
+def _options_universe():
+    opt_master = _option_master()
+    if not opt_master:
+        print(f"{COLOR_RED_FG}[API Error] Could not build the option master.{COLOR_RESET}")
+        return []
+
+    spot_items = [{"symbol": n, "key": c["spot_key"]} for n, c in INDEX_CONFIG.items()]
+    quotes = fetch_quotes(spot_items)
+    print(f"🎯 Calculating ATM Strikes & Constructing Options Chain for {len(INDEX_CONFIG)} Indices...\n")
+
+    universe, today = [], now_ist().date()
+    for idx_name, cfg in INDEX_CONFIG.items():
+        spot_price = (quotes.get(cfg["spot_key"]) or {}).get('ltp') or 0.0
+        if spot_price <= 0:                                  
+            df = fetch_today(cfg["spot_key"])
+            if df is None:
+                end = now_ist().date() - timedelta(days=1)
+                df = load_history({"key": cfg["spot_key"]}, end - timedelta(days=6), end, 2)
+            spot_price = float(df['Close'].iloc[-1]) if df is not None and not df.empty else 0.0
+        if spot_price <= 0:
+            print(f"   [!] {idx_name}: Could not fetch live spot price. Skipping.")
+            continue
+
+        step = cfg["step"]
+        atm = int(round(spot_price / step) * step)
+        targets = {int(atm + i * step) for i in range(-STRIKES_FROM_ATM, STRIKES_FROM_ATM + 1)}
+        idx_opts = opt_master.get(idx_name, [])
+        if not idx_opts:
+            print(f"   [!] {idx_name}: Could not find option chain in JSON. Skipping.")
+            continue
+
+        exp = {}
+        for o in idx_opts:
+            if o.get("expiry") is not None and o["expiry"] not in exp:
+                exp[o["expiry"]] = _parse_expiry(o["expiry"])
+        live = sorted((dt, e) for e, dt in exp.items() if dt == datetime.max or dt.date() >= today)
+        if len(live) <= EXPIRY_OFFSET:
+            print(f"   [!] {idx_name}: Required expiry offset not available. Found {len(live)}. Skipping.")
+            continue
+        target_dt, target_expiry = live[EXPIRY_OFFSET]
+        expiry_str = target_dt.strftime("%d-%b-%Y") if target_dt != datetime.max else str(target_expiry)
+
+        matched = [o for o in idx_opts if o["expiry"] == target_expiry and o["strike"] in targets]
+        print(f"   => {idx_name:<10} | Spot: {spot_price:<8.2f} | ATM: {atm:<6} | Expiry: {expiry_str} "
+              f"| Grabbed {len(matched)} CE/PE Contracts")
+        universe.extend({"symbol": o["ts"], "key": o["key"]} for o in matched)
+    print("\n")
+    return universe
+
+def get_dynamic_universe(mode):
+    if mode == "INDEX_OPTIONS":
+        return _options_universe()
+    if mode in ("STOCK_FNO", "CASH_EQUITY"):
+        return _equity_universe(mode)
+    return []
+
+# ==============================================================================
+# 2. THE DECOUPLED HA-ATR ENGINE 
+# ==============================================================================
+def compute_base_atr(m):
+    hi, lo, cl = m['High'].values, m['Low'].values, m['Close'].values
+    sid, mins = m['SessId'].values, m['Min'].values
+
+    bucket = sid * 100 + mins // 15
+    starts = np.concatenate(([0], np.flatnonzero(np.diff(bucket)) + 1))
+    ends = np.concatenate((starts[1:], [len(bucket)])) - 1
+    b_high = np.maximum.reduceat(hi, starts)
+    b_low = np.minimum.reduceat(lo, starts)
+    b_close = cl[ends]
+    if len(b_close) < 5:
+        return max(cl[-1] * MIN_ATR_PCT, 0.01)
+
+    prev_close = np.concatenate(([np.nan], b_close[:-1]))
+    tr = np.fmax(np.fmax(b_high - b_low, np.abs(b_high - prev_close)), np.abs(b_low - prev_close))
+    atr = float(tr[-ATR_BASIS_PERIOD:].mean())
+    return max(atr, b_close[-1] * MIN_ATR_PCT, 0.01)
+
+def split_sessions(m):
+    sid = m['SessId'].values
+    cuts = np.flatnonzero(np.diff(sid)) + 1
+    starts = np.concatenate(([0], cuts))
+    ends = np.concatenate((cuts, [len(sid)]))
+    o, h, l, c = (m[k].tolist() for k in ('Open', 'High', 'Low', 'Close'))
+    return [(o[s:e], h[s:e], l[s:e], c[s:e]) for s, e in zip(starts, ends)]
+
+def build_isolated_range_bars(sessions, target_range):
+    B_O, B_H, B_L, B_C = [], [], [], []
+    seg_start = 0                                            
+
+    for opens, highs, lows, closes in sessions:
+        if not closes:
+            continue
+        before = len(B_C)
+        curr_O, curr_H, curr_L, curr_C = opens[0], highs[0], lows[0], closes[0]
+        for hi, lo, cl in zip(highs, lows, closes):
+            if hi > curr_H:
+                curr_H = hi
+            if lo < curr_L:
+                curr_L = lo
+            curr_C = cl
+            if curr_H - curr_L >= target_range:
+                B_O.append(curr_O); B_H.append(curr_H); B_L.append(curr_L); B_C.append(curr_C)
+                curr_O = curr_H = curr_L = curr_C
+        if curr_H > curr_L:
+            B_O.append(curr_O); B_H.append(curr_H); B_L.append(curr_L); B_C.append(curr_C)
+        if len(B_C) > before:
+            seg_start = before
+
+    if not B_C:
+        return None
+
+    o = B_O[seg_start:]; h = B_H[seg_start:]; l = B_L[seg_start:]; c = B_C[seg_start:]
+    ha_close = [(o[i] + h[i] + l[i] + c[i]) / 4 for i in range(len(c))]
+    ha_open = (o[0] + c[0]) / 2
+    for i in range(1, len(c)):
+        ha_open = (ha_open + ha_close[i - 1]) / 2.0
+    ha_trend = 'Green' if ha_close[-1] >= ha_open else 'Red'
+
+    return {'High': np.asarray(B_H), 'Low': np.asarray(B_L), 'Close': np.asarray(B_C), 'HA_Trend': ha_trend}
+
+def _ewm(x, alpha):
+    xs = x.tolist()
+    out = [0.0] * len(xs)
+    prev = xs[0]
+    out[0] = prev
+    keep = 1.0 - alpha
+    for i in range(1, len(xs)):
+        prev = keep * prev + alpha * xs[i]
+        out[i] = prev
+    return np.asarray(out)
+
+def _last_bb(series):
+    w = series[-BB_PERIOD:]
+    mean = float(w.mean())
+    std = float(w.std(ddof=0)) if len(w) > 1 else 0.0
+    return mean, std
+
+def calculate_strict_signals(bars):
+    if bars is None or len(bars['Close']) < 5:
+        return "", "", "", "NONE"
+    close, high, low = bars['Close'], bars['High'], bars['Low']
+    n = len(close)
+
+    delta = np.diff(close, prepend=close[0])
+    gain = _ewm(np.where(delta > 0, delta, 0.0), 1 / RSI_PERIOD)
+    loss = _ewm(np.where(delta < 0, -delta, 0.0), 1 / RSI_PERIOD)
+    rsi = 100 - (100 / (1 + (gain / (loss + 1e-8))))
+    r_mean, r_std = _last_bb(rsi)
+
+    macd = _ewm(close, 2 / 13) - _ewm(close, 2 / 27)
+    hist = macd - _ewm(macd, 2 / 10)
+    h_mean, h_std = _last_bb(hist)
+
+    up = np.zeros(n); down = np.zeros(n)
+    up[1:] = high[1:] - high[:-1]
+    down[1:] = low[:-1] - low[1:]
+    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
+    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
+    
+    tr = (high - low).copy()
+    tr[1:] = np.maximum(tr[1:], np.maximum(np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])))
+
+    a = 1 / ADX_PERIOD
+    atr = _ewm(tr, a)
+    plus_di = 100 * (_ewm(plus_dm, a) / (atr + 1e-8))
+    minus_di = 100 * (_ewm(minus_dm, a) / (atr + 1e-8))
+    adx = _ewm(100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-8), a)
+    p_mean, p_std = _last_bb(plus_di)
+    m_mean, m_std = _last_bb(minus_di)
+
+    bb_rsi = "Neutral"
+    if r_std > 0:
+        if rsi[-1] > r_mean + BB_STD * r_std: bb_rsi = "Buy"
+        elif rsi[-1] < r_mean - BB_STD * r_std: bb_rsi = "Sell"
+
+    bb_macd = "Neutral"
+    if h_std > 0:
+        if hist[-1] > h_mean + BB_STD * h_std: bb_macd = "Buy"
+        elif hist[-1] < h_mean - BB_STD * h_std: bb_macd = "Sell"
+
+    adx_sig = "Neutral"
+    if p_std > 0 and plus_di[-1] > p_mean + BB_STD * p_std and plus_di[-1] > minus_di[-1] and adx[-1] >= ADX_THRESHOLD:
+        adx_sig = "Buy"
+    elif m_std > 0 and minus_di[-1] > m_mean + BB_STD * m_std and minus_di[-1] > plus_di[-1] and adx[-1] >= ADX_THRESHOLD:
+        adx_sig = "Sell"
+
+    ha_trend = bars['HA_Trend']
+    is_bull = bb_rsi == "Buy" and bb_macd == "Buy" and adx_sig == "Buy" and ha_trend == 'Green'
+    is_bear = bb_rsi == "Sell" and bb_macd == "Sell" and adx_sig == "Sell" and ha_trend == 'Red'
+
+    if is_bull:
+        return bb_rsi, bb_macd, adx_sig, "BULL"
+    if is_bear:
+        return bb_rsi, bb_macd, adx_sig, "BEAR"
+    return "", "", "", "NONE"
+
+
+def compute_row(symbol, master_1m):
+    close = master_1m['Close'].values
+    high = master_1m['High'].values
+    low = master_1m['Low'].values
+    
+    sma20 = pd.Series(close).rolling(20, min_periods=1).mean().values
+    std20 = pd.Series(close).rolling(20, min_periods=1).std(ddof=0).values
+    
+    tr = np.zeros_like(close)
+    tr[0] = high[0] - low[0]
+    tr[1:] = np.maximum(high[1:] - low[1:], np.maximum(np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])))
+    atr20 = pd.Series(tr).rolling(20, min_periods=1).mean().values
+    
+    bb_upper = sma20[-1] + 2.0 * std20[-1]
+    bb_lower = sma20[-1] - 2.0 * std20[-1]
+    kc_upper = sma20[-1] + 1.5 * atr20[-1]
+    kc_lower = sma20[-1] - 1.5 * atr20[-1]
+    
+    # PERCENTAGE DELTA MATH (Normalizing output to a percentage scale instead of raw rupees)
+    bull_bb_kc_delta = float((bb_upper - kc_upper) / kc_upper * 100) if kc_upper > 0 else 0.0
+    bear_bb_kc_delta = float((kc_lower - bb_lower) / kc_lower * 100) if kc_lower > 0 else 0.0
+
+    base_atr = compute_base_atr(master_1m)
+    sessions = split_sessions(master_1m)
+    row = {'Symbol': symbol, 'LTP': float(master_1m['Close'].iloc[-1]), 'LastSession': master_1m['Session'].iloc[-1],
+           'Score': 0, 'PerfectBullBlocks': 0, 'PerfectBearBlocks': 0, 
+           'Bull_BB_KC_Delta': bull_bb_kc_delta, 'Bear_BB_KC_Delta': bear_bb_kc_delta}
+    
+    for mult in HA_ATR_MULTIPLIERS:
+        gtag = f"{mult}X"
+        bars = build_isolated_range_bars(sessions, base_atr * mult)
+        bb_rsi, bb_macd, adx_sig, alignment = calculate_strict_signals(bars)
+        row[f'BB_RSI_{gtag}'], row[f'BB_MACD_{gtag}'], row[f'ADX_{gtag}'] = bb_rsi, bb_macd, adx_sig
+        if alignment == "BULL":
+            row['PerfectBullBlocks'] += 1
+            row['Score'] += 1
+        elif alignment == "BEAR":
+            row['PerfectBearBlocks'] += 1
+            row['Score'] -= 1
+    
+    return row
+
+# ==============================================================================
+# 3. PIPELINE EXECUTOR & UI DRAWING
+# ==============================================================================
+def format_cell(text, width=10):
+    if not text: return " " * width
+    spaces = width - len(str(text))
+    left_pad, right_pad = " " * (spaces // 2), " " * (spaces - (spaces // 2))
+    colored_text = (f"{COLOR_GREEN_BG}{text}{COLOR_RESET}" if text == "Buy"
+                    else f"{COLOR_RED_BG}{text}{COLOR_RESET}" if text == "Sell" else str(text))
+    return f"{left_pad}{colored_text}{right_pad}"
+
+
+def prefilter_by_quotes(universe):
+    quotes = fetch_quotes(universe)
+    if len(quotes) < 0.5 * len(universe):
+        print(f"{COLOR_YELLOW}⚠️ Quote pre-filter unavailable; falling back to full scan.{COLOR_RESET}")
+        return universe
+    lo, hi = MIN_PRICE * (1 - PREFILTER_PRICE_SLACK), MAX_PRICE * (1 + PREFILTER_PRICE_SLACK)
+    live = market_is_open()
+    keep = []
+    for it in universe:
+        q = quotes.get(it['key'])
+        if not q or not (lo <= q['ltp'] <= hi):
+            continue
+        if live:
+            if PREFILTER_MIN_TODAY_VOLUME and q['vol'] < PREFILTER_MIN_TODAY_VOLUME:
+                continue
+            if PREFILTER_MIN_ABS_MOVE_PCT:
+                prev = q['ltp'] - q['net']
+                if prev > 0 and abs(q['net']) / prev * 100 < PREFILTER_MIN_ABS_MOVE_PCT:
+                    continue
+        keep.append(it)
+    return keep
+
+
+def _history_worker(args):
+    item, start, end, days, mode, progress = args
+    try:
+        hist = load_history(item, start, end, days)
+        if hist is None or hist.empty:
+            return None
+        close, vol = hist['Close'].iloc[-1], hist['Volume'].sum()
+        if mode == "INDEX_OPTIONS":
+            ok = close >= OPT_MIN_PRICE and vol >= OPT_MIN_VOLUME
+        else:
+            ok = MIN_PRICE <= close <= MAX_PRICE and vol >= MIN_DAILY_VOLUME
+        return (item, hist) if ok else None
+    except Exception as e:
+        print(f"\n{COLOR_YELLOW}[history] {item['symbol']}: {e}{COLOR_RESET}", file=sys.stderr)
+        return None
+    finally:
+        progress.tick()
+
+
+def process_stock(args):
+    item, hist, days, progress = args
+    try:
+        today_df = fetch_today(item['key'])
+        frames = [hist] + ([today_df] if today_df is not None else [])
+        master_1m = keep_last_sessions(prepare_master(frames), days)
+        if len(master_1m) < 30:
+            return None
+        return compute_row(item['symbol'], master_1m)
+    except Exception as e:
+        print(f"\n{COLOR_YELLOW}[process] {item['symbol']}: {e}{COLOR_RESET}", file=sys.stderr)
+        return None
+    finally:
+        progress.tick()
+
+
+def _eta(calls):
+    per_min = min(cap for span, cap in RATE_CAPS if span == 60.0)
+    return f"~{max(1, round(calls / per_min * 60))}s" if calls < per_min else f"~{calls / per_min:.1f} min"
+
+
+def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_BLOCKS):
+    t_start = time.time()
+    days = max(days, 2)
+    print(f"\n{COLOR_CYAN}📡 Initializing Screener Pipeline [{mode}] via UPSTOX API...{COLOR_RESET}")
+
+    universe_raw = get_dynamic_universe(mode)
+    if STATS.auth_failed:
+        print(f"{COLOR_RED_FG}[Auth Error] Upstox rejected the token (401). Refresh UPSTOX_ACCESS_TOKEN.{COLOR_RESET}")
+        return
+    if not universe_raw:
+        print(f"{COLOR_RED_FG}[!] Failed to generate the Universe list. Exiting.{COLOR_RESET}")
+        return
+
+    end = now_ist().date() - timedelta(days=1)
+    start = end - timedelta(days=days * 2 + 6)
+
+    candidates = universe_raw
+    if mode != "INDEX_OPTIONS":
+        candidates = prefilter_by_quotes(universe_raw)
+        print(f"⚡ Quote pre-filter: {len(universe_raw)} -> {len(candidates)} instruments "
+              f"({-(-len(universe_raw) // 100)} API calls)")
+        if STATS.auth_failed:
+            print(f"{COLOR_RED_FG}[Auth Error] Upstox rejected the token (401). Refresh UPSTOX_ACCESS_TOKEN.{COLOR_RESET}")
+            return
+
+    what = "Options Strikes for Minimum Premium & Liquidity" if mode == "INDEX_OPTIONS" \
+        else "stocks for Volume & Price constraints"
+    print(f"🔄 Fetching Live History for {len(candidates)} {what}...  [{_eta(len(candidates))}]")
+    prog = Progress("history", len(candidates))
+    work = [(it, start, end, days, mode, prog) for it in candidates]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        stage1 = [r for r in ex.map(_history_worker, work) if r is not None]
+    prog.done()
+
+    if STATS.auth_failed:
+        print(f"{COLOR_RED_FG}[Auth Error] Upstox rejected the token (401). Refresh UPSTOX_ACCESS_TOKEN.{COLOR_RESET}")
+        return
+    if not stage1:
+        print(f"{COLOR_YELLOW}No instruments passed the universe filter.{COLOR_RESET}")
+        return
+    liq = "highly liquid Option Strikes" if mode == "INDEX_OPTIONS" else "qualified assets"
+    print(f"✅ Target Universe ready ({len(stage1)} {liq}). Fetching live candles "
+          f"[{len(stage1)} calls, {_eta(len(stage1))}; {LIMITER.used(1800)}/{RATE_CAPS[-1][1]} used in last 30 min]...\n")
+
+    prog = Progress("signals", len(stage1))
+    work = [(item, hist, days, prog) for item, hist in stage1]
+    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        results = [r for r in ex.map(process_stock, work) if r is not None]
+    prog.done()
+
+    if not results:
+        print(f"{COLOR_YELLOW}No usable data returned.{COLOR_RESET}")
+        return
+
+    latest_session = max(r['LastSession'] for r in results)         
+    dashboard_data = [r for r in results if r['LastSession'] == latest_session]
+
+    # THE 1X ANCHOR RULE (Mandatory alignment on lowest timeframe)
+    bulls = [r for r in dashboard_data if r['PerfectBullBlocks'] >= min_blocks 
+             and r.get('BB_RSI_1X') == 'Buy' 
+             and r.get('BB_MACD_1X') == 'Buy' 
+             and r.get('ADX_1X') == 'Buy']
+             
+    bears = [r for r in dashboard_data if r['PerfectBearBlocks'] >= min_blocks 
+             and r.get('BB_RSI_1X') == 'Sell' 
+             and r.get('BB_MACD_1X') == 'Sell' 
+             and r.get('ADX_1X') == 'Sell']
+
+    # TWO-TIER PRIME SORTING: 1. Perfect Blocks (Descending) -> 2. Freshness % (Ascending, >0.00 first)
+    def order_bull(r):
+        d = r['Bull_BB_KC_Delta']
+        tier2 = d if d > 0 else float('inf') # Force non-breakouts (inside squeeze) to bottom
+        return (-r['PerfectBullBlocks'], tier2)
+
+    def order_bear(r):
+        d = r['Bear_BB_KC_Delta']
+        tier2 = d if d > 0 else float('inf')
+        return (-r['PerfectBearBlocks'], tier2)
+
+    bulls.sort(key=order_bull)
+    bears.sort(key=order_bear)
+    
+    bulls, bears = bulls[:TOP_N_BUYERS], bears[:TOP_N_SELLERS]
+
+    print(f"{COLOR_BOLD}=== STRICT INSTITUTIONAL VOLATILITY DASHBOARD [{mode}] ==={COLOR_RESET}")
+    print(f"Session: {latest_session} | Refreshed: {now_ist():%H:%M:%S} IST | Scanned: {len(dashboard_data)}\n")
+
+    sym_title = "Options Strike" if mode == "INDEX_OPTIONS" else "Script"
+    prem = "PREMIUM " if mode == "INDEX_OPTIONS" else ""
+
+    def print_basket(title, icon, data_list, dist_key):
+        if not data_list: return
+        print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
+        header_str = f" {COLOR_CYAN}{sym_title:<22} {'LTP':<8} |"
+        for mult in HA_ATR_MULTIPLIERS:
+            gtag = f"{mult}X"
+            header_str += f"  {'BB-RSI ' + gtag:^11} {'BB-MACD ' + gtag:^12} {'BB-DI ' + gtag:^9} |"
+        header_str += f" {'BB-KC Δ%':>8}"
+        print(header_str + COLOR_RESET)
+        print("-" * len(ANSI_RE.sub("", header_str)))
+        for row in data_list:
+            row_str = f" {row['Symbol']:<22} {row['LTP']:<8.2f} |"
+            for mult in HA_ATR_MULTIPLIERS:
+                gtag = f"{mult}X"
+                row_str += (f"  {format_cell(row.get(f'BB_RSI_{gtag}'), 11)}"
+                            f" {format_cell(row.get(f'BB_MACD_{gtag}'), 12)}"
+                            f" {format_cell(row.get(f'ADX_{gtag}'), 9)} |")
+            val = row[dist_key]
+            val_str = f"{val:>7.2f}%" if val > 0 else f"{val:>7.2f}%"
+            row_str += f" {val_str}"
+            print(row_str)
+
+    print_basket(f"TOP {prem}BUYERS (Freshest BB/KC Breakouts Sorted First)", "🔥", bulls, 'Bull_BB_KC_Delta')
+    print_basket(f"TOP {prem}SELLERS (Freshest BB/KC Breakdowns Sorted First)", "🩸", bears, 'Bear_BB_KC_Delta')
+    
+    if not bulls and not bears:
+        print(f"{COLOR_YELLOW}No instrument has a perfectly aligned block (with active 1X Anchor) right now.{COLOR_RESET}")
+    if STATS.failed:
+        print(f"\n{COLOR_YELLOW}⚠️ {STATS.failed} request(s) failed after retries; results may be incomplete.{COLOR_RESET}")
+
+    total_calls = sum(l.total_calls for l in LIMITERS.values())
+    print(f"\n⏱️ Scan completed in {(time.time() - t_start):.2f} seconds "
+          f"({total_calls} API calls this run).\n")
+
+def parse_args():
+    p = argparse.ArgumentParser(description="Strict institutional volatility screener (Upstox)")
+    p.add_argument("--mode", choices=["STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"], default=TRADING_MODE)
+    p.add_argument("--days", type=int, default=BACKTRACE_DAYS, help="trading sessions of history (min 2)")
+    p.add_argument("--min-blocks", type=int, default=MIN_PERFECT_BLOCKS)
+    return p.parse_args()
 
 if __name__ == "__main__":
-    run_production_sweep()
+    if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
+        print(f"{COLOR_RED_FG}[!] Missing UPSTOX_ACCESS_TOKEN environment variable.{COLOR_RESET}")
+        sys.exit(1)
+    args = parse_args()
+    run_screener(args.mode, args.days, args.min_blocks)
