@@ -52,7 +52,7 @@ MIN_ATR_PCT = 0.001
 # OWN TARGET RANGE (not a flat ATR amount) before the block closes, the block is
 # "Dirty/Exhausted" and its Buy/Sell signal is killed. Being relative to each
 # block's own range keeps the bar equally strict at 1X and at 5X.
-DIRTY_MOVE_ATR_FRACTION = 0.0
+DIRTY_MOVE_ATR_FRACTION = 0.8
 
 # --- OUTPUT LIMITS & CONFLUENCE ---
 TOP_N_BUYERS = 15
