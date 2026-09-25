@@ -1,29 +1,12 @@
 #!/usr/bin/env python3
 """
-Strict Institutional Volatility Screener (Upstox) - v4  (SPEED rewrite, logic untouched).
-+ Result ordering by distance beyond the Bollinger band (RSI, MACD histogram, +DI/-DI), in sigmas.
-
-WHY THE OLD VERSION TOOK HOURS
-  Upstox caps historical-candle calls at 50/sec, 500/min and 2000 per 30 min. The old flow made
-  ~1 call per instrument for the filter + 1 call per DAY per survivor (~6000 calls for CASH_EQUITY),
-  so it was throttled for 60+ minutes, and requests that got 429'd 3 times were silently dropped.
-
-WHAT THIS VERSION DOES
-  1. Universe + option master cached per day (no repeated 100MB downloads; BSE only for SENSEX options).
-  2. ONE batch quote call per 100 instruments pre-filters by price -> ~20 calls instead of ~2000.
-  3. History = ONE multi-day call per stock (cached on disk for the day), live = ONE intraday call.
-  4. A global limiter that respects 50/s, 500/min AND 2000/30-min (remembered across runs).
-  5. Indicator math in numpy (same numbers as the pandas version) - ~4x less CPU.
-  6. Results are ordered by how far RSI / MACD-hist / DI have pushed past their Bollinger band
-     (buy: beyond the upper band, sell: beyond the lower band), shown in the "BB Δσ" column.
-
-    export UPSTOX_ACCESS_TOKEN=...
-    python screener_v4.py --mode CASH_EQUITY
+Strict Institutional Volatility Screener (Upstox) - STATELESS EDITION
++ Zero Disk Caching (100% Live API fetches)
++ Prime Sorting: BB/KC Crossover (TTM Squeeze) Fresh Breakouts
 """
 import os
 import sys
 import re
-import atexit
 import argparse
 import urllib.parse
 import json
@@ -44,30 +27,26 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ==============================================================================
-# 0. ENGINE CONSTANTS & CONFIGURATION  (your values, unchanged)
+# 0. ENGINE CONSTANTS & CONFIGURATION 
 # ==============================================================================
 TRADING_MODE = "STOCK_FNO"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
 
 # --- OPTIONS CHAIN CONFIGURATION ---
-EXPIRY_OFFSET = 0          # 0 = Current (Nearest) Expiry, 1 = Next Expiry
-STRIKES_FROM_ATM = 5       # Generates ATM + 5 OTM + 5 ITM (Total 11 strikes per CE and PE)
+EXPIRY_OFFSET = 0          
+STRIKES_FROM_ATM = 5       
 OPT_MIN_PRICE = 30
 OPT_MIN_VOLUME = 10000
 
 # --- DECOUPLED HA-ATR ENGINE MULTIPLIERS ---
 HA_ATR_MULTIPLIERS = [1, 2, 3, 5]
 ATR_BASIS_PERIOD = 14
-ATR_BASIS_TF = "240min"     # (15-minute buckets are hard-wired in the numpy ATR)
+ATR_BASIS_TF = "240min"     
 MIN_ATR_PCT = 0.001
 
 # --- OUTPUT LIMITS & CONFLUENCE ---
 TOP_N_BUYERS = 15
 TOP_N_SELLERS = 15
 MIN_PERFECT_BLOCKS = 1
-
-# --- RESULT ORDERING (distance beyond the Bollinger band, in sigmas) ---
-SORT_ASCENDING = True        # True = closest to the band first (fresh breakouts); False = most extended first
-SORT_BLOCKS_FIRST = False    # True = rank by number of aligned blocks first, then by distance
 
 COLOR_GREEN_BG = '\033[42m\033[30m'
 COLOR_RED_BG = '\033[41m\033[97m'
@@ -78,11 +57,11 @@ COLOR_RED_FG = '\033[91m'
 COLOR_YELLOW = '\033[93m'
 ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 
-# --- EQUITY UNIVERSE FILTERING (Only applies if not in OPTIONS mode) ---
+# --- EQUITY UNIVERSE FILTERING ---
 MIN_PRICE = 100
 MAX_PRICE = 5000
 MIN_DAILY_VOLUME = 100000
-BACKTRACE_DAYS = 5
+BACKTRACE_DAYS = 120       # 120 Days for Swing Trading
 
 # --- INDICATOR PERIODS ---
 RSI_PERIOD = 14
@@ -91,29 +70,15 @@ BB_STD = 1
 ADX_PERIOD = 14
 ADX_THRESHOLD = 20
 
-# --- SPEED KNOBS -------------------------------------------------------------
-WORKERS = 16                       # I/O threads (the rate limiter is what really paces requests)
-INCLUDE_NON_EQ_SERIES = False      # False = plain "EQ" series only (BE/SM/ST are not intraday-tradable)
-
-# Batch-quote pre-filter (equity modes): price band with slack, because the pre-filter uses LIVE price
-# while your real filter uses the previous close. Exact filter still runs afterwards on real candles.
+# --- SPEED KNOBS ---
+WORKERS = 16                       
+INCLUDE_NON_EQ_SERIES = False      
 PREFILTER_PRICE_SLACK = 0.25
-# OPTIONAL big speed levers (0 = off, so your results are unchanged). Applied only while the market
-# is open. Each stock removed here saves one API call on EVERY scan.
-PREFILTER_MIN_TODAY_VOLUME = 0     # e.g. 50000 -> skip stocks that have barely traded today
-PREFILTER_MIN_ABS_MOVE_PCT = 0.0   # e.g. 0.5   -> skip stocks moving < 0.5% from yesterday's close
+PREFILTER_MIN_TODAY_VOLUME = 0     
+PREFILTER_MIN_ABS_MOVE_PCT = 0.0   
 
 # --- API RATE LIMITS ---
-# Verified against Upstox's published limits (upstox.com/developer/api-documentation/rate-limiting):
-# 25 requests/sec, 250/minute, 1000/30-minutes, enforced PER API ENDPOINT, PER USER.
-# Kept at 90% of the real ceiling for safety margin. Each endpoint group below gets its OWN
-# budget (that's what "per API" means) instead of one shared bucket - so quote calls, history
-# calls and live-candle calls all proceed independently instead of competing for one limit.
 RATE_CAPS = ((1.0, 22), (60.0, 220), (1800.0, 900))
-USE_CACHE = True
-CACHE_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd(),
-                         ".screener_cache")
-CACHE_MAX_AGE_DAYS = 3
 
 API_HOST = "https://api.upstox.com"
 IST = timezone(timedelta(hours=5, minutes=30))
@@ -122,7 +87,7 @@ SESSION_CLOSE_MIN = 15 * 60 + 30
 
 
 # ==============================================================================
-# HELPERS: clock, budgeted rate limiter, HTTP, cache, progress
+# HELPERS: clock, budgeted rate limiter, HTTP, progress
 # ==============================================================================
 def now_ist():
     return datetime.now(IST).replace(tzinfo=None)
@@ -135,43 +100,15 @@ def market_is_open():
 
 
 class BudgetLimiter:
-    """
-    Sliding-window limiter over several windows at once (per-second / per-minute / per-30-min).
-    The 30-min history is persisted, so two scans back-to-back can't blow through the cap.
-    """
-    def __init__(self, caps, state_file=None):
+    """In-memory sliding window rate limiter. Loses history on script exit."""
+    def __init__(self, caps):
         self.caps = caps
         self.horizon = max(s for s, _ in caps)
-        self.state_file = state_file
         self.lock = threading.Lock()
         self.stamps = []
         self.block_until = 0.0
-        self.since_save = 0
         self.last_notice = 0.0
         self.total_calls = 0
-        self._load()
-        atexit.register(self.save)
-
-    def _load(self):
-        try:
-            if self.state_file and os.path.exists(self.state_file):
-                with open(self.state_file) as f:
-                    cut = time.time() - self.horizon
-                    self.stamps = sorted(t for t in json.load(f) if t > cut)
-        except Exception:
-            self.stamps = []
-
-    def save(self):
-        if not self.state_file:
-            return
-        try:
-            os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
-            with self.lock:
-                data = list(self.stamps)
-            with open(self.state_file, "w") as f:
-                json.dump(data, f)
-        except Exception:
-            pass
 
     def used(self, span):
         with self.lock:
@@ -197,15 +134,6 @@ class BudgetLimiter:
                 if wait <= 0:
                     self.stamps.append(now)
                     self.total_calls += 1
-                    self.since_save += 1
-                    if self.since_save >= 50 and self.state_file:
-                        self.since_save = 0
-                        try:
-                            os.makedirs(os.path.dirname(self.state_file), exist_ok=True)
-                            with open(self.state_file, "w") as f:
-                                json.dump(self.stamps, f)
-                        except Exception:
-                            pass
                     return
                 if wait > 5 and now - self.last_notice > 20:
                     self.last_notice = now
@@ -232,13 +160,12 @@ class FetchStats:
 
 
 STATS = FetchStats()
-# One independent budget per Upstox endpoint group, matching "per API, per user" in their docs.
 LIMITERS = {
-    "quotes": BudgetLimiter(RATE_CAPS, os.path.join(CACHE_DIR, "api_calls_quotes.json")),
-    "history": BudgetLimiter(RATE_CAPS, os.path.join(CACHE_DIR, "api_calls_history.json")),
-    "intraday": BudgetLimiter(RATE_CAPS, os.path.join(CACHE_DIR, "api_calls_intraday.json")),
+    "quotes": BudgetLimiter(RATE_CAPS),
+    "history": BudgetLimiter(RATE_CAPS),
+    "intraday": BudgetLimiter(RATE_CAPS),
 }
-LIMITER = LIMITERS["history"]   # kept as the default name so ETA/progress text below still works
+LIMITER = LIMITERS["history"]   
 _TLS = threading.local()
 
 
@@ -257,51 +184,6 @@ def _session():
         s.mount("https://", HTTPAdapter(pool_connections=2, pool_maxsize=2))
         _TLS.s = s
     return s
-
-
-def _safe(name):
-    return re.sub(r'[^A-Za-z0-9_-]', '_', name)
-
-
-def _cache_read(path, kind="pickle"):
-    if not USE_CACHE:
-        return None
-    try:
-        if os.path.exists(path):
-            if kind == "json":
-                with open(path) as f:
-                    return json.load(f)
-            return pd.read_pickle(path)
-    except Exception:
-        pass
-    return None
-
-
-def _cache_write(path, obj, kind="pickle"):
-    if not USE_CACHE:
-        return
-    try:
-        os.makedirs(CACHE_DIR, exist_ok=True)
-        tmp = f"{path}.{threading.get_ident()}.tmp"
-        if kind == "json":
-            with open(tmp, "w") as f:
-                json.dump(obj, f)
-        else:
-            obj.to_pickle(tmp)
-        os.replace(tmp, path)
-    except Exception:
-        pass
-
-
-def _cache_cleanup():
-    try:
-        cutoff = time.time() - CACHE_MAX_AGE_DAYS * 86400
-        for fn in os.listdir(CACHE_DIR):
-            p = os.path.join(CACHE_DIR, fn)
-            if os.path.isfile(p) and fn != "api_calls.json" and os.path.getmtime(p) < cutoff:
-                os.remove(p)
-    except Exception:
-        pass
 
 
 class Progress:
@@ -324,7 +206,6 @@ class Progress:
 # 1. UPSTOX API: quotes, candles, universe & dynamic options strikes
 # ==============================================================================
 def _get(url, params=None, retries=4):
-    """(http_status, parsed_json|None). 0 = failed after retries, 401 = bad token."""
     token = os.environ.get("UPSTOX_ACCESS_TOKEN")
     if not token or STATS.auth_failed:
         return 401, None
@@ -348,9 +229,6 @@ def _get(url, params=None, retries=4):
             STATS.mark_auth_failed()
             return 401, None
         if code == 429 or code >= 500:
-            # 429 here means Upstox's real limit was still hit despite our budget (clock drift
-            # between processes, another app sharing the token, etc). Back off HARD and shrink
-            # this endpoint's own budget for the rest of the run so it stops recurring.
             limiter.penalize(min(3.0 * (attempt + 1), 15.0))
             continue
         return code, None
@@ -365,8 +243,6 @@ def _to_frame(candles):
     df.columns = ['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']
     ts = df['Timestamp'].astype(str)
     try:
-        # Fast path: Upstox stamps candles in IST (+05:30); slicing the offset is ~9x faster
-        # than parsing timezone-aware strings.
         if not ts.str.endswith('+05:30').all():
             raise ValueError("non-IST offset")
         df['Datetime'] = pd.to_datetime(ts.str.slice(0, 19), format="%Y-%m-%dT%H:%M:%S")
@@ -386,17 +262,17 @@ def _candles(url):
     return 200, _to_frame((js.get('data') or {}).get('candles') or [])
 
 
-def _url_range(key, start, end):       # Upstox order: to_date / from_date
-    return (f"{API_HOST}/v2/historical-candle/{urllib.parse.quote(key)}/1minute/"
+def _url_range(key, start, end):       
+    return (f"{API_HOST}/v2/historical-candle/{urllib.parse.quote(key)}/day/"
             f"{end:%Y-%m-%d}/{start:%Y-%m-%d}")
 
 
 def _url_intraday(key):
-    return f"{API_HOST}/v2/historical-candle/intraday/{urllib.parse.quote(key)}/1minute"
+    return f"{API_HOST}/v2/historical-candle/intraday/{urllib.parse.quote(key)}/30minute"
 
 
-def _date_chunks(start, end, span=28):
-    """1-minute history is limited to ~1 month per request."""
+def _date_chunks(start, end, span=365):
+    """Daily fetch permits up to 365 days per API call."""
     cur = end
     while cur >= start:
         c_start = max(start, cur - timedelta(days=span - 1))
@@ -404,13 +280,8 @@ def _date_chunks(start, end, span=28):
         cur = c_start - timedelta(days=1)
 
 
-def fetch_quotes(items, batch=500):
-    """
-    Batch full-quote snapshot. Upstox's /v2/market-quote/quotes accepts up to 500 instrument
-    keys per call (verified against their docs), so a 2000-stock CASH_EQUITY universe needs
-    only 4 calls here, all against the quotes endpoint's own independent rate budget.
-    Returns {instrument_key: {'ltp','vol','net'}}. Empty dict if the endpoint is unusable.
-    """
+def fetch_quotes(items, batch=200):
+    """Batch size locked to 200 to prevent HTTP 414 URI Too Long errors."""
     batches = [items[i:i + batch] for i in range(0, len(items), batch)]
 
     def one(b):
@@ -435,13 +306,12 @@ def fetch_quotes(items, batch=500):
 
 
 def fetch_today(key):
-    """Today's 1-minute candles (1 call). Skips weekends; keeps only today's date."""
     if now_ist().weekday() >= 5:
         return None
     status, df = _candles(_url_intraday(key))
     if status != 200 or df is None:
         return None
-    df = df[df['Datetime'].dt.date == now_ist().date()]     # same guard as your date_str check
+    df = df[df['Datetime'].dt.date == now_ist().date()]     
     return df if not df.empty else None
 
 
@@ -449,7 +319,6 @@ BASE_COLS = ['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume']
 
 
 def prepare_master(dfs):
-    """Merge frames; tag each row with Min (minute of day), SessId (int day key) and Session (date)."""
     master = (pd.concat([d[BASE_COLS] for d in dfs], ignore_index=True)
               .drop_duplicates(subset='Datetime')
               .sort_values('Datetime').reset_index(drop=True))
@@ -466,21 +335,12 @@ def keep_last_sessions(master, days):
     return master[master['Session'].isin(sessions)].reset_index(drop=True)
 
 
-def hist_cache_path(key, end, days):
-    return os.path.join(CACHE_DIR, f"hist_{end:%Y%m%d}_{days}_{_safe(key)}.pkl")
-
-
 def load_history(item, start, end, days):
-    """Completed sessions up to yesterday: ONE call (disk-cached for the day)."""
-    path = hist_cache_path(item['key'], end, days)
-    cached = _cache_read(path)
-    if cached is not None:
-        return cached
     frames = []
     for c_start, c_end in _date_chunks(start, end):
         status, df = _candles(_url_range(item['key'], c_start, c_end))
         if status != 200:
-            return None                     # failure counted in STATS; never cache partial data
+            return None                     
         if df is not None:
             frames.append(df)
     if not frames:
@@ -488,7 +348,6 @@ def load_history(item, start, end, days):
     hist = keep_last_sessions(prepare_master(frames), days)
     if hist.empty:
         return None
-    _cache_write(path, hist)
     return hist
 
 
@@ -516,14 +375,7 @@ def _download_master(name):
 
 
 def _equity_universe(mode):
-    today = now_ist().strftime("%Y-%m-%d")
-    tag = "all" if INCLUDE_NON_EQ_SERIES else "eq"
-    path = os.path.join(CACHE_DIR, f"universe_{mode}_{tag}_{today}.json")
-    cached = _cache_read(path, "json")
-    if cached:
-        return cached
-
-    print("🔄 Downloading NSE instrument master (cached for the rest of today)...")
+    print("🔄 Downloading NSE instrument master Live...")
     nse = _download_master("NSE")
     if not nse:
         return []
@@ -541,20 +393,11 @@ def _equity_universe(mode):
     else:
         rows = [i for i in nse if plain(i) and ts_of(i) not in fno]
     universe = list({i["instrument_key"]: {"symbol": ts_of(i), "key": i["instrument_key"]} for i in rows}.values())
-    if universe:
-        _cache_write(path, universe, "json")
     return universe
 
 
 def _option_master():
-    """CE/PE contracts of the configured indices only (tiny), cached per day."""
-    today = now_ist().strftime("%Y-%m-%d")
-    path = os.path.join(CACHE_DIR, f"optmaster_{today}.json")
-    cached = _cache_read(path, "json")
-    if cached:
-        return cached
-
-    print("🔄 Downloading NSE & BSE instrument masters (cached for the rest of today)...")
+    print("🔄 Downloading NSE & BSE instrument masters Live...")
     nse, bse = _download_master("NSE"), _download_master("BSE")
     if not nse or not bse:
         return {}
@@ -564,7 +407,7 @@ def _option_master():
             name_to_idx[m] = idx
 
     out = {idx: [] for idx in INDEX_CONFIG}
-    for item in nse + bse:                                   # single pass instead of one per index
+    for item in nse + bse:                                       
         if str(item.get("instrument_type", "")).upper() not in ("CE", "PE"):
             continue
         idx = name_to_idx.get(str(item.get("name", "")).upper()) or \
@@ -580,7 +423,6 @@ def _option_master():
             out[idx].append({"strike": strike, "expiry": item.get("expiry"),
                              "ts": str(item.get("tradingsymbol", item.get("trading_symbol", ""))),
                              "key": item.get("instrument_key")})
-    _cache_write(path, out, "json")
     return out
 
 
@@ -605,7 +447,6 @@ def _options_universe():
         print(f"{COLOR_RED_FG}[API Error] Could not build the option master.{COLOR_RESET}")
         return []
 
-    # ONE batch call for all index spots (was one candle call per index)
     spot_items = [{"symbol": n, "key": c["spot_key"]} for n, c in INDEX_CONFIG.items()]
     quotes = fetch_quotes(spot_items)
     print(f"🎯 Calculating ATM Strikes & Constructing Options Chain for {len(INDEX_CONFIG)} Indices...\n")
@@ -613,7 +454,7 @@ def _options_universe():
     universe, today = [], now_ist().date()
     for idx_name, cfg in INDEX_CONFIG.items():
         spot_price = (quotes.get(cfg["spot_key"]) or {}).get('ltp') or 0.0
-        if spot_price <= 0:                                  # fallback: last candle
+        if spot_price <= 0:                                  
             df = fetch_today(cfg["spot_key"])
             if df is None:
                 end = now_ist().date() - timedelta(days=1)
@@ -659,10 +500,9 @@ def get_dynamic_universe(mode):
 
 
 # ==============================================================================
-# 2. THE DECOUPLED HA-ATR ENGINE  (identical maths to your pandas version, in numpy)
+# 2. THE DECOUPLED HA-ATR ENGINE 
 # ==============================================================================
 def compute_base_atr(m):
-    """15-minute ATR. Same as your resample+rolling version (overnight gap included in TR, like yours)."""
     hi, lo, cl = m['High'].values, m['Low'].values, m['Close'].values
     sid, mins = m['SessId'].values, m['Min'].values
 
@@ -682,7 +522,6 @@ def compute_base_atr(m):
 
 
 def split_sessions(m):
-    """Slice the 1-minute frame into per-day python lists ONCE (reused by all multipliers)."""
     sid = m['SessId'].values
     cuts = np.flatnonzero(np.diff(sid)) + 1
     starts = np.concatenate(([0], cuts))
@@ -692,9 +531,8 @@ def split_sessions(m):
 
 
 def build_isolated_range_bars(sessions, target_range):
-    """Per-day raw ATR range bars (incl. each day's live bar) + Heikin-Ashi trend of the last bar."""
     B_O, B_H, B_L, B_C = [], [], [], []
-    seg_start = 0                                            # first bar of the last day that has bars
+    seg_start = 0                                            
 
     for opens, highs, lows, closes in sessions:
         if not closes:
@@ -718,7 +556,6 @@ def build_isolated_range_bars(sessions, target_range):
     if not B_C:
         return None
 
-    # HA resets every day, and only the LAST bar's colour is ever used -> compute just the last day's segment.
     o = B_O[seg_start:]; h = B_H[seg_start:]; l = B_L[seg_start:]; c = B_C[seg_start:]
     ha_close = [(o[i] + h[i] + l[i] + c[i]) / 4 for i in range(len(c))]
     ha_open = (o[0] + c[0]) / 2
@@ -730,7 +567,6 @@ def build_isolated_range_bars(sessions, target_range):
 
 
 def _ewm(x, alpha):
-    """Recursive EMA identical to pandas ewm(alpha=..., adjust=False)."""
     xs = x.tolist()
     out = [0.0] * len(xs)
     prev = xs[0]
@@ -743,21 +579,16 @@ def _ewm(x, alpha):
 
 
 def _last_bb(series):
-    """Mean/std of the latest rolling window (min_periods=1, ddof=1, std of 1 sample -> 0)."""
+    """Mean/std of the latest rolling window. ddof=0 matches True charting platforms."""
     w = series[-BB_PERIOD:]
     mean = float(w.mean())
-    std = float(w.std(ddof=1)) if len(w) > 1 else 0.0
+    std = float(w.std(ddof=0)) if len(w) > 1 else 0.0
     return mean, std
 
 
 def calculate_strict_signals(bars):
-    """
-    Strict Bollinger-band breakouts for RSI, MACD-hist and +DI/-DI, protected by the HA filter.
-    Returns (bb_rsi, bb_macd, adx_sig, alignment, dist) where `dist` is the average distance the
-    three band-tested indicators have pushed beyond their band, in sigmas (0.0 if not aligned).
-    """
     if bars is None or len(bars['Close']) < 5:
-        return "", "", "", "NONE", 0.0
+        return "", "", "", "NONE"
     close, high, low = bars['Close'], bars['High'], bars['Low']
     n = len(close)
 
@@ -779,7 +610,9 @@ def calculate_strict_signals(bars):
     down[1:] = low[:-1] - low[1:]
     plus_dm = np.where((up > down) & (up > 0), up, 0.0)
     minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-    tr = high - low
+    
+    # Fix Memory Issue: .copy() prevents 'assignment destination is read-only' crash
+    tr = (high - low).copy()
     tr[1:] = np.maximum(tr[1:], np.maximum(np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])))
 
     a = 1 / ADX_PERIOD
@@ -790,7 +623,7 @@ def calculate_strict_signals(bars):
     p_mean, p_std = _last_bb(plus_di)
     m_mean, m_std = _last_bb(minus_di)
 
-    # --- signals (your exact rules) ---
+    # --- signals ---
     bb_rsi = "Neutral"
     if r_std > 0:
         if rsi[-1] > r_mean + BB_STD * r_std: bb_rsi = "Buy"
@@ -811,46 +644,54 @@ def calculate_strict_signals(bars):
     is_bull = bb_rsi == "Buy" and bb_macd == "Buy" and adx_sig == "Buy" and ha_trend == 'Green'
     is_bear = bb_rsi == "Sell" and bb_macd == "Sell" and adx_sig == "Sell" and ha_trend == 'Red'
 
-    # Distance beyond the band in sigmas (all stds are > 0 here, since a signal requires it).
     if is_bull:
-        dist = np.mean([
-            (rsi[-1] - (r_mean + BB_STD * r_std)) / r_std,
-            (hist[-1] - (h_mean + BB_STD * h_std)) / h_std,
-            (plus_di[-1] - (p_mean + BB_STD * p_std)) / p_std,
-        ])
-        return bb_rsi, bb_macd, adx_sig, "BULL", float(dist)
+        return bb_rsi, bb_macd, adx_sig, "BULL"
     if is_bear:
-        dist = np.mean([
-            ((r_mean - BB_STD * r_std) - rsi[-1]) / r_std,
-            ((h_mean - BB_STD * h_std) - hist[-1]) / h_std,
-            ((m_mean - BB_STD * m_std) - minus_di[-1]) / m_std,
-        ])
-        return bb_rsi, bb_macd, adx_sig, "BEAR", float(dist)
-    return "", "", "", "NONE", 0.0
+        return bb_rsi, bb_macd, adx_sig, "BEAR"
+    return "", "", "", "NONE"
 
 
 def compute_row(symbol, master_1m):
-    """Pure function: 1-minute frame -> dashboard row (same rules/scoring as your process_stock)."""
+    # Prime Sorter Math: Bollinger Bands vs. Keltner Channels (TTM Squeeze Overlay)
+    close = master_1m['Close'].values
+    high = master_1m['High'].values
+    low = master_1m['Low'].values
+    
+    # 20-Period Overlays
+    sma20 = pd.Series(close).rolling(20, min_periods=1).mean().values
+    std20 = pd.Series(close).rolling(20, min_periods=1).std(ddof=0).values
+    
+    tr = np.zeros_like(close)
+    tr[0] = high[0] - low[0]
+    tr[1:] = np.maximum(high[1:] - low[1:], np.maximum(np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])))
+    atr20 = pd.Series(tr).rolling(20, min_periods=1).mean().values
+    
+    bb_upper = sma20[-1] + 2.0 * std20[-1]
+    bb_lower = sma20[-1] - 2.0 * std20[-1]
+    kc_upper = sma20[-1] + 1.5 * atr20[-1]
+    kc_lower = sma20[-1] - 1.5 * atr20[-1]
+    
+    bull_bb_kc_delta = float(bb_upper - kc_upper)
+    bear_bb_kc_delta = float(kc_lower - bb_lower)
+
     base_atr = compute_base_atr(master_1m)
     sessions = split_sessions(master_1m)
     row = {'Symbol': symbol, 'LTP': float(master_1m['Close'].iloc[-1]), 'LastSession': master_1m['Session'].iloc[-1],
-           'Score': 0, 'PerfectBullBlocks': 0, 'PerfectBearBlocks': 0, 'BullDist': 0.0, 'BearDist': 0.0}
-    bull_d, bear_d = [], []
+           'Score': 0, 'PerfectBullBlocks': 0, 'PerfectBearBlocks': 0, 
+           'Bull_BB_KC_Delta': bull_bb_kc_delta, 'Bear_BB_KC_Delta': bear_bb_kc_delta}
+    
     for mult in HA_ATR_MULTIPLIERS:
         gtag = f"{mult}X"
         bars = build_isolated_range_bars(sessions, base_atr * mult)
-        bb_rsi, bb_macd, adx_sig, alignment, dist = calculate_strict_signals(bars)
+        bb_rsi, bb_macd, adx_sig, alignment = calculate_strict_signals(bars)
         row[f'BB_RSI_{gtag}'], row[f'BB_MACD_{gtag}'], row[f'ADX_{gtag}'] = bb_rsi, bb_macd, adx_sig
         if alignment == "BULL":
             row['PerfectBullBlocks'] += 1
             row['Score'] += 1
-            bull_d.append(dist)
         elif alignment == "BEAR":
             row['PerfectBearBlocks'] += 1
             row['Score'] -= 1
-            bear_d.append(dist)
-    row['BullDist'] = float(np.mean(bull_d)) if bull_d else 0.0
-    row['BearDist'] = float(np.mean(bear_d)) if bear_d else 0.0
+    
     return row
 
 
@@ -867,11 +708,9 @@ def format_cell(text, width=10):
 
 
 def prefilter_by_quotes(universe):
-    """Cheap price/activity screen from batch quotes (equity modes). Never drops on a failed call."""
     quotes = fetch_quotes(universe)
     if len(quotes) < 0.5 * len(universe):
-        print(f"{COLOR_YELLOW}⚠️ Quote pre-filter unavailable ({len(quotes)}/{len(universe)} answered); "
-              f"falling back to the slower full scan.{COLOR_RESET}")
+        print(f"{COLOR_YELLOW}⚠️ Quote pre-filter unavailable; falling back to full scan.{COLOR_RESET}")
         return universe
     lo, hi = MIN_PRICE * (1 - PREFILTER_PRICE_SLACK), MAX_PRICE * (1 + PREFILTER_PRICE_SLACK)
     live = market_is_open()
@@ -897,8 +736,8 @@ def _history_worker(args):
         hist = load_history(item, start, end, days)
         if hist is None or hist.empty:
             return None
-        last_day = hist[hist['Session'] == hist['Session'].max()]     # last COMPLETED session
-        close, vol = last_day['Close'].iloc[-1], last_day['Volume'].sum()
+        # Verify volume using total fetched volume to fix 0DTE bug
+        close, vol = hist['Close'].iloc[-1], hist['Volume'].sum()
         if mode == "INDEX_OPTIONS":
             ok = close >= OPT_MIN_PRICE and vol >= OPT_MIN_VOLUME
         else:
@@ -936,8 +775,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
     t_start = time.time()
     days = max(days, 2)
     print(f"\n{COLOR_CYAN}📡 Initializing Screener Pipeline [{mode}] via UPSTOX API...{COLOR_RESET}")
-    if USE_CACHE:
-        _cache_cleanup()
 
     universe_raw = get_dynamic_universe(mode)
     if STATS.auth_failed:
@@ -947,7 +784,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
         print(f"{COLOR_RED_FG}[!] Failed to generate the Universe list. Exiting.{COLOR_RESET}")
         return
 
-    # History = completed sessions up to yesterday. A calendar window + "last N real sessions" is holiday-proof.
     end = now_ist().date() - timedelta(days=1)
     start = end - timedelta(days=days * 2 + 6)
 
@@ -961,12 +797,10 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
             print(f"{COLOR_RED_FG}[Auth Error] Upstox rejected the token (401). Refresh UPSTOX_ACCESS_TOKEN.{COLOR_RESET}")
             return
 
-    # ---- Stage 1: history (1 call each, cached) + exact volume/price filter ----
-    uncached = sum(1 for it in candidates if not (USE_CACHE and os.path.exists(hist_cache_path(it['key'], end, days))))
+    # ---- Stage 1: history (Live Fetch) + exact volume/price filter ----
     what = "Options Strikes for Minimum Premium & Liquidity" if mode == "INDEX_OPTIONS" \
         else "stocks for Volume & Price constraints"
-    print(f"🔄 Filtering {len(candidates)} {what}...  "
-          f"[{uncached} history calls needed, {len(candidates) - uncached} cached, {_eta(uncached)}]")
+    print(f"🔄 Fetching Live History for {len(candidates)} {what}...  [{_eta(len(candidates))}]")
     prog = Progress("history", len(candidates))
     work = [(it, start, end, days, mode, prog) for it in candidates]
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
@@ -989,29 +823,31 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
         results = [r for r in ex.map(process_stock, work) if r is not None]
     prog.done()
-    for lim in LIMITERS.values():
-        lim.save()
 
     if not results:
         print(f"{COLOR_YELLOW}No usable data returned.{COLOR_RESET}")
         return
 
-    latest_session = max(r['LastSession'] for r in results)         # replaces the weekday-guess latest_day
+    latest_session = max(r['LastSession'] for r in results)         
     dashboard_data = [r for r in results if r['LastSession'] == latest_session]
 
     bulls = [r for r in dashboard_data if r['PerfectBullBlocks'] >= min_blocks]
     bears = [r for r in dashboard_data if r['PerfectBearBlocks'] >= min_blocks]
 
-    # ---- Ordering: distance beyond the Bollinger band (sigmas) ----
-    # Buy  = how far RSI / MACD-hist / +DI sit ABOVE their upper band.
-    # Sell = how far RSI / MACD-hist / -DI sit BELOW their lower band.
-    sign = 1 if SORT_ASCENDING else -1
+    # ---- PRIME SORTING: BB/KC Fresh Breakout priority ----
+    # Category 0 (Fresh): BB-KC Δ > 0.00 -> Sorted Ascending (smallest positive first)
+    # Category 1 (Squeeze): BB-KC Δ <= 0.00 -> Pushed to bottom, sorted closest to zero
+    def order_bull(r):
+        d = r['Bull_BB_KC_Delta']
+        return (0, d) if d > 0 else (1, -d)
 
-    def order(blocks_key, dist_key):
-        return lambda r: ((-r[blocks_key]) if SORT_BLOCKS_FIRST else 0, sign * r[dist_key])
+    def order_bear(r):
+        d = r['Bear_BB_KC_Delta']
+        return (0, d) if d > 0 else (1, -d)
 
-    bulls.sort(key=order('PerfectBullBlocks', 'BullDist'))
-    bears.sort(key=order('PerfectBearBlocks', 'BearDist'))
+    bulls.sort(key=order_bull)
+    bears.sort(key=order_bear)
+    
     bulls, bears = bulls[:TOP_N_BUYERS], bears[:TOP_N_SELLERS]
 
     print(f"{COLOR_BOLD}=== STRICT INSTITUTIONAL VOLATILITY DASHBOARD [{mode}] ==={COLOR_RESET}")
@@ -1027,7 +863,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
         for mult in HA_ATR_MULTIPLIERS:
             gtag = f"{mult}X"
             header_str += f"  {'BB-RSI ' + gtag:^11} {'BB-MACD ' + gtag:^12} {'BB-DI ' + gtag:^9} |"
-        header_str += f" {'BB Δσ':>7}"
+        header_str += f" {'BB-KC Δ':>7}"
         print(header_str + COLOR_RESET)
         print("-" * len(ANSI_RE.sub("", header_str)))
         for row in data_list:
@@ -1040,8 +876,9 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
             row_str += f" {row[dist_key]:>7.2f}"
             print(row_str)
 
-    print_basket(f"TOP {prem}BUYERS (Pure Alignment >= {min_blocks} Block)", "🔥", bulls, 'BullDist')
-    print_basket(f"TOP {prem}SELLERS (Pure Alignment >= {min_blocks} Block)", "🩸", bears, 'BearDist')
+    print_basket(f"TOP {prem}BUYERS (Freshest BB/KC Breakouts Sorted First)", "🔥", bulls, 'Bull_BB_KC_Delta')
+    print_basket(f"TOP {prem}SELLERS (Freshest BB/KC Breakdowns Sorted First)", "🩸", bears, 'Bear_BB_KC_Delta')
+    
     if not bulls and not bears:
         print(f"{COLOR_YELLOW}No instrument has a perfectly aligned block right now.{COLOR_RESET}")
     if STATS.failed:
@@ -1057,7 +894,6 @@ def parse_args():
     p.add_argument("--mode", choices=["STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"], default=TRADING_MODE)
     p.add_argument("--days", type=int, default=BACKTRACE_DAYS, help="trading sessions of history (min 2)")
     p.add_argument("--min-blocks", type=int, default=MIN_PERFECT_BLOCKS)
-    p.add_argument("--no-cache", action="store_true", help="ignore/skip the on-disk cache")
     return p.parse_args()
 
 
@@ -1066,6 +902,4 @@ if __name__ == "__main__":
         print(f"{COLOR_RED_FG}[!] Missing UPSTOX_ACCESS_TOKEN environment variable.{COLOR_RESET}")
         sys.exit(1)
     args = parse_args()
-    if args.no_cache:
-        USE_CACHE = False
     run_screener(args.mode, args.days, args.min_blocks)
