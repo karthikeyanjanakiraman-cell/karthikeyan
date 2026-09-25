@@ -512,7 +512,7 @@ def split_sessions(m):
     return [(o[s:e], h[s:e], l[s:e], c[s:e]) for s, e in zip(starts, ends)]
 
 def build_isolated_range_bars(sessions, target_range, base_atr=None,
-                               dirty_fraction=DIRTY_MOVE_ATR_FRACTION):
+                               dirty_fraction=None):
     """
     Builds range bars from 1-minute (opens, highs, lows, closes) tuples per session.
 
@@ -527,6 +527,9 @@ def build_isolated_range_bars(sessions, target_range, base_atr=None,
     closes, that block is flagged Dirty for that direction. A block can be dirty
     for Bulls, dirty for Bears, both, or neither.
     """
+    if dirty_fraction is None:
+        dirty_fraction = DIRTY_MOVE_ATR_FRACTION      # re-read live so --dirty-fraction works
+
     B_O, B_H, B_L, B_C = [], [], [], []
     B_DIRTY_BULL, B_DIRTY_BEAR = [], []
     seg_start = 0
@@ -674,16 +677,19 @@ def calculate_strict_signals(bars):
     # CLEAN-SURGE AUDIT: a block that technically closed Bull/Bear but only did so
     # after a chaotic internal fight (price reversed >= DIRTY_MOVE_ATR_FRACTION of
     # Base ATR against the trend mid-block) is "Dirty/Exhausted" -> kill the signal.
+    dirty_killed = False
     if is_bull and bars.get('Dirty_Bull'):
         is_bull = False
+        dirty_killed = True
     if is_bear and bars.get('Dirty_Bear'):
         is_bear = False
+        dirty_killed = True
 
     if is_bull:
-        return bb_rsi, bb_macd, adx_sig, "BULL"
+        return bb_rsi, bb_macd, adx_sig, "BULL", dirty_killed
     if is_bear:
-        return bb_rsi, bb_macd, adx_sig, "BEAR"
-    return "", "", "", "NONE"
+        return bb_rsi, bb_macd, adx_sig, "BEAR", dirty_killed
+    return "", "", "", "NONE", dirty_killed
 
 
 def compute_row(symbol, master_1m):
@@ -711,13 +717,13 @@ def compute_row(symbol, master_1m):
     base_atr = compute_base_atr(master_1m)
     sessions = split_sessions(master_1m)
     row = {'Symbol': symbol, 'LTP': float(master_1m['Close'].iloc[-1]), 'LastSession': master_1m['Session'].iloc[-1],
-           'Score': 0, 'PerfectBullBlocks': 0, 'PerfectBearBlocks': 0, 
+           'Score': 0, 'PerfectBullBlocks': 0, 'PerfectBearBlocks': 0, 'DirtyKilled1X': False,
            'Bull_BB_KC_Delta': bull_bb_kc_delta, 'Bear_BB_KC_Delta': bear_bb_kc_delta}
     
     for mult in HA_ATR_MULTIPLIERS:
         gtag = f"{mult}X"
         bars = build_isolated_range_bars(sessions, base_atr * mult, base_atr=base_atr)
-        bb_rsi, bb_macd, adx_sig, alignment = calculate_strict_signals(bars)
+        bb_rsi, bb_macd, adx_sig, alignment, dirty_killed = calculate_strict_signals(bars)
         row[f'BB_RSI_{gtag}'], row[f'BB_MACD_{gtag}'], row[f'ADX_{gtag}'] = bb_rsi, bb_macd, adx_sig
         if alignment == "BULL":
             row['PerfectBullBlocks'] += 1
@@ -725,6 +731,8 @@ def compute_row(symbol, master_1m):
         elif alignment == "BEAR":
             row['PerfectBearBlocks'] += 1
             row['Score'] -= 1
+        if mult == 1 and dirty_killed:
+            row['DirtyKilled1X'] = True
     
     return row
 
@@ -918,8 +926,16 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
     print_basket(f"TOP {prem}BUYERS (Freshest BB/KC Breakouts Sorted First)", "🔥", bulls, 'Bull_BB_KC_Delta')
     print_basket(f"TOP {prem}SELLERS (Freshest BB/KC Breakdowns Sorted First)", "🩸", bears, 'Bear_BB_KC_Delta')
     
+    dirty_vetoed = sum(1 for r in dashboard_data if r.get('DirtyKilled1X'))
     if not bulls and not bears:
         print(f"{COLOR_YELLOW}No instrument has a perfectly aligned block (with active 1X Anchor) right now.{COLOR_RESET}")
+        if dirty_vetoed:
+            print(f"{COLOR_YELLOW}   ↳ {dirty_vetoed}/{len(dashboard_data)} instrument(s) had a perfect 1X alignment "
+                  f"that was vetoed as Dirty/Exhausted (internal reverse >= {DIRTY_MOVE_ATR_FRACTION:.2f}x Base ATR). "
+                  f"Try a looser --dirty-fraction if this feels too strict.{COLOR_RESET}")
+    elif dirty_vetoed:
+        print(f"{COLOR_YELLOW}ℹ️  {dirty_vetoed} additional instrument(s) had a perfect 1X alignment but were "
+              f"vetoed as Dirty/Exhausted.{COLOR_RESET}")
     if STATS.failed:
         print(f"\n{COLOR_YELLOW}⚠️ {STATS.failed} request(s) failed after retries; results may be incomplete.{COLOR_RESET}")
 
@@ -932,6 +948,13 @@ def parse_args():
     p.add_argument("--mode", choices=["STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"], default=TRADING_MODE)
     p.add_argument("--days", type=int, default=BACKTRACE_DAYS, help="trading sessions of history (min 2)")
     p.add_argument("--min-blocks", type=int, default=MIN_PERFECT_BLOCKS)
+    p.add_argument("--dirty-fraction", type=float, default=DIRTY_MOVE_ATR_FRACTION,
+                    help="Fraction of Base ATR an internal reverse move must reach, mid-block, "
+                         "to mark that block Dirty/Exhausted and kill its signal (default: "
+                         f"{DIRTY_MOVE_ATR_FRACTION}). Note this is measured against the flat "
+                         "Base ATR, so it bites hardest on the 1X anchor block (whose entire "
+                         "range IS 1x Base ATR) and barely at all on 5X blocks. Raise it "
+                         "(e.g. 0.6-0.8) if the 1X anchor is vetoing almost everything.")
     return p.parse_args()
 
 if __name__ == "__main__":
@@ -939,4 +962,5 @@ if __name__ == "__main__":
         print(f"{COLOR_RED_FG}[!] Missing UPSTOX_ACCESS_TOKEN environment variable.{COLOR_RESET}")
         sys.exit(1)
     args = parse_args()
+    DIRTY_MOVE_ATR_FRACTION = args.dirty_fraction
     run_screener(args.mode, args.days, args.min_blocks)
