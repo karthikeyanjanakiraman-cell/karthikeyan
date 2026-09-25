@@ -45,6 +45,14 @@ ATR_BASIS_PERIOD = 14
 ATR_BASIS_TF = "15min"      # 15-minute baseline for Intraday Institutional Volume
 MIN_ATR_PCT = 0.001
 
+# --- CLEAN-SURGE / DIRTY-BLOCK AUDIT ---
+# While a range block is being built from 1-minute candles, track the worst move
+# against the emerging trend (peak->trough for an up-move, trough->peak for a
+# down-move). If that internal reverse move reaches this fraction of the Base
+# ATR before the block closes, the block is "Dirty/Exhausted" and its Buy/Sell
+# signal is killed, regardless of how the block eventually closed.
+DIRTY_MOVE_ATR_FRACTION = 0.4
+
 # --- OUTPUT LIMITS & CONFLUENCE ---
 TOP_N_BUYERS = 15
 TOP_N_SELLERS = 15
@@ -503,26 +511,78 @@ def split_sessions(m):
     o, h, l, c = (m[k].tolist() for k in ('Open', 'High', 'Low', 'Close'))
     return [(o[s:e], h[s:e], l[s:e], c[s:e]) for s, e in zip(starts, ends)]
 
-def build_isolated_range_bars(sessions, target_range):
+def build_isolated_range_bars(sessions, target_range, base_atr=None,
+                               dirty_fraction=DIRTY_MOVE_ATR_FRACTION):
+    """
+    Builds range bars from 1-minute (opens, highs, lows, closes) tuples per session.
+
+    While each block accumulates, this also audits the *path* price took to get
+    there (not just the fact that it closed):
+      - block_max_high / low_since_max: tracks the running peak of the block and
+        the lowest low seen since that peak -> "pullback" = how hard sellers hit
+        the move on the way up.
+      - block_min_low / high_since_min: mirror image for the downside -> "bounce"
+        = how hard buyers hit the move on the way down.
+    If pullback (or bounce) reaches dirty_fraction * base_atr before the block
+    closes, that block is flagged Dirty for that direction. A block can be dirty
+    for Bulls, dirty for Bears, both, or neither.
+    """
     B_O, B_H, B_L, B_C = [], [], [], []
-    seg_start = 0                                            
+    B_DIRTY_BULL, B_DIRTY_BEAR = [], []
+    seg_start = 0
+    dirty_thresh = (base_atr * dirty_fraction) if base_atr else None
 
     for opens, highs, lows, closes in sessions:
         if not closes:
             continue
         before = len(B_C)
         curr_O, curr_H, curr_L, curr_C = opens[0], highs[0], lows[0], closes[0]
+
+        # Internal path trackers for the block currently being built
+        blk_max_high, blk_low_since_max = curr_H, curr_L
+        blk_min_low, blk_high_since_min = curr_L, curr_H
+        dirty_bull = dirty_bear = False
+
+        def _reset_trackers(o0, h0, l0):
+            nonlocal blk_max_high, blk_low_since_max, blk_min_low, blk_high_since_min
+            nonlocal dirty_bull, dirty_bear
+            blk_max_high, blk_low_since_max = h0, l0
+            blk_min_low, blk_high_since_min = l0, h0
+            dirty_bull = dirty_bear = False
+
         for hi, lo, cl in zip(highs, lows, closes):
             if hi > curr_H:
                 curr_H = hi
             if lo < curr_L:
                 curr_L = lo
             curr_C = cl
+
+            # --- audit the path for THIS candle before it can be folded away ---
+            if hi >= blk_max_high:
+                blk_max_high = hi
+                blk_low_since_max = lo
+            else:
+                blk_low_since_max = min(blk_low_since_max, lo)
+            if lo <= blk_min_low:
+                blk_min_low = lo
+                blk_high_since_min = hi
+            else:
+                blk_high_since_min = max(blk_high_since_min, hi)
+
+            if dirty_thresh is not None:
+                if (blk_max_high - blk_low_since_max) >= dirty_thresh:
+                    dirty_bull = True
+                if (blk_high_since_min - blk_min_low) >= dirty_thresh:
+                    dirty_bear = True
+
             if curr_H - curr_L >= target_range:
                 B_O.append(curr_O); B_H.append(curr_H); B_L.append(curr_L); B_C.append(curr_C)
+                B_DIRTY_BULL.append(dirty_bull); B_DIRTY_BEAR.append(dirty_bear)
                 curr_O = curr_H = curr_L = curr_C
+                _reset_trackers(curr_O, curr_H, curr_L)
         if curr_H > curr_L:
             B_O.append(curr_O); B_H.append(curr_H); B_L.append(curr_L); B_C.append(curr_C)
+            B_DIRTY_BULL.append(dirty_bull); B_DIRTY_BEAR.append(dirty_bear)
         if len(B_C) > before:
             seg_start = before
 
@@ -536,7 +596,10 @@ def build_isolated_range_bars(sessions, target_range):
         ha_open = (ha_open + ha_close[i - 1]) / 2.0
     ha_trend = 'Green' if ha_close[-1] >= ha_open else 'Red'
 
-    return {'High': np.asarray(B_H), 'Low': np.asarray(B_L), 'Close': np.asarray(B_C), 'HA_Trend': ha_trend}
+    return {'High': np.asarray(B_H), 'Low': np.asarray(B_L), 'Close': np.asarray(B_C),
+            'HA_Trend': ha_trend,
+            'Dirty_Bull': B_DIRTY_BULL[seg_start:][-1] if B_DIRTY_BULL[seg_start:] else False,
+            'Dirty_Bear': B_DIRTY_BEAR[seg_start:][-1] if B_DIRTY_BEAR[seg_start:] else False}
 
 def _ewm(x, alpha):
     xs = x.tolist()
@@ -608,6 +671,14 @@ def calculate_strict_signals(bars):
     is_bull = bb_rsi == "Buy" and bb_macd == "Buy" and adx_sig == "Buy" and ha_trend == 'Green'
     is_bear = bb_rsi == "Sell" and bb_macd == "Sell" and adx_sig == "Sell" and ha_trend == 'Red'
 
+    # CLEAN-SURGE AUDIT: a block that technically closed Bull/Bear but only did so
+    # after a chaotic internal fight (price reversed >= DIRTY_MOVE_ATR_FRACTION of
+    # Base ATR against the trend mid-block) is "Dirty/Exhausted" -> kill the signal.
+    if is_bull and bars.get('Dirty_Bull'):
+        is_bull = False
+    if is_bear and bars.get('Dirty_Bear'):
+        is_bear = False
+
     if is_bull:
         return bb_rsi, bb_macd, adx_sig, "BULL"
     if is_bear:
@@ -645,7 +716,7 @@ def compute_row(symbol, master_1m):
     
     for mult in HA_ATR_MULTIPLIERS:
         gtag = f"{mult}X"
-        bars = build_isolated_range_bars(sessions, base_atr * mult)
+        bars = build_isolated_range_bars(sessions, base_atr * mult, base_atr=base_atr)
         bb_rsi, bb_macd, adx_sig, alignment = calculate_strict_signals(bars)
         row[f'BB_RSI_{gtag}'], row[f'BB_MACD_{gtag}'], row[f'ADX_{gtag}'] = bb_rsi, bb_macd, adx_sig
         if alignment == "BULL":
