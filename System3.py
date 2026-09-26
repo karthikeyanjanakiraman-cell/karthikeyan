@@ -4,7 +4,7 @@ Strict Institutional Volatility Screener (Upstox) - STATELESS INTRADAY EDITION
 + Zero Disk Caching (100% Live API fetches)
 + 1X Mandatory Anchor Rule (No hollow core breakouts)
 + Two-Tier Prime Sorting: Confluence (Blocks) -> Freshness (BB/KC % Crossover)
-+ High-Res Intraday Optimizations (1-min candles, 15-min ATR baseline)
++ Dynamic Kinetic Trap Killer (Bull vs Bear Power on BB, no static percentages)
 """
 import os
 import sys
@@ -44,15 +44,6 @@ HA_ATR_MULTIPLIERS = [1, 2, 3, 5]
 ATR_BASIS_PERIOD = 14
 ATR_BASIS_TF = "15min"      # 15-minute baseline for Intraday Institutional Volume
 MIN_ATR_PCT = 0.001
-
-# --- CLEAN-SURGE / DIRTY-BLOCK AUDIT ---
-# While a range block is being built from 1-minute candles, track the worst move
-# against the emerging trend (peak->trough for an up-move, trough->peak for a
-# down-move). If that internal reverse move reaches this FRACTION OF THE BLOCK'S
-# OWN TARGET RANGE (not a flat ATR amount) before the block closes, the block is
-# "Dirty/Exhausted" and its Buy/Sell signal is killed. Being relative to each
-# block's own range keeps the bar equally strict at 1X and at 5X.
-DIRTY_MOVE_ATR_FRACTION = 0.8
 
 # --- OUTPUT LIMITS & CONFLUENCE ---
 TOP_N_BUYERS = 15
@@ -512,54 +503,19 @@ def split_sessions(m):
     o, h, l, c = (m[k].tolist() for k in ('Open', 'High', 'Low', 'Close'))
     return [(o[s:e], h[s:e], l[s:e], c[s:e]) for s, e in zip(starts, ends)]
 
-def build_isolated_range_bars(sessions, target_range, base_atr=None,
-                               dirty_fraction=None):
-    # NOTE: base_atr is accepted for call-site compatibility / potential future
-    # diagnostics, but is no longer used to size the dirty threshold -- that is
-    # now target_range * dirty_fraction (see docstring below).
+def build_isolated_range_bars(sessions, target_range, base_atr=None):
     """
-    Builds range bars from 1-minute (opens, highs, lows, closes) tuples per session.
-
-    While each block accumulates, this also audits the *path* price took to get
-    there (not just the fact that it closed):
-      - block_max_high / low_since_max: tracks the running peak of the block and
-        the lowest low seen since that peak -> "pullback" = how hard sellers hit
-        the move on the way up.
-      - block_min_low / high_since_min: mirror image for the downside -> "bounce"
-        = how hard buyers hit the move on the way down.
-    If pullback (or bounce) reaches dirty_fraction * target_range before the
-    block closes, that block is flagged Dirty for that direction. Using the
-    block's OWN target_range (rather than a flat multiple of Base ATR) keeps the
-    bar equally strict at every multiplier: a 1X block and a 5X block both fail
-    only if they retrace the same PROPORTION of their own range, so the
-    mandatory 1X anchor isn't disproportionately punished just for being small.
-    A block can be dirty for Bulls, dirty for Bears, both, or neither.
+    Builds range bars from 1-minute tuples per session strictly by price distance.
+    The old static percentage trap logic has been completely removed.
     """
-    if dirty_fraction is None:
-        dirty_fraction = DIRTY_MOVE_ATR_FRACTION      # re-read live so --dirty-fraction works
-
     B_O, B_H, B_L, B_C = [], [], [], []
-    B_DIRTY_BULL, B_DIRTY_BEAR = [], []
     seg_start = 0
-    dirty_thresh = target_range * dirty_fraction
 
     for opens, highs, lows, closes in sessions:
         if not closes:
             continue
         before = len(B_C)
         curr_O, curr_H, curr_L, curr_C = opens[0], highs[0], lows[0], closes[0]
-
-        # Internal path trackers for the block currently being built
-        blk_max_high, blk_low_since_max = curr_H, curr_L
-        blk_min_low, blk_high_since_min = curr_L, curr_H
-        dirty_bull = dirty_bear = False
-
-        def _reset_trackers(o0, h0, l0):
-            nonlocal blk_max_high, blk_low_since_max, blk_min_low, blk_high_since_min
-            nonlocal dirty_bull, dirty_bear
-            blk_max_high, blk_low_since_max = h0, l0
-            blk_min_low, blk_high_since_min = l0, h0
-            dirty_bull = dirty_bear = False
 
         for hi, lo, cl in zip(highs, lows, closes):
             if hi > curr_H:
@@ -568,31 +524,12 @@ def build_isolated_range_bars(sessions, target_range, base_atr=None,
                 curr_L = lo
             curr_C = cl
 
-            # --- audit the path for THIS candle before it can be folded away ---
-            if hi >= blk_max_high:
-                blk_max_high = hi
-                blk_low_since_max = lo
-            else:
-                blk_low_since_max = min(blk_low_since_max, lo)
-            if lo <= blk_min_low:
-                blk_min_low = lo
-                blk_high_since_min = hi
-            else:
-                blk_high_since_min = max(blk_high_since_min, hi)
-
-            if (blk_max_high - blk_low_since_max) >= dirty_thresh:
-                dirty_bull = True
-            if (blk_high_since_min - blk_min_low) >= dirty_thresh:
-                dirty_bear = True
-
             if curr_H - curr_L >= target_range:
                 B_O.append(curr_O); B_H.append(curr_H); B_L.append(curr_L); B_C.append(curr_C)
-                B_DIRTY_BULL.append(dirty_bull); B_DIRTY_BEAR.append(dirty_bear)
                 curr_O = curr_H = curr_L = curr_C
-                _reset_trackers(curr_O, curr_H, curr_L)
+                
         if curr_H > curr_L:
             B_O.append(curr_O); B_H.append(curr_H); B_L.append(curr_L); B_C.append(curr_C)
-            B_DIRTY_BULL.append(dirty_bull); B_DIRTY_BEAR.append(dirty_bear)
         if len(B_C) > before:
             seg_start = before
 
@@ -607,9 +544,7 @@ def build_isolated_range_bars(sessions, target_range, base_atr=None,
     ha_trend = 'Green' if ha_close[-1] >= ha_open else 'Red'
 
     return {'High': np.asarray(B_H), 'Low': np.asarray(B_L), 'Close': np.asarray(B_C),
-            'HA_Trend': ha_trend,
-            'Dirty_Bull': B_DIRTY_BULL[seg_start:][-1] if B_DIRTY_BULL[seg_start:] else False,
-            'Dirty_Bear': B_DIRTY_BEAR[seg_start:][-1] if B_DIRTY_BEAR[seg_start:] else False}
+            'HA_Trend': ha_trend}
 
 def _ewm(x, alpha):
     xs = x.tolist()
@@ -630,7 +565,7 @@ def _last_bb(series):
 
 def calculate_strict_signals(bars):
     if bars is None or len(bars['Close']) < 5:
-        return "", "", "", "NONE"
+        return "", "", "", "NONE", False
     close, high, low = bars['Close'], bars['High'], bars['Low']
     n = len(close)
 
@@ -658,9 +593,11 @@ def calculate_strict_signals(bars):
     plus_di = 100 * (_ewm(plus_dm, a) / (atr + 1e-8))
     minus_di = 100 * (_ewm(minus_dm, a) / (atr + 1e-8))
     adx = _ewm(100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-8), a)
+    
     p_mean, p_std = _last_bb(plus_di)
     m_mean, m_std = _last_bb(minus_di)
 
+    # --- INDICATOR EVALUATION ---
     bb_rsi = "Neutral"
     if r_std > 0:
         if rsi[-1] > r_mean + BB_STD * r_std: bb_rsi = "Buy"
@@ -671,24 +608,31 @@ def calculate_strict_signals(bars):
         if hist[-1] > h_mean + BB_STD * h_std: bb_macd = "Buy"
         elif hist[-1] < h_mean - BB_STD * h_std: bb_macd = "Sell"
 
+    # --- KINETIC POWER MEASUREMENT (Bull vs Bear) ---
+    bull_power_aggressive = p_std > 0 and plus_di[-1] > p_mean + BB_STD * p_std
+    bear_power_aggressive = m_std > 0 and minus_di[-1] > m_mean + BB_STD * m_std
+
     adx_sig = "Neutral"
-    if p_std > 0 and plus_di[-1] > p_mean + BB_STD * p_std and plus_di[-1] > minus_di[-1] and adx[-1] >= ADX_THRESHOLD:
+    if bull_power_aggressive and plus_di[-1] > minus_di[-1] and adx[-1] >= ADX_THRESHOLD:
         adx_sig = "Buy"
-    elif m_std > 0 and minus_di[-1] > m_mean + BB_STD * m_std and minus_di[-1] > plus_di[-1] and adx[-1] >= ADX_THRESHOLD:
+    elif bear_power_aggressive and minus_di[-1] > plus_di[-1] and adx[-1] >= ADX_THRESHOLD:
         adx_sig = "Sell"
 
     ha_trend = bars['HA_Trend']
     is_bull = bb_rsi == "Buy" and bb_macd == "Buy" and adx_sig == "Buy" and ha_trend == 'Green'
     is_bear = bb_rsi == "Sell" and bb_macd == "Sell" and adx_sig == "Sell" and ha_trend == 'Red'
 
-    # CLEAN-SURGE AUDIT: a block that technically closed Bull/Bear but only did so
-    # after a chaotic internal fight (price reversed >= DIRTY_MOVE_ATR_FRACTION of
-    # THAT BLOCK'S OWN RANGE mid-block) is "Dirty/Exhausted" -> kill the signal.
+    # --- THE KINETIC TRAP KILLER (Warzone Audit) ---
+    # Replaces the static percentage rule. If BOTH Bull Power and Bear Power pierce 
+    # their Upper Bollinger Bands simultaneously, it indicates aggressive, two-way algorithmic 
+    # chop (exhaustion). A true surge requires one side to dominate while the other remains passive.
     dirty_killed = False
-    if is_bull and bars.get('Dirty_Bull'):
+    warzone_chop = bull_power_aggressive and bear_power_aggressive
+
+    if is_bull and warzone_chop:
         is_bull = False
         dirty_killed = True
-    if is_bear and bars.get('Dirty_Bear'):
+    if is_bear and warzone_chop:
         is_bear = False
         dirty_killed = True
 
@@ -938,11 +882,10 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
         print(f"{COLOR_YELLOW}No instrument has a perfectly aligned block (with active 1X Anchor) right now.{COLOR_RESET}")
         if dirty_vetoed:
             print(f"{COLOR_YELLOW}   ↳ {dirty_vetoed}/{len(dashboard_data)} instrument(s) had a perfect 1X alignment "
-                  f"that was vetoed as Dirty/Exhausted (internal reverse >= {DIRTY_MOVE_ATR_FRACTION:.2f}x that "
-                  f"block's own range). Try a looser --dirty-fraction if this feels too strict.{COLOR_RESET}")
+                  f"that was vetoed as a Warzone (both Bull & Bear Power pierced Bollinger Bands simultaneously, indicating exhaustion/chop).{COLOR_RESET}")
     elif dirty_vetoed:
         print(f"{COLOR_YELLOW}ℹ️  {dirty_vetoed} additional instrument(s) had a perfect 1X alignment but were "
-              f"vetoed as Dirty/Exhausted.{COLOR_RESET}")
+              f"vetoed due to high-power chop (Warzone).{COLOR_RESET}")
     if STATS.failed:
         print(f"\n{COLOR_YELLOW}⚠️ {STATS.failed} request(s) failed after retries; results may be incomplete.{COLOR_RESET}")
 
@@ -955,13 +898,6 @@ def parse_args():
     p.add_argument("--mode", choices=["STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"], default=TRADING_MODE)
     p.add_argument("--days", type=int, default=BACKTRACE_DAYS, help="trading sessions of history (min 2)")
     p.add_argument("--min-blocks", type=int, default=MIN_PERFECT_BLOCKS)
-    p.add_argument("--dirty-fraction", type=float, default=DIRTY_MOVE_ATR_FRACTION,
-                    help="Fraction of a BLOCK'S OWN TARGET RANGE an internal reverse move "
-                         "must reach, mid-block, to mark that block Dirty/Exhausted and kill "
-                         f"its signal (default: {DIRTY_MOVE_ATR_FRACTION}). This is relative "
-                         "to each block's own range, so 1X and 5X blocks are held to the same "
-                         "proportional standard. Lower = stricter (fewer, cleaner signals); "
-                         "higher = looser (more signals allowed through).")
     return p.parse_args()
 
 if __name__ == "__main__":
@@ -969,5 +905,4 @@ if __name__ == "__main__":
         print(f"{COLOR_RED_FG}[!] Missing UPSTOX_ACCESS_TOKEN environment variable.{COLOR_RESET}")
         sys.exit(1)
     args = parse_args()
-    DIRTY_MOVE_ATR_FRACTION = args.dirty_fraction
     run_screener(args.mode, args.days, args.min_blocks)
