@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Strict Institutional Volatility Tracker (Upstox) - STATEFUL INTRADAY EDITION
+Strict Institutional Volatility Tracker (Upstox) - APEX STATEFUL EDITION
 + Dynamic Anchor Time: Locks the exact minute a 1X block fires.
 + Majority Rules Entry: Requires >=2 of 3 kinetic signals to anchor.
-+ Kinetic Stop-Loss: Survives price dips; killed only on >=2 counter-trend kinetic breaches.
++ Pure Block-Space Stop-Loss: Ignores 1-minute noise. Killed only on confirmed Range Block reversals.
 + Multi-Anchor Scanning: Re-arms and keeps searching if early morning anchor is stopped out.
 + Genesis Shield: Prevents same-minute self-kills on the anchor formation candle.
 + Forensic Graveyard: Lists exactly WHY every filtered stock was rejected.
@@ -325,48 +325,6 @@ def _last_bb(series):
     w = series[-BB_PERIOD:]
     return float(w.mean()), float(w.std(ddof=0)) if len(w) > 1 else 0.0
 
-# ---------------------------------------------------------
-# KINETIC ARRAYS (For 1-minute tracking & Stop-Losses)
-# ---------------------------------------------------------
-def _evaluate_kinetic_arrays(close, high, low):
-    n = len(close)
-    delta = np.diff(close, prepend=close[0])
-    gain = _ewm(np.where(delta > 0, delta, 0.0), 1 / RSI_PERIOD)
-    loss = _ewm(np.where(delta < 0, -delta, 0.0), 1 / RSI_PERIOD)
-    rsi = 100 - (100 / (1 + (gain / (loss + 1e-8))))
-    
-    rsi_mean = pd.Series(rsi).rolling(BB_PERIOD, min_periods=1).mean().values
-    rsi_std = pd.Series(rsi).rolling(BB_PERIOD, min_periods=1).std(ddof=0).values
-    
-    macd = _ewm(close, 2 / 13) - _ewm(close, 2 / 27)
-    hist = macd - _ewm(macd, 2 / 10)
-    h_mean = pd.Series(hist).rolling(BB_PERIOD, min_periods=1).mean().values
-    h_std = pd.Series(hist).rolling(BB_PERIOD, min_periods=1).std(ddof=0).values
-    
-    up, down = np.zeros(n), np.zeros(n)
-    up[1:] = high[1:] - high[:-1]; down[1:] = low[:-1] - low[1:]
-    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-    
-    tr = (high - low).copy()
-    tr[1:] = np.maximum(tr[1:], np.maximum(np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])))
-    
-    a = 1 / ADX_PERIOD; atr = _ewm(tr, a)
-    plus_di = 100 * (_ewm(plus_dm, a) / (atr + 1e-8))
-    minus_di = 100 * (_ewm(minus_dm, a) / (atr + 1e-8))
-    
-    p_mean = pd.Series(plus_di).rolling(BB_PERIOD, min_periods=1).mean().values
-    p_std = pd.Series(plus_di).rolling(BB_PERIOD, min_periods=1).std(ddof=0).values
-    m_mean = pd.Series(minus_di).rolling(BB_PERIOD, min_periods=1).mean().values
-    m_std = pd.Series(minus_di).rolling(BB_PERIOD, min_periods=1).std(ddof=0).values
-    
-    return {
-        'rsi': rsi, 'r_mean': rsi_mean, 'r_std': rsi_std,
-        'hist': hist, 'h_mean': h_mean, 'h_std': h_std,
-        'plus_di': plus_di, 'p_mean': p_mean, 'p_std': p_std,
-        'minus_di': minus_di, 'm_mean': m_mean, 'm_std': m_std
-    }
-
 def _evaluate_kinetic_step(close, high, low, idx):
     if idx < 5: return "Neutral", "Neutral", "Neutral", False, False
     
@@ -411,10 +369,10 @@ def _evaluate_kinetic_step(close, high, low, idx):
     
     return rsi_sig, macd_sig, adx_sig, bull_agg, bear_agg
 
-def evaluate_anchor(bars, bb_upper, bb_lower, kc_upper, kc_lower, dt_1m, kin_1m):
+def evaluate_anchor(bars, bb_upper, bb_lower, kc_upper, kc_lower, dt_1m):
     """
-    Finds the 1X anchor on the range blocks, then verifies survival on the 1-minute array
-    using the 'Max 2 of 3' Kinetic Invalidation rule. Continues searching if early anchor dies.
+    APEX LOGIC: Evaluates survival purely on Range Blocks (No 1-minute tracking).
+    Max 2 of 3 Kinetic Rule applied. Re-arms search if early anchor is stop-lossed.
     """
     if bars is None or len(bars['Close']) < 5: 
         return None, "Not enough fully closed 1X range blocks today."
@@ -459,7 +417,7 @@ def evaluate_anchor(bars, bb_upper, bb_lower, kc_upper, kc_lower, dt_1m, kin_1m)
         is_bull = is_bull_raw
         is_bear = is_bear_raw
 
-        # Warzone Audit remains strict
+        # Warzone Audit
         if is_bull_raw and f_bear_power: is_bull = False; warzone_kills += 1
         if is_bear_raw and f_bull_power: is_bear = False; warzone_kills += 1
         
@@ -467,39 +425,32 @@ def evaluate_anchor(bars, bb_upper, bb_lower, kc_upper, kc_lower, dt_1m, kin_1m)
         if is_bull: anchor = {"dir": "BULL", "time": times[i], "idx": i, "m_idx": m_idx}
         elif is_bear: anchor = {"dir": "BEAR", "time": times[i], "idx": i, "m_idx": m_idx}
 
-        # If we found an anchor, check if it SURVIVED until the current minute
+        # If an anchor is found, evaluate survival across subsequent RANGE BLOCKS
         if anchor:
             survived = True
             
-            # Genesis Shield: start loop at m_idx + 1
-            for j in range(anchor['m_idx'] + 1, len(dt_1m)):
-                is_rsi_sell = kin_1m['r_std'][j] > 0 and kin_1m['rsi'][j] < kin_1m['r_mean'][j] - BB_STD * kin_1m['r_std'][j]
-                is_macd_sell = kin_1m['h_std'][j] > 0 and kin_1m['hist'][j] < kin_1m['h_mean'][j] - BB_STD * kin_1m['h_std'][j]
-                is_di_sell = kin_1m['m_std'][j] > 0 and kin_1m['minus_di'][j] > kin_1m['m_mean'][j] + BB_STD * kin_1m['m_std'][j]
+            # Genesis Shield: start loop at idx + 1 (the blocks AFTER the anchor)
+            for k in range(anchor['idx'] + 1, len(close)):
+                k_rsi, k_macd, k_adx, _, _ = _evaluate_kinetic_step(close, high, low, k)
                 
-                is_rsi_buy = kin_1m['r_std'][j] > 0 and kin_1m['rsi'][j] > kin_1m['r_mean'][j] + BB_STD * kin_1m['r_std'][j]
-                is_macd_buy = kin_1m['h_std'][j] > 0 and kin_1m['hist'][j] > kin_1m['h_mean'][j] + BB_STD * kin_1m['h_std'][j]
-                is_di_buy = kin_1m['p_std'][j] > 0 and kin_1m['plus_di'][j] > kin_1m['p_mean'][j] + BB_STD * kin_1m['p_std'][j]
+                bear_score_sl = (1 if k_rsi == "Sell" else 0) + (1 if k_macd == "Sell" else 0) + (1 if k_adx == "Sell" else 0)
+                bull_score_sl = (1 if k_rsi == "Buy" else 0) + (1 if k_macd == "Buy" else 0) + (1 if k_adx == "Buy" else 0)
                     
-                if anchor['dir'] == "BULL":
-                    breach_count = (1 if is_rsi_sell else 0) + (1 if is_macd_sell else 0) + (1 if is_di_sell else 0)
-                    if breach_count >= 2:
-                        b_time = pd.to_datetime(dt_1m[j]).strftime('%H:%M')
-                        a_time = pd.to_datetime(anchor['time']).strftime('%H:%M')
-                        last_reject_reason = f"Anchor at {a_time} killed at {b_time} (Kinetic SL: >=2 Bearish Breaches)."
-                        survived = False
-                        break
+                if anchor['dir'] == "BULL" and bear_score_sl >= 2:
+                    b_time = pd.to_datetime(times[k]).strftime('%H:%M')
+                    a_time = pd.to_datetime(anchor['time']).strftime('%H:%M')
+                    last_reject_reason = f"Anchor at {a_time} killed at {b_time} (Kinetic SL on Range Block)."
+                    survived = False
+                    break
                         
-                if anchor['dir'] == "BEAR":
-                    breach_count = (1 if is_rsi_buy else 0) + (1 if is_macd_buy else 0) + (1 if is_di_buy else 0)
-                    if breach_count >= 2:
-                        b_time = pd.to_datetime(dt_1m[j]).strftime('%H:%M')
-                        a_time = pd.to_datetime(anchor['time']).strftime('%H:%M')
-                        last_reject_reason = f"Anchor at {a_time} killed at {b_time} (Kinetic SL: >=2 Bullish Breaches)."
-                        survived = False
-                        break
+                if anchor['dir'] == "BEAR" and bull_score_sl >= 2:
+                    b_time = pd.to_datetime(times[k]).strftime('%H:%M')
+                    a_time = pd.to_datetime(anchor['time']).strftime('%H:%M')
+                    last_reject_reason = f"Anchor at {a_time} killed at {b_time} (Kinetic SL on Range Block)."
+                    survived = False
+                    break
             
-            # If the anchor survived until the current minute, lock it and break
+            # If the anchor survived all subsequent blocks, lock it and break search
             if survived:
                 survived_anchor = anchor
                 break
@@ -536,7 +487,6 @@ def compute_row(symbol, master_1m):
     kc_upper = sma20 + 1.5 * atr20
     kc_lower = sma20 - 1.5 * atr20
     
-    kin_1m = _evaluate_kinetic_arrays(close, high, low)
     base_atr = compute_base_atr(master_1m)
     sessions = split_sessions(master_1m)
     
@@ -544,7 +494,7 @@ def compute_row(symbol, master_1m):
            'ActiveAnchor': None, 'AnchorDir': "NONE", 'State': "NONE", 'Blocks': 0, 'RejectReason': ""}
     
     bars_1x = build_isolated_range_bars(sessions, base_atr * 1, base_atr=base_atr)
-    anchor, reject_reason = evaluate_anchor(bars_1x, bb_upper, bb_lower, kc_upper, kc_lower, dt, kin_1m)
+    anchor, reject_reason = evaluate_anchor(bars_1x, bb_upper, bb_lower, kc_upper, kc_lower, dt)
     
     row['RejectReason'] = reject_reason
 
