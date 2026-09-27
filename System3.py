@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """
-Strict Institutional Volatility Tracker (Upstox) - REFACTORED TERMINAL UI EDITION
-+ High-Legibility Formatting: Fits standard 120-col terminals without line wrapping.
-+ Foreground Typography: Replaced harsh background blocks with clean ANSI color-coded text.
-+ Structured Graveyard: Columns for Signal, Anchor Time/Val, Killed Time/Val, LTP, Day%, Move%, Reason.
-+ Move% Tracker: Tracks percentage expansion from Anchor Price to current LTP or Kill Price.
-+ Directional ATR Tripwires & Trailing Stop-Loss Floor intact.
+Strict Institutional Volatility Tracker (Upstox) - ULTIMATE MULTI-ASSET ENGINE
++ Multi-Universe Coverage: STOCK_FNO, CASH_EQUITY, and INDEX_OPTIONS (NIFTY, BANKNIFTY, FINNIFTY, SENSEX).
++ Dynamic Option Chain Resolution: Resolves NSE_FO and BSE_FO masters to extract +/- 5 ATM strikes (CE & PE).
++ Time-Machine Targeting: Truncates data strictly to the specified date and HH:MM cutoff.
++ Upstox Fetch Boundary Fix: Prevents 00:00:00 exclusion by appending an offset day to historical fetches.
++ Continuous Kinetic Indicator Engine: Seamless calculation on 1-min arrays to prevent EMA time-warping.
++ Directional ATR Tripwires: Price-distance based evaluation across 1X, 2X, 3X, and 5X multipliers.
++ Trailing Stop-Loss Floor: Protects open runs until a 1-ATR pullback/rally occurs with kinetic confirmation.
++ High-Legibility UI: Non-wrapping 120-column display with dedicated Move% tracking across active and graveyard tables.
 """
 import os
 import sys
@@ -30,14 +33,14 @@ import warnings
 warnings.filterwarnings("ignore")
 
 # ==============================================================================
-# 0. ENGINE CONSTANTS & CONFIGURATION 
+# 0. ENGINE CONSTANTS & CONFIGURATION
 # ==============================================================================
 TRADING_MODE = "STOCK_FNO"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
 
 EXPIRY_OFFSET = 0          
 STRIKES_FROM_ATM = 5       
-OPT_MIN_PRICE = 30
-OPT_MIN_VOLUME = 10000
+OPT_MIN_PRICE = 10
+OPT_MIN_VOLUME = 5000
 
 HA_ATR_MULTIPLIERS = [1, 2, 3, 5]
 ATR_BASIS_PERIOD = 14
@@ -49,7 +52,6 @@ TOP_N_SELLERS = 15
 
 REQUIRE_BB_KC_PIERCE = False
 
-# --- REFACTORED COLOR PALETTE (No bulky background blocks) ---
 COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 COLOR_DIM = '\033[90m'
@@ -83,7 +85,7 @@ SESSION_OPEN_MIN = 9 * 60 + 15
 SESSION_CLOSE_MIN = 15 * 60 + 30
 
 # ==============================================================================
-# HELPERS
+# HELPERS & RATE LIMITERS
 # ==============================================================================
 def now_ist():
     return datetime.now(IST).replace(tzinfo=None)
@@ -154,7 +156,7 @@ class Progress:
     def done(self): print("", file=sys.stderr)
 
 # ==============================================================================
-# 1. UPSTOX API
+# 1. UPSTOX DATA PIPELINE
 # ==============================================================================
 def _get(url, params=None, retries=4):
     token = os.environ.get("UPSTOX_ACCESS_TOKEN")
@@ -249,7 +251,121 @@ def _equity_universe(mode):
     rows = [i for i in nse if plain(i) and (ts_of(i) in fno if mode == "STOCK_FNO" else ts_of(i) not in fno)]
     return list({i["instrument_key"]: {"symbol": ts_of(i), "key": i["instrument_key"]} for i in rows}.values())
 
-def get_dynamic_universe(mode): return _equity_universe(mode) if mode in ("STOCK_FNO", "CASH_EQUITY") else [] 
+def _resolve_index_spot_price(key, symbol, target_dt):
+    """Fetches spot price via live quote if target_dt is today, otherwise fetches from historical daily candles."""
+    if target_dt == now_ist().date():
+        q = fetch_quotes([{"key": key, "symbol": symbol}], batch=1)
+        return q.get(key, {}).get('ltp', 0.0)
+    
+    start_dt = target_dt - timedelta(days=10)
+    end_dt = target_dt + timedelta(days=1)
+    status, df = _candles(_url_range_daily(key, start_dt, end_dt))
+    if status == 200 and df is not None and not df.empty:
+        df_sub = df[df['Datetime'].dt.date <= target_dt]
+        if not df_sub.empty:
+            return float(df_sub['Close'].iloc[-1])
+    return 0.0
+
+def _index_options_universe(target_dt):
+    """
+    Dynamically maps NIFTY, BANKNIFTY, FINNIFTY, and SENSEX spot prices,
+    filters the closest valid weekly expiry >= target_dt, and extracts +/- 5 strikes (CE & PE) around ATM.
+    """
+    spot_definitions = [
+        {"key": "NSE_INDEX|Nifty 50", "symbol": "NIFTY", "underlying": "NIFTY"},
+        {"key": "NSE_INDEX|Nifty Bank", "symbol": "BANKNIFTY", "underlying": "BANKNIFTY"},
+        {"key": "NSE_INDEX|Nifty Fin Service", "symbol": "FINNIFTY", "underlying": "FINNIFTY"},
+        {"key": "BSE_INDEX|SENSEX", "symbol": "SENSEX", "underlying": "SENSEX"}
+    ]
+    
+    spot_ltp = {}
+    for item in spot_definitions:
+        price = _resolve_index_spot_price(item['key'], item['symbol'], target_dt)
+        if price > 0:
+            spot_ltp[item['underlying']] = price
+
+    print(f"   {COLOR_DIM}» ATM Spot Anchors (NIFTY: {spot_ltp.get('NIFTY', 0):.1f}, "
+          f"BANKNIFTY: {spot_ltp.get('BANKNIFTY', 0):.1f}, "
+          f"FINNIFTY: {spot_ltp.get('FINNIFTY', 0):.1f}, "
+          f"SENSEX: {spot_ltp.get('SENSEX', 0):.1f}){COLOR_RESET}")
+
+    nse_fo = _download_master("NSE_FO") or []
+    bse_fo = _download_master("BSE_FO") or []
+    master_fo = nse_fo + bse_fo
+    if not master_fo: return []
+
+    valid_opts = []
+    for i in master_fo:
+        u_sym = i.get("underlying_symbol")
+        if u_sym not in spot_ltp or spot_ltp[u_sym] == 0: 
+            continue
+            
+        itype = i.get("instrument_type", "")
+        symbol = i.get("tradingsymbol", i.get("trading_symbol", ""))
+        
+        if itype not in ("CE", "PE"):
+            if " CE " in symbol or symbol.endswith("CE"):
+                itype = "CE"
+            elif " PE " in symbol or symbol.endswith("PE"):
+                itype = "PE"
+            else:
+                continue
+
+        exp = i.get("expiry")
+        if not exp: 
+            continue
+            
+        try:
+            if isinstance(exp, str) and "-" in exp:
+                dt = datetime.strptime(exp[:10], "%Y-%m-%d").date()
+            else:
+                dt = datetime.fromtimestamp(int(exp)/1000.0).date()
+        except Exception:
+            continue
+            
+        if dt >= target_dt:
+            strike = float(i.get("strike", i.get("strike_price", 0)))
+            valid_opts.append((u_sym, dt, strike, itype, i))
+            
+    if not valid_opts: 
+        return []
+
+    df = pd.DataFrame(valid_opts, columns=["u_sym", "expiry", "strike", "itype", "raw"])
+    universe = []
+
+    for u_sym, group in df.groupby("u_sym"):
+        expiries = sorted(group['expiry'].unique())
+        if not expiries: 
+            continue
+            
+        target_exp = expiries[min(EXPIRY_OFFSET, len(expiries) - 1)]
+        exp_group = group[group['expiry'] == target_exp]
+        
+        ltp = spot_ltp[u_sym]
+        strikes = np.array(sorted(exp_group['strike'].unique()))
+        if len(strikes) == 0: 
+            continue
+            
+        atm_idx = (np.abs(strikes - ltp)).argmin()
+        start_idx = max(0, atm_idx - STRIKES_FROM_ATM)
+        end_idx = min(len(strikes), atm_idx + STRIKES_FROM_ATM + 1)
+        selected_strikes = strikes[start_idx:end_idx]
+        
+        final_opts = exp_group[exp_group['strike'].isin(selected_strikes)]
+        for _, row in final_opts.iterrows():
+            item = row['raw']
+            key = item.get("instrument_key")
+            ts = item.get("tradingsymbol", item.get("trading_symbol", key))
+            universe.append({"key": key, "symbol": ts})
+            
+    return universe
+
+def get_dynamic_universe(mode, target_dt): 
+    if mode in ("STOCK_FNO", "CASH_EQUITY"):
+        return _equity_universe(mode)
+    elif mode == "INDEX_OPTIONS":
+        return _index_options_universe(target_dt)
+    return []
 
 # ==============================================================================
 # 2. CONTINUOUS KINETIC TRIPWIRE ENGINE 
@@ -379,7 +495,6 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
     while i < len(close):
         anchor = None
         
-        # 1. Search for Anchor (Wait for 1 ATR Directional Close)
         while i < len(close):
             bull_score, bear_score, r_bull, r_bear, _, _, _, _, _, _ = get_kinetics(kin_1m, i)
             
@@ -391,7 +506,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
 
             if close[i] - curr_open >= base_atr:
                 if bull_score >= 2 and bb_kc_bull_fire:
-                    if r_bear: # Warzone
+                    if r_bear:
                         warzone_kills += 1
                         curr_open = close[i]
                     else:
@@ -402,7 +517,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                     
             elif curr_open - close[i] >= base_atr:
                 if bear_score >= 2 and bb_kc_bear_fire:
-                    if r_bull: # Warzone
+                    if r_bull:
                         warzone_kills += 1
                         curr_open = close[i]
                     else:
@@ -416,7 +531,6 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
         if not anchor:
             break 
             
-        # 2. Track Anchor Survival (Trailing Stop-Loss Floor)
         survived = True
         peak_price = anchor['price']
         j = anchor['idx'] + 1
@@ -426,7 +540,6 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
             
             if anchor['dir'] == "BULL":
                 peak_price = max(peak_price, close[j])
-                # Downward SL Tripwire: 1 ATR drop from highest peak
                 if peak_price - close[j] >= base_atr: 
                     if bear_score >= 2:
                         b_time = pd.to_datetime(dt_1m[j]).strftime('%H:%M')
@@ -440,15 +553,14 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                             'reason': "Kinetic SL (1 ATR Pullback)"
                         }
                         survived = False
-                        curr_open = close[j] # Restart search
+                        curr_open = close[j]
                         i = j + 1
                         break
                     else:
-                        peak_price = close[j] # Survived the dip! Reset peak
+                        peak_price = close[j]
                         
             elif anchor['dir'] == "BEAR":
                 peak_price = min(peak_price, close[j])
-                # Upward SL Tripwire: 1 ATR rally from lowest trough
                 if close[j] - peak_price >= base_atr: 
                     if bull_score >= 2:
                         b_time = pd.to_datetime(dt_1m[j]).strftime('%H:%M')
@@ -462,11 +574,11 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                             'reason': "Kinetic SL (1 ATR Rally)"
                         }
                         survived = False
-                        curr_open = close[j] # Restart search
+                        curr_open = close[j]
                         i = j + 1
                         break
                     else:
-                        peak_price = close[j] # Survived the rally! Reset trough
+                        peak_price = close[j]
             j += 1
             
         if survived:
@@ -561,22 +673,18 @@ def compute_row(symbol, master_1m, target_dt):
 # 3. REFACTORED FORMATTERS & UI DRAWING
 # ==============================================================================
 def format_kinetic_triad(rsi, macd, di):
-    """
-    Renders clean 11-char string: 'Buy Buy  - ' without line-wrapping or bulky backgrounds.
-    """
     def fmt(sig):
-        if sig == "Buy":
-            return f"{COLOR_GREEN_FG}Buy{COLOR_RESET}"
-        elif sig == "Sell":
-            return f"{COLOR_RED_FG}Sel{COLOR_RESET}"
-        else:
-            return f"{COLOR_DIM} - {COLOR_RESET}"
-    
+        if sig == "Buy": return f"{COLOR_GREEN_FG}Buy{COLOR_RESET}"
+        elif sig == "Sell": return f"{COLOR_RED_FG}Sel{COLOR_RESET}"
+        else: return f"{COLOR_DIM} - {COLOR_RESET}"
     return f"{fmt(rsi)} {fmt(macd)} {fmt(di)}"
 
 def _history_worker_daily(args):
-    item, start, end, progress = args
+    item, start, end, progress, mode = args
     try:
+        if mode == "INDEX_OPTIONS":
+            return item
+            
         frames = []
         fetch_end_dt = end + timedelta(days=1)
         for c_start, c_end in _date_chunks(start, fetch_end_dt, span=365):
@@ -631,13 +739,15 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
 
     print(f"\n{COLOR_CYAN}📡 Initializing Tracker [{mode}] | Time Machine: {cutoff_dt.strftime('%Y-%m-%d %H:%M:%S')} (Live: {is_live}){COLOR_RESET}")
 
-    universe_raw = get_dynamic_universe(mode)
-    if STATS.auth_failed or not universe_raw: return
+    universe_raw = get_dynamic_universe(mode, target_dt)
+    if STATS.auth_failed or not universe_raw: 
+        print(f"{COLOR_YELLOW}[!] Universe resolution returned 0 active instruments.{COLOR_RESET}")
+        return
 
     daily_start = target_dt - timedelta(days=days * 2 + 6)
-    prog = Progress("daily_prefilter", len(universe_raw))
+    prog = Progress("prefilter", len(universe_raw))
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        candidates = [r for r in ex.map(_history_worker_daily, [(it, daily_start, target_dt, prog) for it in universe_raw]) if r is not None]
+        candidates = [r for r in ex.map(_history_worker_daily, [(it, daily_start, target_dt, prog, mode) for it in universe_raw]) if r is not None]
     prog.done()
 
     if STATS.auth_failed or not candidates: return
@@ -661,12 +771,11 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     print(f"\n{COLOR_BOLD}=== STATEFUL INSTITUTIONAL VOLATILITY TRACKER [{mode}] ==={COLOR_RESET}")
     print(f"Target Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Scanned: {len(results)}\n")
 
-    # --- REFACTORED TOP BASKET DISPLAY ---
     def print_basket(title, icon, data_list):
         if not data_list: return
         print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
         header_str = (
-            f" {COLOR_CYAN}{'Script':<12} {'LTP':>8} {'Day%':>7} | "
+            f" {COLOR_CYAN}{'Script':<22} {'LTP':>8} {'Day%':>7} | "
             f"{'Anchor':^6} {'Anch Val':>9} {'Move%':>7} | "
             f"{'1X (R-M-D)':^11}  {'2X (R-M-D)':^11}  {'3X (R-M-D)':^11}  {'5X (R-M-D)':^11} | "
             f"{'State':^14}{COLOR_RESET}"
@@ -695,7 +804,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
                 state_text = f"{COLOR_YELLOW}{state:^14}{COLOR_RESET}"
                 
             row_str = (
-                f" {COLOR_BOLD}{row['Symbol']:<12}{COLOR_RESET} "
+                f" {COLOR_BOLD}{row['Symbol']:<22}{COLOR_RESET} "
                 f"{row['LTP']:>8.2f} "
                 f"{day_color}{day_pct_str}{COLOR_RESET} | "
                 f"{row['ActiveAnchor']:^6} "
@@ -709,11 +818,10 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     print_basket("TOP BULL SETUPS (Valid Anchors Surviving)", "🔥", bulls)
     print_basket("TOP BEAR SETUPS (Valid Anchors Surviving)", "🩸", bears)
     
-    # --- REFACTORED STRUCTURED GRAVEYARD DISPLAY ---
     if rejected:
         print(f"\n{COLOR_BOLD}🚫 THE GRAVEYARD (Filtered / Rejected Stocks){COLOR_RESET}")
         header_str = (
-            f" {COLOR_CYAN}{'Script':<12} {'Signal':^6} {'Anchor':^6} {'Anch Val':>9} "
+            f" {COLOR_CYAN}{'Script':<22} {'Signal':^6} {'Anchor':^6} {'Anch Val':>9} "
             f"{'Killed':^6} {'Kill Val':>9} {'LTP':>8} {'Day%':>7} {'Move%':>7} | "
             f"{'Forensic Rejection Reason'}{COLOR_RESET}"
         )
@@ -731,12 +839,9 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         
         for row in rejected:
             sig = row['AnchorDir']
-            if sig == "BULL":
-                sig_colored = f"{COLOR_GREEN_FG}BULL{COLOR_RESET}  "
-            elif sig == "BEAR":
-                sig_colored = f"{COLOR_RED_FG}BEAR{COLOR_RESET}  "
-            else:
-                sig_colored = f"{COLOR_DIM}NONE{COLOR_RESET}  "
+            if sig == "BULL": sig_colored = f"{COLOR_GREEN_FG}BULL{COLOR_RESET}  "
+            elif sig == "BEAR": sig_colored = f"{COLOR_RED_FG}BEAR{COLOR_RESET}  "
+            else: sig_colored = f"{COLOR_DIM}NONE{COLOR_RESET}  "
                 
             a_time = row['ActiveAnchor'] if row['ActiveAnchor'] and row['ActiveAnchor'] != '-' else '-'
             a_price = f"{row['AnchorPrice']:>9.2f}" if row['AnchorPrice'] > 0 else f"{'-':>9}"
@@ -746,7 +851,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             day_pct_str = f"{row['DayChangePct']:>+6.2f}%"
             day_color = COLOR_GREEN_FG if row['DayChangePct'] > 0 else COLOR_RED_FG if row['DayChangePct'] < 0 else COLOR_DIM
             
-            # --- NEW MOVE% COLUMN LOGIC ---
             if row['AnchorPrice'] > 0 and row['KilledPrice'] > 0:
                 move_pct_str = f"{row['MovePct']:>+6.2f}%"
                 move_color = COLOR_GREEN_FG if row['MovePct'] > 0 else COLOR_RED_FG if row['MovePct'] < 0 else COLOR_DIM
@@ -755,15 +859,12 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
                 move_color = COLOR_DIM
             
             reason = row['RejectReason']
-            if "Pullback" in reason or "Rally" in reason or "Kinetic SL" in reason:
-                reason_color = COLOR_YELLOW
-            elif "Chop" in reason or "Warzone" in reason:
-                reason_color = COLOR_RED_FG
-            else:
-                reason_color = COLOR_DIM
+            if "Pullback" in reason or "Rally" in reason or "Kinetic SL" in reason: reason_color = COLOR_YELLOW
+            elif "Chop" in reason or "Warzone" in reason: reason_color = COLOR_RED_FG
+            else: reason_color = COLOR_DIM
                 
             row_str = (
-                f" {COLOR_BOLD}{row['Symbol']:<12}{COLOR_RESET} "
+                f" {COLOR_BOLD}{row['Symbol']:<22}{COLOR_RESET} "
                 f"{sig_colored} "
                 f"{a_time:^6} "
                 f"{a_price} "
