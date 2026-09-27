@@ -3,8 +3,8 @@
 Strict Institutional Volatility Tracker (Upstox) - REFACTORED TERMINAL UI EDITION
 + High-Legibility Formatting: Fits standard 120-col terminals without line wrapping.
 + Foreground Typography: Replaced harsh background blocks with clean ANSI color-coded text.
-+ Structured Graveyard: Columns for Signal, Anchor Time/Val, Killed Time/Val, LTP, Day%, Reason.
-+ Move% Tracker: Tracks percentage expansion from Anchor Price to current LTP.
++ Structured Graveyard: Columns for Signal, Anchor Time/Val, Killed Time/Val, LTP, Day%, Move%, Reason.
++ Move% Tracker: Tracks percentage expansion from Anchor Price to current LTP or Kill Price.
 + Directional ATR Tripwires & Trailing Stop-Loss Floor intact.
 """
 import os
@@ -551,6 +551,9 @@ def compute_row(symbol, master_1m, target_dt):
         row['KilledTime'] = reject_info.get('killed_time', '-')
         row['KilledPrice'] = float(reject_info.get('killed_price', 0.0))
         row['RejectReason'] = reject_info.get('reason', 'Failed Kinetic Alignment')
+        
+        if row['AnchorPrice'] > 0 and row['KilledPrice'] > 0:
+            row['MovePct'] = ((row['KilledPrice'] - row['AnchorPrice']) / row['AnchorPrice']) * 100
 
     return row
 
@@ -711,7 +714,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         print(f"\n{COLOR_BOLD}🚫 THE GRAVEYARD (Filtered / Rejected Stocks){COLOR_RESET}")
         header_str = (
             f" {COLOR_CYAN}{'Script':<12} {'Signal':^6} {'Anchor':^6} {'Anch Val':>9} "
-            f"{'Killed':^6} {'Kill Val':>9} {'LTP':>8} {'Day%':>7} | "
+            f"{'Killed':^6} {'Kill Val':>9} {'LTP':>8} {'Day%':>7} {'Move%':>7} | "
             f"{'Forensic Rejection Reason'}{COLOR_RESET}"
         )
         print(header_str)
@@ -743,6 +746,14 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             day_pct_str = f"{row['DayChangePct']:>+6.2f}%"
             day_color = COLOR_GREEN_FG if row['DayChangePct'] > 0 else COLOR_RED_FG if row['DayChangePct'] < 0 else COLOR_DIM
             
+            # --- NEW MOVE% COLUMN LOGIC ---
+            if row['AnchorPrice'] > 0 and row['KilledPrice'] > 0:
+                move_pct_str = f"{row['MovePct']:>+6.2f}%"
+                move_color = COLOR_GREEN_FG if row['MovePct'] > 0 else COLOR_RED_FG if row['MovePct'] < 0 else COLOR_DIM
+            else:
+                move_pct_str = f"{'-':>7}"
+                move_color = COLOR_DIM
+            
             reason = row['RejectReason']
             if "Pullback" in reason or "Rally" in reason or "Kinetic SL" in reason:
                 reason_color = COLOR_YELLOW
@@ -759,7 +770,8 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
                 f"{k_time:^6} "
                 f"{k_price} "
                 f"{row['LTP']:>8.2f} "
-                f"{day_color}{day_pct_str}{COLOR_RESET} | "
+                f"{day_color}{day_pct_str}{COLOR_RESET} "
+                f"{move_color}{move_pct_str}{COLOR_RESET} | "
                 f"{reason_color}{reason}{COLOR_RESET}"
             )
             print(row_str)
