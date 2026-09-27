@@ -640,7 +640,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
     total_calls = sum(l.total_calls for l in LIMITERS.values())
     print(f"\n⏱️ Scan completed in {(time.time() - t_start):.2f} seconds ({total_calls} API calls).\n")
 
-idef parse_args():
+def parse_args():
     p = argparse.ArgumentParser(description="Strict institutional volatility screener (Upstox)")
     p.add_argument("--mode", choices=["STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"], default=TRADING_MODE)
     p.add_argument("--days", type=int, default=BACKTRACE_DAYS, help="trading sessions of history (min 2)")
