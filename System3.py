@@ -2,13 +2,12 @@
 """
 Strict Institutional Volatility Tracker (Upstox) - ULTIMATE MULTI-ASSET ENGINE
 + Multi-Universe Coverage: STOCK_FNO, CASH_EQUITY, and INDEX_OPTIONS (NIFTY, BANKNIFTY, FINNIFTY, SENSEX).
-+ Dynamic Option Chain Resolution: Resolves NSE_FO and BSE_FO masters to extract +/- 5 ATM strikes (CE & PE).
++ Aggressive Master Parsing: Bulletproof JSON and Regex fallback mapping for all Option Contracts.
++ Historical Master Support: Pass a local CSV/JSON file to backtest expired option contracts.
 + Time-Machine Targeting: Truncates data strictly to the specified date and HH:MM cutoff.
-+ Upstox Fetch Boundary Fix: Prevents 00:00:00 exclusion by appending an offset day to historical fetches.
 + Continuous Kinetic Indicator Engine: Seamless calculation on 1-min arrays to prevent EMA time-warping.
 + Directional ATR Tripwires: Price-distance based evaluation across 1X, 2X, 3X, and 5X multipliers.
-+ Trailing Stop-Loss Floor: Protects open runs until a 1-ATR pullback/rally occurs with kinetic confirmation.
-+ High-Legibility UI: Non-wrapping 120-column display with dedicated Move% tracking across active and graveyard tables.
++ High-Legibility UI: Non-wrapping 120-column display with dedicated Move% tracking.
 """
 import os
 import sys
@@ -156,7 +155,7 @@ class Progress:
     def done(self): print("", file=sys.stderr)
 
 # ==============================================================================
-# 1. UPSTOX DATA PIPELINE
+# 1. UPSTOX DATA PIPELINE & AGGRESSIVE MASTER PARSER
 # ==============================================================================
 def _get(url, params=None, retries=4):
     token = os.environ.get("UPSTOX_ACCESS_TOKEN")
@@ -238,9 +237,15 @@ def _download_master(name):
     for _ in range(3):
         try:
             resp = requests.get(f"https://assets.upstox.com/market-quote/instruments/exchange/{name}.json.gz", timeout=90)
-            if resp.status_code == 200: return json.load(gzip.GzipFile(fileobj=io.BytesIO(resp.content)))
+            if resp.status_code == 200: 
+                data = json.loads(gzip.decompress(resp.content).decode('utf-8'))
+                if isinstance(data, dict):
+                    if "data" in data: return data["data"]
+                    return list(data.values())[0] if data else []
+                if isinstance(data, list):
+                    return data
         except Exception: time.sleep(1.0)
-    return None
+    return []
 
 def _equity_universe(mode):
     nse = _download_master("NSE")
@@ -265,7 +270,12 @@ def _resolve_index_spot_price(key, symbol, target_dt):
             return float(df_sub['Close'].iloc[-1])
     return 0.0
 
-def _index_options_universe(target_dt):
+def _index_options_universe(target_dt, options_master_path=""):
+    """
+    Bulletproof Dynamic Option Chain Resolver.
+    Cross-references against a local historical expiry calendar if provided, 
+    otherwise falls back to live Upstox NSE_FO and BSE_FO masters.
+    """
     spot_definitions = [
         {"key": "NSE_INDEX|Nifty 50", "symbol": "NIFTY", "underlying": "NIFTY"},
         {"key": "NSE_INDEX|Nifty Bank", "symbol": "BANKNIFTY", "underlying": "BANKNIFTY"},
@@ -284,36 +294,55 @@ def _index_options_universe(target_dt):
           f"FINNIFTY: {spot_ltp.get('FINNIFTY', 0):.1f}, "
           f"SENSEX: {spot_ltp.get('SENSEX', 0):.1f}){COLOR_RESET}")
 
-    nse_fo = _download_master("NSE_FO") or []
-    bse_fo = _download_master("BSE_FO") or []
-    master_fo = nse_fo + bse_fo
-    if not master_fo: return []
+    master_fo = []
+    
+    if options_master_path and os.path.exists(options_master_path):
+        print(f"   {COLOR_DIM}» Cross-referencing local historical calendar: {options_master_path}{COLOR_RESET}")
+        try:
+            if options_master_path.lower().endswith('.csv'):
+                master_fo = pd.read_csv(options_master_path).to_dict(orient='records')
+            elif options_master_path.lower().endswith('.json'):
+                with open(options_master_path, 'r') as f:
+                    master_fo = json.load(f)
+        except Exception as e:
+            print(f"   {COLOR_RED_FG}[!] Failed to read local master: {e}{COLOR_RESET}")
+    else:
+        nse_fo = _download_master("NSE_FO") or []
+        bse_fo = _download_master("BSE_FO") or []
+        master_fo = nse_fo + bse_fo
+
+    if not master_fo: 
+        print(f"   {COLOR_RED_FG}[!] Universe resolution returned 0 records. Ensure master file is loaded.{COLOR_RESET}")
+        return []
 
     valid_opts = []
     for i in master_fo:
-        u_sym = i.get("name") or i.get("underlying_symbol")
-        if not u_sym: 
-            continue
+        symbol = str(i.get("tradingsymbol", i.get("trading_symbol", ""))).upper()
+        u_sym = str(i.get("name") or i.get("underlying_symbol") or "").upper().strip()
+        
+        if not u_sym:
+            if symbol.startswith("BANKNIFTY"): u_sym = "BANKNIFTY"
+            elif symbol.startswith("FINNIFTY"): u_sym = "FINNIFTY"
+            elif symbol.startswith("NIFTY"): u_sym = "NIFTY"
+            elif symbol.startswith("SENSEX") or symbol.startswith("BSESN"): u_sym = "SENSEX"
+            else: continue
             
-        u_sym = u_sym.upper().strip()
+        if "BSESN" in u_sym: u_sym = "SENSEX"
+        
         if u_sym not in spot_ltp or spot_ltp[u_sym] == 0: 
             continue
             
-        itype = i.get("option_type") or i.get("instrument_type", "")
-        symbol = i.get("tradingsymbol", i.get("trading_symbol", ""))
-        
-        if itype not in ("CE", "PE"):
-            if " CE" in symbol or symbol.endswith("CE"):
-                itype = "CE"
-            elif " PE" in symbol or symbol.endswith("PE"):
-                itype = "PE"
-            else:
-                continue
+        itype = str(i.get("option_type") or i.get("instrument_type", "")).upper()
+        if "CE" not in itype and "PE" not in itype:
+            if " CE" in symbol or symbol.endswith("CE"): itype = "CE"
+            elif " PE" in symbol or symbol.endswith("PE"): itype = "PE"
+            else: continue
+            
+        if "CE" in itype: itype = "CE"
+        elif "PE" in itype: itype = "PE"
 
         exp = i.get("expiry")
-        if not exp: 
-            continue
-            
+        if not exp: continue
         try:
             if isinstance(exp, str) and "-" in exp:
                 dt = datetime.strptime(exp[:10], "%Y-%m-%d").date()
@@ -323,7 +352,13 @@ def _index_options_universe(target_dt):
             continue
             
         if dt >= target_dt:
-            strike = float(i.get("strike", i.get("strike_price", 0)))
+            strike_val = i.get("strike", i.get("strike_price"))
+            if strike_val is None or strike_val == "":
+                match = re.search(r'(\d+)(CE|PE)$', symbol)
+                if match: strike_val = match.group(1)
+                else: continue
+            
+            strike = float(strike_val)
             valid_opts.append((u_sym, dt, strike, itype, i))
             
     if not valid_opts: 
@@ -334,16 +369,14 @@ def _index_options_universe(target_dt):
 
     for u_sym, group in df.groupby("u_sym"):
         expiries = sorted(group['expiry'].unique())
-        if not expiries: 
-            continue
+        if not expiries: continue
             
         target_exp = expiries[min(EXPIRY_OFFSET, len(expiries) - 1)]
         exp_group = group[group['expiry'] == target_exp]
         
         ltp = spot_ltp[u_sym]
         strikes = np.array(sorted(exp_group['strike'].unique()))
-        if len(strikes) == 0: 
-            continue
+        if len(strikes) == 0: continue
             
         atm_idx = (np.abs(strikes - ltp)).argmin()
         start_idx = max(0, atm_idx - STRIKES_FROM_ATM)
@@ -359,11 +392,11 @@ def _index_options_universe(target_dt):
             
     return universe
 
-def get_dynamic_universe(mode, target_dt): 
+def get_dynamic_universe(mode, target_dt, options_master_path=""): 
     if mode in ("STOCK_FNO", "CASH_EQUITY"):
         return _equity_universe(mode)
     elif mode == "INDEX_OPTIONS":
-        return _index_options_universe(target_dt)
+        return _index_options_universe(target_dt, options_master_path)
     return []
 
 # ==============================================================================
@@ -721,7 +754,7 @@ def process_stock_1m(args):
     except Exception: return None
     finally: progress.tick()
 
-def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, target_time_str="15:30"):
+def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, target_time_str="15:30", options_master_path=""):
     t_start = time.time()
     
     if target_date_str:
@@ -738,7 +771,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
 
     print(f"\n{COLOR_CYAN}📡 Initializing Tracker [{mode}] | Time Machine: {cutoff_dt.strftime('%Y-%m-%d %H:%M:%S')} (Live: {is_live}){COLOR_RESET}")
 
-    universe_raw = get_dynamic_universe(mode, target_dt)
+    universe_raw = get_dynamic_universe(mode, target_dt, options_master_path)
     if STATS.auth_failed or not universe_raw: 
         print(f"{COLOR_YELLOW}[!] Universe resolution returned 0 active instruments.{COLOR_RESET}")
         return
@@ -885,10 +918,9 @@ def parse_args():
     p.add_argument("--days", type=int, default=BACKTRACE_DAYS, help="trading sessions of history (daily prefilter only)")
     p.add_argument("--date", type=str, default=None, help="Target date (YYYY-MM-DD)")
     p.add_argument("--time", type=str, default="15:30", help="Target time (HH:MM). Defaults to 15:30.")
-    p.add_argument("--history-days", type=int, default=MIN1_HISTORY_DAYS,
-                    help=f"Calendar days of 1-minute history to fetch for indicator math (default: {MIN1_HISTORY_DAYS}).")
-    p.add_argument("--disable-bb-kc-gate", action="store_true",
-                    help="Drop the 'Bollinger Band already pierced Keltner Channel' requirement.")
+    p.add_argument("--history-days", type=int, default=MIN1_HISTORY_DAYS, help="Calendar days of 1-minute history to fetch.")
+    p.add_argument("--disable-bb-kc-gate", action="store_true", help="Drop the 'Bollinger Band already pierced Keltner Channel' requirement.")
+    p.add_argument("--options-master", type=str, default="", help="Path to local historical options master JSON/CSV for backtesting")
     return p.parse_args()
 
 if __name__ == "__main__":
@@ -898,4 +930,4 @@ if __name__ == "__main__":
     MIN1_HISTORY_DAYS = args.history_days
     if args.disable_bb_kc_gate:
         REQUIRE_BB_KC_PIERCE = False
-    run_screener(args.mode, args.days, args.date, args.time)
+    run_screener(args.mode, args.days, args.date, args.time, args.options_master)
