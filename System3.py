@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 """
 Strict Institutional Volatility Tracker (Upstox) - APEX TRIPWIRE EDITION
++ Explicit Time-Machine Targeting: Truncates data strictly to the specified HH:MM.
++ Fetch Boundary Fix: Forces Upstox API to include the target day.
 + Continuous Kinetic Math: Indicators calculated smoothly on 1-min arrays to prevent EMA time-warping.
 + Directional ATR Tripwires: Wicks are ignored. Indicators are only sampled when Close pushes 1 ATR.
 + Trailing Stop-Loss Floor: Trade survives indefinitely until Close drops 1 full ATR from the peak + confirmed reversal.
@@ -198,6 +200,22 @@ def _date_chunks(start, end, span=7):
         yield c_start, cur
         cur = c_start - timedelta(days=1)
 
+def fetch_quotes(items, batch=200):
+    batches = [items[i:i + batch] for i in range(0, len(items), batch)]
+    def one(b):
+        status, js = _get(f"{API_HOST}/v2/market-quote/quotes", params={"instrument_key": ",".join(x['key'] for x in b)})
+        if status != 200 or not js: return {}
+        by_ts = {f"{x['key'].split('|')[0]}:{x['symbol']}": x['key'] for x in b}
+        out = {}
+        for k, v in (js.get('data') or {}).items():
+            key = v.get('instrument_token') or by_ts.get(k)
+            if key: out[key] = {'ltp': v.get('last_price') or 0.0, 'vol': v.get('volume') or 0}
+        return out
+    res = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(WORKERS, max(1, len(batches)))) as ex:
+        for part in ex.map(one, batches): res.update(part)
+    return res
+
 def fetch_today(key):
     if now_ist().weekday() >= 5: return None
     status, df = _candles(_url_intraday(key))
@@ -365,7 +383,6 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                 bb_kc_bull_fire = bb_kc_bear_fire = True
 
             if close[i] - curr_open >= base_atr:
-                # 1 ATR Bullish Tripwire snapped! Take Kinetic Snapshot.
                 if bull_score >= 2 and bb_kc_bull_fire:
                     if r_bear: # Warzone
                         warzone_kills += 1
@@ -377,7 +394,6 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                     curr_open = close[i]
                     
             elif curr_open - close[i] >= base_atr:
-                # 1 ATR Bearish Tripwire snapped! Take Kinetic Snapshot.
                 if bear_score >= 2 and bb_kc_bear_fire:
                     if r_bull: # Warzone
                         warzone_kills += 1
@@ -391,7 +407,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
             i += 1
             
         if not anchor:
-            break # Reached the end of the day without finding anything
+            break 
             
         # 2. Track Anchor Survival (Trailing Stop-Loss Floor)
         survived = True
@@ -414,7 +430,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                         i = j + 1
                         break
                     else:
-                        peak_price = close[j] # Survived the dip! Reset peak to avoid spamming
+                        peak_price = close[j] # Survived the dip! Reset peak
                         
             elif anchor['dir'] == "BEAR":
                 peak_price = min(peak_price, close[j])
@@ -444,14 +460,17 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
         
     return None, last_reject_reason
 
-def compute_row(symbol, master_1m):
+def compute_row(symbol, master_1m, target_dt):
     close, high, low, dt = master_1m['Close'].values, master_1m['High'].values, master_1m['Low'].values, master_1m['Datetime'].values
     
-    # Locate today's start index
-    today = pd.to_datetime(dt[-1]).date()
-    today_start_idx = master_1m.index[master_1m['Datetime'].dt.date == today][0]
+    # Locate today's start index specifically for the target_dt
+    today_mask = master_1m['Datetime'].dt.date == target_dt
+    if not today_mask.any():
+        return None # Silently drop if the requested date is totally missing (e.g. holiday)
     
-    # Calculate Day % Change (Current Close vs Today's Open)
+    today_start_idx = master_1m.index[today_mask][0]
+    
+    # Calculate Day % Change (Current Close vs Target Date Open)
     day_open_price = master_1m['Open'].iloc[today_start_idx]
     intraday_pct = ((close[-1] - day_open_price) / day_open_price) * 100
     
@@ -511,7 +530,9 @@ def _history_worker_daily(args):
     item, start, end, progress = args
     try:
         frames = []
-        for c_start, c_end in _date_chunks(start, end, span=365):
+        # CRITICAL FIX: Upstox boundary exclusion fix. Add 1 day to fetch to guarantee the target day is included.
+        fetch_end_dt = end + timedelta(days=1)
+        for c_start, c_end in _date_chunks(start, fetch_end_dt, span=365):
             status, df = _candles(_url_range_daily(item['key'], c_start, c_end))
             if status == 200 and df is not None: frames.append(df)
         if not frames: return None
@@ -526,9 +547,11 @@ def process_stock_1m(args):
     item, cutoff_dt, is_live, history_days, progress = args
     try:
         target_dt = cutoff_dt.date()
+        # CRITICAL FIX: Add 1 day so Upstox doesn't end the fetch at target_dt 00:00:00 exclusive
+        fetch_end_dt = target_dt + timedelta(days=1) 
         start_dt = target_dt - timedelta(days=history_days)
         frames = []
-        for c_start, c_end in _date_chunks(start_dt, target_dt, span=7):
+        for c_start, c_end in _date_chunks(start_dt, fetch_end_dt, span=7):
             status, df = _candles(_url_range_1m(item['key'], c_start, c_end))
             if status == 200 and df is not None: frames.append(df)
             
@@ -538,10 +561,14 @@ def process_stock_1m(args):
             
         if not frames: return None
         master_1m = prepare_master(frames)
-        master_1m = master_1m[master_1m['Datetime'] <= cutoff_dt] 
+        
+        # TRUNCATE DATA: Chop off all candles strictly after the user's --time parameter
+        master_1m = master_1m[master_1m['Datetime'] <= cutoff_dt].reset_index(drop=True)
         
         if len(master_1m) < 30: return None
-        return compute_row(item['symbol'], master_1m)
+        
+        # Strict pass-through of the exact requested date
+        return compute_row(item['symbol'], master_1m, target_dt)
     except Exception: return None
     finally: progress.tick()
 
@@ -560,7 +587,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         cutoff_dt = now_ist()
         is_live = True
 
-    print(f"\n{COLOR_CYAN}📡 Initializing Tracker [{mode}] | Time Machine: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} (Live: {is_live}){COLOR_RESET}")
+    print(f"\n{COLOR_CYAN}📡 Initializing Tracker [{mode}] | Time Machine: {cutoff_dt.strftime('%Y-%m-%d %H:%M:%S')} (Live: {is_live}){COLOR_RESET}")
 
     universe_raw = get_dynamic_universe(mode)
     if STATS.auth_failed or not universe_raw: return
@@ -584,8 +611,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     bears = [r for r in results if r['AnchorDir'] == "BEAR"]
     rejected = [r for r in results if r['AnchorDir'] == "NONE"]
 
-    # --- THE SORTING TRAP FIXED --- 
-    # Top % Gainers with ACTIVE BUY status rise to the very top.
     bulls.sort(key=lambda r: (r['State'] != "[ACTIVE BUY]", -r['DayChangePct']))
     bears.sort(key=lambda r: (r['State'] != "[ACTIVE SELL]", r['DayChangePct']))
     
