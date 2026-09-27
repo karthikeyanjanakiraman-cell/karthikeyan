@@ -296,17 +296,23 @@ def _index_options_universe(target_dt):
 
     valid_opts = []
     for i in master_fo:
-        u_sym = i.get("underlying_symbol")
+        # FIX 1: Upstox uses 'name' for Index Options, not 'underlying_symbol'
+        u_sym = i.get("name") or i.get("underlying_symbol")
+        if not u_sym: 
+            continue
+            
+        u_sym = u_sym.upper().strip()
         if u_sym not in spot_ltp or spot_ltp[u_sym] == 0: 
             continue
             
-        itype = i.get("instrument_type", "")
+        # FIX 2: Upstox uses 'option_type' for Options, 'instrument_type' is 'OPTIDX'
+        itype = i.get("option_type") or i.get("instrument_type", "")
         symbol = i.get("tradingsymbol", i.get("trading_symbol", ""))
         
         if itype not in ("CE", "PE"):
-            if " CE " in symbol or symbol.endswith("CE"):
+            if " CE" in symbol or symbol.endswith("CE"):
                 itype = "CE"
-            elif " PE " in symbol or symbol.endswith("PE"):
+            elif " PE" in symbol or symbol.endswith("PE"):
                 itype = "PE"
             else:
                 continue
@@ -359,14 +365,7 @@ def _index_options_universe(target_dt):
             universe.append({"key": key, "symbol": ts})
             
     return universe
-
-def get_dynamic_universe(mode, target_dt): 
-    if mode in ("STOCK_FNO", "CASH_EQUITY"):
-        return _equity_universe(mode)
-    elif mode == "INDEX_OPTIONS":
-        return _index_options_universe(target_dt)
-    return []
-
+    
 # ==============================================================================
 # 2. CONTINUOUS KINETIC TRIPWIRE ENGINE 
 # ==============================================================================
