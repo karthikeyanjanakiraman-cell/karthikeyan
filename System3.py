@@ -31,7 +31,7 @@ warnings.filterwarnings("ignore")
 # ==============================================================================
 # 0. ENGINE CONSTANTS & CONFIGURATION 
 # ==============================================================================
-TRADING_MODE = "STOCK_FNO"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
+TRADING_MODE = "CASH_EQUITY"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
 
 EXPIRY_OFFSET = 0          
 STRIKES_FROM_ATM = 5       
