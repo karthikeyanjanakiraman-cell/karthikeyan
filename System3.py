@@ -2,7 +2,10 @@
 """
 Strict Institutional Volatility Tracker (Upstox) - STATEFUL INTRADAY EDITION
 + Dynamic Anchor Time: Locks the exact minute a 1X block fires.
-+ Kinetic Stop-Loss (Max 2 of 3 Rule): Survives price dips unless indicators violently reverse.
++ Majority Rules Entry: Requires >=2 of 3 kinetic signals to anchor.
++ Kinetic Stop-Loss: Survives price dips; killed only on >=2 counter-trend kinetic breaches.
++ Multi-Anchor Scanning: Re-arms and keeps searching if early morning anchor is stopped out.
++ Genesis Shield: Prevents same-minute self-kills on the anchor formation candle.
 + Forensic Graveyard: Lists exactly WHY every filtered stock was rejected.
 """
 import os
@@ -46,15 +49,7 @@ TOP_N_BUYERS = 15
 TOP_N_SELLERS = 15
 MIN_PERFECT_BLOCKS = 1
 
-# --- BB/KC PIERCE GATE (now configurable, as requested) ---
-# An anchor previously required the Bollinger Band to have already pushed
-# outside the Keltner Channel (a "squeeze fired" condition) on top of the
-# 4-way RSI/MACD/ADX/HA alignment. That's a 5th, separate requirement and is
-# often why "Failed Kinetic Alignment / BB never pierced KC" dominates the
-# graveyard: a stock can have a perfectly clean 4-way alignment and still get
-# rejected purely because the squeeze hasn't technically fired yet. Toggle
-# this off (or via --disable-bb-kc-gate) to let the 4-way alignment stand on
-# its own.
+# --- BB/KC PIERCE GATE ---
 REQUIRE_BB_KC_PIERCE = False
 
 COLOR_GREEN_BG = '\033[42m\033[30m'
@@ -70,17 +65,6 @@ MIN_PRICE = 100
 MAX_PRICE = 5000
 MIN_DAILY_VOLUME = 100000
 BACKTRACE_DAYS = 30        
-
-# --- 1-MINUTE HISTORY DEPTH (separate from --days / BACKTRACE_DAYS) ---
-# BACKTRACE_DAYS drives the cheap DAILY-candle prefilter (1 API call/stock).
-# The 1X/2X/3X/5X block indicator math needs its own, separate history depth
-# -- too little (the old hardcoded 7 calendar days) starves the rolling BB
-# stats down to a handful of data points; too much needlessly multiplies
-# 1-minute API calls (each extra 7-day chunk is +1 call/stock). 15 calendar
-# days (~10 trading sessions) is a reasonable middle ground: meaningfully
-# more statistical depth than the old 7-day default, without exploding the
-# call budget the way reusing BACKTRACE_DAYS's formula would (that would go
-# from ~1 call/stock to ~10 calls/stock).
 MIN1_HISTORY_DAYS = 15
 
 RSI_PERIOD = 14
@@ -293,20 +277,6 @@ def split_sessions(m):
     return [(o[s:e], h[s:e], l[s:e], c[s:e], dt[s:e]) for s, e in zip(starts, ends)]
 
 def build_isolated_range_bars(sessions, target_range, base_atr=None):
-    """
-    Builds range bars from 1-minute tuples, session-by-session (a block never
-    spans a session boundary -- curr_O/H/L/C resets fresh at each session).
-
-    IMPORTANT: returns the FULL multi-session block sequence, not just the
-    latest session's. Slicing down to "today only" here used to starve the
-    RSI/MACD/DI Bollinger-Band statistics of history -- on a quiet morning
-    that might mean computing a rolling mean/std off 3-5 data points, which
-    is close to noise and makes genuine breakouts very hard to detect. Real
-    history (however many days were fetched) gives those rolling stats
-    something meaningful to work with. TodaySegStart marks where the most
-    recent session's blocks begin, so callers can still restrict anchor
-    SEARCH to today only, while indicator MATH still sees full history.
-    """
     B_O, B_H, B_L, B_C, B_CLOSED, B_TIME = [], [], [], [], [], []
     seg_start = 0
 
@@ -397,7 +367,6 @@ def _evaluate_kinetic_arrays(close, high, low):
         'minus_di': minus_di, 'm_mean': m_mean, 'm_std': m_std
     }
 
-# For Range Blocks (Step-by-step logic remains unchanged)
 def _evaluate_kinetic_step(close, high, low, idx):
     if idx < 5: return "Neutral", "Neutral", "Neutral", False, False
     
@@ -445,7 +414,7 @@ def _evaluate_kinetic_step(close, high, low, idx):
 def evaluate_anchor(bars, bb_upper, bb_lower, kc_upper, kc_lower, dt_1m, kin_1m):
     """
     Finds the 1X anchor on the range blocks, then verifies survival on the 1-minute array
-    using the 'Max 2 of 3' Kinetic Invalidation rule.
+    using the 'Max 2 of 3' Kinetic Invalidation rule. Continues searching if early anchor dies.
     """
     if bars is None or len(bars['Close']) < 5: 
         return None, "Not enough fully closed 1X range blocks today."
@@ -459,12 +428,11 @@ def evaluate_anchor(bars, bb_upper, bb_lower, kc_upper, kc_lower, dt_1m, kin_1m)
     if today_start >= len(close):
         return None, "No 1X blocks have formed yet in today's session."
     
-    anchor = None
     warzone_kills = 0
+    last_reject_reason = "Failed Kinetic Alignment (Need >=2 of RSI/MACD/ADX + HA)."
+    survived_anchor = None
     
-    # 1. FIND THE ANCHOR (On Range Bars) -- search ONLY today's blocks, but
-    # _evaluate_kinetic_step(close, high, low, i) still sees the FULL history
-    # up through block i (close[:i+1]), so its rolling BB stats are real.
+    # SCAN EVERY BLOCK TODAY
     for i in range(today_start, len(close)):
         if not closed[i]: continue 
         
@@ -481,59 +449,75 @@ def evaluate_anchor(bars, bb_upper, bb_lower, kc_upper, kc_lower, dt_1m, kin_1m)
         else:
             bb_kc_bull_fire = bb_kc_bear_fire = True
 
-        is_bull_raw = f_rsi == "Buy" and f_macd == "Buy" and f_adx == "Buy" and ha_trend[i] == 'Green' and bb_kc_bull_fire
-        is_bear_raw = f_rsi == "Sell" and f_macd == "Sell" and f_adx == "Sell" and ha_trend[i] == 'Red' and bb_kc_bear_fire
+        # Majority Rules Entry: >= 2 of 3 Kinetic Indicators
+        bull_score = (1 if f_rsi == "Buy" else 0) + (1 if f_macd == "Buy" else 0) + (1 if f_adx == "Buy" else 0)
+        bear_score = (1 if f_rsi == "Sell" else 0) + (1 if f_macd == "Sell" else 0) + (1 if f_adx == "Sell" else 0)
+
+        is_bull_raw = (bull_score >= 2) and (ha_trend[i] == 'Green') and bb_kc_bull_fire
+        is_bear_raw = (bear_score >= 2) and (ha_trend[i] == 'Red') and bb_kc_bear_fire
 
         is_bull = is_bull_raw
         is_bear = is_bear_raw
 
+        # Warzone Audit remains strict
         if is_bull_raw and f_bear_power: is_bull = False; warzone_kills += 1
         if is_bear_raw and f_bull_power: is_bear = False; warzone_kills += 1
         
-        if is_bull:
-            anchor = {"dir": "BULL", "time": times[i], "idx": i, "m_idx": m_idx}
-            break
-        if is_bear:
-            anchor = {"dir": "BEAR", "time": times[i], "idx": i, "m_idx": m_idx}
-            break
+        anchor = None
+        if is_bull: anchor = {"dir": "BULL", "time": times[i], "idx": i, "m_idx": m_idx}
+        elif is_bear: anchor = {"dir": "BEAR", "time": times[i], "idx": i, "m_idx": m_idx}
 
-    if not anchor: 
-        if warzone_kills > 0: return None, f"Killed by Inverted Warzone Chop ({warzone_kills} attempts)."
-        if REQUIRE_BB_KC_PIERCE:
-            return None, "Failed Kinetic Alignment / BB never pierced KC."
-        return None, "Failed Kinetic Alignment (4-way RSI/MACD/ADX/HA)."
-    
-    # 2. VERIFY SURVIVAL: Max 2 of 3 Kinetic Breach (On 1-minute array)
-    for i in range(anchor['m_idx'], len(dt_1m)):
-        is_rsi_sell = kin_1m['r_std'][i] > 0 and kin_1m['rsi'][i] < kin_1m['r_mean'][i] - BB_STD * kin_1m['r_std'][i]
-        is_macd_sell = kin_1m['h_std'][i] > 0 and kin_1m['hist'][i] < kin_1m['h_mean'][i] - BB_STD * kin_1m['h_std'][i]
-        is_di_sell = kin_1m['m_std'][i] > 0 and kin_1m['minus_di'][i] > kin_1m['m_mean'][i] + BB_STD * kin_1m['m_std'][i]
-        
-        is_rsi_buy = kin_1m['r_std'][i] > 0 and kin_1m['rsi'][i] > kin_1m['r_mean'][i] + BB_STD * kin_1m['r_std'][i]
-        is_macd_buy = kin_1m['h_std'][i] > 0 and kin_1m['hist'][i] > kin_1m['h_mean'][i] + BB_STD * kin_1m['h_std'][i]
-        is_di_buy = kin_1m['p_std'][i] > 0 and kin_1m['plus_di'][i] > kin_1m['p_mean'][i] + BB_STD * kin_1m['p_std'][i]
+        # If we found an anchor, check if it SURVIVED until the current minute
+        if anchor:
+            survived = True
             
-        if anchor['dir'] == "BULL":
-            breach_count = (1 if is_rsi_sell else 0) + (1 if is_macd_sell else 0) + (1 if is_di_sell else 0)
-            if breach_count >= 2:
-                b_time = pd.to_datetime(dt_1m[i]).strftime('%H:%M')
-                a_time = pd.to_datetime(anchor['time']).strftime('%H:%M')
-                return None, f"Anchor at {a_time} killed at {b_time} (Kinetic SL: >=2 Bearish Breaches)."
+            # Genesis Shield: start loop at m_idx + 1
+            for j in range(anchor['m_idx'] + 1, len(dt_1m)):
+                is_rsi_sell = kin_1m['r_std'][j] > 0 and kin_1m['rsi'][j] < kin_1m['r_mean'][j] - BB_STD * kin_1m['r_std'][j]
+                is_macd_sell = kin_1m['h_std'][j] > 0 and kin_1m['hist'][j] < kin_1m['h_mean'][j] - BB_STD * kin_1m['h_std'][j]
+                is_di_sell = kin_1m['m_std'][j] > 0 and kin_1m['minus_di'][j] > kin_1m['m_mean'][j] + BB_STD * kin_1m['m_std'][j]
                 
-        if anchor['dir'] == "BEAR":
-            breach_count = (1 if is_rsi_buy else 0) + (1 if is_macd_buy else 0) + (1 if is_di_buy else 0)
-            if breach_count >= 2:
-                b_time = pd.to_datetime(dt_1m[i]).strftime('%H:%M')
-                a_time = pd.to_datetime(anchor['time']).strftime('%H:%M')
-                return None, f"Anchor at {a_time} killed at {b_time} (Kinetic SL: >=2 Bullish Breaches)."
+                is_rsi_buy = kin_1m['r_std'][j] > 0 and kin_1m['rsi'][j] > kin_1m['r_mean'][j] + BB_STD * kin_1m['r_std'][j]
+                is_macd_buy = kin_1m['h_std'][j] > 0 and kin_1m['hist'][j] > kin_1m['h_mean'][j] + BB_STD * kin_1m['h_std'][j]
+                is_di_buy = kin_1m['p_std'][j] > 0 and kin_1m['plus_di'][j] > kin_1m['p_mean'][j] + BB_STD * kin_1m['p_std'][j]
+                    
+                if anchor['dir'] == "BULL":
+                    breach_count = (1 if is_rsi_sell else 0) + (1 if is_macd_sell else 0) + (1 if is_di_sell else 0)
+                    if breach_count >= 2:
+                        b_time = pd.to_datetime(dt_1m[j]).strftime('%H:%M')
+                        a_time = pd.to_datetime(anchor['time']).strftime('%H:%M')
+                        last_reject_reason = f"Anchor at {a_time} killed at {b_time} (Kinetic SL: >=2 Bearish Breaches)."
+                        survived = False
+                        break
+                        
+                if anchor['dir'] == "BEAR":
+                    breach_count = (1 if is_rsi_buy else 0) + (1 if is_macd_buy else 0) + (1 if is_di_buy else 0)
+                    if breach_count >= 2:
+                        b_time = pd.to_datetime(dt_1m[j]).strftime('%H:%M')
+                        a_time = pd.to_datetime(anchor['time']).strftime('%H:%M')
+                        last_reject_reason = f"Anchor at {a_time} killed at {b_time} (Kinetic SL: >=2 Bullish Breaches)."
+                        survived = False
+                        break
             
-    f_rsi, f_macd, f_adx, _, _ = _evaluate_kinetic_step(close, high, low, len(close)-1)
+            # If the anchor survived until the current minute, lock it and break
+            if survived:
+                survived_anchor = anchor
+                break
 
-    return {
-        "dir": anchor['dir'],
-        "time": pd.to_datetime(anchor['time']).strftime("%H:%M"),
-        "rsi": f_rsi, "macd": f_macd, "adx": f_adx
-    }, "Survived"
+    # If an anchor survived the loop, return it
+    if survived_anchor:
+        f_rsi, f_macd, f_adx, _, _ = _evaluate_kinetic_step(close, high, low, len(close)-1)
+        return {
+            "dir": survived_anchor['dir'],
+            "time": pd.to_datetime(survived_anchor['time']).strftime("%H:%M"),
+            "rsi": f_rsi, "macd": f_macd, "adx": f_adx
+        }, "Survived"
+
+    # Fallback return if NO anchors survived the entire day
+    if warzone_kills > 0 and "killed at" not in last_reject_reason:
+        return None, f"Killed by Inverted Warzone Chop ({warzone_kills} attempts)."
+        
+    return None, last_reject_reason
 
 
 def compute_row(symbol, master_1m):
@@ -583,10 +567,6 @@ def compute_row(symbol, master_1m):
             if bars and len(bars['Close']) >= 5:
                 last_idx = len(bars['Close']) - 1
                 today_start_m = bars.get('TodaySegStart', 0)
-                # Only trust this multiplier's confirmation if its last bar is a
-                # genuine closed block (reached target_range) AND is from today
-                # -- not the trailing still-forming leftover, and not a stale
-                # bar left over from a day when this multiplier never closed.
                 if bars['Closed'][last_idx] and last_idx >= today_start_m:
                     f_rsi, f_macd, f_adx, _, _ = _evaluate_kinetic_step(bars['Close'], bars['High'], bars['Low'], last_idx)
                     row[f'BB_RSI_{gtag}'], row[f'BB_MACD_{gtag}'], row[f'ADX_{gtag}'] = f_rsi, f_macd, f_adx
@@ -624,11 +604,6 @@ def process_stock_1m(args):
     item, cutoff_dt, is_live, history_days, progress = args
     try:
         target_dt = cutoff_dt.date()
-        # Previously hardcoded to a flat 7 calendar days regardless of any
-        # setting, silently capping how much real block history was available
-        # for the indicator math. Now uses MIN1_HISTORY_DAYS (configurable via
-        # --history-days), decoupled from --days (which only drives the cheap
-        # daily-candle prefilter) to avoid multiplying 1-minute API calls.
         start_dt = target_dt - timedelta(days=history_days)
         frames = []
         for c_start, c_end in _date_chunks(start_dt, target_dt, span=7):
