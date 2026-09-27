@@ -640,7 +640,15 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
     total_calls = sum(l.total_calls for l in LIMITERS.values())
     print(f"\n⏱️ Scan completed in {(time.time() - t_start):.2f} seconds ({total_calls} API calls).\n")
 
+idef parse_args():
+    p = argparse.ArgumentParser(description="Strict institutional volatility screener (Upstox)")
+    p.add_argument("--mode", choices=["STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"], default=TRADING_MODE)
+    p.add_argument("--days", type=int, default=BACKTRACE_DAYS, help="trading sessions of history (min 2)")
+    p.add_argument("--min-blocks", type=int, default=MIN_PERFECT_BLOCKS)
+    return p.parse_args()
+
 if __name__ == "__main__":
     if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
         print(f"{COLOR_RED_FG}[!] Missing UPSTOX_ACCESS_TOKEN.{COLOR_RESET}"); sys.exit(1)
-    run_screener(parse_args().mode, parse_args().days, parse_args().min_blocks)
+    args = parse_args()
+    run_screener(args.mode, args.days, args.min_blocks)
