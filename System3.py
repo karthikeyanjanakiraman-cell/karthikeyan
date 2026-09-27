@@ -46,6 +46,17 @@ TOP_N_BUYERS = 15
 TOP_N_SELLERS = 15
 MIN_PERFECT_BLOCKS = 1
 
+# --- BB/KC PIERCE GATE (now configurable, as requested) ---
+# An anchor previously required the Bollinger Band to have already pushed
+# outside the Keltner Channel (a "squeeze fired" condition) on top of the
+# 4-way RSI/MACD/ADX/HA alignment. That's a 5th, separate requirement and is
+# often why "Failed Kinetic Alignment / BB never pierced KC" dominates the
+# graveyard: a stock can have a perfectly clean 4-way alignment and still get
+# rejected purely because the squeeze hasn't technically fired yet. Toggle
+# this off (or via --disable-bb-kc-gate) to let the 4-way alignment stand on
+# its own.
+REQUIRE_BB_KC_PIERCE = False
+
 COLOR_GREEN_BG = '\033[42m\033[30m'
 COLOR_RED_BG = '\033[41m\033[97m'
 COLOR_RESET = '\033[0m'
@@ -59,6 +70,18 @@ MIN_PRICE = 100
 MAX_PRICE = 5000
 MIN_DAILY_VOLUME = 100000
 BACKTRACE_DAYS = 30        
+
+# --- 1-MINUTE HISTORY DEPTH (separate from --days / BACKTRACE_DAYS) ---
+# BACKTRACE_DAYS drives the cheap DAILY-candle prefilter (1 API call/stock).
+# The 1X/2X/3X/5X block indicator math needs its own, separate history depth
+# -- too little (the old hardcoded 7 calendar days) starves the rolling BB
+# stats down to a handful of data points; too much needlessly multiplies
+# 1-minute API calls (each extra 7-day chunk is +1 call/stock). 15 calendar
+# days (~10 trading sessions) is a reasonable middle ground: meaningfully
+# more statistical depth than the old 7-day default, without exploding the
+# call budget the way reusing BACKTRACE_DAYS's formula would (that would go
+# from ~1 call/stock to ~10 calls/stock).
+MIN1_HISTORY_DAYS = 15
 
 RSI_PERIOD = 14
 BB_PERIOD = 20
@@ -270,6 +293,20 @@ def split_sessions(m):
     return [(o[s:e], h[s:e], l[s:e], c[s:e], dt[s:e]) for s, e in zip(starts, ends)]
 
 def build_isolated_range_bars(sessions, target_range, base_atr=None):
+    """
+    Builds range bars from 1-minute tuples, session-by-session (a block never
+    spans a session boundary -- curr_O/H/L/C resets fresh at each session).
+
+    IMPORTANT: returns the FULL multi-session block sequence, not just the
+    latest session's. Slicing down to "today only" here used to starve the
+    RSI/MACD/DI Bollinger-Band statistics of history -- on a quiet morning
+    that might mean computing a rolling mean/std off 3-5 data points, which
+    is close to noise and makes genuine breakouts very hard to detect. Real
+    history (however many days were fetched) gives those rolling stats
+    something meaningful to work with. TodaySegStart marks where the most
+    recent session's blocks begin, so callers can still restrict anchor
+    SEARCH to today only, while indicator MATH still sees full history.
+    """
     B_O, B_H, B_L, B_C, B_CLOSED, B_TIME = [], [], [], [], [], []
     seg_start = 0
 
@@ -297,14 +334,16 @@ def build_isolated_range_bars(sessions, target_range, base_atr=None):
 
     if not B_C: return None
 
-    o = B_O[seg_start:]; h = B_H[seg_start:]; l = B_L[seg_start:]; c = B_C[seg_start:]; t = B_TIME[seg_start:]
-    closed = B_CLOSED[seg_start:]
-    ha_close = [(o[i] + h[i] + l[i] + c[i]) / 4 for i in range(len(c))]
-    ha_open = (o[0] + c[0]) / 2
-    for i in range(1, len(c)): ha_open = (ha_open + ha_close[i - 1]) / 2.0
-    ha_trend = ['Green' if ha_close[i] >= ha_open else 'Red' for i in range(len(c))]
+    ha_close = [(B_O[i] + B_H[i] + B_L[i] + B_C[i]) / 4 for i in range(len(B_C))]
+    ha_trend = [None] * len(B_C)
+    ha_open = (B_O[0] + B_C[0]) / 2
+    ha_trend[0] = 'Green' if ha_close[0] >= ha_open else 'Red'
+    for i in range(1, len(B_C)):
+        ha_open = (ha_open + ha_close[i - 1]) / 2.0
+        ha_trend[i] = 'Green' if ha_close[i] >= ha_open else 'Red'
 
-    return {'High': np.asarray(h), 'Low': np.asarray(l), 'Close': np.asarray(c), 'Closed': closed, 'HA_Trend': ha_trend, 'Time': t}
+    return {'High': np.asarray(B_H), 'Low': np.asarray(B_L), 'Close': np.asarray(B_C),
+            'Closed': B_CLOSED, 'HA_Trend': ha_trend, 'Time': B_TIME, 'TodaySegStart': seg_start}
 
 def _ewm(x, alpha):
     xs = x.tolist(); out = [0.0] * len(xs); prev = out[0] = xs[0]
@@ -415,12 +454,18 @@ def evaluate_anchor(bars, bb_upper, bb_lower, kc_upper, kc_lower, dt_1m, kin_1m)
     closed = bars['Closed']
     times = bars['Time']
     ha_trend = bars['HA_Trend']
+    today_start = bars.get('TodaySegStart', 0)
+
+    if today_start >= len(close):
+        return None, "No 1X blocks have formed yet in today's session."
     
     anchor = None
     warzone_kills = 0
     
-    # 1. FIND THE ANCHOR (On Range Bars)
-    for i in range(len(close)):
+    # 1. FIND THE ANCHOR (On Range Bars) -- search ONLY today's blocks, but
+    # _evaluate_kinetic_step(close, high, low, i) still sees the FULL history
+    # up through block i (close[:i+1]), so its rolling BB stats are real.
+    for i in range(today_start, len(close)):
         if not closed[i]: continue 
         
         f_rsi, f_macd, f_adx, f_bull_power, f_bear_power = _evaluate_kinetic_step(close, high, low, i)
@@ -429,9 +474,12 @@ def evaluate_anchor(bars, bb_upper, bb_lower, kc_upper, kc_lower, dt_1m, kin_1m)
             m_idx = next(idx for idx, t in enumerate(dt_1m) if t >= times[i])
         except StopIteration:
             m_idx = len(dt_1m) - 1
-            
-        bb_kc_bull_fire = bb_upper[m_idx] > kc_upper[m_idx]
-        bb_kc_bear_fire = bb_lower[m_idx] < kc_lower[m_idx]
+
+        if REQUIRE_BB_KC_PIERCE:
+            bb_kc_bull_fire = bb_upper[m_idx] > kc_upper[m_idx]
+            bb_kc_bear_fire = bb_lower[m_idx] < kc_lower[m_idx]
+        else:
+            bb_kc_bull_fire = bb_kc_bear_fire = True
 
         is_bull_raw = f_rsi == "Buy" and f_macd == "Buy" and f_adx == "Buy" and ha_trend[i] == 'Green' and bb_kc_bull_fire
         is_bear_raw = f_rsi == "Sell" and f_macd == "Sell" and f_adx == "Sell" and ha_trend[i] == 'Red' and bb_kc_bear_fire
@@ -451,7 +499,9 @@ def evaluate_anchor(bars, bb_upper, bb_lower, kc_upper, kc_lower, dt_1m, kin_1m)
 
     if not anchor: 
         if warzone_kills > 0: return None, f"Killed by Inverted Warzone Chop ({warzone_kills} attempts)."
-        return None, "Failed Kinetic Alignment / BB never pierced KC."
+        if REQUIRE_BB_KC_PIERCE:
+            return None, "Failed Kinetic Alignment / BB never pierced KC."
+        return None, "Failed Kinetic Alignment (4-way RSI/MACD/ADX/HA)."
     
     # 2. VERIFY SURVIVAL: Max 2 of 3 Kinetic Breach (On 1-minute array)
     for i in range(anchor['m_idx'], len(dt_1m)):
@@ -531,10 +581,17 @@ def compute_row(symbol, master_1m):
             gtag = f"{mult}X"
             bars = build_isolated_range_bars(sessions, base_atr * mult, base_atr=base_atr)
             if bars and len(bars['Close']) >= 5:
-                f_rsi, f_macd, f_adx, _, _ = _evaluate_kinetic_step(bars['Close'], bars['High'], bars['Low'], len(bars['Close'])-1)
-                row[f'BB_RSI_{gtag}'], row[f'BB_MACD_{gtag}'], row[f'ADX_{gtag}'] = f_rsi, f_macd, f_adx
-                if anchor['dir'] == "BULL" and f_rsi == "Buy" and f_macd == "Buy" and f_adx == "Buy": row['Blocks'] += 1
-                if anchor['dir'] == "BEAR" and f_rsi == "Sell" and f_macd == "Sell" and f_adx == "Sell": row['Blocks'] += 1
+                last_idx = len(bars['Close']) - 1
+                today_start_m = bars.get('TodaySegStart', 0)
+                # Only trust this multiplier's confirmation if its last bar is a
+                # genuine closed block (reached target_range) AND is from today
+                # -- not the trailing still-forming leftover, and not a stale
+                # bar left over from a day when this multiplier never closed.
+                if bars['Closed'][last_idx] and last_idx >= today_start_m:
+                    f_rsi, f_macd, f_adx, _, _ = _evaluate_kinetic_step(bars['Close'], bars['High'], bars['Low'], last_idx)
+                    row[f'BB_RSI_{gtag}'], row[f'BB_MACD_{gtag}'], row[f'ADX_{gtag}'] = f_rsi, f_macd, f_adx
+                    if anchor['dir'] == "BULL" and f_rsi == "Buy" and f_macd == "Buy" and f_adx == "Buy": row['Blocks'] += 1
+                    if anchor['dir'] == "BEAR" and f_rsi == "Sell" and f_macd == "Sell" and f_adx == "Sell": row['Blocks'] += 1
 
     return row
 
@@ -564,10 +621,15 @@ def _history_worker_daily(args):
     finally: progress.tick()
 
 def process_stock_1m(args):
-    item, cutoff_dt, is_live, progress = args
+    item, cutoff_dt, is_live, history_days, progress = args
     try:
         target_dt = cutoff_dt.date()
-        start_dt = target_dt - timedelta(days=7) 
+        # Previously hardcoded to a flat 7 calendar days regardless of any
+        # setting, silently capping how much real block history was available
+        # for the indicator math. Now uses MIN1_HISTORY_DAYS (configurable via
+        # --history-days), decoupled from --days (which only drives the cheap
+        # daily-candle prefilter) to avoid multiplying 1-minute API calls.
+        start_dt = target_dt - timedelta(days=history_days)
         frames = []
         for c_start, c_end in _date_chunks(start_dt, target_dt, span=7):
             status, df = _candles(_url_range_1m(item['key'], c_start, c_end))
@@ -616,7 +678,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
 
     prog = Progress("1m_blocks", len(candidates))
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        results = [r for r in ex.map(process_stock_1m, [(item, cutoff_dt, is_live, prog) for item in candidates]) if r is not None]
+        results = [r for r in ex.map(process_stock_1m, [(item, cutoff_dt, is_live, MIN1_HISTORY_DAYS, prog) for item in candidates]) if r is not None]
     prog.done()
 
     if not results: return
@@ -684,13 +746,24 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
 def parse_args():
     p = argparse.ArgumentParser(description="Strict institutional volatility tracker (Upstox)")
     p.add_argument("--mode", choices=["STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"], default=TRADING_MODE)
-    p.add_argument("--days", type=int, default=BACKTRACE_DAYS, help="trading sessions of history")
+    p.add_argument("--days", type=int, default=BACKTRACE_DAYS, help="trading sessions of history (daily prefilter only)")
     p.add_argument("--date", type=str, default=None, help="Target date (YYYY-MM-DD)")
     p.add_argument("--time", type=str, default="15:30", help="Target time (HH:MM). Defaults to 15:30.")
+    p.add_argument("--history-days", type=int, default=MIN1_HISTORY_DAYS,
+                    help=f"Calendar days of 1-minute history to fetch for the block/indicator math "
+                         f"(default: {MIN1_HISTORY_DAYS}). Higher = more statistically stable BB "
+                         f"signals but more 1-minute API calls (~1 extra call/stock per +7 days).")
+    p.add_argument("--disable-bb-kc-gate", action="store_true",
+                    help="Drop the 'Bollinger Band already pierced Keltner Channel' requirement "
+                         "from anchor detection, leaving just the 4-way RSI/MACD/ADX/HA alignment. "
+                         "Off by default (gate stays on, matching prior behavior).")
     return p.parse_args()
 
 if __name__ == "__main__":
     if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
         print(f"{COLOR_RED_FG}[!] Missing UPSTOX_ACCESS_TOKEN.{COLOR_RESET}"); sys.exit(1)
     args = parse_args()
+    MIN1_HISTORY_DAYS = args.history_days
+    if args.disable_bb_kc_gate:
+        REQUIRE_BB_KC_PIERCE = False
     run_screener(args.mode, args.days, args.date, args.time)
