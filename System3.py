@@ -3,8 +3,8 @@
 Strict Institutional Volatility Screener (Upstox) - STATELESS INTRADAY EDITION
 + Zero Disk Caching (100% Live API fetches)
 + 1X Mandatory Anchor Rule (No hollow core breakouts)
-+ Strict BB > KC Binary Trigger (Keltner Channel acts as the baseline bouncer)
-+ The True Warzone Audit (+DI and -DI Kinetic Clash)
++ EOD Date Parser (--date YYYY-MM-DD)
++ Lists all values, tagging BB/KC state as FIRED or COILED
 """
 import os
 import sys
@@ -71,7 +71,6 @@ WORKERS = 16
 INCLUDE_NON_EQ_SERIES = False      
 PREFILTER_PRICE_SLACK = 0.25
 PREFILTER_MIN_TODAY_VOLUME = 0     
-PREFILTER_MIN_ABS_MOVE_PCT = 0.0   
 
 RATE_CAPS = ((1.0, 22), (60.0, 220), (1800.0, 900))
 API_HOST = "https://api.upstox.com"
@@ -97,39 +96,21 @@ class BudgetLimiter:
         self.lock = threading.Lock()
         self.stamps = []
         self.block_until = 0.0
-        self.last_notice = 0.0
         self.total_calls = 0
-
-    def used(self, span):
-        with self.lock:
-            return len(self.stamps) - bisect_left(self.stamps, time.time() - span)
-
-    def penalize(self, seconds):
-        with self.lock:
-            self.block_until = max(self.block_until, time.time() + seconds)
 
     def acquire(self):
         while True:
-            notice = None
             with self.lock:
                 now = time.time()
                 cut = bisect_left(self.stamps, now - self.horizon)
-                if cut:
-                    del self.stamps[:cut]
+                if cut: del self.stamps[:cut]
                 n = len(self.stamps)
                 wait = max(0.0, self.block_until - now)
                 for span, cap in self.caps:
                     if n >= cap and n - bisect_left(self.stamps, now - span) >= cap:
                         wait = max(wait, self.stamps[n - cap] + span - now)
                 if wait <= 0:
-                    self.stamps.append(now)
-                    self.total_calls += 1
-                    return
-                if wait > 5 and now - self.last_notice > 20:
-                    self.last_notice = now
-                    notice = (n, wait)
-            if notice:
-                print(f"\n   ⏳ Upstox rate-limit window is full; waiting {notice[1]:.0f}s...", file=sys.stderr, flush=True)
+                    self.stamps.append(now); self.total_calls += 1; return
             time.sleep(min(wait, 1.0) + 0.005)
 
 class FetchStats:
@@ -137,14 +118,11 @@ class FetchStats:
         self.lock = threading.Lock()
         self.failed = 0
         self.auth_failed = False
-    def fail(self):
-        with self.lock: self.failed += 1
     def mark_auth_failed(self):
         with self.lock: self.auth_failed = True
 
 STATS = FetchStats()
 LIMITERS = {"quotes": BudgetLimiter(RATE_CAPS), "history": BudgetLimiter(RATE_CAPS), "intraday": BudgetLimiter(RATE_CAPS)}
-LIMITER = LIMITERS["history"]   
 _TLS = threading.local()
 
 def _limiter_for(url):
@@ -162,8 +140,7 @@ def _session():
 
 class Progress:
     def __init__(self, label, total):
-        self.label, self.total, self.n = label, total, 0
-        self.step = max(1, total // 20)
+        self.label, self.total, self.n, self.step = label, total, 0, max(1, total // 20)
         self.lock = threading.Lock()
     def tick(self):
         with self.lock:
@@ -184,18 +161,12 @@ def _get(url, params=None, retries=4):
         limiter.acquire()
         try:
             r = _session().get(url, headers=headers, params=params, timeout=20)
-        except requests.RequestException:
-            time.sleep(0.5 * (attempt + 1)); continue
-        code = r.status_code
-        if code == 200:
-            try: return 200, r.json()
-            except ValueError: time.sleep(0.5 * (attempt + 1)); continue
-        if code == 401:
-            STATS.mark_auth_failed(); return 401, None
-        if code == 429 or code >= 500:
-            limiter.penalize(min(3.0 * (attempt + 1), 15.0)); continue
-        return code, None
-    STATS.fail(); return 0, None
+            code = r.status_code
+            if code == 200: return 200, r.json()
+            if code == 401: STATS.mark_auth_failed(); return 401, None
+        except Exception: pass
+        time.sleep(0.5 * (attempt + 1))
+    return 0, None
 
 def _to_frame(candles):
     if not candles: return None
@@ -211,10 +182,14 @@ def _candles(url):
     status, js = _get(url)
     return (200, _to_frame((js.get('data') or {}).get('candles') or [])) if status == 200 and js else (status, None)
 
-def _url_range(key, start, end): return f"{API_HOST}/v2/historical-candle/{urllib.parse.quote(key)}/day/{end:%Y-%m-%d}/{start:%Y-%m-%d}"
-def _url_intraday(key): return f"{API_HOST}/v2/historical-candle/intraday/{urllib.parse.quote(key)}/1minute"
+def _url_range_daily(key, start, end): 
+    return f"{API_HOST}/v2/historical-candle/{urllib.parse.quote(key)}/day/{end:%Y-%m-%d}/{start:%Y-%m-%d}"
+def _url_range_1m(key, start, end): 
+    return f"{API_HOST}/v2/historical-candle/{urllib.parse.quote(key)}/1minute/{end:%Y-%m-%d}/{start:%Y-%m-%d}"
+def _url_intraday(key): 
+    return f"{API_HOST}/v2/historical-candle/intraday/{urllib.parse.quote(key)}/1minute"
 
-def _date_chunks(start, end, span=365):
+def _date_chunks(start, end, span=7):
     cur = end
     while cur >= start:
         c_start = max(start, cur - timedelta(days=span - 1))
@@ -230,7 +205,7 @@ def fetch_quotes(items, batch=200):
         out = {}
         for k, v in (js.get('data') or {}).items():
             key = v.get('instrument_token') or by_ts.get(k)
-            if key: out[key] = {'ltp': v.get('last_price') or 0.0, 'vol': v.get('volume') or 0, 'net': v.get('net_change') or 0.0}
+            if key: out[key] = {'ltp': v.get('last_price') or 0.0, 'vol': v.get('volume') or 0}
         return out
     res = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(WORKERS, max(1, len(batches)))) as ex:
@@ -253,35 +228,18 @@ def prepare_master(dfs):
     master['Session'] = day.dt.date
     return master
 
-def keep_last_sessions(master, days):
-    sessions = sorted(master['Session'].unique())[-days:]
-    return master[master['Session'].isin(sessions)].reset_index(drop=True)
-
-def load_history(item, start, end, days):
-    frames = []
-    for c_start, c_end in _date_chunks(start, end):
-        status, df = _candles(_url_range(item['key'], c_start, c_end))
-        if status != 200: return None                     
-        if df is not None: frames.append(df)
-    if not frames: return None
-    hist = keep_last_sessions(prepare_master(frames), days)
-    return hist if not hist.empty else None
-
 INDEX_CONFIG = {
     "NIFTY": {"spot_key": "NSE_INDEX|Nifty 50", "step": 50, "match": ["NIFTY", "NIFTY 50"]},
     "BANKNIFTY": {"spot_key": "NSE_INDEX|Nifty Bank", "step": 100, "match": ["BANKNIFTY", "NIFTY BANK"]},
     "FINNIFTY": {"spot_key": "NSE_INDEX|Nifty Fin Service", "step": 50, "match": ["FINNIFTY", "NIFTY FIN SERVICE"]},
-    "MIDCPNIFTY": {"spot_key": "NSE_INDEX|NIFTY MID SELECT", "step": 25, "match": ["MIDCPNIFTY", "NIFTY MID SELECT"]},
-    "SENSEX": {"spot_key": "BSE_INDEX|SENSEX", "step": 100, "match": ["SENSEX", "BSE SENSEX"]},
 }
 
 def _download_master(name):
-    url = f"https://assets.upstox.com/market-quote/instruments/exchange/{name}.json.gz"
-    for attempt in range(3):
+    for _ in range(3):
         try:
-            resp = requests.get(url, timeout=90)
+            resp = requests.get(f"https://assets.upstox.com/market-quote/instruments/exchange/{name}.json.gz", timeout=90)
             if resp.status_code == 200: return json.load(gzip.GzipFile(fileobj=io.BytesIO(resp.content)))
-        except Exception: time.sleep(1.0 * (attempt + 1))
+        except Exception: time.sleep(1.0)
     return None
 
 def _equity_universe(mode):
@@ -293,8 +251,7 @@ def _equity_universe(mode):
     rows = [i for i in nse if plain(i) and (ts_of(i) in fno if mode == "STOCK_FNO" else ts_of(i) not in fno)]
     return list({i["instrument_key"]: {"symbol": ts_of(i), "key": i["instrument_key"]} for i in rows}.values())
 
-def get_dynamic_universe(mode):
-    return _equity_universe(mode) if mode in ("STOCK_FNO", "CASH_EQUITY") else [] 
+def get_dynamic_universe(mode): return _equity_universe(mode) if mode in ("STOCK_FNO", "CASH_EQUITY") else [] 
 
 # ==============================================================================
 # 2. THE DECOUPLED HA-ATR ENGINE 
@@ -320,8 +277,7 @@ def split_sessions(m):
     return [(o[s:e], h[s:e], l[s:e], c[s:e]) for s, e in zip(starts, ends)]
 
 def build_isolated_range_bars(sessions, target_range, base_atr=None):
-    """Builds range bars strictly by price distance. Drops unclosed leftover candles."""
-    B_O, B_H, B_L, B_C = [], [], [], []
+    B_O, B_H, B_L, B_C, B_CLOSED = [], [], [], [], []
     seg_start = 0
 
     for opens, highs, lows, closes in sessions:
@@ -336,20 +292,24 @@ def build_isolated_range_bars(sessions, target_range, base_atr=None):
 
             if curr_H - curr_L >= target_range:
                 B_O.append(curr_O); B_H.append(curr_H); B_L.append(curr_L); B_C.append(curr_C)
+                B_CLOSED.append(True)
                 curr_O = curr_H = curr_L = curr_C
                 
-        # Unclosed partials are deliberately NOT appended here to ensure pure data
+        if curr_H > curr_L:
+            B_O.append(curr_O); B_H.append(curr_H); B_L.append(curr_L); B_C.append(curr_C)
+            B_CLOSED.append(False) 
         if len(B_C) > before: seg_start = before
 
     if not B_C: return None
 
     o = B_O[seg_start:]; h = B_H[seg_start:]; l = B_L[seg_start:]; c = B_C[seg_start:]
+    closed = B_CLOSED[seg_start:]
     ha_close = [(o[i] + h[i] + l[i] + c[i]) / 4 for i in range(len(c))]
     ha_open = (o[0] + c[0]) / 2
     for i in range(1, len(c)): ha_open = (ha_open + ha_close[i - 1]) / 2.0
     ha_trend = 'Green' if ha_close[-1] >= ha_open else 'Red'
 
-    return {'High': np.asarray(h), 'Low': np.asarray(l), 'Close': np.asarray(c), 'HA_Trend': ha_trend}
+    return {'High': np.asarray(h), 'Low': np.asarray(l), 'Close': np.asarray(c), 'Closed': closed, 'HA_Trend': ha_trend}
 
 def _ewm(x, alpha):
     xs = x.tolist(); out = [0.0] * len(xs); prev = out[0] = xs[0]
@@ -359,9 +319,7 @@ def _ewm(x, alpha):
 
 def _last_bb(series):
     w = series[-BB_PERIOD:]
-    mean = float(w.mean())
-    std = float(w.std(ddof=0)) if len(w) > 1 else 0.0
-    return mean, std
+    return float(w.mean()), float(w.std(ddof=0)) if len(w) > 1 else 0.0
 
 def _evaluate_kinetic(close, high, low):
     n = len(close)
@@ -375,7 +333,7 @@ def _evaluate_kinetic(close, high, low):
     hist = macd - _ewm(macd, 2 / 10)
     h_mean, h_std = _last_bb(hist)
 
-    up = np.zeros(n); down = np.zeros(n)
+    up, down = np.zeros(n), np.zeros(n)
     up[1:] = high[1:] - high[:-1]; down[1:] = low[:-1] - low[1:]
     plus_dm = np.where((up > down) & (up > 0), up, 0.0)
     minus_dm = np.where((down > up) & (down > 0), down, 0.0)
@@ -391,48 +349,33 @@ def _evaluate_kinetic(close, high, low):
     p_mean, p_std = _last_bb(plus_di)
     m_mean, m_std = _last_bb(minus_di)
 
-    rsi_sig = "Neutral"
-    if r_std > 0:
-        if rsi[-1] > r_mean + BB_STD * r_std: rsi_sig = "Buy"
-        elif rsi[-1] < r_mean - BB_STD * r_std: rsi_sig = "Sell"
-
-    macd_sig = "Neutral"
-    if h_std > 0:
-        if hist[-1] > h_mean + BB_STD * h_std: macd_sig = "Buy"
-        elif hist[-1] < h_mean - BB_STD * h_std: macd_sig = "Sell"
+    rsi_sig = "Buy" if r_std > 0 and rsi[-1] > r_mean + BB_STD * r_std else "Sell" if r_std > 0 and rsi[-1] < r_mean - BB_STD * r_std else "Neutral"
+    macd_sig = "Buy" if h_std > 0 and hist[-1] > h_mean + BB_STD * h_std else "Sell" if h_std > 0 and hist[-1] < h_mean - BB_STD * h_std else "Neutral"
 
     bull_agg = p_std > 0 and plus_di[-1] > p_mean + BB_STD * p_std
     bear_agg = m_std > 0 and minus_di[-1] > m_mean + BB_STD * m_std
 
-    adx_sig = "Neutral"
-    if bull_agg and plus_di[-1] > minus_di[-1] and adx[-1] >= ADX_THRESHOLD: adx_sig = "Buy"
-    elif bear_agg and minus_di[-1] > plus_di[-1] and adx[-1] >= ADX_THRESHOLD: adx_sig = "Sell"
-
+    adx_sig = "Buy" if bull_agg and plus_di[-1] > minus_di[-1] and adx[-1] >= ADX_THRESHOLD else "Sell" if bear_agg and minus_di[-1] > plus_di[-1] and adx[-1] >= ADX_THRESHOLD else "Neutral"
     return rsi_sig, macd_sig, adx_sig, bull_agg, bear_agg
 
 def calculate_strict_signals(bars):
-    if bars is None or len(bars['Close']) < 5:
-        return "", "", "", "NONE", False
+    if bars is None or len(bars['Close']) < 5: return "", "", "", "NONE", False, False
     
     close, high, low = bars['Close'], bars['High'], bars['Low']
     f_rsi, f_macd, f_adx, f_bull_power, f_bear_power = _evaluate_kinetic(close, high, low)
-    
     ha_trend = bars['HA_Trend']
+    
     is_bull = f_rsi == "Buy" and f_macd == "Buy" and f_adx == "Buy" and ha_trend == 'Green'
     is_bear = f_rsi == "Sell" and f_macd == "Sell" and f_adx == "Sell" and ha_trend == 'Red'
 
-    # --- THE KINETIC TRAP KILLER (Warzone Audit) ---
-    # We check the native DI lines directly. If a Bull move triggers strong Bear Power (-DI spike)
-    # during its formation, it was too chaotic and gets killed.
     dirty_killed = False
-    if is_bull and f_bear_power:
-        is_bull = False; dirty_killed = True
-    if is_bear and f_bull_power:
-        is_bear = False; dirty_killed = True
+    if is_bull and f_bear_power: is_bull = False; dirty_killed = True
+    if is_bear and f_bull_power: is_bear = False; dirty_killed = True
 
-    if is_bull: return f_rsi, f_macd, f_adx, "BULL", dirty_killed
-    if is_bear: return f_rsi, f_macd, f_adx, "BEAR", dirty_killed
-    return "", "", "", "NONE", dirty_killed
+    unclosed = not bars['Closed'][-1]
+    if unclosed: is_bull = is_bear = False
+
+    return f_rsi, f_macd, f_adx, "BULL" if is_bull else "BEAR" if is_bear else "NONE", dirty_killed, unclosed
 
 def compute_row(symbol, master_1m):
     close, high, low = master_1m['Close'].values, master_1m['High'].values, master_1m['Low'].values
@@ -450,21 +393,17 @@ def compute_row(symbol, master_1m):
     kc_upper = sma20[-1] + 1.5 * atr20[-1]
     kc_lower = sma20[-1] - 1.5 * atr20[-1]
     
-    # --- HARD BB/KC GATES ---
-    bb_kc_bull_fire = bb_upper > kc_upper
-    bb_kc_bear_fire = bb_lower < kc_lower
-
     base_atr = compute_base_atr(master_1m)
     sessions = split_sessions(master_1m)
     row = {'Symbol': symbol, 'LTP': float(close[-1]), 'LastSession': master_1m['Session'].iloc[-1],
-           'PerfectBullBlocks': 0, 'PerfectBearBlocks': 0, 'DirtyKilled1X': False,
+           'PerfectBullBlocks': 0, 'PerfectBearBlocks': 0, 'DirtyKilled1X': False, 'Unclosed1X': False,
            'Anchor1XBull': False, 'Anchor1XBear': False,
-           'BB_KC_Bull': bb_kc_bull_fire, 'BB_KC_Bear': bb_kc_bear_fire}
+           'BB_KC_Bull': (bb_upper > kc_upper), 'BB_KC_Bear': (bb_lower < kc_lower)}
     
     for mult in HA_ATR_MULTIPLIERS:
         gtag = f"{mult}X"
         bars = build_isolated_range_bars(sessions, base_atr * mult, base_atr=base_atr)
-        bb_rsi, bb_macd, adx_sig, alignment, dirty_killed = calculate_strict_signals(bars)
+        bb_rsi, bb_macd, adx_sig, alignment, dirty_killed, unclosed = calculate_strict_signals(bars)
         row[f'BB_RSI_{gtag}'], row[f'BB_MACD_{gtag}'], row[f'ADX_{gtag}'] = bb_rsi, bb_macd, adx_sig
         
         if alignment == "BULL": row['PerfectBullBlocks'] += 1
@@ -474,6 +413,7 @@ def compute_row(symbol, master_1m):
             row['Anchor1XBull'] = (alignment == "BULL")
             row['Anchor1XBear'] = (alignment == "BEAR")
             if dirty_killed: row['DirtyKilled1X'] = True
+            if unclosed: row['Unclosed1X'] = True
     return row
 
 # ==============================================================================
@@ -486,94 +426,97 @@ def format_cell(text, width=10):
     colored_text = f"{COLOR_GREEN_BG}{text}{COLOR_RESET}" if text == "Buy" else f"{COLOR_RED_BG}{text}{COLOR_RESET}" if text == "Sell" else str(text)
     return f"{left_pad}{colored_text}{right_pad}"
 
-def prefilter_by_quotes(universe):
-    quotes = fetch_quotes(universe)
-    if len(quotes) < 0.5 * len(universe): return universe
-    lo, hi = MIN_PRICE * (1 - PREFILTER_PRICE_SLACK), MAX_PRICE * (1 + PREFILTER_PRICE_SLACK)
-    live = market_is_open()
-    keep = []
-    for it in universe:
-        q = quotes.get(it['key'])
-        if not q or not (lo <= q['ltp'] <= hi): continue
-        if live and PREFILTER_MIN_TODAY_VOLUME and q['vol'] < PREFILTER_MIN_TODAY_VOLUME: continue
-        keep.append(it)
-    return keep
-
-def _history_worker(args):
-    item, start, end, days, mode, progress = args
+def _history_worker_daily(args):
+    item, start, end, progress = args
     try:
-        hist = load_history(item, start, end, days)
-        if hist is None: return None
-        close, vol = hist['Close'].iloc[-1], hist['Volume'].sum()
-        ok = close >= OPT_MIN_PRICE and vol >= OPT_MIN_VOLUME if mode == "INDEX_OPTIONS" else MIN_PRICE <= close <= MAX_PRICE and vol >= MIN_DAILY_VOLUME
-        return (item, hist) if ok else None
+        frames = []
+        for c_start, c_end in _date_chunks(start, end, span=365):
+            status, df = _candles(_url_range_daily(item['key'], c_start, c_end))
+            if status == 200 and df is not None: frames.append(df)
+        if not frames: return None
+        master = prepare_master(frames)
+        close, vol = master['Close'].iloc[-1], master['Volume'].iloc[-1]
+        ok = MIN_PRICE <= close <= MAX_PRICE and vol >= MIN_DAILY_VOLUME
+        return item if ok else None
     except Exception: return None
     finally: progress.tick()
 
-def process_stock(args):
-    item, hist, days, progress = args
+def process_stock_1m(args):
+    item, target_dt, is_live, progress = args
     try:
-        today_df = fetch_today(item['key'])
-        frames = [hist] + ([today_df] if today_df is not None else [])
-        master_1m = keep_last_sessions(prepare_master(frames), days)
+        start_dt = target_dt - timedelta(days=7) # Fetch only recent 1m data for blocks to save API
+        frames = []
+        for c_start, c_end in _date_chunks(start_dt, target_dt, span=7):
+            status, df = _candles(_url_range_1m(item['key'], c_start, c_end))
+            if status == 200 and df is not None: frames.append(df)
+            
+        if is_live:
+            today_df = fetch_today(item['key'])
+            if today_df is not None: frames.append(today_df)
+            
+        if not frames: return None
+        master_1m = prepare_master(frames)
+        master_1m = master_1m[master_1m['Session'] <= target_dt] # Strict cut-off for EOD parsing
+        
         if len(master_1m) < 30: return None
         return compute_row(item['symbol'], master_1m)
     except Exception: return None
     finally: progress.tick()
 
-def _eta(calls):
-    per_min = min(cap for span, cap in RATE_CAPS if span == 60.0)
-    return f"~{max(1, round(calls / per_min * 60))}s" if calls < per_min else f"~{calls / per_min:.1f} min"
-
-def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_BLOCKS):
+def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_BLOCKS, target_date_str=None):
     t_start = time.time()
-    days = max(days, 2)
-    print(f"\n{COLOR_CYAN}📡 Initializing Screener Pipeline [{mode}] via UPSTOX API...{COLOR_RESET}")
+    
+    if target_date_str:
+        try:
+            target_dt = datetime.strptime(target_date_str, "%Y-%m-%d").date()
+            is_live = False
+        except ValueError:
+            print(f"{COLOR_RED_FG}[!] Invalid date format. Use YYYY-MM-DD.{COLOR_RESET}"); return
+    else:
+        target_dt = now_ist().date()
+        is_live = True
+
+    print(f"\n{COLOR_CYAN}📡 Initializing Screener [{mode}] | Target Date: {target_dt} (Live: {is_live}){COLOR_RESET}")
 
     universe_raw = get_dynamic_universe(mode)
     if STATS.auth_failed or not universe_raw: return
 
-    end = now_ist().date() - timedelta(days=1)
-    start = end - timedelta(days=days * 2 + 6)
-    candidates = prefilter_by_quotes(universe_raw) if mode != "INDEX_OPTIONS" else universe_raw
-
-    prog = Progress("history", len(candidates))
+    # Prefilter step using daily candles
+    daily_start = target_dt - timedelta(days=days * 2 + 6)
+    prog = Progress("daily_prefilter", len(universe_raw))
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        stage1 = [r for r in ex.map(_history_worker, [(it, start, end, days, mode, prog) for it in candidates]) if r is not None]
+        candidates = [r for r in ex.map(_history_worker_daily, [(it, daily_start, target_dt, prog) for it in universe_raw]) if r is not None]
     prog.done()
 
-    if STATS.auth_failed or not stage1: return
+    if STATS.auth_failed or not candidates: return
 
-    prog = Progress("signals", len(stage1))
+    # Process 1-minute blocks for candidates
+    prog = Progress("1m_blocks", len(candidates))
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        results = [r for r in ex.map(process_stock, [(item, hist, days, prog) for item, hist in stage1]) if r is not None]
+        results = [r for r in ex.map(process_stock_1m, [(item, target_dt, is_live, prog) for item in candidates]) if r is not None]
     prog.done()
 
     if not results: return
 
-    latest_session = max(r['LastSession'] for r in results)         
-    dashboard_data = [r for r in results if r['LastSession'] == latest_session]
+    # No hard BB/KC filtering here. We grab EVERYTHING that has aligned blocks so values are parsed.
+    bulls = [r for r in results if r['PerfectBullBlocks'] >= min_blocks and r.get('Anchor1XBull')]
+    bears = [r for r in results if r['PerfectBearBlocks'] >= min_blocks and r.get('Anchor1XBear')]
 
-    bulls = [r for r in dashboard_data if r['PerfectBullBlocks'] >= min_blocks and r.get('Anchor1XBull') and r['BB_KC_Bull']]
-    bears = [r for r in dashboard_data if r['PerfectBearBlocks'] >= min_blocks and r.get('Anchor1XBear') and r['BB_KC_Bear']]
-
-    bulls.sort(key=lambda r: -r['PerfectBullBlocks'])
-    bears.sort(key=lambda r: -r['PerfectBearBlocks'])
+    bulls.sort(key=lambda r: (-r['PerfectBullBlocks'], not r['BB_KC_Bull']))
+    bears.sort(key=lambda r: (-r['PerfectBearBlocks'], not r['BB_KC_Bear']))
     
     bulls, bears = bulls[:TOP_N_BUYERS], bears[:TOP_N_SELLERS]
 
     print(f"{COLOR_BOLD}\n=== STRICT INSTITUTIONAL VOLATILITY DASHBOARD [{mode}] ==={COLOR_RESET}")
-    print(f"Session: {latest_session} | Refreshed: {now_ist():%H:%M:%S} IST | Scanned: {len(dashboard_data)}\n")
+    print(f"Target Date: {target_dt} | Scanned: {len(results)}\n")
 
-    sym_title = "Options Strike" if mode == "INDEX_OPTIONS" else "Script"
-
-    def print_basket(title, icon, data_list, blocks_key):
+    def print_basket(title, icon, data_list, blocks_key, bb_kc_key):
         if not data_list: return
         print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
-        header_str = f" {COLOR_CYAN}{sym_title:<22} {'LTP':<8} |"
+        header_str = f" {COLOR_CYAN}{'Script':<22} {'LTP':<8} |"
         for mult in HA_ATR_MULTIPLIERS:
             header_str += f"  {'BB-RSI ' + str(mult) + 'X':^11} {'BB-MACD ' + str(mult) + 'X':^12} {'BB-DI ' + str(mult) + 'X':^9} |"
-        header_str += f" {'Blocks':>7}"
+        header_str += f" {'Blocks':>7} | {'BB/KC State':^11}"
         print(header_str + COLOR_RESET)
         print("-" * len(ANSI_RE.sub("", header_str)))
 
@@ -584,18 +527,22 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
                 row_str += (f"  {format_cell(row.get(f'BB_RSI_{gtag}'), 11)}"
                             f" {format_cell(row.get(f'BB_MACD_{gtag}'), 12)}"
                             f" {format_cell(row.get(f'ADX_{gtag}'), 9)} |")
-            row_str += f" {row[blocks_key]:>3}/{len(HA_ATR_MULTIPLIERS)}"
+            
+            # Print values directly. State is visually tagged.
+            state = row[bb_kc_key]
+            state_text = f"{COLOR_GREEN_BG} [FIRED] {COLOR_RESET}" if state else f"{COLOR_YELLOW} [COILED] {COLOR_RESET}"
+            row_str += f" {row[blocks_key]:>3}/{len(HA_ATR_MULTIPLIERS)} | {state_text}"
             print(row_str)
 
-    print_basket("TOP BUYERS (Confirmed Breakouts only: BB > KC)", "🔥", bulls, 'PerfectBullBlocks')
-    print_basket("TOP SELLERS (Confirmed Breakdowns only: BB < KC)", "🩸", bears, 'PerfectBearBlocks')
+    print_basket("TOP BUYERS (Values Parsed)", "🔥", bulls, 'PerfectBullBlocks', 'BB_KC_Bull')
+    print_basket("TOP SELLERS (Values Parsed)", "🩸", bears, 'PerfectBearBlocks', 'BB_KC_Bear')
     
-    dirty_vetoed = sum(1 for r in dashboard_data if r.get('DirtyKilled1X'))
-    if not bulls and not bears:
-        print(f"{COLOR_YELLOW}No instrument passed the strict alignment criteria right now.{COLOR_RESET}")
-        if dirty_vetoed: print(f"{COLOR_YELLOW}   ↳ {dirty_vetoed}/{len(dashboard_data)} instruments vetoed by True Warzone Audit (Algorithmic Chop).{COLOR_RESET}")
-    else:
-        if dirty_vetoed: print(f"{COLOR_YELLOW}ℹ️  {dirty_vetoed} additional instrument(s) vetoed by True Warzone Audit (Algorithmic Chop).{COLOR_RESET}")
+    dirty_vetoed = sum(1 for r in results if r.get('DirtyKilled1X'))
+    unclosed_vetoed = sum(1 for r in results if r.get('Unclosed1X'))
+    
+    print(f"\n{COLOR_YELLOW}ℹ️  VETO LOG:{COLOR_RESET}")
+    print(f"   ↳ {dirty_vetoed} setups killed by True Warzone Audit (Algorithmic Chop).")
+    print(f"   ↳ {unclosed_vetoed} setups killed because 1X block distance was incomplete.")
     
     total_calls = sum(l.total_calls for l in LIMITERS.values())
     print(f"\n⏱️ Scan completed in {(time.time() - t_start):.2f} seconds ({total_calls} API calls).\n")
@@ -605,10 +552,11 @@ def parse_args():
     p.add_argument("--mode", choices=["STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"], default=TRADING_MODE)
     p.add_argument("--days", type=int, default=BACKTRACE_DAYS, help="trading sessions of history (min 2)")
     p.add_argument("--min-blocks", type=int, default=MIN_PERFECT_BLOCKS)
+    p.add_argument("--date", type=str, default=None, help="Target date for EOD parsing (YYYY-MM-DD)")
     return p.parse_args()
 
 if __name__ == "__main__":
     if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
         print(f"{COLOR_RED_FG}[!] Missing UPSTOX_ACCESS_TOKEN.{COLOR_RESET}"); sys.exit(1)
     args = parse_args()
-    run_screener(args.mode, args.days, args.min_blocks)
+    run_screener(args.mode, args.days, args.min_blocks, args.date)
