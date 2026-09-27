@@ -4,7 +4,7 @@ Strict Institutional Volatility Screener (Upstox) - STATELESS INTRADAY EDITION
 + Zero Disk Caching (100% Live API fetches)
 + 1X Mandatory Anchor Rule (No hollow core breakouts)
 + Strict BB > KC Binary Trigger (Keltner Channel acts as the baseline bouncer)
-+ The Inverted Warzone Audit (Forward Bull Power vs Inverted Bear Power)
++ The True Warzone Audit (+DI and -DI Kinetic Clash)
 """
 import os
 import sys
@@ -294,7 +294,7 @@ def _equity_universe(mode):
     return list({i["instrument_key"]: {"symbol": ts_of(i), "key": i["instrument_key"]} for i in rows}.values())
 
 def get_dynamic_universe(mode):
-    return _equity_universe(mode) if mode in ("STOCK_FNO", "CASH_EQUITY") else [] # Shortened for clarity
+    return _equity_universe(mode) if mode in ("STOCK_FNO", "CASH_EQUITY") else [] 
 
 # ==============================================================================
 # 2. THE DECOUPLED HA-ATR ENGINE 
@@ -320,8 +320,8 @@ def split_sessions(m):
     return [(o[s:e], h[s:e], l[s:e], c[s:e]) for s, e in zip(starts, ends)]
 
 def build_isolated_range_bars(sessions, target_range, base_atr=None):
-    """Builds range bars strictly by price distance."""
-    B_O, B_H, B_L, B_C, B_CLOSED = [], [], [], [], []
+    """Builds range bars strictly by price distance. Drops unclosed leftover candles."""
+    B_O, B_H, B_L, B_C = [], [], [], []
     seg_start = 0
 
     for opens, highs, lows, closes in sessions:
@@ -336,24 +336,20 @@ def build_isolated_range_bars(sessions, target_range, base_atr=None):
 
             if curr_H - curr_L >= target_range:
                 B_O.append(curr_O); B_H.append(curr_H); B_L.append(curr_L); B_C.append(curr_C)
-                B_CLOSED.append(True)
                 curr_O = curr_H = curr_L = curr_C
                 
-        if curr_H > curr_L:
-            B_O.append(curr_O); B_H.append(curr_H); B_L.append(curr_L); B_C.append(curr_C)
-            B_CLOSED.append(False) 
+        # Unclosed partials are deliberately NOT appended here to ensure pure data
         if len(B_C) > before: seg_start = before
 
     if not B_C: return None
 
     o = B_O[seg_start:]; h = B_H[seg_start:]; l = B_L[seg_start:]; c = B_C[seg_start:]
-    closed = B_CLOSED[seg_start:]
     ha_close = [(o[i] + h[i] + l[i] + c[i]) / 4 for i in range(len(c))]
     ha_open = (o[0] + c[0]) / 2
     for i in range(1, len(c)): ha_open = (ha_open + ha_close[i - 1]) / 2.0
     ha_trend = 'Green' if ha_close[-1] >= ha_open else 'Red'
 
-    return {'High': np.asarray(h), 'Low': np.asarray(l), 'Close': np.asarray(c), 'Closed': closed, 'HA_Trend': ha_trend}
+    return {'High': np.asarray(h), 'Low': np.asarray(l), 'Close': np.asarray(c), 'HA_Trend': ha_trend}
 
 def _ewm(x, alpha):
     xs = x.tolist(); out = [0.0] * len(xs); prev = out[0] = xs[0]
@@ -368,10 +364,6 @@ def _last_bb(series):
     return mean, std
 
 def _evaluate_kinetic(close, high, low):
-    """
-    Calculates the exact RSI, MACD, and DI against Bollinger Bands for any given array.
-    Returns: (rsi_sig, macd_sig, adx_sig, is_bull_aggressive, is_bear_aggressive)
-    """
     n = len(close)
     delta = np.diff(close, prepend=close[0])
     gain = _ewm(np.where(delta > 0, delta, 0.0), 1 / RSI_PERIOD)
@@ -420,51 +412,27 @@ def _evaluate_kinetic(close, high, low):
 
 def calculate_strict_signals(bars):
     if bars is None or len(bars['Close']) < 5:
-        return "", "", "", "NONE", False, False
+        return "", "", "", "NONE", False
     
     close, high, low = bars['Close'], bars['High'], bars['Low']
-    base_price = close[0]
-
-    # --- THE INVERSION ARRAYS (For the Warzone Audit) ---
-    # Flipped perfectly over the baseline to simulate the exact same path moving backwards
-    inv_close = 2.0 * base_price - close
-    inv_high = 2.0 * base_price - low
-    inv_low = 2.0 * base_price - high
-
-    # Evaluate the physical reality (Forward)
     f_rsi, f_macd, f_adx, f_bull_power, f_bear_power = _evaluate_kinetic(close, high, low)
     
-    # Evaluate the hypothetical mirror (Inverted)
-    i_rsi, i_macd, i_adx, i_bull_power, i_bear_power = _evaluate_kinetic(inv_close, inv_high, inv_low)
-
     ha_trend = bars['HA_Trend']
     is_bull = f_rsi == "Buy" and f_macd == "Buy" and f_adx == "Buy" and ha_trend == 'Green'
     is_bear = f_rsi == "Sell" and f_macd == "Sell" and f_adx == "Sell" and ha_trend == 'Red'
 
     # --- THE KINETIC TRAP KILLER (Warzone Audit) ---
-    # To be a valid Bull Move, the forward path MUST pierce Bull Bands (f_bull_power), 
-    # and the mirrored downward path MUST NOT pierce Bear Bands (i_bear_power).
-    # If both trigger, the internal 1-minute structure was chaotic algorithmic chop.
+    # We check the native DI lines directly. If a Bull move triggers strong Bear Power (-DI spike)
+    # during its formation, it was too chaotic and gets killed.
     dirty_killed = False
-    
-    if is_bull and i_bear_power:
-        is_bull = False
-        dirty_killed = True
-    
-    # To be a valid Bear Move, the forward path is plunging (f_bear_power).
-    # The mirrored upward path MUST NOT pierce Bull Bands (i_bull_power).
-    if is_bear and i_bull_power:
-        is_bear = False
-        dirty_killed = True
+    if is_bull and f_bear_power:
+        is_bull = False; dirty_killed = True
+    if is_bear and f_bull_power:
+        is_bear = False; dirty_killed = True
 
-    # --- BLOCK-ACTUALLY-CLOSED GATE ---
-    unclosed = not bars['Closed'][-1]
-    if unclosed:
-        is_bull = is_bear = False
-
-    if is_bull: return f_rsi, f_macd, f_adx, "BULL", dirty_killed, unclosed
-    if is_bear: return f_rsi, f_macd, f_adx, "BEAR", dirty_killed, unclosed
-    return "", "", "", "NONE", dirty_killed, unclosed
+    if is_bull: return f_rsi, f_macd, f_adx, "BULL", dirty_killed
+    if is_bear: return f_rsi, f_macd, f_adx, "BEAR", dirty_killed
+    return "", "", "", "NONE", dirty_killed
 
 def compute_row(symbol, master_1m):
     close, high, low = master_1m['Close'].values, master_1m['High'].values, master_1m['Low'].values
@@ -490,13 +458,13 @@ def compute_row(symbol, master_1m):
     sessions = split_sessions(master_1m)
     row = {'Symbol': symbol, 'LTP': float(close[-1]), 'LastSession': master_1m['Session'].iloc[-1],
            'PerfectBullBlocks': 0, 'PerfectBearBlocks': 0, 'DirtyKilled1X': False,
-           'Anchor1XBull': False, 'Anchor1XBear': False, 'Unclosed1X': False,
+           'Anchor1XBull': False, 'Anchor1XBear': False,
            'BB_KC_Bull': bb_kc_bull_fire, 'BB_KC_Bear': bb_kc_bear_fire}
     
     for mult in HA_ATR_MULTIPLIERS:
         gtag = f"{mult}X"
         bars = build_isolated_range_bars(sessions, base_atr * mult, base_atr=base_atr)
-        bb_rsi, bb_macd, adx_sig, alignment, dirty_killed, unclosed = calculate_strict_signals(bars)
+        bb_rsi, bb_macd, adx_sig, alignment, dirty_killed = calculate_strict_signals(bars)
         row[f'BB_RSI_{gtag}'], row[f'BB_MACD_{gtag}'], row[f'ADX_{gtag}'] = bb_rsi, bb_macd, adx_sig
         
         if alignment == "BULL": row['PerfectBullBlocks'] += 1
@@ -506,7 +474,6 @@ def compute_row(symbol, master_1m):
             row['Anchor1XBull'] = (alignment == "BULL")
             row['Anchor1XBear'] = (alignment == "BEAR")
             if dirty_killed: row['DirtyKilled1X'] = True
-            if unclosed: row['Unclosed1X'] = True
     return row
 
 # ==============================================================================
@@ -587,10 +554,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
     latest_session = max(r['LastSession'] for r in results)         
     dashboard_data = [r for r in results if r['LastSession'] == latest_session]
 
-    # --- THE HARD GATES ---
-    # 1. Has Perfect Blocks >= Threshold
-    # 2. 1X Anchor Block is Valid (Includes Trend, Distance, AND the Inverted Warzone Audit)
-    # 3. The raw BB/KC Binary check is True
     bulls = [r for r in dashboard_data if r['PerfectBullBlocks'] >= min_blocks and r.get('Anchor1XBull') and r['BB_KC_Bull']]
     bears = [r for r in dashboard_data if r['PerfectBearBlocks'] >= min_blocks and r.get('Anchor1XBear') and r['BB_KC_Bear']]
 
@@ -628,14 +591,11 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
     print_basket("TOP SELLERS (Confirmed Breakdowns only: BB < KC)", "🩸", bears, 'PerfectBearBlocks')
     
     dirty_vetoed = sum(1 for r in dashboard_data if r.get('DirtyKilled1X'))
-    unclosed_vetoed = sum(1 for r in dashboard_data if r.get('Unclosed1X'))
     if not bulls and not bears:
         print(f"{COLOR_YELLOW}No instrument passed the strict alignment criteria right now.{COLOR_RESET}")
-        if dirty_vetoed: print(f"{COLOR_YELLOW}   ↳ {dirty_vetoed}/{len(dashboard_data)} instruments vetoed by Inverted Warzone Audit (Algorithmic Chop).{COLOR_RESET}")
-        if unclosed_vetoed: print(f"{COLOR_YELLOW}   ↳ {unclosed_vetoed}/{len(dashboard_data)} instruments vetoed because the 1X block has not completed distance.{COLOR_RESET}")
+        if dirty_vetoed: print(f"{COLOR_YELLOW}   ↳ {dirty_vetoed}/{len(dashboard_data)} instruments vetoed by True Warzone Audit (Algorithmic Chop).{COLOR_RESET}")
     else:
-        if dirty_vetoed: print(f"{COLOR_YELLOW}ℹ️  {dirty_vetoed} additional instrument(s) vetoed by Inverted Warzone Audit (Algorithmic Chop).{COLOR_RESET}")
-        if unclosed_vetoed: print(f"{COLOR_YELLOW}ℹ️  {unclosed_vetoed} additional instrument(s) vetoed (1X block distance incomplete).{COLOR_RESET}")
+        if dirty_vetoed: print(f"{COLOR_YELLOW}ℹ️  {dirty_vetoed} additional instrument(s) vetoed by True Warzone Audit (Algorithmic Chop).{COLOR_RESET}")
     
     total_calls = sum(l.total_calls for l in LIMITERS.values())
     print(f"\n⏱️ Scan completed in {(time.time() - t_start):.2f} seconds ({total_calls} API calls).\n")
