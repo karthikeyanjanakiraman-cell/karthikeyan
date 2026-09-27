@@ -2,17 +2,29 @@ name: Institutional Hybrid AI Sweep
 
 on:
   schedule:
+    # Runs automatically at 10:30 UTC Monday through Friday
     - cron: '30 10 * * 1-5'
   workflow_dispatch:
     inputs:
+      trading_mode:
+        description: 'Trading Universe'
+        required: true
+        default: 'STOCK_FNO'
+        type: choice
+        options:
+          - STOCK_FNO
+          - CASH_EQUITY
+          - INDEX_OPTIONS
       backtest_date:
         description: 'Optional Backtest Date (YYYY-MM-DD)'
         required: false
         default: ''
+        type: string
       backtest_time:
         description: 'Optional Backtest Time (HH:MM) - Defaults to 15:30'
         required: false
         default: ''
+        type: string
 
 jobs:
   run_quant_engine:
@@ -32,9 +44,9 @@ jobs:
         python -m pip install --upgrade pip
         pip install torch numpy pandas faiss-cpu xgboost scikit-learn requests yfinance fyers_apiv3
 
-    - name: Execute Live Hybrid Engine Scan
+    - name: Execute Stateful Hybrid Engine Scan
       env:
-        # Fyers & Email configurations
+        # Fyers & Email Configurations
         FYERS_CLIENT_ID: ${{ secrets.CLIENT_ID }}
         FYERS_ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
         EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
@@ -45,19 +57,30 @@ jobs:
         UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
         
         # GitHub Actions Inputs
-        PARAM_BACKTEST_DATE: ${{ github.event.inputs.backtest_date }}
-        PARAM_BACKTEST_TIME: ${{ github.event.inputs.backtest_time }}
+        PARAM_MODE: ${{ inputs.trading_mode }}
+        PARAM_BACKTEST_DATE: ${{ inputs.backtest_date }}
+        PARAM_BACKTEST_TIME: ${{ inputs.backtest_time }}
       run: |
-        # Build the command dynamically so it doesn't crash on empty inputs
+        # Base Execution Command
         CMD="python -u System3.py"
         
+        # 1. Inject Trading Mode (Defaults to STOCK_FNO for automated cron runs)
+        if [ -n "$PARAM_MODE" ]; then
+          CMD="$CMD --mode $PARAM_MODE"
+        else
+          CMD="$CMD --mode STOCK_FNO"
+        fi
+        
+        # 2. Inject Optional Backtest Date
         if [ -n "$PARAM_BACKTEST_DATE" ]; then
           CMD="$CMD --date $PARAM_BACKTEST_DATE"
         fi
         
+        # 3. Inject Optional Backtest Time
         if [ -n "$PARAM_BACKTEST_TIME" ]; then
           CMD="$CMD --time $PARAM_BACKTEST_TIME"
         fi
         
+        # Log and Execute
         echo "Executing Command: $CMD"
         eval $CMD
