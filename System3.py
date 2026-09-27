@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Strict Institutional Volatility Screener (Upstox) - STATELESS INTRADAY EDITION
-+ Zero Disk Caching (100% Live API fetches)
-+ 1X Mandatory Anchor Rule (No hollow core breakouts)
-+ EOD Date Parser (--date YYYY-MM-DD)
-+ Lists all values, tagging BB/KC state as FIRED or COILED
+Strict Institutional Volatility Tracker (Upstox) - STATEFUL INTRADAY EDITION
++ Dynamic Anchor Time: Locks the exact minute a 1X block fires.
++ Stateful Tracking: Tracks the anchor's survival through the rest of the day.
++ Invalidation: Drops the signal if the anchor's structural level is breached.
++ Tagging: [ACTIVE BUY / SELL], [COILING], or blanks out if invalidated.
 """
 import os
 import sys
@@ -273,43 +273,45 @@ def split_sessions(m):
     sid = m['SessId'].values
     cuts = np.flatnonzero(np.diff(sid)) + 1
     starts = np.concatenate(([0], cuts)); ends = np.concatenate((cuts, [len(sid)]))
-    o, h, l, c = (m[k].tolist() for k in ('Open', 'High', 'Low', 'Close'))
-    return [(o[s:e], h[s:e], l[s:e], c[s:e]) for s, e in zip(starts, ends)]
+    o, h, l, c, dt = (m[k].tolist() for k in ('Open', 'High', 'Low', 'Close', 'Datetime'))
+    return [(o[s:e], h[s:e], l[s:e], c[s:e], dt[s:e]) for s, e in zip(starts, ends)]
 
 def build_isolated_range_bars(sessions, target_range, base_atr=None):
-    B_O, B_H, B_L, B_C, B_CLOSED = [], [], [], [], []
+    B_O, B_H, B_L, B_C, B_CLOSED, B_TIME = [], [], [], [], [], []
     seg_start = 0
 
-    for opens, highs, lows, closes in sessions:
+    for opens, highs, lows, closes, dts in sessions:
         if not closes: continue
         before = len(B_C)
         curr_O, curr_H, curr_L, curr_C = opens[0], highs[0], lows[0], closes[0]
+        curr_T = dts[0]
 
-        for hi, lo, cl in zip(highs, lows, closes):
+        for hi, lo, cl, t in zip(highs, lows, closes, dts):
             if hi > curr_H: curr_H = hi
             if lo < curr_L: curr_L = lo
             curr_C = cl
+            curr_T = t
 
             if curr_H - curr_L >= target_range:
-                B_O.append(curr_O); B_H.append(curr_H); B_L.append(curr_L); B_C.append(curr_C)
+                B_O.append(curr_O); B_H.append(curr_H); B_L.append(curr_L); B_C.append(curr_C); B_TIME.append(curr_T)
                 B_CLOSED.append(True)
                 curr_O = curr_H = curr_L = curr_C
                 
         if curr_H > curr_L:
-            B_O.append(curr_O); B_H.append(curr_H); B_L.append(curr_L); B_C.append(curr_C)
+            B_O.append(curr_O); B_H.append(curr_H); B_L.append(curr_L); B_C.append(curr_C); B_TIME.append(curr_T)
             B_CLOSED.append(False) 
         if len(B_C) > before: seg_start = before
 
     if not B_C: return None
 
-    o = B_O[seg_start:]; h = B_H[seg_start:]; l = B_L[seg_start:]; c = B_C[seg_start:]
+    o = B_O[seg_start:]; h = B_H[seg_start:]; l = B_L[seg_start:]; c = B_C[seg_start:]; t = B_TIME[seg_start:]
     closed = B_CLOSED[seg_start:]
     ha_close = [(o[i] + h[i] + l[i] + c[i]) / 4 for i in range(len(c))]
     ha_open = (o[0] + c[0]) / 2
     for i in range(1, len(c)): ha_open = (ha_open + ha_close[i - 1]) / 2.0
-    ha_trend = 'Green' if ha_close[-1] >= ha_open else 'Red'
+    ha_trend = ['Green' if ha_close[i] >= ha_open else 'Red' for i in range(len(c))]
 
-    return {'High': np.asarray(h), 'Low': np.asarray(l), 'Close': np.asarray(c), 'Closed': closed, 'HA_Trend': ha_trend}
+    return {'High': np.asarray(h), 'Low': np.asarray(l), 'Close': np.asarray(c), 'Closed': closed, 'HA_Trend': ha_trend, 'Time': t}
 
 def _ewm(x, alpha):
     xs = x.tolist(); out = [0.0] * len(xs); prev = out[0] = xs[0]
@@ -321,25 +323,31 @@ def _last_bb(series):
     w = series[-BB_PERIOD:]
     return float(w.mean()), float(w.std(ddof=0)) if len(w) > 1 else 0.0
 
-def _evaluate_kinetic(close, high, low):
-    n = len(close)
-    delta = np.diff(close, prepend=close[0])
+def _evaluate_kinetic_step(close, high, low, idx):
+    if idx < 5: return "Neutral", "Neutral", "Neutral", False, False
+    
+    n = idx + 1
+    c_slice = close[:n]
+    h_slice = high[:n]
+    l_slice = low[:n]
+    
+    delta = np.diff(c_slice, prepend=c_slice[0])
     gain = _ewm(np.where(delta > 0, delta, 0.0), 1 / RSI_PERIOD)
     loss = _ewm(np.where(delta < 0, -delta, 0.0), 1 / RSI_PERIOD)
     rsi = 100 - (100 / (1 + (gain / (loss + 1e-8))))
     r_mean, r_std = _last_bb(rsi)
 
-    macd = _ewm(close, 2 / 13) - _ewm(close, 2 / 27)
+    macd = _ewm(c_slice, 2 / 13) - _ewm(c_slice, 2 / 27)
     hist = macd - _ewm(macd, 2 / 10)
     h_mean, h_std = _last_bb(hist)
 
     up, down = np.zeros(n), np.zeros(n)
-    up[1:] = high[1:] - high[:-1]; down[1:] = low[:-1] - low[1:]
+    up[1:] = h_slice[1:] - h_slice[:-1]; down[1:] = l_slice[:-1] - l_slice[1:]
     plus_dm = np.where((up > down) & (up > 0), up, 0.0)
     minus_dm = np.where((down > up) & (down > 0), down, 0.0)
     
-    tr = (high - low).copy()
-    tr[1:] = np.maximum(tr[1:], np.maximum(np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])))
+    tr = (h_slice - l_slice).copy()
+    tr[1:] = np.maximum(tr[1:], np.maximum(np.abs(h_slice[1:] - c_slice[:-1]), np.abs(l_slice[1:] - c_slice[:-1])))
 
     a = 1 / ADX_PERIOD; atr = _ewm(tr, a)
     plus_di = 100 * (_ewm(plus_dm, a) / (atr + 1e-8))
@@ -356,29 +364,79 @@ def _evaluate_kinetic(close, high, low):
     bear_agg = m_std > 0 and minus_di[-1] > m_mean + BB_STD * m_std
 
     adx_sig = "Buy" if bull_agg and plus_di[-1] > minus_di[-1] and adx[-1] >= ADX_THRESHOLD else "Sell" if bear_agg and minus_di[-1] > plus_di[-1] and adx[-1] >= ADX_THRESHOLD else "Neutral"
+    
     return rsi_sig, macd_sig, adx_sig, bull_agg, bear_agg
 
-def calculate_strict_signals(bars):
-    if bars is None or len(bars['Close']) < 5: return "", "", "", "NONE", False, False
+def evaluate_anchor(bars, bb_upper, bb_lower, kc_upper, kc_lower, close_1m, dt_1m):
+    """
+    Steps through today's 1X blocks to find the FIRST mathematically perfect Anchor.
+    If an anchor is found, it verifies if it survived until the end of the data slice.
+    """
+    if bars is None or len(bars['Close']) < 5: return None
     
     close, high, low = bars['Close'], bars['High'], bars['Low']
-    f_rsi, f_macd, f_adx, f_bull_power, f_bear_power = _evaluate_kinetic(close, high, low)
+    closed = bars['Closed']
+    times = bars['Time']
     ha_trend = bars['HA_Trend']
     
-    is_bull = f_rsi == "Buy" and f_macd == "Buy" and f_adx == "Buy" and ha_trend == 'Green'
-    is_bear = f_rsi == "Sell" and f_macd == "Sell" and f_adx == "Sell" and ha_trend == 'Red'
+    anchor = None
+    
+    # 1. FIND THE ANCHOR
+    for i in range(len(close)):
+        if not closed[i]: continue # Must be a fully closed 1X block
+        
+        # Check Kinetic Signals at this exact block
+        f_rsi, f_macd, f_adx, f_bull_power, f_bear_power = _evaluate_kinetic_step(close, high, low, i)
+        
+        # We need the 1-minute BB/KC state at the exact time this block closed
+        # Find the closest 1-minute candle index to the block's close time
+        try:
+            m_idx = next(idx for idx, t in enumerate(dt_1m) if t >= times[i])
+        except StopIteration:
+            m_idx = len(close_1m) - 1
+            
+        bb_kc_bull_fire = bb_upper[m_idx] > kc_upper[m_idx]
+        bb_kc_bear_fire = bb_lower[m_idx] < kc_lower[m_idx]
 
-    dirty_killed = False
-    if is_bull and f_bear_power: is_bull = False; dirty_killed = True
-    if is_bear and f_bull_power: is_bear = False; dirty_killed = True
+        is_bull = f_rsi == "Buy" and f_macd == "Buy" and f_adx == "Buy" and ha_trend[i] == 'Green' and bb_kc_bull_fire
+        is_bear = f_rsi == "Sell" and f_macd == "Sell" and f_adx == "Sell" and ha_trend[i] == 'Red' and bb_kc_bear_fire
 
-    unclosed = not bars['Closed'][-1]
-    if unclosed: is_bull = is_bear = False
+        # Warzone Audit
+        if is_bull and f_bear_power: is_bull = False
+        if is_bear and f_bull_power: is_bear = False
+        
+        if is_bull:
+            anchor = {"dir": "BULL", "time": times[i], "low": low[i], "high": high[i], "idx": i, "m_idx": m_idx}
+            break # Found the first anchor of the day
+        if is_bear:
+            anchor = {"dir": "BEAR", "time": times[i], "low": low[i], "high": high[i], "idx": i, "m_idx": m_idx}
+            break
 
-    return f_rsi, f_macd, f_adx, "BULL" if is_bull else "BEAR" if is_bear else "NONE", dirty_killed, unclosed
+    if not anchor: return None
+    
+    # 2. VERIFY SURVIVAL
+    # Has the price violated the structural boundary since the anchor fired?
+    survived = True
+    for i in range(anchor['m_idx'], len(close_1m)):
+        if anchor['dir'] == "BULL" and close_1m[i] < anchor['low']:
+            survived = False; break
+        if anchor['dir'] == "BEAR" and close_1m[i] > anchor['high']:
+            survived = False; break
+            
+    if not survived: return None
+    
+    # Evaluate the *current* state of the indicators (Last block) for the UI
+    f_rsi, f_macd, f_adx, _, _ = _evaluate_kinetic_step(close, high, low, len(close)-1)
+
+    return {
+        "dir": anchor['dir'],
+        "time": anchor['time'].strftime("%H:%M"),
+        "rsi": f_rsi, "macd": f_macd, "adx": f_adx
+    }
+
 
 def compute_row(symbol, master_1m):
-    close, high, low = master_1m['Close'].values, master_1m['High'].values, master_1m['Low'].values
+    close, high, low, dt = master_1m['Close'].values, master_1m['High'].values, master_1m['Low'].values, master_1m['Datetime'].values
     
     sma20 = pd.Series(close).rolling(20, min_periods=1).mean().values
     std20 = pd.Series(close).rolling(20, min_periods=1).std(ddof=0).values
@@ -388,32 +446,46 @@ def compute_row(symbol, master_1m):
     tr[1:] = np.maximum(high[1:] - low[1:], np.maximum(np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])))
     atr20 = pd.Series(tr).rolling(20, min_periods=1).mean().values
     
-    bb_upper = sma20[-1] + 2.0 * std20[-1]
-    bb_lower = sma20[-1] - 2.0 * std20[-1]
-    kc_upper = sma20[-1] + 1.5 * atr20[-1]
-    kc_lower = sma20[-1] - 1.5 * atr20[-1]
+    bb_upper = sma20 + 2.0 * std20
+    bb_lower = sma20 - 2.0 * std20
+    kc_upper = sma20 + 1.5 * atr20
+    kc_lower = sma20 - 1.5 * atr20
     
     base_atr = compute_base_atr(master_1m)
     sessions = split_sessions(master_1m)
-    row = {'Symbol': symbol, 'LTP': float(close[-1]), 'LastSession': master_1m['Session'].iloc[-1],
-           'PerfectBullBlocks': 0, 'PerfectBearBlocks': 0, 'DirtyKilled1X': False, 'Unclosed1X': False,
-           'Anchor1XBull': False, 'Anchor1XBear': False,
-           'BB_KC_Bull': (bb_upper > kc_upper), 'BB_KC_Bear': (bb_lower < kc_lower)}
     
-    for mult in HA_ATR_MULTIPLIERS:
-        gtag = f"{mult}X"
-        bars = build_isolated_range_bars(sessions, base_atr * mult, base_atr=base_atr)
-        bb_rsi, bb_macd, adx_sig, alignment, dirty_killed, unclosed = calculate_strict_signals(bars)
-        row[f'BB_RSI_{gtag}'], row[f'BB_MACD_{gtag}'], row[f'ADX_{gtag}'] = bb_rsi, bb_macd, adx_sig
+    row = {'Symbol': symbol, 'LTP': float(close[-1]), 'LastSession': master_1m['Session'].iloc[-1],
+           'ActiveAnchor': None, 'AnchorDir': "NONE", 'State': "NONE", 'Blocks': 0}
+    
+    # Check 1X Anchor
+    bars_1x = build_isolated_range_bars(sessions, base_atr * 1, base_atr=base_atr)
+    anchor = evaluate_anchor(bars_1x, bb_upper, bb_lower, kc_upper, kc_lower, close, dt)
+    
+    if anchor:
+        row['ActiveAnchor'] = anchor['time']
+        row['AnchorDir'] = anchor['dir']
+        row['BB_RSI_1X'] = anchor['rsi']
+        row['BB_MACD_1X'] = anchor['macd']
+        row['ADX_1X'] = anchor['adx']
+        row['Blocks'] += 1
         
-        if alignment == "BULL": row['PerfectBullBlocks'] += 1
-        elif alignment == "BEAR": row['PerfectBearBlocks'] += 1
+        # Determine Current State (Is BB still > KC right now?)
+        if anchor['dir'] == "BULL":
+            row['State'] = "[ACTIVE BUY]" if bb_upper[-1] > kc_upper[-1] else "[COILING]"
+        else:
+            row['State'] = "[ACTIVE SELL]" if bb_lower[-1] < kc_lower[-1] else "[COILING]"
             
-        if mult == 1:
-            row['Anchor1XBull'] = (alignment == "BULL")
-            row['Anchor1XBear'] = (alignment == "BEAR")
-            if dirty_killed: row['DirtyKilled1X'] = True
-            if unclosed: row['Unclosed1X'] = True
+        # Calculate higher timeframe blocks for UI (Only if anchor exists)
+        for mult in HA_ATR_MULTIPLIERS[1:]:
+            gtag = f"{mult}X"
+            bars = build_isolated_range_bars(sessions, base_atr * mult, base_atr=base_atr)
+            if bars and len(bars['Close']) >= 5:
+                f_rsi, f_macd, f_adx, _, _ = _evaluate_kinetic_step(bars['Close'], bars['High'], bars['Low'], len(bars['Close'])-1)
+                row[f'BB_RSI_{gtag}'], row[f'BB_MACD_{gtag}'], row[f'ADX_{gtag}'] = f_rsi, f_macd, f_adx
+                # Simple alignment check for higher blocks
+                if anchor['dir'] == "BULL" and f_rsi == "Buy" and f_macd == "Buy" and f_adx == "Buy": row['Blocks'] += 1
+                if anchor['dir'] == "BEAR" and f_rsi == "Sell" and f_macd == "Sell" and f_adx == "Sell": row['Blocks'] += 1
+
     return row
 
 # ==============================================================================
@@ -442,9 +514,10 @@ def _history_worker_daily(args):
     finally: progress.tick()
 
 def process_stock_1m(args):
-    item, target_dt, is_live, progress = args
+    item, cutoff_dt, is_live, progress = args
     try:
-        start_dt = target_dt - timedelta(days=7) # Fetch only recent 1m data for blocks to save API
+        target_dt = cutoff_dt.date()
+        start_dt = target_dt - timedelta(days=7) 
         frames = []
         for c_start, c_end in _date_chunks(start_dt, target_dt, span=7):
             status, df = _candles(_url_range_1m(item['key'], c_start, c_end))
@@ -456,32 +529,33 @@ def process_stock_1m(args):
             
         if not frames: return None
         master_1m = prepare_master(frames)
-        master_1m = master_1m[master_1m['Session'] <= target_dt] # Strict cut-off for EOD parsing
+        master_1m = master_1m[master_1m['Datetime'] <= cutoff_dt] 
         
         if len(master_1m) < 30: return None
         return compute_row(item['symbol'], master_1m)
     except Exception: return None
     finally: progress.tick()
 
-def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_BLOCKS, target_date_str=None):
+def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, target_time_str="15:30"):
     t_start = time.time()
     
     if target_date_str:
         try:
-            target_dt = datetime.strptime(target_date_str, "%Y-%m-%d").date()
+            cutoff_dt = datetime.strptime(f"{target_date_str} {target_time_str}", "%Y-%m-%d %H:%M")
+            target_dt = cutoff_dt.date()
             is_live = False
         except ValueError:
-            print(f"{COLOR_RED_FG}[!] Invalid date format. Use YYYY-MM-DD.{COLOR_RESET}"); return
+            print(f"{COLOR_RED_FG}[!] Invalid date format.{COLOR_RESET}"); return
     else:
         target_dt = now_ist().date()
+        cutoff_dt = now_ist()
         is_live = True
 
-    print(f"\n{COLOR_CYAN}📡 Initializing Screener [{mode}] | Target Date: {target_dt} (Live: {is_live}){COLOR_RESET}")
+    print(f"\n{COLOR_CYAN}📡 Initializing Tracker [{mode}] | Time Machine: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} (Live: {is_live}){COLOR_RESET}")
 
     universe_raw = get_dynamic_universe(mode)
     if STATS.auth_failed or not universe_raw: return
 
-    # Prefilter step using daily candles
     daily_start = target_dt - timedelta(days=days * 2 + 6)
     prog = Progress("daily_prefilter", len(universe_raw))
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
@@ -490,73 +564,64 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, min_blocks=MIN_PERFECT_
 
     if STATS.auth_failed or not candidates: return
 
-    # Process 1-minute blocks for candidates
     prog = Progress("1m_blocks", len(candidates))
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        results = [r for r in ex.map(process_stock_1m, [(item, target_dt, is_live, prog) for item in candidates]) if r is not None]
+        results = [r for r in ex.map(process_stock_1m, [(item, cutoff_dt, is_live, prog) for item in candidates]) if r is not None]
     prog.done()
 
     if not results: return
 
-    # No hard BB/KC filtering here. We grab EVERYTHING that has aligned blocks so values are parsed.
-    bulls = [r for r in results if r['PerfectBullBlocks'] >= min_blocks and r.get('Anchor1XBull')]
-    bears = [r for r in results if r['PerfectBearBlocks'] >= min_blocks and r.get('Anchor1XBear')]
+    bulls = [r for r in results if r['AnchorDir'] == "BULL"]
+    bears = [r for r in results if r['AnchorDir'] == "BEAR"]
 
-    bulls.sort(key=lambda r: (-r['PerfectBullBlocks'], not r['BB_KC_Bull']))
-    bears.sort(key=lambda r: (-r['PerfectBearBlocks'], not r['BB_KC_Bear']))
+    bulls.sort(key=lambda r: (-r['Blocks'], r['State'] != "[ACTIVE BUY]"))
+    bears.sort(key=lambda r: (-r['Blocks'], r['State'] != "[ACTIVE SELL]"))
     
     bulls, bears = bulls[:TOP_N_BUYERS], bears[:TOP_N_SELLERS]
 
-    print(f"{COLOR_BOLD}\n=== STRICT INSTITUTIONAL VOLATILITY DASHBOARD [{mode}] ==={COLOR_RESET}")
-    print(f"Target Date: {target_dt} | Scanned: {len(results)}\n")
+    print(f"{COLOR_BOLD}\n=== STATEFUL INSTITUTIONAL VOLATILITY TRACKER [{mode}] ==={COLOR_RESET}")
+    print(f"Time Machine: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Scanned: {len(results)}\n")
 
-    def print_basket(title, icon, data_list, blocks_key, bb_kc_key):
+    def print_basket(title, icon, data_list):
         if not data_list: return
         print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
-        header_str = f" {COLOR_CYAN}{'Script':<22} {'LTP':<8} |"
+        header_str = f" {COLOR_CYAN}{'Script':<15} {'LTP':<8} |"
         for mult in HA_ATR_MULTIPLIERS:
             header_str += f"  {'BB-RSI ' + str(mult) + 'X':^11} {'BB-MACD ' + str(mult) + 'X':^12} {'BB-DI ' + str(mult) + 'X':^9} |"
-        header_str += f" {'Blocks':>7} | {'BB/KC State':^11}"
+        header_str += f" {'Anchor':^8} | {'Tracker State':^15}"
         print(header_str + COLOR_RESET)
         print("-" * len(ANSI_RE.sub("", header_str)))
 
         for row in data_list:
-            row_str = f" {row['Symbol']:<22} {row['LTP']:<8.2f} |"
+            row_str = f" {row['Symbol']:<15} {row['LTP']:<8.2f} |"
             for mult in HA_ATR_MULTIPLIERS:
                 gtag = f"{mult}X"
                 row_str += (f"  {format_cell(row.get(f'BB_RSI_{gtag}'), 11)}"
                             f" {format_cell(row.get(f'BB_MACD_{gtag}'), 12)}"
                             f" {format_cell(row.get(f'ADX_{gtag}'), 9)} |")
             
-            # Print values directly. State is visually tagged.
-            state = row[bb_kc_key]
-            state_text = f"{COLOR_GREEN_BG} [FIRED] {COLOR_RESET}" if state else f"{COLOR_YELLOW} [COILED] {COLOR_RESET}"
-            row_str += f" {row[blocks_key]:>3}/{len(HA_ATR_MULTIPLIERS)} | {state_text}"
+            state = row['State']
+            state_text = f"{COLOR_GREEN_BG} {state} {COLOR_RESET}" if "BUY]" in state else f"{COLOR_RED_BG} {state} {COLOR_RESET}" if "SELL]" in state else f"{COLOR_YELLOW} {state} {COLOR_RESET}"
+            
+            row_str += f" {row['ActiveAnchor']:^8} | {state_text}"
             print(row_str)
 
-    print_basket("TOP BUYERS (Values Parsed)", "🔥", bulls, 'PerfectBullBlocks', 'BB_KC_Bull')
-    print_basket("TOP SELLERS (Values Parsed)", "🩸", bears, 'PerfectBearBlocks', 'BB_KC_Bear')
-    
-    dirty_vetoed = sum(1 for r in results if r.get('DirtyKilled1X'))
-    unclosed_vetoed = sum(1 for r in results if r.get('Unclosed1X'))
-    
-    print(f"\n{COLOR_YELLOW}ℹ️  VETO LOG:{COLOR_RESET}")
-    print(f"   ↳ {dirty_vetoed} setups killed by True Warzone Audit (Algorithmic Chop).")
-    print(f"   ↳ {unclosed_vetoed} setups killed because 1X block distance was incomplete.")
+    print_basket("TOP BULL SETUPS (Valid Anchors Surviving)", "🔥", bulls)
+    print_basket("TOP BEAR SETUPS (Valid Anchors Surviving)", "🩸", bears)
     
     total_calls = sum(l.total_calls for l in LIMITERS.values())
-    print(f"\n⏱️ Scan completed in {(time.time() - t_start):.2f} seconds ({total_calls} API calls).\n")
+    print(f"\n⏱️ Tracker sync completed in {(time.time() - t_start):.2f} seconds ({total_calls} API calls).\n")
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Strict institutional volatility screener (Upstox)")
+    p = argparse.ArgumentParser(description="Strict institutional volatility tracker (Upstox)")
     p.add_argument("--mode", choices=["STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"], default=TRADING_MODE)
-    p.add_argument("--days", type=int, default=BACKTRACE_DAYS, help="trading sessions of history (min 2)")
-    p.add_argument("--min-blocks", type=int, default=MIN_PERFECT_BLOCKS)
-    p.add_argument("--date", type=str, default=None, help="Target date for EOD parsing (YYYY-MM-DD)")
+    p.add_argument("--days", type=int, default=BACKTRACE_DAYS, help="trading sessions of history")
+    p.add_argument("--date", type=str, default=None, help="Target date (YYYY-MM-DD)")
+    p.add_argument("--time", type=str, default="15:30", help="Target time (HH:MM). Defaults to 15:30.")
     return p.parse_args()
 
 if __name__ == "__main__":
     if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
         print(f"{COLOR_RED_FG}[!] Missing UPSTOX_ACCESS_TOKEN.{COLOR_RESET}"); sys.exit(1)
     args = parse_args()
-    run_screener(args.mode, args.days, args.min_blocks, args.date)
+    run_screener(args.mode, args.days, args.date, args.time)
