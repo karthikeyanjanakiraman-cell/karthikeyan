@@ -252,7 +252,6 @@ def _equity_universe(mode):
     return list({i["instrument_key"]: {"symbol": ts_of(i), "key": i["instrument_key"]} for i in rows}.values())
 
 def _resolve_index_spot_price(key, symbol, target_dt):
-    """Fetches spot price via live quote if target_dt is today, otherwise fetches from historical daily candles."""
     if target_dt == now_ist().date():
         q = fetch_quotes([{"key": key, "symbol": symbol}], batch=1)
         return q.get(key, {}).get('ltp', 0.0)
@@ -267,10 +266,6 @@ def _resolve_index_spot_price(key, symbol, target_dt):
     return 0.0
 
 def _index_options_universe(target_dt):
-    """
-    Dynamically maps NIFTY, BANKNIFTY, FINNIFTY, and SENSEX spot prices,
-    filters the closest valid weekly expiry >= target_dt, and extracts +/- 5 strikes (CE & PE) around ATM.
-    """
     spot_definitions = [
         {"key": "NSE_INDEX|Nifty 50", "symbol": "NIFTY", "underlying": "NIFTY"},
         {"key": "NSE_INDEX|Nifty Bank", "symbol": "BANKNIFTY", "underlying": "BANKNIFTY"},
@@ -296,7 +291,6 @@ def _index_options_universe(target_dt):
 
     valid_opts = []
     for i in master_fo:
-        # FIX 1: Upstox uses 'name' for Index Options, not 'underlying_symbol'
         u_sym = i.get("name") or i.get("underlying_symbol")
         if not u_sym: 
             continue
@@ -305,7 +299,6 @@ def _index_options_universe(target_dt):
         if u_sym not in spot_ltp or spot_ltp[u_sym] == 0: 
             continue
             
-        # FIX 2: Upstox uses 'option_type' for Options, 'instrument_type' is 'OPTIDX'
         itype = i.get("option_type") or i.get("instrument_type", "")
         symbol = i.get("tradingsymbol", i.get("trading_symbol", ""))
         
@@ -365,7 +358,14 @@ def _index_options_universe(target_dt):
             universe.append({"key": key, "symbol": ts})
             
     return universe
-    
+
+def get_dynamic_universe(mode, target_dt): 
+    if mode in ("STOCK_FNO", "CASH_EQUITY"):
+        return _equity_universe(mode)
+    elif mode == "INDEX_OPTIONS":
+        return _index_options_universe(target_dt)
+    return []
+
 # ==============================================================================
 # 2. CONTINUOUS KINETIC TRIPWIRE ENGINE 
 # ==============================================================================
