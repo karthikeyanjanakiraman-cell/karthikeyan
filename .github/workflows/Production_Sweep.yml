@@ -9,6 +9,10 @@ on:
         description: 'Optional Backtest Date (YYYY-MM-DD)'
         required: false
         default: ''
+      backtest_time:
+        description: 'Optional Backtest Time (HH:MM) - Defaults to 15:30'
+        required: false
+        default: ''
 
 jobs:
   run_quant_engine:
@@ -30,18 +34,30 @@ jobs:
 
     - name: Execute Live Hybrid Engine Scan
       env:
-        # THE FIX: Added the exact Fyers credentials the script is demanding
+        # Fyers & Email configurations
         FYERS_CLIENT_ID: ${{ secrets.CLIENT_ID }}
         FYERS_ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-        
-        # THE FIX: Matched the exact Email variable names expected by Python
         EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
         EMAIL_APP_PWD: ${{ secrets.EMAIL_APP_PWD }}
         EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
         
-        # Kept your Upstox token intact for your other AI Engine
+        # Upstox Token
         UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
         
+        # GitHub Actions Inputs
         PARAM_BACKTEST_DATE: ${{ github.event.inputs.backtest_date }}
+        PARAM_BACKTEST_TIME: ${{ github.event.inputs.backtest_time }}
       run: |
-        python -u System3.py
+        # Build the command dynamically so it doesn't crash on empty inputs
+        CMD="python -u System3.py"
+        
+        if [ -n "$PARAM_BACKTEST_DATE" ]; then
+          CMD="$CMD --date $PARAM_BACKTEST_DATE"
+        fi
+        
+        if [ -n "$PARAM_BACKTEST_TIME" ]; then
+          CMD="$CMD --time $PARAM_BACKTEST_TIME"
+        fi
+        
+        echo "Executing Command: $CMD"
+        eval $CMD
