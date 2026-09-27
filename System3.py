@@ -3,8 +3,7 @@
 Strict Institutional Volatility Tracker (Upstox) - STATEFUL INTRADAY EDITION
 + Dynamic Anchor Time: Locks the exact minute a 1X block fires.
 + Stateful Tracking: Tracks the anchor's survival through the rest of the day.
-+ Invalidation: Drops the signal if the anchor's structural level is breached.
-+ Tagging: [ACTIVE BUY / SELL], [COILING], or blanks out if invalidated.
++ Forensic Graveyard: Lists exactly WHY every filtered stock was rejected.
 """
 import os
 import sys
@@ -228,12 +227,6 @@ def prepare_master(dfs):
     master['Session'] = day.dt.date
     return master
 
-INDEX_CONFIG = {
-    "NIFTY": {"spot_key": "NSE_INDEX|Nifty 50", "step": 50, "match": ["NIFTY", "NIFTY 50"]},
-    "BANKNIFTY": {"spot_key": "NSE_INDEX|Nifty Bank", "step": 100, "match": ["BANKNIFTY", "NIFTY BANK"]},
-    "FINNIFTY": {"spot_key": "NSE_INDEX|Nifty Fin Service", "step": 50, "match": ["FINNIFTY", "NIFTY FIN SERVICE"]},
-}
-
 def _download_master(name):
     for _ in range(3):
         try:
@@ -369,10 +362,11 @@ def _evaluate_kinetic_step(close, high, low, idx):
 
 def evaluate_anchor(bars, bb_upper, bb_lower, kc_upper, kc_lower, close_1m, dt_1m):
     """
-    Steps through today's 1X blocks to find the FIRST mathematically perfect Anchor.
-    If an anchor is found, it verifies if it survived until the end of the data slice.
+    Steps through today's 1X blocks. Returns the anchor if it survives.
+    Otherwise, returns (None, RejectionReasonString) so the UI can display why it failed.
     """
-    if bars is None or len(bars['Close']) < 5: return None
+    if bars is None or len(bars['Close']) < 5: 
+        return None, "Not enough fully closed 1X range blocks today."
     
     close, high, low = bars['Close'], bars['High'], bars['Low']
     closed = bars['Closed']
@@ -380,16 +374,14 @@ def evaluate_anchor(bars, bb_upper, bb_lower, kc_upper, kc_lower, close_1m, dt_1
     ha_trend = bars['HA_Trend']
     
     anchor = None
+    warzone_kills = 0
     
     # 1. FIND THE ANCHOR
     for i in range(len(close)):
-        if not closed[i]: continue # Must be a fully closed 1X block
+        if not closed[i]: continue 
         
-        # Check Kinetic Signals at this exact block
         f_rsi, f_macd, f_adx, f_bull_power, f_bear_power = _evaluate_kinetic_step(close, high, low, i)
         
-        # We need the 1-minute BB/KC state at the exact time this block closed
-        # Find the closest 1-minute candle index to the block's close time
         try:
             m_idx = next(idx for idx, t in enumerate(dt_1m) if t >= times[i])
         except StopIteration:
@@ -398,41 +390,46 @@ def evaluate_anchor(bars, bb_upper, bb_lower, kc_upper, kc_lower, close_1m, dt_1
         bb_kc_bull_fire = bb_upper[m_idx] > kc_upper[m_idx]
         bb_kc_bear_fire = bb_lower[m_idx] < kc_lower[m_idx]
 
-        is_bull = f_rsi == "Buy" and f_macd == "Buy" and f_adx == "Buy" and ha_trend[i] == 'Green' and bb_kc_bull_fire
-        is_bear = f_rsi == "Sell" and f_macd == "Sell" and f_adx == "Sell" and ha_trend[i] == 'Red' and bb_kc_bear_fire
+        is_bull_raw = f_rsi == "Buy" and f_macd == "Buy" and f_adx == "Buy" and ha_trend[i] == 'Green' and bb_kc_bull_fire
+        is_bear_raw = f_rsi == "Sell" and f_macd == "Sell" and f_adx == "Sell" and ha_trend[i] == 'Red' and bb_kc_bear_fire
+
+        is_bull = is_bull_raw
+        is_bear = is_bear_raw
 
         # Warzone Audit
-        if is_bull and f_bear_power: is_bull = False
-        if is_bear and f_bull_power: is_bear = False
+        if is_bull_raw and f_bear_power: is_bull = False; warzone_kills += 1
+        if is_bear_raw and f_bull_power: is_bear = False; warzone_kills += 1
         
         if is_bull:
             anchor = {"dir": "BULL", "time": times[i], "low": low[i], "high": high[i], "idx": i, "m_idx": m_idx}
-            break # Found the first anchor of the day
+            break
         if is_bear:
             anchor = {"dir": "BEAR", "time": times[i], "low": low[i], "high": high[i], "idx": i, "m_idx": m_idx}
             break
 
-    if not anchor: return None
+    if not anchor: 
+        if warzone_kills > 0:
+            return None, f"Killed by Inverted Warzone Chop ({warzone_kills} attempts)."
+        return None, "Failed Kinetic Alignment / BB never pierced KC."
     
     # 2. VERIFY SURVIVAL
-    # Has the price violated the structural boundary since the anchor fired?
-    survived = True
     for i in range(anchor['m_idx'], len(close_1m)):
         if anchor['dir'] == "BULL" and close_1m[i] < anchor['low']:
-            survived = False; break
+            b_time = pd.to_datetime(dt_1m[i]).strftime('%H:%M')
+            a_time = pd.to_datetime(anchor['time']).strftime('%H:%M')
+            return None, f"Anchor at {a_time} breached its Low ({anchor['low']:.2f}) at {b_time}."
         if anchor['dir'] == "BEAR" and close_1m[i] > anchor['high']:
-            survived = False; break
+            b_time = pd.to_datetime(dt_1m[i]).strftime('%H:%M')
+            a_time = pd.to_datetime(anchor['time']).strftime('%H:%M')
+            return None, f"Anchor at {a_time} breached its High ({anchor['high']:.2f}) at {b_time}."
             
-    if not survived: return None
-    
-    # Evaluate the *current* state of the indicators (Last block) for the UI
     f_rsi, f_macd, f_adx, _, _ = _evaluate_kinetic_step(close, high, low, len(close)-1)
 
     return {
         "dir": anchor['dir'],
-        "time": anchor['time'].strftime("%H:%M"),
+        "time": pd.to_datetime(anchor['time']).strftime("%H:%M"),
         "rsi": f_rsi, "macd": f_macd, "adx": f_adx
-    }
+    }, "Survived"
 
 
 def compute_row(symbol, master_1m):
@@ -455,12 +452,13 @@ def compute_row(symbol, master_1m):
     sessions = split_sessions(master_1m)
     
     row = {'Symbol': symbol, 'LTP': float(close[-1]), 'LastSession': master_1m['Session'].iloc[-1],
-           'ActiveAnchor': None, 'AnchorDir': "NONE", 'State': "NONE", 'Blocks': 0}
+           'ActiveAnchor': None, 'AnchorDir': "NONE", 'State': "NONE", 'Blocks': 0, 'RejectReason': ""}
     
-    # Check 1X Anchor
     bars_1x = build_isolated_range_bars(sessions, base_atr * 1, base_atr=base_atr)
-    anchor = evaluate_anchor(bars_1x, bb_upper, bb_lower, kc_upper, kc_lower, close, dt)
+    anchor, reject_reason = evaluate_anchor(bars_1x, bb_upper, bb_lower, kc_upper, kc_lower, close, dt)
     
+    row['RejectReason'] = reject_reason
+
     if anchor:
         row['ActiveAnchor'] = anchor['time']
         row['AnchorDir'] = anchor['dir']
@@ -469,20 +467,17 @@ def compute_row(symbol, master_1m):
         row['ADX_1X'] = anchor['adx']
         row['Blocks'] += 1
         
-        # Determine Current State (Is BB still > KC right now?)
         if anchor['dir'] == "BULL":
             row['State'] = "[ACTIVE BUY]" if bb_upper[-1] > kc_upper[-1] else "[COILING]"
         else:
             row['State'] = "[ACTIVE SELL]" if bb_lower[-1] < kc_lower[-1] else "[COILING]"
             
-        # Calculate higher timeframe blocks for UI (Only if anchor exists)
         for mult in HA_ATR_MULTIPLIERS[1:]:
             gtag = f"{mult}X"
             bars = build_isolated_range_bars(sessions, base_atr * mult, base_atr=base_atr)
             if bars and len(bars['Close']) >= 5:
                 f_rsi, f_macd, f_adx, _, _ = _evaluate_kinetic_step(bars['Close'], bars['High'], bars['Low'], len(bars['Close'])-1)
                 row[f'BB_RSI_{gtag}'], row[f'BB_MACD_{gtag}'], row[f'ADX_{gtag}'] = f_rsi, f_macd, f_adx
-                # Simple alignment check for higher blocks
                 if anchor['dir'] == "BULL" and f_rsi == "Buy" and f_macd == "Buy" and f_adx == "Buy": row['Blocks'] += 1
                 if anchor['dir'] == "BEAR" and f_rsi == "Sell" and f_macd == "Sell" and f_adx == "Sell": row['Blocks'] += 1
 
@@ -573,6 +568,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
 
     bulls = [r for r in results if r['AnchorDir'] == "BULL"]
     bears = [r for r in results if r['AnchorDir'] == "BEAR"]
+    rejected = [r for r in results if r['AnchorDir'] == "NONE"]
 
     bulls.sort(key=lambda r: (-r['Blocks'], r['State'] != "[ACTIVE BUY]"))
     bears.sort(key=lambda r: (-r['Blocks'], r['State'] != "[ACTIVE SELL]"))
@@ -608,6 +604,25 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
 
     print_basket("TOP BULL SETUPS (Valid Anchors Surviving)", "🔥", bulls)
     print_basket("TOP BEAR SETUPS (Valid Anchors Surviving)", "🩸", bears)
+    
+    if rejected:
+        print(f"\n{COLOR_BOLD}🚫 THE GRAVEYARD (Filtered / Rejected Stocks){COLOR_RESET}")
+        header_str = f" {COLOR_CYAN}{'Script':<15} {'LTP':<8} | {'Forensic Rejection Reason'}"
+        print(header_str + COLOR_RESET)
+        print("-" * 90)
+        
+        # Sort so breached anchors appear first, then warzones, then flatlines
+        def sort_reason(r):
+            reason = r['RejectReason']
+            if "breached" in reason: return 0
+            if "Warzone" in reason: return 1
+            if "Kinetic" in reason: return 2
+            return 3
+            
+        rejected.sort(key=lambda x: (sort_reason(x), x['Symbol']))
+        
+        for row in rejected:
+            print(f" {row['Symbol']:<15} {row['LTP']:<8.2f} | {COLOR_YELLOW}{row['RejectReason']}{COLOR_RESET}")
     
     total_calls = sum(l.total_calls for l in LIMITERS.values())
     print(f"\n⏱️ Tracker sync completed in {(time.time() - t_start):.2f} seconds ({total_calls} API calls).\n")
