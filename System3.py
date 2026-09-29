@@ -2,6 +2,7 @@
 """
 Strict Institutional Volatility Tracker (Upstox) - ALL-MODE EDITION  (System3.py)
 + Modes: STOCK_FNO, CASH_EQUITY, INDEX_OPTIONS (NIFTY / BANKNIFTY / FINNIFTY / SENSEX option chains).
++ Configurable Expiry & Strike Window: EXPIRY_SELECTION (CURRENT/NEXT) and separate STRIKES_ABOVE_ATM/STRIKES_BELOW_ATM.
 + Time-Machine Targeting: --date / --time truncate all data at that snapshot.
 + Directional ATR Tripwires + Trailing Stop-Loss Floor, evaluated on a continuous 1-min indicator engine.
 + NEVER EXITS SILENTLY: every early-exit prints its reason, and real failures return a non-zero exit code.
@@ -35,8 +36,9 @@ warnings.filterwarnings("ignore")
 TRADING_MODE = "STOCK_FNO"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
 
 # --- INDEX OPTIONS ---
-EXPIRY_OFFSET = 0            # 0 = nearest expiry on/after the snapshot date, 1 = next, ...
-STRIKES_FROM_ATM = 5         # strikes each side of ATM (CE + PE for each)
+EXPIRY_SELECTION = "CURRENT"  # "CURRENT" = nearest expiry on/after the snapshot date, "NEXT" = the one after that
+STRIKES_ABOVE_ATM = 5         # strikes ABOVE the ATM strike to include (higher price, CE+PE each)
+STRIKES_BELOW_ATM = 5         # strikes BELOW the ATM strike to include (lower price, CE+PE each)
 OPT_MIN_PRICE = 10           # skip option contracts priced below this at the snapshot
 OPT_MIN_VOLUME = 5000        # skip contracts with less traded volume than this by the snapshot
 INDEX_CONFIG = {
@@ -484,11 +486,22 @@ def _index_options_universe(cutoff_dt, is_live, options_master_path=""):
             print(f"   {COLOR_YELLOW}» {idx:<10} no expiry on/after {target_dt} in this master (latest is {latest}). "
                   f"Expired contracts need --options-master.{COLOR_RESET}")
             continue
-        target_exp = expiries[min(EXPIRY_OFFSET, len(expiries) - 1)]
+
+        # EXPIRY_SELECTION: "CURRENT" = nearest expiry on/after the snapshot (index 0),
+        # "NEXT" = the one after that (index 1). Falls back to the last available
+        # expiry if the master doesn't have one that far out.
+        expiry_idx = 1 if str(EXPIRY_SELECTION).upper() == "NEXT" else 0
+        if expiry_idx >= len(expiries):
+            print(f"   {COLOR_YELLOW}  ⚠ {idx:<10} EXPIRY_SELECTION={EXPIRY_SELECTION!r} wants expiry #{expiry_idx + 1} "
+                  f"on/after {target_dt}, but the master only has {len(expiries)}. Using the furthest one available "
+                  f"instead of failing outright.{COLOR_RESET}")
+        target_exp = expiries[min(expiry_idx, len(expiries) - 1)]
         chain = [c for c in contracts if c[0] == target_exp]
         strikes = np.array(sorted({c[1] for c in chain}))
         atm_i = int(np.abs(strikes - spot[idx]).argmin())
-        lo, hi = max(0, atm_i - STRIKES_FROM_ATM), min(len(strikes), atm_i + STRIKES_FROM_ATM + 1)
+        # BELOW = lower strike price (lower index in the sorted array), ABOVE = higher.
+        lo = max(0, atm_i - STRIKES_BELOW_ATM)
+        hi = min(len(strikes), atm_i + STRIKES_ABOVE_ATM + 1)
         window = set(strikes[lo:hi].tolist())
         picked = 0
         for exp_date, strike, itype, row in chain:
@@ -498,9 +511,10 @@ def _index_options_universe(cutoff_dt, is_live, options_master_path=""):
                 universe.append({"key": key, "symbol": str(_field(row, "trading_symbol", "tradingsymbol") or key)})
                 picked += 1
         gap = (target_exp - target_dt).days
-        print(f"   {COLOR_DIM}» {idx:<10} expiry {target_exp}  strikes {strikes[lo]:.0f}-{strikes[hi-1]:.0f}  "
+        print(f"   {COLOR_DIM}» {idx:<10} expiry {target_exp} ({EXPIRY_SELECTION})  "
+              f"strikes {strikes[lo]:.0f}-{strikes[hi-1]:.0f} ({STRIKES_BELOW_ATM}↓/{STRIKES_ABOVE_ATM}↑ of ATM)  "
               f"-> {picked} contracts{COLOR_RESET}")
-        if not is_live and gap > 10:
+        if not is_live and expiry_idx == 0 and gap > 10:
             print(f"   {COLOR_YELLOW}  ⚠ nearest expiry in today's master is {gap} days after {target_dt}; the true nearest "
                   f"expiry on that date may already have expired. Use --options-master for exact backtests.{COLOR_RESET}")
     return universe
@@ -1061,6 +1075,13 @@ def parse_args():
                    help="INDEX_OPTIONS only: local JSON/CSV instrument master, for backtesting contracts that have already expired.")
     p.add_argument("--opt-min-price", type=float, default=OPT_MIN_PRICE, help="INDEX_OPTIONS: minimum premium at the snapshot.")
     p.add_argument("--opt-min-volume", type=float, default=OPT_MIN_VOLUME, help="INDEX_OPTIONS: minimum traded volume by the snapshot.")
+    p.add_argument("--expiry", choices=["CURRENT", "NEXT"], default=EXPIRY_SELECTION,
+                   help=f"INDEX_OPTIONS: which expiry to trade -- CURRENT (nearest expiry on/after the snapshot date) "
+                        f"or NEXT (the one after that). Default: {EXPIRY_SELECTION}.")
+    p.add_argument("--strikes-up", type=int, default=STRIKES_ABOVE_ATM,
+                   help=f"INDEX_OPTIONS: number of strikes ABOVE ATM to include, CE+PE each (default {STRIKES_ABOVE_ATM}).")
+    p.add_argument("--strikes-down", type=int, default=STRIKES_BELOW_ATM,
+                   help=f"INDEX_OPTIONS: number of strikes BELOW ATM to include, CE+PE each (default {STRIKES_BELOW_ATM}).")
     return p.parse_args()
 
 if __name__ == "__main__":
@@ -1071,6 +1092,9 @@ if __name__ == "__main__":
     MIN1_HISTORY_DAYS = args.history_days
     OPT_MIN_PRICE = args.opt_min_price
     OPT_MIN_VOLUME = args.opt_min_volume
+    EXPIRY_SELECTION = args.expiry
+    STRIKES_ABOVE_ATM = args.strikes_up
+    STRIKES_BELOW_ATM = args.strikes_down
     if args.disable_bb_kc_gate:
         REQUIRE_BB_KC_PIERCE = False
     try:
