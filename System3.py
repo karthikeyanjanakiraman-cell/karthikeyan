@@ -4,6 +4,7 @@ Strict Institutional Volatility Tracker (Upstox) - ALL-MODE EDITION  (System3.py
 + Modes: STOCK_FNO, CASH_EQUITY, INDEX_OPTIONS (NIFTY / BANKNIFTY / FINNIFTY / SENSEX option chains).
 + Configurable Expiry & Strike Window: EXPIRY_SELECTION (CURRENT/NEXT) and separate STRIKES_ABOVE_ATM/STRIKES_BELOW_ATM.
 + Time-Machine Targeting: --date / --time truncate all data at that snapshot.
++ 15-Minute Checkpoint Iteration: Evaluates every 15 mins (9:30, 9:45...) and deduplicates the earliest structural occurrence.
 + Directional ATR Tripwires + Trailing Stop-Loss Floor, evaluated on a continuous 1-min indicator engine.
 + NEVER EXITS SILENTLY: every early-exit prints its reason, and real failures return a non-zero exit code.
 + Structured Graveyard with Anchor / Killed / Move% forensics.
@@ -172,6 +173,18 @@ class Progress:
             if self.n == self.total or self.n % self.step == 0:
                 print(f"\r   {self.label}: {self.n}/{self.total}", end="", file=sys.stderr, flush=True)
     def done(self): print("", file=sys.stderr)
+
+def _get_checkpoints(cutoff_dt):
+    """Generates 15-min interval checkpoints from 09:30 up to the final cutoff_dt."""
+    target_dt = cutoff_dt.date()
+    cps = []
+    current = datetime.combine(target_dt, datetime.min.time()) + timedelta(hours=9, minutes=30)
+    while current < cutoff_dt:
+        cps.append(current)
+        current += timedelta(minutes=15)
+    if not cps or cps[-1] < cutoff_dt:
+        cps.append(cutoff_dt)
+    return cps
 
 # ==============================================================================
 # 1. UPSTOX API
@@ -850,17 +863,33 @@ def process_stock_1m(args):
 
         if not frames: return ("no_data", item['symbol'])
         master_1m = prepare_master(frames)
-        master_1m = master_1m[master_1m['Datetime'] <= cutoff_dt].reset_index(drop=True)
-        if len(master_1m) < 30: return ("no_data", item['symbol'])
+        master_1m_full = master_1m[master_1m['Datetime'] <= cutoff_dt].reset_index(drop=True)
+        if len(master_1m_full) < 30: return ("no_data", item['symbol'])
 
         if mode == "INDEX_OPTIONS":
-            day = master_1m[master_1m['Datetime'].dt.date == target_dt]
+            day = master_1m_full[master_1m_full['Datetime'].dt.date == target_dt]
             if day.empty: return ("no_data", item['symbol'])
             if day['Close'].iloc[-1] < OPT_MIN_PRICE or day['Volume'].sum() < OPT_MIN_VOLUME:
                 return ("illiquid", item['symbol'])
 
-        row = compute_row(item['symbol'], master_1m, target_dt)
-        return ("ok", row) if row is not None else ("no_data", item['symbol'])
+        checkpoints = _get_checkpoints(cutoff_dt)
+        best_row = None
+        
+        for cp in checkpoints:
+            sub_master = master_1m_full[master_1m_full['Datetime'] <= cp]
+            if len(sub_master) < 30: continue
+            row = compute_row(item['symbol'], sub_master, target_dt)
+            if row and row['AnchorDir'] != "NONE":
+                row['Checkpoint'] = cp.strftime('%H:%M')
+                best_row = row
+                break
+                
+        if best_row is None:
+            best_row = compute_row(item['symbol'], master_1m_full, target_dt)
+            if best_row:
+                best_row['Checkpoint'] = cutoff_dt.strftime('%H:%M')
+
+        return ("ok", best_row) if best_row is not None else ("no_data", item['symbol'])
     except Exception as e:
         ERRORS.add(f"1m:{item.get('symbol')}", e)
         return ("error", item.get('symbol'))
@@ -947,12 +976,15 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         _print_error_summary()
         return 1
 
+    for r in results:
+        if 'Checkpoint' not in r: r['Checkpoint'] = '23:59'
+
     bulls = [r for r in results if r['State'] in ("[ACTIVE BUY]", "[COILING]") and r['AnchorDir'] == "BULL"]
     bears = [r for r in results if r['State'] in ("[ACTIVE SELL]", "[COILING]") and r['AnchorDir'] == "BEAR"]
     rejected = [r for r in results if r['State'] == "NONE"]
 
-    bulls.sort(key=lambda r: (r['State'] != "[ACTIVE BUY]", -r['DayChangePct']))
-    bears.sort(key=lambda r: (r['State'] != "[ACTIVE SELL]", r['DayChangePct']))
+    bulls.sort(key=lambda r: (r['Checkpoint'], r['State'] != "[ACTIVE BUY]", -r['DayChangePct']))
+    bears.sort(key=lambda r: (r['Checkpoint'], r['State'] != "[ACTIVE SELL]", r['DayChangePct']))
     bulls, bears = bulls[:TOP_N_BUYERS], bears[:TOP_N_SELLERS]
 
     shown = bulls + bears + rejected
@@ -968,7 +1000,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP':>8} {'Day%':>7} | "
             f"{'Anchor':^6} {'Anch Val':>9} {'Move%':>7} | "
             f"{'1X (R-M-D)':^11}  {'2X (R-M-D)':^11}  {'3X (R-M-D)':^11}  {'5X (R-M-D)':^11} | "
-            f"{'State':^14}{COLOR_RESET}"
+            f"{'State @ CP':^16}{COLOR_RESET}"
         )
         print(header_str)
         print("-" * len(ANSI_RE.sub("", header_str)))
@@ -985,9 +1017,13 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             k5 = format_kinetic_triad(row.get('BB_RSI_5X'), row.get('BB_MACD_5X'), row.get('ADX_5X'))
 
             state = row['State']
-            if "BUY]" in state: state_text = f"{COLOR_GREEN_FG}{state:^14}{COLOR_RESET}"
-            elif "SELL]" in state: state_text = f"{COLOR_RED_FG}{state:^14}{COLOR_RESET}"
-            else: state_text = f"{COLOR_YELLOW}{state:^14}{COLOR_RESET}"
+            cp_str = f" @ {row.get('Checkpoint', '')}"
+            if "BUY]" in state: 
+                state_text = f"{COLOR_GREEN_FG}{(state.replace('ACTIVE ', '') + cp_str):^16}{COLOR_RESET}"
+            elif "SELL]" in state: 
+                state_text = f"{COLOR_RED_FG}{(state.replace('ACTIVE ', '') + cp_str):^16}{COLOR_RESET}"
+            else: 
+                state_text = f"{COLOR_YELLOW}{(state + cp_str):^16}{COLOR_RESET}"
 
             print(
                 f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} "
@@ -1021,7 +1057,8 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             if "Warzone" in reason: return 1
             if "Alignment" in reason: return 2
             return 3
-        rejected.sort(key=lambda x: (sort_reason(x), -abs(x['DayChangePct'])))
+            
+        rejected.sort(key=lambda x: (x.get('Checkpoint', '23:59'), sort_reason(x), -abs(x['DayChangePct'])))
 
         for row in rejected:
             sig = row['AnchorDir']
