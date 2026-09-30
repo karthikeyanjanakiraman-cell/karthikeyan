@@ -5,6 +5,7 @@ Strict Institutional Volatility Tracker (Upstox) - ALL-MODE EDITION  (System3.py
 + Configurable Expiry & Strike Window: EXPIRY_SELECTION (CURRENT/NEXT) and separate STRIKES_ABOVE_ATM/STRIKES_BELOW_ATM.
 + Time-Machine Targeting: --date / --time truncate all data at that snapshot.
 + 15-Minute Checkpoint Iteration: Evaluates every 15 mins (9:30, 9:45...) and deduplicates the earliest structural occurrence.
++ Strict Market Clamp: Automatically caps cutoff times at 15:30 to prevent post-market indexing errors.
 + Directional ATR Tripwires + Trailing Stop-Loss Floor, evaluated on a continuous 1-min indicator engine.
 + NEVER EXITS SILENTLY: every early-exit prints its reason, and real failures return a non-zero exit code.
 + Structured Graveyard with Anchor / Killed / Move% forensics.
@@ -123,7 +124,6 @@ class BudgetLimiter:
             time.sleep(min(wait, 1.0) + 0.005)
 
 class FetchStats:
-    """Counts failed API requests and remembers a few samples so failures are never invisible."""
     def __init__(self):
         self.lock = threading.Lock()
         self.failed = 0
@@ -137,7 +137,6 @@ class FetchStats:
         with self.lock: self.auth_failed = True
 
 class ErrorLog:
-    """Collects exceptions raised inside worker threads (they used to be swallowed silently)."""
     def __init__(self):
         self.lock = threading.Lock()
         self.items = []
@@ -206,7 +205,7 @@ def _get(url, params=None, retries=4):
                 STATS.mark_auth_failed()
                 return 401, None
             last = f"HTTP {code}"
-            if code in (400, 404):            # retrying won't change these
+            if code in (400, 404):
                 STATS.fail(f"{last} for {short}")
                 return code, None
             time.sleep(2.0 * (attempt + 1) if code == 429 else 0.5 * (attempt + 1))
@@ -286,7 +285,6 @@ def prepare_master(dfs):
 # Instrument masters
 # ------------------------------------------------------------------------------
 def _unwrap_master(data):
-    """Instrument masters are normally a flat JSON list; tolerate a dict wrapper too."""
     if isinstance(data, list): return data
     if isinstance(data, dict):
         if isinstance(data.get("data"), list): return data["data"]
@@ -295,12 +293,6 @@ def _unwrap_master(data):
     return []
 
 def _download_master(name, _is_fallback=False):
-    """
-    Downloads an Upstox instrument master. Prints a specific reason for every failed
-    attempt (HTTP status / network error / bad JSON) so a failure is never silent.
-    F&O contracts live INSIDE the per-exchange files ("NSE", "BSE") -- there is no
-    separate NSE_FO / BSE_FO file.
-    """
     url = f"https://assets.upstox.com/market-quote/instruments/exchange/{name}.json.gz"
     last_reason, attempts_made = "unknown", 0
     for attempt in range(1, 4):
@@ -354,7 +346,6 @@ def _equity_universe(mode):
 # INDEX OPTIONS universe
 # ------------------------------------------------------------------------------
 def _resolve_index_spot_price(key, name, cutoff_dt, is_live):
-    """Returns (price, source). Live -> quote; backtest -> last 1-min close at/before the cutoff."""
     target_dt = cutoff_dt.date()
     if is_live:
         q = fetch_quotes([{"key": key, "symbol": name}], batch=1)
@@ -384,7 +375,6 @@ def _field(row, *names):
     return None
 
 def _expiry_to_date(exp):
-    """Upstox expiry is epoch-ms at midnight IST. Convert in IST -- a UTC runner would be off by a day."""
     try:
         if isinstance(exp, (int, float, np.integer, np.floating)) or (isinstance(exp, str) and exp.strip().isdigit()):
             v = float(exp)
@@ -410,8 +400,6 @@ def _load_local_master(path):
 
 def _index_options_universe(cutoff_dt, is_live, options_master_path=""):
     target_dt = cutoff_dt.date()
-
-    # 1. ATM anchors
     spot = {}
     for idx, cfg in INDEX_CONFIG.items():
         try:
@@ -426,11 +414,9 @@ def _index_options_universe(cutoff_dt, is_live, options_master_path=""):
             print(f"   {COLOR_YELLOW}» {idx:<10} spot unavailable -- skipped ({src}){COLOR_RESET}")
     if not spot:
         if not STATS.auth_failed:
-            print(f"{COLOR_RED_FG}[!] Could not resolve a spot price for ANY index, so no ATM strikes can be chosen. "
-                  f"Check the token/API access to index candles (see failure samples below).{COLOR_RESET}")
+            print(f"{COLOR_RED_FG}[!] Could not resolve a spot price for ANY index. Check API access.{COLOR_RESET}")
         return []
 
-    # 2. Instrument master
     rows = []
     if options_master_path:
         if os.path.exists(options_master_path):
@@ -443,11 +429,9 @@ def _index_options_universe(cutoff_dt, is_live, options_master_path=""):
         print(f"   {COLOR_DIM}» Master rows fetched -- NSE: {len(nse)}, BSE: {len(bse)}{COLOR_RESET}")
         rows = nse + bse
     if not rows:
-        print(f"{COLOR_RED_FG}[!] Both NSE and BSE instrument masters came back empty -- see the [master:...] lines above "
-              f"for the exact HTTP status / network error.{COLOR_RESET}")
+        print(f"{COLOR_RED_FG}[!] Both NSE and BSE instrument masters came back empty.{COLOR_RESET}")
         return []
 
-    # 3. Pick out the CE/PE contracts of the configured indices
     by_idx = {idx: [] for idx in INDEX_CONFIG}
     for row in rows:
         segment = str(_field(row, "segment") or "").upper()
@@ -482,11 +466,9 @@ def _index_options_universe(cutoff_dt, is_live, options_master_path=""):
     total_opts = sum(len(v) for v in by_idx.values())
     if total_opts == 0:
         sample = sorted(rows[0].keys()) if rows and isinstance(rows[0], dict) else "n/a"
-        print(f"{COLOR_RED_FG}[!] Master downloaded ({len(rows)} rows) but 0 CE/PE contracts matched "
-              f"NIFTY/BANKNIFTY/FINNIFTY/SENSEX. Field names in this master: {sample}{COLOR_RESET}")
+        print(f"{COLOR_RED_FG}[!] Master downloaded ({len(rows)} rows) but 0 CE/PE contracts matched indices. Fields: {sample}{COLOR_RESET}")
         return []
 
-    # 4. Choose expiry + ATM window per index
     universe, seen = [], set()
     for idx, contracts in by_idx.items():
         if idx not in spot: continue
@@ -496,23 +478,16 @@ def _index_options_universe(cutoff_dt, is_live, options_master_path=""):
         expiries = sorted({c[0] for c in contracts if c[0] >= target_dt})
         if not expiries:
             latest = max(c[0] for c in contracts)
-            print(f"   {COLOR_YELLOW}» {idx:<10} no expiry on/after {target_dt} in this master (latest is {latest}). "
-                  f"Expired contracts need --options-master.{COLOR_RESET}")
+            print(f"   {COLOR_YELLOW}» {idx:<10} no expiry on/after {target_dt} in this master. Requires historical master.{COLOR_RESET}")
             continue
 
-        # EXPIRY_SELECTION: "CURRENT" = nearest expiry on/after the snapshot (index 0),
-        # "NEXT" = the one after that (index 1). Falls back to the last available
-        # expiry if the master doesn't have one that far out.
         expiry_idx = 1 if str(EXPIRY_SELECTION).upper() == "NEXT" else 0
         if expiry_idx >= len(expiries):
-            print(f"   {COLOR_YELLOW}  ⚠ {idx:<10} EXPIRY_SELECTION={EXPIRY_SELECTION!r} wants expiry #{expiry_idx + 1} "
-                  f"on/after {target_dt}, but the master only has {len(expiries)}. Using the furthest one available "
-                  f"instead of failing outright.{COLOR_RESET}")
+            print(f"   {COLOR_YELLOW}  ⚠ {idx:<10} using furthest available expiry due to lack of choices.{COLOR_RESET}")
         target_exp = expiries[min(expiry_idx, len(expiries) - 1)]
         chain = [c for c in contracts if c[0] == target_exp]
         strikes = np.array(sorted({c[1] for c in chain}))
         atm_i = int(np.abs(strikes - spot[idx]).argmin())
-        # BELOW = lower strike price (lower index in the sorted array), ABOVE = higher.
         lo = max(0, atm_i - STRIKES_BELOW_ATM)
         hi = min(len(strikes), atm_i + STRIKES_ABOVE_ATM + 1)
         window = set(strikes[lo:hi].tolist())
@@ -527,9 +502,6 @@ def _index_options_universe(cutoff_dt, is_live, options_master_path=""):
         print(f"   {COLOR_DIM}» {idx:<10} expiry {target_exp} ({EXPIRY_SELECTION})  "
               f"strikes {strikes[lo]:.0f}-{strikes[hi-1]:.0f} ({STRIKES_BELOW_ATM}↓/{STRIKES_ABOVE_ATM}↑ of ATM)  "
               f"-> {picked} contracts{COLOR_RESET}")
-        if not is_live and expiry_idx == 0 and gap > 10:
-            print(f"   {COLOR_YELLOW}  ⚠ nearest expiry in today's master is {gap} days after {target_dt}; the true nearest "
-                  f"expiry on that date may already have expired. Use --options-master for exact backtests.{COLOR_RESET}")
     return universe
 
 def get_dynamic_universe(mode, cutoff_dt, is_live, options_master_path=""):
@@ -657,7 +629,6 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
     while i < len(close):
         anchor = None
 
-        # 1. Search for Anchor (wait for a 1-ATR directional close confirmed by >=2 of 3 kinetics)
         while i < len(close):
             bull_score, bear_score, r_bull, r_bear, _, _, _, _, _, _ = get_kinetics(kin_1m, i)
 
@@ -669,7 +640,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
 
             if close[i] - curr_open >= base_atr:
                 if bull_score >= 2 and bb_kc_bull_fire:
-                    if r_bear:  # Warzone: opposing power also spiking
+                    if r_bear:
                         warzone_kills += 1
                         curr_open = close[i]
                     else:
@@ -680,7 +651,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
 
             elif curr_open - close[i] >= base_atr:
                 if bear_score >= 2 and bb_kc_bear_fire:
-                    if r_bull:  # Warzone
+                    if r_bull:
                         warzone_kills += 1
                         curr_open = close[i]
                     else:
@@ -688,13 +659,11 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                         break
                 else:
                     curr_open = close[i]
-
             i += 1
 
         if not anchor:
             break
 
-        # 2. Track anchor survival (trailing stop-loss floor)
         survived = True
         peak_price = anchor['price']
         j = anchor['idx'] + 1
@@ -719,7 +688,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                         i = j + 1
                         break
                     else:
-                        peak_price = close[j]  # survived the dip -> reset peak
+                        peak_price = close[j]
 
             elif anchor['dir'] == "BEAR":
                 peak_price = min(peak_price, close[j])
@@ -738,7 +707,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                         i = j + 1
                         break
                     else:
-                        peak_price = close[j]  # survived the rally -> reset trough
+                        peak_price = close[j]
             j += 1
 
         if survived:
@@ -922,12 +891,23 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         cutoff_dt = now_ist()
         target_dt, is_live = cutoff_dt.date(), True
 
-    # STRICT MARKET CLOSE CLAMP: Never evaluate past 15:30 on any given day.
+    # STRICT MARKET CLOSE CLAMP: Prevents querying post-market dead zones
     market_close = datetime.combine(target_dt, datetime.min.time()) + timedelta(hours=15, minutes=30)
     cutoff_dt = min(cutoff_dt, market_close)
 
     print(f"\n{COLOR_CYAN}📡 Initializing Tracker [{mode}] | Time Machine: {cutoff_dt.strftime('%Y-%m-%d %H:%M:%S')} (Live: {is_live}){COLOR_RESET}")
-    
+
+    # --- Universe ---
+    universe_raw = get_dynamic_universe(mode, cutoff_dt, is_live, options_master_path)
+    if STATS.auth_failed:
+        print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401). Regenerate UPSTOX_ACCESS_TOKEN -- it expires daily.{COLOR_RESET}")
+        return 1
+    if not universe_raw:
+        print(f"{COLOR_RED_FG}[!] Universe is EMPTY for mode {mode} -- nothing to scan. See the messages above for why.{COLOR_RESET}")
+        _print_error_summary()
+        return 1
+    print(f"   {COLOR_DIM}» Universe: {len(universe_raw)} instruments{COLOR_RESET}")
+
     # --- Daily prefilter (equities only; option premiums use the liquidity filter instead) ---
     if mode == "INDEX_OPTIONS":
         candidates = universe_raw
