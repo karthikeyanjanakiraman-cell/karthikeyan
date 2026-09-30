@@ -919,21 +919,15 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             return 1
         target_dt, is_live = cutoff_dt.date(), False
     else:
-        target_dt, cutoff_dt, is_live = now_ist().date(), now_ist(), True
+        cutoff_dt = now_ist()
+        target_dt, is_live = cutoff_dt.date(), True
+
+    # STRICT MARKET CLOSE CLAMP: Never evaluate past 15:30 on any given day.
+    market_close = datetime.combine(target_dt, datetime.min.time()) + timedelta(hours=15, minutes=30)
+    cutoff_dt = min(cutoff_dt, market_close)
 
     print(f"\n{COLOR_CYAN}📡 Initializing Tracker [{mode}] | Time Machine: {cutoff_dt.strftime('%Y-%m-%d %H:%M:%S')} (Live: {is_live}){COLOR_RESET}")
-
-    # --- Universe ---
-    universe_raw = get_dynamic_universe(mode, cutoff_dt, is_live, options_master_path)
-    if STATS.auth_failed:
-        print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401). Regenerate UPSTOX_ACCESS_TOKEN -- it expires daily.{COLOR_RESET}")
-        return 1
-    if not universe_raw:
-        print(f"{COLOR_RED_FG}[!] Universe is EMPTY for mode {mode} -- nothing to scan. See the messages above for why.{COLOR_RESET}")
-        _print_error_summary()
-        return 1
-    print(f"   {COLOR_DIM}» Universe: {len(universe_raw)} instruments{COLOR_RESET}")
-
+    
     # --- Daily prefilter (equities only; option premiums use the liquidity filter instead) ---
     if mode == "INDEX_OPTIONS":
         candidates = universe_raw
