@@ -36,14 +36,14 @@ warnings.filterwarnings("ignore")
 # ==============================================================================
 # 0. ENGINE CONSTANTS & CONFIGURATION
 # ==============================================================================
-TRADING_MODE = "STOCK_FNO"   # Options: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
+TRADING_MODE = "STOCK_FNO"   
 
 # --- INDEX OPTIONS ---
-EXPIRY_SELECTION = "CURRENT"  # "CURRENT" = nearest expiry on/after the snapshot date, "NEXT" = the one after that
-STRIKES_ABOVE_ATM = 5         # strikes ABOVE the ATM strike to include (higher price, CE+PE each)
-STRIKES_BELOW_ATM = 5         # strikes BELOW the ATM strike to include (lower price, CE+PE each)
-OPT_MIN_PRICE = 10           # skip option contracts priced below this at the snapshot
-OPT_MIN_VOLUME = 5000        # skip contracts with less traded volume than this by the snapshot
+EXPIRY_SELECTION = "CURRENT"  
+STRIKES_ABOVE_ATM = 5         
+STRIKES_BELOW_ATM = 5         
+OPT_MIN_PRICE = 10           
+OPT_MIN_VOLUME = 5000        
 INDEX_CONFIG = {
     "NIFTY":     {"spot_key": "NSE_INDEX|Nifty 50",          "aliases": {"NIFTY", "NIFTY 50"}},
     "BANKNIFTY": {"spot_key": "NSE_INDEX|Nifty Bank",        "aliases": {"BANKNIFTY", "NIFTY BANK"}},
@@ -250,7 +250,7 @@ def generate_checkpoints(cutoff_dt, interval_min=None):
         return [cutoff_dt]
 
     checkpoints = []
-    t = session_open + timedelta(minutes=interval)
+    t = session_open
     while t <= cutoff_dt:
         checkpoints.append(t)
         t += timedelta(minutes=interval)
@@ -290,9 +290,6 @@ def prepare_master(dfs):
     master['Session'] = day.dt.date
     return master
 
-# ------------------------------------------------------------------------------
-# Instrument masters
-# ------------------------------------------------------------------------------
 def _unwrap_master(data):
     if isinstance(data, list): return data
     if isinstance(data, dict):
@@ -350,7 +347,6 @@ def _equity_universe(mode):
     fno = {i.get("underlying_symbol") for i in nse if i.get("segment") == "NSE_FO" and i.get("underlying_symbol")}
     rows = [i for i in nse if plain(i) and (ts_of(i) in fno if mode == "STOCK_FNO" else ts_of(i) not in fno)]
     return list({i["instrument_key"]: {"symbol": ts_of(i), "key": i["instrument_key"]} for i in rows}.values())
-
 # ------------------------------------------------------------------------------
 # INDEX OPTIONS universe
 # ------------------------------------------------------------------------------
@@ -406,7 +402,6 @@ def _load_local_master(path):
     except Exception as e:
         print(f"   {COLOR_RED_FG}[!] Could not read local options master '{path}': {type(e).__name__}: {e}{COLOR_RESET}")
         return []
-
 
 def _index_options_universe(cutoff_dt, is_live, options_master_path=""):
     target_dt = cutoff_dt.date()
@@ -524,7 +519,8 @@ def _index_options_universe(cutoff_dt, is_live, options_master_path=""):
             print(f"   {COLOR_YELLOW}  ⚠ nearest expiry in today's master is {gap} days after {target_dt}; the true nearest "
                   f"expiry on that date may already have expired. Use --options-master for exact backtests.{COLOR_RESET}")
     return universe
-  def get_dynamic_universe(mode, cutoff_dt, is_live, options_master_path=""):
+
+def get_dynamic_universe(mode, cutoff_dt, is_live, options_master_path=""):
     if mode in ("STOCK_FNO", "CASH_EQUITY"):
         return _equity_universe(mode)
     if mode == "INDEX_OPTIONS":
@@ -741,7 +737,8 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
         last_killed_info['reason'] = f"Warzone Inversion Chop ({warzone_kills}x)"
 
     return None, last_killed_info
-  def compute_row(symbol, master_1m, target_dt):
+
+def compute_row(symbol, master_1m, target_dt):
     close, high, low, dt = master_1m['Close'].values, master_1m['High'].values, master_1m['Low'].values, master_1m['Datetime'].values
 
     today_mask = master_1m['Datetime'].dt.date == target_dt
@@ -774,40 +771,8 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
         'State': "NONE", 'Blocks': 0, 'KilledTime': '-', 'KilledPrice': 0.0, 'RejectReason': ""
     }
 
-    anchor, reject_info = evaluate_anchor_tripwire(close, dt, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, today_start_idx)
-
-    if anchor:
-        row['ActiveAnchor'] = pd.to_datetime(anchor['time']).strftime("%H:%M")
-        row['AnchorPrice'] = float(anchor['price'])
-        row['AnchorDir'] = anchor['dir']
-        row['MovePct'] = ((float(close[-1]) - anchor['price']) / anchor['price']) * 100 if anchor['price'] else 0.0
-
-        if anchor['dir'] == "BULL":
-            row['State'] = "[ACTIVE BUY]" if bb_upper[-1] > kc_upper[-1] else "[COILING]"
-        else:
-            row['State'] = "[ACTIVE SELL]" if bb_lower[-1] < kc_lower[-1] else "[COILING]"
-
-        for mult in HA_ATR_MULTIPLIERS:
-            rsi_st, macd_st, adx_st, blk_count = get_tripwire_state(close, kin_1m, base_atr, mult, today_start_idx)
-            gtag = f"{mult}X"
-            row[f'BB_RSI_{gtag}'] = rsi_st
-            row[f'BB_MACD_{gtag}'] = macd_st
-            row[f'ADX_{gtag}'] = adx_st
-            if mult == 1:
-                row['Blocks'] = blk_count
-    else:
-        row['AnchorDir'] = reject_info.get('dir', 'NONE')
-        row['ActiveAnchor'] = reject_info.get('anchor_time', '-')
-        row['AnchorPrice'] = float(reject_info.get('anchor_price', 0.0))
-        row['KilledTime'] = reject_info.get('killed_time', '-')
-        row['KilledPrice'] = float(reject_info.get('killed_price', 0.0))
-        row['RejectReason'] = reject_info.get('reason', 'Failed Kinetic Alignment')
-        if row['AnchorPrice'] > 0 and row['KilledPrice'] > 0:
-            row['MovePct'] = ((row['KilledPrice'] - row['AnchorPrice']) / row['AnchorPrice']) * 100
-
-    return row
-
-# ==============================================================================
+    anchor, reject_info = evaluate_anchor_tripwire(close, dt, kin_1m, b
+  # ==============================================================================
 # 3. WORKERS, FORMATTERS & UI
 # ==============================================================================
 def format_kinetic_triad(rsi, macd, di):
@@ -977,10 +942,8 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     for symbol, rows in by_symbol.items():
         rows.sort(key=lambda r: r['CheckpointTime'])   
         
-        # Pull the absolute latest state to reflect "now" (LTP, Day%, Move%, current indicators)
         latest_row = dict(rows[-1])
         
-        # Identify the EARLIEST checkpoint where this setup anchored to preserve the True 'Seen' time
         first_active_cp = None
         for r in rows:
             if r['AnchorDir'] in ("BULL", "BEAR"):
@@ -1175,3 +1138,4 @@ if __name__ == "__main__":
         traceback.print_exc()
         code = 1
     sys.exit(code)
+              
