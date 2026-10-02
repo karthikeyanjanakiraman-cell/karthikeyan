@@ -2,8 +2,9 @@
 """
 Strict Institutional Volatility Tracker (Upstox) - ALL-MODE EDITION  (System3.py)
 + Modes: STOCK_FNO, CASH_EQUITY, INDEX_OPTIONS (NIFTY / BANKNIFTY / FINNIFTY / SENSEX option chains).
-+ Intraday Backtrace: re-evaluates every 15-min checkpoint from session open to the run time; each symbol
-  keeps its EARLIEST valid Bull/Bear/Graveyard occurrence, sorted earliest-first (--checkpoint-min / --single-snapshot).
++ Intraday Backtrace: re-evaluates every 15-min checkpoint from session open to the run time.
+  Displays the 'Seen' time of the earliest structural occurrence, but uses the LATEST available 
+  data for LTP, Move%, Day%, and Indicators to reflect the true "now" state.
 + Configurable Expiry & Strike Window: EXPIRY_SELECTION (CURRENT/NEXT) and separate STRIKES_ABOVE_ATM/STRIKES_BELOW_ATM.
 + Time-Machine Targeting: --date / --time truncate all data at that snapshot.
 + Directional ATR Tripwires + Trailing Stop-Loss Floor, evaluated on a continuous 1-min indicator engine.
@@ -56,19 +57,11 @@ ATR_BASIS_PERIOD = 14
 ATR_BASIS_TF = "60min"
 MIN_ATR_PCT = 0.001
 
-TOP_N_BUYERS = 15
-TOP_N_SELLERS = 15
+TOP_N_BUYERS = 50
+TOP_N_SELLERS = 50
 MAX_SYMBOL_WIDTH = 30
 
 # --- INTRADAY BACKTRACE CHECKPOINTS ---
-# Instead of one snapshot at the run time, the scan is re-evaluated at every
-# CHECKPOINT_INTERVAL_MIN boundary from session open up to the run time (e.g. a
-# 10:30 run checks 9:30, 9:45, 10:00, 10:15, 10:30; a 10:35 run adds a final
-# 10:30->10:35 partial checkpoint). Across all checkpoints, each symbol keeps
-# only its EARLIEST valid Bull/Bear/Graveyard occurrence, so a real setup that
-# fired early and later got stopped out (and would otherwise vanish from a
-# single "right now" snapshot) still gets reported. Set BACKTRACE_CHECKPOINTS
-# to False to fall back to a single snapshot at the run time.
 CHECKPOINT_INTERVAL_MIN = 15
 BACKTRACE_CHECKPOINTS = True
 
@@ -136,7 +129,6 @@ class BudgetLimiter:
             time.sleep(min(wait, 1.0) + 0.005)
 
 class FetchStats:
-    """Counts failed API requests and remembers a few samples so failures are never invisible."""
     def __init__(self):
         self.lock = threading.Lock()
         self.failed = 0
@@ -150,7 +142,6 @@ class FetchStats:
         with self.lock: self.auth_failed = True
 
 class ErrorLog:
-    """Collects exceptions raised inside worker threads (they used to be swallowed silently)."""
     def __init__(self):
         self.lock = threading.Lock()
         self.items = []
@@ -207,7 +198,7 @@ def _get(url, params=None, retries=4):
                 STATS.mark_auth_failed()
                 return 401, None
             last = f"HTTP {code}"
-            if code in (400, 404):            # retrying won't change these
+            if code in (400, 404):            
                 STATS.fail(f"{last} for {short}")
                 return code, None
             time.sleep(2.0 * (attempt + 1) if code == 429 else 0.5 * (attempt + 1))
@@ -252,15 +243,6 @@ def _date_chunks(start, end, span=7):
         cur = c_start - timedelta(days=1)
 
 def generate_checkpoints(cutoff_dt, interval_min=None):
-    """
-    Builds the intra-session cutoff times to re-evaluate the scan at: the first
-    interval boundary after session open, every interval after that, up through
-    cutoff_dt -- e.g. session open 9:15, interval 15 -> 9:30, 9:45, 10:00, 10:15,
-    10:30 for a 10:30 run. If cutoff_dt isn't itself on a boundary, one final
-    partial checkpoint is added AT cutoff_dt (a 10:35 run adds 10:35 after 10:30).
-    If cutoff_dt is at or before session open, there's nothing to backtrace --
-    returns just [cutoff_dt].
-    """
     interval = interval_min or CHECKPOINT_INTERVAL_MIN
     session_open = cutoff_dt.replace(hour=SESSION_OPEN_MIN // 60, minute=SESSION_OPEN_MIN % 60,
                                       second=0, microsecond=0)
@@ -312,7 +294,6 @@ def prepare_master(dfs):
 # Instrument masters
 # ------------------------------------------------------------------------------
 def _unwrap_master(data):
-    """Instrument masters are normally a flat JSON list; tolerate a dict wrapper too."""
     if isinstance(data, list): return data
     if isinstance(data, dict):
         if isinstance(data.get("data"), list): return data["data"]
@@ -321,12 +302,6 @@ def _unwrap_master(data):
     return []
 
 def _download_master(name, _is_fallback=False):
-    """
-    Downloads an Upstox instrument master. Prints a specific reason for every failed
-    attempt (HTTP status / network error / bad JSON) so a failure is never silent.
-    F&O contracts live INSIDE the per-exchange files ("NSE", "BSE") -- there is no
-    separate NSE_FO / BSE_FO file.
-    """
     url = f"https://assets.upstox.com/market-quote/instruments/exchange/{name}.json.gz"
     last_reason, attempts_made = "unknown", 0
     for attempt in range(1, 4):
@@ -380,7 +355,6 @@ def _equity_universe(mode):
 # INDEX OPTIONS universe
 # ------------------------------------------------------------------------------
 def _resolve_index_spot_price(key, name, cutoff_dt, is_live):
-    """Returns (price, source). Live -> quote; backtest -> last 1-min close at/before the cutoff."""
     target_dt = cutoff_dt.date()
     if is_live:
         q = fetch_quotes([{"key": key, "symbol": name}], batch=1)
@@ -410,7 +384,6 @@ def _field(row, *names):
     return None
 
 def _expiry_to_date(exp):
-    """Upstox expiry is epoch-ms at midnight IST. Convert in IST -- a UTC runner would be off by a day."""
     try:
         if isinstance(exp, (int, float, np.integer, np.floating)) or (isinstance(exp, str) and exp.strip().isdigit()):
             v = float(exp)
@@ -434,10 +407,10 @@ def _load_local_master(path):
         print(f"   {COLOR_RED_FG}[!] Could not read local options master '{path}': {type(e).__name__}: {e}{COLOR_RESET}")
         return []
 
+
 def _index_options_universe(cutoff_dt, is_live, options_master_path=""):
     target_dt = cutoff_dt.date()
 
-    # 1. ATM anchors
     spot = {}
     for idx, cfg in INDEX_CONFIG.items():
         try:
@@ -456,7 +429,6 @@ def _index_options_universe(cutoff_dt, is_live, options_master_path=""):
                   f"Check the token/API access to index candles (see failure samples below).{COLOR_RESET}")
         return []
 
-    # 2. Instrument master
     rows = []
     if options_master_path:
         if os.path.exists(options_master_path):
@@ -473,7 +445,6 @@ def _index_options_universe(cutoff_dt, is_live, options_master_path=""):
               f"for the exact HTTP status / network error.{COLOR_RESET}")
         return []
 
-    # 3. Pick out the CE/PE contracts of the configured indices
     by_idx = {idx: [] for idx in INDEX_CONFIG}
     for row in rows:
         segment = str(_field(row, "segment") or "").upper()
@@ -512,7 +483,6 @@ def _index_options_universe(cutoff_dt, is_live, options_master_path=""):
               f"NIFTY/BANKNIFTY/FINNIFTY/SENSEX. Field names in this master: {sample}{COLOR_RESET}")
         return []
 
-    # 4. Choose expiry + ATM window per index
     universe, seen = [], set()
     for idx, contracts in by_idx.items():
         if idx not in spot: continue
@@ -526,9 +496,6 @@ def _index_options_universe(cutoff_dt, is_live, options_master_path=""):
                   f"Expired contracts need --options-master.{COLOR_RESET}")
             continue
 
-        # EXPIRY_SELECTION: "CURRENT" = nearest expiry on/after the snapshot (index 0),
-        # "NEXT" = the one after that (index 1). Falls back to the last available
-        # expiry if the master doesn't have one that far out.
         expiry_idx = 1 if str(EXPIRY_SELECTION).upper() == "NEXT" else 0
         if expiry_idx >= len(expiries):
             print(f"   {COLOR_YELLOW}  ⚠ {idx:<10} EXPIRY_SELECTION={EXPIRY_SELECTION!r} wants expiry #{expiry_idx + 1} "
@@ -538,7 +505,7 @@ def _index_options_universe(cutoff_dt, is_live, options_master_path=""):
         chain = [c for c in contracts if c[0] == target_exp]
         strikes = np.array(sorted({c[1] for c in chain}))
         atm_i = int(np.abs(strikes - spot[idx]).argmin())
-        # BELOW = lower strike price (lower index in the sorted array), ABOVE = higher.
+        
         lo = max(0, atm_i - STRIKES_BELOW_ATM)
         hi = min(len(strikes), atm_i + STRIKES_ABOVE_ATM + 1)
         window = set(strikes[lo:hi].tolist())
@@ -557,8 +524,7 @@ def _index_options_universe(cutoff_dt, is_live, options_master_path=""):
             print(f"   {COLOR_YELLOW}  ⚠ nearest expiry in today's master is {gap} days after {target_dt}; the true nearest "
                   f"expiry on that date may already have expired. Use --options-master for exact backtests.{COLOR_RESET}")
     return universe
-
-def get_dynamic_universe(mode, cutoff_dt, is_live, options_master_path=""):
+  def get_dynamic_universe(mode, cutoff_dt, is_live, options_master_path=""):
     if mode in ("STOCK_FNO", "CASH_EQUITY"):
         return _equity_universe(mode)
     if mode == "INDEX_OPTIONS":
@@ -683,7 +649,6 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
     while i < len(close):
         anchor = None
 
-        # 1. Search for Anchor (wait for a 1-ATR directional close confirmed by >=2 of 3 kinetics)
         while i < len(close):
             bull_score, bear_score, r_bull, r_bear, _, _, _, _, _, _ = get_kinetics(kin_1m, i)
 
@@ -695,7 +660,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
 
             if close[i] - curr_open >= base_atr:
                 if bull_score >= 2 and bb_kc_bull_fire:
-                    if r_bear:  # Warzone: opposing power also spiking
+                    if r_bear:  
                         warzone_kills += 1
                         curr_open = close[i]
                     else:
@@ -706,7 +671,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
 
             elif curr_open - close[i] >= base_atr:
                 if bear_score >= 2 and bb_kc_bear_fire:
-                    if r_bull:  # Warzone
+                    if r_bull:  
                         warzone_kills += 1
                         curr_open = close[i]
                     else:
@@ -714,13 +679,11 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                         break
                 else:
                     curr_open = close[i]
-
             i += 1
 
         if not anchor:
             break
 
-        # 2. Track anchor survival (trailing stop-loss floor)
         survived = True
         peak_price = anchor['price']
         j = anchor['idx'] + 1
@@ -745,7 +708,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                         i = j + 1
                         break
                     else:
-                        peak_price = close[j]  # survived the dip -> reset peak
+                        peak_price = close[j]  
 
             elif anchor['dir'] == "BEAR":
                 peak_price = min(peak_price, close[j])
@@ -764,7 +727,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                         i = j + 1
                         break
                     else:
-                        peak_price = close[j]  # survived the rally -> reset trough
+                        peak_price = close[j]  
             j += 1
 
         if survived:
@@ -778,8 +741,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
         last_killed_info['reason'] = f"Warzone Inversion Chop ({warzone_kills}x)"
 
     return None, last_killed_info
-
-def compute_row(symbol, master_1m, target_dt):
+  def compute_row(symbol, master_1m, target_dt):
     close, high, low, dt = master_1m['Close'].values, master_1m['High'].values, master_1m['Low'].values, master_1m['Datetime'].values
 
     today_mask = master_1m['Datetime'].dt.date == target_dt
@@ -873,14 +835,6 @@ def _history_worker_daily(args):
         progress.tick()
 
 def process_stock_checkpoints(args):
-    """
-    Fetches 1-minute history ONCE (same number of API calls as a single-snapshot
-    scan) and evaluates the row at EVERY checkpoint by truncating the same
-    in-memory frame -- backtracing through the session does not multiply the
-    API call cost, only the (cheap, local) indicator computation.
-    Returns a list of (checkpoint_dt, status, payload) -- one entry per checkpoint,
-    status in {ok, no_data, illiquid, error}.
-    """
     item, checkpoints, is_live, history_days, mode, progress = args
     try:
         final_cutoff = checkpoints[-1]
@@ -940,7 +894,6 @@ def _print_error_summary():
         print(f"{COLOR_DIM}   [{where}] {msg}\n{tb}{COLOR_RESET}")
 
 def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, target_time_str="15:30", options_master_path=""):
-    """Returns a process exit code: 0 = ran fine (even if no setups), 1 = could not run."""
     t_start = time.time()
 
     if target_date_str:
@@ -951,11 +904,14 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             return 1
         target_dt, is_live = cutoff_dt.date(), False
     else:
-        target_dt, cutoff_dt, is_live = now_ist().date(), now_ist(), True
+        cutoff_dt = now_ist()
+        target_dt, is_live = cutoff_dt.date(), True
+
+    market_close = datetime.combine(target_dt, datetime.min.time()) + timedelta(hours=15, minutes=30)
+    cutoff_dt = min(cutoff_dt, market_close)
 
     print(f"\n{COLOR_CYAN}📡 Initializing Tracker [{mode}] | Time Machine: {cutoff_dt.strftime('%Y-%m-%d %H:%M:%S')} (Live: {is_live}){COLOR_RESET}")
 
-    # --- Universe ---
     universe_raw = get_dynamic_universe(mode, cutoff_dt, is_live, options_master_path)
     if STATS.auth_failed:
         print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401). Regenerate UPSTOX_ACCESS_TOKEN -- it expires daily.{COLOR_RESET}")
@@ -966,7 +922,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         return 1
     print(f"   {COLOR_DIM}» Universe: {len(universe_raw)} instruments{COLOR_RESET}")
 
-    # --- Daily prefilter (equities only; option premiums use the liquidity filter instead) ---
     if mode == "INDEX_OPTIONS":
         candidates = universe_raw
     else:
@@ -985,8 +940,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             return 1 if (STATS.failed or ERRORS.items) else 0
         print(f"   {COLOR_DIM}» Prefilter: {len(universe_raw)} -> {len(candidates)} instruments{COLOR_RESET}")
 
-    # --- 1-minute engine: backtrace every CHECKPOINT_INTERVAL_MIN boundary from
-    # session open up to cutoff_dt, instead of just the current instant ---
     checkpoints = generate_checkpoints(cutoff_dt) if BACKTRACE_CHECKPOINTS else [cutoff_dt]
     print(f"   {COLOR_DIM}» Backtrace checkpoints ({len(checkpoints)}): "
           f"{', '.join(c.strftime('%H:%M') for c in checkpoints)}{COLOR_RESET}")
@@ -1001,7 +954,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401) while fetching candles.{COLOR_RESET}")
         return 1
 
-    outcomes = [o for sym_outcomes in per_symbol for o in sym_outcomes]   # flatten (symbol x checkpoint) -> single list
+    outcomes = [o for sym_outcomes in per_symbol for o in sym_outcomes]   
     results = [p for _, s, p in outcomes if s == "ok"]
     n_nodata = sum(1 for _, s, _ in outcomes if s == "no_data")
     n_illiq = sum(1 for _, s, _ in outcomes if s == "illiquid")
@@ -1016,39 +969,54 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         _print_error_summary()
         return 1
 
-    # Collapse (symbol x checkpoint) rows down to ONE row per symbol: the
-    # EARLIEST checkpoint at which it was a valid Bull, else the earliest at
-    # which it was a valid Bear, else (only if it was never Bull/Bear at any
-    # checkpoint) the earliest checkpoint it landed in the Graveyard.
     by_symbol = {}
     for row in results:
         by_symbol.setdefault(row['Symbol'], []).append(row)
 
     bulls, bears, rejected = [], [], []
     for symbol, rows in by_symbol.items():
-        rows.sort(key=lambda r: r['CheckpointTime'])   # chronological, earliest first
-        bull_rows = [r for r in rows if r['AnchorDir'] == "BULL" and r['State'] in ("[ACTIVE BUY]", "[COILING]")]
-        bear_rows = [r for r in rows if r['AnchorDir'] == "BEAR" and r['State'] in ("[ACTIVE SELL]", "[COILING]")]
-        if bull_rows:
-            bulls.append(bull_rows[0])
-        if bear_rows:
-            bears.append(bear_rows[0])
-        if not bull_rows and not bear_rows:
-            none_rows = [r for r in rows if r['State'] == "NONE"]
-            if none_rows:
-                rejected.append(none_rows[0])
+        rows.sort(key=lambda r: r['CheckpointTime'])   
+        
+        # Pull the absolute latest state to reflect "now" (LTP, Day%, Move%, current indicators)
+        latest_row = dict(rows[-1])
+        
+        # Identify the EARLIEST checkpoint where this setup anchored to preserve the True 'Seen' time
+        first_active_cp = None
+        for r in rows:
+            if r['AnchorDir'] in ("BULL", "BEAR"):
+                first_active_cp = r['CheckpointTime']
+                break
+                
+        if first_active_cp is not None:
+            latest_row['CheckpointTime'] = first_active_cp
+        else:
+            latest_row['CheckpointTime'] = rows[0]['CheckpointTime']
 
-    # Sort by earliest occurrence first, then by strength within the same checkpoint.
+        if latest_row['AnchorDir'] == "BULL" and latest_row['State'] in ("[ACTIVE BUY]", "[COILING]"):
+            bulls.append(latest_row)
+        elif latest_row['AnchorDir'] == "BEAR" and latest_row['State'] in ("[ACTIVE SELL]", "[COILING]"):
+            bears.append(latest_row)
+        else:
+            rejected.append(latest_row)
+
+    true_bull_count = len(bulls)
+    true_bear_count = len(bears)
+
     bulls.sort(key=lambda r: (r['CheckpointTime'], r['State'] != "[ACTIVE BUY]", -r['DayChangePct']))
     bears.sort(key=lambda r: (r['CheckpointTime'], r['State'] != "[ACTIVE SELL]", r['DayChangePct']))
-    bulls, bears = bulls[:TOP_N_BUYERS], bears[:TOP_N_SELLERS]
+    
+    bulls = bulls[:TOP_N_BUYERS]
+    bears = bears[:TOP_N_SELLERS]
+
+    bull_count_str = f"{len(bulls)} (of {true_bull_count})" if true_bull_count > TOP_N_BUYERS else f"{true_bull_count}"
+    bear_count_str = f"{len(bears)} (of {true_bear_count})" if true_bear_count > TOP_N_SELLERS else f"{true_bear_count}"
 
     shown = bulls + bears + rejected
     sym_w = max(12, min(MAX_SYMBOL_WIDTH, max((len(r['Symbol']) for r in shown), default=12)))
 
     print(f"\n{COLOR_BOLD}=== STATEFUL INSTITUTIONAL VOLATILITY TRACKER [{mode}] ==={COLOR_RESET}")
     print(f"Target Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Scanned: {len(by_symbol)} symbols "
-          f"across {len(checkpoints)} checkpoints | After dedup: {len(bulls)} bull, {len(bears)} bear, "
+          f"across {len(checkpoints)} checkpoints | After dedup: {bull_count_str} bull, {bear_count_str} bear, "
           f"{len(rejected)} graveyard\n")
 
     def print_basket(title, icon, data_list):
@@ -1112,7 +1080,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             if "Warzone" in reason: return 1
             if "Alignment" in reason: return 2
             return 3
-        # Earliest occurrence first (same rule as bulls/bears), then reason category, then move size.
+        
         rejected.sort(key=lambda x: (x['CheckpointTime'], sort_reason(x), -abs(x['DayChangePct'])))
 
         for row in rejected:
@@ -1153,6 +1121,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     total_calls = sum(l.total_calls for l in LIMITERS.values())
     print(f"\n⏱️ Tracker sync completed in {(time.time() - t_start):.2f} seconds ({total_calls} API calls).\n")
     return 0
+
 
 def parse_args():
     p = argparse.ArgumentParser(description="Strict institutional volatility tracker (Upstox)")
