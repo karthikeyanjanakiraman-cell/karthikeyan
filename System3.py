@@ -771,7 +771,38 @@ def compute_row(symbol, master_1m, target_dt):
         'State': "NONE", 'Blocks': 0, 'KilledTime': '-', 'KilledPrice': 0.0, 'RejectReason': ""
     }
 
-    anchor, reject_info = evaluate_anchor_tripwire(close, dt, kin_1m, b
+    anchor, reject_info = evaluate_anchor_tripwire(close, dt, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, today_start_idx)
+
+    if anchor:
+        row['ActiveAnchor'] = pd.to_datetime(anchor['time']).strftime("%H:%M")
+        row['AnchorPrice'] = float(anchor['price'])
+        row['AnchorDir'] = anchor['dir']
+        row['MovePct'] = ((float(close[-1]) - anchor['price']) / anchor['price']) * 100 if anchor['price'] else 0.0
+
+        if anchor['dir'] == "BULL":
+            row['State'] = "[ACTIVE BUY]" if bb_upper[-1] > kc_upper[-1] else "[COILING]"
+        else:
+            row['State'] = "[ACTIVE SELL]" if bb_lower[-1] < kc_lower[-1] else "[COILING]"
+
+        for mult in HA_ATR_MULTIPLIERS:
+            rsi_st, macd_st, adx_st, blk_count = get_tripwire_state(close, kin_1m, base_atr, mult, today_start_idx)
+            gtag = f"{mult}X"
+            row[f'BB_RSI_{gtag}'] = rsi_st
+            row[f'BB_MACD_{gtag}'] = macd_st
+            row[f'ADX_{gtag}'] = adx_st
+            if mult == 1:
+                row['Blocks'] = blk_count
+    else:
+        row['AnchorDir'] = reject_info.get('dir', 'NONE')
+        row['ActiveAnchor'] = reject_info.get('anchor_time', '-')
+        row['AnchorPrice'] = float(reject_info.get('anchor_price', 0.0))
+        row['KilledTime'] = reject_info.get('killed_time', '-')
+        row['KilledPrice'] = float(reject_info.get('killed_price', 0.0))
+        row['RejectReason'] = reject_info.get('reason', 'Failed Kinetic Alignment')
+        if row['AnchorPrice'] > 0 and row['KilledPrice'] > 0:
+            row['MovePct'] = ((row['KilledPrice'] - row['AnchorPrice']) / row['AnchorPrice']) * 100
+
+    return row                                              
   # ==============================================================================
 # 3. WORKERS, FORMATTERS & UI
 # ==============================================================================
