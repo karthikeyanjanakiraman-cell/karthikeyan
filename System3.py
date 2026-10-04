@@ -1037,8 +1037,14 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     true_bull_count = len(bulls)
     true_bear_count = len(bears)
 
-    bulls.sort(key=lambda r: (r['CheckpointTime'], r['State'] != "[ACTIVE BUY]", -r['DayChangePct']))
-    bears.sort(key=lambda r: (r['CheckpointTime'], r['State'] != "[ACTIVE SELL]", r['DayChangePct']))
+    # Rank LIVE setups (ACTIVE/COILING) ahead of [STOPPED] ones first, THEN by earliest
+    # Seen time within each group. Sorting by Seen time alone (old behavior) let a pile of
+    # long-dead, already-stopped-out anchors -- which had more of the day to both fire AND
+    # get killed, so they skew toward earlier Seen times -- outrank and bury genuinely live
+    # setups that simply fired later, and the TOP_N truncation below could then drop live
+    # setups entirely in favor of historical ones.
+    bulls.sort(key=lambda r: (r['State'] == "[STOPPED]", r['CheckpointTime'], r['State'] != "[ACTIVE BUY]", -r['DayChangePct']))
+    bears.sort(key=lambda r: (r['State'] == "[STOPPED]", r['CheckpointTime'], r['State'] != "[ACTIVE SELL]", r['DayChangePct']))
 
     bulls = bulls[:TOP_N_BUYERS]
     bears = bears[:TOP_N_SELLERS]
