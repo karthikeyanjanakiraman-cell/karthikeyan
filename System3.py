@@ -12,6 +12,13 @@ Strict Institutional Volatility Tracker (Upstox) - ALL-MODE EDITION  (System3.py
 + Directional ATR Tripwires + Trailing Stop-Loss Floor, evaluated on a continuous 1-min indicator engine.
 + NEVER EXITS SILENTLY: every early-exit prints its reason, and real failures return a non-zero exit code.
 + Structured Graveyard with Anchor / Killed / Move% forensics.
++ OrderPlaced tracking: after you place an order off a run's results (a CE/PE strike, an F&O
+  stock, or a cash-equity symbol), put that value in the OrderPlaced environment variable for
+  subsequent runs. When OrderPlaced is empty, nothing changes -- the scan just runs and prints
+  its results as before. When OrderPlaced is set, this run also looks that value up among its
+  own results (same case-insensitive substring match as --watch) and emails its current status
+  (live/stopped/rejected, LTP, Day%, Move% off anchor) so a scheduled run keeps you posted on a
+  position you already took. See check_order_placed() below for the exact behaviour.
 """
 import os
 import sys
@@ -84,6 +91,18 @@ REQUIRE_BB_KC_PIERCE = False
 # this code runs at all -- no email, no state file, nothing.
 WATCH_VALUE = ""
 WATCH_STATE_FILE = "system3_watch_state.json"
+
+# --- ORDER-PLACED TRACKING (env-driven, separate from --watch) ---
+# Name of the environment variable this run reads to decide whether to track
+# a placed order. Same idea as WATCH_VALUE/--watch, but sourced purely from
+# the environment (so a scheduled run can be pointed at a live position
+# without touching the command line) and, by default, emails EVERY run it
+# finds a match on rather than only on a status change -- see
+# check_order_placed() for the exact rules and ORDER_EMAIL_ONLY_ON_CHANGE
+# below to switch it to change-only emails instead.
+ORDER_PLACED_ENV = "OrderPlaced"
+ORDER_EMAIL_ONLY_ON_CHANGE = False
+ORDER_STATE_FILE = "system3_order_state.json"
 
 # --- COLOR PALETTE ---
 COLOR_RESET = '\033[0m'
@@ -920,6 +939,7 @@ def _print_error_summary():
 
 # ==============================================================================
 # 3b. OPTIONAL WATCH / EMAIL ALERT (no-op unless --watch is passed)
+#     + ORDER-PLACED TRACKING (no-op unless the OrderPlaced env var is set)
 # ==============================================================================
 def _load_watch_state(path):
     if not os.path.exists(path):
@@ -947,9 +967,9 @@ def _send_watch_email(subject, body):
     # SMTP_SERVER/SMTP_PORT default to Gmail's SMTP-over-SSL endpoint when not
     # set -- that workflow defines no SMTP_SERVER/SMTP_PORT secrets at all, and
     # an "app password" (EMAIL_APP_PWD) is Gmail's term for that credential.
-    sender = os.environ.get("SENDER_EMAIL") or os.environ.get("SENDER_EMAIL")
-    password = os.environ.get("SENDER_PASSWORD") or os.environ.get("SENDER_PASSWORD")
-    recipient = os.environ.get("RECIPIENT_EMAIL") or os.environ.get("RECIPIENT_EMAIL")
+    sender = os.environ.get("SENDER_EMAIL") or os.environ.get("EMAIL_SENDER")
+    password = os.environ.get("SENDER_PASSWORD") or os.environ.get("EMAIL_APP_PWD")
+    recipient = os.environ.get("RECIPIENT_EMAIL") or os.environ.get("EMAIL_RECEIVER")
     smtp_server = os.environ.get("SMTP_SERVER") or "smtp.gmail.com"
     smtp_port = os.environ.get("SMTP_PORT") or "465"
 
@@ -990,6 +1010,40 @@ def _send_watch_email(subject, body):
         print(f"   {COLOR_YELLOW}[watch] failed to send email ({type(e).__name__}: {e}).{COLOR_RESET}")
         return False
 
+def _find_match(needle_upper, all_bulls, all_bears, rejected):
+    """
+    Shared lookup for --watch and OrderPlaced alike: case-insensitive substring
+    match against 'Symbol', checked in order live-bull -> live-bear -> graveyard,
+    so it works the same way whether the placed order was a CE/PE option strike
+    (e.g. 'NIFTY25000CE'), an F&O stock, or a plain cash-equity symbol.
+    """
+    for row in all_bulls:
+        if needle_upper in row['Symbol'].upper():
+            return row
+    for row in all_bears:
+        if needle_upper in row['Symbol'].upper():
+            return row
+    for row in rejected:
+        if needle_upper in row['Symbol'].upper():
+            return row
+    return None
+
+def _describe_match(mode, value, match, cutoff_dt):
+    """Returns (symbol, status, detail_text) for a matched row, or a NOT FOUND placeholder."""
+    if match is not None:
+        symbol = match['Symbol']
+        status = match['State'] if match.get('State', 'NONE') != "NONE" else f"REJECTED ({match.get('RejectReason', 'unknown')})"
+        seen = match.get('CheckpointTime', cutoff_dt)
+        seen_str = seen.strftime('%H:%M') if hasattr(seen, 'strftime') else str(seen)
+        detail = (f"Symbol: {symbol}\nStatus: {status}\nLTP: {match.get('LTP', 0):.2f}\n"
+                  f"Day Change: {match.get('DayChangePct', 0):+.2f}%\nMove from anchor: {match.get('MovePct', 0):+.2f}%\n"
+                  f"Seen: {seen_str}\nMode: {mode}\nSnapshot: {cutoff_dt:%Y-%m-%d %H:%M}")
+    else:
+        symbol = value
+        status = "NOT FOUND"
+        detail = f"'{value}' did not match any scanned symbol this run.\nMode: {mode}\nSnapshot: {cutoff_dt:%Y-%m-%d %H:%M}"
+    return symbol, status, detail
+
 def check_watch_alerts(mode, watch_value, cutoff_dt, all_bulls, all_bears, rejected):
     """
     Optional single-symbol/strike watch. WATCH_VALUE (set via --watch) is
@@ -1008,34 +1062,8 @@ def check_watch_alerts(mode, watch_value, cutoff_dt, all_bulls, all_bears, rejec
     if not needle:
         return
 
-    match = None
-    for row in all_bulls:
-        if needle in row['Symbol'].upper():
-            match = row
-            break
-    if match is None:
-        for row in all_bears:
-            if needle in row['Symbol'].upper():
-                match = row
-                break
-    if match is None:
-        for row in rejected:
-            if needle in row['Symbol'].upper():
-                match = row
-                break
-
-    if match is not None:
-        symbol = match['Symbol']
-        status = match['State'] if match.get('State', 'NONE') != "NONE" else f"REJECTED ({match.get('RejectReason', 'unknown')})"
-        seen = match.get('CheckpointTime', cutoff_dt)
-        seen_str = seen.strftime('%H:%M') if hasattr(seen, 'strftime') else str(seen)
-        detail = (f"Symbol: {symbol}\nStatus: {status}\nLTP: {match.get('LTP', 0):.2f}\n"
-                  f"Day Change: {match.get('DayChangePct', 0):+.2f}%\nMove from anchor: {match.get('MovePct', 0):+.2f}%\n"
-                  f"Seen: {seen_str}\nMode: {mode}\nSnapshot: {cutoff_dt:%Y-%m-%d %H:%M}")
-    else:
-        symbol = watch_value
-        status = "NOT FOUND"
-        detail = f"'{watch_value}' did not match any scanned symbol this run.\nMode: {mode}\nSnapshot: {cutoff_dt:%Y-%m-%d %H:%M}"
+    match = _find_match(needle, all_bulls, all_bears, rejected)
+    symbol, status, detail = _describe_match(mode, watch_value, match, cutoff_dt)
 
     state = _load_watch_state(WATCH_STATE_FILE)
     key = needle
@@ -1056,6 +1084,63 @@ def check_watch_alerts(mode, watch_value, cutoff_dt, all_bulls, all_bears, rejec
 
     state[key] = {"status": status, "checked_at": cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")}
     _save_watch_state(WATCH_STATE_FILE, state)
+
+def check_order_placed(mode, order_value, cutoff_dt, all_bulls, all_bears, rejected):
+    """
+    Env-driven order tracker. After placing an order off a previous run's
+    results -- a CE/PE option strike, an F&O stock, or a plain cash-equity
+    symbol -- put that exact value (or any substring unique enough to match
+    only it, e.g. just the strike '25000CE') into the OrderPlaced
+    environment variable before the next run.
+
+      * OrderPlaced empty/unset -> this function is never called. The run
+        just scans and prints its normal results, exactly as before.
+      * OrderPlaced non-empty  -> this run looks that value up among its own
+        results (same matching as --watch: live bulls, then live bears,
+        then the graveyard) and emails its current status -- LTP, Day%,
+        Move% off anchor, and whether it's [ACTIVE BUY]/[ACTIVE SELL]/
+        [COILING]/[STOPPED], or its graveyard rejection reason if it never
+        became a live setup, or NOT FOUND if nothing matched this run.
+
+    By default (ORDER_EMAIL_ONLY_ON_CHANGE = False) an email goes out on
+    EVERY run that has OrderPlaced set, so a position you're holding gets a
+    fresh status email each scheduled run. Set ORDER_EMAIL_ONLY_ON_CHANGE =
+    True to instead only email when the status changes since the last run
+    (tracked separately in ORDER_STATE_FILE, so it never shares state with
+    --watch).
+    """
+    needle = str(order_value).strip().upper()
+    if not needle:
+        return
+
+    match = _find_match(needle, all_bulls, all_bears, rejected)
+    symbol, status, detail = _describe_match(mode, order_value, match, cutoff_dt)
+
+    prev_status = None
+    should_send = True
+    if ORDER_EMAIL_ONLY_ON_CHANGE:
+        state = _load_watch_state(ORDER_STATE_FILE)
+        prev_status = state.get(needle, {}).get("status")
+        should_send = (prev_status != status)
+
+    print(f"\n{COLOR_BOLD}📦 ORDER PLACED [{order_value}] -> {status}{COLOR_RESET}" +
+          (f" {COLOR_DIM}(previous: {prev_status}){COLOR_RESET}" if prev_status else ""))
+
+    if not should_send:
+        print(f"   {COLOR_DIM}[order] status unchanged since last run -- no email sent.{COLOR_RESET}")
+    else:
+        if ORDER_EMAIL_ONLY_ON_CHANGE:
+            subject = (f"[System3] Order tracking started: {order_value} is {status}" if prev_status is None
+                       else f"[System3] {order_value} changed: {prev_status} -> {status}")
+        else:
+            subject = f"[System3] Order status: {order_value} -> {status}"
+        body = f"{subject}\n\n{detail}"
+        _send_watch_email(subject, body)
+
+    if ORDER_EMAIL_ONLY_ON_CHANGE:
+        state = _load_watch_state(ORDER_STATE_FILE)
+        state[needle] = {"status": status, "checked_at": cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")}
+        _save_watch_state(ORDER_STATE_FILE, state)
 
 def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, target_time_str="15:30", options_master_path=""):
     t_start = time.time()
@@ -1201,7 +1286,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     bulls.sort(key=lambda r: (r['State'] == "[STOPPED]", r['CheckpointTime'], r['State'] != "[ACTIVE BUY]", -r['DayChangePct']))
     bears.sort(key=lambda r: (r['State'] == "[STOPPED]", r['CheckpointTime'], r['State'] != "[ACTIVE SELL]", r['DayChangePct']))
 
-    all_bulls, all_bears = list(bulls), list(bears)   # full pre-truncation lists, for --watch below
+    all_bulls, all_bears = list(bulls), list(bears)   # full pre-truncation lists, for --watch / OrderPlaced below
 
     bulls = bulls[:TOP_N_BUYERS]
     bears = bears[:TOP_N_SELLERS]
@@ -1318,6 +1403,13 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     if WATCH_VALUE:
         check_watch_alerts(mode, WATCH_VALUE, cutoff_dt, all_bulls, all_bears, rejected)
 
+    # OrderPlaced: purely env-driven, independent of --watch. Empty/unset -> no-op,
+    # the run above already printed its results and nothing else happens. Non-empty
+    # -> look that value up in this run's results and email its current status.
+    order_value = os.environ.get(ORDER_PLACED_ENV, "").strip()
+    if order_value:
+        check_order_placed(mode, order_value, cutoff_dt, all_bulls, all_bears, rejected)
+
     _print_error_summary()
     total_calls = sum(l.total_calls for l in LIMITERS.values())
     print(f"\n⏱️ Tracker sync completed in {(time.time() - t_start):.2f} seconds ({total_calls} API calls).\n")
@@ -1359,6 +1451,10 @@ def parse_args():
                         "(SMTP_SERVER/SMTP_PORT optional, default smtp.gmail.com:465) ONLY if the status changed "
                         "since the last run (tracked in system3_watch_state.json). If this flag is omitted "
                         "(default: no watch), no email code runs at all.")
+    p.add_argument("--order-email-only-on-change", action="store_true",
+                   help="Switch OrderPlaced tracking (see the OrderPlaced env var) from 'email every run' to "
+                        "'email only when the status changes since the last run', using its own state file "
+                        f"({ORDER_STATE_FILE}) so it never shares state with --watch.")
     return p.parse_args()
 
 if __name__ == "__main__":
@@ -1374,6 +1470,8 @@ if __name__ == "__main__":
     STRIKES_BELOW_ATM = args.strikes_down
     CHECKPOINT_INTERVAL_MIN = args.checkpoint_min
     WATCH_VALUE = args.watch
+    if args.order_email_only_on_change:
+        ORDER_EMAIL_ONLY_ON_CHANGE = True
     if args.single_snapshot:
         BACKTRACE_CHECKPOINTS = False
     if args.disable_bb_kc_gate:
