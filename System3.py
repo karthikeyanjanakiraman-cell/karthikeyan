@@ -947,9 +947,9 @@ def _send_watch_email(subject, body):
     # SMTP_SERVER/SMTP_PORT default to Gmail's SMTP-over-SSL endpoint when not
     # set -- that workflow defines no SMTP_SERVER/SMTP_PORT secrets at all, and
     # an "app password" (EMAIL_APP_PWD) is Gmail's term for that credential.
-    sender = os.environ.get("SENDER_EMAIL") or os.environ.get("EMAIL_SENDER")
-    password = os.environ.get("SENDER_PASSWORD") or os.environ.get("EMAIL_APP_PWD")
-    recipient = os.environ.get("RECIPIENT_EMAIL") or os.environ.get("EMAIL_RECEIVER")
+    sender = os.environ.get("SENDER_EMAIL") or os.environ.get("SENDER_EMAIL")
+    password = os.environ.get("SENDER_PASSWORD") or os.environ.get("SENDER_PASSWORD")
+    recipient = os.environ.get("RECIPIENT_EMAIL") or os.environ.get("RECIPIENT_EMAIL")
     smtp_server = os.environ.get("SMTP_SERVER") or "smtp.gmail.com"
     smtp_port = os.environ.get("SMTP_PORT") or "465"
 
