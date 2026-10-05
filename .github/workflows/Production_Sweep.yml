@@ -25,16 +25,11 @@ on:
         required: false
         default: ''
         type: string
-      strike:
-        description: 'Optional: Strike / Symbol to Watch (e.g. NIFTY25000CE or 25000). Emails an alert only if its status changes.'
-        required: false
-        default: ''
-        type: string
 
 jobs:
   run_quant_engine:
     runs-on: ubuntu-latest
-
+    
     steps:
     - name: Checkout Code Repository
       uses: actions/checkout@v4
@@ -57,41 +52,35 @@ jobs:
         EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
         EMAIL_APP_PWD: ${{ secrets.EMAIL_APP_PWD }}
         EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
-
+        
         # Upstox Token
         UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
-
+        
         # GitHub Actions Inputs
         PARAM_MODE: ${{ inputs.trading_mode }}
         PARAM_BACKTEST_DATE: ${{ inputs.backtest_date }}
         PARAM_BACKTEST_TIME: ${{ inputs.backtest_time }}
-        PARAM_STRIKE: ${{ inputs.strike }}
       run: |
         # Base Execution Command
         CMD="python -u System3.py"
-
+        
         # 1. Inject Trading Mode (Defaults to STOCK_FNO for automated cron runs)
         if [ -n "$PARAM_MODE" ]; then
           CMD="$CMD --mode $PARAM_MODE"
         else
           CMD="$CMD --mode STOCK_FNO"
         fi
-
+        
         # 2. Inject Optional Backtest Date
         if [ -n "$PARAM_BACKTEST_DATE" ]; then
           CMD="$CMD --date $PARAM_BACKTEST_DATE"
         fi
-
+        
         # 3. Inject Optional Backtest Time
         if [ -n "$PARAM_BACKTEST_TIME" ]; then
           CMD="$CMD --time $PARAM_BACKTEST_TIME"
         fi
-
-        # 4. Inject Optional Strike/Symbol to Watch (triggers the email-alert feature)
-        if [ -n "$PARAM_STRIKE" ]; then
-          CMD="$CMD --watch \"$PARAM_STRIKE\""
-        fi
-
+        
         # Log and Execute
         echo "Executing Command: $CMD"
         eval $CMD
