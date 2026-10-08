@@ -395,6 +395,7 @@ def _equity_universe(mode):
     fno = {i.get("underlying_symbol") for i in nse if i.get("segment") == "NSE_FO" and i.get("underlying_symbol")}
     rows = [i for i in nse if plain(i) and (ts_of(i) in fno if mode == "STOCK_FNO" else ts_of(i) not in fno)]
     return list({i["instrument_key"]: {"symbol": ts_of(i), "key": i["instrument_key"]} for i in rows}.values())
+
 # ------------------------------------------------------------------------------
 # INDEX OPTIONS universe
 # ------------------------------------------------------------------------------
@@ -683,7 +684,7 @@ def get_tripwire_state(close, kin_1m, base_atr, mult, today_start):
             curr_open = close[i]
     return last_rsi, last_macd, last_adx, blocks
 
-def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, today_start):
+def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, vwap, today_start):
     if today_start >= len(close):
         return None, {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0,
                       'killed_time': '-', 'killed_price': 0.0, 'reason': 'No data for today'}
@@ -708,7 +709,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                 bb_kc_bull_fire = bb_kc_bear_fire = True
 
             if close[i] - curr_open >= base_atr:
-                if bull_score >= 2 and bb_kc_bull_fire:
+                if bull_score >= 2 and bb_kc_bull_fire and close[i] > vwap[i]:
                     if r_bear:
                         warzone_kills += 1
                         curr_open = close[i]
@@ -719,7 +720,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                     curr_open = close[i]
 
             elif curr_open - close[i] >= base_atr:
-                if bear_score >= 2 and bb_kc_bear_fire:
+                if bear_score >= 2 and bb_kc_bear_fire and close[i] < vwap[i]:
                     if r_bull:
                         warzone_kills += 1
                         curr_open = close[i]
@@ -788,11 +789,14 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
 
     if warzone_kills > 0 and last_killed_info['dir'] == 'NONE':
         last_killed_info['reason'] = f"Warzone Inversion Chop ({warzone_kills}x)"
+    elif last_killed_info['dir'] == 'NONE':
+        last_killed_info['reason'] = "Failed Kinetic or VWAP Alignment"
 
     return None, last_killed_info
 
 def compute_row(symbol, master_1m, target_dt):
     close, high, low, dt = master_1m['Close'].values, master_1m['High'].values, master_1m['Low'].values, master_1m['Datetime'].values
+    vol = master_1m['Volume'].values
 
     today_mask = master_1m['Datetime'].dt.date == target_dt
     if not today_mask.any():
@@ -801,6 +805,17 @@ def compute_row(symbol, master_1m, target_dt):
     today_start_idx = int(master_1m.index[today_mask][0])
     day_open_price = master_1m['Open'].iloc[today_start_idx]
     intraday_pct = ((close[-1] - day_open_price) / day_open_price) * 100 if day_open_price else 0.0
+
+    # ---> CALCULATE INTRADAY VWAP <---
+    cum_vol = np.zeros_like(vol)
+    cum_vol_price = np.zeros_like(vol)
+    cum_vol[today_start_idx:] = np.cumsum(vol[today_start_idx:])
+    cum_vol_price[today_start_idx:] = np.cumsum((close * vol)[today_start_idx:])
+    
+    vwap = np.zeros_like(close)
+    with np.errstate(divide='ignore', invalid='ignore'):
+        vwap = np.where(cum_vol > 0, cum_vol_price / cum_vol, close)
+    # ---------------------------------
 
     sma20 = pd.Series(close).rolling(20, min_periods=1).mean().values
     std20 = pd.Series(close).rolling(20, min_periods=1).std(ddof=0).values
@@ -824,7 +839,8 @@ def compute_row(symbol, master_1m, target_dt):
         'State': "NONE", 'Blocks': 0, 'KilledTime': '-', 'KilledPrice': 0.0, 'RejectReason': ""
     }
 
-    anchor, reject_info = evaluate_anchor_tripwire(close, dt, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, today_start_idx)
+    # ---> PASS VWAP INTO THE TRIPWIRE <---
+    anchor, reject_info = evaluate_anchor_tripwire(close, dt, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, vwap, today_start_idx)
 
     if anchor:
         row['ActiveAnchor'] = pd.to_datetime(anchor['time']).strftime("%H:%M")
@@ -856,7 +872,8 @@ def compute_row(symbol, master_1m, target_dt):
             row['MovePct'] = ((row['KilledPrice'] - row['AnchorPrice']) / row['AnchorPrice']) * 100
 
     return row
-  # ==============================================================================
+
+# ==============================================================================
 # 3. WORKERS, FORMATTERS & UI
 # ==============================================================================
 def format_kinetic_triad(rsi, macd, di):
@@ -964,13 +981,6 @@ def _save_watch_state(path, state):
         print(f"   {COLOR_YELLOW}[watch] could not write state file '{path}' ({type(e).__name__}: {e}).{COLOR_RESET}")
 
 def _send_watch_email(subject, body):
-    # Accepts either naming convention, so this works unmodified whichever
-    # secrets the workflow happens to define:
-    #   SENDER_EMAIL / SENDER_PASSWORD / RECIPIENT_EMAIL   (original names), or
-    #   EMAIL_SENDER / EMAIL_APP_PWD   / EMAIL_RECEIVER     (alternate names)
-    # SMTP_SERVER/SMTP_PORT default to Gmail's SMTP-over-SSL endpoint when not
-    # set -- that workflow defines no SMTP_SERVER/SMTP_PORT secrets at all, and
-    # an "app password" (EMAIL_APP_PWD) is Gmail's term for that credential.
     sender = os.environ.get("SENDER_EMAIL") or os.environ.get("EMAIL_SENDER")
     password = os.environ.get("SENDER_PASSWORD") or os.environ.get("EMAIL_APP_PWD")
     recipient = os.environ.get("RECIPIENT_EMAIL") or os.environ.get("EMAIL_RECEIVER")
@@ -1015,12 +1025,6 @@ def _send_watch_email(subject, body):
         return False
 
 def _find_match(needle_upper, all_bulls, all_bears, rejected):
-    """
-    Shared lookup for --watch and OrderPlaced alike: case-insensitive substring
-    match against 'Symbol', checked in order live-bull -> live-bear -> graveyard,
-    so it works the same way whether the placed order was a CE/PE option strike
-    (e.g. 'NIFTY25000CE'), an F&O stock, or a plain cash-equity symbol.
-    """
     for row in all_bulls:
         if needle_upper in row['Symbol'].upper():
             return row
@@ -1033,7 +1037,6 @@ def _find_match(needle_upper, all_bulls, all_bears, rejected):
     return None
 
 def _describe_match(mode, value, match, cutoff_dt):
-    """Returns (symbol, status, detail_text) for a matched row, or a NOT FOUND placeholder."""
     if match is not None:
         symbol = match['Symbol']
         status = match['State'] if match.get('State', 'NONE') != "NONE" else f"REJECTED ({match.get('RejectReason', 'unknown')})"
@@ -1049,19 +1052,6 @@ def _describe_match(mode, value, match, cutoff_dt):
     return symbol, status, detail
 
 def check_watch_alerts(mode, watch_value, cutoff_dt, all_bulls, all_bears, rejected):
-    """
-    Optional single-symbol/strike watch. WATCH_VALUE (set via --watch) is
-    matched case-insensitively as a substring against each row's 'Symbol' --
-    so a bare strike like '25000' or a full tradingsymbol like
-    'NIFTY25000CE' both work. The matched row's status (ACTIVE BUY /
-    ACTIVE SELL / COILING / STOPPED / a rejection reason / NOT FOUND) is
-    compared against the last run's status for that same watch value,
-    persisted in WATCH_STATE_FILE. An email is sent ONLY when the status
-    changed (or on the very first run that sees this watch value at all).
-    This entire function is only ever called when WATCH_VALUE is non-empty,
-    so none of it runs -- no email, no state file read/write -- unless
-    --watch was explicitly passed.
-    """
     needle = str(watch_value).strip().upper()
     if not needle:
         return
@@ -1090,29 +1080,6 @@ def check_watch_alerts(mode, watch_value, cutoff_dt, all_bulls, all_bears, rejec
     _save_watch_state(WATCH_STATE_FILE, state)
 
 def check_order_placed(mode, order_value, cutoff_dt, all_bulls, all_bears, rejected):
-    """
-    Env-driven order tracker. After placing an order off a previous run's
-    results -- a CE/PE option strike, an F&O stock, or a plain cash-equity
-    symbol -- put that exact value (or any substring unique enough to match
-    only it, e.g. just the strike '25000CE') into the OrderPlaced
-    environment variable before the next run.
-
-      * OrderPlaced empty/unset -> this function is never called. The run
-        just scans and prints its normal results, exactly as before.
-      * OrderPlaced non-empty  -> this run looks that value up among its own
-        results (same matching as --watch: live bulls, then live bears,
-        then the graveyard) and emails its current status -- LTP, Day%,
-        Move% off anchor, and whether it's [ACTIVE BUY]/[ACTIVE SELL]/
-        [COILING]/[STOPPED], or its graveyard rejection reason if it never
-        became a live setup, or NOT FOUND if nothing matched this run.
-
-    By default (ORDER_EMAIL_ONLY_ON_CHANGE = False) an email goes out on
-    EVERY run that has OrderPlaced set, so a position you're holding gets a
-    fresh status email each scheduled run. Set ORDER_EMAIL_ONLY_ON_CHANGE =
-    True to instead only email when the status changes since the last run
-    (tracked separately in ORDER_STATE_FILE, so it never shares state with
-    --watch).
-    """
     needle = str(order_value).strip().upper()
     if not needle:
         return
@@ -1230,23 +1197,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     ACTIVE_BEAR_STATES = ("[ACTIVE SELL]", "[COILING]")
 
     def _merge(first_row, last_row, direction):
-        """
-        Build the display row for one direction (BULL/BEAR) of one symbol.
-        Identity -- Seen time ('CheckpointTime'), Anchor time, Anchor price --
-        comes from the FIRST checkpoint where this symbol genuinely qualified
-        for `direction` (AnchorDir matches AND State was active). That is what
-        "sort by which occurred earlier" ranks on. Every OTHER field (LTP,
-        Day%, indicator triads, current State) is refreshed from the LATEST
-        checkpoint evaluated, so the row reflects what's true NOW rather than
-        what was true back when the anchor first appeared. If the anchor is
-        no longer alive as of the latest checkpoint, State is overridden to
-        [STOPPED] instead of silently keeping a stale ACTIVE/COILING tag.
-        Note: because each checkpoint independently re-runs the anchor search
-        over the data available up to that point, 'Killed' time/price (when
-        shown) reflect whatever the LATEST checkpoint's search concluded --
-        the architecture has no persistent handle on "this exact anchor" across
-        checkpoints, only on "was this symbol genuinely bull/bear at time X".
-        """
         row = dict(last_row)
         row['CheckpointTime'] = first_row['CheckpointTime']
         row['ActiveAnchor'] = first_row['ActiveAnchor']
@@ -1263,8 +1213,8 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
 
     bulls, bears, rejected = [], [], []
     for symbol, rows in by_symbol.items():
-        rows.sort(key=lambda r: r['CheckpointTime'])    # chronological, earliest first
-        last_row = rows[-1]                             # freshest available data for this symbol
+        rows.sort(key=lambda r: r['CheckpointTime'])
+        last_row = rows[-1]
 
         bull_rows = [r for r in rows if r['AnchorDir'] == "BULL" and r['State'] in ACTIVE_BULL_STATES]
         bear_rows = [r for r in rows if r['AnchorDir'] == "BEAR" and r['State'] in ACTIVE_BEAR_STATES]
@@ -1275,22 +1225,16 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             bears.append(_merge(bear_rows[0], last_row, "BEAR"))
         if not bull_rows and not bear_rows:
             row = dict(last_row)
-            row['CheckpointTime'] = rows[0]['CheckpointTime']   # earliest time this symbol was ever evaluated
+            row['CheckpointTime'] = rows[0]['CheckpointTime']
             rejected.append(row)
 
     true_bull_count = len(bulls)
     true_bear_count = len(bears)
 
-    # Rank LIVE setups (ACTIVE/COILING) ahead of [STOPPED] ones first, THEN by earliest
-    # Seen time within each group. Sorting by Seen time alone (old behavior) let a pile of
-    # long-dead, already-stopped-out anchors -- which had more of the day to both fire AND
-    # get killed, so they skew toward earlier Seen times -- outrank and bury genuinely live
-    # setups that simply fired later, and the TOP_N truncation below could then drop live
-    # setups entirely in favor of historical ones.
     bulls.sort(key=lambda r: (r['State'] == "[STOPPED]", r['CheckpointTime'], r['State'] != "[ACTIVE BUY]", -r['DayChangePct']))
     bears.sort(key=lambda r: (r['State'] == "[STOPPED]", r['CheckpointTime'], r['State'] != "[ACTIVE SELL]", r['DayChangePct']))
 
-    all_bulls, all_bears = list(bulls), list(bears)   # full pre-truncation lists, for --watch / OrderPlaced below
+    all_bulls, all_bears = list(bulls), list(bears)
 
     bulls = bulls[:TOP_N_BUYERS]
     bears = bears[:TOP_N_SELLERS]
@@ -1407,9 +1351,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     if WATCH_VALUE:
         check_watch_alerts(mode, WATCH_VALUE, cutoff_dt, all_bulls, all_bears, rejected)
 
-    # OrderPlaced: purely env-driven, independent of --watch. Empty/unset -> no-op,
-    # the run above already printed its results and nothing else happens. Non-empty
-    # -> look that value up in this run's results and email its current status.
     order_value = os.environ.get(ORDER_PLACED_ENV, "").strip()
     if order_value:
         check_order_placed(mode, order_value, cutoff_dt, all_bulls, all_bears, rejected)
