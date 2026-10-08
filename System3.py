@@ -66,7 +66,7 @@ ALIAS_TO_INDEX = {a: idx for idx, cfg in INDEX_CONFIG.items() for a in cfg["alia
 
 HA_ATR_MULTIPLIERS = [1, 2, 3, 5]
 ATR_BASIS_PERIOD = 14
-ATR_BASIS_TF = "60min"
+ATR_BASIS_TF = "15min"
 MIN_ATR_PCT = 0.001
 
 TOP_N_BUYERS = 50
