@@ -100,7 +100,7 @@ HA_ATR_MULTIPLIERS = [1, 2, 3, 5]
 ATR_BASIS_PERIOD = 14
 # FIX 1: "375min" = ONE NSE session (09:15-15:30) and buckets are anchored to the open (it was "390min"
 # anchored to midnight, which cut every session in two at 13:00).
-ATR_BASIS_TF = "375min"
+ATR_BASIS_TF = "15min"
 ATR_MIN_BARS = 5            # FIX 1: fewer completed sessions than this => "short history" (unless pinned)
 MIN_ATR_PCT = 0.001
 # FIX 5: unconditional trailing floor, in ATRs below the TRUE peak since the anchor (0 = disabled).
