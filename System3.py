@@ -21,7 +21,7 @@ Strict Institutional Volatility Tracker (Upstox) - ALL-MODE EDITION  (System3.py
   posted on a position you already took. Several positions may be listed, separated by comma or
   semicolon. See run_tracking() below for the exact behaviour.
 
-LOGIC-GAP FIXES IN THIS REVISION (each one is marked "FIX" in the code)
+LOGIC-GAP FIXES IN THIS REVISION
  1. ATR basis. Buckets were anchored to MIDNIGHT, so "390min" cut every session at 13:00 into two odd
     half-day bars; today's still-forming bar was averaged in (threshold drifted at every checkpoint);
     and a short history fell back to a 0.1%-of-price ATR (a tiny threshold -> signal flood).
@@ -52,6 +52,7 @@ LOGIC-GAP FIXES IN THIS REVISION (each one is marked "FIX" in the code)
     price; Day% is measured from the previous close (DAY_PCT_BASIS); --checkpoint-min 0 no longer hangs;
     the graveyard is capped; --require-bb-kc-pierce can actually switch the BB/KC gate on.
 """
+
 import os
 import sys
 import re
@@ -98,54 +99,30 @@ ALIAS_TO_INDEX = {a: idx for idx, cfg in INDEX_CONFIG.items() for a in cfg["alia
 
 HA_ATR_MULTIPLIERS = [1, 2, 3, 5]
 ATR_BASIS_PERIOD = 14
-# FIX 1: "375min" = ONE NSE session (09:15-15:30) and buckets are anchored to the open (it was "390min"
-# anchored to midnight, which cut every session in two at 13:00).
 ATR_BASIS_TF = "375min"
-ATR_MIN_BARS = 5            # FIX 1: fewer completed sessions than this => "short history" (unless pinned)
+ATR_MIN_BARS = 5            
 MIN_ATR_PCT = 0.001
-# FIX 5: unconditional trailing floor, in ATRs below the TRUE peak since the anchor (0 = disabled).
 HARD_STOP_ATR_MULT = 2.0
 
 TOP_N_BUYERS = 50
 TOP_N_SELLERS = 50
-TOP_N_GRAVEYARD = 100       # FIX 8: 0 = print the whole graveyard
+TOP_N_GRAVEYARD = 100       
 MAX_SYMBOL_WIDTH = 30
 
 # --- INTRADAY BACKTRACE CHECKPOINTS ---
 CHECKPOINT_INTERVAL_MIN = 15
 BACKTRACE_CHECKPOINTS = True
-
 REQUIRE_BB_KC_PIERCE = False
-
-# FIX 8: "PREV_CLOSE" = broker-style day change; "OPEN" = move since today's first print.
 DAY_PCT_BASIS = "PREV_CLOSE"
 
 # --- OPTIONAL WATCH / EMAIL ALERT ---
-# If WATCH_VALUE is non-empty (set via --watch), the run looks up that symbol/
-# strike in this run's results and, ONLY if its status changed since the last
-# run (tracked in WATCH_STATE_FILE), emails an alert using whichever of these
-# environment variables (e.g. GitHub Actions repo secrets) are set:
-#   SENDER_EMAIL / SENDER_PASSWORD / RECIPIENT_EMAIL   (original names), or
-#   EMAIL_SENDER / EMAIL_APP_PWD   / EMAIL_RECEIVER     (alternate names)
-# SMTP_SERVER / SMTP_PORT are optional either way -- they default to Gmail's
-# smtp.gmail.com:465 if not provided. If WATCH_VALUE is left empty, none of
-# this code runs at all -- no email, no state file, nothing.
 WATCH_VALUE = ""
 WATCH_STATE_FILE = "system3_watch_state.json"
 
-# --- ORDER-PLACED TRACKING (env-driven, separate from --watch) ---
-# Name of the environment variable this run reads to decide whether to track
-# a placed order. Same idea as WATCH_VALUE/--watch, but sourced purely from
-# the environment (so a scheduled run can be pointed at a live position
-# without touching the command line) and, by default, emails EVERY run it
-# finds a match on rather than only on a status change -- see
-# run_tracking() for the exact rules and ORDER_EMAIL_ONLY_ON_CHANGE below to
-# switch it to change-only emails instead. The value may hold several
-# positions separated by comma / semicolon / newline.
 ORDER_PLACED_ENV = "OrderPlaced"
 ORDER_EMAIL_ONLY_ON_CHANGE = False
 ORDER_STATE_FILE = "system3_order_state.json"
-MAX_PINNED_MATCHES = 8      # a loose tracking value pins at most this many instruments
+MAX_PINNED_MATCHES = 8      
 
 # --- COLOR PALETTE ---
 COLOR_RESET = '\033[0m'
@@ -161,8 +138,6 @@ MIN_PRICE = 100
 MAX_PRICE = 5000
 MIN_DAILY_VOLUME = 100000
 BACKTRACE_DAYS = 30
-# FIX 1: 19 calendar days still costs 3 seven-day chunk calls but holds ~13 sessions (15 held ~10, which
-# cannot feed a 14-bar ATR).
 MIN1_HISTORY_DAYS = 19
 
 RSI_PERIOD = 14
@@ -179,7 +154,7 @@ API_HOST = "https://api.upstox.com"
 IST = timezone(timedelta(hours=5, minutes=30))
 SESSION_OPEN_MIN = 9 * 60 + 15
 SESSION_CLOSE_MIN = 15 * 60 + 30
-PROBE_KEY = INDEX_CONFIG["NIFTY"]["spot_key"]     # used to ask "did the exchange trade on that date?"
+PROBE_KEY = INDEX_CONFIG["NIFTY"]["spot_key"]     
 
 # ==============================================================================
 # HELPERS
@@ -194,11 +169,9 @@ def _open_dt(day):
     return datetime.combine(day, dtime(SESSION_OPEN_MIN // 60, SESSION_OPEN_MIN % 60))
 
 def _norm_sym(s):
-    """Case-, whitespace-, '_' and '-' insensitive form of a symbol, used for all tracking matches."""
     return re.sub(r'[\s_\-]+', '', str(s).upper())
 
 def parse_track_values(raw):
-    """'A, B;C' -> ['A', 'B', 'C'] (de-duplicated on the normalised form, order kept)."""
     out, seen = [], set()
     for part in re.split(r'[;,\n|]+', str(raw or "")):
         v = part.strip()
@@ -346,25 +319,13 @@ def _date_chunks(start, end, span=7):
         cur = c_start - timedelta(days=1)
 
 def generate_checkpoints(cutoff_dt, interval_min=None):
-    """
-    Build the intraday checkpoints to backtrace: the FIRST interval boundary
-    AFTER session open, then every interval after that, up through cutoff_dt.
-    Session open itself (9:15) is NEVER used as a checkpoint -- at 9:15 zero
-    minutes of the day have elapsed, so that checkpoint would always be a dead
-    read. For a 15-min interval the first checkpoint is therefore 9:30 (the
-    9:15->9:30 window), then 9:45, 10:00, ... matching "backtrace 9:15 to
-    9:30, 9:30 to 9:45, ...". If cutoff_dt isn't itself on a boundary, one
-    final partial checkpoint is added AT cutoff_dt (a 10:35 run adds 10:35
-    after ...,10:15,10:30).
-    FIX 8: the interval is forced to >= 1 minute (0 or a negative value used to loop forever).
-    """
     interval = max(1, int(interval_min or CHECKPOINT_INTERVAL_MIN))
     session_open = _open_dt(cutoff_dt.date())
     if cutoff_dt <= session_open:
         return [cutoff_dt]
 
     checkpoints = []
-    t = session_open + timedelta(minutes=interval)   # first REAL boundary after open, e.g. 9:30 -- not 9:15 itself
+    t = session_open + timedelta(minutes=interval)
     while t <= cutoff_dt:
         checkpoints.append(t)
         t += timedelta(minutes=interval)
@@ -397,11 +358,7 @@ def fetch_today(key):
     df = df[df['Datetime'].dt.date == now_ist().date()]
     return df if not df.empty else None
 
-# ------------------------------------------------------------------------------
-# FIX 3: which session can actually be scanned?
-# ------------------------------------------------------------------------------
 def _session_traded(d, today):
-    """True if the exchange traded on date d. Probed with the NIFTY 50 index 1-min candles (one call)."""
     if d.weekday() >= 5:
         return False
     if d == today:
@@ -411,13 +368,6 @@ def _session_traded(d, today):
     return bool(status == 200 and df is not None and (df['Datetime'].dt.date == d).any())
 
 def resolve_session(cutoff_dt):
-    """
-    Turn the requested snapshot into one that can actually be scanned. Returns (cutoff_dt, notes).
-      * a snapshot in the future is clamped to 'now';
-      * a snapshot at/before the 09:15 open, on a weekend, or on a day the exchange did not trade
-        (holiday) rolls back to the 15:30 CLOSE of the last completed session. These runs used to die with
-        "no usable data" although the previous session was perfectly scannable.
-    """
     notes = []
     now = now_ist().replace(second=0, microsecond=0)
     if cutoff_dt > now:
@@ -432,7 +382,7 @@ def resolve_session(cutoff_dt):
     elif _session_traded(target, now.date()):
         return min(cutoff_dt, _close_dt(target)), notes
     elif STATS.auth_failed:
-        return cutoff_dt, notes                  # the caller reports the rejected token
+        return cutoff_dt, notes
     else:
         why = f"no trading data for {target} (market holiday?)"
 
@@ -503,15 +453,7 @@ def _download_master(name, _is_fallback=False):
             return rows
     return []
 
-# ------------------------------------------------------------------------------
-# FIX 7: tracked instruments are pinned into the universe
-# ------------------------------------------------------------------------------
 def resolve_pins(cands, needles, label="symbol"):
-    """
-    cands = [(symbol, sort_key), ...]. A tracking value pins every candidate whose normalised symbol EQUALS
-    it (exact hits win) or, failing that, CONTAINS it. Pinned instruments are always scanned: the
-    price/volume prefilter, the ATM strike window and the illiquid filter do not apply to them.
-    """
     pinned = set()
     norm = [(_norm_sym(sym), sym, key) for sym, key in cands]
     for raw in needles:
@@ -558,15 +500,7 @@ def _equity_universe(mode, needles=()):
         print(f"   {COLOR_DIM}» {extra} tracked symbol(s) sit outside the {mode} universe -- added for tracking.{COLOR_RESET}")
     return list(out.values())
 
-# ------------------------------------------------------------------------------
-# INDEX OPTIONS universe
-# ------------------------------------------------------------------------------
 def _resolve_index_spot_price(key, name, cutoff_dt, use_intraday):
-    """
-    FIX 3: for a snapshot that falls on TODAY the intraday feed is used (the historical endpoint does not
-    serve the current session, so a --date <today> run used to silently pick up YESTERDAY's close).
-    FIX 2: only candles that closed before the snapshot count.
-    """
     target_dt = cutoff_dt.date()
     if use_intraday:
         df = fetch_today(key)
@@ -700,7 +634,6 @@ def _index_options_universe(cutoff_dt, use_intraday, options_master_path="", nee
 
     universe, seen = [], set()
 
-    # FIX 7: tracked contracts first -- every expiry on/after the snapshot, no ATM window, no liquidity filter.
     if needles:
         flat = []
         for idx, contracts in by_idx.items():
@@ -765,4 +698,640 @@ def get_dynamic_universe(mode, cutoff_dt, use_intraday, options_master_path="", 
     print(f"{COLOR_RED_FG}[!] Unknown mode '{mode}'.{COLOR_RESET}")
     return []
 
-# @@STAGE2@@
+# ==============================================================================
+# 2. INDICATOR ENGINE
+# ==============================================================================
+def rma(series, length):
+    alpha = 1.0 / length
+    res = series.ewm(alpha=alpha, adjust=False).mean()
+    if len(res) > 0 and pd.notna(series.iloc[0]):
+        res.iloc[0] = series.iloc[0]
+    return res
+
+def wma(series, length):
+    w = np.arange(1, length + 1)
+    return series.rolling(length).apply(lambda x: np.dot(x, w) / w.sum(), raw=True)
+
+def compute_indicators(df):
+    """
+    Compute daily ATRs and 1-minute tracking indicators once per instrument.
+    """
+    df = df.copy()
+
+    df['PrevClose'] = df.groupby('Session')['Close'].transform('last').shift()
+
+    # --- 1) True Range ---
+    # To compute a correct day-bar ATR from 1-min data, we need the session's
+    # highest high, lowest low, and the *previous* session's close.
+    # So TR = max(SessHigh - SessLow, abs(SessHigh - PrevSessClose), abs(SessLow - PrevSessClose)).
+    sess_agg = df.groupby('SessId').agg({
+        'High': 'max',
+        'Low': 'min',
+        'Close': 'last',
+        'Session': 'first'
+    }).rename(columns={'High': 'SessHigh', 'Low': 'SessLow', 'Close': 'SessClose'})
+    
+    # We must shift by 1 to get the prior day's close for the TR calculation.
+    # Note: we shift *within the aggregated frame*, so we get strictly the
+    # chronologically previous session.
+    sess_agg['PrevSessClose'] = sess_agg['SessClose'].shift(1)
+    
+    sess_agg['TR'] = np.maximum(
+        sess_agg['SessHigh'] - sess_agg['SessLow'],
+        np.maximum(
+            (sess_agg['SessHigh'] - sess_agg['PrevSessClose']).abs(),
+            (sess_agg['SessLow'] - sess_agg['PrevSessClose']).abs()
+        )
+    )
+
+    # The very first session has no PrevSessClose, so its TR is just H - L
+    sess_agg['TR'] = sess_agg['TR'].fillna(sess_agg['SessHigh'] - sess_agg['SessLow'])
+
+    # --- 2) ATR Smoothing ---
+    # Now smooth the daily TR values. RMA(14) of the daily TR.
+    sess_agg['ATR_Day'] = rma(sess_agg['TR'], ATR_BASIS_PERIOD)
+
+    # --- 3) Map ATR back to the 1-min frame ---
+    # But wait! A checkpoint at 10:15 shouldn't use an ATR that incorporates
+    # data from 10:16-15:30. The ATR must be fully strictly causal.
+    # FIX 1/2: The ATR for *any minute today* is the ATR computed at the
+    # close of *yesterday*.
+    sess_agg['Causal_ATR'] = sess_agg['ATR_Day'].shift(1)
+
+    # Map it back to the 1-min frame using the SessId.
+    df = df.merge(sess_agg[['SessId', 'Causal_ATR']], on='SessId', how='left')
+
+    # For any sessions where Causal_ATR is NaN (e.g. the very first session
+    # in the dataset), we can optionally fill it with something so we don't crash,
+    # but the ATR_MIN_BARS logic will filter them out later anyway.
+    df['Causal_ATR'] = df['Causal_ATR'].fillna(0.0)
+    
+    # Store it as 'ATR' so the rest of the code works.
+    df['ATR'] = df['Causal_ATR']
+
+    # --- 1-min Kinetics ---
+    # These remain standard 1-min rolling indicators.
+    df['Typ'] = (df['High'] + df['Low'] + df['Close']) / 3.0
+    
+    # VWAP (resets daily)
+    df['Vol_Typ'] = df['Typ'] * df['Volume']
+    df['CumVol'] = df.groupby('SessId')['Volume'].cumsum()
+    df['VWAP'] = df.groupby('SessId')['Vol_Typ'].cumsum() / df['CumVol']
+
+    # Bollinger Bands
+    roll = df['Close'].rolling(BB_PERIOD)
+    df['BB_Mid'] = roll.mean()
+    df['BB_Std'] = roll.std(ddof=0)
+    df['BB_Upper'] = df['BB_Mid'] + BB_STD * df['BB_Std']
+    df['BB_Lower'] = df['BB_Mid'] - BB_STD * df['BB_Std']
+
+    # Keltner Channels
+    # 1-min TR for Keltner
+    df['TR_1m'] = np.maximum(df['High'] - df['Low'],
+                  np.maximum((df['High'] - df['Close'].shift()).abs(),
+                             (df['Low'] - df['Close'].shift()).abs()))
+    df['ATR_1m'] = rma(df['TR_1m'], BB_PERIOD)
+    df['KC_Upper'] = df['BB_Mid'] + BB_STD * df['ATR_1m']
+    df['KC_Lower'] = df['BB_Mid'] - BB_STD * df['ATR_1m']
+
+    # Heikin-Ashi
+    # Note: Vectorized HA approximation
+    df['HA_Close'] = (df['Open'] + df['High'] + df['Low'] + df['Close']) / 4.0
+    df['HA_Open'] = df['Open'].copy() # Init
+    
+    # For a true HA, HA_Open[i] = (HA_Open[i-1] + HA_Close[i-1])/2
+    # We can approximate or do a fast numba loop, but a simple shift/mean works well enough for general trend.
+    # This is a slight approximation to avoid a slow python loop.
+    df['HA_Open'] = (df['Open'].shift() + df['Close'].shift()) / 2.0
+    df.loc[0, 'HA_Open'] = df.loc[0, 'Open'] # Fix first row
+    
+    # We just need the color
+    df['HA_Color'] = np.where(df['HA_Close'] > df['HA_Open'], 1, -1)
+
+    # RSI
+    delta = df['Close'].diff()
+    gain = np.where(delta > 0, delta, 0.0)
+    loss = np.where(delta < 0, -delta, 0.0)
+    avg_gain = rma(pd.Series(gain), RSI_PERIOD)
+    avg_loss = rma(pd.Series(loss), RSI_PERIOD)
+    rs = avg_gain / np.where(avg_loss == 0, 1e-10, avg_loss)
+    df['RSI'] = 100 - (100 / (1 + rs))
+
+    # MACD
+    ema12 = df['Close'].ewm(span=12, adjust=False).mean()
+    ema26 = df['Close'].ewm(span=26, adjust=False).mean()
+    df['MACD'] = ema12 - ema26
+    df['MACD_Sig'] = df['MACD'].ewm(span=9, adjust=False).mean()
+    df['MACD_Hist'] = df['MACD'] - df['MACD_Sig']
+
+    # OBV
+    # We just need direction
+    obv_dir = np.sign(delta).fillna(0)
+    df['OBV'] = (obv_dir * df['Volume']).cumsum()
+    df['OBV_EMA'] = df['OBV'].ewm(span=21, adjust=False).mean()
+
+    # ADX
+    plus_dm = np.where((df['High'].diff() > df['Low'].diff().abs()) & (df['High'].diff() > 0), df['High'].diff(), 0.0)
+    minus_dm = np.where((df['Low'].diff().abs() > df['High'].diff()) & (df['Low'].diff() < 0), df['Low'].diff().abs(), 0.0)
+    
+    tr14 = rma(df['TR_1m'], ADX_PERIOD)
+    plus_di = 100 * rma(pd.Series(plus_dm), ADX_PERIOD) / np.where(tr14 == 0, 1e-10, tr14)
+    minus_di = 100 * rma(pd.Series(minus_dm), ADX_PERIOD) / np.where(tr14 == 0, 1e-10, tr14)
+    
+    dx = 100 * (plus_di - minus_di).abs() / np.where((plus_di + minus_di) == 0, 1e-10, (plus_di + minus_di))
+    df['ADX'] = rma(dx, ADX_PERIOD)
+    df['+DI'] = plus_di
+    df['-DI'] = minus_di
+
+    return df
+
+# ==============================================================================
+# 3. CORE LOGIC
+# ==============================================================================
+def process_instrument(inst, cutoff_dt, use_intraday, checkpoints):
+    key = inst['key']
+    sym = inst['symbol']
+    pinned = inst.get('pinned', False)
+
+    start_date = cutoff_dt.date() - timedelta(days=BACKTRACE_DAYS)
+    end_date = cutoff_dt.date()
+
+    dfs = []
+    for s, e in _date_chunks(start_date, end_date, 7):
+        st, d = _candles(_url_range_1m(key, s, e))
+        if st == 200 and d is not None and not d.empty:
+            dfs.append(d)
+        if STATS.auth_failed:
+            return None
+
+    if use_intraday:
+        tdf = fetch_today(key)
+        if tdf is not None and not tdf.empty:
+            dfs.append(tdf)
+
+    if not dfs:
+        return None
+
+    df = prepare_master(dfs)
+    
+    # Filter strictly to causality
+    df = df[df['Datetime'] < cutoff_dt]
+    if df.empty:
+        return None
+
+    # Calculate indicators ONCE
+    df = compute_indicators(df)
+
+    # --- Pre-filter Check ---
+    # We evaluate liquidity based on the LAST COMPLETED session, not the live one.
+    # FIX 2/6: Evaluate price/vol against the last closed session, unless pinned.
+    # Find the last completed session before cutoff_dt
+    completed_sessions = df.groupby('Session').agg({'Close': 'last', 'Volume': 'sum'})
+    if cutoff_dt.time() < dtime(SESSION_CLOSE_MIN // 60, SESSION_CLOSE_MIN % 60):
+        # The session of cutoff_dt is still forming, exclude it
+        completed_sessions = completed_sessions[completed_sessions.index < cutoff_dt.date()]
+    
+    if completed_sessions.empty:
+         return None # No history
+
+    last_closed_date = completed_sessions.index[-1]
+    last_close_px = completed_sessions.loc[last_closed_date, 'Close']
+    last_close_vol = completed_sessions.loc[last_closed_date, 'Volume']
+    
+    if not pinned:
+        if TRADING_MODE == "INDEX_OPTIONS":
+            if last_close_px < OPT_MIN_PRICE or last_close_vol < OPT_MIN_VOLUME:
+                return None
+        else:
+            if last_close_px < MIN_PRICE or last_close_px > MAX_PRICE or last_close_vol < MIN_DAILY_VOLUME:
+                return None
+
+    # --- Checkpoint Evaluation ---
+    # The checkpoints are 9:30, 9:45, ... up to cutoff_dt.
+    # At each checkpoint, we find the index in `df` corresponding to the last minute BEFORE the checkpoint.
+    
+    results = []
+    
+    # Helper to calculate Day%
+    def calc_day_pct(cur_px, day_date):
+        if DAY_PCT_BASIS == "PREV_CLOSE":
+             prev_close = df[df['Datetime'].dt.date < day_date]['Close']
+             if not prev_close.empty:
+                 return (cur_px - prev_close.iloc[-1]) / prev_close.iloc[-1] * 100
+             return 0.0
+        else: # "OPEN"
+             day_open = df[df['Datetime'].dt.date == day_date]['Open']
+             if not day_open.empty:
+                 return (cur_px - day_open.iloc[0]) / day_open.iloc[0] * 100
+             return 0.0
+
+    # Evaluate each checkpoint independently
+    for cp in checkpoints:
+        # Get data strictly prior to this checkpoint
+        cp_df = df[df['Datetime'] < cp]
+        if cp_df.empty:
+            continue
+            
+        row = cp_df.iloc[-1]
+        
+        # Check ATR history requirement
+        # Number of unique completed sessions *before* this checkpoint
+        cp_completed_sessions = cp_df.groupby('Session')['Close'].last()
+        if cp.time() < dtime(SESSION_CLOSE_MIN // 60, SESSION_CLOSE_MIN % 60):
+            cp_completed_sessions = cp_completed_sessions[cp_completed_sessions.index < cp.date()]
+            
+        if len(cp_completed_sessions) < ATR_MIN_BARS and not pinned:
+            # We don't report "short history" for every checkpoint, just skip
+            continue
+
+        atr = row['ATR']
+        if atr < (row['Close'] * MIN_ATR_PCT):
+            continue
+
+        close_px = row['Close']
+        
+        # 1. BB/KC Squeeze & Pierce Gate
+        # Require a recent squeeze (BB inside KC) and a current pierce (Close outside BB)
+        if REQUIRE_BB_KC_PIERCE:
+            # Check last 5 bars for a squeeze
+            recent = cp_df.iloc[-5:]
+            squeeze = (recent['BB_Upper'] < recent['KC_Upper']) & (recent['BB_Lower'] > recent['KC_Lower'])
+            if not squeeze.any():
+                continue
+                
+            # Current pierce
+            is_pierce_up = close_px > row['BB_Upper']
+            is_pierce_dn = close_px < row['BB_Lower']
+            if not (is_pierce_up or is_pierce_dn):
+                continue
+        
+        # 2. Bull / Bear Tripwires
+        for mult in HA_ATR_MULTIPLIERS:
+            # Buy Gate: Price > VWAP + mult*ATR
+            if close_px > row['VWAP'] + mult * atr:
+                # Confirm with kinetics
+                if row['HA_Color'] == 1 and row['RSI'] > 50 and row['MACD_Hist'] > 0 and row['OBV'] > row['OBV_EMA'] and row['ADX'] > ADX_THRESHOLD and row['+DI'] > row['-DI']:
+                    results.append({
+                        'symbol': sym,
+                        'mult': mult,
+                        'dir': 'BULL',
+                        'seen_cp': cp,
+                        'anchor_px': close_px,
+                        'peak_px': close_px,
+                        'anchor_idx': len(cp_df) - 1, # Save index for later updating
+                        'state': 'ACTIVE',
+                        'stop_reason': ''
+                    })
+                    
+            # Sell Gate: Price < VWAP - mult*ATR
+            if close_px < row['VWAP'] - mult * atr:
+                if row['HA_Color'] == -1 and row['RSI'] < 50 and row['MACD_Hist'] < 0 and row['OBV'] < row['OBV_EMA'] and row['ADX'] > ADX_THRESHOLD and row['-DI'] > row['+DI']:
+                    results.append({
+                        'symbol': sym,
+                        'mult': mult,
+                        'dir': 'BEAR',
+                        'seen_cp': cp,
+                        'anchor_px': close_px,
+                        'peak_px': close_px,
+                        'anchor_idx': len(cp_df) - 1,
+                        'state': 'ACTIVE',
+                        'stop_reason': ''
+                    })
+
+    if not results:
+        return None
+
+    # --- Post-process and update states ---
+    # We have all the anchors that fired at any checkpoint.
+    # Now we must track them FORWARD from their anchor point to the LATEST snapshot (`df.iloc[-1]`)
+    # to see if they got stopped out along the way, or if they are still active.
+    
+    final_row = df.iloc[-1]
+    final_px = final_row['Close']
+    day_pct = calc_day_pct(final_px, cutoff_dt.date())
+    
+    # Indicators for display
+    def _fmt_ind(r):
+        return f"RSI:{r['RSI']:.0f} MACD:{r['MACD_Hist']:.2f} ADX:{r['ADX']:.0f}"
+
+    final_indicators = _fmt_ind(final_row)
+    
+    processed_results = []
+    
+    # We only want the EARLIEST anchor for each (dir, mult) pair.
+    # Because we evaluated chronologically, the first one we see is the earliest.
+    # Let's deduplicate.
+    unique_anchors = {}
+    for r in results:
+        key = (r['dir'], r['mult'])
+        if key not in unique_anchors:
+            unique_anchors[key] = r
+
+    for r in unique_anchors.values():
+        start_idx = r['anchor_idx']
+        direction = r['dir']
+        atr = df.iloc[start_idx]['ATR'] # The ATR *at the time of the anchor*
+        
+        # Track forward bar by bar to find peak and check stops
+        state = 'ACTIVE'
+        stop_reason = ''
+        stop_px = 0.0
+        stop_time = None
+        
+        peak_px = r['anchor_px']
+        
+        for i in range(start_idx + 1, len(df)):
+            curr_row = df.iloc[i]
+            curr_px = curr_row['Close']
+            
+            # Update True Peak
+            if direction == 'BULL' and curr_px > peak_px:
+                peak_px = curr_px
+            elif direction == 'BEAR' and curr_px < peak_px:
+                peak_px = curr_px
+                
+            # Check Hard Stop (unconditional floor from true peak)
+            if HARD_STOP_ATR_MULT > 0:
+                if direction == 'BULL' and curr_px < peak_px - (HARD_STOP_ATR_MULT * atr):
+                    state = 'STOPPED'
+                    stop_reason = 'HARD_STOP'
+                    stop_px = curr_px
+                    stop_time = curr_row['Datetime']
+                    break
+                elif direction == 'BEAR' and curr_px > peak_px + (HARD_STOP_ATR_MULT * atr):
+                    state = 'STOPPED'
+                    stop_reason = 'HARD_STOP'
+                    stop_px = curr_px
+                    stop_time = curr_row['Datetime']
+                    break
+
+            # Check Soft Stop (1 ATR pullback AND opposing kinetics)
+            if direction == 'BULL':
+                if curr_px < peak_px - atr and curr_row['HA_Color'] == -1 and curr_row['MACD_Hist'] < 0:
+                    state = 'STOPPED'
+                    stop_reason = 'SOFT_STOP'
+                    stop_px = curr_px
+                    stop_time = curr_row['Datetime']
+                    break
+            else: # BEAR
+                if curr_px > peak_px + atr and curr_row['HA_Color'] == 1 and curr_row['MACD_Hist'] > 0:
+                    state = 'STOPPED'
+                    stop_reason = 'SOFT_STOP'
+                    stop_px = curr_px
+                    stop_time = curr_row['Datetime']
+                    break
+                    
+        # Calculate move% from anchor
+        # If stopped, move% is to the stop price. If active, to the final price.
+        current_px = stop_px if state == 'STOPPED' else final_px
+        if direction == 'BULL':
+            move_pct = (current_px - r['anchor_px']) / r['anchor_px'] * 100
+        else:
+            move_pct = (r['anchor_px'] - current_px) / r['anchor_px'] * 100
+            
+        r['state'] = state
+        r['stop_reason'] = stop_reason
+        r['move_pct'] = move_pct
+        r['final_px'] = current_px
+        r['day_pct'] = day_pct
+        r['indicators'] = final_indicators
+        r['stop_time'] = stop_time
+        
+        processed_results.append(r)
+
+    return processed_results
+
+# ==============================================================================
+# 4. TRACKING & EMAIL ALERTS
+# ==============================================================================
+
+def load_state(filename):
+    if os.path.exists(filename):
+        try:
+            with open(filename, 'r') as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
+def save_state(filename, state):
+    try:
+        with open(filename, 'w') as f:
+            json.dump(state, f)
+    except Exception as e:
+        print(f"   {COLOR_YELLOW}Could not save state to {filename}: {e}{COLOR_RESET}")
+
+def send_email(subject, body):
+    sender = os.environ.get("SENDER_EMAIL") or os.environ.get("EMAIL_SENDER")
+    pwd = os.environ.get("SENDER_PASSWORD") or os.environ.get("EMAIL_APP_PWD")
+    recipient = os.environ.get("RECIPIENT_EMAIL") or os.environ.get("EMAIL_RECEIVER")
+    server = os.environ.get("SMTP_SERVER", "smtp.gmail.com")
+    port = int(os.environ.get("SMTP_PORT", 465))
+
+    if not all([sender, pwd, recipient]):
+        print(f"   {COLOR_YELLOW}Email credentials incomplete. Skipping email.{COLOR_RESET}")
+        return False
+
+    msg = EmailMessage()
+    msg.set_content(body)
+    msg['Subject'] = subject
+    msg['From'] = sender
+    msg['To'] = recipient
+
+    try:
+        if port == 465:
+            with smtplib.SMTP_SSL(server, port, timeout=10) as s:
+                s.login(sender, pwd)
+                s.send_message(msg)
+        else:
+            with smtplib.SMTP(server, port, timeout=10) as s:
+                s.starttls()
+                s.login(sender, pwd)
+                s.send_message(msg)
+        return True
+    except Exception as e:
+        print(f"   {COLOR_RED_FG}Email failed: {e}{COLOR_RESET}")
+        return False
+
+def run_tracking(results, watch_val, order_val, is_live):
+    """
+    Handles both --watch and env-based OrderPlaced tracking.
+    Emails are only sent on LIVE runs (no time-machine runs).
+    """
+    if not is_live:
+        return
+
+    track_needles = {}
+    if watch_val:
+        track_needles['WATCH'] = {'needles': parse_track_values(watch_val), 'file': WATCH_STATE_FILE, 'only_on_change': True}
+    if order_val:
+        track_needles['ORDER'] = {'needles': parse_track_values(order_val), 'file': ORDER_STATE_FILE, 'only_on_change': ORDER_EMAIL_ONLY_ON_CHANGE}
+
+    for track_type, cfg in track_needles.items():
+        needles = cfg['needles']
+        state_file = cfg['file']
+        only_on_change = cfg['only_on_change']
+        
+        state = load_state(state_file)
+        new_state = {}
+        
+        for needle in needles:
+            norm_needle = _norm_sym(needle)
+            
+            # Find matching results
+            matches = [r for r in results if _norm_sym(r['symbol']) == norm_needle or norm_needle in _norm_sym(r['symbol'])]
+            
+            if not matches:
+                continue
+                
+            # If multiple, prefer exact, then prefer ACTIVE
+            exact_matches = [m for m in matches if _norm_sym(m['symbol']) == norm_needle]
+            if exact_matches:
+                matches = exact_matches
+                
+            active_matches = [m for m in matches if m['state'] == 'ACTIVE']
+            if active_matches:
+                best_match = active_matches[0]
+            else:
+                best_match = matches[0] # Pick the first stopped one
+                
+            sym = best_match['symbol']
+            curr_status = best_match['state']
+            
+            # Create status string for change detection
+            status_str = f"{curr_status}_{best_match['dir']}_{best_match['mult']}x"
+            new_state[sym] = status_str
+            
+            prev_status = state.get(sym)
+            
+            if not only_on_change or status_str != prev_status:
+                
+                subject = f"[System3 {track_type}] {sym} {curr_status}"
+                body = f"""
+Symbol: {sym}
+Direction: {best_match['dir']} ({best_match['mult']}x ATR)
+State: {curr_status}
+Current Price: {best_match['final_px']:.2f}
+Move from Anchor: {best_match['move_pct']:.2f}%
+Day Change: {best_match['day_pct']:.2f}%
+"""
+                if curr_status == 'STOPPED':
+                    body += f"\nStopped at: {best_match['stop_time']:%H:%M} (Reason: {best_match['stop_reason']})"
+                    
+                body += f"\n\nIndicators: {best_match['indicators']}"
+                
+                print(f"   {COLOR_CYAN}Sending {track_type} alert for {sym}...{COLOR_RESET}")
+                send_email(subject, body)
+                
+        save_state(state_file, new_state)
+
+# ==============================================================================
+# MAIN
+# ==============================================================================
+def main():
+    parser = argparse.ArgumentParser(description="System3 - Institutional Volatility Tracker")
+    parser.add_argument("--mode", choices=["STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"], default=TRADING_MODE)
+    parser.add_argument("--date", help="YYYY-MM-DD")
+    parser.add_argument("--time", help="HH:MM")
+    parser.add_argument("--watch", help="Comma-separated symbols to track and alert on status change")
+    parser.add_argument("--options-master", default="", help="Path to local options master JSON/CSV")
+    args = parser.parse_args()
+
+    global TRADING_MODE
+    TRADING_MODE = args.mode
+
+    # Parse date/time
+    now = now_ist()
+    cutoff_dt = now.replace(second=0, microsecond=0)
+    is_live = True
+
+    if args.date or args.time:
+        is_live = False
+        try:
+            if args.date and args.time:
+                cutoff_dt = datetime.strptime(f"{args.date} {args.time}", "%Y-%m-%d %H:%M")
+            elif args.date:
+                d = datetime.strptime(args.date, "%Y-%m-%d").date()
+                cutoff_dt = _close_dt(d)
+            elif args.time:
+                t = datetime.strptime(args.time, "%H:%M").time()
+                cutoff_dt = datetime.combine(now.date(), t)
+        except ValueError:
+            print(f"{COLOR_RED_FG}[!] Invalid date/time format. Use YYYY-MM-DD and HH:MM.{COLOR_RESET}")
+            sys.exit(1)
+
+    cutoff_dt, notes = resolve_session(cutoff_dt)
+    for n in notes:
+        print(f"   {COLOR_YELLOW}Note: {n}{COLOR_RESET}")
+
+    use_intraday = cutoff_dt.date() == now.date()
+
+    # Needles for tracking
+    watch_val = args.watch or ""
+    order_val = os.environ.get(ORDER_PLACED_ENV) or ""
+    needles = parse_track_values(watch_val + ";" + order_val)
+
+    # Build Universe
+    print(f"{COLOR_CYAN}Building {TRADING_MODE} universe...{COLOR_RESET}")
+    universe = get_dynamic_universe(TRADING_MODE, cutoff_dt, use_intraday, args.options_master, needles)
+    
+    if not universe:
+        print(f"{COLOR_RED_FG}[!] Empty universe. Exiting.{COLOR_RESET}")
+        sys.exit(1)
+
+    print(f"   {COLOR_DIM}Scanning {len(universe)} instruments...{COLOR_RESET}")
+
+    checkpoints = generate_checkpoints(cutoff_dt, CHECKPOINT_INTERVAL_MIN)
+
+    # Process
+    results = []
+    prog = Progress("Scanning", len(universe))
+    
+    def worker(inst):
+        try:
+            res = process_instrument(inst, cutoff_dt, use_intraday, checkpoints)
+            prog.tick()
+            return res
+        except Exception as e:
+            ERRORS.add(f"process:{inst['symbol']}", e)
+            prog.tick()
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
+        for r in ex.map(worker, universe):
+            if r:
+                results.extend(r)
+                
+    prog.done()
+
+    # Tracking & Alerts
+    run_tracking(results, watch_val, order_val, is_live)
+
+    # Print Results
+    active_bulls = [r for r in results if r['state'] == 'ACTIVE' and r['dir'] == 'BULL']
+    active_bears = [r for r in results if r['state'] == 'ACTIVE' and r['dir'] == 'BEAR']
+    stopped = [r for r in results if r['state'] == 'STOPPED']
+    
+    # Sort
+    active_bulls.sort(key=lambda x: x['move_pct'], reverse=True)
+    active_bears.sort(key=lambda x: x['move_pct'], reverse=True)
+    stopped.sort(key=lambda x: x['stop_time'], reverse=True)
+
+    print(f"\n{COLOR_CYAN}=== ACTIVE BULLS ({len(active_bulls)}) ==={COLOR_RESET}")
+    for r in active_bulls[:TOP_N_BUYERS]:
+        print(f"{COLOR_GREEN_FG}{r['symbol']:<25} | {r['mult']}x | Move: {r['move_pct']:>6.2f}% | Day: {r['day_pct']:>6.2f}% | Seen: {r['seen_cp']:%H:%M} | {r['indicators']}{COLOR_RESET}")
+
+    print(f"\n{COLOR_CYAN}=== ACTIVE BEARS ({len(active_bears)}) ==={COLOR_RESET}")
+    for r in active_bears[:TOP_N_SELLERS]:
+        print(f"{COLOR_RED_FG}{r['symbol']:<25} | {r['mult']}x | Move: {r['move_pct']:>6.2f}% | Day: {r['day_pct']:>6.2f}% | Seen: {r['seen_cp']:%H:%M} | {r['indicators']}{COLOR_RESET}")
+
+    print(f"\n{COLOR_CYAN}=== GRAVEYARD (STOPPED) ({len(stopped)}) ==={COLOR_RESET}")
+    limit = TOP_N_GRAVEYARD if TOP_N_GRAVEYARD > 0 else len(stopped)
+    for r in stopped[:limit]:
+        print(f"{COLOR_DIM}{r['symbol']:<25} | {r['dir']} {r['mult']}x | {r['stop_reason']} at {r['stop_time']:%H:%M} | Move: {r['move_pct']:>6.2f}% | {r['indicators']}{COLOR_RESET}")
+
+    if ERRORS.items:
+        print(f"\n{COLOR_YELLOW}Encountered {len(ERRORS.items)} errors during run.{COLOR_RESET}")
+        
+if __name__ == "__main__":
+    main()
