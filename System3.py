@@ -721,9 +721,6 @@ def compute_indicators(df):
     df['PrevClose'] = df.groupby('Session')['Close'].transform('last').shift()
 
     # --- 1) True Range ---
-    # To compute a correct day-bar ATR from 1-min data, we need the session's
-    # highest high, lowest low, and the *previous* session's close.
-    # So TR = max(SessHigh - SessLow, abs(SessHigh - PrevSessClose), abs(SessLow - PrevSessClose)).
     sess_agg = df.groupby('SessId').agg({
         'High': 'max',
         'Low': 'min',
@@ -731,9 +728,6 @@ def compute_indicators(df):
         'Session': 'first'
     }).rename(columns={'High': 'SessHigh', 'Low': 'SessLow', 'Close': 'SessClose'})
     
-    # We must shift by 1 to get the prior day's close for the TR calculation.
-    # Note: we shift *within the aggregated frame*, so we get strictly the
-    # chronologically previous session.
     sess_agg['PrevSessClose'] = sess_agg['SessClose'].shift(1)
     
     sess_agg['TR'] = np.maximum(
@@ -744,36 +738,23 @@ def compute_indicators(df):
         )
     )
 
-    # The very first session has no PrevSessClose, so its TR is just H - L
     sess_agg['TR'] = sess_agg['TR'].fillna(sess_agg['SessHigh'] - sess_agg['SessLow'])
 
     # --- 2) ATR Smoothing ---
-    # Now smooth the daily TR values. RMA(14) of the daily TR.
     sess_agg['ATR_Day'] = rma(sess_agg['TR'], ATR_BASIS_PERIOD)
 
     # --- 3) Map ATR back to the 1-min frame ---
-    # But wait! A checkpoint at 10:15 shouldn't use an ATR that incorporates
-    # data from 10:16-15:30. The ATR must be fully strictly causal.
-    # FIX 1/2: The ATR for *any minute today* is the ATR computed at the
-    # close of *yesterday*.
     sess_agg['Causal_ATR'] = sess_agg['ATR_Day'].shift(1)
 
-    # Map it back to the 1-min frame using the SessId.
-    df = df.merge(sess_agg[['SessId', 'Causal_ATR']], on='SessId', how='left')
-
-    # For any sessions where Causal_ATR is NaN (e.g. the very first session
-    # in the dataset), we can optionally fill it with something so we don't crash,
-    # but the ATR_MIN_BARS logic will filter them out later anyway.
+    # FIX: Use .map() instead of .merge() to prevent the KeyError on SessId
+    df['Causal_ATR'] = df['SessId'].map(sess_agg['Causal_ATR'])
     df['Causal_ATR'] = df['Causal_ATR'].fillna(0.0)
-    
-    # Store it as 'ATR' so the rest of the code works.
     df['ATR'] = df['Causal_ATR']
 
     # --- 1-min Kinetics ---
-    # These remain standard 1-min rolling indicators.
     df['Typ'] = (df['High'] + df['Low'] + df['Close']) / 3.0
     
-    # VWAP (resets daily)
+    # VWAP
     df['Vol_Typ'] = df['Typ'] * df['Volume']
     df['CumVol'] = df.groupby('SessId')['Volume'].cumsum()
     df['VWAP'] = df.groupby('SessId')['Vol_Typ'].cumsum() / df['CumVol']
@@ -786,7 +767,6 @@ def compute_indicators(df):
     df['BB_Lower'] = df['BB_Mid'] - BB_STD * df['BB_Std']
 
     # Keltner Channels
-    # 1-min TR for Keltner
     df['TR_1m'] = np.maximum(df['High'] - df['Low'],
                   np.maximum((df['High'] - df['Close'].shift()).abs(),
                              (df['Low'] - df['Close'].shift()).abs()))
@@ -795,17 +775,9 @@ def compute_indicators(df):
     df['KC_Lower'] = df['BB_Mid'] - BB_STD * df['ATR_1m']
 
     # Heikin-Ashi
-    # Note: Vectorized HA approximation
     df['HA_Close'] = (df['Open'] + df['High'] + df['Low'] + df['Close']) / 4.0
-    df['HA_Open'] = df['Open'].copy() # Init
-    
-    # For a true HA, HA_Open[i] = (HA_Open[i-1] + HA_Close[i-1])/2
-    # We can approximate or do a fast numba loop, but a simple shift/mean works well enough for general trend.
-    # This is a slight approximation to avoid a slow python loop.
     df['HA_Open'] = (df['Open'].shift() + df['Close'].shift()) / 2.0
-    df.loc[0, 'HA_Open'] = df.loc[0, 'Open'] # Fix first row
-    
-    # We just need the color
+    df.loc[0, 'HA_Open'] = df.loc[0, 'Open'] 
     df['HA_Color'] = np.where(df['HA_Close'] > df['HA_Open'], 1, -1)
 
     # RSI
@@ -825,7 +797,6 @@ def compute_indicators(df):
     df['MACD_Hist'] = df['MACD'] - df['MACD_Sig']
 
     # OBV
-    # We just need direction
     obv_dir = np.sign(delta).fillna(0)
     df['OBV'] = (obv_dir * df['Volume']).cumsum()
     df['OBV_EMA'] = df['OBV'].ewm(span=21, adjust=False).mean()
@@ -844,7 +815,6 @@ def compute_indicators(df):
     df['-DI'] = minus_di
 
     return df
-
 # ==============================================================================
 # 3. CORE LOGIC
 # ==============================================================================
@@ -1332,7 +1302,9 @@ def main():
         print(f"{COLOR_DIM}{r['symbol']:<25} | {r['dir']} {r['mult']}x | {r['stop_reason']} at {r['stop_time']:%H:%M} | Move: {r['move_pct']:>6.2f}% | {r['indicators']}{COLOR_RESET}")
 
     if ERRORS.items:
-        print(f"\n{COLOR_YELLOW}Encountered {len(ERRORS.items)} errors during run.{COLOR_RESET}")
-        
+        print(f"\n{COLOR_YELLOW}Encountered {len(ERRORS.items)} errors during run. Here are the first few:{COLOR_RESET}")
+        for where, msg, _ in ERRORS.items[:5]:
+            print(f"  {where}: {msg}")
+            
 if __name__ == "__main__":
     main()
