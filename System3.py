@@ -835,22 +835,21 @@ def _evaluate_kinetic_arrays(close, high, low, vol):
     m_mean = pd.Series(minus_di).rolling(BB_PERIOD, min_periods=1).mean().values
     m_std = pd.Series(minus_di).rolling(BB_PERIOD, min_periods=1).std(ddof=0).values
 
-    # --- NEW CODE: OSCILLATOR ATRs & VELOCITY ---
-    # 1. On-Balance Volume (OBV)
+    # On-Balance Volume (OBV)
     direction = np.where(delta > 0, 1, np.where(delta < 0, -1, 0))
     obv = np.cumsum(direction * vol)
 
-    # 2. 1-Bar Velocity (Rate of Change)
+    # 1-Bar Velocity (Rate of Change)
     vel_hist = np.diff(hist, prepend=hist[0])
     vel_obv = np.diff(obv, prepend=obv[0])
     vel_pdi = np.diff(plus_di, prepend=plus_di[0])
     vel_mdi = np.diff(minus_di, prepend=minus_di[0])
 
-    # 3. Oscillator ATRs (14-period EWM of absolute deltas)
-    atr_hist = _ewm(np.abs(vel_hist), 1/14)
-    atr_obv = _ewm(np.abs(vel_obv), 1/14)
-    atr_pdi = _ewm(np.abs(vel_pdi), 1/14)
-    atr_mdi = _ewm(np.abs(vel_mdi), 1/14)
+    # Oscillator ATRs (14-period EWM of absolute deltas)
+    atr_hist = _ewm(np.abs(vel_hist), 1 / 14)
+    atr_obv = _ewm(np.abs(vel_obv), 1 / 14)
+    atr_pdi = _ewm(np.abs(vel_pdi), 1 / 14)
+    atr_mdi = _ewm(np.abs(vel_mdi), 1 / 14)
 
     return {
         'rsi': rsi, 'r_mean': rsi_mean, 'r_std': rsi_std,
@@ -858,13 +857,11 @@ def _evaluate_kinetic_arrays(close, high, low, vol):
         'plus_di': plus_di, 'p_mean': p_mean, 'p_std': p_std,
         'minus_di': minus_di, 'm_mean': m_mean, 'm_std': m_std,
         'adx': adx, 'a_mean': a_mean, 'a_std': a_std,
-        # New Shock Metrics:
         'vel_hist': vel_hist, 'atr_hist': atr_hist,
         'vel_obv': vel_obv, 'atr_obv': atr_obv,
         'vel_pdi': vel_pdi, 'atr_pdi': atr_pdi,
         'vel_mdi': vel_mdi, 'atr_mdi': atr_mdi
     }
-
 def get_kinetics(kin_1m, idx):
     rsi = kin_1m['rsi'][idx]; r_mean = kin_1m['r_mean'][idx]; r_std = kin_1m['r_std'][idx]
     hist = kin_1m['hist'][idx]; h_mean = kin_1m['h_mean'][idx]; h_std = kin_1m['h_std'][idx]
