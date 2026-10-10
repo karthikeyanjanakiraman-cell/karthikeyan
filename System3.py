@@ -1229,6 +1229,8 @@ Day Change: {best_match['day_pct']:.2f}%
 # MAIN
 # ==============================================================================
 def main():
+    global TRADING_MODE  # <--- MOVED TO THE TOP
+    
     parser = argparse.ArgumentParser(description="System3 - Institutional Volatility Tracker")
     parser.add_argument("--mode", choices=["STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"], default=TRADING_MODE)
     parser.add_argument("--date", help="YYYY-MM-DD")
@@ -1237,7 +1239,6 @@ def main():
     parser.add_argument("--options-master", default="", help="Path to local options master JSON/CSV")
     args = parser.parse_args()
 
-    global TRADING_MODE
     TRADING_MODE = args.mode
 
     # Parse date/time
