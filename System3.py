@@ -835,12 +835,34 @@ def _evaluate_kinetic_arrays(close, high, low):
     m_mean = pd.Series(minus_di).rolling(BB_PERIOD, min_periods=1).mean().values
     m_std = pd.Series(minus_di).rolling(BB_PERIOD, min_periods=1).std(ddof=0).values
 
+    # --- NEW CODE: OSCILLATOR ATRs & VELOCITY ---
+    # 1. On-Balance Volume (OBV)
+    direction = np.where(delta > 0, 1, np.where(delta < 0, -1, 0))
+    obv = np.cumsum(direction * vol)
+
+    # 2. 1-Bar Velocity (Rate of Change)
+    vel_hist = np.diff(hist, prepend=hist[0])
+    vel_obv = np.diff(obv, prepend=obv[0])
+    vel_pdi = np.diff(plus_di, prepend=plus_di[0])
+    vel_mdi = np.diff(minus_di, prepend=minus_di[0])
+
+    # 3. Oscillator ATRs (14-period EWM of absolute deltas)
+    atr_hist = _ewm(np.abs(vel_hist), 1/14)
+    atr_obv = _ewm(np.abs(vel_obv), 1/14)
+    atr_pdi = _ewm(np.abs(vel_pdi), 1/14)
+    atr_mdi = _ewm(np.abs(vel_mdi), 1/14)
+
     return {
         'rsi': rsi, 'r_mean': rsi_mean, 'r_std': rsi_std,
         'hist': hist, 'h_mean': h_mean, 'h_std': h_std,
         'plus_di': plus_di, 'p_mean': p_mean, 'p_std': p_std,
         'minus_di': minus_di, 'm_mean': m_mean, 'm_std': m_std,
-        'adx': adx, 'a_mean': a_mean, 'a_std': a_std
+        'adx': adx, 'a_mean': a_mean, 'a_std': a_std,
+        # New Shock Metrics:
+        'vel_hist': vel_hist, 'atr_hist': atr_hist,
+        'vel_obv': vel_obv, 'atr_obv': atr_obv,
+        'vel_pdi': vel_pdi, 'atr_pdi': atr_pdi,
+        'vel_mdi': vel_mdi, 'atr_mdi': atr_mdi
     }
 
 def get_kinetics(kin_1m, idx):
@@ -865,7 +887,22 @@ def get_kinetics(kin_1m, idx):
     bull_score = (1 if bull_rsi else 0) + (1 if bull_macd else 0) + (1 if bull_di else 0)
     bear_score = (1 if bear_rsi else 0) + (1 if bear_macd else 0) + (1 if bear_di else 0)
 
-    return bull_score, bear_score, raw_bull_power, raw_bear_power, bull_rsi, bear_rsi, bull_macd, bear_macd, bull_di, bear_di
+    # --- NEW CODE: SHOCK EVALUATION ---
+    vh = kin_1m['vel_hist'][idx]; ah = kin_1m['atr_hist'][idx]
+    vo = kin_1m['vel_obv'][idx]; ao = kin_1m['atr_obv'][idx]
+    vp = kin_1m['vel_pdi'][idx]; ap = kin_1m['atr_pdi'][idx]
+    vm = kin_1m['vel_mdi'][idx]; am = kin_1m['atr_mdi'][idx]
+
+    # Shock Multipliers (1.5x normal volatility expansion)
+    M_HIST, M_OBV, M_DI = 1.5, 1.5, 1.5
+
+    # Bull Shock: MACD Hist Up + OBV Up + Plus_DI Up
+    bull_shock = (vh > M_HIST * ah) and (vo > M_OBV * ao) and (vp > M_DI * ap)
+    
+    # Bear Shock: MACD Hist Down + OBV Down + Minus_DI Up (Bear dominance rising)
+    bear_shock = (vh < -M_HIST * ah) and (vo < -M_OBV * ao) and (vm > M_DI * am)
+
+    return bull_score, bear_score, raw_bull_power, raw_bear_power, bull_rsi, bear_rsi, bull_macd, bear_macd, bull_di, bear_di, bull_shock, bear_shock
 
 def get_tripwire_state(close, kin_1m, base_atr, mult, today_start, end=None):
     n = len(close) if end is None else min(int(end), len(close))
@@ -875,7 +912,7 @@ def get_tripwire_state(close, kin_1m, base_atr, mult, today_start, end=None):
     target = base_atr * mult
     for i in range(today_start, n):
         if close[i] - curr_open >= target or curr_open - close[i] >= target:
-            _, _, _, _, b_rsi, br_rsi, b_macd, br_macd, b_di, br_di = get_kinetics(kin_1m, i)
+            _, _, _, _, b_rsi, br_rsi, b_macd, br_macd, b_di, br_di, _, _ = get_kinetics(kin_1m, i)
             last_rsi = "Buy" if b_rsi else "Sell" if br_rsi else "Neutral"
             last_macd = "Buy" if b_macd else "Sell" if br_macd else "Neutral"
             last_adx = "Buy" if b_di else "Sell" if br_di else "Neutral"
@@ -914,7 +951,8 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
         anchor = None
 
         while i < n:
-            bull_score, bear_score, r_bull, r_bear, _, _, _, _, _, _ = get_kinetics(kin_1m, i)
+            # Unpack the new shock variables
+            bull_score, bear_score, r_bull, r_bear, _, _, _, _, _, _, bull_shock, bear_shock = get_kinetics(kin_1m, i)
 
             if REQUIRE_BB_KC_PIERCE:
                 bb_kc_bull_fire = bb_upper[i] > kc_upper[i]
@@ -922,27 +960,26 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
             else:
                 bb_kc_bull_fire = bb_kc_bear_fire = True
 
-            if close[i] - curr_open >= base_atr:
-                if bull_score >= 2 and bb_kc_bull_fire and close[i] > vwap[i]:
+            # --- NEW TRIGGER: Oscillator ATR Shocks instead of Price ATR ---
+            if bull_shock:
+                # Still require VWAP and BB/KC safety filters
+                if bb_kc_bull_fire and close[i] > vwap[i]:
                     if r_bear:
                         warzone_kills += 1
                         curr_open = close[i]
                     else:
                         anchor = {"dir": "BULL", "idx": i, "time": dt_1m[i], "price": close[i]}
                         break
-                else:
-                    curr_open = close[i]
 
-            elif curr_open - close[i] >= base_atr:
-                if bear_score >= 2 and bb_kc_bear_fire and close[i] < vwap[i]:
+            elif bear_shock:
+                if bb_kc_bear_fire and close[i] < vwap[i]:
                     if r_bull:
                         warzone_kills += 1
                         curr_open = close[i]
                     else:
                         anchor = {"dir": "BEAR", "idx": i, "time": dt_1m[i], "price": close[i]}
                         break
-                else:
-                    curr_open = close[i]
+            
             i += 1
 
         if not anchor:
@@ -955,7 +992,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
         j = anchor['idx'] + 1
 
         while j < n:
-            bull_score, bear_score, _, _, _, _, _, _, _, _ = get_kinetics(kin_1m, j)
+            bull_score, bear_score, _, _, _, _, _, _, _, _, _, _ = get_kinetics(kin_1m, j)
             if is_bull:
                 peak_price = max(peak_price, close[j]); true_peak = max(true_peak, close[j])
                 adverse, hard_adverse, opposing = peak_price - close[j], true_peak - close[j], bear_score
@@ -1053,7 +1090,7 @@ def prepare_series(master, target_dt, pinned=False):
         'close': close, 'dt': master['Datetime'].values, 'today_start': ts,
         'day_open': float(master['Open'].iloc[ts]), 'prev_close': float(close[ts - 1]) if ts > 0 else 0.0,
         'base_atr': float(base_atr), 'atr_bars': int(atr_bars),
-        'kin': _evaluate_kinetic_arrays(close, high, low),
+        'kin': _evaluate_kinetic_arrays(close, high, low, vol),
         'vwap': vwap,
         'bb_upper': sma20 + 2.0 * std20, 'bb_lower': sma20 - 2.0 * std20,
         'kc_upper': sma20 + 1.5 * atr20, 'kc_lower': sma20 - 1.5 * atr20,
