@@ -797,7 +797,7 @@ def _ewm(x, alpha):
     for i in range(1, len(xs)): out[i] = prev = keep * prev + alpha * xs[i]
     return np.asarray(out)
 
-def _evaluate_kinetic_arrays(close, high, low):
+def _evaluate_kinetic_arrays(close, high, low, vol):
     n = len(close)
     delta = np.diff(close, prepend=close[0])
     gain = _ewm(np.where(delta > 0, delta, 0.0), 1 / RSI_PERIOD)
