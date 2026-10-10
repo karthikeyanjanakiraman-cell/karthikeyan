@@ -16,9 +16,41 @@ Strict Institutional Volatility Tracker (Upstox) - ALL-MODE EDITION  (System3.py
   stock, or a cash-equity symbol), put that value in the OrderPlaced environment variable for
   subsequent runs. When OrderPlaced is empty, nothing changes -- the scan just runs and prints
   its results as before. When OrderPlaced is set, this run also looks that value up among its
-  own results (same case-insensitive substring match as --watch) and emails its current status
-  (live/stopped/rejected, LTP, Day%, Move% off anchor) so a scheduled run keeps you posted on a
-  position you already took. See check_order_placed() below for the exact behaviour.
+  own results (case- and whitespace-insensitive substring match, same as --watch) and emails its
+  current status (live/stopped/rejected, LTP, Day%, Move% off anchor) so a scheduled run keeps you
+  posted on a position you already took. Several positions may be listed, separated by comma or
+  semicolon. See run_tracking() below for the exact behaviour.
+
+LOGIC-GAP FIXES IN THIS REVISION (each one is marked "FIX" in the code)
+ 1. ATR basis. Buckets were anchored to MIDNIGHT, so "390min" cut every session at 13:00 into two odd
+    half-day bars; today's still-forming bar was averaged in (threshold drifted at every checkpoint);
+    and a short history fell back to a 0.1%-of-price ATR (a tiny threshold -> signal flood).
+    Now: bars are anchored to the 09:15 open (ATR_BASIS_TF "375min" = one NSE session), only COMPLETED
+    prior sessions are used (one stable number per day, identical at every checkpoint) and instruments
+    with fewer than ATR_MIN_BARS completed sessions are reported as "short history", not scanned.
+ 2. Causality. A snapshot at HH:MM now uses only candles that CLOSED before HH:MM (the still-forming
+    candle leaked in), so a live run and a --date/--time run of the same minute agree. The price/volume
+    prefilter judges the last COMPLETED session (it used same-day -- partial or, in a backtest, future --
+    data).
+ 3. Off-hours. A live run on a weekend / holiday / before the open now rolls back to the last completed
+    session (it died with "no usable data"). --time without --date means "today at that time". A
+    --date/--time snapshot that falls on today now uses today's intraday feed (it found nothing).
+ 4. Backtrace merge. Every anchor is tracked on its own: a KILLED anchor can no longer be shown ACTIVE just
+    because a LATER anchor in the same direction is alive. STOPPED rows carry stop time / price / reason,
+    and stopped / graveyard rows keep their indicator triads.
+ 5. Trailing floor. The soft stop (1-ATR pullback AND opposing kinetics) re-based its peak whenever the
+    kinetics did not confirm, so a position could bleed any number of ATRs and still read ACTIVE.
+    HARD_STOP_ATR_MULT adds an unconditional floor measured from the true peak.
+ 6. INDEX_OPTIONS liquidity (price / volume) is judged once at the snapshot, not at every checkpoint
+    (cumulative volume at 09:30 hid contracts that were fine by the close and delayed 'Seen').
+ 7. Tracking (--watch / OrderPlaced). The tracked contract is always scanned (ATM window, price/volume
+    prefilter and illiquid filter bypassed) so it cannot silently become NOT FOUND exactly when it hurts;
+    matching ignores spaces/case ('NIFTY25000CE' finds 'NIFTY 25000 CE 14 OCT 26'), prefers exact and LIVE
+    matches and lists ambiguous ones; several positions are supported; a failed email no longer marks a
+    status as reported; time-machine runs never email.
+ 8. Misc. Indicators are computed once per instrument (not once per checkpoint); VWAP uses the typical
+    price; Day% is measured from the previous close (DAY_PCT_BASIS); --checkpoint-min 0 no longer hangs;
+    the graveyard is capped; --require-bb-kc-pierce can actually switch the BB/KC gate on.
 """
 import os
 import sys
@@ -31,7 +63,7 @@ import gzip
 import time
 import threading
 from bisect import bisect_left
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone, time as dtime
 import concurrent.futures
 
 import smtplib
@@ -66,11 +98,17 @@ ALIAS_TO_INDEX = {a: idx for idx, cfg in INDEX_CONFIG.items() for a in cfg["alia
 
 HA_ATR_MULTIPLIERS = [1, 2, 3, 5]
 ATR_BASIS_PERIOD = 14
-ATR_BASIS_TF = "390min"
+# FIX 1: "375min" = ONE NSE session (09:15-15:30) and buckets are anchored to the open (it was "390min"
+# anchored to midnight, which cut every session in two at 13:00).
+ATR_BASIS_TF = "375min"
+ATR_MIN_BARS = 5            # FIX 1: fewer completed sessions than this => "short history" (unless pinned)
 MIN_ATR_PCT = 0.001
+# FIX 5: unconditional trailing floor, in ATRs below the TRUE peak since the anchor (0 = disabled).
+HARD_STOP_ATR_MULT = 2.0
 
 TOP_N_BUYERS = 50
 TOP_N_SELLERS = 50
+TOP_N_GRAVEYARD = 100       # FIX 8: 0 = print the whole graveyard
 MAX_SYMBOL_WIDTH = 30
 
 # --- INTRADAY BACKTRACE CHECKPOINTS ---
@@ -78,6 +116,9 @@ CHECKPOINT_INTERVAL_MIN = 15
 BACKTRACE_CHECKPOINTS = True
 
 REQUIRE_BB_KC_PIERCE = False
+
+# FIX 8: "PREV_CLOSE" = broker-style day change; "OPEN" = move since today's first print.
+DAY_PCT_BASIS = "PREV_CLOSE"
 
 # --- OPTIONAL WATCH / EMAIL ALERT ---
 # If WATCH_VALUE is non-empty (set via --watch), the run looks up that symbol/
@@ -98,11 +139,13 @@ WATCH_STATE_FILE = "system3_watch_state.json"
 # the environment (so a scheduled run can be pointed at a live position
 # without touching the command line) and, by default, emails EVERY run it
 # finds a match on rather than only on a status change -- see
-# check_order_placed() for the exact rules and ORDER_EMAIL_ONLY_ON_CHANGE
-# below to switch it to change-only emails instead.
+# run_tracking() for the exact rules and ORDER_EMAIL_ONLY_ON_CHANGE below to
+# switch it to change-only emails instead. The value may hold several
+# positions separated by comma / semicolon / newline.
 ORDER_PLACED_ENV = "OrderPlaced"
 ORDER_EMAIL_ONLY_ON_CHANGE = False
 ORDER_STATE_FILE = "system3_order_state.json"
+MAX_PINNED_MATCHES = 8      # a loose tracking value pins at most this many instruments
 
 # --- COLOR PALETTE ---
 COLOR_RESET = '\033[0m'
@@ -118,7 +161,9 @@ MIN_PRICE = 100
 MAX_PRICE = 5000
 MIN_DAILY_VOLUME = 100000
 BACKTRACE_DAYS = 30
-MIN1_HISTORY_DAYS = 15
+# FIX 1: 19 calendar days still costs 3 seven-day chunk calls but holds ~13 sessions (15 held ~10, which
+# cannot feed a 14-bar ATR).
+MIN1_HISTORY_DAYS = 19
 
 RSI_PERIOD = 14
 BB_PERIOD = 20
@@ -134,12 +179,33 @@ API_HOST = "https://api.upstox.com"
 IST = timezone(timedelta(hours=5, minutes=30))
 SESSION_OPEN_MIN = 9 * 60 + 15
 SESSION_CLOSE_MIN = 15 * 60 + 30
+PROBE_KEY = INDEX_CONFIG["NIFTY"]["spot_key"]     # used to ask "did the exchange trade on that date?"
 
 # ==============================================================================
 # HELPERS
 # ==============================================================================
 def now_ist():
     return datetime.now(IST).replace(tzinfo=None)
+
+def _close_dt(day):
+    return datetime.combine(day, dtime(SESSION_CLOSE_MIN // 60, SESSION_CLOSE_MIN % 60))
+
+def _open_dt(day):
+    return datetime.combine(day, dtime(SESSION_OPEN_MIN // 60, SESSION_OPEN_MIN % 60))
+
+def _norm_sym(s):
+    """Case-, whitespace-, '_' and '-' insensitive form of a symbol, used for all tracking matches."""
+    return re.sub(r'[\s_\-]+', '', str(s).upper())
+
+def parse_track_values(raw):
+    """'A, B;C' -> ['A', 'B', 'C'] (de-duplicated on the normalised form, order kept)."""
+    out, seen = [], set()
+    for part in re.split(r'[;,\n|]+', str(raw or "")):
+        v = part.strip()
+        if v and _norm_sym(v) not in seen:
+            seen.add(_norm_sym(v))
+            out.append(v)
+    return out
 
 class BudgetLimiter:
     def __init__(self, caps):
@@ -290,10 +356,10 @@ def generate_checkpoints(cutoff_dt, interval_min=None):
     9:30, 9:30 to 9:45, ...". If cutoff_dt isn't itself on a boundary, one
     final partial checkpoint is added AT cutoff_dt (a 10:35 run adds 10:35
     after ...,10:15,10:30).
+    FIX 8: the interval is forced to >= 1 minute (0 or a negative value used to loop forever).
     """
-    interval = interval_min or CHECKPOINT_INTERVAL_MIN
-    session_open = cutoff_dt.replace(hour=SESSION_OPEN_MIN // 60, minute=SESSION_OPEN_MIN % 60,
-                                      second=0, microsecond=0)
+    interval = max(1, int(interval_min or CHECKPOINT_INTERVAL_MIN))
+    session_open = _open_dt(cutoff_dt.date())
     if cutoff_dt <= session_open:
         return [cutoff_dt]
 
@@ -312,9 +378,11 @@ def fetch_quotes(items, batch=200):
         status, js = _get(f"{API_HOST}/v2/market-quote/quotes", params={"instrument_key": ",".join(x['key'] for x in b)})
         if status != 200 or not js: return {}
         by_ts = {f"{x['key'].split('|')[0]}:{x['symbol']}": x['key'] for x in b}
+        data = js.get('data') or {}
         out = {}
-        for k, v in (js.get('data') or {}).items():
+        for k, v in data.items():
             key = v.get('instrument_token') or by_ts.get(k)
+            if not key and len(b) == 1 and len(data) == 1: key = b[0]['key']
             if key: out[key] = {'ltp': v.get('last_price') or 0.0, 'vol': v.get('volume') or 0}
         return out
     res = {}
@@ -328,6 +396,56 @@ def fetch_today(key):
     if status != 200 or df is None: return None
     df = df[df['Datetime'].dt.date == now_ist().date()]
     return df if not df.empty else None
+
+# ------------------------------------------------------------------------------
+# FIX 3: which session can actually be scanned?
+# ------------------------------------------------------------------------------
+def _session_traded(d, today):
+    """True if the exchange traded on date d. Probed with the NIFTY 50 index 1-min candles (one call)."""
+    if d.weekday() >= 5:
+        return False
+    if d == today:
+        df = fetch_today(PROBE_KEY)
+        return df is not None and not df.empty
+    status, df = _candles(_url_range_1m(PROBE_KEY, d, d + timedelta(days=1)))
+    return bool(status == 200 and df is not None and (df['Datetime'].dt.date == d).any())
+
+def resolve_session(cutoff_dt):
+    """
+    Turn the requested snapshot into one that can actually be scanned. Returns (cutoff_dt, notes).
+      * a snapshot in the future is clamped to 'now';
+      * a snapshot at/before the 09:15 open, on a weekend, or on a day the exchange did not trade
+        (holiday) rolls back to the 15:30 CLOSE of the last completed session. These runs used to die with
+        "no usable data" although the previous session was perfectly scannable.
+    """
+    notes = []
+    now = now_ist().replace(second=0, microsecond=0)
+    if cutoff_dt > now:
+        notes.append(f"snapshot {cutoff_dt:%Y-%m-%d %H:%M} is in the future -- using the current time {now:%Y-%m-%d %H:%M} instead")
+        cutoff_dt = now
+    target = cutoff_dt.date()
+
+    if cutoff_dt <= _open_dt(target):
+        why = f"{cutoff_dt:%Y-%m-%d %H:%M} is at/before the {_open_dt(target):%H:%M} open"
+    elif target.weekday() >= 5:
+        why = f"{target} is a weekend"
+    elif _session_traded(target, now.date()):
+        return min(cutoff_dt, _close_dt(target)), notes
+    elif STATS.auth_failed:
+        return cutoff_dt, notes                  # the caller reports the rejected token
+    else:
+        why = f"no trading data for {target} (market holiday?)"
+
+    d = target - timedelta(days=1)
+    for _ in range(14):
+        if STATS.auth_failed:
+            return cutoff_dt, notes
+        if _session_traded(d, now.date()):
+            notes.append(f"{why} -> using the last completed session: {d} {SESSION_CLOSE_MIN // 60}:{SESSION_CLOSE_MIN % 60:02d}")
+            return _close_dt(d), notes
+        d -= timedelta(days=1)
+    notes.append(f"{why}, and no trading session was found in the previous 14 days -- continuing with the requested time")
+    return cutoff_dt, notes
 
 def prepare_master(dfs):
     master = pd.concat([d[['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume']] for d in dfs], ignore_index=True).drop_duplicates(subset='Datetime').sort_values('Datetime').reset_index(drop=True)
@@ -385,7 +503,36 @@ def _download_master(name, _is_fallback=False):
             return rows
     return []
 
-def _equity_universe(mode):
+# ------------------------------------------------------------------------------
+# FIX 7: tracked instruments are pinned into the universe
+# ------------------------------------------------------------------------------
+def resolve_pins(cands, needles, label="symbol"):
+    """
+    cands = [(symbol, sort_key), ...]. A tracking value pins every candidate whose normalised symbol EQUALS
+    it (exact hits win) or, failing that, CONTAINS it. Pinned instruments are always scanned: the
+    price/volume prefilter, the ATM strike window and the illiquid filter do not apply to them.
+    """
+    pinned = set()
+    norm = [(_norm_sym(sym), sym, key) for sym, key in cands]
+    for raw in needles:
+        n = _norm_sym(raw)
+        if not n:
+            continue
+        hits = [c for c in norm if c[0] == n] or [c for c in norm if n in c[0]]
+        if not hits:
+            print(f"   {COLOR_YELLOW}» track '{raw}': no {label} in the instrument master matches it.{COLOR_RESET}")
+            continue
+        hits.sort(key=lambda c: c[2])
+        if len(hits) > MAX_PINNED_MATCHES:
+            print(f"   {COLOR_YELLOW}» track '{raw}': {len(hits)} matches -- keeping the first {MAX_PINNED_MATCHES}; "
+                  f"use a more specific value.{COLOR_RESET}")
+            hits = hits[:MAX_PINNED_MATCHES]
+        names = ", ".join(h[1] for h in hits[:3]) + (" ..." if len(hits) > 3 else "")
+        print(f"   {COLOR_DIM}» track '{raw}': pinned {len(hits)} {label}(s) -- always scanned, filters bypassed: {names}{COLOR_RESET}")
+        pinned.update(h[1] for h in hits)
+    return pinned
+
+def _equity_universe(mode, needles=()):
     nse = _download_master("NSE")
     if not nse:
         print(f"{COLOR_RED_FG}[!] NSE instrument master unavailable -- cannot build the {mode} universe.{COLOR_RESET}")
@@ -393,29 +540,53 @@ def _equity_universe(mode):
     def ts_of(i): return i.get("tradingsymbol", i.get("trading_symbol"))
     def plain(i): return (i.get("segment") == "NSE_EQ" and ts_of(i) and i.get("instrument_key") and (INCLUDE_NON_EQ_SERIES or (i.get("instrument_type") or "EQ") == "EQ"))
     fno = {i.get("underlying_symbol") for i in nse if i.get("segment") == "NSE_FO" and i.get("underlying_symbol")}
-    rows = [i for i in nse if plain(i) and (ts_of(i) in fno if mode == "STOCK_FNO" else ts_of(i) not in fno)]
-    return list({i["instrument_key"]: {"symbol": ts_of(i), "key": i["instrument_key"]} for i in rows}.values())
+    everything = {i["instrument_key"]: {"symbol": ts_of(i), "key": i["instrument_key"]} for i in nse if plain(i)}
+    in_mode = {k: v for k, v in everything.items()
+               if ((v["symbol"] in fno) if mode == "STOCK_FNO" else (v["symbol"] not in fno))}
+
+    pinned = set()
+    if needles:
+        pinned = resolve_pins([(v["symbol"], (len(v["symbol"]), v["symbol"])) for v in everything.values()],
+                              needles, "equity symbol")
+    out = {k: dict(v, pinned=v["symbol"] in pinned) for k, v in in_mode.items()}
+    extra = 0
+    for k, v in everything.items():
+        if v["symbol"] in pinned and k not in out:
+            out[k] = dict(v, pinned=True)
+            extra += 1
+    if extra:
+        print(f"   {COLOR_DIM}» {extra} tracked symbol(s) sit outside the {mode} universe -- added for tracking.{COLOR_RESET}")
+    return list(out.values())
 
 # ------------------------------------------------------------------------------
 # INDEX OPTIONS universe
 # ------------------------------------------------------------------------------
-def _resolve_index_spot_price(key, name, cutoff_dt, is_live):
+def _resolve_index_spot_price(key, name, cutoff_dt, use_intraday):
+    """
+    FIX 3: for a snapshot that falls on TODAY the intraday feed is used (the historical endpoint does not
+    serve the current session, so a --date <today> run used to silently pick up YESTERDAY's close).
+    FIX 2: only candles that closed before the snapshot count.
+    """
     target_dt = cutoff_dt.date()
-    if is_live:
-        q = fetch_quotes([{"key": key, "symbol": name}], batch=1)
-        ltp = q.get(key, {}).get('ltp', 0.0)
-        if ltp and ltp > 0: return float(ltp), "live quote"
+    if use_intraday:
         df = fetch_today(key)
-        if df is not None and not df.empty: return float(df['Close'].iloc[-1]), "today's 1-min candles"
+        if df is not None and not df.empty:
+            sub = df[df['Datetime'] < cutoff_dt]
+            if not sub.empty: return float(sub['Close'].iloc[-1]), "today's 1-min close at snapshot"
+        if now_ist() - cutoff_dt <= timedelta(minutes=3):
+            q = fetch_quotes([{"key": key, "symbol": name}], batch=1)
+            ltp = q.get(key, {}).get('ltp', 0.0)
+            if ltp and ltp > 0: return float(ltp), "live quote"
 
     status, df = _candles(_url_range_1m(key, target_dt - timedelta(days=5), target_dt + timedelta(days=1)))
     if status == 200 and df is not None and not df.empty:
-        sub = df[df['Datetime'] <= cutoff_dt]
+        sub = df[df['Datetime'] < cutoff_dt]
         if not sub.empty: return float(sub['Close'].iloc[-1]), "1-min close at snapshot"
 
     status, df = _candles(_url_range_daily(key, target_dt - timedelta(days=10), target_dt + timedelta(days=1)))
     if status == 200 and df is not None and not df.empty:
-        sub = df[df['Datetime'].dt.date <= target_dt]
+        limit = target_dt if cutoff_dt >= _close_dt(target_dt) else target_dt - timedelta(days=1)
+        sub = df[df['Datetime'].dt.date <= limit]
         if not sub.empty: return float(sub['Close'].iloc[-1]), "daily close (fallback)"
     if STATS.auth_failed:
         return 0.0, "Upstox rejected the access token (HTTP 401)"
@@ -452,13 +623,13 @@ def _load_local_master(path):
         print(f"   {COLOR_RED_FG}[!] Could not read local options master '{path}': {type(e).__name__}: {e}{COLOR_RESET}")
         return []
 
-def _index_options_universe(cutoff_dt, is_live, options_master_path=""):
+def _index_options_universe(cutoff_dt, use_intraday, options_master_path="", needles=()):
     target_dt = cutoff_dt.date()
 
     spot = {}
     for idx, cfg in INDEX_CONFIG.items():
         try:
-            price, src = _resolve_index_spot_price(cfg["spot_key"], idx, cutoff_dt, is_live)
+            price, src = _resolve_index_spot_price(cfg["spot_key"], idx, cutoff_dt, use_intraday)
         except Exception as e:
             ERRORS.add(f"spot:{idx}", e)
             price, src = 0.0, f"{type(e).__name__}: {e}"
@@ -467,7 +638,7 @@ def _index_options_universe(cutoff_dt, is_live, options_master_path=""):
             print(f"   {COLOR_DIM}» {idx:<10} spot {price:>10.2f}  ({src}){COLOR_RESET}")
         else:
             print(f"   {COLOR_YELLOW}» {idx:<10} spot unavailable -- skipped ({src}){COLOR_RESET}")
-    if not spot:
+    if not spot and not needles:
         if not STATS.auth_failed:
             print(f"{COLOR_RED_FG}[!] Could not resolve a spot price for ANY index, so no ATM strikes can be chosen. "
                   f"Check the token/API access to index candles (see failure samples below).{COLOR_RESET}")
@@ -528,6 +699,23 @@ def _index_options_universe(cutoff_dt, is_live, options_master_path=""):
         return []
 
     universe, seen = [], set()
+
+    # FIX 7: tracked contracts first -- every expiry on/after the snapshot, no ATM window, no liquidity filter.
+    if needles:
+        flat = []
+        for idx, contracts in by_idx.items():
+            for exp_date, strike, itype, row in contracts:
+                if exp_date < target_dt: continue
+                key = _field(row, "instrument_key")
+                sym = str(_field(row, "trading_symbol", "tradingsymbol") or key)
+                flat.append((sym, (exp_date, strike, itype, sym), key))
+        sym_to_key = {sym: key for sym, _, key in flat}
+        for sym in sorted(resolve_pins([(s, k) for s, k, _ in flat], needles, "option contract")):
+            key = sym_to_key[sym]
+            if key not in seen:
+                seen.add(key)
+                universe.append({"key": key, "symbol": sym, "pinned": True})
+
     for idx, contracts in by_idx.items():
         if idx not in spot: continue
         if not contracts:
@@ -558,873 +746,23 @@ def _index_options_universe(cutoff_dt, is_live, options_master_path=""):
             key = _field(row, "instrument_key")
             if strike in window and key not in seen:
                 seen.add(key)
-                universe.append({"key": key, "symbol": str(_field(row, "trading_symbol", "tradingsymbol") or key)})
+                universe.append({"key": key, "symbol": str(_field(row, "trading_symbol", "tradingsymbol") or key), "pinned": False})
                 picked += 1
         gap = (target_exp - target_dt).days
         print(f"   {COLOR_DIM}» {idx:<10} expiry {target_exp} ({EXPIRY_SELECTION})  "
               f"strikes {strikes[lo]:.0f}-{strikes[hi-1]:.0f} ({STRIKES_BELOW_ATM}↓/{STRIKES_ABOVE_ATM}↑ of ATM)  "
               f"-> {picked} contracts{COLOR_RESET}")
-        if not is_live and expiry_idx == 0 and gap > 10:
+        if target_dt != now_ist().date() and expiry_idx == 0 and gap > 10:
             print(f"   {COLOR_YELLOW}  ⚠ nearest expiry in today's master is {gap} days after {target_dt}; the true nearest "
                   f"expiry on that date may already have expired. Use --options-master for exact backtests.{COLOR_RESET}")
     return universe
 
-def get_dynamic_universe(mode, cutoff_dt, is_live, options_master_path=""):
+def get_dynamic_universe(mode, cutoff_dt, use_intraday, options_master_path="", needles=()):
     if mode in ("STOCK_FNO", "CASH_EQUITY"):
-        return _equity_universe(mode)
+        return _equity_universe(mode, needles)
     if mode == "INDEX_OPTIONS":
-        return _index_options_universe(cutoff_dt, is_live, options_master_path)
+        return _index_options_universe(cutoff_dt, use_intraday, options_master_path, needles)
     print(f"{COLOR_RED_FG}[!] Unknown mode '{mode}'.{COLOR_RESET}")
     return []
 
-# ==============================================================================
-# 2. CONTINUOUS KINETIC TRIPWIRE ENGINE
-# ==============================================================================
-def compute_base_atr(m):
-    hi, lo, cl = m['High'].values, m['Low'].values, m['Close'].values
-    sid, mins = m['SessId'].values, m['Min'].values
-    tf_minutes = int(ATR_BASIS_TF.replace("min", ""))
-    bucket = sid * 100 + mins // tf_minutes
-    starts = np.concatenate(([0], np.flatnonzero(np.diff(bucket)) + 1))
-    ends = np.concatenate((starts[1:], [len(bucket)])) - 1
-    b_high, b_low, b_close = np.maximum.reduceat(hi, starts), np.minimum.reduceat(lo, starts), cl[ends]
-    if len(b_close) < 5: return max(cl[-1] * MIN_ATR_PCT, 0.01)
-    prev_close = np.concatenate(([np.nan], b_close[:-1]))
-    tr = np.fmax(np.fmax(b_high - b_low, np.abs(b_high - prev_close)), np.abs(b_low - prev_close))
-    return max(float(tr[-ATR_BASIS_PERIOD:].mean()), b_close[-1] * MIN_ATR_PCT, 0.01)
-
-def _ewm(x, alpha):
-    xs = x.tolist(); out = [0.0] * len(xs); prev = out[0] = xs[0]
-    keep = 1.0 - alpha
-    for i in range(1, len(xs)): out[i] = prev = keep * prev + alpha * xs[i]
-    return np.asarray(out)
-
-def _evaluate_kinetic_arrays(close, high, low):
-    n = len(close)
-    delta = np.diff(close, prepend=close[0])
-    gain = _ewm(np.where(delta > 0, delta, 0.0), 1 / RSI_PERIOD)
-    loss = _ewm(np.where(delta < 0, -delta, 0.0), 1 / RSI_PERIOD)
-    rsi = 100 - (100 / (1 + (gain / (loss + 1e-8))))
-
-    rsi_mean = pd.Series(rsi).rolling(BB_PERIOD, min_periods=1).mean().values
-    rsi_std = pd.Series(rsi).rolling(BB_PERIOD, min_periods=1).std(ddof=0).values
-
-    macd = _ewm(close, 2 / 13) - _ewm(close, 2 / 27)
-    hist = macd - _ewm(macd, 2 / 10)
-    h_mean = pd.Series(hist).rolling(BB_PERIOD, min_periods=1).mean().values
-    h_std = pd.Series(hist).rolling(BB_PERIOD, min_periods=1).std(ddof=0).values
-
-    up, down = np.zeros(n), np.zeros(n)
-    up[1:] = high[1:] - high[:-1]; down[1:] = low[:-1] - low[1:]
-    plus_dm = np.where((up > down) & (up > 0), up, 0.0)
-    minus_dm = np.where((down > up) & (down > 0), down, 0.0)
-
-    tr = (high - low).copy()
-    tr[1:] = np.maximum(tr[1:], np.maximum(np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])))
-
-    a = 1 / ADX_PERIOD; atr = _ewm(tr, a)
-    plus_di = 100 * (_ewm(plus_dm, a) / (atr + 1e-8))
-    minus_di = 100 * (_ewm(minus_dm, a) / (atr + 1e-8))
-
-    dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-8)
-    adx = _ewm(dx, a)
-
-    a_mean = pd.Series(adx).rolling(BB_PERIOD, min_periods=1).mean().values
-    a_std = pd.Series(adx).rolling(BB_PERIOD, min_periods=1).std(ddof=0).values
-
-    p_mean = pd.Series(plus_di).rolling(BB_PERIOD, min_periods=1).mean().values
-    p_std = pd.Series(plus_di).rolling(BB_PERIOD, min_periods=1).std(ddof=0).values
-    m_mean = pd.Series(minus_di).rolling(BB_PERIOD, min_periods=1).mean().values
-    m_std = pd.Series(minus_di).rolling(BB_PERIOD, min_periods=1).std(ddof=0).values
-
-    return {
-        'rsi': rsi, 'r_mean': rsi_mean, 'r_std': rsi_std,
-        'hist': hist, 'h_mean': h_mean, 'h_std': h_std,
-        'plus_di': plus_di, 'p_mean': p_mean, 'p_std': p_std,
-        'minus_di': minus_di, 'm_mean': m_mean, 'm_std': m_std,
-        'adx': adx, 'a_mean': a_mean, 'a_std': a_std
-    }
-
-def get_kinetics(kin_1m, idx):
-    rsi = kin_1m['rsi'][idx]; r_mean = kin_1m['r_mean'][idx]; r_std = kin_1m['r_std'][idx]
-    hist = kin_1m['hist'][idx]; h_mean = kin_1m['h_mean'][idx]; h_std = kin_1m['h_std'][idx]
-    p_di = kin_1m['plus_di'][idx]; p_mean = kin_1m['p_mean'][idx]; p_std = kin_1m['p_std'][idx]
-    m_di = kin_1m['minus_di'][idx]; m_mean = kin_1m['m_mean'][idx]; m_std = kin_1m['m_std'][idx]
-    adx = kin_1m['adx'][idx]; a_mean = kin_1m['a_mean'][idx]; a_std = kin_1m['a_std'][idx]
-
-    bull_rsi = r_std > 0 and rsi > r_mean + BB_STD * r_std
-    bear_rsi = r_std > 0 and rsi < r_mean - BB_STD * r_std
-    bull_macd = h_std > 0 and hist > h_mean + BB_STD * h_std
-    bear_macd = h_std > 0 and hist < h_mean - BB_STD * h_std
-    
-    adx_breakout = a_std > 0 and adx > a_mean + BB_STD * a_std
-    bull_di = p_std > 0 and p_di > p_mean + BB_STD * p_std and p_di > m_di and adx_breakout
-    bear_di = m_std > 0 and m_di > m_mean + BB_STD * m_std and m_di > p_di and adx_breakout
-
-    raw_bull_power = p_std > 0 and p_di > p_mean + BB_STD * p_std
-    raw_bear_power = m_std > 0 and m_di > m_mean + BB_STD * m_std
-
-    bull_score = (1 if bull_rsi else 0) + (1 if bull_macd else 0) + (1 if bull_di else 0)
-    bear_score = (1 if bear_rsi else 0) + (1 if bear_macd else 0) + (1 if bear_di else 0)
-
-    return bull_score, bear_score, raw_bull_power, raw_bear_power, bull_rsi, bear_rsi, bull_macd, bear_macd, bull_di, bear_di
-
-def get_tripwire_state(close, kin_1m, base_atr, mult, today_start):
-    curr_open = close[today_start]
-    last_rsi, last_macd, last_adx = "Neutral", "Neutral", "Neutral"
-    blocks = 0
-    target = base_atr * mult
-    for i in range(today_start, len(close)):
-        if close[i] - curr_open >= target or curr_open - close[i] >= target:
-            _, _, _, _, b_rsi, br_rsi, b_macd, br_macd, b_di, br_di = get_kinetics(kin_1m, i)
-            last_rsi = "Buy" if b_rsi else "Sell" if br_rsi else "Neutral"
-            last_macd = "Buy" if b_macd else "Sell" if br_macd else "Neutral"
-            last_adx = "Buy" if b_di else "Sell" if br_di else "Neutral"
-            blocks += 1
-            curr_open = close[i]
-    return last_rsi, last_macd, last_adx, blocks
-
-def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, vwap, today_start):
-    if today_start >= len(close):
-        return None, {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0,
-                      'killed_time': '-', 'killed_price': 0.0, 'reason': 'No data for today'}
-
-    i = today_start
-    curr_open = close[today_start]
-    survived_anchor = None
-    last_killed_info = {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0,
-                        'killed_time': '-', 'killed_price': 0.0, 'reason': 'Failed Kinetic Alignment'}
-    warzone_kills = 0
-
-    while i < len(close):
-        anchor = None
-
-        while i < len(close):
-            bull_score, bear_score, r_bull, r_bear, _, _, _, _, _, _ = get_kinetics(kin_1m, i)
-
-            if REQUIRE_BB_KC_PIERCE:
-                bb_kc_bull_fire = bb_upper[i] > kc_upper[i]
-                bb_kc_bear_fire = bb_lower[i] < kc_lower[i]
-            else:
-                bb_kc_bull_fire = bb_kc_bear_fire = True
-
-            if close[i] - curr_open >= base_atr:
-                if bull_score >= 2 and bb_kc_bull_fire and close[i] > vwap[i]:
-                    if r_bear:
-                        warzone_kills += 1
-                        curr_open = close[i]
-                    else:
-                        anchor = {"dir": "BULL", "idx": i, "time": dt_1m[i], "price": close[i]}
-                        break
-                else:
-                    curr_open = close[i]
-
-            elif curr_open - close[i] >= base_atr:
-                if bear_score >= 2 and bb_kc_bear_fire and close[i] < vwap[i]:
-                    if r_bull:
-                        warzone_kills += 1
-                        curr_open = close[i]
-                    else:
-                        anchor = {"dir": "BEAR", "idx": i, "time": dt_1m[i], "price": close[i]}
-                        break
-                else:
-                    curr_open = close[i]
-            i += 1
-
-        if not anchor:
-            break
-
-        survived = True
-        peak_price = anchor['price']
-        j = anchor['idx'] + 1
-
-        while j < len(close):
-            bull_score, bear_score, _, _, _, _, _, _, _, _ = get_kinetics(kin_1m, j)
-
-            if anchor['dir'] == "BULL":
-                peak_price = max(peak_price, close[j])
-                if peak_price - close[j] >= base_atr:
-                    if bear_score >= 2:
-                        last_killed_info = {
-                            'dir': 'BULL',
-                            'anchor_time': pd.to_datetime(anchor['time']).strftime('%H:%M'),
-                            'anchor_price': float(anchor['price']),
-                            'killed_time': pd.to_datetime(dt_1m[j]).strftime('%H:%M'),
-                            'killed_price': float(close[j]),
-                            'reason': "Kinetic SL (1 ATR Pullback)"
-                        }
-                        survived = False
-                        curr_open = close[j]
-                        i = j + 1
-                        break
-                    else:
-                        peak_price = close[j]
-
-            elif anchor['dir'] == "BEAR":
-                peak_price = min(peak_price, close[j])
-                if close[j] - peak_price >= base_atr:
-                    if bull_score >= 2:
-                        last_killed_info = {
-                            'dir': 'BEAR',
-                            'anchor_time': pd.to_datetime(anchor['time']).strftime('%H:%M'),
-                            'anchor_price': float(anchor['price']),
-                            'killed_time': pd.to_datetime(dt_1m[j]).strftime('%H:%M'),
-                            'killed_price': float(close[j]),
-                            'reason': "Kinetic SL (1 ATR Rally)"
-                        }
-                        survived = False
-                        curr_open = close[j]
-                        i = j + 1
-                        break
-                    else:
-                        peak_price = close[j]
-            j += 1
-
-        if survived:
-            survived_anchor = anchor
-            break
-
-    if survived_anchor:
-        return survived_anchor, {"status": "Survived"}
-
-    if warzone_kills > 0 and last_killed_info['dir'] == 'NONE':
-        last_killed_info['reason'] = f"Warzone Inversion Chop ({warzone_kills}x)"
-    elif last_killed_info['dir'] == 'NONE':
-        last_killed_info['reason'] = "Failed Kinetic or VWAP Alignment"
-
-    return None, last_killed_info
-
-def compute_row(symbol, master_1m, target_dt):
-    close, high, low, dt = master_1m['Close'].values, master_1m['High'].values, master_1m['Low'].values, master_1m['Datetime'].values
-    vol = master_1m['Volume'].values
-
-    today_mask = master_1m['Datetime'].dt.date == target_dt
-    if not today_mask.any():
-        return None
-
-    today_start_idx = int(master_1m.index[today_mask][0])
-    day_open_price = master_1m['Open'].iloc[today_start_idx]
-    intraday_pct = ((close[-1] - day_open_price) / day_open_price) * 100 if day_open_price else 0.0
-
-    # ---> CALCULATE INTRADAY VWAP <---
-    cum_vol = np.zeros_like(vol)
-    cum_vol_price = np.zeros_like(vol)
-    cum_vol[today_start_idx:] = np.cumsum(vol[today_start_idx:])
-    cum_vol_price[today_start_idx:] = np.cumsum((close * vol)[today_start_idx:])
-    
-    vwap = np.zeros_like(close)
-    with np.errstate(divide='ignore', invalid='ignore'):
-        vwap = np.where(cum_vol > 0, cum_vol_price / cum_vol, close)
-    # ---------------------------------
-
-    sma20 = pd.Series(close).rolling(20, min_periods=1).mean().values
-    std20 = pd.Series(close).rolling(20, min_periods=1).std(ddof=0).values
-
-    tr = np.zeros_like(close)
-    tr[0] = high[0] - low[0]
-    tr[1:] = np.maximum(high[1:] - low[1:], np.maximum(np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])))
-    atr20 = pd.Series(tr).rolling(20, min_periods=1).mean().values
-
-    bb_upper = sma20 + 2.0 * std20
-    bb_lower = sma20 - 2.0 * std20
-    kc_upper = sma20 + 1.5 * atr20
-    kc_lower = sma20 - 1.5 * atr20
-
-    kin_1m = _evaluate_kinetic_arrays(close, high, low)
-    base_atr = compute_base_atr(master_1m)
-
-    row = {
-        'Symbol': symbol, 'LTP': float(close[-1]), 'DayChangePct': float(intraday_pct),
-        'ActiveAnchor': None, 'AnchorPrice': 0.0, 'AnchorDir': "NONE", 'MovePct': 0.0,
-        'State': "NONE", 'Blocks': 0, 'KilledTime': '-', 'KilledPrice': 0.0, 'RejectReason': ""
-    }
-
-    # ---> PASS VWAP INTO THE TRIPWIRE <---
-    anchor, reject_info = evaluate_anchor_tripwire(close, dt, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, vwap, today_start_idx)
-
-    if anchor:
-        row['ActiveAnchor'] = pd.to_datetime(anchor['time']).strftime("%H:%M")
-        row['AnchorPrice'] = float(anchor['price'])
-        row['AnchorDir'] = anchor['dir']
-        row['MovePct'] = ((float(close[-1]) - anchor['price']) / anchor['price']) * 100 if anchor['price'] else 0.0
-
-        if anchor['dir'] == "BULL":
-            row['State'] = "[ACTIVE BUY]" if bb_upper[-1] > kc_upper[-1] else "[COILING]"
-        else:
-            row['State'] = "[ACTIVE SELL]" if bb_lower[-1] < kc_lower[-1] else "[COILING]"
-
-        for mult in HA_ATR_MULTIPLIERS:
-            rsi_st, macd_st, adx_st, blk_count = get_tripwire_state(close, kin_1m, base_atr, mult, today_start_idx)
-            gtag = f"{mult}X"
-            row[f'BB_RSI_{gtag}'] = rsi_st
-            row[f'BB_MACD_{gtag}'] = macd_st
-            row[f'ADX_{gtag}'] = adx_st
-            if mult == 1:
-                row['Blocks'] = blk_count
-    else:
-        row['AnchorDir'] = reject_info.get('dir', 'NONE')
-        row['ActiveAnchor'] = reject_info.get('anchor_time', '-')
-        row['AnchorPrice'] = float(reject_info.get('anchor_price', 0.0))
-        row['KilledTime'] = reject_info.get('killed_time', '-')
-        row['KilledPrice'] = float(reject_info.get('killed_price', 0.0))
-        row['RejectReason'] = reject_info.get('reason', 'Failed Kinetic Alignment')
-        if row['AnchorPrice'] > 0 and row['KilledPrice'] > 0:
-            row['MovePct'] = ((row['KilledPrice'] - row['AnchorPrice']) / row['AnchorPrice']) * 100
-
-    return row
-
-# ==============================================================================
-# 3. WORKERS, FORMATTERS & UI
-# ==============================================================================
-def format_kinetic_triad(rsi, macd, di):
-    def fmt(sig):
-        if sig == "Buy": return f"{COLOR_GREEN_FG}Buy{COLOR_RESET}"
-        if sig == "Sell": return f"{COLOR_RED_FG}Sel{COLOR_RESET}"
-        return f"{COLOR_DIM} - {COLOR_RESET}"
-    return f"{fmt(rsi)} {fmt(macd)} {fmt(di)}"
-
-def _history_worker_daily(args):
-    item, start, end, progress = args
-    try:
-        frames = []
-        for c_start, c_end in _date_chunks(start, end + timedelta(days=1), span=365):
-            status, df = _candles(_url_range_daily(item['key'], c_start, c_end))
-            if status == 200 and df is not None: frames.append(df)
-        if not frames: return None
-        master = prepare_master(frames)
-        close, vol = master['Close'].iloc[-1], master['Volume'].iloc[-1]
-        return item if (MIN_PRICE <= close <= MAX_PRICE and vol >= MIN_DAILY_VOLUME) else None
-    except Exception as e:
-        ERRORS.add(f"prefilter:{item.get('symbol')}", e)
-        return None
-    finally:
-        progress.tick()
-
-def process_stock_checkpoints(args):
-    item, checkpoints, is_live, history_days, mode, progress = args
-    try:
-        final_cutoff = checkpoints[-1]
-        target_dt = final_cutoff.date()
-        start_dt = target_dt - timedelta(days=history_days)
-        frames = []
-        for c_start, c_end in _date_chunks(start_dt, target_dt + timedelta(days=1), span=7):
-            status, df = _candles(_url_range_1m(item['key'], c_start, c_end))
-            if status == 200 and df is not None: frames.append(df)
-
-        if is_live:
-            today_df = fetch_today(item['key'])
-            if today_df is not None: frames.append(today_df)
-
-        if not frames:
-            return [(cp, "no_data", item['symbol']) for cp in checkpoints]
-
-        master_full = prepare_master(frames)
-        out = []
-        for cp in checkpoints:
-            master_1m = master_full[master_full['Datetime'] <= cp].reset_index(drop=True)
-            if len(master_1m) < 30:
-                out.append((cp, "no_data", item['symbol']))
-                continue
-
-            if mode == "INDEX_OPTIONS":
-                day = master_1m[master_1m['Datetime'].dt.date == target_dt]
-                if day.empty:
-                    out.append((cp, "no_data", item['symbol']))
-                    continue
-                if day['Close'].iloc[-1] < OPT_MIN_PRICE or day['Volume'].sum() < OPT_MIN_VOLUME:
-                    out.append((cp, "illiquid", item['symbol']))
-                    continue
-
-            row = compute_row(item['symbol'], master_1m, target_dt)
-            if row is None:
-                out.append((cp, "no_data", item['symbol']))
-            else:
-                row['CheckpointTime'] = cp
-                out.append((cp, "ok", row))
-        return out
-    except Exception as e:
-        ERRORS.add(f"1m:{item.get('symbol')}", e)
-        return [(cp, "error", item.get('symbol')) for cp in checkpoints]
-    finally:
-        progress.tick()
-
-def _clip(s, w):
-    return s if len(s) <= w else s[:w - 1] + "~"
-
-def _print_error_summary():
-    if STATS.failed:
-        print(f"{COLOR_YELLOW}⚠ {STATS.failed} API request(s) failed after retries. Samples: {'; '.join(STATS.samples)}{COLOR_RESET}")
-    if ERRORS.items:
-        print(f"{COLOR_YELLOW}⚠ {len(ERRORS.items)} instrument(s) raised exceptions. First one:{COLOR_RESET}")
-        where, msg, tb = ERRORS.items[0]
-        print(f"{COLOR_DIM}   [{where}] {msg}\n{tb}{COLOR_RESET}")
-
-# ==============================================================================
-# 3b. OPTIONAL WATCH / EMAIL ALERT (no-op unless --watch is passed)
-#     + ORDER-PLACED TRACKING (no-op unless the OrderPlaced env var is set)
-# ==============================================================================
-def _load_watch_state(path):
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, 'r') as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"   {COLOR_YELLOW}[watch] could not read state file '{path}' ({type(e).__name__}: {e}) -- starting fresh.{COLOR_RESET}")
-        return {}
-
-def _save_watch_state(path, state):
-    try:
-        with open(path, 'w') as f:
-            json.dump(state, f, indent=2, default=str)
-    except Exception as e:
-        print(f"   {COLOR_YELLOW}[watch] could not write state file '{path}' ({type(e).__name__}: {e}).{COLOR_RESET}")
-
-def _send_watch_email(subject, body):
-    sender = os.environ.get("SENDER_EMAIL") or os.environ.get("EMAIL_SENDER")
-    password = os.environ.get("SENDER_PASSWORD") or os.environ.get("EMAIL_APP_PWD")
-    recipient = os.environ.get("RECIPIENT_EMAIL") or os.environ.get("EMAIL_RECEIVER")
-    smtp_server = os.environ.get("SMTP_SERVER") or "smtp.gmail.com"
-    smtp_port = os.environ.get("SMTP_PORT") or "465"
-
-    missing = [name for name, val in (
-        ("SENDER_EMAIL/EMAIL_SENDER", sender),
-        ("SENDER_PASSWORD/EMAIL_APP_PWD", password),
-        ("RECIPIENT_EMAIL/EMAIL_RECEIVER", recipient),
-    ) if not val]
-    if missing:
-        print(f"   {COLOR_YELLOW}[watch] cannot send email -- missing env var(s): {', '.join(missing)}.{COLOR_RESET}")
-        return False
-
-    try:
-        port = int(smtp_port)
-    except ValueError:
-        print(f"   {COLOR_YELLOW}[watch] cannot send email -- SMTP_PORT='{smtp_port}' is not a valid integer.{COLOR_RESET}")
-        return False
-
-    msg = EmailMessage()
-    msg['Subject'] = subject
-    msg['From'] = sender
-    msg['To'] = recipient
-    msg.set_content(body)
-
-    try:
-        if port == 465:
-            with smtplib.SMTP_SSL(smtp_server, port, timeout=20) as server:
-                server.login(sender, password)
-                server.send_message(msg)
-        else:
-            with smtplib.SMTP(smtp_server, port, timeout=20) as server:
-                server.starttls()
-                server.login(sender, password)
-                server.send_message(msg)
-        print(f"   {COLOR_GREEN_FG}[watch] alert email sent to {recipient}.{COLOR_RESET}")
-        return True
-    except Exception as e:
-        print(f"   {COLOR_YELLOW}[watch] failed to send email ({type(e).__name__}: {e}).{COLOR_RESET}")
-        return False
-
-def _find_match(needle_upper, all_bulls, all_bears, rejected):
-    for row in all_bulls:
-        if needle_upper in row['Symbol'].upper():
-            return row
-    for row in all_bears:
-        if needle_upper in row['Symbol'].upper():
-            return row
-    for row in rejected:
-        if needle_upper in row['Symbol'].upper():
-            return row
-    return None
-
-def _describe_match(mode, value, match, cutoff_dt):
-    if match is not None:
-        symbol = match['Symbol']
-        status = match['State'] if match.get('State', 'NONE') != "NONE" else f"REJECTED ({match.get('RejectReason', 'unknown')})"
-        seen = match.get('CheckpointTime', cutoff_dt)
-        seen_str = seen.strftime('%H:%M') if hasattr(seen, 'strftime') else str(seen)
-        detail = (f"Symbol: {symbol}\nStatus: {status}\nLTP: {match.get('LTP', 0):.2f}\n"
-                  f"Day Change: {match.get('DayChangePct', 0):+.2f}%\nMove from anchor: {match.get('MovePct', 0):+.2f}%\n"
-                  f"Seen: {seen_str}\nMode: {mode}\nSnapshot: {cutoff_dt:%Y-%m-%d %H:%M}")
-    else:
-        symbol = value
-        status = "NOT FOUND"
-        detail = f"'{value}' did not match any scanned symbol this run.\nMode: {mode}\nSnapshot: {cutoff_dt:%Y-%m-%d %H:%M}"
-    return symbol, status, detail
-
-def check_watch_alerts(mode, watch_value, cutoff_dt, all_bulls, all_bears, rejected):
-    needle = str(watch_value).strip().upper()
-    if not needle:
-        return
-
-    match = _find_match(needle, all_bulls, all_bears, rejected)
-    symbol, status, detail = _describe_match(mode, watch_value, match, cutoff_dt)
-
-    state = _load_watch_state(WATCH_STATE_FILE)
-    key = needle
-    prev_status = state.get(key, {}).get("status")
-
-    print(f"\n{COLOR_BOLD}👁  WATCH [{watch_value}] -> {status}{COLOR_RESET}" +
-          (f" {COLOR_DIM}(previous: {prev_status}){COLOR_RESET}" if prev_status else ""))
-
-    if prev_status == status:
-        print(f"   {COLOR_DIM}[watch] status unchanged since last run -- no email sent.{COLOR_RESET}")
-    else:
-        if prev_status is None:
-            subject = f"[System3] Watch started: {watch_value} is {status}"
-        else:
-            subject = f"[System3] {watch_value} changed: {prev_status} -> {status}"
-        body = f"{subject}\n\n{detail}"
-        _send_watch_email(subject, body)
-
-    state[key] = {"status": status, "checked_at": cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")}
-    _save_watch_state(WATCH_STATE_FILE, state)
-
-def check_order_placed(mode, order_value, cutoff_dt, all_bulls, all_bears, rejected):
-    needle = str(order_value).strip().upper()
-    if not needle:
-        return
-
-    match = _find_match(needle, all_bulls, all_bears, rejected)
-    symbol, status, detail = _describe_match(mode, order_value, match, cutoff_dt)
-
-    prev_status = None
-    should_send = True
-    if ORDER_EMAIL_ONLY_ON_CHANGE:
-        state = _load_watch_state(ORDER_STATE_FILE)
-        prev_status = state.get(needle, {}).get("status")
-        should_send = (prev_status != status)
-
-    print(f"\n{COLOR_BOLD}📦 ORDER PLACED [{order_value}] -> {status}{COLOR_RESET}" +
-          (f" {COLOR_DIM}(previous: {prev_status}){COLOR_RESET}" if prev_status else ""))
-
-    if not should_send:
-        print(f"   {COLOR_DIM}[order] status unchanged since last run -- no email sent.{COLOR_RESET}")
-    else:
-        if ORDER_EMAIL_ONLY_ON_CHANGE:
-            subject = (f"[System3] Order tracking started: {order_value} is {status}" if prev_status is None
-                       else f"[System3] {order_value} changed: {prev_status} -> {status}")
-        else:
-            subject = f"[System3] Order status: {order_value} -> {status}"
-        body = f"{subject}\n\n{detail}"
-        _send_watch_email(subject, body)
-
-    if ORDER_EMAIL_ONLY_ON_CHANGE:
-        state = _load_watch_state(ORDER_STATE_FILE)
-        state[needle] = {"status": status, "checked_at": cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")}
-        _save_watch_state(ORDER_STATE_FILE, state)
-
-def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, target_time_str="15:30", options_master_path=""):
-    t_start = time.time()
-
-    if target_date_str:
-        try:
-            cutoff_dt = datetime.strptime(f"{target_date_str} {target_time_str}", "%Y-%m-%d %H:%M")
-        except ValueError:
-            print(f"{COLOR_RED_FG}[!] Invalid --date/--time '{target_date_str} {target_time_str}' (expected YYYY-MM-DD and HH:MM).{COLOR_RESET}")
-            return 1
-        target_dt, is_live = cutoff_dt.date(), False
-    else:
-        cutoff_dt = now_ist()
-        target_dt, is_live = cutoff_dt.date(), True
-
-    market_close = datetime.combine(target_dt, datetime.min.time()) + timedelta(hours=15, minutes=30)
-    cutoff_dt = min(cutoff_dt, market_close)
-
-    print(f"\n{COLOR_CYAN}📡 Initializing Tracker [{mode}] | Time Machine: {cutoff_dt.strftime('%Y-%m-%d %H:%M:%S')} (Live: {is_live}){COLOR_RESET}")
-
-    universe_raw = get_dynamic_universe(mode, cutoff_dt, is_live, options_master_path)
-    if STATS.auth_failed:
-        print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401). Regenerate UPSTOX_ACCESS_TOKEN -- it expires daily.{COLOR_RESET}")
-        return 1
-    if not universe_raw:
-        print(f"{COLOR_RED_FG}[!] Universe is EMPTY for mode {mode} -- nothing to scan. See the messages above for why.{COLOR_RESET}")
-        _print_error_summary()
-        return 1
-    print(f"   {COLOR_DIM}» Universe: {len(universe_raw)} instruments{COLOR_RESET}")
-
-    if mode == "INDEX_OPTIONS":
-        candidates = universe_raw
-    else:
-        daily_start = target_dt - timedelta(days=days * 2 + 6)
-        prog = Progress("prefilter", len(universe_raw))
-        with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
-            candidates = [r for r in ex.map(_history_worker_daily, [(it, daily_start, target_dt, prog) for it in universe_raw]) if r is not None]
-        prog.done()
-        if STATS.auth_failed:
-            print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401) during the prefilter.{COLOR_RESET}")
-            return 1
-        if not candidates:
-            print(f"{COLOR_YELLOW}[!] 0 of {len(universe_raw)} instruments passed the price/volume prefilter "
-                  f"(price {MIN_PRICE}-{MAX_PRICE}, volume >= {MIN_DAILY_VOLUME}).{COLOR_RESET}")
-            _print_error_summary()
-            return 1 if (STATS.failed or ERRORS.items) else 0
-        print(f"   {COLOR_DIM}» Prefilter: {len(universe_raw)} -> {len(candidates)} instruments{COLOR_RESET}")
-
-    checkpoints = generate_checkpoints(cutoff_dt) if BACKTRACE_CHECKPOINTS else [cutoff_dt]
-    print(f"   {COLOR_DIM}» Backtrace checkpoints ({len(checkpoints)}): "
-          f"{', '.join(c.strftime('%H:%M') for c in checkpoints)}{COLOR_RESET}")
-
-    prog = Progress("checkpoints", len(candidates))
-    with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        per_symbol = list(ex.map(process_stock_checkpoints,
-                                  [(item, checkpoints, is_live, MIN1_HISTORY_DAYS, mode, prog) for item in candidates]))
-    prog.done()
-
-    if STATS.auth_failed:
-        print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401) while fetching candles.{COLOR_RESET}")
-        return 1
-
-    outcomes = [o for sym_outcomes in per_symbol for o in sym_outcomes]
-    results = [p for _, s, p in outcomes if s == "ok"]
-    n_nodata = sum(1 for _, s, _ in outcomes if s == "no_data")
-    n_illiq = sum(1 for _, s, _ in outcomes if s == "illiquid")
-    n_err = sum(1 for _, s, _ in outcomes if s == "error")
-    print(f"   {COLOR_DIM}» Scan summary: {len(candidates)} instruments x {len(checkpoints)} checkpoints = "
-          f"{len(outcomes)} evaluations | ok {len(results)} | no data {n_nodata} | illiquid {n_illiq} | "
-          f"errors {n_err}{COLOR_RESET}")
-
-    if not results:
-        print(f"{COLOR_RED_FG}[!] No instrument produced usable data at any checkpoint up to {cutoff_dt:%Y-%m-%d %H:%M}. "
-              f"Is that a trading day/time, and does the token have historical-candle access?{COLOR_RESET}")
-        _print_error_summary()
-        return 1
-
-    by_symbol = {}
-    for row in results:
-        by_symbol.setdefault(row['Symbol'], []).append(row)
-
-    ACTIVE_BULL_STATES = ("[ACTIVE BUY]", "[COILING]")
-    ACTIVE_BEAR_STATES = ("[ACTIVE SELL]", "[COILING]")
-
-    def _merge(first_row, last_row, direction):
-        row = dict(last_row)
-        row['CheckpointTime'] = first_row['CheckpointTime']
-        row['ActiveAnchor'] = first_row['ActiveAnchor']
-        row['AnchorPrice'] = first_row['AnchorPrice']
-        row['AnchorDir'] = direction
-        anchor_price = first_row['AnchorPrice'] or last_row['LTP']
-        row['MovePct'] = ((last_row['LTP'] - anchor_price) / anchor_price) * 100 if anchor_price else 0.0
-
-        active_states = ACTIVE_BULL_STATES if direction == "BULL" else ACTIVE_BEAR_STATES
-        still_alive = (last_row['AnchorDir'] == direction and last_row['State'] in active_states)
-        if not still_alive:
-            row['State'] = "[STOPPED]"
-        return row
-
-    bulls, bears, rejected = [], [], []
-    for symbol, rows in by_symbol.items():
-        rows.sort(key=lambda r: r['CheckpointTime'])
-        last_row = rows[-1]
-
-        bull_rows = [r for r in rows if r['AnchorDir'] == "BULL" and r['State'] in ACTIVE_BULL_STATES]
-        bear_rows = [r for r in rows if r['AnchorDir'] == "BEAR" and r['State'] in ACTIVE_BEAR_STATES]
-
-        if bull_rows:
-            bulls.append(_merge(bull_rows[0], last_row, "BULL"))
-        if bear_rows:
-            bears.append(_merge(bear_rows[0], last_row, "BEAR"))
-        if not bull_rows and not bear_rows:
-            row = dict(last_row)
-            row['CheckpointTime'] = rows[0]['CheckpointTime']
-            rejected.append(row)
-
-    true_bull_count = len(bulls)
-    true_bear_count = len(bears)
-
-    bulls.sort(key=lambda r: (r['State'] == "[STOPPED]", r['CheckpointTime'], r['State'] != "[ACTIVE BUY]", -r['DayChangePct']))
-    bears.sort(key=lambda r: (r['State'] == "[STOPPED]", r['CheckpointTime'], r['State'] != "[ACTIVE SELL]", r['DayChangePct']))
-
-    all_bulls, all_bears = list(bulls), list(bears)
-
-    bulls = bulls[:TOP_N_BUYERS]
-    bears = bears[:TOP_N_SELLERS]
-
-    bull_count_str = f"{len(bulls)} (of {true_bull_count})" if true_bull_count > TOP_N_BUYERS else f"{true_bull_count}"
-    bear_count_str = f"{len(bears)} (of {true_bear_count})" if true_bear_count > TOP_N_SELLERS else f"{true_bear_count}"
-
-    shown = bulls + bears + rejected
-    sym_w = max(12, min(MAX_SYMBOL_WIDTH, max((len(r['Symbol']) for r in shown), default=12)))
-
-    print(f"\n{COLOR_BOLD}=== STATEFUL INSTITUTIONAL VOLATILITY TRACKER [{mode}] ==={COLOR_RESET}")
-    print(f"Target Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Scanned: {len(by_symbol)} symbols "
-          f"across {len(checkpoints)} checkpoints | After dedup: {bull_count_str} bull, {bear_count_str} bear, "
-          f"{len(rejected)} graveyard\n")
-
-    def print_basket(title, icon, data_list):
-        if not data_list: return
-        print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
-        header_str = (
-            f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP':>8} {'Day%':>7} | "
-            f"{'Seen':^6} {'Anchor':^6} {'Anch Val':>9} {'Move%':>7} | "
-            f"{'1X (R-M-D)':^11}  {'2X (R-M-D)':^11}  {'3X (R-M-D)':^11}  {'5X (R-M-D)':^11} | "
-            f"{'State':^14}{COLOR_RESET}"
-        )
-        print(header_str)
-        print("-" * len(ANSI_RE.sub("", header_str)))
-
-        for row in data_list:
-            day_pct_str = f"{row['DayChangePct']:>+6.2f}%"
-            day_color = COLOR_GREEN_FG if row['DayChangePct'] > 0 else COLOR_RED_FG if row['DayChangePct'] < 0 else COLOR_DIM
-            move_pct_str = f"{row['MovePct']:>+6.2f}%"
-            move_color = COLOR_GREEN_FG if row['MovePct'] > 0 else COLOR_RED_FG if row['MovePct'] < 0 else COLOR_DIM
-
-            k1 = format_kinetic_triad(row.get('BB_RSI_1X'), row.get('BB_MACD_1X'), row.get('ADX_1X'))
-            k2 = format_kinetic_triad(row.get('BB_RSI_2X'), row.get('BB_MACD_2X'), row.get('ADX_2X'))
-            k3 = format_kinetic_triad(row.get('BB_RSI_3X'), row.get('BB_MACD_3X'), row.get('ADX_3X'))
-            k5 = format_kinetic_triad(row.get('BB_RSI_5X'), row.get('BB_MACD_5X'), row.get('ADX_5X'))
-
-            state = row['State']
-            if "BUY]" in state: state_text = f"{COLOR_GREEN_FG}{state:^14}{COLOR_RESET}"
-            elif "SELL]" in state: state_text = f"{COLOR_RED_FG}{state:^14}{COLOR_RESET}"
-            else: state_text = f"{COLOR_YELLOW}{state:^14}{COLOR_RESET}"
-
-            print(
-                f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} "
-                f"{row['LTP']:>8.2f} "
-                f"{day_color}{day_pct_str}{COLOR_RESET} | "
-                f"{row['CheckpointTime'].strftime('%H:%M'):^6} "
-                f"{row['ActiveAnchor']:^6} "
-                f"{row['AnchorPrice']:>9.2f} "
-                f"{move_color}{move_pct_str}{COLOR_RESET} | "
-                f"{k1}  {k2}  {k3}  {k5} | "
-                f"{state_text}"
-            )
-
-    print_basket("TOP BULL SETUPS (Valid Anchors Surviving)", "🔥", bulls)
-    print_basket("TOP BEAR SETUPS (Valid Anchors Surviving)", "🩸", bears)
-    if not bulls and not bears:
-        print(f"{COLOR_YELLOW}No surviving anchors at this snapshot -- every candidate was rejected (see graveyard).{COLOR_RESET}")
-
-    if rejected:
-        print(f"\n{COLOR_BOLD}🚫 THE GRAVEYARD (Filtered / Rejected){COLOR_RESET}")
-        header_str = (
-            f" {COLOR_CYAN}{'Script':<{sym_w}} {'Seen':^6} {'Signal':^6} {'Anchor':^6} {'Anch Val':>9} "
-            f"{'Killed':^6} {'Kill Val':>9} {'LTP':>8} {'Day%':>7} {'Move%':>7} | "
-            f"{'Forensic Rejection Reason'}{COLOR_RESET}"
-        )
-        print(header_str)
-        print("-" * len(ANSI_RE.sub("", header_str)))
-
-        def sort_reason(r):
-            reason = r['RejectReason']
-            if "Kinetic SL" in reason: return 0
-            if "Warzone" in reason: return 1
-            if "Alignment" in reason: return 2
-            return 3
-
-        rejected.sort(key=lambda x: (x['CheckpointTime'], sort_reason(x), -abs(x['DayChangePct'])))
-
-        for row in rejected:
-            sig = row['AnchorDir']
-            if sig == "BULL": sig_colored = f"{COLOR_GREEN_FG}BULL{COLOR_RESET}  "
-            elif sig == "BEAR": sig_colored = f"{COLOR_RED_FG}BEAR{COLOR_RESET}  "
-            else: sig_colored = f"{COLOR_DIM}NONE{COLOR_RESET}  "
-
-            a_time = row['ActiveAnchor'] if row['ActiveAnchor'] else '-'
-            a_price = f"{row['AnchorPrice']:>9.2f}" if row['AnchorPrice'] > 0 else f"{'-':>9}"
-            k_time = row['KilledTime'] if row['KilledTime'] else '-'
-            k_price = f"{row['KilledPrice']:>9.2f}" if row['KilledPrice'] > 0 else f"{'-':>9}"
-
-            day_pct_str = f"{row['DayChangePct']:>+6.2f}%"
-            day_color = COLOR_GREEN_FG if row['DayChangePct'] > 0 else COLOR_RED_FG if row['DayChangePct'] < 0 else COLOR_DIM
-
-            if row['AnchorPrice'] > 0 and row['KilledPrice'] > 0:
-                move_pct_str = f"{row['MovePct']:>+6.2f}%"
-                move_color = COLOR_GREEN_FG if row['MovePct'] > 0 else COLOR_RED_FG if row['MovePct'] < 0 else COLOR_DIM
-            else:
-                move_pct_str, move_color = f"{'-':>7}", COLOR_DIM
-
-            reason = row['RejectReason']
-            if "Kinetic SL" in reason or "Pullback" in reason or "Rally" in reason: reason_color = COLOR_YELLOW
-            elif "Chop" in reason or "Warzone" in reason: reason_color = COLOR_RED_FG
-            else: reason_color = COLOR_DIM
-
-            print(
-                f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} "
-                f"{row['CheckpointTime'].strftime('%H:%M'):^6} "
-                f"{sig_colored} {a_time:^6} {a_price} {k_time:^6} {k_price} "
-                f"{row['LTP']:>8.2f} {day_color}{day_pct_str}{COLOR_RESET} "
-                f"{move_color}{move_pct_str}{COLOR_RESET} | "
-                f"{reason_color}{reason}{COLOR_RESET}"
-            )
-
-    if WATCH_VALUE:
-        check_watch_alerts(mode, WATCH_VALUE, cutoff_dt, all_bulls, all_bears, rejected)
-
-    order_value = os.environ.get(ORDER_PLACED_ENV, "").strip()
-    if order_value:
-        check_order_placed(mode, order_value, cutoff_dt, all_bulls, all_bears, rejected)
-
-    _print_error_summary()
-    total_calls = sum(l.total_calls for l in LIMITERS.values())
-    print(f"\n⏱️ Tracker sync completed in {(time.time() - t_start):.2f} seconds ({total_calls} API calls).\n")
-    return 0
-
-
-def parse_args():
-    p = argparse.ArgumentParser(description="Strict institutional volatility tracker (Upstox)")
-    p.add_argument("--mode", choices=["STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"], default=TRADING_MODE)
-    p.add_argument("--days", type=int, default=BACKTRACE_DAYS, help="trading sessions of history (daily prefilter only)")
-    p.add_argument("--date", type=str, default=None, help="Target date (YYYY-MM-DD)")
-    p.add_argument("--time", type=str, default="15:30", help="Target time (HH:MM). Defaults to 15:30.")
-    p.add_argument("--history-days", type=int, default=MIN1_HISTORY_DAYS,
-                   help=f"Calendar days of 1-minute history for indicator math (default: {MIN1_HISTORY_DAYS}).")
-    p.add_argument("--disable-bb-kc-gate", action="store_true",
-                   help="Drop the 'Bollinger Band already pierced Keltner Channel' requirement (already off by default).")
-    p.add_argument("--options-master", type=str, default="",
-                   help="INDEX_OPTIONS only: local JSON/CSV instrument master, for backtesting contracts that have already expired.")
-    p.add_argument("--opt-min-price", type=float, default=OPT_MIN_PRICE, help="INDEX_OPTIONS: minimum premium at the snapshot.")
-    p.add_argument("--opt-min-volume", type=float, default=OPT_MIN_VOLUME, help="INDEX_OPTIONS: minimum traded volume by the snapshot.")
-    p.add_argument("--expiry", choices=["CURRENT", "NEXT"], default=EXPIRY_SELECTION,
-                   help=f"INDEX_OPTIONS: which expiry to trade -- CURRENT (nearest expiry on/after the snapshot date) "
-                        f"or NEXT (the one after that). Default: {EXPIRY_SELECTION}.")
-    p.add_argument("--strikes-up", type=int, default=STRIKES_ABOVE_ATM,
-                   help=f"INDEX_OPTIONS: number of strikes ABOVE ATM to include, CE+PE each (default {STRIKES_ABOVE_ATM}).")
-    p.add_argument("--strikes-down", type=int, default=STRIKES_BELOW_ATM,
-                   help=f"INDEX_OPTIONS: number of strikes BELOW ATM to include, CE+PE each (default {STRIKES_BELOW_ATM}).")
-    p.add_argument("--checkpoint-min", type=int, default=CHECKPOINT_INTERVAL_MIN,
-                   help=f"Size in minutes of each intraday backtrace window, from session open up to the run "
-                        f"time (default {CHECKPOINT_INTERVAL_MIN}). E.g. a 10:30 run with 15 checks 9:30, "
-                        f"9:45, 10:00, 10:15, 10:30; a 10:35 run adds a final 10:30->10:35 partial checkpoint.")
-    p.add_argument("--single-snapshot", action="store_true",
-                   help="Disable the backtrace -- evaluate only the current run time, like a single snapshot.")
-    p.add_argument("--watch", type=str, default="",
-                   help="Optional. A symbol, tradingsymbol, or strike-bearing string to monitor (e.g. 'RELIANCE', "
-                        "'NIFTY25000CE', or just '25000' -- matched as a case-insensitive substring of the symbol). "
-                        "When set, this run checks that symbol's status and emails an alert via "
-                        "SENDER_EMAIL/EMAIL_SENDER, SENDER_PASSWORD/EMAIL_APP_PWD, RECIPIENT_EMAIL/EMAIL_RECEIVER "
-                        "(SMTP_SERVER/SMTP_PORT optional, default smtp.gmail.com:465) ONLY if the status changed "
-                        "since the last run (tracked in system3_watch_state.json). If this flag is omitted "
-                        "(default: no watch), no email code runs at all.")
-    p.add_argument("--order-email-only-on-change", action="store_true",
-                   help="Switch OrderPlaced tracking (see the OrderPlaced env var) from 'email every run' to "
-                        "'email only when the status changes since the last run', using its own state file "
-                        f"({ORDER_STATE_FILE}) so it never shares state with --watch.")
-    return p.parse_args()
-
-if __name__ == "__main__":
-    if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
-        print(f"{COLOR_RED_FG}[!] Missing UPSTOX_ACCESS_TOKEN environment variable.{COLOR_RESET}")
-        sys.exit(1)
-    args = parse_args()
-    MIN1_HISTORY_DAYS = args.history_days
-    OPT_MIN_PRICE = args.opt_min_price
-    OPT_MIN_VOLUME = args.opt_min_volume
-    EXPIRY_SELECTION = args.expiry
-    STRIKES_ABOVE_ATM = args.strikes_up
-    STRIKES_BELOW_ATM = args.strikes_down
-    CHECKPOINT_INTERVAL_MIN = args.checkpoint_min
-    WATCH_VALUE = args.watch
-    if args.order_email_only_on_change:
-        ORDER_EMAIL_ONLY_ON_CHANGE = True
-    if args.single_snapshot:
-        BACKTRACE_CHECKPOINTS = False
-    if args.disable_bb_kc_gate:
-        REQUIRE_BB_KC_PIERCE = False
-    try:
-        code = run_screener(args.mode, args.days, args.date, args.time, args.options_master)
-    except Exception:
-        print(f"\n{COLOR_RED_FG}💥 FATAL: unhandled exception -- full traceback follows.{COLOR_RESET}")
-        traceback.print_exc()
-        code = 1
-    sys.exit(code)
+# @@STAGE2@@
