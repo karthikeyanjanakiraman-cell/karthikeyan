@@ -917,19 +917,7 @@ def get_tripwire_state(close, kin_1m, base_atr, mult, today_start, end=None):
             curr_open = close[i]
     return last_rsi, last_macd, last_adx, blocks
 
-def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, vwap, today_start, end=None):
-    """
-    Replays the day from the open up to candle index `end` (exclusive) and returns
-    (surviving_anchor | None, info).
-
-    FIX 4: `info['kills']` lists EVERY anchor killed so far (direction, anchor time/price, kill time/price,
-           reason), so the merge step can say which signal was stopped, when and why.
-    FIX 5: besides the soft stop (1-ATR pullback from the peak AND opposing kinetics, where the reference peak is
-           re-based whenever the kinetics do not confirm) there is now an unconditional trailing floor
-           HARD_STOP_ATR_MULT x ATR below the TRUE peak since the anchor. Without it a position could bleed any
-           number of ATRs and still read ACTIVE. With HARD_STOP_ATR_MULT = 0 the behaviour is identical to the
-           original state machine.
-    """
+ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, vwap, today_start, end=None):
     n = len(close) if end is None else min(int(end), len(close))
     if today_start >= n:
         return None, {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0,
@@ -948,8 +936,8 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
         anchor = None
 
         while i < n:
-            # Unpack the new shock variables
-            bull_score, bear_score, r_bull, r_bear, _, _, _, _, _, _, bull_shock, bear_shock = get_kinetics(kin_1m, i)
+            (bull_score, bear_score, r_bull, r_bear,
+             _, _, _, _, _, _, bull_shock, bear_shock) = get_kinetics(kin_1m, i)
 
             if REQUIRE_BB_KC_PIERCE:
                 bb_kc_bull_fire = bb_upper[i] > kc_upper[i]
@@ -957,9 +945,8 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
             else:
                 bb_kc_bull_fire = bb_kc_bear_fire = True
 
-            # --- NEW TRIGGER: Oscillator ATR Shocks instead of Price ATR ---
+            # Oscillator ATR Shock trigger
             if bull_shock:
-                # Still require VWAP and BB/KC safety filters
                 if bb_kc_bull_fire and close[i] > vwap[i]:
                     if r_bear:
                         warzone_kills += 1
@@ -976,7 +963,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                     else:
                         anchor = {"dir": "BEAR", "idx": i, "time": dt_1m[i], "price": close[i]}
                         break
-            
+
             i += 1
 
         if not anchor:
@@ -984,12 +971,14 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
 
         survived = True
         is_bull = anchor['dir'] == "BULL"
-        peak_price = anchor['price']     # soft-stop reference: re-based when a pullback is NOT kinetically confirmed
-        true_peak = anchor['price']      # FIX 5: never re-based
+        peak_price = anchor['price']
+        true_peak = anchor['price']
         j = anchor['idx'] + 1
 
         while j < n:
-            bull_score, bear_score, _, _, _, _, _, _, _, _, _, _ = get_kinetics(kin_1m, j)
+            # Unpack all 12 variables returned by the updated get_kinetics
+            (bull_score, bear_score, _, _, _, _, _, _, _, _, _, _) = get_kinetics(kin_1m, j)
+            
             if is_bull:
                 peak_price = max(peak_price, close[j]); true_peak = max(true_peak, close[j])
                 adverse, hard_adverse, opposing = peak_price - close[j], true_peak - close[j], bear_score
@@ -1002,11 +991,10 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
             reason = None
             if hard_mult > 0 and hard_adverse >= hard_mult * base_atr:
                 reason = f"Hard stop ({hard_mult:g} ATR trailing floor)"
-            elif adverse >= base_atr:
-                if opposing >= 2:
-                    reason = soft_reason
-                else:
-                    peak_price = close[j]
+            elif adverse >= base_atr and opposing >= 2:
+                # The fatal 'else: peak_price = close[j]' ratchet has been deleted.
+                # Now, the soft stop preserves its highest peak properly.
+                reason = soft_reason
 
             if reason:
                 last_killed_info = {
@@ -1038,6 +1026,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
         info['reason'] = "Failed Kinetic or VWAP Alignment"
     info['kills'] = kills
     return None, info
+   
 
 def prepare_series(master, target_dt, pinned=False):
     """
