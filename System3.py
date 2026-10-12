@@ -1190,52 +1190,19 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     bull_live = sum(1 for r in bulls if r['State'] != "[STOPPED]")
     bear_live = sum(1 for r in bears if r['State'] != "[STOPPED]")
 
-    def kinetic_score(r, target="Buy"):
-        keys = [f'{ind}_{m}X' for m in (1, 2, 3, 5) for ind in ('BB_RSI', 'BB_MACD', 'ADX')]
-        return sum(1 for k in keys if r.get(k) == target)
-
-    def bull_state_rank(st):
-        if "[ACTIVE BUY]" in st: return 0
-        if "[COILING]" in st:    return 1
+    # State Rank: ACTIVE (0) -> COILING (1) -> STOPPED (2)
+    def state_rank(st):
+        if "[ACTIVE BUY]" in st or "[ACTIVE SELL]" in st:
+            return 0
+        if "[COILING]" in st:
+            return 1
         return 2
 
-    def bull_sort_key(r):
-        a_time = r.get('ActiveAnchor', '00:00')
-        try:
-            hh, mm = map(int, a_time.split(':'))
-            anchor_mins = hh * 60 + mm
-        except Exception:
-            anchor_mins = 0
+    # Bulls: State Priority -> Move% Descending (Highest gain off anchor first)
+    bulls.sort(key=lambda r: (state_rank(r['State']), -r.get('MovePct', 0.0)))
 
-        return (
-            bull_state_rank(r['State']),
-            -anchor_mins,
-            -r.get('MovePct', 0.0),
-            -kinetic_score(r, "Buy"),
-        )
-
-    def bear_state_rank(st):
-        if "[ACTIVE SELL]" in st: return 0
-        if "[COILING]" in st:     return 1
-        return 2
-
-    def bear_sort_key(r):
-        a_time = r.get('ActiveAnchor', '00:00')
-        try:
-            hh, mm = map(int, a_time.split(':'))
-            anchor_mins = hh * 60 + mm
-        except Exception:
-            anchor_mins = 0
-
-        return (
-            bear_state_rank(r['State']),
-            -anchor_mins,
-            r.get('MovePct', 0.0),
-            -kinetic_score(r, "Sell"),
-        )
-
-    bulls.sort(key=bull_sort_key)
-    bears.sort(key=bear_sort_key)
+    # Bears: State Priority -> Move% Descending (Deepest downside off anchor first)
+    bears.sort(key=lambda r: (state_rank(r['State']), r.get('MovePct', 0.0)))
 
     bulls = bulls[:TOP_N_BUYERS]
     bears = bears[:TOP_N_SELLERS]
