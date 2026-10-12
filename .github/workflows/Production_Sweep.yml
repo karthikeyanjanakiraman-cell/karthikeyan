@@ -26,7 +26,7 @@ on:
         default: ''
         type: string
       track_symbol:
-        description: 'Optional Tracking Symbol (e.g., BDL or NIFTY 22500 CE)'
+        description: 'Optional Tracking Symbol (Manual Fallback)'
         required: false
         default: ''
         type: string
@@ -55,7 +55,7 @@ jobs:
         FYERS_CLIENT_ID: ${{ secrets.CLIENT_ID }}
         FYERS_ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
         
-        # Email Alert Configurations (Matched exactly to your repository secrets)
+        # Email Alert Configurations
         SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
         SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
         RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
@@ -65,7 +65,10 @@ jobs:
         # Upstox Token
         UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
         
-        # GitHub Actions Inputs
+        # Tracking Security Variable (Priority 1)
+        SECRET_TRACK: ${{ secrets.TRACK_SYMBOL }}
+        
+        # GitHub Actions Manual Inputs (Priority 2)
         PARAM_MODE: ${{ inputs.trading_mode }}
         PARAM_BACKTEST_DATE: ${{ inputs.backtest_date }}
         PARAM_BACKTEST_TIME: ${{ inputs.backtest_time }}
@@ -91,8 +94,10 @@ jobs:
           CMD="$CMD --time $PARAM_BACKTEST_TIME"
         fi
 
-        # 4. Inject Stateless Tracking Symbol
-        if [ -n "$PARAM_TRACK" ]; then
+        # 4. Inject Stateless Tracking Symbol (Secret > Manual Input)
+        if [ -n "$SECRET_TRACK" ]; then
+          CMD="$CMD --track \"$SECRET_TRACK\""
+        elif [ -n "$PARAM_TRACK" ]; then
           CMD="$CMD --track \"$PARAM_TRACK\""
         fi
         
