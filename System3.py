@@ -862,6 +862,7 @@ def _evaluate_kinetic_arrays(close, high, low, vol):
         'vel_pdi': vel_pdi, 'atr_pdi': atr_pdi,
         'vel_mdi': vel_mdi, 'atr_mdi': atr_mdi
     }
+
 def get_kinetics(kin_1m, idx):
     rsi = kin_1m['rsi'][idx]; r_mean = kin_1m['r_mean'][idx]; r_std = kin_1m['r_std'][idx]
     hist = kin_1m['hist'][idx]; h_mean = kin_1m['h_mean'][idx]; h_std = kin_1m['h_std'][idx]
@@ -917,7 +918,7 @@ def get_tripwire_state(close, kin_1m, base_atr, mult, today_start, end=None):
             curr_open = close[i]
     return last_rsi, last_macd, last_adx, blocks
 
- def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, vwap, today_start, end=None):
+def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, vwap, today_start, end=None):
     n = len(close) if end is None else min(int(end), len(close))
     if today_start >= n:
         return None, {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0,
@@ -1026,7 +1027,6 @@ def get_tripwire_state(close, kin_1m, base_atr, mult, today_start, end=None):
         info['reason'] = "Failed Kinetic or VWAP Alignment"
     info['kills'] = kills
     return None, info
-   
 
 def prepare_series(master, target_dt, pinned=False):
     """
@@ -1144,10 +1144,16 @@ def compute_row(symbol, master_1m, target_dt):
 # ==============================================================================
 # 3. WORKERS, FORMATTERS & UI
 # ==============================================================================
-def format_kinetic_triad(rsi, macd, di):
+def format_kinetic_triad(rsi, macd, di, symbol):
+    is_pe = " PE " in symbol or symbol.endswith("PE")
     def fmt(sig):
-        if sig == "Buy": return f"{COLOR_GREEN_FG}Buy{COLOR_RESET}"
-        if sig == "Sell": return f"{COLOR_RED_FG}Sel{COLOR_RESET}"
+        # Invert the text if it's a Put Option (PE premium going up = Market Sell)
+        if is_pe:
+            if sig == "Buy": return f"{COLOR_RED_FG}Sel{COLOR_RESET}"
+            if sig == "Sell": return f"{COLOR_GREEN_FG}Buy{COLOR_RESET}"
+        else:
+            if sig == "Buy": return f"{COLOR_GREEN_FG}Buy{COLOR_RESET}"
+            if sig == "Sell": return f"{COLOR_RED_FG}Sel{COLOR_RESET}"
         return f"{COLOR_DIM} - {COLOR_RESET}"
     return f"{fmt(rsi)} {fmt(macd)} {fmt(di)}"
 
@@ -1646,8 +1652,31 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     bulls, bears, rejected = [], [], []
     for symbol, rows in by_symbol.items():
         b, r_, g = merge_symbol_rows(rows)
-        if b: bulls.append(b)
-        if r_: bears.append(r_)
+        
+        is_pe = " PE " in symbol or symbol.endswith("PE")
+        is_ce = " CE " in symbol or symbol.endswith("CE")
+        
+        if b:
+            if is_pe:
+                # Upward PE Breakout -> Market Bear Setup
+                b['AnchorDir'] = "BEAR"
+                if b['State'] == "[ACTIVE BUY]": b['State'] = "[ACTIVE SELL]"
+                bears.append(b)
+            else:
+                bulls.append(b)
+                
+        if r_:
+            if not is_pe:
+                # Downward CE Breakdown -> Market Bear Setup
+                r_['AnchorDir'] = "BEAR"
+                if r_['State'] == "[ACTIVE SELL]": r_['State'] = "[ACTIVE SELL]"
+                bears.append(r_)
+            else:
+                # Downward PE Breakdown -> Market Bull Setup
+                r_['AnchorDir'] = "BULL"
+                if r_['State'] == "[ACTIVE SELL]": r_['State'] = "[ACTIVE BUY]"
+                bulls.append(r_)
+                
         if g: rejected.append(g)
 
     true_bull_count = len(bulls)
@@ -1655,8 +1684,53 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     bull_live = sum(1 for r in bulls if r['State'] != "[STOPPED]")
     bear_live = sum(1 for r in bears if r['State'] != "[STOPPED]")
 
-    bulls.sort(key=lambda r: (r['State'] == "[STOPPED]", r['CheckpointTime'], r['State'] != "[ACTIVE BUY]", -r['DayChangePct']))
-    bears.sort(key=lambda r: (r['State'] == "[STOPPED]", r['CheckpointTime'], r['State'] != "[ACTIVE SELL]", r['DayChangePct']))
+    # Kinetic confirmation score across 1X, 2X, 3X, 5X triads (max 12)
+    def kinetic_score(r, target="Buy"):
+        keys = [f'{ind}_{m}X' for m in (1, 2, 3, 5) for ind in ('BB_RSI', 'BB_MACD', 'ADX')]
+        return sum(1 for k in keys if r.get(k) == target)
+
+    def bull_state_rank(st):
+        if "[ACTIVE BUY]" in st: return 0
+        if "[COILING]" in st:    return 1
+        return 2
+
+    def bull_sort_key(r):
+        a_time = r.get('ActiveAnchor', '00:00')
+        try:
+            hh, mm = map(int, a_time.split(':'))
+            anchor_mins = hh * 60 + mm
+        except Exception:
+            anchor_mins = 0
+
+        return (
+            bull_state_rank(r['State']), # 1. Active Buy -> Coiling -> Stopped
+            -anchor_mins,                # 2. Most recent anchor first
+            -r.get('MovePct', 0.0),      # 3. Best gain preservation
+            -kinetic_score(r, "Buy"),    # 4. Triad confluence
+        )
+
+    def bear_state_rank(st):
+        if "[ACTIVE SELL]" in st: return 0
+        if "[COILING]" in st:     return 1
+        return 2
+
+    def bear_sort_key(r):
+        a_time = r.get('ActiveAnchor', '00:00')
+        try:
+            hh, mm = map(int, a_time.split(':'))
+            anchor_mins = hh * 60 + mm
+        except Exception:
+            anchor_mins = 0
+
+        return (
+            bear_state_rank(r['State']),
+            -anchor_mins,
+            r.get('MovePct', 0.0),       # More negative Move% ranked higher for short setups
+            -kinetic_score(r, "Sell"),
+        )
+
+    bulls.sort(key=bull_sort_key)
+    bears.sort(key=bear_sort_key)
 
     all_bulls, all_bears = list(bulls), list(bears)      # the tracking lookup searches EVERYTHING, not just the top N
 
@@ -1703,10 +1777,11 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             move_pct_str = f"{row['MovePct']:>+6.2f}%"
             move_color = _fav_color(row['MovePct'], row['AnchorDir'])
 
-            k1 = format_kinetic_triad(row.get('BB_RSI_1X'), row.get('BB_MACD_1X'), row.get('ADX_1X'))
-            k2 = format_kinetic_triad(row.get('BB_RSI_2X'), row.get('BB_MACD_2X'), row.get('ADX_2X'))
-            k3 = format_kinetic_triad(row.get('BB_RSI_3X'), row.get('BB_MACD_3X'), row.get('ADX_3X'))
-            k5 = format_kinetic_triad(row.get('BB_RSI_5X'), row.get('BB_MACD_5X'), row.get('ADX_5X'))
+            sym = row['Symbol']
+            k1 = format_kinetic_triad(row.get('BB_RSI_1X'), row.get('BB_MACD_1X'), row.get('ADX_1X'), sym)
+            k2 = format_kinetic_triad(row.get('BB_RSI_2X'), row.get('BB_MACD_2X'), row.get('ADX_2X'), sym)
+            k3 = format_kinetic_triad(row.get('BB_RSI_3X'), row.get('BB_MACD_3X'), row.get('ADX_3X'), sym)
+            k5 = format_kinetic_triad(row.get('BB_RSI_5X'), row.get('BB_MACD_5X'), row.get('ADX_5X'), sym)
 
             state = row['State']
             shown_state = _state_display(row)
