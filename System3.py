@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
 Strict Institutional Volatility Tracker (Upstox) - ALL-MODE EDITION  (System3.py)
-+ Modes: STOCK_FNO, CASH_EQUITY, INDEX_OPTIONS (NIFTY / BANKNIFTY / FINNIFTY / SENSEX option chains).
-+ Intraday Backtrace: re-evaluates every 15-min checkpoint from session open to the run time.
-+ Configurable Expiry & Strike Window: EXPIRY_SELECTION (CURRENT/NEXT) and separate STRIKES_ABOVE_ATM/STRIKES_BELOW_ATM.
-+ Time-Machine Targeting: --date / --time truncate all data at that snapshot.
-+ Directional ATR Tripwires + Trailing Stop-Loss Floor, evaluated on a continuous 1-min indicator engine.
++ Modes: STOCK_FNO, CASH_EQUITY, INDEX_OPTIONS
++ Stateless Tracking: Pass `--track "SYMBOL"` to print its intraday checkpoint history
+  and receive an email alert if its state changes between intervals.
++ Directional ATR Tripwires + Trailing Stop-Loss Floor
 """
 import os
 import sys
@@ -13,13 +12,16 @@ import re
 import argparse
 import traceback
 import urllib.parse
-import json
 import gzip
+import json
 import time
 import threading
 from bisect import bisect_left
 from datetime import datetime, timedelta, timezone, time as dtime
 import concurrent.futures
+
+import smtplib
+from email.message import EmailMessage
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -53,20 +55,18 @@ ATR_BASIS_PERIOD = 14
 ATR_BASIS_TF = "15min"
 ATR_MIN_BARS = 5
 MIN_ATR_PCT = 0.001
-HARD_STOP_ATR_MULT = 1.2  # Tightened hard stop
+HARD_STOP_ATR_MULT = 1.2
 
 TOP_N_BUYERS = 50
 TOP_N_SELLERS = 50
 TOP_N_GRAVEYARD = 100
 MAX_SYMBOL_WIDTH = 30
 
-# --- INTRADAY BACKTRACE CHECKPOINTS ---
 CHECKPOINT_INTERVAL_MIN = 15
 BACKTRACE_CHECKPOINTS = True
 REQUIRE_BB_KC_PIERCE = False
 DAY_PCT_BASIS = "PREV_CLOSE"
 
-# --- COLOR PALETTE ---
 COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
 COLOR_DIM = '\033[90m'
@@ -98,7 +98,7 @@ SESSION_CLOSE_MIN = 15 * 60 + 30
 PROBE_KEY = INDEX_CONFIG["NIFTY"]["spot_key"]
 
 # ==============================================================================
-# HELPERS
+# HELPERS & RATE LIMITERS
 # ==============================================================================
 def now_ist():
     return datetime.now(IST).replace(tzinfo=None)
@@ -255,7 +255,6 @@ def generate_checkpoints(cutoff_dt, interval_min=None):
     session_open = _open_dt(cutoff_dt.date())
     if cutoff_dt <= session_open:
         return [cutoff_dt]
-
     checkpoints = []
     t = session_open + timedelta(minutes=interval)
     while t <= cutoff_dt:
@@ -385,7 +384,29 @@ def _download_master(name, _is_fallback=False):
             return rows
     return []
 
-def _equity_universe(mode):
+def resolve_pins(cands, needles, label="symbol"):
+    pinned = set()
+    norm = [(_norm_sym(sym), sym, key) for sym, key in cands]
+    MAX_PINNED_MATCHES = 8
+    for raw in needles:
+        n = _norm_sym(raw)
+        if not n:
+            continue
+        hits = [c for c in norm if c[0] == n] or [c for c in norm if n in c[0]]
+        if not hits:
+            print(f"   {COLOR_YELLOW}» track '{raw}': no {label} in the instrument master matches it.{COLOR_RESET}")
+            continue
+        hits.sort(key=lambda c: c[2])
+        if len(hits) > MAX_PINNED_MATCHES:
+            print(f"   {COLOR_YELLOW}» track '{raw}': {len(hits)} matches -- keeping the first {MAX_PINNED_MATCHES}; "
+                  f"use a more specific value.{COLOR_RESET}")
+            hits = hits[:MAX_PINNED_MATCHES]
+        names = ", ".join(h[1] for h in hits[:3]) + (" ..." if len(hits) > 3 else "")
+        print(f"   {COLOR_DIM}» track '{raw}': pinned {len(hits)} {label}(s) -- always scanned, filters bypassed: {names}{COLOR_RESET}")
+        pinned.update(h[1] for h in hits)
+    return pinned
+
+def _equity_universe(mode, needles=()):
     nse = _download_master("NSE")
     if not nse:
         print(f"{COLOR_RED_FG}[!] NSE instrument master unavailable -- cannot build the {mode} universe.{COLOR_RESET}")
@@ -396,7 +417,20 @@ def _equity_universe(mode):
     everything = {i["instrument_key"]: {"symbol": ts_of(i), "key": i["instrument_key"]} for i in nse if plain(i)}
     in_mode = {k: v for k, v in everything.items()
                if ((v["symbol"] in fno) if mode == "STOCK_FNO" else (v["symbol"] not in fno))}
-    return list(in_mode.values())
+
+    pinned = set()
+    if needles:
+        pinned = resolve_pins([(v["symbol"], (len(v["symbol"]), v["symbol"])) for v in everything.values()],
+                              needles, "equity symbol")
+    out = {k: dict(v, pinned=v["symbol"] in pinned) for k, v in in_mode.items()}
+    extra = 0
+    for k, v in everything.items():
+        if v["symbol"] in pinned and k not in out:
+            out[k] = dict(v, pinned=True)
+            extra += 1
+    if extra:
+        print(f"   {COLOR_DIM}» {extra} tracked symbol(s) sit outside the {mode} universe -- added for tracking.{COLOR_RESET}")
+    return list(out.values())
 
 def _resolve_index_spot_price(key, name, cutoff_dt, use_intraday):
     target_dt = cutoff_dt.date()
@@ -445,7 +479,7 @@ def _expiry_to_date(exp):
         pass
     return None
 
-def _index_options_universe(cutoff_dt, use_intraday):
+def _index_options_universe(cutoff_dt, use_intraday, needles=()):
     target_dt = cutoff_dt.date()
 
     spot = {}
@@ -460,7 +494,7 @@ def _index_options_universe(cutoff_dt, use_intraday):
             print(f"   {COLOR_DIM}» {idx:<10} spot {price:>10.2f}  ({src}){COLOR_RESET}")
         else:
             print(f"   {COLOR_YELLOW}» {idx:<10} spot unavailable -- skipped ({src}){COLOR_RESET}")
-    if not spot:
+    if not spot and not needles:
         if not STATS.auth_failed:
             print(f"{COLOR_RED_FG}[!] Could not resolve a spot price for ANY index, so no ATM strikes can be chosen. "
                   f"Check the token/API access to index candles (see failure samples below).{COLOR_RESET}")
@@ -515,6 +549,21 @@ def _index_options_universe(cutoff_dt, use_intraday):
 
     universe, seen = [], set()
 
+    if needles:
+        flat = []
+        for idx, contracts in by_idx.items():
+            for exp_date, strike, itype, row in contracts:
+                if exp_date < target_dt: continue
+                key = _field(row, "instrument_key")
+                sym = str(_field(row, "trading_symbol", "tradingsymbol") or key)
+                flat.append((sym, (exp_date, strike, itype, sym), key))
+        sym_to_key = {sym: key for sym, _, key in flat}
+        for sym in sorted(resolve_pins([(s, k) for s, k, _ in flat], needles, "option contract")):
+            key = sym_to_key[sym]
+            if key not in seen:
+                seen.add(key)
+                universe.append({"key": key, "symbol": sym, "pinned": True})
+
     for idx, contracts in by_idx.items():
         if idx not in spot: continue
         if not contracts:
@@ -545,7 +594,7 @@ def _index_options_universe(cutoff_dt, use_intraday):
             key = _field(row, "instrument_key")
             if strike in window and key not in seen:
                 seen.add(key)
-                universe.append({"key": key, "symbol": str(_field(row, "trading_symbol", "tradingsymbol") or key)})
+                universe.append({"key": key, "symbol": str(_field(row, "trading_symbol", "tradingsymbol") or key), "pinned": False})
                 picked += 1
         gap = (target_exp - target_dt).days
         print(f"   {COLOR_DIM}» {idx:<10} expiry {target_exp} ({EXPIRY_SELECTION})  "
@@ -553,11 +602,11 @@ def _index_options_universe(cutoff_dt, use_intraday):
               f"-> {picked} contracts{COLOR_RESET}")
     return universe
 
-def get_dynamic_universe(mode, cutoff_dt, use_intraday):
+def get_dynamic_universe(mode, cutoff_dt, use_intraday, needles=()):
     if mode in ("STOCK_FNO", "CASH_EQUITY"):
-        return _equity_universe(mode)
+        return _equity_universe(mode, needles)
     if mode == "INDEX_OPTIONS":
-        return _index_options_universe(cutoff_dt, use_intraday)
+        return _index_options_universe(cutoff_dt, use_intraday, needles)
     print(f"{COLOR_RED_FG}[!] Unknown mode '{mode}'.{COLOR_RESET}")
     return []
 
@@ -624,17 +673,14 @@ def _evaluate_kinetic_arrays(close, high, low, vol):
     m_mean = pd.Series(minus_di).rolling(BB_PERIOD, min_periods=1).mean().values
     m_std = pd.Series(minus_di).rolling(BB_PERIOD, min_periods=1).std(ddof=0).values
 
-    # On-Balance Volume (OBV)
     direction = np.where(delta > 0, 1, np.where(delta < 0, -1, 0))
     obv = np.cumsum(direction * vol)
 
-    # 1-Bar Velocity (Rate of Change)
     vel_hist = np.diff(hist, prepend=hist[0])
     vel_obv = np.diff(obv, prepend=obv[0])
     vel_pdi = np.diff(plus_di, prepend=plus_di[0])
     vel_mdi = np.diff(minus_di, prepend=minus_di[0])
 
-    # Oscillator ATRs (14-period EWM of absolute deltas)
     atr_hist = _ewm(np.abs(vel_hist), 1 / 14)
     atr_obv = _ewm(np.abs(vel_obv), 1 / 14)
     atr_pdi = _ewm(np.abs(vel_pdi), 1 / 14)
@@ -674,19 +720,14 @@ def get_kinetics(kin_1m, idx):
     bull_score = (1 if bull_rsi else 0) + (1 if bull_macd else 0) + (1 if bull_di else 0)
     bear_score = (1 if bear_rsi else 0) + (1 if bear_macd else 0) + (1 if bear_di else 0)
 
-    # --- NEW CODE: SHOCK EVALUATION ---
     vh = kin_1m['vel_hist'][idx]; ah = kin_1m['atr_hist'][idx]
     vo = kin_1m['vel_obv'][idx]; ao = kin_1m['atr_obv'][idx]
     vp = kin_1m['vel_pdi'][idx]; ap = kin_1m['atr_pdi'][idx]
     vm = kin_1m['vel_mdi'][idx]; am = kin_1m['atr_mdi'][idx]
 
-    # Shock Multipliers (1.5x normal volatility expansion)
     M_HIST, M_OBV, M_DI = 1.5, 1.5, 1.5
 
-    # Bull Shock: MACD Hist Up + OBV Up + Plus_DI Up
     bull_shock = (vh > M_HIST * ah) and (vo > M_OBV * ao) and (vp > M_DI * ap)
-    
-    # Bear Shock: MACD Hist Down + OBV Down + Minus_DI Up (Bear dominance rising)
     bear_shock = (vh < -M_HIST * ah) and (vo < -M_OBV * ao) and (vm > M_DI * am)
 
     return bull_score, bear_score, raw_bull_power, raw_bear_power, bull_rsi, bear_rsi, bull_macd, bear_macd, bull_di, bear_di, bull_shock, bear_shock
@@ -735,7 +776,6 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
             else:
                 bb_kc_bull_fire = bb_kc_bear_fire = True
 
-            # Oscillator ATR Shock trigger (VWAP completely removed)
             if bull_shock:
                 if bb_kc_bull_fire:
                     if r_bear:
@@ -753,7 +793,6 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                     else:
                         anchor = {"dir": "BEAR", "idx": i, "time": dt_1m[i], "price": close[i]}
                         break
-
             i += 1
 
         if not anchor:
@@ -1000,7 +1039,7 @@ def _print_error_summary():
         print(f"{COLOR_DIM}   [{where}] {msg}\n{tb}{COLOR_RESET}")
 
 # ------------------------------------------------------------------------------
-# FIX 4: backtrace merge -- every anchor is its own signal
+# MERGE LOGIC
 # ------------------------------------------------------------------------------
 ACTIVE_BULL_STATES = ("[ACTIVE BUY]", "[COILING]")
 ACTIVE_BEAR_STATES = ("[ACTIVE SELL]", "[COILING]")
@@ -1067,13 +1106,59 @@ def _fav_color(pct, direction):
     fav = pct * sign
     return COLOR_GREEN_FG if fav > 0 else COLOR_RED_FG if fav < 0 else COLOR_DIM
 
+# ------------------------------------------------------------------------------
+# TRACKING EMAIL & INTRADAY HISTORY
+# ------------------------------------------------------------------------------
+def _send_watch_email(subject, body, tag="track"):
+    sender = os.environ.get("SENDER_EMAIL")
+    password = os.environ.get("SENDER_PASSWORD")
+    recipient = os.environ.get("RECIPIENT_EMAIL")
+    smtp_server = os.environ.get("SMTP_SERVER") or "smtp.gmail.com"
+    smtp_port = os.environ.get("SMTP_PORT") or "465"
+
+    missing = [name for name, val in (
+        ("SENDER_EMAIL", sender),
+        ("SENDER_PASSWORD", password),
+        ("RECIPIENT_EMAIL", recipient),
+    ) if not val]
+    
+    if missing:
+        print(f"   {COLOR_YELLOW}[{tag}] Cannot send email -- missing env var(s): {', '.join(missing)}.{COLOR_RESET}")
+        return False
+
+    try:
+        port = int(smtp_port)
+    except ValueError:
+        print(f"   {COLOR_YELLOW}[{tag}] Cannot send email -- SMTP_PORT='{smtp_port}' is not a valid integer.{COLOR_RESET}")
+        return False
+
+    msg = EmailMessage()
+    msg['Subject'] = subject
+    msg['From'] = sender
+    msg['To'] = recipient
+    msg.set_content(body)
+
+    try:
+        if port == 465:
+            with smtplib.SMTP_SSL(smtp_server, port, timeout=20) as server:
+                server.login(sender, password)
+                server.send_message(msg)
+        else:
+            with smtplib.SMTP(smtp_server, port, timeout=20) as server:
+                server.starttls()
+                server.login(sender, password)
+                server.send_message(msg)
+        print(f"   {COLOR_GREEN_FG}[{tag}] Email successfully sent to {recipient}.{COLOR_RESET}")
+        return True
+    except Exception as e:
+        print(f"   {COLOR_YELLOW}[{tag}] Failed to send email ({type(e).__name__}: {e}).{COLOR_RESET}")
+        return False
 
 def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol):
     if not tracked_symbol_raw:
         return
     n = _norm_sym(tracked_symbol_raw)
     
-    # Find exact or partial symbol match in the scanned results
     matched_sym = None
     for sym in by_symbol.keys():
         if n in _norm_sym(sym):
@@ -1084,16 +1169,13 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol):
         print(f"{COLOR_YELLOW}» Tracked symbol '{tracked_symbol_raw}' not found in scanned results.{COLOR_RESET}")
         return
         
-    # Sort raw checkpoints chronologically
     rows = sorted(by_symbol[matched_sym], key=lambda r: r['CheckpointTime'])
     history = []
     
-    # Simulate running the script live at every single 15-min checkpoint
     for i in range(1, len(rows) + 1):
         subset = rows[:i]
         b, r_, g = merge_symbol_rows(subset)
         
-        # Determine the prevailing state at this exact checkpoint
         if b and b['State'] != "[STOPPED]":
             history.append(b)
         elif r_ and r_['State'] != "[STOPPED]":
@@ -1149,7 +1231,6 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol):
             f"{state_text}"
         )
         
-    # --- Stateless State Change Detection & Email Alert ---
     if len(history) >= 2:
         last_row = history[-1]
         prev_row = history[-2]
@@ -1172,9 +1253,11 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol):
                 f"Day Change: {last_row.get('DayChangePct', 0):+.2f}%\n"
                 f"Move from Anchor: {last_row.get('MovePct', 0):+.2f}%\n"
             )
-            # Uses SENDER_EMAIL, RECIPIENT_EMAIL, etc. automatically
             _send_watch_email(subject, body, "track")
 
+# ==============================================================================
+# MAIN RUNNER
+# ==============================================================================
 def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, target_time_str=None, track_symbol=""):
     t_start = time.time()
 
@@ -1204,9 +1287,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     for n in notes:
         print(f"   {COLOR_YELLOW}» {n}{COLOR_RESET}")
 
-    # --- TRACKING: Pass needles to universe to bypass filters ---
     needles = [track_symbol] if track_symbol else []
-    
     universe_raw = get_dynamic_universe(mode, cutoff_dt, today_session, needles=needles)
     
     if STATS.auth_failed:
@@ -1297,7 +1378,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
                 
         if g: rejected.append(g)
 
-    # --- INTRADAY TRACKING HISTORY ---
     if track_symbol:
         print_and_alert_tracked_history(track_symbol, by_symbol)
 
@@ -1317,38 +1397,8 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             return 1
         return 2
 
-    def bull_sort_key(r):
-        a_time = r.get('ActiveAnchor', '00:00')
-        try:
-            hh, mm = map(int, a_time.split(':'))
-            anchor_mins = hh * 60 + mm
-        except Exception:
-            anchor_mins = 0
-
-        return (
-            state_rank(r['State']),      # 1. Active Buy -> Coiling -> Stopped
-            -anchor_mins,                # 2. Most recent anchor first
-            -r.get('MovePct', 0.0),      # 3. Best gain preservation
-            -kinetic_score(r, "Buy"),    # 4. Triad confluence
-        )
-
-    def bear_sort_key(r):
-        a_time = r.get('ActiveAnchor', '00:00')
-        try:
-            hh, mm = map(int, a_time.split(':'))
-            anchor_mins = hh * 60 + mm
-        except Exception:
-            anchor_mins = 0
-
-        return (
-            state_rank(r['State']),
-            -anchor_mins,
-            r.get('MovePct', 0.0),       # More negative Move% ranked higher for short setups
-            -kinetic_score(r, "Sell"),
-        )
-
-    bulls.sort(key=bull_sort_key)
-    bears.sort(key=bear_sort_key)
+    bulls.sort(key=lambda r: (state_rank(r['State']), -r.get('MovePct', 0.0)))
+    bears.sort(key=lambda r: (state_rank(r['State']), r.get('MovePct', 0.0)))
 
     bulls = bulls[:TOP_N_BUYERS]
     bears = bears[:TOP_N_SELLERS]
@@ -1509,6 +1559,8 @@ def parse_args():
                    help=f"Day%% is measured from the previous close (broker-style) or from today's open. Default {DAY_PCT_BASIS}.")
     p.add_argument("--graveyard-max", type=int, default=TOP_N_GRAVEYARD,
                    help=f"Max graveyard rows printed (default {TOP_N_GRAVEYARD}; 0 = all). Tracking searches every row regardless.")
+    p.add_argument("--track", type=str, default="", 
+                   help="Specific symbol to track. Prints its 15-min intraday history and emails on state change.")
     args = p.parse_args()
     if args.checkpoint_min < 1: p.error("--checkpoint-min must be >= 1 (0 or a negative value used to hang the run)")
     if args.strikes_up < 0 or args.strikes_down < 0: p.error("--strikes-up / --strikes-down must be >= 0")
@@ -1539,7 +1591,7 @@ if __name__ == "__main__":
     elif args.disable_bb_kc_gate:
         REQUIRE_BB_KC_PIERCE = False
     try:
-        code = run_screener(args.mode, args.days, args.date, args.time)
+        code = run_screener(args.mode, args.days, args.date, args.time, args.track)
     except Exception:
         print(f"\n{COLOR_RED_FG}💥 FATAL: unhandled exception -- full traceback follows.{COLOR_RESET}")
         traceback.print_exc()
