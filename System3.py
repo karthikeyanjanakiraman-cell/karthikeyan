@@ -3,54 +3,9 @@
 Strict Institutional Volatility Tracker (Upstox) - ALL-MODE EDITION  (System3.py)
 + Modes: STOCK_FNO, CASH_EQUITY, INDEX_OPTIONS (NIFTY / BANKNIFTY / FINNIFTY / SENSEX option chains).
 + Intraday Backtrace: re-evaluates every 15-min checkpoint from session open to the run time.
-  Displays the 'Seen' time of the EARLIEST checkpoint where a symbol genuinely qualified as
-  Bull/Bear, but refreshes LTP, Move%, Day%, State and Indicators to the LATEST available
-  checkpoint, so a symbol that fired early and is still alive (or was stopped out since) is
-  never silently dropped just because the very last checkpoint looks different.
 + Configurable Expiry & Strike Window: EXPIRY_SELECTION (CURRENT/NEXT) and separate STRIKES_ABOVE_ATM/STRIKES_BELOW_ATM.
 + Time-Machine Targeting: --date / --time truncate all data at that snapshot.
 + Directional ATR Tripwires + Trailing Stop-Loss Floor, evaluated on a continuous 1-min indicator engine.
-+ NEVER EXITS SILENTLY: every early-exit prints its reason, and real failures return a non-zero exit code.
-+ Structured Graveyard with Anchor / Killed / Move% forensics.
-+ OrderPlaced tracking: after you place an order off a run's results (a CE/PE strike, an F&O
-  stock, or a cash-equity symbol), put that value in the OrderPlaced environment variable for
-  subsequent runs. When OrderPlaced is empty, nothing changes -- the scan just runs and prints
-  its results as before. When OrderPlaced is set, this run also looks that value up among its
-  own results (case- and whitespace-insensitive substring match, same as --watch) and emails its
-  current status (live/stopped/rejected, LTP, Day%, Move% off anchor) so a scheduled run keeps you
-  posted on a position you already took. Several positions may be listed, separated by comma or
-  semicolon. See run_tracking() below for the exact behaviour.
-
-LOGIC-GAP FIXES IN THIS REVISION (each one is marked "FIX" in the code)
- 1. ATR basis. Buckets were anchored to MIDNIGHT, so "390min" cut every session at 13:00 into two odd
-    half-day bars; today's still-forming bar was averaged in (threshold drifted at every checkpoint);
-    and a short history fell back to a 0.1%-of-price ATR (a tiny threshold -> signal flood).
-    Now: bars are anchored to the 09:15 open (ATR_BASIS_TF "375min" = one NSE session), only COMPLETED
-    prior sessions are used (one stable number per day, identical at every checkpoint) and instruments
-    with fewer than ATR_MIN_BARS completed sessions are reported as "short history", not scanned.
- 2. Causality. A snapshot at HH:MM now uses only candles that CLOSED before HH:MM (the still-forming
-    candle leaked in), so a live run and a --date/--time run of the same minute agree. The price/volume
-    prefilter judges the last COMPLETED session (it used same-day -- partial or, in a backtest, future --
-    data).
- 3. Off-hours. A live run on a weekend / holiday / before the open now rolls back to the last completed
-    session (it died with "no usable data"). --time without --date means "today at that time". A
-    --date/--time snapshot that falls on today now uses today's intraday feed (it found nothing).
- 4. Backtrace merge. Every anchor is tracked on its own: a KILLED anchor can no longer be shown ACTIVE just
-    because a LATER anchor in the same direction is alive. STOPPED rows carry stop time / price / reason,
-    and stopped / graveyard rows keep their indicator triads.
- 5. Trailing floor. The soft stop (1-ATR pullback AND opposing kinetics) re-based its peak whenever the
-    kinetics did not confirm, so a position could bleed any number of ATRs and still read ACTIVE.
-    HARD_STOP_ATR_MULT adds an unconditional floor measured from the true peak.
- 6. INDEX_OPTIONS liquidity (price / volume) is judged once at the snapshot, not at every checkpoint
-    (cumulative volume at 09:30 hid contracts that were fine by the close and delayed 'Seen').
- 7. Tracking (--watch / OrderPlaced). The tracked contract is always scanned (ATM window, price/volume
-    prefilter and illiquid filter bypassed) so it cannot silently become NOT FOUND exactly when it hurts;
-    matching ignores spaces/case ('NIFTY25000CE' finds 'NIFTY 25000 CE 14 OCT 26'), prefers exact and LIVE
-    matches and lists ambiguous ones; several positions are supported; a failed email no longer marks a
-    status as reported; time-machine runs never email.
- 8. Misc. Indicators are computed once per instrument (not once per checkpoint); VWAP uses the typical
-    price; Day% is measured from the previous close (DAY_PCT_BASIS); --checkpoint-min 0 no longer hangs;
-    the graveyard is capped; --require-bb-kc-pierce can actually switch the BB/KC gate on.
 """
 import os
 import sys
@@ -65,9 +20,6 @@ import threading
 from bisect import bisect_left
 from datetime import datetime, timedelta, timezone, time as dtime
 import concurrent.futures
-
-import smtplib
-from email.message import EmailMessage
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -98,54 +50,21 @@ ALIAS_TO_INDEX = {a: idx for idx, cfg in INDEX_CONFIG.items() for a in cfg["alia
 
 HA_ATR_MULTIPLIERS = [1, 2, 3, 5]
 ATR_BASIS_PERIOD = 14
-# FIX 1: "375min" = ONE NSE session (09:15-15:30) and buckets are anchored to the open (it was "390min"
-# anchored to midnight, which cut every session in two at 13:00).
 ATR_BASIS_TF = "15min"
-ATR_MIN_BARS = 5            # FIX 1: fewer completed sessions than this => "short history" (unless pinned)
+ATR_MIN_BARS = 5
 MIN_ATR_PCT = 0.001
-# FIX 5: unconditional trailing floor, in ATRs below the TRUE peak since the anchor (0 = disabled).
-HARD_STOP_ATR_MULT = 2.0
+HARD_STOP_ATR_MULT = 1.2  # Tightened hard stop
 
 TOP_N_BUYERS = 50
 TOP_N_SELLERS = 50
-TOP_N_GRAVEYARD = 100       # FIX 8: 0 = print the whole graveyard
+TOP_N_GRAVEYARD = 100
 MAX_SYMBOL_WIDTH = 30
 
 # --- INTRADAY BACKTRACE CHECKPOINTS ---
 CHECKPOINT_INTERVAL_MIN = 15
 BACKTRACE_CHECKPOINTS = True
-
 REQUIRE_BB_KC_PIERCE = False
-
-# FIX 8: "PREV_CLOSE" = broker-style day change; "OPEN" = move since today's first print.
 DAY_PCT_BASIS = "PREV_CLOSE"
-
-# --- OPTIONAL WATCH / EMAIL ALERT ---
-# If WATCH_VALUE is non-empty (set via --watch), the run looks up that symbol/
-# strike in this run's results and, ONLY if its status changed since the last
-# run (tracked in WATCH_STATE_FILE), emails an alert using whichever of these
-# environment variables (e.g. GitHub Actions repo secrets) are set:
-#   SENDER_EMAIL / SENDER_PASSWORD / RECIPIENT_EMAIL   (original names), or
-#   EMAIL_SENDER / EMAIL_APP_PWD   / EMAIL_RECEIVER     (alternate names)
-# SMTP_SERVER / SMTP_PORT are optional either way -- they default to Gmail's
-# smtp.gmail.com:465 if not provided. If WATCH_VALUE is left empty, none of
-# this code runs at all -- no email, no state file, nothing.
-WATCH_VALUE = ""
-WATCH_STATE_FILE = "system3_watch_state.json"
-
-# --- ORDER-PLACED TRACKING (env-driven, separate from --watch) ---
-# Name of the environment variable this run reads to decide whether to track
-# a placed order. Same idea as WATCH_VALUE/--watch, but sourced purely from
-# the environment (so a scheduled run can be pointed at a live position
-# without touching the command line) and, by default, emails EVERY run it
-# finds a match on rather than only on a status change -- see
-# run_tracking() for the exact rules and ORDER_EMAIL_ONLY_ON_CHANGE below to
-# switch it to change-only emails instead. The value may hold several
-# positions separated by comma / semicolon / newline.
-ORDER_PLACED_ENV = "OrderPlaced"
-ORDER_EMAIL_ONLY_ON_CHANGE = False
-ORDER_STATE_FILE = "system3_order_state.json"
-MAX_PINNED_MATCHES = 8      # a loose tracking value pins at most this many instruments
 
 # --- COLOR PALETTE ---
 COLOR_RESET = '\033[0m'
@@ -161,15 +80,12 @@ MIN_PRICE = 100
 MAX_PRICE = 5000
 MIN_DAILY_VOLUME = 100000
 BACKTRACE_DAYS = 30
-# FIX 1: 19 calendar days still costs 3 seven-day chunk calls but holds ~13 sessions (15 held ~10, which
-# cannot feed a 14-bar ATR).
 MIN1_HISTORY_DAYS = 19
 
 RSI_PERIOD = 14
 BB_PERIOD = 20
 BB_STD = 1.0
 ADX_PERIOD = 14
-ADX_THRESHOLD = 20
 
 WORKERS = 16
 INCLUDE_NON_EQ_SERIES = False
@@ -179,7 +95,7 @@ API_HOST = "https://api.upstox.com"
 IST = timezone(timedelta(hours=5, minutes=30))
 SESSION_OPEN_MIN = 9 * 60 + 15
 SESSION_CLOSE_MIN = 15 * 60 + 30
-PROBE_KEY = INDEX_CONFIG["NIFTY"]["spot_key"]     # used to ask "did the exchange trade on that date?"
+PROBE_KEY = INDEX_CONFIG["NIFTY"]["spot_key"]
 
 # ==============================================================================
 # HELPERS
@@ -194,18 +110,7 @@ def _open_dt(day):
     return datetime.combine(day, dtime(SESSION_OPEN_MIN // 60, SESSION_OPEN_MIN % 60))
 
 def _norm_sym(s):
-    """Case-, whitespace-, '_' and '-' insensitive form of a symbol, used for all tracking matches."""
     return re.sub(r'[\s_\-]+', '', str(s).upper())
-
-def parse_track_values(raw):
-    """'A, B;C' -> ['A', 'B', 'C'] (de-duplicated on the normalised form, order kept)."""
-    out, seen = [], set()
-    for part in re.split(r'[;,\n|]+', str(raw or "")):
-        v = part.strip()
-        if v and _norm_sym(v) not in seen:
-            seen.add(_norm_sym(v))
-            out.append(v)
-    return out
 
 class BudgetLimiter:
     def __init__(self, caps):
@@ -346,25 +251,13 @@ def _date_chunks(start, end, span=7):
         cur = c_start - timedelta(days=1)
 
 def generate_checkpoints(cutoff_dt, interval_min=None):
-    """
-    Build the intraday checkpoints to backtrace: the FIRST interval boundary
-    AFTER session open, then every interval after that, up through cutoff_dt.
-    Session open itself (9:15) is NEVER used as a checkpoint -- at 9:15 zero
-    minutes of the day have elapsed, so that checkpoint would always be a dead
-    read. For a 15-min interval the first checkpoint is therefore 9:30 (the
-    9:15->9:30 window), then 9:45, 10:00, ... matching "backtrace 9:15 to
-    9:30, 9:30 to 9:45, ...". If cutoff_dt isn't itself on a boundary, one
-    final partial checkpoint is added AT cutoff_dt (a 10:35 run adds 10:35
-    after ...,10:15,10:30).
-    FIX 8: the interval is forced to >= 1 minute (0 or a negative value used to loop forever).
-    """
     interval = max(1, int(interval_min or CHECKPOINT_INTERVAL_MIN))
     session_open = _open_dt(cutoff_dt.date())
     if cutoff_dt <= session_open:
         return [cutoff_dt]
 
     checkpoints = []
-    t = session_open + timedelta(minutes=interval)   # first REAL boundary after open, e.g. 9:30 -- not 9:15 itself
+    t = session_open + timedelta(minutes=interval)
     while t <= cutoff_dt:
         checkpoints.append(t)
         t += timedelta(minutes=interval)
@@ -397,11 +290,7 @@ def fetch_today(key):
     df = df[df['Datetime'].dt.date == now_ist().date()]
     return df if not df.empty else None
 
-# ------------------------------------------------------------------------------
-# FIX 3: which session can actually be scanned?
-# ------------------------------------------------------------------------------
 def _session_traded(d, today):
-    """True if the exchange traded on date d. Probed with the NIFTY 50 index 1-min candles (one call)."""
     if d.weekday() >= 5:
         return False
     if d == today:
@@ -411,13 +300,6 @@ def _session_traded(d, today):
     return bool(status == 200 and df is not None and (df['Datetime'].dt.date == d).any())
 
 def resolve_session(cutoff_dt):
-    """
-    Turn the requested snapshot into one that can actually be scanned. Returns (cutoff_dt, notes).
-      * a snapshot in the future is clamped to 'now';
-      * a snapshot at/before the 09:15 open, on a weekend, or on a day the exchange did not trade
-        (holiday) rolls back to the 15:30 CLOSE of the last completed session. These runs used to die with
-        "no usable data" although the previous session was perfectly scannable.
-    """
     notes = []
     now = now_ist().replace(second=0, microsecond=0)
     if cutoff_dt > now:
@@ -432,7 +314,7 @@ def resolve_session(cutoff_dt):
     elif _session_traded(target, now.date()):
         return min(cutoff_dt, _close_dt(target)), notes
     elif STATS.auth_failed:
-        return cutoff_dt, notes                  # the caller reports the rejected token
+        return cutoff_dt, notes
     else:
         why = f"no trading data for {target} (market holiday?)"
 
@@ -503,36 +385,7 @@ def _download_master(name, _is_fallback=False):
             return rows
     return []
 
-# ------------------------------------------------------------------------------
-# FIX 7: tracked instruments are pinned into the universe
-# ------------------------------------------------------------------------------
-def resolve_pins(cands, needles, label="symbol"):
-    """
-    cands = [(symbol, sort_key), ...]. A tracking value pins every candidate whose normalised symbol EQUALS
-    it (exact hits win) or, failing that, CONTAINS it. Pinned instruments are always scanned: the
-    price/volume prefilter, the ATM strike window and the illiquid filter do not apply to them.
-    """
-    pinned = set()
-    norm = [(_norm_sym(sym), sym, key) for sym, key in cands]
-    for raw in needles:
-        n = _norm_sym(raw)
-        if not n:
-            continue
-        hits = [c for c in norm if c[0] == n] or [c for c in norm if n in c[0]]
-        if not hits:
-            print(f"   {COLOR_YELLOW}» track '{raw}': no {label} in the instrument master matches it.{COLOR_RESET}")
-            continue
-        hits.sort(key=lambda c: c[2])
-        if len(hits) > MAX_PINNED_MATCHES:
-            print(f"   {COLOR_YELLOW}» track '{raw}': {len(hits)} matches -- keeping the first {MAX_PINNED_MATCHES}; "
-                  f"use a more specific value.{COLOR_RESET}")
-            hits = hits[:MAX_PINNED_MATCHES]
-        names = ", ".join(h[1] for h in hits[:3]) + (" ..." if len(hits) > 3 else "")
-        print(f"   {COLOR_DIM}» track '{raw}': pinned {len(hits)} {label}(s) -- always scanned, filters bypassed: {names}{COLOR_RESET}")
-        pinned.update(h[1] for h in hits)
-    return pinned
-
-def _equity_universe(mode, needles=()):
+def _equity_universe(mode):
     nse = _download_master("NSE")
     if not nse:
         print(f"{COLOR_RED_FG}[!] NSE instrument master unavailable -- cannot build the {mode} universe.{COLOR_RESET}")
@@ -543,30 +396,9 @@ def _equity_universe(mode, needles=()):
     everything = {i["instrument_key"]: {"symbol": ts_of(i), "key": i["instrument_key"]} for i in nse if plain(i)}
     in_mode = {k: v for k, v in everything.items()
                if ((v["symbol"] in fno) if mode == "STOCK_FNO" else (v["symbol"] not in fno))}
+    return list(in_mode.values())
 
-    pinned = set()
-    if needles:
-        pinned = resolve_pins([(v["symbol"], (len(v["symbol"]), v["symbol"])) for v in everything.values()],
-                              needles, "equity symbol")
-    out = {k: dict(v, pinned=v["symbol"] in pinned) for k, v in in_mode.items()}
-    extra = 0
-    for k, v in everything.items():
-        if v["symbol"] in pinned and k not in out:
-            out[k] = dict(v, pinned=True)
-            extra += 1
-    if extra:
-        print(f"   {COLOR_DIM}» {extra} tracked symbol(s) sit outside the {mode} universe -- added for tracking.{COLOR_RESET}")
-    return list(out.values())
-
-# ------------------------------------------------------------------------------
-# INDEX OPTIONS universe
-# ------------------------------------------------------------------------------
 def _resolve_index_spot_price(key, name, cutoff_dt, use_intraday):
-    """
-    FIX 3: for a snapshot that falls on TODAY the intraday feed is used (the historical endpoint does not
-    serve the current session, so a --date <today> run used to silently pick up YESTERDAY's close).
-    FIX 2: only candles that closed before the snapshot count.
-    """
     target_dt = cutoff_dt.date()
     if use_intraday:
         df = fetch_today(key)
@@ -613,17 +445,7 @@ def _expiry_to_date(exp):
         pass
     return None
 
-def _load_local_master(path):
-    try:
-        if path.lower().endswith('.csv'):
-            return pd.read_csv(path).to_dict(orient='records')
-        with open(path, 'r') as f:
-            return _unwrap_master(json.load(f))
-    except Exception as e:
-        print(f"   {COLOR_RED_FG}[!] Could not read local options master '{path}': {type(e).__name__}: {e}{COLOR_RESET}")
-        return []
-
-def _index_options_universe(cutoff_dt, use_intraday, options_master_path="", needles=()):
+def _index_options_universe(cutoff_dt, use_intraday):
     target_dt = cutoff_dt.date()
 
     spot = {}
@@ -638,23 +460,16 @@ def _index_options_universe(cutoff_dt, use_intraday, options_master_path="", nee
             print(f"   {COLOR_DIM}» {idx:<10} spot {price:>10.2f}  ({src}){COLOR_RESET}")
         else:
             print(f"   {COLOR_YELLOW}» {idx:<10} spot unavailable -- skipped ({src}){COLOR_RESET}")
-    if not spot and not needles:
+    if not spot:
         if not STATS.auth_failed:
             print(f"{COLOR_RED_FG}[!] Could not resolve a spot price for ANY index, so no ATM strikes can be chosen. "
                   f"Check the token/API access to index candles (see failure samples below).{COLOR_RESET}")
         return []
 
     rows = []
-    if options_master_path:
-        if os.path.exists(options_master_path):
-            print(f"   {COLOR_DIM}» Using local options master: {options_master_path}{COLOR_RESET}")
-            rows = _load_local_master(options_master_path)
-        else:
-            print(f"   {COLOR_YELLOW}» --options-master '{options_master_path}' not found; using live masters instead.{COLOR_RESET}")
-    if not rows:
-        nse, bse = _download_master("NSE"), _download_master("BSE")
-        print(f"   {COLOR_DIM}» Master rows fetched -- NSE: {len(nse)}, BSE: {len(bse)}{COLOR_RESET}")
-        rows = nse + bse
+    nse, bse = _download_master("NSE"), _download_master("BSE")
+    print(f"   {COLOR_DIM}» Master rows fetched -- NSE: {len(nse)}, BSE: {len(bse)}{COLOR_RESET}")
+    rows = nse + bse
     if not rows:
         print(f"{COLOR_RED_FG}[!] Both NSE and BSE instrument masters came back empty -- see the [master:...] lines above "
               f"for the exact HTTP status / network error.{COLOR_RESET}")
@@ -700,22 +515,6 @@ def _index_options_universe(cutoff_dt, use_intraday, options_master_path="", nee
 
     universe, seen = [], set()
 
-    # FIX 7: tracked contracts first -- every expiry on/after the snapshot, no ATM window, no liquidity filter.
-    if needles:
-        flat = []
-        for idx, contracts in by_idx.items():
-            for exp_date, strike, itype, row in contracts:
-                if exp_date < target_dt: continue
-                key = _field(row, "instrument_key")
-                sym = str(_field(row, "trading_symbol", "tradingsymbol") or key)
-                flat.append((sym, (exp_date, strike, itype, sym), key))
-        sym_to_key = {sym: key for sym, _, key in flat}
-        for sym in sorted(resolve_pins([(s, k) for s, k, _ in flat], needles, "option contract")):
-            key = sym_to_key[sym]
-            if key not in seen:
-                seen.add(key)
-                universe.append({"key": key, "symbol": sym, "pinned": True})
-
     for idx, contracts in by_idx.items():
         if idx not in spot: continue
         if not contracts:
@@ -746,22 +545,19 @@ def _index_options_universe(cutoff_dt, use_intraday, options_master_path="", nee
             key = _field(row, "instrument_key")
             if strike in window and key not in seen:
                 seen.add(key)
-                universe.append({"key": key, "symbol": str(_field(row, "trading_symbol", "tradingsymbol") or key), "pinned": False})
+                universe.append({"key": key, "symbol": str(_field(row, "trading_symbol", "tradingsymbol") or key)})
                 picked += 1
         gap = (target_exp - target_dt).days
         print(f"   {COLOR_DIM}» {idx:<10} expiry {target_exp} ({EXPIRY_SELECTION})  "
               f"strikes {strikes[lo]:.0f}-{strikes[hi-1]:.0f} ({STRIKES_BELOW_ATM}↓/{STRIKES_ABOVE_ATM}↑ of ATM)  "
               f"-> {picked} contracts{COLOR_RESET}")
-        if target_dt != now_ist().date() and expiry_idx == 0 and gap > 10:
-            print(f"   {COLOR_YELLOW}  ⚠ nearest expiry in today's master is {gap} days after {target_dt}; the true nearest "
-                  f"expiry on that date may already have expired. Use --options-master for exact backtests.{COLOR_RESET}")
     return universe
 
-def get_dynamic_universe(mode, cutoff_dt, use_intraday, options_master_path="", needles=()):
+def get_dynamic_universe(mode, cutoff_dt, use_intraday):
     if mode in ("STOCK_FNO", "CASH_EQUITY"):
-        return _equity_universe(mode, needles)
+        return _equity_universe(mode)
     if mode == "INDEX_OPTIONS":
-        return _index_options_universe(cutoff_dt, use_intraday, options_master_path, needles)
+        return _index_options_universe(cutoff_dt, use_intraday)
     print(f"{COLOR_RED_FG}[!] Unknown mode '{mode}'.{COLOR_RESET}")
     return []
 
@@ -769,13 +565,6 @@ def get_dynamic_universe(mode, cutoff_dt, use_intraday, options_master_path="", 
 # 2. CONTINUOUS KINETIC TRIPWIRE ENGINE
 # ==============================================================================
 def compute_base_atr(m):
-    """
-    FIX 1. Mean true range of the last ATR_BASIS_PERIOD COMPLETED bars.
-    `m` must hold only sessions BEFORE the target day, so the number is the same at every checkpoint of the day
-    (it used to include today's still-forming bar and drift with each checkpoint). Bars are anchored to the
-    09:15 open: ATR_BASIS_TF "375min" is one NSE session (the old "390min" bucket was anchored to midnight and
-    cut every session at 13:00). Returns (atr, n_bars); (None, 0) when there is no prior session at all.
-    """
     if m is None or len(m) == 0:
         return None, 0
     hi, lo, cl = m['High'].values, m['Low'].values, m['Close'].values
@@ -918,7 +707,7 @@ def get_tripwire_state(close, kin_1m, base_atr, mult, today_start, end=None):
             curr_open = close[i]
     return last_rsi, last_macd, last_adx, blocks
 
-def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, vwap, today_start, end=None):
+def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, today_start, end=None):
     n = len(close) if end is None else min(int(end), len(close))
     if today_start >= n:
         return None, {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0,
@@ -946,9 +735,9 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
             else:
                 bb_kc_bull_fire = bb_kc_bear_fire = True
 
-            # Oscillator ATR Shock trigger
+            # Oscillator ATR Shock trigger (VWAP completely removed)
             if bull_shock:
-                if bb_kc_bull_fire and close[i] > vwap[i]:
+                if bb_kc_bull_fire:
                     if r_bear:
                         warzone_kills += 1
                         curr_open = close[i]
@@ -957,7 +746,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                         break
 
             elif bear_shock:
-                if bb_kc_bear_fire and close[i] < vwap[i]:
+                if bb_kc_bear_fire:
                     if r_bull:
                         warzone_kills += 1
                         curr_open = close[i]
@@ -977,7 +766,6 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
         j = anchor['idx'] + 1
 
         while j < n:
-            # Unpack all 12 variables returned by the updated get_kinetics
             (bull_score, bear_score, _, _, _, _, _, _, _, _, _, _) = get_kinetics(kin_1m, j)
             
             if is_bull:
@@ -993,8 +781,6 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
             if hard_mult > 0 and hard_adverse >= hard_mult * base_atr:
                 reason = f"Hard stop ({hard_mult:g} ATR trailing floor)"
             elif adverse >= base_atr and opposing >= 2:
-                # The fatal 'else: peak_price = close[j]' ratchet has been deleted.
-                # Now, the soft stop preserves its highest peak properly.
                 reason = soft_reason
 
             if reason:
@@ -1024,18 +810,11 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
     if warzone_kills > 0 and info['dir'] == 'NONE':
         info['reason'] = f"Warzone Inversion Chop ({warzone_kills}x)"
     elif info['dir'] == 'NONE':
-        info['reason'] = "Failed Kinetic or VWAP Alignment"
+        info['reason'] = "Failed Kinetic Alignment"
     info['kills'] = kills
     return None, info
 
-def prepare_series(master, target_dt, pinned=False):
-    """
-    FIX 8. Everything that does not depend on the checkpoint, computed ONCE per instrument. Every indicator
-    here is causal (EWMs, rolling windows and the running VWAP only look backwards), so slicing these arrays at a
-    checkpoint is exactly what recomputing on the truncated data gave -- for ~25x less work, and with ONE ATR
-    (FIX 1) instead of one per checkpoint. `master` must already be cut at the snapshot (no future candles).
-    Returns (series | None, reason) with reason 'no_data' or 'short_history'.
-    """
+def prepare_series(master, target_dt):
     if master is None or master.empty:
         return None, "no_data"
     day_mask = (master['Datetime'].dt.date == target_dt).values
@@ -1051,19 +830,9 @@ def prepare_series(master, target_dt, pinned=False):
 
     base_atr, atr_bars = compute_base_atr(master.iloc[:ts])
     if base_atr is None:
-        if not pinned:
-            return None, "short_history"
-        base_atr = max(float(close[ts]) * MIN_ATR_PCT, 0.01)
-    elif atr_bars < ATR_MIN_BARS and not pinned:
         return None, "short_history"
-
-    # VWAP from today's first candle. FIX 8: typical price (H+L+C)/3 -- it used the close alone.
-    typ = (high + low + close) / 3.0
-    cum_vol, cum_pv = np.zeros(n), np.zeros(n)
-    cum_vol[ts:] = np.cumsum(vol[ts:])
-    cum_pv[ts:] = np.cumsum((typ * vol)[ts:])
-    with np.errstate(divide='ignore', invalid='ignore'):
-        vwap = np.where(cum_vol > 0, cum_pv / cum_vol, close)
+    elif atr_bars < ATR_MIN_BARS:
+        return None, "short_history"
 
     sma20 = pd.Series(close).rolling(20, min_periods=1).mean().values
     std20 = pd.Series(close).rolling(20, min_periods=1).std(ddof=0).values
@@ -1077,13 +846,11 @@ def prepare_series(master, target_dt, pinned=False):
         'day_open': float(master['Open'].iloc[ts]), 'prev_close': float(close[ts - 1]) if ts > 0 else 0.0,
         'base_atr': float(base_atr), 'atr_bars': int(atr_bars),
         'kin': _evaluate_kinetic_arrays(close, high, low, vol),
-        'vwap': vwap,
         'bb_upper': sma20 + 2.0 * std20, 'bb_lower': sma20 - 2.0 * std20,
         'kc_upper': sma20 + 1.5 * atr20, 'kc_lower': sma20 - 1.5 * atr20,
     }, None
 
 def row_at(S, end, symbol):
-    """The row for ONE checkpoint: the replay of the day from the open up to candle index `end` (exclusive)."""
     ts = S['today_start']
     end = min(int(end), len(S['close']))
     if end <= ts:
@@ -1091,7 +858,6 @@ def row_at(S, end, symbol):
     close, base_atr, kin = S['close'], S['base_atr'], S['kin']
     last = end - 1
     ltp = float(close[last])
-    # FIX 8: Day% from the previous close (what a broker shows); falls back to today's open
     ref = S['prev_close'] if (DAY_PCT_BASIS == "PREV_CLOSE" and S['prev_close'] > 0) else S['day_open']
     day_pct = ((ltp - ref) / ref) * 100 if ref else 0.0
 
@@ -1103,10 +869,9 @@ def row_at(S, end, symbol):
     }
 
     anchor, info = evaluate_anchor_tripwire(close, S['dt'], kin, base_atr, S['bb_upper'], S['bb_lower'],
-                                            S['kc_upper'], S['kc_lower'], S['vwap'], ts, end)
+                                            S['kc_upper'], S['kc_lower'], ts, end)
     row['Kills'] = info.get('kills', [])
 
-    # FIX 4: the R-M-D triads are computed for EVERY row, so stopped / graveyard rows keep their indicators
     for mult in HA_ATR_MULTIPLIERS:
         rsi_st, macd_st, adx_st, blk_count = get_tripwire_state(close, kin, base_atr, mult, ts, end)
         gtag = f"{mult}X"
@@ -1137,8 +902,7 @@ def row_at(S, end, symbol):
     return row
 
 def compute_row(symbol, master_1m, target_dt):
-    """Single-snapshot convenience wrapper (kept for callers of the old API): the row at the END of master_1m."""
-    S, _ = prepare_series(master_1m, target_dt, pinned=True)
+    S, _ = prepare_series(master_1m, target_dt)
     return None if S is None else row_at(S, len(master_1m), symbol)
 
 # ==============================================================================
@@ -1147,7 +911,6 @@ def compute_row(symbol, master_1m, target_dt):
 def format_kinetic_triad(rsi, macd, di, symbol):
     is_pe = " PE " in symbol or symbol.endswith("PE")
     def fmt(sig):
-        # Invert the text if it's a Put Option (PE premium going up = Market Sell)
         if is_pe:
             if sig == "Buy": return f"{COLOR_RED_FG}Sel{COLOR_RESET}"
             if sig == "Sell": return f"{COLOR_GREEN_FG}Buy{COLOR_RESET}"
@@ -1160,16 +923,12 @@ def format_kinetic_triad(rsi, macd, di, symbol):
 def _history_worker_daily(args):
     item, start, end, progress = args
     try:
-        if item.get('pinned'):
-            return item                  # FIX 7: a tracked instrument is never filtered out
         frames = []
         for c_start, c_end in _date_chunks(start, end + timedelta(days=1), span=365):
             status, df = _candles(_url_range_daily(item['key'], c_start, c_end))
             if status == 200 and df is not None: frames.append(df)
         if not frames: return None
         master = prepare_master(frames)
-        # FIX 2: judge the last COMPLETED session before the snapshot date. Same-day data is wrong twice over:
-        # a partial day's volume fails the threshold, and in a backtest the full day leaks the future.
         master = master[master['Datetime'].dt.date < end]
         if master.empty: return None
         close, vol = master['Close'].iloc[-1], master['Volume'].iloc[-1]
@@ -1181,13 +940,8 @@ def _history_worker_daily(args):
         progress.tick()
 
 def process_stock_checkpoints(args):
-    """
-    One instrument -> one (checkpoint, status, payload) tuple per checkpoint.
-    status: ok | no_data | illiquid | short_history | error   (payload = row for ok, the symbol otherwise)
-    """
     item, checkpoints, use_intraday, history_days, mode, progress = args
     sym = item['symbol']
-    pinned = bool(item.get('pinned'))
     try:
         final_cutoff = checkpoints[-1]
         target_dt = final_cutoff.date()
@@ -1197,26 +951,24 @@ def process_stock_checkpoints(args):
             status, df = _candles(_url_range_1m(item['key'], c_start, c_end))
             if status == 200 and df is not None: frames.append(df)
 
-        if use_intraday:         # FIX 3: any snapshot that falls on TODAY needs the intraday feed, live or not
+        if use_intraday:
             today_df = fetch_today(item['key'])
             if today_df is not None: frames.append(today_df)
 
         if not frames:
             return [(cp, "no_data", sym) for cp in checkpoints]
 
-        # FIX 2: only candles that CLOSED before the snapshot (a candle stamped HH:MM is still forming at HH:MM)
         master = prepare_master(frames)
         master = master[master['Datetime'] < final_cutoff].reset_index(drop=True)
 
-        if mode == "INDEX_OPTIONS" and not pinned:
-            # FIX 6: liquidity is judged ONCE, at the snapshot, not on the cumulative volume of each checkpoint
+        if mode == "INDEX_OPTIONS":
             day = master[master['Datetime'].dt.date == target_dt]
             if day.empty:
                 return [(cp, "no_data", sym) for cp in checkpoints]
             if day['Close'].iloc[-1] < OPT_MIN_PRICE or day['Volume'].sum() < OPT_MIN_VOLUME:
                 return [(cp, "illiquid", sym) for cp in checkpoints]
 
-        S, why = prepare_series(master, target_dt, pinned)
+        S, why = prepare_series(master, target_dt)
         if S is None:
             return [(cp, why, sym) for cp in checkpoints]
 
@@ -1264,13 +1016,6 @@ def _find_kill(kills, direction, anchor_time):
     return None
 
 def _merge_signal(sig_rows, last_row, direction):
-    """
-    sig_rows: the checkpoint rows in which ONE specific anchor was alive. 'Seen' is the first of them.
-    LTP / Day% / indicators come from the latest checkpoint. The signal is alive only if that same anchor is
-    still alive at the latest checkpoint; otherwise it is STOPPED and the kill (time / price / reason) is
-    attached. The old merge looked only at the latest checkpoint's DIRECTION, so a killed anchor was shown
-    ACTIVE whenever a later anchor in the same direction had formed (with the earlier anchor's time and price).
-    """
     first, latest = sig_rows[0], sig_rows[-1]
     row = dict(last_row)
     row['CheckpointTime'] = first['CheckpointTime']
@@ -1295,7 +1040,6 @@ def _merge_signal(sig_rows, last_row, direction):
     return row
 
 def merge_symbol_rows(rows):
-    """rows: one row per checkpoint for ONE instrument. Returns (bull_row | None, bear_row | None, graveyard_row | None)."""
     rows = sorted(rows, key=lambda r: r['CheckpointTime'])
     last_row = rows[-1]
     merged = {}
@@ -1303,7 +1047,7 @@ def merge_symbol_rows(rows):
         d_rows = [r for r in rows if r['AnchorDir'] == direction and r['State'] in active]
         if not d_rows:
             continue
-        sid = _signal_id(d_rows[-1])                     # the most recent signal of this direction
+        sid = _signal_id(d_rows[-1])
         merged[direction] = _merge_signal([r for r in d_rows if _signal_id(r) == sid], last_row, direction)
     grave = None
     if not merged:
@@ -1318,234 +1062,14 @@ def _state_display(row):
         return f"[STOPPED {k}]" if k and k != '-' else st
     return st
 
-# ==============================================================================
-# 3b. OPTIONAL WATCH / EMAIL ALERT (no-op unless --watch is passed)
-#     + ORDER-PLACED TRACKING (no-op unless the OrderPlaced env var is set)
-# ==============================================================================
-def _load_watch_state(path):
-    if not os.path.exists(path):
-        return {}
-    try:
-        with open(path, 'r') as f:
-            return json.load(f)
-    except Exception as e:
-        print(f"   {COLOR_YELLOW}[track] could not read state file '{path}' ({type(e).__name__}: {e}) -- starting fresh.{COLOR_RESET}")
-        return {}
-
-def _save_watch_state(path, state):
-    try:
-        with open(path, 'w') as f:
-            json.dump(state, f, indent=2, default=str)
-    except Exception as e:
-        print(f"   {COLOR_YELLOW}[track] could not write state file '{path}' ({type(e).__name__}: {e}).{COLOR_RESET}")
-
-def _send_watch_email(subject, body, tag="watch"):
-    sender = os.environ.get("SENDER_EMAIL") or os.environ.get("EMAIL_SENDER")
-    password = os.environ.get("SENDER_PASSWORD") or os.environ.get("EMAIL_APP_PWD")
-    recipient = os.environ.get("RECIPIENT_EMAIL") or os.environ.get("EMAIL_RECEIVER")
-    smtp_server = os.environ.get("SMTP_SERVER") or "smtp.gmail.com"
-    smtp_port = os.environ.get("SMTP_PORT") or "465"
-
-    missing = [name for name, val in (
-        ("SENDER_EMAIL/EMAIL_SENDER", sender),
-        ("SENDER_PASSWORD/EMAIL_APP_PWD", password),
-        ("RECIPIENT_EMAIL/EMAIL_RECEIVER", recipient),
-    ) if not val]
-    if missing:
-        print(f"   {COLOR_YELLOW}[{tag}] cannot send email -- missing env var(s): {', '.join(missing)}.{COLOR_RESET}")
-        return False
-
-    try:
-        port = int(smtp_port)
-    except ValueError:
-        print(f"   {COLOR_YELLOW}[{tag}] cannot send email -- SMTP_PORT='{smtp_port}' is not a valid integer.{COLOR_RESET}")
-        return False
-
-    msg = EmailMessage()
-    msg['Subject'] = subject
-    msg['From'] = sender
-    msg['To'] = recipient
-    msg.set_content(body)
-
-    try:
-        if port == 465:
-            with smtplib.SMTP_SSL(smtp_server, port, timeout=20) as server:
-                server.login(sender, password)
-                server.send_message(msg)
-        else:
-            with smtplib.SMTP(smtp_server, port, timeout=20) as server:
-                server.starttls()
-                server.login(sender, password)
-                server.send_message(msg)
-        print(f"   {COLOR_GREEN_FG}[{tag}] email sent to {recipient}.{COLOR_RESET}")
-        return True
-    except Exception as e:
-        print(f"   {COLOR_YELLOW}[{tag}] failed to send email ({type(e).__name__}: {e}).{COLOR_RESET}")
-        return False
-
-def _read_order_env():
-    for name in dict.fromkeys((ORDER_PLACED_ENV, ORDER_PLACED_ENV.upper(), "ORDER_PLACED")):
-        v = (os.environ.get(name) or "").strip()
-        if v:
-            return v
-    return ""
-
-def _status_of(row):
-    """(key, text). `key` carries no prices, so a drifting LTP never looks like a status change."""
-    st, d = row.get('State', 'NONE'), row.get('AnchorDir', 'NONE')
-    if st in LIVE_STATES:
-        return f"{d} LIVE", f"{d} LIVE {st}"
-    if st == "[STOPPED]":
-        k = row.get('KilledTime', '-')
-        return f"{d} STOPPED", (f"{d} STOPPED at {k}" if k and k != '-' else f"{d} STOPPED")
-    return "REJECTED", f"REJECTED ({row.get('RejectReason') or 'unknown'})"
-
-def resolve_track(value, all_bulls, all_bears, rejected, unevaluated):
-    """
-    FIX 7. Look a tracked value up in this run's results. Case- and whitespace-insensitive substring match
-    ('NIFTY25000CE' finds 'NIFTY 25000 CE 14 OCT 26'). When several symbols match, an EXACT symbol wins, then a
-    LIVE one, then a STOPPED one, then the shortest name -- the old lookup returned the first hit in the order
-    bull / bear / graveyard, which could be a stopped bull signal while the bear signal was live, or simply the
-    wrong strike. A symbol can sit in both baskets: every entry of the winning symbol is reported.
-    """
-    n = _norm_sym(value)
-    hits = {}
-    for rows in (all_bulls, all_bears, rejected):
-        for r in rows:
-            if n and n in _norm_sym(r['Symbol']):
-                hits.setdefault(r['Symbol'], []).append(r)
-
-    if not hits:
-        for sym, why in unevaluated.items():
-            if n and n in _norm_sym(sym):
-                return {"key": "NO DATA", "text": f"NO DATA ({why})", "symbol": sym, "entries": [], "others": []}
-        return {"key": "NOT FOUND", "text": "NOT FOUND (no instrument in this run's universe matches)",
-                "symbol": value, "entries": [], "others": []}
-
-    def rank(sym):
-        rows = hits[sym]
-        return (_norm_sym(sym) != n,
-                not any(r.get('State') in LIVE_STATES for r in rows),
-                not any(r.get('State') == "[STOPPED]" for r in rows),
-                len(sym), sym)
-    order = sorted(hits, key=rank)
-    best = order[0]
-    entries = sorted(hits[best], key=lambda r: (r.get('State') == 'NONE', r.get('AnchorDir') != 'BULL'))
-    statuses = [_status_of(r) for r in entries]
-    return {"key": " + ".join(k for k, _ in statuses), "text": " | ".join(t for _, t in statuses),
-            "symbol": best, "entries": entries, "others": order[1:]}
-
-def _entry_brief(row):
-    return (f"{row['Symbol']}: {_status_of(row)[1]} | LTP {row.get('LTP', 0):.2f} | "
-            f"Day {row.get('DayChangePct', 0):+.2f}% | Move {row.get('MovePct', 0):+.2f}%")
-
-def _entry_lines(row):
-    key, text = _status_of(row)
-    lines = [f"Symbol : {row['Symbol']}", f"Status : {text}",
-             f"LTP    : {row.get('LTP', 0):.2f}    Day: {row.get('DayChangePct', 0):+.2f}%    "
-             f"Move from anchor: {row.get('MovePct', 0):+.2f}%"]
-    if row.get('AnchorPrice', 0) > 0:
-        seen = row.get('CheckpointTime')
-        tail = f"    first seen {seen:%H:%M}" if (key != "REJECTED" and hasattr(seen, 'strftime')) else ""
-        lines.append(f"Anchor : {row.get('ActiveAnchor', '-')} @ {row['AnchorPrice']:.2f}{tail}")
-    if row.get('KilledTime', '-') not in ('-', '', None):
-        lines.append(f"Stopped: {row['KilledTime']} @ {row.get('KilledPrice', 0):.2f} -- {row.get('RejectReason', '')}")
-    elif key == "REJECTED":
-        lines.append(f"Reason : {row.get('RejectReason') or 'unknown'}")
-    if row.get('PriorStops'):
-        lines.append(f"Earlier {row['AnchorDir']} signals stopped out today: {row['PriorStops']}")
-    return lines
-
-TRACK_CFG = {
-    "watch": {"icon": "👁 ", "label": "WATCH", "tag": "watch", "word": "Watch"},
-    "order": {"icon": "📦", "label": "ORDER PLACED", "tag": "order", "word": "Order status"},
-}
-
-def run_tracking(kind, values, mode, cutoff_dt, all_bulls, all_bears, rejected, unevaluated, can_email, notes=()):
-    """
-    kind 'watch': emails only when a value's status CHANGED since the last run (state file).
-    kind 'order': emails on EVERY run (one digest for all positions), or only on change when
-                  ORDER_EMAIL_ONLY_ON_CHANGE / --order-email-only-on-change is set.
-    FIX 7: a value is marked as reported only after the email was actually delivered (it used to be recorded
-           even when SMTP failed, so the alert was lost for good); time-machine runs never email.
-    """
-    if not values:
-        return
-    cfg = TRACK_CFG[kind]
-    only_on_change = True if kind == "watch" else bool(ORDER_EMAIL_ONLY_ON_CHANGE)
-    state_file = WATCH_STATE_FILE if kind == "watch" else ORDER_STATE_FILE
-    state = _load_watch_state(state_file) if (only_on_change and can_email) else {}
-
-    results = []
-    for value in values:
-        res = resolve_track(value, all_bulls, all_bears, rejected, unevaluated)
-        nk = _norm_sym(value)
-        prev = state.get(nk, {}).get("status")
-        results.append({"value": value, "res": res, "prev": prev, "changed": prev != res['key'], "nk": nk})
-
-        print(f"\n{COLOR_BOLD}{cfg['icon']} {cfg['label']} [{value}] -> {res['text']}{COLOR_RESET}" +
-              (f" {COLOR_DIM}(previous: {prev}){COLOR_RESET}" if prev else ""))
-        for r in res['entries']:
-            print(f"   {COLOR_DIM}{_entry_brief(r)}{COLOR_RESET}")
-        if res['others']:
-            shown = ", ".join(res['others'][:5]) + (" ..." if len(res['others']) > 5 else "")
-            print(f"   {COLOR_YELLOW}⚠ '{value}' also matches {len(res['others'])} other symbol(s): {shown}. "
-                  f"Tracking '{res['symbol']}' -- use a more specific value if that is wrong.{COLOR_RESET}")
-
-    if not can_email:
-        print(f"   {COLOR_DIM}[{cfg['tag']}] time-machine snapshot -- no email (it would not describe the live position).{COLOR_RESET}")
-        return
-    due = [r for r in results if r['changed'] or not only_on_change]
-    if not due:
-        print(f"   {COLOR_DIM}[{cfg['tag']}] status unchanged since last run -- no email sent.{COLOR_RESET}")
-        return
-
-    if len(due) == 1:
-        r = due[0]
-        if not only_on_change:
-            subject = f"[System3] {cfg['word']}: {r['value']} -> {r['res']['key']}"
-        elif r['prev'] is None:
-            subject = f"[System3] {cfg['word']} started: {r['value']} is {r['res']['key']}"
-        else:
-            subject = f"[System3] {r['value']} changed: {r['prev']} -> {r['res']['key']}"
-    else:
-        subject = f"[System3] {cfg['word']}: " + "; ".join(f"{r['value']} -> {r['res']['key']}" for r in due)
-        if len(subject) > 150:
-            subject = subject[:147] + "..."
-
-    head = [f"Snapshot : {cutoff_dt:%Y-%m-%d %H:%M}  (live run)", f"Mode     : {mode}"] + [f"Note     : {n}" for n in notes]
-    parts = ["\n".join(head)]
-    for r in due:
-        block = [f"== {r['value']}  ->  {r['res']['text']}"]
-        if only_on_change and r['prev'] is not None:
-            block.append(f"   previous status: {r['prev']}")
-        for e in r['res']['entries']:
-            block += ["   " + ln for ln in _entry_lines(e)] + [""]
-        if r['res']['others']:
-            block.append("   Also matches: " + ", ".join(r['res']['others'][:8]))
-        parts.append("\n".join(block).rstrip())
-    body = subject + "\n\n" + "\n\n".join(parts) + "\n"
-
-    sent = _send_watch_email(subject, body, cfg['tag'])
-    if only_on_change:
-        if sent:
-            stamp = cutoff_dt.strftime("%Y-%m-%d %H:%M:%S")
-            for r in due:
-                state[r['nk']] = {"status": r['res']['key'], "checked_at": stamp}
-            _save_watch_state(state_file, state)
-        else:
-            print(f"   {COLOR_YELLOW}[{cfg['tag']}] email not delivered -- the status is NOT marked as reported and will be retried next run.{COLOR_RESET}")
-
 def _fav_color(pct, direction):
-    """Green = the move is in favour of the signal (a falling price is GOOD for a BEAR setup)."""
     sign = 1 if direction == "BULL" else -1 if direction == "BEAR" else 0
     fav = pct * sign
     return COLOR_GREEN_FG if fav > 0 else COLOR_RED_FG if fav < 0 else COLOR_DIM
 
-def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, target_time_str=None, options_master_path=""):
+def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, target_time_str=None):
     t_start = time.time()
 
-    # FIX 3: --time without --date means "today at that time" (it used to be silently ignored)
     explicit = bool(target_date_str or target_time_str)
     if explicit:
         d_str = target_date_str or now_ist().strftime("%Y-%m-%d")
@@ -1560,7 +1084,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     cutoff_dt = cutoff_dt.replace(second=0, microsecond=0)
     live_run = not explicit
 
-    # FIX 3: weekend / holiday / pre-open / future snapshots roll back to the last completed session
     cutoff_dt, notes = resolve_session(cutoff_dt)
     if STATS.auth_failed:
         print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401). Regenerate UPSTOX_ACCESS_TOKEN -- it expires daily.{COLOR_RESET}")
@@ -1573,11 +1096,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     for n in notes:
         print(f"   {COLOR_YELLOW}» {n}{COLOR_RESET}")
 
-    watch_values = parse_track_values(WATCH_VALUE)
-    order_values = parse_track_values(_read_order_env())
-    needles = watch_values + order_values
-
-    universe_raw = get_dynamic_universe(mode, cutoff_dt, today_session, options_master_path, needles)
+    universe_raw = get_dynamic_universe(mode, cutoff_dt, today_session)
     if STATS.auth_failed:
         print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401). Regenerate UPSTOX_ACCESS_TOKEN -- it expires daily.{COLOR_RESET}")
         return 1
@@ -1635,16 +1154,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         _print_error_summary()
         return 1
 
-    # why an instrument that was looked at has no row (used by the tracking lookup: NO DATA vs NOT FOUND)
-    why_text = {"no_data": "no candles for this session", "illiquid": "below the price/volume floor",
-                "short_history": "too little history for an ATR", "error": "processing error"}
-    ok_symbols = {r['Symbol'] for r in results}
-    unevaluated = {}
-    for _, s, p in outcomes:
-        if s != "ok" and p not in ok_symbols:
-            unevaluated.setdefault(p, set()).add(why_text.get(s, s))
-    unevaluated = {sym: ", ".join(sorted(v)) for sym, v in unevaluated.items()}
-
     by_symbol = {}
     for row in results:
         by_symbol.setdefault(row['Symbol'], []).append(row)
@@ -1658,7 +1167,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         
         if b:
             if is_pe:
-                # Upward PE Breakout -> Market Bear Setup
                 b['AnchorDir'] = "BEAR"
                 if b['State'] == "[ACTIVE BUY]": b['State'] = "[ACTIVE SELL]"
                 bears.append(b)
@@ -1667,12 +1175,10 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
                 
         if r_:
             if not is_pe:
-                # Downward CE Breakdown -> Market Bear Setup
                 r_['AnchorDir'] = "BEAR"
                 if r_['State'] == "[ACTIVE SELL]": r_['State'] = "[ACTIVE SELL]"
                 bears.append(r_)
             else:
-                # Downward PE Breakdown -> Market Bull Setup
                 r_['AnchorDir'] = "BULL"
                 if r_['State'] == "[ACTIVE SELL]": r_['State'] = "[ACTIVE BUY]"
                 bulls.append(r_)
@@ -1684,7 +1190,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     bull_live = sum(1 for r in bulls if r['State'] != "[STOPPED]")
     bear_live = sum(1 for r in bears if r['State'] != "[STOPPED]")
 
-    # Kinetic confirmation score across 1X, 2X, 3X, 5X triads (max 12)
     def kinetic_score(r, target="Buy"):
         keys = [f'{ind}_{m}X' for m in (1, 2, 3, 5) for ind in ('BB_RSI', 'BB_MACD', 'ADX')]
         return sum(1 for k in keys if r.get(k) == target)
@@ -1703,10 +1208,10 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             anchor_mins = 0
 
         return (
-            bull_state_rank(r['State']), # 1. Active Buy -> Coiling -> Stopped
-            -anchor_mins,                # 2. Most recent anchor first
-            -r.get('MovePct', 0.0),      # 3. Best gain preservation
-            -kinetic_score(r, "Buy"),    # 4. Triad confluence
+            bull_state_rank(r['State']),
+            -anchor_mins,
+            -r.get('MovePct', 0.0),
+            -kinetic_score(r, "Buy"),
         )
 
     def bear_state_rank(st):
@@ -1725,14 +1230,12 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         return (
             bear_state_rank(r['State']),
             -anchor_mins,
-            r.get('MovePct', 0.0),       # More negative Move% ranked higher for short setups
+            r.get('MovePct', 0.0),
             -kinetic_score(r, "Sell"),
         )
 
     bulls.sort(key=bull_sort_key)
     bears.sort(key=bear_sort_key)
-
-    all_bulls, all_bears = list(bulls), list(bears)      # the tracking lookup searches EVERYTHING, not just the top N
 
     bulls = bulls[:TOP_N_BUYERS]
     bears = bears[:TOP_N_SELLERS]
@@ -1808,7 +1311,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
 
     if grave_shown:
         print(f"\n{COLOR_BOLD}🚫 THE GRAVEYARD (Filtered / Rejected){COLOR_RESET}")
-        # FIX 4: no 'Seen' column here -- a rejected symbol never had a surviving checkpoint to be 'seen' at
         header_str = (
             f" {COLOR_CYAN}{'Script':<{sym_w}} {'Signal':^6} {'Anchor':^6} {'Anch Val':>9} "
             f"{'Killed':^6} {'Kill Val':>9} {'LTP':>8} {'Day%':>7} {'Move%':>7} | "
@@ -1851,18 +1353,12 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             )
         if grave_total > len(grave_shown):
             print(f"{COLOR_DIM}   ... {grave_total - len(grave_shown)} more graveyard row(s) not shown "
-                  f"(--graveyard-max 0 prints them all; --watch / OrderPlaced still search every one).{COLOR_RESET}")
-
-    # --watch / OrderPlaced: a time-machine snapshot is printed but never emailed
-    can_email = live_run
-    run_tracking("watch", watch_values, mode, cutoff_dt, all_bulls, all_bears, rejected, unevaluated, can_email, notes)
-    run_tracking("order", order_values, mode, cutoff_dt, all_bulls, all_bears, rejected, unevaluated, can_email, notes)
+                  f"(--graveyard-max 0 prints them all).{COLOR_RESET}")
 
     _print_error_summary()
     total_calls = sum(l.total_calls for l in LIMITERS.values())
     print(f"\n⏱️ Tracker sync completed in {(time.time() - t_start):.2f} seconds ({total_calls} API calls).\n")
     return 0
-
 
 def parse_args():
     p = argparse.ArgumentParser(description="Strict institutional volatility tracker (Upstox)")
@@ -1879,8 +1375,6 @@ def parse_args():
                       help="Drop the 'Bollinger Band already pierced Keltner Channel' requirement (already off by default).")
     gate.add_argument("--require-bb-kc-pierce", action="store_true",
                       help="Turn the 'Bollinger Band already pierced Keltner Channel' anchor requirement ON.")
-    p.add_argument("--options-master", type=str, default="",
-                   help="INDEX_OPTIONS only: local JSON/CSV instrument master, for backtesting contracts that have already expired.")
     p.add_argument("--opt-min-price", type=float, default=OPT_MIN_PRICE, help="INDEX_OPTIONS: minimum premium at the snapshot.")
     p.add_argument("--opt-min-volume", type=float, default=OPT_MIN_VOLUME, help="INDEX_OPTIONS: minimum traded volume by the snapshot.")
     p.add_argument("--expiry", choices=["CURRENT", "NEXT"], default=EXPIRY_SELECTION,
@@ -1902,20 +1396,6 @@ def parse_args():
                    help=f"Day%% is measured from the previous close (broker-style) or from today's open. Default {DAY_PCT_BASIS}.")
     p.add_argument("--graveyard-max", type=int, default=TOP_N_GRAVEYARD,
                    help=f"Max graveyard rows printed (default {TOP_N_GRAVEYARD}; 0 = all). Tracking searches every row regardless.")
-    p.add_argument("--watch", type=str, default="",
-                   help="Optional. A symbol, tradingsymbol, or strike-bearing string to monitor (e.g. 'RELIANCE', "
-                        "'NIFTY25000CE', or just '25000' -- matched as a case- and whitespace-insensitive substring of the "
-                        "symbol; several values may be separated by commas). The matching instrument is always scanned, "
-                        "even if the price/volume prefilter or the ATM window would drop it. "
-                        "When set, this run checks that symbol's status and emails an alert via "
-                        "SENDER_EMAIL/EMAIL_SENDER, SENDER_PASSWORD/EMAIL_APP_PWD, RECIPIENT_EMAIL/EMAIL_RECEIVER "
-                        "(SMTP_SERVER/SMTP_PORT optional, default smtp.gmail.com:465) ONLY if the status changed "
-                        "since the last run (tracked in system3_watch_state.json). If this flag is omitted "
-                        "(default: no watch), no email code runs at all.")
-    p.add_argument("--order-email-only-on-change", action="store_true",
-                   help="Switch OrderPlaced tracking (see the OrderPlaced env var) from 'email every run' to "
-                        "'email only when the status changes since the last run', using its own state file "
-                        f"({ORDER_STATE_FILE}) so it never shares state with --watch.")
     args = p.parse_args()
     if args.checkpoint_min < 1: p.error("--checkpoint-min must be >= 1 (0 or a negative value used to hang the run)")
     if args.strikes_up < 0 or args.strikes_down < 0: p.error("--strikes-up / --strikes-down must be >= 0")
@@ -1939,9 +1419,6 @@ if __name__ == "__main__":
     HARD_STOP_ATR_MULT = args.hard_stop_atr
     DAY_PCT_BASIS = args.day_pct_basis
     TOP_N_GRAVEYARD = args.graveyard_max
-    WATCH_VALUE = args.watch
-    if args.order_email_only_on_change:
-        ORDER_EMAIL_ONLY_ON_CHANGE = True
     if args.single_snapshot:
         BACKTRACE_CHECKPOINTS = False
     if args.require_bb_kc_pierce:
@@ -1949,7 +1426,7 @@ if __name__ == "__main__":
     elif args.disable_bb_kc_gate:
         REQUIRE_BB_KC_PIERCE = False
     try:
-        code = run_screener(args.mode, args.days, args.date, args.time, args.options_master)
+        code = run_screener(args.mode, args.days, args.date, args.time)
     except Exception:
         print(f"\n{COLOR_RED_FG}💥 FATAL: unhandled exception -- full traceback follows.{COLOR_RESET}")
         traceback.print_exc()
