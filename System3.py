@@ -1154,7 +1154,7 @@ def _send_watch_email(subject, body, tag="track"):
         print(f"   {COLOR_YELLOW}[{tag}] Failed to send email ({type(e).__name__}: {e}).{COLOR_RESET}")
         return False
 
-def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol):
+def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True):
     if not tracked_symbol_raw:
         return
     n = _norm_sym(tracked_symbol_raw)
@@ -1174,16 +1174,22 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol):
     
     for i in range(1, len(rows) + 1):
         subset = rows[:i]
+        eval_time = subset[-1]['CheckpointTime']  # The actual 15-min interval time
         b, r_, g = merge_symbol_rows(subset)
         
-        if b and b['State'] != "[STOPPED]":
-            history.append(b)
-        elif r_ and r_['State'] != "[STOPPED]":
-            history.append(r_)
+        selected_row = None
+        if b and b['State'] != "[STOPPED]": selected_row = b
+        elif r_ and r_['State'] != "[STOPPED]": selected_row = r_
         else:
-            if b and b['State'] == "[STOPPED]": history.append(b)
-            elif r_ and r_['State'] == "[STOPPED]": history.append(r_)
-            elif g: history.append(g)
+            if b and b['State'] == "[STOPPED]": selected_row = b
+            elif r_ and r_['State'] == "[STOPPED]": selected_row = r_
+            elif g: selected_row = g
+            
+        if selected_row:
+            # Copy to avoid mutating the original dict
+            row_copy = dict(selected_row)
+            row_copy['_EvalTime'] = eval_time
+            history.append(row_copy)
             
     if not history: return
     
@@ -1191,7 +1197,7 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol):
     sym_w = max(12, len(matched_sym))
     header_str = (
         f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP':>8} {'Day%':>7} | "
-        f"{'Seen':^6} {'Anchor':^6} {'Anch Val':>9} {'Move%':>7} | "
+        f"{'Eval':^5} {'Anchor':^6} {'Anch Val':>9} {'Move%':>7} | "
         f"{'1X (R-M-D)':^11}  {'2X (R-M-D)':^11}  {'3X (R-M-D)':^11}  {'5X (R-M-D)':^11} | "
         f"{'State':^16}{COLOR_RESET}"
     )
@@ -1216,14 +1222,14 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol):
         elif "SELL]" in state: state_text = f"{COLOR_RED_FG}{shown_state:^16}{COLOR_RESET}"
         else: state_text = f"{COLOR_YELLOW}{shown_state:^16}{COLOR_RESET}"
 
-        seen_time = row['CheckpointTime'].strftime('%H:%M')
+        eval_time_str = row['_EvalTime'].strftime('%H:%M')
         a_time = row.get('ActiveAnchor', '-')
 
         print(
             f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} "
             f"{row['LTP']:>8.2f} "
             f"{day_color}{day_pct_str}{COLOR_RESET} | "
-            f"{seen_time:^6} "
+            f"{eval_time_str:^5} "
             f"{a_time:^6} "
             f"{row['AnchorPrice']:>9.2f} "
             f"{move_color}{move_pct_str}{COLOR_RESET} | "
@@ -1231,6 +1237,7 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol):
             f"{state_text}"
         )
         
+    # --- Stateless State Change Detection & Email Alert ---
     if len(history) >= 2:
         last_row = history[-1]
         prev_row = history[-2]
@@ -1240,21 +1247,30 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol):
             
         last_state = get_full_state(last_row)
         prev_state = get_full_state(prev_row)
+        last_eval = last_row['_EvalTime'].strftime('%H:%M')
+        prev_eval = prev_row['_EvalTime'].strftime('%H:%M')
+        
+        print(f"\n{COLOR_DIM}Stateless Check: Evaluating {last_eval} vs {prev_eval}...{COLOR_RESET}")
         
         if last_state != prev_state:
-            print(f"\n{COLOR_BOLD}🔔 ALERT: State change detected for {matched_sym}! {prev_state} -> {last_state}{COLOR_RESET}")
+            print(f"{COLOR_BOLD}🔔 ALERT: State change detected! {prev_state} -> {last_state}{COLOR_RESET}")
             
+            if not live_run:
+                print(f"   {COLOR_DIM}[track] Historical execution (Live: False) — skipping email transmission.{COLOR_RESET}")
+                return
+
             subject = f"[System3] {matched_sym} Alert: {prev_state} -> {last_state}"
             body = (
-                f"System3 tracked a state change for {matched_sym} at {last_row['CheckpointTime'].strftime('%H:%M')}.\n\n"
-                f"Previous State: {prev_state}\n"
-                f"Current State:  {last_state}\n\n"
+                f"System3 detected a state transition for {matched_sym} at checkpoint {last_eval}.\n\n"
+                f"Previous State ({prev_eval}): {prev_state}\n"
+                f"Current State  ({last_eval}): {last_state}\n\n"
                 f"LTP: {last_row.get('LTP', 0):.2f}\n"
                 f"Day Change: {last_row.get('DayChangePct', 0):+.2f}%\n"
                 f"Move from Anchor: {last_row.get('MovePct', 0):+.2f}%\n"
             )
             _send_watch_email(subject, body, "track")
-
+        else:
+            print(f"{COLOR_DIM}[track] State is unchanged ({last_state}). No email sent.{COLOR_RESET}")
 # ==============================================================================
 # MAIN RUNNER
 # ==============================================================================
