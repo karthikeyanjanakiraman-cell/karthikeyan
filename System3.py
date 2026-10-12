@@ -1067,7 +1067,115 @@ def _fav_color(pct, direction):
     fav = pct * sign
     return COLOR_GREEN_FG if fav > 0 else COLOR_RED_FG if fav < 0 else COLOR_DIM
 
-def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, target_time_str=None):
+
+def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol):
+    if not tracked_symbol_raw:
+        return
+    n = _norm_sym(tracked_symbol_raw)
+    
+    # Find exact or partial symbol match in the scanned results
+    matched_sym = None
+    for sym in by_symbol.keys():
+        if n in _norm_sym(sym):
+            matched_sym = sym
+            break
+            
+    if not matched_sym:
+        print(f"{COLOR_YELLOW}» Tracked symbol '{tracked_symbol_raw}' not found in scanned results.{COLOR_RESET}")
+        return
+        
+    # Sort raw checkpoints chronologically
+    rows = sorted(by_symbol[matched_sym], key=lambda r: r['CheckpointTime'])
+    history = []
+    
+    # Simulate running the script live at every single 15-min checkpoint
+    for i in range(1, len(rows) + 1):
+        subset = rows[:i]
+        b, r_, g = merge_symbol_rows(subset)
+        
+        # Determine the prevailing state at this exact checkpoint
+        if b and b['State'] != "[STOPPED]":
+            history.append(b)
+        elif r_ and r_['State'] != "[STOPPED]":
+            history.append(r_)
+        else:
+            if b and b['State'] == "[STOPPED]": history.append(b)
+            elif r_ and r_['State'] == "[STOPPED]": history.append(r_)
+            elif g: history.append(g)
+            
+    if not history: return
+    
+    print(f"\n{COLOR_BOLD}🔍 INTRADAY HISTORY FOR TRACKED SYMBOL: {matched_sym}{COLOR_RESET}")
+    sym_w = max(12, len(matched_sym))
+    header_str = (
+        f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP':>8} {'Day%':>7} | "
+        f"{'Seen':^6} {'Anchor':^6} {'Anch Val':>9} {'Move%':>7} | "
+        f"{'1X (R-M-D)':^11}  {'2X (R-M-D)':^11}  {'3X (R-M-D)':^11}  {'5X (R-M-D)':^11} | "
+        f"{'State':^16}{COLOR_RESET}"
+    )
+    print(header_str)
+    print("-" * len(ANSI_RE.sub("", header_str)))
+    
+    for row in history:
+        day_pct_str = f"{row['DayChangePct']:>+6.2f}%"
+        day_color = COLOR_GREEN_FG if row['DayChangePct'] > 0 else COLOR_RED_FG if row['DayChangePct'] < 0 else COLOR_DIM
+        move_pct_str = f"{row['MovePct']:>+6.2f}%"
+        move_color = _fav_color(row['MovePct'], row['AnchorDir'])
+
+        sym = row['Symbol']
+        k1 = format_kinetic_triad(row.get('BB_RSI_1X'), row.get('BB_MACD_1X'), row.get('ADX_1X'), sym)
+        k2 = format_kinetic_triad(row.get('BB_RSI_2X'), row.get('BB_MACD_2X'), row.get('ADX_2X'), sym)
+        k3 = format_kinetic_triad(row.get('BB_RSI_3X'), row.get('BB_MACD_3X'), row.get('ADX_3X'), sym)
+        k5 = format_kinetic_triad(row.get('BB_RSI_5X'), row.get('BB_MACD_5X'), row.get('ADX_5X'), sym)
+
+        state = row['State']
+        shown_state = _state_display(row)
+        if "BUY]" in state: state_text = f"{COLOR_GREEN_FG}{shown_state:^16}{COLOR_RESET}"
+        elif "SELL]" in state: state_text = f"{COLOR_RED_FG}{shown_state:^16}{COLOR_RESET}"
+        else: state_text = f"{COLOR_YELLOW}{shown_state:^16}{COLOR_RESET}"
+
+        seen_time = row['CheckpointTime'].strftime('%H:%M')
+        a_time = row.get('ActiveAnchor', '-')
+
+        print(
+            f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} "
+            f"{row['LTP']:>8.2f} "
+            f"{day_color}{day_pct_str}{COLOR_RESET} | "
+            f"{seen_time:^6} "
+            f"{a_time:^6} "
+            f"{row['AnchorPrice']:>9.2f} "
+            f"{move_color}{move_pct_str}{COLOR_RESET} | "
+            f"{k1}  {k2}  {k3}  {k5} | "
+            f"{state_text}"
+        )
+        
+    # --- Stateless State Change Detection & Email Alert ---
+    if len(history) >= 2:
+        last_row = history[-1]
+        prev_row = history[-2]
+        
+        def get_full_state(r):
+            return f"{r.get('AnchorDir', 'NONE')} {r.get('State', 'NONE')}"
+            
+        last_state = get_full_state(last_row)
+        prev_state = get_full_state(prev_row)
+        
+        if last_state != prev_state:
+            print(f"\n{COLOR_BOLD}🔔 ALERT: State change detected for {matched_sym}! {prev_state} -> {last_state}{COLOR_RESET}")
+            
+            subject = f"[System3] {matched_sym} Alert: {prev_state} -> {last_state}"
+            body = (
+                f"System3 tracked a state change for {matched_sym} at {last_row['CheckpointTime'].strftime('%H:%M')}.\n\n"
+                f"Previous State: {prev_state}\n"
+                f"Current State:  {last_state}\n\n"
+                f"LTP: {last_row.get('LTP', 0):.2f}\n"
+                f"Day Change: {last_row.get('DayChangePct', 0):+.2f}%\n"
+                f"Move from Anchor: {last_row.get('MovePct', 0):+.2f}%\n"
+            )
+            # Uses SENDER_EMAIL, RECIPIENT_EMAIL, etc. automatically
+            _send_watch_email(subject, body, "track")
+
+def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, target_time_str=None, track_symbol=""):
     t_start = time.time()
 
     explicit = bool(target_date_str or target_time_str)
@@ -1096,7 +1204,11 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     for n in notes:
         print(f"   {COLOR_YELLOW}» {n}{COLOR_RESET}")
 
-    universe_raw = get_dynamic_universe(mode, cutoff_dt, today_session)
+    # --- TRACKING: Pass needles to universe to bypass filters ---
+    needles = [track_symbol] if track_symbol else []
+    
+    universe_raw = get_dynamic_universe(mode, cutoff_dt, today_session, needles=needles)
+    
     if STATS.auth_failed:
         print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401). Regenerate UPSTOX_ACCESS_TOKEN -- it expires daily.{COLOR_RESET}")
         return 1
@@ -1185,12 +1297,19 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
                 
         if g: rejected.append(g)
 
+    # --- INTRADAY TRACKING HISTORY ---
+    if track_symbol:
+        print_and_alert_tracked_history(track_symbol, by_symbol)
+
     true_bull_count = len(bulls)
     true_bear_count = len(bears)
     bull_live = sum(1 for r in bulls if r['State'] != "[STOPPED]")
     bear_live = sum(1 for r in bears if r['State'] != "[STOPPED]")
 
-    # State Rank: ACTIVE (0) -> COILING (1) -> STOPPED (2)
+    def kinetic_score(r, target="Buy"):
+        keys = [f'{ind}_{m}X' for m in (1, 2, 3, 5) for ind in ('BB_RSI', 'BB_MACD', 'ADX')]
+        return sum(1 for k in keys if r.get(k) == target)
+
     def state_rank(st):
         if "[ACTIVE BUY]" in st or "[ACTIVE SELL]" in st:
             return 0
@@ -1198,11 +1317,38 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             return 1
         return 2
 
-    # Bulls: State Priority -> Move% Descending (Highest gain off anchor first)
-    bulls.sort(key=lambda r: (state_rank(r['State']), -r.get('MovePct', 0.0)))
+    def bull_sort_key(r):
+        a_time = r.get('ActiveAnchor', '00:00')
+        try:
+            hh, mm = map(int, a_time.split(':'))
+            anchor_mins = hh * 60 + mm
+        except Exception:
+            anchor_mins = 0
 
-    # Bears: State Priority -> Move% Descending (Deepest downside off anchor first)
-    bears.sort(key=lambda r: (state_rank(r['State']), r.get('MovePct', 0.0)))
+        return (
+            state_rank(r['State']),      # 1. Active Buy -> Coiling -> Stopped
+            -anchor_mins,                # 2. Most recent anchor first
+            -r.get('MovePct', 0.0),      # 3. Best gain preservation
+            -kinetic_score(r, "Buy"),    # 4. Triad confluence
+        )
+
+    def bear_sort_key(r):
+        a_time = r.get('ActiveAnchor', '00:00')
+        try:
+            hh, mm = map(int, a_time.split(':'))
+            anchor_mins = hh * 60 + mm
+        except Exception:
+            anchor_mins = 0
+
+        return (
+            state_rank(r['State']),
+            -anchor_mins,
+            r.get('MovePct', 0.0),       # More negative Move% ranked higher for short setups
+            -kinetic_score(r, "Sell"),
+        )
+
+    bulls.sort(key=bull_sort_key)
+    bears.sort(key=bear_sort_key)
 
     bulls = bulls[:TOP_N_BUYERS]
     bears = bears[:TOP_N_SELLERS]
