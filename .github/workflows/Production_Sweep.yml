@@ -25,6 +25,11 @@ on:
         required: false
         default: ''
         type: string
+      track_symbol:
+        description: 'Optional Tracking Symbol (e.g., BDL or NIFTY 22500 CE)'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   run_quant_engine:
@@ -46,12 +51,16 @@ jobs:
 
     - name: Execute Stateful Hybrid Engine Scan
       env:
-        # Fyers & Email Configurations
+        # Fyers Configurations
         FYERS_CLIENT_ID: ${{ secrets.CLIENT_ID }}
         FYERS_ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-        EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
-        EMAIL_APP_PWD: ${{ secrets.EMAIL_APP_PWD }}
-        EMAIL_RECEIVER: ${{ secrets.EMAIL_RECEIVER }}
+        
+        # Email Alert Configurations (Matched exactly to your repository secrets)
+        SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+        SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+        RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+        SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+        SMTP_PORT: ${{ secrets.SMTP_PORT }}
         
         # Upstox Token
         UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
@@ -60,6 +69,7 @@ jobs:
         PARAM_MODE: ${{ inputs.trading_mode }}
         PARAM_BACKTEST_DATE: ${{ inputs.backtest_date }}
         PARAM_BACKTEST_TIME: ${{ inputs.backtest_time }}
+        PARAM_TRACK: ${{ inputs.track_symbol }}
       run: |
         # Base Execution Command
         CMD="python -u System3.py"
@@ -79,6 +89,11 @@ jobs:
         # 3. Inject Optional Backtest Time
         if [ -n "$PARAM_BACKTEST_TIME" ]; then
           CMD="$CMD --time $PARAM_BACKTEST_TIME"
+        fi
+
+        # 4. Inject Stateless Tracking Symbol
+        if [ -n "$PARAM_TRACK" ]; then
+          CMD="$CMD --track \"$PARAM_TRACK\""
         fi
         
         # Log and Execute
