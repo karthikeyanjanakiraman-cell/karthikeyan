@@ -1174,7 +1174,7 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
     
     for i in range(1, len(rows) + 1):
         subset = rows[:i]
-        eval_time = subset[-1]['CheckpointTime']  # The actual 15-min interval time
+        eval_time = subset[-1]['CheckpointTime']  
         b, r_, g = merge_symbol_rows(subset)
         
         selected_row = None
@@ -1186,7 +1186,6 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
             elif g: selected_row = g
             
         if selected_row:
-            # Copy to avoid mutating the original dict
             row_copy = dict(selected_row)
             row_copy['_EvalTime'] = eval_time
             history.append(row_copy)
@@ -1197,7 +1196,7 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
     sym_w = max(12, len(matched_sym))
     header_str = (
         f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP':>8} {'Day%':>7} | "
-        f"{'Eval':^5} {'Anchor':^6} {'Anch Val':>9} {'Move%':>7} | "
+        f"{'Eval':^5} {'Anchor':^6} {'Anch Val':>9} {'R-Mult':>7} | "
         f"{'1X (R-M-D)':^11}  {'2X (R-M-D)':^11}  {'3X (R-M-D)':^11}  {'5X (R-M-D)':^11} | "
         f"{'State':^16}{COLOR_RESET}"
     )
@@ -1207,8 +1206,17 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
     for row in history:
         day_pct_str = f"{row['DayChangePct']:>+6.2f}%"
         day_color = COLOR_GREEN_FG if row['DayChangePct'] > 0 else COLOR_RED_FG if row['DayChangePct'] < 0 else COLOR_DIM
-        move_pct_str = f"{row['MovePct']:>+6.2f}%"
-        move_color = _fav_color(row['MovePct'], row['AnchorDir'])
+        
+        # --- R-Multiple Calculation ---
+        r_mult = 0.0
+        if row.get('AnchorPrice', 0) > 0 and row.get('BaseAtr', 0) > 0:
+            if row.get('AnchorDir') == 'BULL':
+                r_mult = (row['LTP'] - row['AnchorPrice']) / row['BaseAtr']
+            elif row.get('AnchorDir') == 'BEAR':
+                r_mult = (row['AnchorPrice'] - row['LTP']) / row['BaseAtr']
+                
+        r_mult_str = f"{r_mult:>+4.2f}R"
+        r_color = COLOR_GREEN_FG if r_mult > 0 else COLOR_RED_FG if r_mult < 0 else COLOR_DIM
 
         sym = row['Symbol']
         k1 = format_kinetic_triad(row.get('BB_RSI_1X'), row.get('BB_MACD_1X'), row.get('ADX_1X'), sym)
@@ -1232,12 +1240,11 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
             f"{eval_time_str:^5} "
             f"{a_time:^6} "
             f"{row['AnchorPrice']:>9.2f} "
-            f"{move_color}{move_pct_str}{COLOR_RESET} | "
+            f"{r_color}{r_mult_str:>7}{COLOR_RESET} | "
             f"{k1}  {k2}  {k3}  {k5} | "
             f"{state_text}"
         )
         
-    # --- Stateless State Change Detection & Email Alert ---
     if len(history) >= 2:
         last_row = history[-1]
         prev_row = history[-2]
@@ -1258,6 +1265,14 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
             if not live_run:
                 print(f"   {COLOR_DIM}[track] Historical execution (Live: False) — skipping email transmission.{COLOR_RESET}")
                 return
+            
+            # --- R-Multiple for Email ---
+            r_mult = 0.0
+            if last_row.get('AnchorPrice', 0) > 0 and last_row.get('BaseAtr', 0) > 0:
+                if last_row.get('AnchorDir') == 'BULL':
+                    r_mult = (last_row['LTP'] - last_row['AnchorPrice']) / last_row['BaseAtr']
+                elif last_row.get('AnchorDir') == 'BEAR':
+                    r_mult = (last_row['AnchorPrice'] - last_row['LTP']) / last_row['BaseAtr']
 
             subject = f"[System3] {matched_sym} Alert: {prev_state} -> {last_state}"
             body = (
@@ -1266,11 +1281,12 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
                 f"Current State  ({last_eval}): {last_state}\n\n"
                 f"LTP: {last_row.get('LTP', 0):.2f}\n"
                 f"Day Change: {last_row.get('DayChangePct', 0):+.2f}%\n"
-                f"Move from Anchor: {last_row.get('MovePct', 0):+.2f}%\n"
+                f"Move from Anchor: {r_mult:+.2f} R-Multiples\n"
             )
             _send_watch_email(subject, body, "track")
         else:
             print(f"{COLOR_DIM}[track] State is unchanged ({last_state}). No email sent.{COLOR_RESET}")
+          
 # ==============================================================================
 # MAIN RUNNER
 # ==============================================================================
@@ -1446,7 +1462,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
         header_str = (
             f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP':>8} {'Day%':>7} | "
-            f"{'Seen':^6} {'Anchor':^6} {'Anch Val':>9} {'Move%':>7} | "
+            f"{'Seen':^5} {'Anchor':^6} {'Anch Val':>9} {'R-Mult':>7} | "
             f"{'1X (R-M-D)':^11}  {'2X (R-M-D)':^11}  {'3X (R-M-D)':^11}  {'5X (R-M-D)':^11} | "
             f"{'State':^16}{COLOR_RESET}"
         )
@@ -1456,8 +1472,17 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         for row in data_list:
             day_pct_str = f"{row['DayChangePct']:>+6.2f}%"
             day_color = COLOR_GREEN_FG if row['DayChangePct'] > 0 else COLOR_RED_FG if row['DayChangePct'] < 0 else COLOR_DIM
-            move_pct_str = f"{row['MovePct']:>+6.2f}%"
-            move_color = _fav_color(row['MovePct'], row['AnchorDir'])
+            
+            # --- R-Multiple Calculation ---
+            r_mult = 0.0
+            if row.get('AnchorPrice', 0) > 0 and row.get('BaseAtr', 0) > 0:
+                if row.get('AnchorDir') == 'BULL':
+                    r_mult = (row['LTP'] - row['AnchorPrice']) / row['BaseAtr']
+                elif row.get('AnchorDir') == 'BEAR':
+                    r_mult = (row['AnchorPrice'] - row['LTP']) / row['BaseAtr']
+                    
+            r_mult_str = f"{r_mult:>+4.2f}R"
+            r_color = COLOR_GREEN_FG if r_mult > 0 else COLOR_RED_FG if r_mult < 0 else COLOR_DIM
 
             sym = row['Symbol']
             k1 = format_kinetic_triad(row.get('BB_RSI_1X'), row.get('BB_MACD_1X'), row.get('ADX_1X'), sym)
@@ -1475,14 +1500,14 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
                 f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} "
                 f"{row['LTP']:>8.2f} "
                 f"{day_color}{day_pct_str}{COLOR_RESET} | "
-                f"{row['CheckpointTime'].strftime('%H:%M'):^6} "
+                f"{row['CheckpointTime'].strftime('%H:%M'):^5} "
                 f"{row['ActiveAnchor']:^6} "
                 f"{row['AnchorPrice']:>9.2f} "
-                f"{move_color}{move_pct_str}{COLOR_RESET} | "
+                f"{r_color}{r_mult_str:>7}{COLOR_RESET} | "
                 f"{k1}  {k2}  {k3}  {k5} | "
                 f"{state_text}"
             )
-
+    
     print_basket("TOP BULL SETUPS (Valid Anchors Surviving)", "🔥", bulls)
     print_basket("TOP BEAR SETUPS (Valid Anchors Surviving)", "🩸", bears)
     if not bulls and not bears:
