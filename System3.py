@@ -1425,12 +1425,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     for symbol, rows in by_symbol.items():
         b, r_, g = merge_symbol_rows(rows)
 
-        # Anchors are detected on the OPTION CONTRACT'S OWN premium series,
-        # not the underlying. A PE's premium rising ("BULL" anchor on the
-        # put) reflects a BEARISH move in the underlying, and a PE's
-        # premium falling ("BEAR" anchor) reflects a BULLISH move -- so PE
-        # signals are flipped into the underlying-direction bucket for
-        # display. CE and stock/cash-equity signals need no flip.
         is_pe = " PE " in symbol or symbol.endswith("PE")
 
         if b:
@@ -1459,10 +1453,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     bull_live = sum(1 for r in bulls if r['State'] != "[STOPPED]")
     bear_live = sum(1 for r in bears if r['State'] != "[STOPPED]")
 
-    def kinetic_score(r, target="Buy"):
-        keys = [f'{ind}_{m}X' for m in (1, 2, 3, 5) for ind in ('BB_RSI', 'BB_MACD', 'ADX')]
-        return sum(1 for k in keys if r.get(k) == target)
-
     def state_rank(st):
         if "[ACTIVE BUY]" in st or "[ACTIVE SELL]" in st:
             return 0
@@ -1470,17 +1460,20 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             return 1
         return 2
 
-    # Most-aligned-first: within the existing state grouping, rank by how many of
-    # RSI/MACD/DI are aligned at 1X, then break ties by 2X, then 3X, then 5X, and
-    # finally fall back to the existing MovePct ordering.
-    bulls.sort(key=lambda r: (state_rank(r['State']),
-                              -_row_aligned_count(r, 1, 'BULL'), -_row_aligned_count(r, 2, 'BULL'),
-                              -_row_aligned_count(r, 3, 'BULL'), -_row_aligned_count(r, 5, 'BULL'),
-                              -r.get('MovePct', 0.0)))
-    bears.sort(key=lambda r: (state_rank(r['State']),
-                              -_row_aligned_count(r, 1, 'BEAR'), -_row_aligned_count(r, 2, 'BEAR'),
-                              -_row_aligned_count(r, 3, 'BEAR'), -_row_aligned_count(r, 5, 'BEAR'),
-                              r.get('MovePct', 0.0)))
+    def total_kin_score(r, direction):
+        return sum(_row_aligned_count(r, m, direction) for m in (1, 2, 3, 5))
+
+    bulls.sort(key=lambda r: (
+        state_rank(r['State']),
+        -total_kin_score(r, 'BULL'),
+        -_r_multiple(r)
+    ))
+    
+    bears.sort(key=lambda r: (
+        state_rank(r['State']),
+        -total_kin_score(r, 'BEAR'),
+        -_r_multiple(r)
+    ))
 
     bulls = bulls[:TOP_N_BUYERS]
     bears = bears[:TOP_N_SELLERS]
@@ -1523,7 +1516,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             day_pct_str = f"{row['DayChangePct']:>+6.2f}%"
             day_color = COLOR_GREEN_FG if row['DayChangePct'] > 0 else COLOR_RED_FG if row['DayChangePct'] < 0 else COLOR_DIM
             
-            # --- R-Multiple Calculation (frozen at exit price once stopped) ---
             r_mult = _r_multiple(row)
             r_mult_str = f"{r_mult:>+4.2f}R"
             r_color = COLOR_GREEN_FG if r_mult > 0 else COLOR_RED_FG if r_mult < 0 else COLOR_DIM
@@ -1608,7 +1600,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     total_calls = sum(l.total_calls for l in LIMITERS.values())
     print(f"\n⏱️ Tracker sync completed in {(time.time() - t_start):.2f} seconds ({total_calls} API calls).\n")
     return 0
-
+  
 def parse_args():
     p = argparse.ArgumentParser(description="Strict institutional volatility tracker (Upstox)")
     p.add_argument("--mode", choices=["STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"], default=TRADING_MODE)
