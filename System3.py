@@ -1465,18 +1465,25 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             return 1
         return 2
 
-    def total_kin_score(r, direction):
-        return sum(_row_aligned_count(r, m, direction) for m in (1, 2, 3, 5))
-
+    # Strict column-by-column priority: most aligned at 1X wins outright; a tie only
+    # then falls through to 2X, then 3X, then 5X, and only once ALL FOUR tie does the
+    # existing R-multiple tiebreak apply. (A summed score here would let a high 5X
+    # count compensate for a low 1X count, which is the bug this replaces.)
     bulls.sort(key=lambda r: (
         state_rank(r['State']),
-        -total_kin_score(r, 'BULL'),
+        -_row_aligned_count(r, 1, 'BULL'),
+        -_row_aligned_count(r, 2, 'BULL'),
+        -_row_aligned_count(r, 3, 'BULL'),
+        -_row_aligned_count(r, 5, 'BULL'),
         -_r_multiple(r)
     ))
-    
+
     bears.sort(key=lambda r: (
         state_rank(r['State']),
-        -total_kin_score(r, 'BEAR'),
+        -_row_aligned_count(r, 1, 'BEAR'),
+        -_row_aligned_count(r, 2, 'BEAR'),
+        -_row_aligned_count(r, 3, 'BEAR'),
+        -_row_aligned_count(r, 5, 'BEAR'),
         -_r_multiple(r)
     ))
 
