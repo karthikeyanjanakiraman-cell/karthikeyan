@@ -947,17 +947,35 @@ def compute_row(symbol, master_1m, target_dt):
 # ==============================================================================
 # 3. WORKERS, FORMATTERS & UI
 # ==============================================================================
-def format_kinetic_triad(rsi, macd, di, symbol):
+def _aligned_count(rsi, macd, di, symbol, direction):
+    """Count, out of RSI/MACD/DI for one multiplier block, how many point the same
+    way as `direction` ('BULL' or 'BEAR'). A PE's premium signals are flipped first
+    (premium Buy = underlying bearish), exactly like the old per-cell coloring did,
+    so the count means 'aligned with this row's displayed direction' either way."""
     is_pe = " PE " in symbol or symbol.endswith("PE")
-    def fmt(sig):
+    want = "Buy" if direction == "BULL" else "Sell"
+    cnt = 0
+    for sig in (rsi, macd, di):
         if is_pe:
-            if sig == "Buy": return f"{COLOR_RED_FG}Sel{COLOR_RESET}"
-            if sig == "Sell": return f"{COLOR_GREEN_FG}Buy{COLOR_RESET}"
+            disp = "Sell" if sig == "Buy" else "Buy" if sig == "Sell" else None
         else:
-            if sig == "Buy": return f"{COLOR_GREEN_FG}Buy{COLOR_RESET}"
-            if sig == "Sell": return f"{COLOR_RED_FG}Sel{COLOR_RESET}"
-        return f"{COLOR_DIM} - {COLOR_RESET}"
-    return f"{fmt(rsi)} {fmt(macd)} {fmt(di)}"
+            disp = sig if sig in ("Buy", "Sell") else None
+        if disp == want:
+            cnt += 1
+    return cnt
+
+def format_kinetic_count(rsi, macd, di, symbol, direction, width=11):
+    cnt = _aligned_count(rsi, macd, di, symbol, direction)
+    color = COLOR_DIM if cnt == 0 else (COLOR_GREEN_FG if direction == "BULL" else COLOR_RED_FG)
+    text = str(cnt)
+    pad = max(0, width - len(text))
+    left = pad // 2
+    return f"{' ' * left}{color}{text}{COLOR_RESET}{' ' * (pad - left)}"
+
+def _row_aligned_count(row, mult, direction):
+    gtag = f"{mult}X"
+    return _aligned_count(row.get(f'BB_RSI_{gtag}'), row.get(f'BB_MACD_{gtag}'), row.get(f'ADX_{gtag}'),
+                          row.get('Symbol', ''), direction)
 
 def _history_worker_daily(args):
     item, start, end, progress = args
@@ -1243,10 +1261,11 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
         r_color = COLOR_GREEN_FG if r_mult > 0 else COLOR_RED_FG if r_mult < 0 else COLOR_DIM
 
         sym = row['Symbol']
-        k1 = format_kinetic_triad(row.get('BB_RSI_1X'), row.get('BB_MACD_1X'), row.get('ADX_1X'), sym)
-        k2 = format_kinetic_triad(row.get('BB_RSI_2X'), row.get('BB_MACD_2X'), row.get('ADX_2X'), sym)
-        k3 = format_kinetic_triad(row.get('BB_RSI_3X'), row.get('BB_MACD_3X'), row.get('ADX_3X'), sym)
-        k5 = format_kinetic_triad(row.get('BB_RSI_5X'), row.get('BB_MACD_5X'), row.get('ADX_5X'), sym)
+        direction = row.get('AnchorDir') if row.get('AnchorDir') in ("BULL", "BEAR") else "BULL"
+        k1 = format_kinetic_count(row.get('BB_RSI_1X'), row.get('BB_MACD_1X'), row.get('ADX_1X'), sym, direction)
+        k2 = format_kinetic_count(row.get('BB_RSI_2X'), row.get('BB_MACD_2X'), row.get('ADX_2X'), sym, direction)
+        k3 = format_kinetic_count(row.get('BB_RSI_3X'), row.get('BB_MACD_3X'), row.get('ADX_3X'), sym, direction)
+        k5 = format_kinetic_count(row.get('BB_RSI_5X'), row.get('BB_MACD_5X'), row.get('ADX_5X'), sym, direction)
 
         state = row['State']
         shown_state = _state_display(row)
@@ -1451,8 +1470,17 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             return 1
         return 2
 
-    bulls.sort(key=lambda r: (state_rank(r['State']), -r.get('MovePct', 0.0)))
-    bears.sort(key=lambda r: (state_rank(r['State']), r.get('MovePct', 0.0)))
+    # Most-aligned-first: within the existing state grouping, rank by how many of
+    # RSI/MACD/DI are aligned at 1X, then break ties by 2X, then 3X, then 5X, and
+    # finally fall back to the existing MovePct ordering.
+    bulls.sort(key=lambda r: (state_rank(r['State']),
+                              -_row_aligned_count(r, 1, 'BULL'), -_row_aligned_count(r, 2, 'BULL'),
+                              -_row_aligned_count(r, 3, 'BULL'), -_row_aligned_count(r, 5, 'BULL'),
+                              -r.get('MovePct', 0.0)))
+    bears.sort(key=lambda r: (state_rank(r['State']),
+                              -_row_aligned_count(r, 1, 'BEAR'), -_row_aligned_count(r, 2, 'BEAR'),
+                              -_row_aligned_count(r, 3, 'BEAR'), -_row_aligned_count(r, 5, 'BEAR'),
+                              r.get('MovePct', 0.0)))
 
     bulls = bulls[:TOP_N_BUYERS]
     bears = bears[:TOP_N_SELLERS]
@@ -1501,10 +1529,11 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             r_color = COLOR_GREEN_FG if r_mult > 0 else COLOR_RED_FG if r_mult < 0 else COLOR_DIM
 
             sym = row['Symbol']
-            k1 = format_kinetic_triad(row.get('BB_RSI_1X'), row.get('BB_MACD_1X'), row.get('ADX_1X'), sym)
-            k2 = format_kinetic_triad(row.get('BB_RSI_2X'), row.get('BB_MACD_2X'), row.get('ADX_2X'), sym)
-            k3 = format_kinetic_triad(row.get('BB_RSI_3X'), row.get('BB_MACD_3X'), row.get('ADX_3X'), sym)
-            k5 = format_kinetic_triad(row.get('BB_RSI_5X'), row.get('BB_MACD_5X'), row.get('ADX_5X'), sym)
+            direction = row.get('AnchorDir') if row.get('AnchorDir') in ("BULL", "BEAR") else "BULL"
+            k1 = format_kinetic_count(row.get('BB_RSI_1X'), row.get('BB_MACD_1X'), row.get('ADX_1X'), sym, direction)
+            k2 = format_kinetic_count(row.get('BB_RSI_2X'), row.get('BB_MACD_2X'), row.get('ADX_2X'), sym, direction)
+            k3 = format_kinetic_count(row.get('BB_RSI_3X'), row.get('BB_MACD_3X'), row.get('ADX_3X'), sym, direction)
+            k5 = format_kinetic_count(row.get('BB_RSI_5X'), row.get('BB_MACD_5X'), row.get('ADX_5X'), sym, direction)
 
             state = row['State']
             shown_state = _state_display(row)
