@@ -949,13 +949,19 @@ def compute_row(symbol, master_1m, target_dt):
 # ==============================================================================
 def _aligned_count(rsi, macd, di, symbol, direction):
     """Count, out of RSI/MACD/DI for one multiplier block, how many point the same
-    way as `direction` ('BULL' or 'BEAR'). Buckets are now based on each contract's
-    OWN premium direction (see the removed CE/PE underlying-direction flip in
-    run_screener), and RSI/MACD/DI are computed on that same premium series, so no
-    per-cell inversion is needed here any more -- a raw "Buy" always means this
-    contract's own price is trending up, matching an 'AnchorDir' of 'BULL'."""
+    way as `direction` ('BULL' or 'BEAR'). A PE's premium signals are flipped first
+    (premium Buy = underlying bearish) so the count means 'aligned with this row's 
+    displayed market direction' either way."""
+    is_pe = " PE " in symbol or symbol.endswith("PE")
     want = "Buy" if direction == "BULL" else "Sell"
-    cnt = sum(1 for sig in (rsi, macd, di) if sig == want)
+    cnt = 0
+    for sig in (rsi, macd, di):
+        if is_pe:
+            disp = "Sell" if sig == "Buy" else "Buy" if sig == "Sell" else None
+        else:
+            disp = sig if sig in ("Buy", "Sell") else None
+        if disp == want:
+            cnt += 1
     return cnt
 
 def format_kinetic_count(rsi, macd, di, symbol, direction, width=11):
@@ -1418,24 +1424,29 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     for row in results:
         by_symbol.setdefault(row['Symbol'], []).append(row)
 
-    # Bull/Bear buckets reflect each contract's OWN premium direction -- a CE or PE
-    # only lands in TOP BULL when ITS OWN price is anchored up, and in TOP BEAR when
-    # ITS OWN price is anchored down. (A previous version re-labeled a PE whose
-    # premium was falling as "bullish" on the theory that it implies a rising
-    # underlying, and flipped it into TOP BULL -- but that showed contracts whose
-    # own price had collapsed all day sitting in the buy basket, which is backwards
-    # for anyone reading this as "what's worth buying right now." Removed.)
     bulls, bears, rejected = [], [], []
     for symbol, rows in by_symbol.items():
         b, r_, g = merge_symbol_rows(rows)
 
+        is_pe = " PE " in symbol or symbol.endswith("PE")
+
         if b:
             b['PremiumDir'] = "BULL"
-            bulls.append(b)
+            if is_pe:
+                b['AnchorDir'] = "BEAR"
+                if b['State'] == "[ACTIVE BUY]": b['State'] = "[ACTIVE SELL]"
+                bears.append(b)
+            else:
+                bulls.append(b)
 
         if r_:
             r_['PremiumDir'] = "BEAR"
-            bears.append(r_)
+            if is_pe:
+                r_['AnchorDir'] = "BULL"
+                if r_['State'] == "[ACTIVE SELL]": r_['State'] = "[ACTIVE BUY]"
+                bulls.append(r_)
+            else:
+                bears.append(r_)
 
         if g: rejected.append(g)
 
@@ -1454,25 +1465,18 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             return 1
         return 2
 
-    # Strict column-by-column priority: most aligned at 1X wins outright; a tie only
-    # then falls through to 2X, then 3X, then 5X, and only once ALL FOUR tie does the
-    # existing R-multiple tiebreak apply. (A summed score here would let a high 5X
-    # count compensate for a low 1X count, which is the bug this replaces.)
+    def total_kin_score(r, direction):
+        return sum(_row_aligned_count(r, m, direction) for m in (1, 2, 3, 5))
+
     bulls.sort(key=lambda r: (
         state_rank(r['State']),
-        -_row_aligned_count(r, 1, 'BULL'),
-        -_row_aligned_count(r, 2, 'BULL'),
-        -_row_aligned_count(r, 3, 'BULL'),
-        -_row_aligned_count(r, 5, 'BULL'),
+        -total_kin_score(r, 'BULL'),
         -_r_multiple(r)
     ))
-
+    
     bears.sort(key=lambda r: (
         state_rank(r['State']),
-        -_row_aligned_count(r, 1, 'BEAR'),
-        -_row_aligned_count(r, 2, 'BEAR'),
-        -_row_aligned_count(r, 3, 'BEAR'),
-        -_row_aligned_count(r, 5, 'BEAR'),
+        -total_kin_score(r, 'BEAR'),
         -_r_multiple(r)
     ))
 
@@ -1601,7 +1605,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     total_calls = sum(l.total_calls for l in LIMITERS.values())
     print(f"\n⏱️ Tracker sync completed in {(time.time() - t_start):.2f} seconds ({total_calls} API calls).\n")
     return 0
-
 
 def parse_args():
     p = argparse.ArgumentParser(description="Strict institutional volatility tracker (Upstox)")
