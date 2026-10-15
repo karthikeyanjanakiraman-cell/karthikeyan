@@ -1089,7 +1089,10 @@ def _r_multiple(row):
     if not (anchor_price and anchor_price > 0 and base_atr and base_atr > 0):
         return 0.0
     price = _exit_price(row)
-    direction = row.get('AnchorDir')
+    
+    # Check true premium direction first, fallback to AnchorDir if missing
+    direction = row.get('PremiumDir', row.get('AnchorDir'))
+    
     if direction == 'BULL':
         return (price - anchor_price) / base_atr
     if direction == 'BEAR':
@@ -1428,6 +1431,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         is_pe = " PE " in symbol or symbol.endswith("PE")
 
         if b:
+            b['PremiumDir'] = "BULL"
             if is_pe:
                 b['AnchorDir'] = "BEAR"
                 if b['State'] == "[ACTIVE BUY]": b['State'] = "[ACTIVE SELL]"
@@ -1436,6 +1440,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
                 bulls.append(b)
 
         if r_:
+            r_['PremiumDir'] = "BEAR"
             if is_pe:
                 r_['AnchorDir'] = "BULL"
                 if r_['State'] == "[ACTIVE SELL]": r_['State'] = "[ACTIVE BUY]"
@@ -1600,7 +1605,8 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     total_calls = sum(l.total_calls for l in LIMITERS.values())
     print(f"\n⏱️ Tracker sync completed in {(time.time() - t_start):.2f} seconds ({total_calls} API calls).\n")
     return 0
-  
+
+
 def parse_args():
     p = argparse.ArgumentParser(description="Strict institutional volatility tracker (Upstox)")
     p.add_argument("--mode", choices=["STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"], default=TRADING_MODE)
