@@ -36,12 +36,12 @@ warnings.filterwarnings("ignore")
 TRADING_MODE = "STOCK_FNO"
 
 # --- SHOCK & STRUCTURE TRIPWIRES ---
-KINETIC_SHOCK_ATR_MULT = 1.5    
+KINETIC_SHOCK_ATR_MULT = 1.0    
 IND_BB_PIERCE_STD = 1.0         
 
 # --- RISK & STOP LOSS FLOORS ---
-HARD_STOP_ATR_MULT = 1.2        
-SOFT_STOP_ATR_MULT = 1.0        
+HARD_STOP_ATR_MULT = 1.8        
+SOFT_STOP_ATR_MULT = 1.2        
 SOFT_STOP_OPPOSING_SCORE = 2    
 
 # --- INDEX OPTIONS ---
