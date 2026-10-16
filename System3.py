@@ -2,8 +2,7 @@
 """
 Strict Institutional Volatility Tracker (Upstox) - System 3.0 (3-Lock Edition)
 + Modes: STOCK_FNO, CASH_EQUITY, INDEX_OPTIONS
-+ Stateless Tracking: Pass `--track "SYMBOL"` to print its intraday checkpoint history.
-+ 3-Lock Master Trigger (Structure + Kinetics + Price Expansion)
++ Configurable Shocks, Stops, and ATR Multipliers via CLI/Globals
 + ADX Velocity & Dynamic ATR/BB Grids
 """
 import os
@@ -36,6 +35,15 @@ warnings.filterwarnings("ignore")
 # ==============================================================================
 TRADING_MODE = "STOCK_FNO"
 
+# --- SHOCK & STRUCTURE TRIPWIRES ---
+KINETIC_SHOCK_ATR_MULT = 1.5    # Velocity must exceed 1.5x its own ATR to trigger Lock 3
+IND_BB_PIERCE_STD = 1.0         # Indicator must pierce its 1.0 StdDev band to trigger Lock 2
+
+# --- RISK & STOP LOSS FLOORS ---
+HARD_STOP_ATR_MULT = 1.2        # Hard trailing stop (1.2x Base ATR from peak)
+SOFT_STOP_ATR_MULT = 1.0        # Soft trailing stop (1.0x Base ATR from peak)
+SOFT_STOP_OPPOSING_SCORE = 2    # How many opposing indicators needed to trigger the Soft Stop
+
 # --- INDEX OPTIONS ---
 EXPIRY_SELECTION = "CURRENT"
 STRIKES_ABOVE_ATM = 5
@@ -55,7 +63,6 @@ ATR_BASIS_PERIOD = 14
 ATR_BASIS_TF = "15min"
 ATR_MIN_BARS = 5
 MIN_ATR_PCT = 0.001
-HARD_STOP_ATR_MULT = 1.2
 
 TOP_N_BUYERS = 50
 TOP_N_SELLERS = 50
@@ -718,24 +725,31 @@ def get_kinetics(kin_1m, idx):
     vm = kin_1m['vel_mdi'][idx]; am = kin_1m['atr_mdi'][idx]
     va = kin_1m['vel_adx'][idx]; aa = kin_1m['atr_adx'][idx]
 
-    # --- LOCK 2: Indicator Structure Breakout (1 StdDev) ---
-    bull_struct = (h_std > 0 and hist > h_mean + 1.0 * h_std) and \
-                  (o_std > 0 and obv > o_mean + 1.0 * o_std) and \
-                  (p_std > 0 and p_di > p_mean + 1.0 * p_std) and \
-                  (a_std > 0 and adx > a_mean + 1.0 * a_std)
+    # --- LOCK 2: Indicator Structure Breakout ---
+    bull_struct = (h_std > 0 and hist > h_mean + IND_BB_PIERCE_STD * h_std) and \
+                  (o_std > 0 and obv > o_mean + IND_BB_PIERCE_STD * o_std) and \
+                  (p_std > 0 and p_di > p_mean + IND_BB_PIERCE_STD * p_std) and \
+                  (a_std > 0 and adx > a_mean + IND_BB_PIERCE_STD * a_std)
 
-    bear_struct = (h_std > 0 and hist < h_mean - 1.0 * h_std) and \
-                  (o_std > 0 and obv < o_mean - 1.0 * o_std) and \
-                  (m_std > 0 and m_di > m_mean + 1.0 * m_std) and \
-                  (a_std > 0 and adx > a_mean + 1.0 * a_std)
+    bear_struct = (h_std > 0 and hist < h_mean - IND_BB_PIERCE_STD * h_std) and \
+                  (o_std > 0 and obv < o_mean - IND_BB_PIERCE_STD * o_std) and \
+                  (m_std > 0 and m_di > m_mean + IND_BB_PIERCE_STD * m_std) and \
+                  (a_std > 0 and adx > a_mean + IND_BB_PIERCE_STD * a_std)
 
-    # --- LOCK 3: Institutional Kinetic Shock (Velocity > 1.5x ATR) ---
-    bull_shock = (vh > 1.5 * ah) and (vo > 1.5 * ao) and (vp > 1.5 * ap) and (va > 1.5 * aa)
-    bear_shock = (vh < -1.5 * ah) and (vo < -1.5 * ao) and (vm > 1.5 * am) and (va > 1.5 * aa)
+    # --- LOCK 3: Institutional Kinetic Shock ---
+    bull_shock = (vh > KINETIC_SHOCK_ATR_MULT * ah) and \
+                 (vo > KINETIC_SHOCK_ATR_MULT * ao) and \
+                 (vp > KINETIC_SHOCK_ATR_MULT * ap) and \
+                 (va > KINETIC_SHOCK_ATR_MULT * aa)
+                 
+    bear_shock = (vh < -KINETIC_SHOCK_ATR_MULT * ah) and \
+                 (vo < -KINETIC_SHOCK_ATR_MULT * ao) and \
+                 (vm > KINETIC_SHOCK_ATR_MULT * am) and \
+                 (va > KINETIC_SHOCK_ATR_MULT * aa)
 
     # Opposing raw power for Soft Stops
-    raw_bull_power = (p_std > 0 and p_di > p_mean + 1.0 * p_std) and (vh > 0)
-    raw_bear_power = (m_std > 0 and m_di > m_mean + 1.0 * m_std) and (vh < 0)
+    raw_bull_power = (p_std > 0 and p_di > p_mean + IND_BB_PIERCE_STD * p_std) and (vh > 0)
+    raw_bear_power = (m_std > 0 and m_di > m_mean + IND_BB_PIERCE_STD * m_std) and (vh < 0)
 
     bull_score = 2 if raw_bull_power else 0
     bear_score = 2 if raw_bear_power else 0
@@ -803,6 +817,9 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                       'killed_time': '-', 'killed_price': 0.0, 'reason': 'No data for today', 'kills': []}
 
     hard_mult = float(HARD_STOP_ATR_MULT or 0.0)
+    soft_mult = float(SOFT_STOP_ATR_MULT)
+    opp_thresh = int(SOFT_STOP_OPPOSING_SCORE)
+
     i = today_start
     curr_open = close[today_start]
     survived_anchor = None
@@ -855,16 +872,16 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
             if is_bull:
                 peak_price = max(peak_price, close[j]); true_peak = max(true_peak, close[j])
                 adverse, hard_adverse, opposing = peak_price - close[j], true_peak - close[j], bear_score
-                soft_reason = "Kinetic SL (1 ATR Pullback)"
+                soft_reason = f"Kinetic SL ({soft_mult:g} ATR Pullback)"
             else:
                 peak_price = min(peak_price, close[j]); true_peak = min(true_peak, close[j])
                 adverse, hard_adverse, opposing = close[j] - peak_price, close[j] - true_peak, bull_score
-                soft_reason = "Kinetic SL (1 ATR Rally)"
+                soft_reason = f"Kinetic SL ({soft_mult:g} ATR Rally)"
 
             reason = None
             if hard_mult > 0 and hard_adverse >= hard_mult * base_atr:
                 reason = f"Hard stop ({hard_mult:g} ATR trailing floor)"
-            elif adverse >= base_atr and opposing >= 2:
+            elif adverse >= soft_mult * base_atr and opposing >= opp_thresh:
                 reason = soft_reason
 
             if reason:
@@ -1124,7 +1141,7 @@ def _merge_signal(sig_rows, last_row, direction):
         row['State'] = "[STOPPED]"
         k = _find_kill(kills, direction, first['ActiveAnchor'])
         if k:
-            row['KilledTime'], row['KilledPrice'], row['RejectReason'] = k['killed_time'], float(k['killed_price']), k['reason']
+            row['KilledTime'], row['KilledPrice'], row['RejectReason'] = k['killed_time'], float(k['killed_price'], k['reason'])
         else:
             row['KilledTime'], row['KilledPrice'], row['RejectReason'] = '-', 0.0, "Anchor no longer valid at the latest checkpoint"
 
@@ -1623,37 +1640,44 @@ def parse_args():
     p.add_argument("--time", type=str, default=None,
                    help="Target time (HH:MM). With --date the default is 15:30; WITHOUT --date it means 'today at that time'.")
     p.add_argument("--history-days", type=int, default=MIN1_HISTORY_DAYS,
-                   help=f"Calendar days of 1-minute history for indicator math and the ATR (default: {MIN1_HISTORY_DAYS}; "
-                        f"the ATR needs at least {ATR_MIN_BARS} completed sessions).")
+                   help=f"Calendar days of 1-minute history for indicator math and the ATR (default: {MIN1_HISTORY_DAYS}).")
     p.add_argument("--opt-min-price", type=float, default=OPT_MIN_PRICE, help="INDEX_OPTIONS: minimum premium at the snapshot.")
     p.add_argument("--opt-min-volume", type=float, default=OPT_MIN_VOLUME, help="INDEX_OPTIONS: minimum traded volume by the snapshot.")
     p.add_argument("--expiry", choices=["CURRENT", "NEXT"], default=EXPIRY_SELECTION,
-                   help=f"INDEX_OPTIONS: which expiry to trade -- CURRENT (nearest expiry on/after the snapshot date) "
-                        f"or NEXT (the one after that). Default: {EXPIRY_SELECTION}.")
+                   help=f"INDEX_OPTIONS: which expiry to trade -- CURRENT or NEXT. Default: {EXPIRY_SELECTION}.")
     p.add_argument("--strikes-up", type=int, default=STRIKES_ABOVE_ATM,
-                   help=f"INDEX_OPTIONS: number of strikes ABOVE ATM to include, CE+PE each (default {STRIKES_ABOVE_ATM}).")
+                   help=f"INDEX_OPTIONS: number of strikes ABOVE ATM to include (default {STRIKES_ABOVE_ATM}).")
     p.add_argument("--strikes-down", type=int, default=STRIKES_BELOW_ATM,
-                   help=f"INDEX_OPTIONS: number of strikes BELOW ATM to include, CE+PE each (default {STRIKES_BELOW_ATM}).")
+                   help=f"INDEX_OPTIONS: number of strikes BELOW ATM to include (default {STRIKES_BELOW_ATM}).")
     p.add_argument("--checkpoint-min", type=int, default=CHECKPOINT_INTERVAL_MIN,
-                   help=f"Size in minutes of each intraday backtrace window, from session open up to the run "
-                        f"time (default {CHECKPOINT_INTERVAL_MIN}). E.g. a 10:30 run with 15 checks 9:30, "
-                        f"9:45, 10:00, 10:15, 10:30; a 10:35 run adds a final 10:30->10:35 partial checkpoint.")
+                   help=f"Size in minutes of each intraday backtrace window (default {CHECKPOINT_INTERVAL_MIN}).")
     p.add_argument("--single-snapshot", action="store_true",
                    help="Disable the backtrace -- evaluate only the current run time, like a single snapshot.")
+    
+    # --- NEW: TRIPWIRE & RISK ARGUMENTS ---
+    p.add_argument("--shock-mult", type=float, default=KINETIC_SHOCK_ATR_MULT,
+                   help=f"Kinetic Shock multiplier vs Velocity ATR (default {KINETIC_SHOCK_ATR_MULT:g}).")
+    p.add_argument("--ind-bb-std", type=float, default=IND_BB_PIERCE_STD,
+                   help=f"Indicator Breakout StdDev multiplier (default {IND_BB_PIERCE_STD:g}).")
     p.add_argument("--hard-stop-atr", type=float, default=HARD_STOP_ATR_MULT,
-                   help=f"Unconditional trailing floor, in ATRs below the true peak since the anchor (default {HARD_STOP_ATR_MULT:g}; 0 disables it).")
+                   help=f"Unconditional trailing floor in ATRs below peak (default {HARD_STOP_ATR_MULT:g}).")
+    p.add_argument("--soft-stop-atr", type=float, default=SOFT_STOP_ATR_MULT,
+                   help=f"Soft pullback floor in ATRs below peak (default {SOFT_STOP_ATR_MULT:g}).")
+    p.add_argument("--soft-stop-score", type=int, default=SOFT_STOP_OPPOSING_SCORE,
+                   help=f"Number of opposing indicators needed to trigger Soft Stop (default {SOFT_STOP_OPPOSING_SCORE}).")
+                   
     p.add_argument("--day-pct-basis", choices=["PREV_CLOSE", "OPEN"], default=DAY_PCT_BASIS,
-                   help=f"Day%% is measured from the previous close (broker-style) or from today's open. Default {DAY_PCT_BASIS}.")
+                   help=f"Day%% is measured from the previous close or open. Default {DAY_PCT_BASIS}.")
     p.add_argument("--graveyard-max", type=int, default=TOP_N_GRAVEYARD,
-                   help=f"Max graveyard rows printed (default {TOP_N_GRAVEYARD}; 0 = all). Tracking searches every row regardless.")
+                   help=f"Max graveyard rows printed (default {TOP_N_GRAVEYARD}; 0 = all).")
     p.add_argument("--track", type=str, default="", 
                    help="Specific symbol to track. Prints its 15-min intraday history and emails on state change.")
     args = p.parse_args()
-    if args.checkpoint_min < 1: p.error("--checkpoint-min must be >= 1 (0 or a negative value used to hang the run)")
+    
+    if args.checkpoint_min < 1: p.error("--checkpoint-min must be >= 1")
     if args.strikes_up < 0 or args.strikes_down < 0: p.error("--strikes-up / --strikes-down must be >= 0")
     if args.history_days < 1: p.error("--history-days must be >= 1")
-    if args.hard_stop_atr < 0: p.error("--hard-stop-atr must be >= 0")
-    if args.graveyard_max < 0: p.error("--graveyard-max must be >= 0")
+    if args.hard_stop_atr < 0 or args.soft_stop_atr < 0: p.error("Stop loss multipliers must be >= 0")
     return args
 
 if __name__ == "__main__":
@@ -1661,6 +1685,8 @@ if __name__ == "__main__":
         print(f"{COLOR_RED_FG}[!] Missing UPSTOX_ACCESS_TOKEN environment variable.{COLOR_RESET}")
         sys.exit(1)
     args = parse_args()
+    
+    # Override globals with CLI arguments
     MIN1_HISTORY_DAYS = args.history_days
     OPT_MIN_PRICE = args.opt_min_price
     OPT_MIN_VOLUME = args.opt_min_volume
@@ -1668,7 +1694,14 @@ if __name__ == "__main__":
     STRIKES_ABOVE_ATM = args.strikes_up
     STRIKES_BELOW_ATM = args.strikes_down
     CHECKPOINT_INTERVAL_MIN = args.checkpoint_min
+    
+    # Inject Risk / Shock variables
+    KINETIC_SHOCK_ATR_MULT = args.shock_mult
+    IND_BB_PIERCE_STD = args.ind_bb_std
     HARD_STOP_ATR_MULT = args.hard_stop_atr
+    SOFT_STOP_ATR_MULT = args.soft_stop_atr
+    SOFT_STOP_OPPOSING_SCORE = args.soft_stop_score
+    
     DAY_PCT_BASIS = args.day_pct_basis
     TOP_N_GRAVEYARD = args.graveyard_max
     if args.single_snapshot:
