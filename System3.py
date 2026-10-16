@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-Strict Institutional Volatility Tracker (Upstox) - ALL-MODE EDITION  (System3.py)
+Strict Institutional Volatility Tracker (Upstox) - System 3.0 (3-Lock Edition)
 + Modes: STOCK_FNO, CASH_EQUITY, INDEX_OPTIONS
-+ Stateless Tracking: Pass `--track "SYMBOL"` to print its intraday checkpoint history
-  and receive an email alert if its state changes between intervals.
-+ Directional ATR Tripwires + Trailing Stop-Loss Floor
++ Stateless Tracking: Pass `--track "SYMBOL"` to print its intraday checkpoint history.
++ 3-Lock Master Trigger (Structure + Kinetics + Price Expansion)
++ ADX Velocity & Dynamic ATR/BB Grids
 """
 import os
 import sys
@@ -64,7 +64,6 @@ MAX_SYMBOL_WIDTH = 30
 
 CHECKPOINT_INTERVAL_MIN = 5
 BACKTRACE_CHECKPOINTS = True
-REQUIRE_BB_KC_PIERCE = False
 DAY_PCT_BASIS = "PREV_CLOSE"
 
 COLOR_RESET = '\033[0m'
@@ -675,78 +674,127 @@ def _evaluate_kinetic_arrays(close, high, low, vol):
 
     direction = np.where(delta > 0, 1, np.where(delta < 0, -1, 0))
     obv = np.cumsum(direction * vol)
+    
+    o_mean = pd.Series(obv).rolling(BB_PERIOD, min_periods=1).mean().values
+    o_std = pd.Series(obv).rolling(BB_PERIOD, min_periods=1).std(ddof=0).values
 
     vel_hist = np.diff(hist, prepend=hist[0])
     vel_obv = np.diff(obv, prepend=obv[0])
     vel_pdi = np.diff(plus_di, prepend=plus_di[0])
     vel_mdi = np.diff(minus_di, prepend=minus_di[0])
+    vel_adx = np.diff(adx, prepend=adx[0])
 
     atr_hist = _ewm(np.abs(vel_hist), 1 / 14)
     atr_obv = _ewm(np.abs(vel_obv), 1 / 14)
     atr_pdi = _ewm(np.abs(vel_pdi), 1 / 14)
     atr_mdi = _ewm(np.abs(vel_mdi), 1 / 14)
+    atr_adx = _ewm(np.abs(vel_adx), 1 / 14)
 
     return {
         'rsi': rsi, 'r_mean': rsi_mean, 'r_std': rsi_std,
         'hist': hist, 'h_mean': h_mean, 'h_std': h_std,
+        'obv': obv, 'o_mean': o_mean, 'o_std': o_std,
         'plus_di': plus_di, 'p_mean': p_mean, 'p_std': p_std,
         'minus_di': minus_di, 'm_mean': m_mean, 'm_std': m_std,
         'adx': adx, 'a_mean': a_mean, 'a_std': a_std,
         'vel_hist': vel_hist, 'atr_hist': atr_hist,
         'vel_obv': vel_obv, 'atr_obv': atr_obv,
         'vel_pdi': vel_pdi, 'atr_pdi': atr_pdi,
-        'vel_mdi': vel_mdi, 'atr_mdi': atr_mdi
+        'vel_mdi': vel_mdi, 'atr_mdi': atr_mdi,
+        'vel_adx': vel_adx, 'atr_adx': atr_adx
     }
 
 def get_kinetics(kin_1m, idx):
-    rsi = kin_1m['rsi'][idx]; r_mean = kin_1m['r_mean'][idx]; r_std = kin_1m['r_std'][idx]
+    """Returns the Booleans needed for the 3-Lock Trigger, and soft-stop powers."""
     hist = kin_1m['hist'][idx]; h_mean = kin_1m['h_mean'][idx]; h_std = kin_1m['h_std'][idx]
+    obv = kin_1m['obv'][idx]; o_mean = kin_1m['o_mean'][idx]; o_std = kin_1m['o_std'][idx]
     p_di = kin_1m['plus_di'][idx]; p_mean = kin_1m['p_mean'][idx]; p_std = kin_1m['p_std'][idx]
     m_di = kin_1m['minus_di'][idx]; m_mean = kin_1m['m_mean'][idx]; m_std = kin_1m['m_std'][idx]
     adx = kin_1m['adx'][idx]; a_mean = kin_1m['a_mean'][idx]; a_std = kin_1m['a_std'][idx]
-
-    bull_rsi = r_std > 0 and rsi > r_mean + BB_STD * r_std
-    bear_rsi = r_std > 0 and rsi < r_mean - BB_STD * r_std
-    bull_macd = h_std > 0 and hist > h_mean + BB_STD * h_std
-    bear_macd = h_std > 0 and hist < h_mean - BB_STD * h_std
-
-    adx_breakout = a_std > 0 and adx > a_mean + BB_STD * a_std
-    bull_di = p_std > 0 and p_di > p_mean + BB_STD * p_std and p_di > m_di and adx_breakout
-    bear_di = m_std > 0 and m_di > m_mean + BB_STD * m_std and m_di > p_di and adx_breakout
-
-    raw_bull_power = p_std > 0 and p_di > p_mean + BB_STD * p_std
-    raw_bear_power = m_std > 0 and m_di > m_mean + BB_STD * m_std
-
-    bull_score = (1 if bull_rsi else 0) + (1 if bull_macd else 0) + (1 if bull_di else 0)
-    bear_score = (1 if bear_rsi else 0) + (1 if bear_macd else 0) + (1 if bear_di else 0)
 
     vh = kin_1m['vel_hist'][idx]; ah = kin_1m['atr_hist'][idx]
     vo = kin_1m['vel_obv'][idx]; ao = kin_1m['atr_obv'][idx]
     vp = kin_1m['vel_pdi'][idx]; ap = kin_1m['atr_pdi'][idx]
     vm = kin_1m['vel_mdi'][idx]; am = kin_1m['atr_mdi'][idx]
+    va = kin_1m['vel_adx'][idx]; aa = kin_1m['atr_adx'][idx]
 
-    M_HIST, M_OBV, M_DI = 1.5, 1.5, 1.5
+    # --- LOCK 2: Indicator Structure Breakout (1 StdDev) ---
+    bull_struct = (h_std > 0 and hist > h_mean + 1.0 * h_std) and \
+                  (o_std > 0 and obv > o_mean + 1.0 * o_std) and \
+                  (p_std > 0 and p_di > p_mean + 1.0 * p_std) and \
+                  (a_std > 0 and adx > a_mean + 1.0 * a_std)
 
-    bull_shock = (vh > M_HIST * ah) and (vo > M_OBV * ao) and (vp > M_DI * ap)
-    bear_shock = (vh < -M_HIST * ah) and (vo < -M_OBV * ao) and (vm > M_DI * am)
+    bear_struct = (h_std > 0 and hist < h_mean - 1.0 * h_std) and \
+                  (o_std > 0 and obv < o_mean - 1.0 * o_std) and \
+                  (m_std > 0 and m_di > m_mean + 1.0 * m_std) and \
+                  (a_std > 0 and adx > a_mean + 1.0 * a_std)
 
-    return bull_score, bear_score, raw_bull_power, raw_bear_power, bull_rsi, bear_rsi, bull_macd, bear_macd, bull_di, bear_di, bull_shock, bear_shock
+    # --- LOCK 3: Institutional Kinetic Shock (Velocity > 1.5x ATR) ---
+    bull_shock = (vh > 1.5 * ah) and (vo > 1.5 * ao) and (vp > 1.5 * ap) and (va > 1.5 * aa)
+    bear_shock = (vh < -1.5 * ah) and (vo < -1.5 * ao) and (vm > 1.5 * am) and (va > 1.5 * aa)
 
-def get_tripwire_state(close, kin_1m, base_atr, mult, today_start, end=None):
-    n = len(close) if end is None else min(int(end), len(close))
-    curr_open = close[today_start]
-    last_rsi, last_macd, last_adx = "Neutral", "Neutral", "Neutral"
-    blocks = 0
-    target = base_atr * mult
-    for i in range(today_start, n):
-        if close[i] - curr_open >= target or curr_open - close[i] >= target:
-            _, _, _, _, b_rsi, br_rsi, b_macd, br_macd, b_di, br_di, _, _ = get_kinetics(kin_1m, i)
-            last_rsi = "Buy" if b_rsi else "Sell" if br_rsi else "Neutral"
-            last_macd = "Buy" if b_macd else "Sell" if br_macd else "Neutral"
-            last_adx = "Buy" if b_di else "Sell" if br_di else "Neutral"
-            blocks += 1
-            curr_open = close[i]
-    return last_rsi, last_macd, last_adx, blocks
+    # Opposing raw power for Soft Stops
+    raw_bull_power = (p_std > 0 and p_di > p_mean + 1.0 * p_std) and (vh > 0)
+    raw_bear_power = (m_std > 0 and m_di > m_mean + 1.0 * m_std) and (vh < 0)
+
+    bull_score = 2 if raw_bull_power else 0
+    bear_score = 2 if raw_bear_power else 0
+
+    return bull_score, bear_score, raw_bull_power, raw_bear_power, bull_struct, bear_struct, bull_shock, bear_shock
+
+def calculate_grids(kin_1m, idx, direction):
+    """Calculates the real-time ATR and BB grids for the active evaluation minute."""
+    hist = kin_1m['hist'][idx]; h_mean = kin_1m['h_mean'][idx]; h_std = kin_1m['h_std'][idx]
+    obv = kin_1m['obv'][idx]; o_mean = kin_1m['o_mean'][idx]; o_std = kin_1m['o_std'][idx]
+    p_di = kin_1m['plus_di'][idx]; p_mean = kin_1m['p_mean'][idx]; p_std = kin_1m['p_std'][idx]
+    m_di = kin_1m['minus_di'][idx]; m_mean = kin_1m['m_mean'][idx]; m_std = kin_1m['m_std'][idx]
+    adx = kin_1m['adx'][idx]; a_mean = kin_1m['a_mean'][idx]; a_std = kin_1m['a_std'][idx]
+
+    vh = kin_1m['vel_hist'][idx]; ah = kin_1m['atr_hist'][idx]
+    vo = kin_1m['vel_obv'][idx]; ao = kin_1m['atr_obv'][idx]
+    vp = kin_1m['vel_pdi'][idx]; ap = kin_1m['atr_pdi'][idx]
+    vm = kin_1m['vel_mdi'][idx]; am = kin_1m['atr_mdi'][idx]
+    va = kin_1m['vel_adx'][idx]; aa = kin_1m['atr_adx'][idx]
+
+    atr_grid = {1: 0, 2: 0, 3: 0, 5: 0}
+    bb_grid = {1: 0, 2: 0, 3: 0, 5: 0}
+
+    def check_bb(val, mean, std, mult, is_bull_ind):
+        if std <= 0: return False
+        if is_bull_ind:
+            return val > mean + (std * mult)
+        else:
+            return val < mean - (std * mult)
+
+    for mult in [1, 2, 3, 5]:
+        a_count = 0
+        b_count = 0
+
+        if direction == "BULL":
+            if vh > mult * ah: a_count += 1
+            if vo > mult * ao: a_count += 1
+            if vp > mult * ap: a_count += 1
+            if va > mult * aa: a_count += 1
+
+            if check_bb(hist, h_mean, h_std, mult, True): b_count += 1
+            if check_bb(obv, o_mean, o_std, mult, True): b_count += 1
+            if check_bb(p_di, p_mean, p_std, mult, True): b_count += 1
+            if check_bb(adx, a_mean, a_std, mult, True): b_count += 1
+        else: # BEAR
+            if vh < -mult * ah: a_count += 1
+            if vo < -mult * ao: a_count += 1
+            if vm > mult * am: a_count += 1
+            if va > mult * aa: a_count += 1
+
+            if check_bb(hist, h_mean, h_std, mult, False): b_count += 1
+            if check_bb(obv, o_mean, o_std, mult, False): b_count += 1
+            if check_bb(m_di, m_mean, m_std, mult, True): b_count += 1
+            if check_bb(adx, a_mean, a_std, mult, True): b_count += 1
+
+        atr_grid[mult] = a_count
+        bb_grid[mult] = b_count
+
+    return atr_grid, bb_grid
 
 def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, today_start, end=None):
     n = len(close) if end is None else min(int(end), len(close))
@@ -768,31 +816,28 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
 
         while i < n:
             (bull_score, bear_score, r_bull, r_bear,
-             _, _, _, _, _, _, bull_shock, bear_shock) = get_kinetics(kin_1m, i)
+             bull_struct, bear_struct, bull_shock, bear_shock) = get_kinetics(kin_1m, i)
 
-            if REQUIRE_BB_KC_PIERCE:
-                bb_kc_bull_fire = bb_upper[i] > kc_upper[i]
-                bb_kc_bear_fire = bb_lower[i] < kc_lower[i]
-            else:
-                bb_kc_bull_fire = bb_kc_bear_fire = True
+            # --- LOCK 1: Price Volatility Expansion ---
+            bb_kc_bull_fire = bb_upper[i] > kc_upper[i]
+            bb_kc_bear_fire = bb_lower[i] < kc_lower[i]
 
-            if bull_shock:
-                if bb_kc_bull_fire:
-                    if r_bear:
-                        warzone_kills += 1
-                        curr_open = close[i]
-                    else:
-                        anchor = {"dir": "BULL", "idx": i, "time": dt_1m[i], "price": close[i]}
-                        break
+            # 3-LOCK MASTER TRIGGER EVALUATION
+            if bull_struct and bull_shock and bb_kc_bull_fire:
+                if r_bear:
+                    warzone_kills += 1
+                    curr_open = close[i]
+                else:
+                    anchor = {"dir": "BULL", "idx": i, "time": dt_1m[i], "price": close[i]}
+                    break
 
-            elif bear_shock:
-                if bb_kc_bear_fire:
-                    if r_bull:
-                        warzone_kills += 1
-                        curr_open = close[i]
-                    else:
-                        anchor = {"dir": "BEAR", "idx": i, "time": dt_1m[i], "price": close[i]}
-                        break
+            elif bear_struct and bear_shock and bb_kc_bear_fire:
+                if r_bull:
+                    warzone_kills += 1
+                    curr_open = close[i]
+                else:
+                    anchor = {"dir": "BEAR", "idx": i, "time": dt_1m[i], "price": close[i]}
+                    break
             i += 1
 
         if not anchor:
@@ -805,7 +850,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
         j = anchor['idx'] + 1
 
         while j < n:
-            (bull_score, bear_score, _, _, _, _, _, _, _, _, _, _) = get_kinetics(kin_1m, j)
+            (bull_score, bear_score, _, _, _, _, _, _) = get_kinetics(kin_1m, j)
             
             if is_bull:
                 peak_price = max(peak_price, close[j]); true_peak = max(true_peak, close[j])
@@ -905,30 +950,30 @@ def row_at(S, end, symbol):
         'ActiveAnchor': None, 'AnchorPrice': 0.0, 'AnchorDir': "NONE", 'MovePct': 0.0,
         'State': "NONE", 'Blocks': 0, 'KilledTime': '-', 'KilledPrice': 0.0, 'RejectReason': "",
         'Kills': [], 'AtrBars': S['atr_bars'], 'BaseAtr': base_atr,
+        'ATR_Grid': {1: 0, 2: 0, 3: 0, 5: 0}, 'BB_Grid': {1: 0, 2: 0, 3: 0, 5: 0}
     }
 
     anchor, info = evaluate_anchor_tripwire(close, S['dt'], kin, base_atr, S['bb_upper'], S['bb_lower'],
                                             S['kc_upper'], S['kc_lower'], ts, end)
     row['Kills'] = info.get('kills', [])
 
-    for mult in HA_ATR_MULTIPLIERS:
-        rsi_st, macd_st, adx_st, blk_count = get_tripwire_state(close, kin, base_atr, mult, ts, end)
-        gtag = f"{mult}X"
-        row[f'BB_RSI_{gtag}'] = rsi_st
-        row[f'BB_MACD_{gtag}'] = macd_st
-        row[f'ADX_{gtag}'] = adx_st
-        if mult == 1:
-            row['Blocks'] = blk_count
+    eval_dir = anchor['dir'] if anchor else info.get('dir')
+    if not eval_dir or eval_dir == "NONE": eval_dir = "BULL" # Default for empty grids
+    
+    ag, bg = calculate_grids(kin, last, eval_dir)
+    row['ATR_Grid'] = ag
+    row['BB_Grid'] = bg
+
+    bb_expanding = (S['bb_upper'][last] > S['kc_upper'][last]) or (S['bb_lower'][last] < S['kc_lower'][last])
+    pure_state = "[ BB > KC ]" if bb_expanding else "[ BB < KC ]"
 
     if anchor:
         row['ActiveAnchor'] = pd.to_datetime(anchor['time']).strftime("%H:%M")
         row['AnchorPrice'] = float(anchor['price'])
         row['AnchorDir'] = anchor['dir']
         row['MovePct'] = ((ltp - anchor['price']) / anchor['price']) * 100 if anchor['price'] else 0.0
-        if anchor['dir'] == "BULL":
-            row['State'] = "[ACTIVE BUY]" if S['bb_upper'][last] > S['kc_upper'][last] else "[COILING]"
-        else:
-            row['State'] = "[ACTIVE SELL]" if S['bb_lower'][last] < S['kc_lower'][last] else "[COILING]"
+        row['State'] = pure_state
+        row['Blocks'] = last - anchor['idx']
     else:
         row['AnchorDir'] = info.get('dir', 'NONE')
         row['ActiveAnchor'] = info.get('anchor_time', '-')
@@ -938,6 +983,8 @@ def row_at(S, end, symbol):
         row['RejectReason'] = info.get('reason', 'Failed Kinetic Alignment')
         if row['AnchorPrice'] > 0 and row['KilledPrice'] > 0:
             row['MovePct'] = ((row['KilledPrice'] - row['AnchorPrice']) / row['AnchorPrice']) * 100
+        # The merge logic handles assigning the [STOPPED] state string across checkpoints.
+        row['State'] = pure_state 
     return row
 
 def compute_row(symbol, master_1m, target_dt):
@@ -947,27 +994,6 @@ def compute_row(symbol, master_1m, target_dt):
 # ==============================================================================
 # 3. WORKERS, FORMATTERS & UI
 # ==============================================================================
-def _aligned_count(rsi, macd, di, symbol, direction):
-    """Count, out of RSI/MACD/DI for one multiplier block, how many point the same
-    way as `direction` ('BULL' or 'BEAR'). Buckets are now based on each contract's
-    OWN premium direction."""
-    want = "Buy" if direction == "BULL" else "Sell"
-    cnt = sum(1 for sig in (rsi, macd, di) if sig == want)
-    return cnt
-
-def format_kinetic_count(rsi, macd, di, symbol, direction, width=5):
-    cnt = _aligned_count(rsi, macd, di, symbol, direction)
-    color = COLOR_DIM if cnt == 0 else (COLOR_GREEN_FG if direction == "BULL" else COLOR_RED_FG)
-    text = str(cnt)
-    pad = max(0, width - len(text))
-    left = pad // 2
-    return f"{' ' * left}{color}{text}{COLOR_RESET}{' ' * (pad - left)}"
-
-def _row_aligned_count(row, mult, direction):
-    gtag = f"{mult}X"
-    return _aligned_count(row.get(f'BB_RSI_{gtag}'), row.get(f'BB_MACD_{gtag}'), row.get(f'ADX_{gtag}'),
-                          row.get('Symbol', ''), direction)
-
 def _history_worker_daily(args):
     item, start, end, progress = args
     try:
@@ -1050,9 +1076,8 @@ def _print_error_summary():
 # ------------------------------------------------------------------------------
 # MERGE LOGIC
 # ------------------------------------------------------------------------------
-ACTIVE_BULL_STATES = ("[ACTIVE BUY]", "[COILING]")
-ACTIVE_BEAR_STATES = ("[ACTIVE SELL]", "[COILING]")
-LIVE_STATES = ("[ACTIVE BUY]", "[ACTIVE SELL]", "[COILING]")
+ACTIVE_BULL_STATES = ("[ BB > KC ]", "[ BB < KC ]")
+ACTIVE_BEAR_STATES = ("[ BB > KC ]", "[ BB < KC ]")
 
 def _signal_id(row):
     return (row['AnchorDir'], row['ActiveAnchor'], round(float(row['AnchorPrice']), 6))
@@ -1128,13 +1153,16 @@ def _state_display(row):
     st = row['State']
     if st == "[STOPPED]":
         k = row.get('KilledTime')
-        return f"[STOPPED {k}]" if k and k != '-' else st
+        return f"[STOP {k}]" if k and k != '-' else st
     return st
 
 def _fav_color(pct, direction):
     sign = 1 if direction == "BULL" else -1 if direction == "BEAR" else 0
     fav = pct * sign
     return COLOR_GREEN_FG if fav > 0 else COLOR_RED_FG if fav < 0 else COLOR_DIM
+
+def _format_val(v, dir_color):
+    return f"{dir_color}{v}{COLOR_RESET}" if v > 0 else f"{COLOR_DIM}{v}{COLOR_RESET}"
 
 # ------------------------------------------------------------------------------
 # TRACKING EMAIL & INTRADAY HISTORY
@@ -1227,8 +1255,9 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
     header_str = (
         f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP':>8} | "
         f"{'Eval':^5} {'Anchor':^6} {'Anch Val':>9} {'R-Mult':>7} | "
-        f"{'1X':^5}  {'2X':^5}  {'3X':^5}  {'5X':^5} | "
-        f"{'State':^16}{COLOR_RESET}"
+        f"ATR: 1X 2X 3X 5X | "
+        f"BB: 1X 2X 3X 5X | "
+        f"{'State':^13}{COLOR_RESET}"
     )
     print(header_str)
     print("-" * len(ANSI_RE.sub("", header_str)))
@@ -1239,17 +1268,23 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
         r_color = COLOR_GREEN_FG if r_mult > 0 else COLOR_RED_FG if r_mult < 0 else COLOR_DIM
 
         sym = row['Symbol']
-        direction = row.get('AnchorDir') if row.get('AnchorDir') in ("BULL", "BEAR") else "BULL"
-        k1 = format_kinetic_count(row.get('BB_RSI_1X'), row.get('BB_MACD_1X'), row.get('ADX_1X'), sym, direction, width=5)
-        k2 = format_kinetic_count(row.get('BB_RSI_2X'), row.get('BB_MACD_2X'), row.get('ADX_2X'), sym, direction, width=5)
-        k3 = format_kinetic_count(row.get('BB_RSI_3X'), row.get('BB_MACD_3X'), row.get('ADX_3X'), sym, direction, width=5)
-        k5 = format_kinetic_count(row.get('BB_RSI_5X'), row.get('BB_MACD_5X'), row.get('ADX_5X'), sym, direction, width=5)
+        direction = row.get('AnchorDir', 'BULL')
+        dir_c = COLOR_GREEN_FG if direction == "BULL" else COLOR_RED_FG
+
+        ag, bg = row.get('ATR_Grid', {1:0, 2:0, 3:0, 5:0}), row.get('BB_Grid', {1:0, 2:0, 3:0, 5:0})
+        a1, a2, a3, a5 = [_format_val(ag[k], dir_c) for k in [1, 2, 3, 5]]
+        b1, b2, b3, b5 = [_format_val(bg[k], dir_c) for k in [1, 2, 3, 5]]
 
         state = row['State']
         shown_state = _state_display(row)
-        if "BUY]" in state: state_text = f"{COLOR_GREEN_FG}{shown_state:^16}{COLOR_RESET}"
-        elif "SELL]" in state: state_text = f"{COLOR_RED_FG}{shown_state:^16}{COLOR_RESET}"
-        else: state_text = f"{COLOR_YELLOW}{shown_state:^16}{COLOR_RESET}"
+        if "[ BB > KC ]" in state:
+            dir_tag = "▲" if direction == "BULL" else "▼" if direction == "BEAR" else ""
+            shown_state = f"[ BB > KC ] {dir_tag}".strip()
+            state_text = f"{COLOR_GREEN_FG if dir_tag=='▲' else COLOR_RED_FG}{shown_state:^13}{COLOR_RESET}"
+        elif "[ BB < KC ]" in state:
+            state_text = f"{COLOR_YELLOW}{shown_state:^13}{COLOR_RESET}"
+        else:
+            state_text = f"{COLOR_DIM}{shown_state:^13}{COLOR_RESET}"
 
         eval_time_str = row['_EvalTime'].strftime('%H:%M')
         a_time = row.get('ActiveAnchor', '-')
@@ -1260,8 +1295,9 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
             f"{eval_time_str:^5} "
             f"{a_time:^6} "
             f"{row['AnchorPrice']:>9.2f} "
-            f"{r_color}{r_mult_str:>7}{COLOR_RESET} | "
-            f"{k1}  {k2}  {k3}  {k5} | "
+            f"{r_color}{r_mult_str:>7}{COLOR_RESET} |   "
+            f"{a1}  {a2}  {a3}  {a5}  |   "
+            f"{b1}  {b2}  {b3}  {b5}  | "
             f"{state_text}"
         )
         
@@ -1406,7 +1442,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             b['PremiumDir'] = "BULL"
             if is_pe:
                 b['AnchorDir'] = "BEAR"
-                if b['State'] == "[ACTIVE BUY]": b['State'] = "[ACTIVE SELL]"
                 bears.append(b)
             else:
                 bulls.append(b)
@@ -1415,7 +1450,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             r_['PremiumDir'] = "BEAR"
             if is_pe:
                 r_['AnchorDir'] = "BULL"
-                if r_['State'] == "[ACTIVE SELL]": r_['State'] = "[ACTIVE BUY]"
                 bulls.append(r_)
             else:
                 bears.append(r_)
@@ -1431,35 +1465,27 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     bear_live = sum(1 for r in bears if r['State'] != "[STOPPED]")
 
     def state_rank(st):
-        if "[ACTIVE BUY]" in st or "[ACTIVE SELL]" in st:
+        if "[ BB > KC ]" in st:
             return 0
-        if "[COILING]" in st:
+        if "[ BB < KC ]" in st:
             return 1
         return 2
 
-    # New 7-Tier Sorting Logic:
-    # 1. State (Active first)
-    # 2. Checkpoint Eval Time (Descending - newest signals at top)
-    # 3. R-Multiple (Descending - highest profit)
-    # 4-7. Kinetic Tripwire Scores (1X, 2X, 3X, 5X - Descending)
+    # Sort based on ATR Grid count 1X descending
     bulls.sort(key=lambda r: (
         state_rank(r['State']),
         -int(r['CheckpointTime'].timestamp()),
         -_r_multiple(r),
-        -_row_aligned_count(r, 1, 'BULL'),
-        -_row_aligned_count(r, 2, 'BULL'),
-        -_row_aligned_count(r, 3, 'BULL'),
-        -_row_aligned_count(r, 5, 'BULL')
+        -r.get('ATR_Grid', {}).get(1, 0),
+        -r.get('BB_Grid', {}).get(1, 0)
     ))
 
     bears.sort(key=lambda r: (
         state_rank(r['State']),
         -int(r['CheckpointTime'].timestamp()),
         -_r_multiple(r),
-        -_row_aligned_count(r, 1, 'BEAR'),
-        -_row_aligned_count(r, 2, 'BEAR'),
-        -_row_aligned_count(r, 3, 'BEAR'),
-        -_row_aligned_count(r, 5, 'BEAR')
+        -r.get('ATR_Grid', {}).get(1, 0),
+        -r.get('BB_Grid', {}).get(1, 0)
     ))
 
     bulls = bulls[:TOP_N_BUYERS]
@@ -1493,8 +1519,9 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         header_str = (
             f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP':>8} | "
             f"{'Seen':^5} {'Anchor':^6} {'Anch Val':>9} {'R-Mult':>7} | "
-            f"{'1X':^5}  {'2X':^5}  {'3X':^5}  {'5X':^5} | "
-            f"{'State':^16}{COLOR_RESET}"
+            f"ATR: 1X 2X 3X 5X | "
+            f"BB: 1X 2X 3X 5X | "
+            f"{'State':^13}{COLOR_RESET}"
         )
         print(header_str)
         print("-" * len(ANSI_RE.sub("", header_str)))
@@ -1505,17 +1532,23 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             r_color = COLOR_GREEN_FG if r_mult > 0 else COLOR_RED_FG if r_mult < 0 else COLOR_DIM
 
             sym = row['Symbol']
-            direction = row.get('AnchorDir') if row.get('AnchorDir') in ("BULL", "BEAR") else "BULL"
-            k1 = format_kinetic_count(row.get('BB_RSI_1X'), row.get('BB_MACD_1X'), row.get('ADX_1X'), sym, direction, width=5)
-            k2 = format_kinetic_count(row.get('BB_RSI_2X'), row.get('BB_MACD_2X'), row.get('ADX_2X'), sym, direction, width=5)
-            k3 = format_kinetic_count(row.get('BB_RSI_3X'), row.get('BB_MACD_3X'), row.get('ADX_3X'), sym, direction, width=5)
-            k5 = format_kinetic_count(row.get('BB_RSI_5X'), row.get('BB_MACD_5X'), row.get('ADX_5X'), sym, direction, width=5)
+            direction = row.get('AnchorDir', 'BULL')
+            dir_c = COLOR_GREEN_FG if direction == "BULL" else COLOR_RED_FG
+
+            ag, bg = row.get('ATR_Grid', {1:0, 2:0, 3:0, 5:0}), row.get('BB_Grid', {1:0, 2:0, 3:0, 5:0})
+            a1, a2, a3, a5 = [_format_val(ag[k], dir_c) for k in [1, 2, 3, 5]]
+            b1, b2, b3, b5 = [_format_val(bg[k], dir_c) for k in [1, 2, 3, 5]]
 
             state = row['State']
             shown_state = _state_display(row)
-            if "BUY]" in state: state_text = f"{COLOR_GREEN_FG}{shown_state:^16}{COLOR_RESET}"
-            elif "SELL]" in state: state_text = f"{COLOR_RED_FG}{shown_state:^16}{COLOR_RESET}"
-            else: state_text = f"{COLOR_YELLOW}{shown_state:^16}{COLOR_RESET}"
+            if "[ BB > KC ]" in state:
+                dir_tag = "▲" if direction == "BULL" else "▼" if direction == "BEAR" else ""
+                shown_state = f"[ BB > KC ] {dir_tag}".strip()
+                state_text = f"{COLOR_GREEN_FG if dir_tag=='▲' else COLOR_RED_FG}{shown_state:^13}{COLOR_RESET}"
+            elif "[ BB < KC ]" in state:
+                state_text = f"{COLOR_YELLOW}{shown_state:^13}{COLOR_RESET}"
+            else:
+                state_text = f"{COLOR_DIM}{shown_state:^13}{COLOR_RESET}"
 
             print(
                 f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} "
@@ -1523,8 +1556,9 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
                 f"{row['CheckpointTime'].strftime('%H:%M'):^5} "
                 f"{row['ActiveAnchor']:^6} "
                 f"{row['AnchorPrice']:>9.2f} "
-                f"{r_color}{r_mult_str:>7}{COLOR_RESET} | "
-                f"{k1}  {k2}  {k3}  {k5} | "
+                f"{r_color}{r_mult_str:>7}{COLOR_RESET} |   "
+                f"{a1}  {a2}  {a3}  {a5}  |   "
+                f"{b1}  {b2}  {b3}  {b5}  | "
                 f"{state_text}"
             )
     
@@ -1591,11 +1625,6 @@ def parse_args():
     p.add_argument("--history-days", type=int, default=MIN1_HISTORY_DAYS,
                    help=f"Calendar days of 1-minute history for indicator math and the ATR (default: {MIN1_HISTORY_DAYS}; "
                         f"the ATR needs at least {ATR_MIN_BARS} completed sessions).")
-    gate = p.add_mutually_exclusive_group()
-    gate.add_argument("--disable-bb-kc-gate", action="store_true",
-                      help="Drop the 'Bollinger Band already pierced Keltner Channel' requirement (already off by default).")
-    gate.add_argument("--require-bb-kc-pierce", action="store_true",
-                      help="Turn the 'Bollinger Band already pierced Keltner Channel' anchor requirement ON.")
     p.add_argument("--opt-min-price", type=float, default=OPT_MIN_PRICE, help="INDEX_OPTIONS: minimum premium at the snapshot.")
     p.add_argument("--opt-min-volume", type=float, default=OPT_MIN_VOLUME, help="INDEX_OPTIONS: minimum traded volume by the snapshot.")
     p.add_argument("--expiry", choices=["CURRENT", "NEXT"], default=EXPIRY_SELECTION,
@@ -1644,10 +1673,6 @@ if __name__ == "__main__":
     TOP_N_GRAVEYARD = args.graveyard_max
     if args.single_snapshot:
         BACKTRACE_CHECKPOINTS = False
-    if args.require_bb_kc_pierce:
-        REQUIRE_BB_KC_PIERCE = True
-    elif args.disable_bb_kc_gate:
-        REQUIRE_BB_KC_PIERCE = False
     try:
         code = run_screener(args.mode, args.days, args.date, args.time, args.track)
     except Exception:
