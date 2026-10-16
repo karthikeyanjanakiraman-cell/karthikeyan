@@ -1173,11 +1173,11 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
     print(f"\n{COLOR_BOLD}🔍 INTRADAY HISTORY FOR TRACKED SYMBOL: {matched_sym}{COLOR_RESET}")
     sym_w = max(12, len(matched_sym))
     header_str = (
-        f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP':>8} | "
-        f"{'Eval':^5} {'Anchor':^6} {'Anch Val':>9} {'R-Mult':>7} | "
-        f"ATR: 1X 2X 3X 5X | "
-        f"BB: 1X 2X 3X 5X | "
-        f"{'State':^13}{COLOR_RESET}"
+            f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP/Exit':>8} | "
+            f"{'Seen':^5} {'Anchor':^6} {'Anch Val':>9} {'R-Mult':>7} | "
+            f"ATR: 1X 2X 3X 5X | "
+            f"BB: 1X 2X 3X 5X | "
+            f"{'State':^13}{COLOR_RESET}"
     )
     print(header_str)
     print("-" * len(ANSI_RE.sub("", header_str)))
@@ -1374,8 +1374,10 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     def print_basket(title, icon, data_list):
         if not data_list: return
         print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
+        
+        # Updated Header: LTP replaced with LTP/Exit
         header_str = (
-            f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP':>8} | "
+            f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP/Exit':>8} | "
             f"{'Seen':^5} {'Anchor':^6} {'Anch Val':>9} {'R-Mult':>7} | "
             f"ATR: 1X 2X 3X 5X | "
             f"BB: 1X 2X 3X 5X | "
@@ -1402,7 +1404,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             state = row['State']
             shown_state = _state_display(row)
             if "[ BB > KC ]" in state:
-                # FIX: Arrow always matches the basket direction purely.
+                # Arrow always matches the basket direction purely.
                 dir_tag = "▲" if basket_dir == "BULL" else "▼"
                 shown_state = f"[ BB > KC ] {dir_tag}".strip()
                 state_text = f"{COLOR_GREEN_FG if dir_tag=='▲' else COLOR_RED_FG}{shown_state:^13}{COLOR_RESET}"
@@ -1411,9 +1413,15 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             else:
                 state_text = f"{COLOR_DIM}{shown_state:^13}{COLOR_RESET}"
 
+            # Dynamic Exit Price formatting for Killed Trades
+            if "[STOP" in shown_state and row.get('KilledPrice', 0) > 0:
+                ltp_val = f"{row['KilledPrice']:>7.2f}x"
+            else:
+                ltp_val = f"{row['LTP']:>8.2f} "
+
             print(
                 f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} "
-                f"{row['LTP']:>8.2f} | "
+                f"{ltp_val} | "
                 f"{row['CheckpointTime'].strftime('%H:%M'):^5} "
                 f"{row['ActiveAnchor']:^6} "
                 f"{row['AnchorPrice']:>9.2f} "
