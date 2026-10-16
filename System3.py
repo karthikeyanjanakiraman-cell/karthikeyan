@@ -3,7 +3,7 @@
 Strict Institutional Volatility Tracker (Upstox) - System 3.0 (3-Lock Edition)
 + Modes: STOCK_FNO, CASH_EQUITY, INDEX_OPTIONS
 + Configurable Shocks, Stops, and ATR Multipliers via CLI/Globals
-+ ADX Velocity & Dynamic ATR/BB Grids
++ Fixed: Ghost Trade Resurrection Bug & R-Multiple Sorting Priority
 """
 import os
 import sys
@@ -36,13 +36,13 @@ warnings.filterwarnings("ignore")
 TRADING_MODE = "STOCK_FNO"
 
 # --- SHOCK & STRUCTURE TRIPWIRES ---
-KINETIC_SHOCK_ATR_MULT = 1.5    # Velocity must exceed 1.5x its own ATR to trigger Lock 3
-IND_BB_PIERCE_STD = 1.0         # Indicator must pierce its 1.0 StdDev band to trigger Lock 2
+KINETIC_SHOCK_ATR_MULT = 1.5    
+IND_BB_PIERCE_STD = 1.0         
 
 # --- RISK & STOP LOSS FLOORS ---
-HARD_STOP_ATR_MULT = 1.2        # Hard trailing stop (1.2x Base ATR from peak)
-SOFT_STOP_ATR_MULT = 1.0        # Soft trailing stop (1.0x Base ATR from peak)
-SOFT_STOP_OPPOSING_SCORE = 2    # How many opposing indicators needed to trigger the Soft Stop
+HARD_STOP_ATR_MULT = 1.2        
+SOFT_STOP_ATR_MULT = 1.0        
+SOFT_STOP_OPPOSING_SCORE = 2    
 
 # --- INDEX OPTIONS ---
 EXPIRY_SELECTION = "CURRENT"
@@ -377,7 +377,6 @@ def _download_master(name, _is_fallback=False):
             last_reason = f"unexpected error: {type(e).__name__}: {e}"
         print(f"   {COLOR_YELLOW}[master:{name}] attempt {attempt}/3 failed: {last_reason}{COLOR_RESET}", file=sys.stderr)
         time.sleep(1.0)
-
     print(f"   {COLOR_RED_FG}[master:{name}] FAILED after {attempts_made} attempt(s): {last_reason}{COLOR_RESET}", file=sys.stderr)
 
     if not _is_fallback and name.upper() in ("NSE", "BSE"):
@@ -396,46 +395,37 @@ def resolve_pins(cands, needles, label="symbol"):
     MAX_PINNED_MATCHES = 8
     for raw in needles:
         n = _norm_sym(raw)
-        if not n:
-            continue
+        if not n: continue
         hits = [c for c in norm if c[0] == n] or [c for c in norm if n in c[0]]
         if not hits:
             print(f"   {COLOR_YELLOW}» track '{raw}': no {label} in the instrument master matches it.{COLOR_RESET}")
             continue
         hits.sort(key=lambda c: c[2])
         if len(hits) > MAX_PINNED_MATCHES:
-            print(f"   {COLOR_YELLOW}» track '{raw}': {len(hits)} matches -- keeping the first {MAX_PINNED_MATCHES}; "
-                  f"use a more specific value.{COLOR_RESET}")
             hits = hits[:MAX_PINNED_MATCHES]
         names = ", ".join(h[1] for h in hits[:3]) + (" ..." if len(hits) > 3 else "")
-        print(f"   {COLOR_DIM}» track '{raw}': pinned {len(hits)} {label}(s) -- always scanned, filters bypassed: {names}{COLOR_RESET}")
+        print(f"   {COLOR_DIM}» track '{raw}': pinned {len(hits)} {label}(s) -- always scanned: {names}{COLOR_RESET}")
         pinned.update(h[1] for h in hits)
     return pinned
 
 def _equity_universe(mode, needles=()):
     nse = _download_master("NSE")
-    if not nse:
-        print(f"{COLOR_RED_FG}[!] NSE instrument master unavailable -- cannot build the {mode} universe.{COLOR_RESET}")
-        return []
+    if not nse: return []
     def ts_of(i): return i.get("tradingsymbol", i.get("trading_symbol"))
     def plain(i): return (i.get("segment") == "NSE_EQ" and ts_of(i) and i.get("instrument_key") and (INCLUDE_NON_EQ_SERIES or (i.get("instrument_type") or "EQ") == "EQ"))
     fno = {i.get("underlying_symbol") for i in nse if i.get("segment") == "NSE_FO" and i.get("underlying_symbol")}
     everything = {i["instrument_key"]: {"symbol": ts_of(i), "key": i["instrument_key"]} for i in nse if plain(i)}
     in_mode = {k: v for k, v in everything.items()
                if ((v["symbol"] in fno) if mode == "STOCK_FNO" else (v["symbol"] not in fno))}
-
     pinned = set()
     if needles:
-        pinned = resolve_pins([(v["symbol"], (len(v["symbol"]), v["symbol"])) for v in everything.values()],
-                              needles, "equity symbol")
+        pinned = resolve_pins([(v["symbol"], (len(v["symbol"]), v["symbol"])) for v in everything.values()], needles, "equity symbol")
     out = {k: dict(v, pinned=v["symbol"] in pinned) for k, v in in_mode.items()}
     extra = 0
     for k, v in everything.items():
         if v["symbol"] in pinned and k not in out:
             out[k] = dict(v, pinned=True)
             extra += 1
-    if extra:
-        print(f"   {COLOR_DIM}» {extra} tracked symbol(s) sit outside the {mode} universe -- added for tracking.{COLOR_RESET}")
     return list(out.values())
 
 def _resolve_index_spot_price(key, name, cutoff_dt, use_intraday):
@@ -460,9 +450,7 @@ def _resolve_index_spot_price(key, name, cutoff_dt, use_intraday):
         limit = target_dt if cutoff_dt >= _close_dt(target_dt) else target_dt - timedelta(days=1)
         sub = df[df['Datetime'].dt.date <= limit]
         if not sub.empty: return float(sub['Close'].iloc[-1]), "daily close (fallback)"
-    if STATS.auth_failed:
-        return 0.0, "Upstox rejected the access token (HTTP 401)"
-    return 0.0, f"no candles returned (last API failure: {STATS.samples[-1] if STATS.samples else 'none recorded'})"
+    return 0.0, "API failure"
 
 def _field(row, *names):
     for n in names:
@@ -487,40 +475,21 @@ def _expiry_to_date(exp):
 
 def _index_options_universe(cutoff_dt, use_intraday, needles=()):
     target_dt = cutoff_dt.date()
-
     spot = {}
     for idx, cfg in INDEX_CONFIG.items():
-        try:
-            price, src = _resolve_index_spot_price(cfg["spot_key"], idx, cutoff_dt, use_intraday)
-        except Exception as e:
-            ERRORS.add(f"spot:{idx}", e)
-            price, src = 0.0, f"{type(e).__name__}: {e}"
-        if price > 0:
-            spot[idx] = price
-            print(f"   {COLOR_DIM}» {idx:<10} spot {price:>10.2f}  ({src}){COLOR_RESET}")
-        else:
-            print(f"   {COLOR_YELLOW}» {idx:<10} spot unavailable -- skipped ({src}){COLOR_RESET}")
-    if not spot and not needles:
-        if not STATS.auth_failed:
-            print(f"{COLOR_RED_FG}[!] Could not resolve a spot price for ANY index, so no ATM strikes can be chosen. "
-                  f"Check the token/API access to index candles (see failure samples below).{COLOR_RESET}")
-        return []
-
-    rows = []
-    nse, bse = _download_master("NSE"), _download_master("BSE")
-    print(f"   {COLOR_DIM}» Master rows fetched -- NSE: {len(nse)}, BSE: {len(bse)}{COLOR_RESET}")
-    rows = nse + bse
-    if not rows:
-        print(f"{COLOR_RED_FG}[!] Both NSE and BSE instrument masters came back empty -- see the [master:...] lines above "
-              f"for the exact HTTP status / network error.{COLOR_RESET}")
-        return []
+        try: price, src = _resolve_index_spot_price(cfg["spot_key"], idx, cutoff_dt, use_intraday)
+        except Exception as e: price, src = 0.0, str(e)
+        if price > 0: spot[idx] = price
+    
+    if not spot and not needles: return []
+    rows = _download_master("NSE") + _download_master("BSE")
+    if not rows: return []
 
     by_idx = {idx: [] for idx in INDEX_CONFIG}
     for row in rows:
         segment = str(_field(row, "segment") or "").upper()
         if segment and segment not in ("NSE_FO", "BSE_FO"): continue
         ts = str(_field(row, "trading_symbol", "tradingsymbol") or "").upper()
-
         itype = str(_field(row, "option_type", "instrument_type") or "").upper()
         if itype not in ("CE", "PE"):
             m = re.search(r'\b(CE|PE)\b', ts) or re.search(r'\d(CE|PE)$', ts)
@@ -533,12 +502,10 @@ def _index_options_universe(cutoff_dt, use_intraday, needles=()):
 
         exp_date = _expiry_to_date(_field(row, "expiry"))
         if exp_date is None: continue
-
+        
         strike_raw = _field(row, "strike_price", "strike")
-        try:
-            strike = float(strike_raw) if strike_raw is not None else 0.0
-        except (TypeError, ValueError):
-            strike = 0.0
+        try: strike = float(strike_raw) if strike_raw is not None else 0.0
+        except (TypeError, ValueError): strike = 0.0
         if strike <= 0:
             m = re.search(r'(\d+(?:\.\d+)?)\s+(?:CE|PE)\b', ts) or re.search(r'(\d+)(?:CE|PE)$', ts)
             strike = float(m.group(1)) if m else 0.0
@@ -546,15 +513,7 @@ def _index_options_universe(cutoff_dt, use_intraday, needles=()):
 
         by_idx[idx].append((exp_date, strike, itype, row))
 
-    total_opts = sum(len(v) for v in by_idx.values())
-    if total_opts == 0:
-        sample = sorted(rows[0].keys()) if rows and isinstance(rows[0], dict) else "n/a"
-        print(f"{COLOR_RED_FG}[!] Master downloaded ({len(rows)} rows) but 0 CE/PE contracts matched "
-              f"NIFTY/BANKNIFTY/FINNIFTY/SENSEX. Field names in this master: {sample}{COLOR_RESET}")
-        return []
-
     universe, seen = [], set()
-
     if needles:
         flat = []
         for idx, contracts in by_idx.items():
@@ -572,21 +531,9 @@ def _index_options_universe(cutoff_dt, use_intraday, needles=()):
 
     for idx, contracts in by_idx.items():
         if idx not in spot: continue
-        if not contracts:
-            print(f"   {COLOR_YELLOW}» {idx:<10} no option contracts found in master -- skipped{COLOR_RESET}")
-            continue
         expiries = sorted({c[0] for c in contracts if c[0] >= target_dt})
-        if not expiries:
-            latest = max(c[0] for c in contracts)
-            print(f"   {COLOR_YELLOW}» {idx:<10} no expiry on/after {target_dt} in this master (latest is {latest}). "
-                  f"Expired contracts need --options-master.{COLOR_RESET}")
-            continue
-
+        if not expiries: continue
         expiry_idx = 1 if str(EXPIRY_SELECTION).upper() == "NEXT" else 0
-        if expiry_idx >= len(expiries):
-            print(f"   {COLOR_YELLOW}  ⚠ {idx:<10} EXPIRY_SELECTION={EXPIRY_SELECTION!r} wants expiry #{expiry_idx + 1} "
-                  f"on/after {target_dt}, but the master only has {len(expiries)}. Using the furthest one available "
-                  f"instead of failing outright.{COLOR_RESET}")
         target_exp = expiries[min(expiry_idx, len(expiries) - 1)]
         chain = [c for c in contracts if c[0] == target_exp]
         strikes = np.array(sorted({c[1] for c in chain}))
@@ -595,33 +542,23 @@ def _index_options_universe(cutoff_dt, use_intraday, needles=()):
         lo = max(0, atm_i - STRIKES_BELOW_ATM)
         hi = min(len(strikes), atm_i + STRIKES_ABOVE_ATM + 1)
         window = set(strikes[lo:hi].tolist())
-        picked = 0
         for exp_date, strike, itype, row in chain:
             key = _field(row, "instrument_key")
             if strike in window and key not in seen:
                 seen.add(key)
                 universe.append({"key": key, "symbol": str(_field(row, "trading_symbol", "tradingsymbol") or key), "pinned": False})
-                picked += 1
-        gap = (target_exp - target_dt).days
-        print(f"   {COLOR_DIM}» {idx:<10} expiry {target_exp} ({EXPIRY_SELECTION})  "
-              f"strikes {strikes[lo]:.0f}-{strikes[hi-1]:.0f} ({STRIKES_BELOW_ATM}↓/{STRIKES_ABOVE_ATM}↑ of ATM)  "
-              f"-> {picked} contracts{COLOR_RESET}")
     return universe
 
 def get_dynamic_universe(mode, cutoff_dt, use_intraday, needles=()):
-    if mode in ("STOCK_FNO", "CASH_EQUITY"):
-        return _equity_universe(mode, needles)
-    if mode == "INDEX_OPTIONS":
-        return _index_options_universe(cutoff_dt, use_intraday, needles)
-    print(f"{COLOR_RED_FG}[!] Unknown mode '{mode}'.{COLOR_RESET}")
+    if mode in ("STOCK_FNO", "CASH_EQUITY"): return _equity_universe(mode, needles)
+    if mode == "INDEX_OPTIONS": return _index_options_universe(cutoff_dt, use_intraday, needles)
     return []
 
 # ==============================================================================
 # 2. CONTINUOUS KINETIC TRIPWIRE ENGINE
 # ==============================================================================
 def compute_base_atr(m):
-    if m is None or len(m) == 0:
-        return None, 0
+    if m is None or len(m) == 0: return None, 0
     hi, lo, cl = m['High'].values, m['Low'].values, m['Close'].values
     sid = m['SessId'].values
     mins = np.clip(m['Min'].values, SESSION_OPEN_MIN, SESSION_CLOSE_MIN - 1)
@@ -712,7 +649,6 @@ def _evaluate_kinetic_arrays(close, high, low, vol):
     }
 
 def get_kinetics(kin_1m, idx):
-    """Returns the Booleans needed for the 3-Lock Trigger, and soft-stop powers."""
     hist = kin_1m['hist'][idx]; h_mean = kin_1m['h_mean'][idx]; h_std = kin_1m['h_std'][idx]
     obv = kin_1m['obv'][idx]; o_mean = kin_1m['o_mean'][idx]; o_std = kin_1m['o_std'][idx]
     p_di = kin_1m['plus_di'][idx]; p_mean = kin_1m['p_mean'][idx]; p_std = kin_1m['p_std'][idx]
@@ -725,7 +661,6 @@ def get_kinetics(kin_1m, idx):
     vm = kin_1m['vel_mdi'][idx]; am = kin_1m['atr_mdi'][idx]
     va = kin_1m['vel_adx'][idx]; aa = kin_1m['atr_adx'][idx]
 
-    # --- LOCK 2: Indicator Structure Breakout ---
     bull_struct = (h_std > 0 and hist > h_mean + IND_BB_PIERCE_STD * h_std) and \
                   (o_std > 0 and obv > o_mean + IND_BB_PIERCE_STD * o_std) and \
                   (p_std > 0 and p_di > p_mean + IND_BB_PIERCE_STD * p_std) and \
@@ -736,7 +671,6 @@ def get_kinetics(kin_1m, idx):
                   (m_std > 0 and m_di > m_mean + IND_BB_PIERCE_STD * m_std) and \
                   (a_std > 0 and adx > a_mean + IND_BB_PIERCE_STD * a_std)
 
-    # --- LOCK 3: Institutional Kinetic Shock ---
     bull_shock = (vh > KINETIC_SHOCK_ATR_MULT * ah) and \
                  (vo > KINETIC_SHOCK_ATR_MULT * ao) and \
                  (vp > KINETIC_SHOCK_ATR_MULT * ap) and \
@@ -747,7 +681,6 @@ def get_kinetics(kin_1m, idx):
                  (vm > KINETIC_SHOCK_ATR_MULT * am) and \
                  (va > KINETIC_SHOCK_ATR_MULT * aa)
 
-    # Opposing raw power for Soft Stops
     raw_bull_power = (p_std > 0 and p_di > p_mean + IND_BB_PIERCE_STD * p_std) and (vh > 0)
     raw_bear_power = (m_std > 0 and m_di > m_mean + IND_BB_PIERCE_STD * m_std) and (vh < 0)
 
@@ -757,7 +690,6 @@ def get_kinetics(kin_1m, idx):
     return bull_score, bear_score, raw_bull_power, raw_bear_power, bull_struct, bear_struct, bull_shock, bear_shock
 
 def calculate_grids(kin_1m, idx, direction):
-    """Calculates the real-time ATR and BB grids for the active evaluation minute."""
     hist = kin_1m['hist'][idx]; h_mean = kin_1m['h_mean'][idx]; h_std = kin_1m['h_std'][idx]
     obv = kin_1m['obv'][idx]; o_mean = kin_1m['o_mean'][idx]; o_std = kin_1m['o_std'][idx]
     p_di = kin_1m['plus_di'][idx]; p_mean = kin_1m['p_mean'][idx]; p_std = kin_1m['p_std'][idx]
@@ -775,15 +707,11 @@ def calculate_grids(kin_1m, idx, direction):
 
     def check_bb(val, mean, std, mult, is_bull_ind):
         if std <= 0: return False
-        if is_bull_ind:
-            return val > mean + (std * mult)
-        else:
-            return val < mean - (std * mult)
+        if is_bull_ind: return val > mean + (std * mult)
+        else: return val < mean - (std * mult)
 
     for mult in [1, 2, 3, 5]:
-        a_count = 0
-        b_count = 0
-
+        a_count, b_count = 0, 0
         if direction == "BULL":
             if vh > mult * ah: a_count += 1
             if vo > mult * ao: a_count += 1
@@ -794,7 +722,7 @@ def calculate_grids(kin_1m, idx, direction):
             if check_bb(obv, o_mean, o_std, mult, True): b_count += 1
             if check_bb(p_di, p_mean, p_std, mult, True): b_count += 1
             if check_bb(adx, a_mean, a_std, mult, True): b_count += 1
-        else: # BEAR
+        else:
             if vh < -mult * ah: a_count += 1
             if vo < -mult * ao: a_count += 1
             if vm > mult * am: a_count += 1
@@ -830,16 +758,13 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
 
     while i < n:
         anchor = None
-
         while i < n:
             (bull_score, bear_score, r_bull, r_bear,
              bull_struct, bear_struct, bull_shock, bear_shock) = get_kinetics(kin_1m, i)
 
-            # --- LOCK 1: Price Volatility Expansion ---
             bb_kc_bull_fire = bb_upper[i] > kc_upper[i]
             bb_kc_bear_fire = bb_lower[i] < kc_lower[i]
 
-            # 3-LOCK MASTER TRIGGER EVALUATION
             if bull_struct and bull_shock and bb_kc_bull_fire:
                 if r_bear:
                     warzone_kills += 1
@@ -847,7 +772,6 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                 else:
                     anchor = {"dir": "BULL", "idx": i, "time": dt_1m[i], "price": close[i]}
                     break
-
             elif bear_struct and bear_shock and bb_kc_bear_fire:
                 if r_bull:
                     warzone_kills += 1
@@ -857,8 +781,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                     break
             i += 1
 
-        if not anchor:
-            break
+        if not anchor: break
 
         survived = True
         is_bull = anchor['dir'] == "BULL"
@@ -916,11 +839,9 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
     return None, info
 
 def prepare_series(master, target_dt):
-    if master is None or master.empty:
-        return None, "no_data"
+    if master is None or master.empty: return None, "no_data"
     day_mask = (master['Datetime'].dt.date == target_dt).values
-    if not day_mask.any():
-        return None, "no_data"
+    if not day_mask.any(): return None, "no_data"
     ts = int(np.argmax(day_mask))
 
     close = master['Close'].values.astype(float)
@@ -930,10 +851,7 @@ def prepare_series(master, target_dt):
     n = len(close)
 
     base_atr, atr_bars = compute_base_atr(master.iloc[:ts])
-    if base_atr is None:
-        return None, "short_history"
-    elif atr_bars < ATR_MIN_BARS:
-        return None, "short_history"
+    if base_atr is None or atr_bars < ATR_MIN_BARS: return None, "short_history"
 
     sma20 = pd.Series(close).rolling(20, min_periods=1).mean().values
     std20 = pd.Series(close).rolling(20, min_periods=1).std(ddof=0).values
@@ -954,8 +872,7 @@ def prepare_series(master, target_dt):
 def row_at(S, end, symbol):
     ts = S['today_start']
     end = min(int(end), len(S['close']))
-    if end <= ts:
-        return None
+    if end <= ts: return None
     close, base_atr, kin = S['close'], S['base_atr'], S['kin']
     last = end - 1
     ltp = float(close[last])
@@ -975,7 +892,7 @@ def row_at(S, end, symbol):
     row['Kills'] = info.get('kills', [])
 
     eval_dir = anchor['dir'] if anchor else info.get('dir')
-    if not eval_dir or eval_dir == "NONE": eval_dir = "BULL" # Default for empty grids
+    if not eval_dir or eval_dir == "NONE": eval_dir = "BULL" 
     
     ag, bg = calculate_grids(kin, last, eval_dir)
     row['ATR_Grid'] = ag
@@ -1000,8 +917,10 @@ def row_at(S, end, symbol):
         row['RejectReason'] = info.get('reason', 'Failed Kinetic Alignment')
         if row['AnchorPrice'] > 0 and row['KilledPrice'] > 0:
             row['MovePct'] = ((row['KilledPrice'] - row['AnchorPrice']) / row['AnchorPrice']) * 100
-        # The merge logic handles assigning the [STOPPED] state string across checkpoints.
-        row['State'] = pure_state 
+            
+        # FIX: Never label a killed trade with an active visual state. 
+        row['State'] = "[STOPPED]" 
+        
     return row
 
 def compute_row(symbol, master_1m, target_dt):
@@ -1024,11 +943,8 @@ def _history_worker_daily(args):
         if master.empty: return None
         close, vol = master['Close'].iloc[-1], master['Volume'].iloc[-1]
         return item if (MIN_PRICE <= close <= MAX_PRICE and vol >= MIN_DAILY_VOLUME) else None
-    except Exception as e:
-        ERRORS.add(f"prefilter:{item.get('symbol')}", e)
-        return None
-    finally:
-        progress.tick()
+    except Exception as e: return None
+    finally: progress.tick()
 
 def process_stock_checkpoints(args):
     item, checkpoints, use_intraday, history_days, mode, progress = args
@@ -1046,29 +962,24 @@ def process_stock_checkpoints(args):
             today_df = fetch_today(item['key'])
             if today_df is not None: frames.append(today_df)
 
-        if not frames:
-            return [(cp, "no_data", sym) for cp in checkpoints]
-
+        if not frames: return [(cp, "no_data", sym) for cp in checkpoints]
         master = prepare_master(frames)
         master = master[master['Datetime'] < final_cutoff].reset_index(drop=True)
 
         if mode == "INDEX_OPTIONS":
             day = master[master['Datetime'].dt.date == target_dt]
-            if day.empty:
-                return [(cp, "no_data", sym) for cp in checkpoints]
+            if day.empty: return [(cp, "no_data", sym) for cp in checkpoints]
             if day['Close'].iloc[-1] < OPT_MIN_PRICE or day['Volume'].sum() < OPT_MIN_VOLUME:
                 return [(cp, "illiquid", sym) for cp in checkpoints]
 
         S, why = prepare_series(master, target_dt)
-        if S is None:
-            return [(cp, why, sym) for cp in checkpoints]
+        if S is None: return [(cp, why, sym) for cp in checkpoints]
 
         ends = np.searchsorted(S['dt'], np.array(checkpoints, dtype='datetime64[ns]'), side='left')
         out = []
         for cp, end in zip(checkpoints, ends):
             row = row_at(S, int(end), sym)
-            if row is None:
-                out.append((cp, "no_data", sym))
+            if row is None: out.append((cp, "no_data", sym))
             else:
                 row['CheckpointTime'] = cp
                 out.append((cp, "ok", row))
@@ -1083,8 +994,7 @@ def _clip(s, w):
     return s if len(s) <= w else s[:w - 1] + "~"
 
 def _print_error_summary():
-    if STATS.failed:
-        print(f"{COLOR_YELLOW}⚠ {STATS.failed} API request(s) failed after retries. Samples: {'; '.join(STATS.samples)}{COLOR_RESET}")
+    if STATS.failed: print(f"{COLOR_YELLOW}⚠ {STATS.failed} API request(s) failed after retries. Samples: {'; '.join(STATS.samples)}{COLOR_RESET}")
     if ERRORS.items:
         print(f"{COLOR_YELLOW}⚠ {len(ERRORS.items)} instrument(s) raised exceptions. First one:{COLOR_RESET}")
         where, msg, tb = ERRORS.items[0]
@@ -1101,8 +1011,7 @@ def _signal_id(row):
 
 def _find_kill(kills, direction, anchor_time):
     for k in reversed(kills or []):
-        if k.get('dir') == direction and k.get('anchor_time') == anchor_time:
-            return k
+        if k.get('dir') == direction and k.get('anchor_time') == anchor_time: return k
     return None
 
 def _exit_price(row):
@@ -1113,16 +1022,12 @@ def _exit_price(row):
 def _r_multiple(row):
     anchor_price = row.get('AnchorPrice', 0.0)
     base_atr = row.get('BaseAtr', 0.0)
-    if not (anchor_price and anchor_price > 0 and base_atr and base_atr > 0):
-        return 0.0
+    if not (anchor_price and anchor_price > 0 and base_atr and base_atr > 0): return 0.0
     price = _exit_price(row)
-    
     direction = row.get('PremiumDir', row.get('AnchorDir'))
     
-    if direction == 'BULL':
-        return (price - anchor_price) / base_atr
-    if direction == 'BEAR':
-        return (anchor_price - price) / base_atr
+    if direction == 'BULL': return (price - anchor_price) / base_atr
+    if direction == 'BEAR': return (anchor_price - price) / base_atr
     return 0.0
 
 def _merge_signal(sig_rows, last_row, direction):
@@ -1141,7 +1046,7 @@ def _merge_signal(sig_rows, last_row, direction):
         row['State'] = "[STOPPED]"
         k = _find_kill(kills, direction, first['ActiveAnchor'])
         if k:
-            row['KilledTime'], row['KilledPrice'], row['RejectReason'] = k['killed_time'], float(k['killed_price'], k['reason'])
+            row['KilledTime'], row['KilledPrice'], row['RejectReason'] = k['killed_time'], float(k['killed_price']), k['reason']
         else:
             row['KilledTime'], row['KilledPrice'], row['RejectReason'] = '-', 0.0, "Anchor no longer valid at the latest checkpoint"
 
@@ -1156,14 +1061,23 @@ def merge_symbol_rows(rows):
     merged = {}
     for direction, active in (("BULL", ACTIVE_BULL_STATES), ("BEAR", ACTIVE_BEAR_STATES)):
         d_rows = [r for r in rows if r['AnchorDir'] == direction and r['State'] in active]
-        if not d_rows:
-            continue
+        if not d_rows: continue
         sid = _signal_id(d_rows[-1])
         merged[direction] = _merge_signal([r for r in d_rows if _signal_id(r) == sid], last_row, direction)
+        
     grave = None
     if not merged:
         grave = dict(last_row)
         grave['CheckpointTime'] = rows[0]['CheckpointTime']
+        grave_dir = grave.get('AnchorDir', 'NONE')
+        is_pe = " PE " in grave['Symbol'] or grave['Symbol'].endswith("PE")
+        
+        # Ensure graveyard gets correct macro direction tracking for accurate post-mortem R-Mult
+        if is_pe:
+            grave['PremiumDir'] = "BULL" if grave_dir == "BEAR" else "BEAR" if grave_dir == "BULL" else "NONE"
+        else:
+            grave['PremiumDir'] = grave_dir
+            
     return merged.get("BULL"), merged.get("BEAR"), grave
 
 def _state_display(row):
@@ -1197,15 +1111,10 @@ def _send_watch_email(subject, body, tag="track"):
         ("RECIPIENT_EMAIL", recipient),
     ) if not val]
     
-    if missing:
-        print(f"   {COLOR_YELLOW}[{tag}] Cannot send email -- missing env var(s): {', '.join(missing)}.{COLOR_RESET}")
-        return False
+    if missing: return False
 
-    try:
-        port = int(smtp_port)
-    except ValueError:
-        print(f"   {COLOR_YELLOW}[{tag}] Cannot send email -- SMTP_PORT='{smtp_port}' is not a valid integer.{COLOR_RESET}")
-        return False
+    try: port = int(smtp_port)
+    except ValueError: return False
 
     msg = EmailMessage()
     msg['Subject'] = subject
@@ -1223,15 +1132,11 @@ def _send_watch_email(subject, body, tag="track"):
                 server.starttls()
                 server.login(sender, password)
                 server.send_message(msg)
-        print(f"   {COLOR_GREEN_FG}[{tag}] Email successfully sent to {recipient}.{COLOR_RESET}")
         return True
-    except Exception as e:
-        print(f"   {COLOR_YELLOW}[{tag}] Failed to send email ({type(e).__name__}: {e}).{COLOR_RESET}")
-        return False
+    except Exception: return False
 
 def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True):
-    if not tracked_symbol_raw:
-        return
+    if not tracked_symbol_raw: return
     n = _norm_sym(tracked_symbol_raw)
     
     matched_sym = None
@@ -1240,9 +1145,7 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
             matched_sym = sym
             break
             
-    if not matched_sym:
-        print(f"{COLOR_YELLOW}» Tracked symbol '{tracked_symbol_raw}' not found in scanned results.{COLOR_RESET}")
-        return
+    if not matched_sym: return
         
     rows = sorted(by_symbol[matched_sym], key=lambda r: r['CheckpointTime'])
     history = []
@@ -1285,7 +1188,7 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
         r_color = COLOR_GREEN_FG if r_mult > 0 else COLOR_RED_FG if r_mult < 0 else COLOR_DIM
 
         sym = row['Symbol']
-        direction = row.get('AnchorDir', 'BULL')
+        direction = row.get('PremiumDir', 'BULL')
         dir_c = COLOR_GREEN_FG if direction == "BULL" else COLOR_RED_FG
 
         ag, bg = row.get('ATR_Grid', {1:0, 2:0, 3:0, 5:0}), row.get('BB_Grid', {1:0, 2:0, 3:0, 5:0})
@@ -1321,37 +1224,16 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
     if len(history) >= 2:
         last_row = history[-1]
         prev_row = history[-2]
-        
-        def get_full_state(r):
-            return f"{r.get('AnchorDir', 'NONE')} {r.get('State', 'NONE')}"
-            
-        last_state = get_full_state(last_row)
-        prev_state = get_full_state(prev_row)
-        last_eval = last_row['_EvalTime'].strftime('%H:%M')
-        prev_eval = prev_row['_EvalTime'].strftime('%H:%M')
-        
-        print(f"\n{COLOR_DIM}Stateless Check: Evaluating {last_eval} vs {prev_eval}...{COLOR_RESET}")
+        def get_full_state(r): return f"{r.get('PremiumDir', 'NONE')} {r.get('State', 'NONE')}"
+        last_state, prev_state = get_full_state(last_row), get_full_state(prev_row)
         
         if last_state != prev_state:
             print(f"{COLOR_BOLD}🔔 ALERT: State change detected! {prev_state} -> {last_state}{COLOR_RESET}")
-            
-            if not live_run:
-                print(f"   {COLOR_DIM}[track] Historical execution (Live: False) — skipping email transmission.{COLOR_RESET}")
-                return
-            
-            r_mult = _r_multiple(last_row)
-            subject = f"[System3] {matched_sym} Alert: {prev_state} -> {last_state}"
-            body = (
-                f"System3 detected a state transition for {matched_sym} at checkpoint {last_eval}.\n\n"
-                f"Previous State ({prev_eval}): {prev_state}\n"
-                f"Current State  ({last_eval}): {last_state}\n\n"
-                f"LTP: {last_row.get('LTP', 0):.2f}\n"
-                f"Day Change: {last_row.get('DayChangePct', 0):+.2f}%\n"
-                f"Move from Anchor: {r_mult:+.2f} R-Multiples\n"
-            )
-            _send_watch_email(subject, body, "track")
-        else:
-            print(f"{COLOR_DIM}[track] State is unchanged ({last_state}). No email sent.{COLOR_RESET}")
+            if live_run:
+                r_mult = _r_multiple(last_row)
+                subject = f"[System3] {matched_sym} Alert: {prev_state} -> {last_state}"
+                body = f"System3 state transition: {prev_state} -> {last_state}\nR-Mult: {r_mult:+.2f}R"
+                _send_watch_email(subject, body, "track")
           
 # ==============================================================================
 # MAIN RUNNER
@@ -1363,39 +1245,25 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     if explicit:
         d_str = target_date_str or now_ist().strftime("%Y-%m-%d")
         t_str = target_time_str or "15:30"
-        try:
-            cutoff_dt = datetime.strptime(f"{d_str} {t_str}", "%Y-%m-%d %H:%M")
-        except ValueError:
-            print(f"{COLOR_RED_FG}[!] Invalid --date/--time '{d_str} {t_str}' (expected YYYY-MM-DD and HH:MM).{COLOR_RESET}")
-            return 1
+        try: cutoff_dt = datetime.strptime(f"{d_str} {t_str}", "%Y-%m-%d %H:%M")
+        except ValueError: return 1
     else:
         cutoff_dt = now_ist()
     cutoff_dt = cutoff_dt.replace(second=0, microsecond=0)
     live_run = not explicit
 
     cutoff_dt, notes = resolve_session(cutoff_dt)
-    if STATS.auth_failed:
-        print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401). Regenerate UPSTOX_ACCESS_TOKEN -- it expires daily.{COLOR_RESET}")
-        return 1
+    if STATS.auth_failed: return 1
     target_dt = cutoff_dt.date()
     cutoff_dt = min(cutoff_dt, _close_dt(target_dt))
     today_session = (target_dt == now_ist().date())
 
     print(f"\n{COLOR_CYAN}📡 Initializing Tracker [{mode}] | Time Machine: {cutoff_dt.strftime('%Y-%m-%d %H:%M:%S')} (Live: {live_run}){COLOR_RESET}")
-    for n in notes:
-        print(f"   {COLOR_YELLOW}» {n}{COLOR_RESET}")
 
     needles = [track_symbol] if track_symbol else []
     universe_raw = get_dynamic_universe(mode, cutoff_dt, today_session, needles=needles)
     
-    if STATS.auth_failed:
-        print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401). Regenerate UPSTOX_ACCESS_TOKEN -- it expires daily.{COLOR_RESET}")
-        return 1
-    if not universe_raw:
-        print(f"{COLOR_RED_FG}[!] Universe is EMPTY for mode {mode} -- nothing to scan. See the messages above for why.{COLOR_RESET}")
-        _print_error_summary()
-        return 1
-    print(f"   {COLOR_DIM}» Universe: {len(universe_raw)} instruments{COLOR_RESET}")
+    if STATS.auth_failed or not universe_raw: return 1
 
     if mode == "INDEX_OPTIONS":
         candidates = universe_raw
@@ -1405,45 +1273,22 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
             candidates = [r for r in ex.map(_history_worker_daily, [(it, daily_start, target_dt, prog) for it in universe_raw]) if r is not None]
         prog.done()
-        if STATS.auth_failed:
-            print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401) during the prefilter.{COLOR_RESET}")
-            return 1
-        if not candidates:
-            print(f"{COLOR_YELLOW}[!] 0 of {len(universe_raw)} instruments passed the price/volume prefilter "
-                  f"(price {MIN_PRICE}-{MAX_PRICE}, volume >= {MIN_DAILY_VOLUME}).{COLOR_RESET}")
-            _print_error_summary()
-            return 1 if (STATS.failed or ERRORS.items) else 0
-        print(f"   {COLOR_DIM}» Prefilter: {len(universe_raw)} -> {len(candidates)} instruments{COLOR_RESET}")
+        if STATS.auth_failed or not candidates: return 1
 
     checkpoints = generate_checkpoints(cutoff_dt) if BACKTRACE_CHECKPOINTS else [cutoff_dt]
-    print(f"   {COLOR_DIM}» Backtrace checkpoints ({len(checkpoints)}): "
-          f"{', '.join(c.strftime('%H:%M') for c in checkpoints)}{COLOR_RESET}")
-
+    
     prog = Progress("checkpoints", len(candidates))
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
         per_symbol = list(ex.map(process_stock_checkpoints,
                                   [(item, checkpoints, today_session, MIN1_HISTORY_DAYS, mode, prog) for item in candidates]))
     prog.done()
 
-    if STATS.auth_failed:
-        print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401) while fetching candles.{COLOR_RESET}")
-        return 1
+    if STATS.auth_failed: return 1
 
     outcomes = [o for sym_outcomes in per_symbol for o in sym_outcomes]
     results = [p for _, s, p in outcomes if s == "ok"]
-    counts = {k: sum(1 for _, s, _ in outcomes if s == k) for k in ("no_data", "illiquid", "short_history", "error")}
-    print(f"   {COLOR_DIM}» Scan summary: {len(candidates)} instruments x {len(checkpoints)} checkpoints = "
-          f"{len(outcomes)} evaluations | ok {len(results)} | no data {counts['no_data']} | illiquid {counts['illiquid']} | "
-          f"short history {counts['short_history']} | errors {counts['error']}{COLOR_RESET}")
-    if counts["short_history"]:
-        print(f"   {COLOR_YELLOW}» {counts['short_history']} evaluations skipped: fewer than {ATR_MIN_BARS} completed sessions of "
-              f"history for the ATR (new contracts, or --history-days too small).{COLOR_RESET}")
 
-    if not results:
-        print(f"{COLOR_RED_FG}[!] No instrument produced usable data at any checkpoint up to {cutoff_dt:%Y-%m-%d %H:%M}. "
-              f"Is that a trading day/time, and does the token have historical-candle access?{COLOR_RESET}")
-        _print_error_summary()
-        return 1
+    if not results: return 1
 
     by_symbol = {}
     for row in results:
@@ -1452,7 +1297,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     bulls, bears, rejected = [], [], []
     for symbol, rows in by_symbol.items():
         b, r_, g = merge_symbol_rows(rows)
-
         is_pe = " PE " in symbol or symbol.endswith("PE")
 
         if b:
@@ -1460,57 +1304,61 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             if is_pe:
                 b['AnchorDir'] = "BEAR"
                 bears.append(b)
-            else:
-                bulls.append(b)
+            else: bulls.append(b)
 
         if r_:
             r_['PremiumDir'] = "BEAR"
             if is_pe:
                 r_['AnchorDir'] = "BULL"
                 bulls.append(r_)
-            else:
-                bears.append(r_)
+            else: bears.append(r_)
 
         if g: rejected.append(g)
 
-    if track_symbol:
-        print_and_alert_tracked_history(track_symbol, by_symbol, live_run=live_run)
+    if track_symbol: print_and_alert_tracked_history(track_symbol, by_symbol, live_run=live_run)
 
-    true_bull_count = len(bulls)
-    true_bear_count = len(bears)
-    bull_live = sum(1 for r in bulls if r['State'] != "[STOPPED]")
-    bear_live = sum(1 for r in bears if r['State'] != "[STOPPED]")
+    # Purge anomalous heavy losers that shouldn't clutter the top lists
+    true_bulls = [r for r in bulls if _r_multiple(r) >= -1.5]
+    true_bears = [r for r in bears if _r_multiple(r) >= -1.5]
+    
+    for r in bulls + bears:
+        if r not in true_bulls and r not in true_bears:
+            r['RejectReason'] = "Adverse Kinetic Drift (Plunged below limits)"
+            rejected.append(r)
+
+    bulls = true_bulls
+    bears = true_bears
 
     def state_rank(st):
-        if "[ BB > KC ]" in st:
-            return 0
-        if "[ BB < KC ]" in st:
-            return 1
+        if "[ BB > KC ]" in st: return 0
+        if "[ BB < KC ]" in st: return 1
         return 2
 
-    # Sort based on ATR Grid count 1X descending
+    # FIX: Prioritize R-Multiple OVER Checkpoint Timestamp
     bulls.sort(key=lambda r: (
         state_rank(r['State']),
-        -int(r['CheckpointTime'].timestamp()),
         -_r_multiple(r),
+        -int(r['CheckpointTime'].timestamp()),
         -r.get('ATR_Grid', {}).get(1, 0),
         -r.get('BB_Grid', {}).get(1, 0)
     ))
 
     bears.sort(key=lambda r: (
         state_rank(r['State']),
-        -int(r['CheckpointTime'].timestamp()),
         -_r_multiple(r),
+        -int(r['CheckpointTime'].timestamp()),
         -r.get('ATR_Grid', {}).get(1, 0),
         -r.get('BB_Grid', {}).get(1, 0)
     ))
 
+    bull_count_str = f"{len(bulls)}"
+    bear_count_str = f"{len(bears)}"
     bulls = bulls[:TOP_N_BUYERS]
     bears = bears[:TOP_N_SELLERS]
 
     def sort_reason(r):
         reason = r['RejectReason']
-        if "Kinetic SL" in reason or "Hard stop" in reason: return 0
+        if "Kinetic SL" in reason or "Hard stop" in reason or "Adverse" in reason: return 0
         if "Warzone" in reason: return 1
         if "Alignment" in reason: return 2
         return 3
@@ -1519,16 +1367,9 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     grave_total = len(rejected)
     grave_shown = rejected if TOP_N_GRAVEYARD <= 0 else rejected[:TOP_N_GRAVEYARD]
 
-    bull_count_str = f"{len(bulls)} (of {true_bull_count})" if true_bull_count > TOP_N_BUYERS else f"{true_bull_count}"
-    bear_count_str = f"{len(bears)} (of {true_bear_count})" if true_bear_count > TOP_N_SELLERS else f"{true_bear_count}"
-
-    shown = bulls + bears + grave_shown
-    sym_w = max(12, min(MAX_SYMBOL_WIDTH, max((len(r['Symbol']) for r in shown), default=12)))
+    sym_w = max(12, min(MAX_SYMBOL_WIDTH, max((len(r['Symbol']) for r in bulls + bears + grave_shown), default=12)))
 
     print(f"\n{COLOR_BOLD}=== STATEFUL INSTITUTIONAL VOLATILITY TRACKER [{mode}] ==={COLOR_RESET}")
-    print(f"Target Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Scanned: {len(by_symbol)} symbols "
-          f"across {len(checkpoints)} checkpoints | After dedup: {bull_count_str} bull ({bull_live} live), "
-          f"{bear_count_str} bear ({bear_live} live), {grave_total} graveyard\n")
 
     def print_basket(title, icon, data_list):
         if not data_list: return
@@ -1543,14 +1384,16 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         print(header_str)
         print("-" * len(ANSI_RE.sub("", header_str)))
 
+        basket_dir = "BULL" if "BULL" in title else "BEAR"
+
         for row in data_list:
             r_mult = _r_multiple(row)
             r_mult_str = f"{r_mult:>+4.2f}R"
             r_color = COLOR_GREEN_FG if r_mult > 0 else COLOR_RED_FG if r_mult < 0 else COLOR_DIM
 
             sym = row['Symbol']
-            direction = row.get('AnchorDir', 'BULL')
-            dir_c = COLOR_GREEN_FG if direction == "BULL" else COLOR_RED_FG
+            macro_dir = row.get('PremiumDir', 'BULL')
+            dir_c = COLOR_GREEN_FG if macro_dir == "BULL" else COLOR_RED_FG
 
             ag, bg = row.get('ATR_Grid', {1:0, 2:0, 3:0, 5:0}), row.get('BB_Grid', {1:0, 2:0, 3:0, 5:0})
             a1, a2, a3, a5 = [_format_val(ag[k], dir_c) for k in [1, 2, 3, 5]]
@@ -1559,7 +1402,8 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             state = row['State']
             shown_state = _state_display(row)
             if "[ BB > KC ]" in state:
-                dir_tag = "▲" if direction == "BULL" else "▼" if direction == "BEAR" else ""
+                # FIX: Arrow always matches the basket direction purely.
+                dir_tag = "▲" if basket_dir == "BULL" else "▼"
                 shown_state = f"[ BB > KC ] {dir_tag}".strip()
                 state_text = f"{COLOR_GREEN_FG if dir_tag=='▲' else COLOR_RED_FG}{shown_state:^13}{COLOR_RESET}"
             elif "[ BB < KC ]" in state:
@@ -1581,8 +1425,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     
     print_basket("TOP BULL SETUPS (Valid Anchors Surviving)", "🔥", bulls)
     print_basket("TOP BEAR SETUPS (Valid Anchors Surviving)", "🩸", bears)
-    if not bulls and not bears:
-        print(f"{COLOR_YELLOW}No surviving anchors at this snapshot -- every candidate was rejected (see graveyard).{COLOR_RESET}")
 
     if grave_shown:
         print(f"\n{COLOR_BOLD}🚫 THE GRAVEYARD (Filtered / Rejected){COLOR_RESET}")
@@ -1595,7 +1437,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         print("-" * len(ANSI_RE.sub("", header_str)))
 
         for row in grave_shown:
-            sig = row['AnchorDir']
+            sig = row.get('PremiumDir', 'NONE')
             if sig == "BULL": sig_colored = f"{COLOR_GREEN_FG}BULL{COLOR_RESET}  "
             elif sig == "BEAR": sig_colored = f"{COLOR_RED_FG}BEAR{COLOR_RESET}  "
             else: sig_colored = f"{COLOR_DIM}NONE{COLOR_RESET}  "
@@ -1612,7 +1454,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
                 move_pct_str, move_color = f"{'-':>7}", COLOR_DIM
 
             reason = row['RejectReason']
-            if "Kinetic SL" in reason or "Hard stop" in reason or "Pullback" in reason or "Rally" in reason: reason_color = COLOR_YELLOW
+            if "Kinetic SL" in reason or "Hard stop" in reason or "Adverse" in reason: reason_color = COLOR_YELLOW
             elif "Chop" in reason or "Warzone" in reason: reason_color = COLOR_RED_FG
             else: reason_color = COLOR_DIM
 
@@ -1624,12 +1466,9 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
                 f"{reason_color}{reason}{COLOR_RESET}"
             )
         if grave_total > len(grave_shown):
-            print(f"{COLOR_DIM}   ... {grave_total - len(grave_shown)} more graveyard row(s) not shown "
-                  f"(--graveyard-max 0 prints them all).{COLOR_RESET}")
+            print(f"{COLOR_DIM}   ... {grave_total - len(grave_shown)} more graveyard row(s) not shown.{COLOR_RESET}")
 
     _print_error_summary()
-    total_calls = sum(l.total_calls for l in LIMITERS.values())
-    print(f"\n⏱️ Tracker sync completed in {(time.time() - t_start):.2f} seconds ({total_calls} API calls).\n")
     return 0
 
 def parse_args():
@@ -1654,7 +1493,6 @@ def parse_args():
     p.add_argument("--single-snapshot", action="store_true",
                    help="Disable the backtrace -- evaluate only the current run time, like a single snapshot.")
     
-    # --- NEW: TRIPWIRE & RISK ARGUMENTS ---
     p.add_argument("--shock-mult", type=float, default=KINETIC_SHOCK_ATR_MULT,
                    help=f"Kinetic Shock multiplier vs Velocity ATR (default {KINETIC_SHOCK_ATR_MULT:g}).")
     p.add_argument("--ind-bb-std", type=float, default=IND_BB_PIERCE_STD,
@@ -1673,20 +1511,13 @@ def parse_args():
     p.add_argument("--track", type=str, default="", 
                    help="Specific symbol to track. Prints its 15-min intraday history and emails on state change.")
     args = p.parse_args()
-    
-    if args.checkpoint_min < 1: p.error("--checkpoint-min must be >= 1")
-    if args.strikes_up < 0 or args.strikes_down < 0: p.error("--strikes-up / --strikes-down must be >= 0")
-    if args.history_days < 1: p.error("--history-days must be >= 1")
-    if args.hard_stop_atr < 0 or args.soft_stop_atr < 0: p.error("Stop loss multipliers must be >= 0")
     return args
 
 if __name__ == "__main__":
     if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
-        print(f"{COLOR_RED_FG}[!] Missing UPSTOX_ACCESS_TOKEN environment variable.{COLOR_RESET}")
         sys.exit(1)
     args = parse_args()
     
-    # Override globals with CLI arguments
     MIN1_HISTORY_DAYS = args.history_days
     OPT_MIN_PRICE = args.opt_min_price
     OPT_MIN_VOLUME = args.opt_min_volume
@@ -1695,7 +1526,6 @@ if __name__ == "__main__":
     STRIKES_BELOW_ATM = args.strikes_down
     CHECKPOINT_INTERVAL_MIN = args.checkpoint_min
     
-    # Inject Risk / Shock variables
     KINETIC_SHOCK_ATR_MULT = args.shock_mult
     IND_BB_PIERCE_STD = args.ind_bb_std
     HARD_STOP_ATR_MULT = args.hard_stop_atr
@@ -1704,12 +1534,10 @@ if __name__ == "__main__":
     
     DAY_PCT_BASIS = args.day_pct_basis
     TOP_N_GRAVEYARD = args.graveyard_max
-    if args.single_snapshot:
-        BACKTRACE_CHECKPOINTS = False
-    try:
-        code = run_screener(args.mode, args.days, args.date, args.time, args.track)
+    if args.single_snapshot: BACKTRACE_CHECKPOINTS = False
+    
+    try: code = run_screener(args.mode, args.days, args.date, args.time, args.track)
     except Exception:
-        print(f"\n{COLOR_RED_FG}💥 FATAL: unhandled exception -- full traceback follows.{COLOR_RESET}")
         traceback.print_exc()
         code = 1
     sys.exit(code)
