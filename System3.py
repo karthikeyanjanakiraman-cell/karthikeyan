@@ -1086,7 +1086,6 @@ def _r_multiple(row):
 def _merge_signal(sig_rows, last_row, direction):
     first, latest = sig_rows[0], sig_rows[-1]
     row = dict(last_row)
-    row['CheckpointTime'] = first['CheckpointTime']
     row['ActiveAnchor'] = first['ActiveAnchor']
     row['AnchorPrice'] = first['AnchorPrice']
     row['AnchorDir'] = direction
