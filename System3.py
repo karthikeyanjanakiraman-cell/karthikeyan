@@ -947,17 +947,26 @@ def compute_row(symbol, master_1m, target_dt):
 # ==============================================================================
 # 3. WORKERS, FORMATTERS & UI
 # ==============================================================================
-def format_kinetic_triad(rsi, macd, di, symbol):
-    is_pe = " PE " in symbol or symbol.endswith("PE")
-    def fmt(sig):
-        if is_pe:
-            if sig == "Buy": return f"{COLOR_RED_FG}Sel{COLOR_RESET}"
-            if sig == "Sell": return f"{COLOR_GREEN_FG}Buy{COLOR_RESET}"
-        else:
-            if sig == "Buy": return f"{COLOR_GREEN_FG}Buy{COLOR_RESET}"
-            if sig == "Sell": return f"{COLOR_RED_FG}Sel{COLOR_RESET}"
-        return f"{COLOR_DIM} - {COLOR_RESET}"
-    return f"{fmt(rsi)} {fmt(macd)} {fmt(di)}"
+def _aligned_count(rsi, macd, di, symbol, direction):
+    """Count, out of RSI/MACD/DI for one multiplier block, how many point the same
+    way as `direction` ('BULL' or 'BEAR'). Buckets are now based on each contract's
+    OWN premium direction."""
+    want = "Buy" if direction == "BULL" else "Sell"
+    cnt = sum(1 for sig in (rsi, macd, di) if sig == want)
+    return cnt
+
+def format_kinetic_count(rsi, macd, di, symbol, direction, width=5):
+    cnt = _aligned_count(rsi, macd, di, symbol, direction)
+    color = COLOR_DIM if cnt == 0 else (COLOR_GREEN_FG if direction == "BULL" else COLOR_RED_FG)
+    text = str(cnt)
+    pad = max(0, width - len(text))
+    left = pad // 2
+    return f"{' ' * left}{color}{text}{COLOR_RESET}{' ' * (pad - left)}"
+
+def _row_aligned_count(row, mult, direction):
+    gtag = f"{mult}X"
+    return _aligned_count(row.get(f'BB_RSI_{gtag}'), row.get(f'BB_MACD_{gtag}'), row.get(f'ADX_{gtag}'),
+                          row.get('Symbol', ''), direction)
 
 def _history_worker_daily(args):
     item, start, end, progress = args
@@ -1055,23 +1064,19 @@ def _find_kill(kills, direction, anchor_time):
     return None
 
 def _exit_price(row):
-    """Price to evaluate a signal at: the actual fill/kill price once a
-    signal is [STOPPED] (the position is no longer live, so its realized
-    move must be frozen at the exit, not drift with the current LTP);
-    the live LTP otherwise."""
     if row.get('State') == "[STOPPED]" and row.get('KilledPrice', 0) > 0:
         return float(row['KilledPrice'])
     return float(row.get('LTP', 0.0) or 0.0)
 
 def _r_multiple(row):
-    """R-multiple = (favorable excursion from anchor) / BaseAtr, measured
-    at the exit price for a stopped signal and at the live LTP otherwise."""
     anchor_price = row.get('AnchorPrice', 0.0)
     base_atr = row.get('BaseAtr', 0.0)
     if not (anchor_price and anchor_price > 0 and base_atr and base_atr > 0):
         return 0.0
     price = _exit_price(row)
-    direction = row.get('AnchorDir')
+    
+    direction = row.get('PremiumDir', row.get('AnchorDir'))
+    
     if direction == 'BULL':
         return (price - anchor_price) / base_atr
     if direction == 'BEAR':
@@ -1099,10 +1104,6 @@ def _merge_signal(sig_rows, last_row, direction):
         else:
             row['KilledTime'], row['KilledPrice'], row['RejectReason'] = '-', 0.0, "Anchor no longer valid at the latest checkpoint"
 
-    # MovePct (and R-multiple, computed on demand via _r_multiple) must be
-    # anchored on the exit price once a signal is stopped -- using the
-    # still-ticking live LTP here previously kept showing a closed
-    # position's "move" changing after the trade was already over.
     ap = row['AnchorPrice'] or last_row['LTP']
     exit_price = _exit_price(row)
     row['MovePct'] = ((exit_price - ap) / ap) * 100 if ap else 0.0
@@ -1225,28 +1226,25 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
     print(f"\n{COLOR_BOLD}🔍 INTRADAY HISTORY FOR TRACKED SYMBOL: {matched_sym}{COLOR_RESET}")
     sym_w = max(12, len(matched_sym))
     header_str = (
-        f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP':>8} {'Day%':>7} | "
+        f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP':>8} | "
         f"{'Eval':^5} {'Anchor':^6} {'Anch Val':>9} {'R-Mult':>7} | "
-        f"{'1X (R-M-D)':^11}  {'2X (R-M-D)':^11}  {'3X (R-M-D)':^11}  {'5X (R-M-D)':^11} | "
+        f"{'1X':^5}  {'2X':^5}  {'3X':^5}  {'5X':^5} | "
         f"{'State':^16}{COLOR_RESET}"
     )
     print(header_str)
     print("-" * len(ANSI_RE.sub("", header_str)))
     
     for row in history:
-        day_pct_str = f"{row['DayChangePct']:>+6.2f}%"
-        day_color = COLOR_GREEN_FG if row['DayChangePct'] > 0 else COLOR_RED_FG if row['DayChangePct'] < 0 else COLOR_DIM
-        
-        # --- R-Multiple Calculation (frozen at exit price once stopped) ---
         r_mult = _r_multiple(row)
         r_mult_str = f"{r_mult:>+4.2f}R"
         r_color = COLOR_GREEN_FG if r_mult > 0 else COLOR_RED_FG if r_mult < 0 else COLOR_DIM
 
         sym = row['Symbol']
-        k1 = format_kinetic_triad(row.get('BB_RSI_1X'), row.get('BB_MACD_1X'), row.get('ADX_1X'), sym)
-        k2 = format_kinetic_triad(row.get('BB_RSI_2X'), row.get('BB_MACD_2X'), row.get('ADX_2X'), sym)
-        k3 = format_kinetic_triad(row.get('BB_RSI_3X'), row.get('BB_MACD_3X'), row.get('ADX_3X'), sym)
-        k5 = format_kinetic_triad(row.get('BB_RSI_5X'), row.get('BB_MACD_5X'), row.get('ADX_5X'), sym)
+        direction = row.get('AnchorDir') if row.get('AnchorDir') in ("BULL", "BEAR") else "BULL"
+        k1 = format_kinetic_count(row.get('BB_RSI_1X'), row.get('BB_MACD_1X'), row.get('ADX_1X'), sym, direction, width=5)
+        k2 = format_kinetic_count(row.get('BB_RSI_2X'), row.get('BB_MACD_2X'), row.get('ADX_2X'), sym, direction, width=5)
+        k3 = format_kinetic_count(row.get('BB_RSI_3X'), row.get('BB_MACD_3X'), row.get('ADX_3X'), sym, direction, width=5)
+        k5 = format_kinetic_count(row.get('BB_RSI_5X'), row.get('BB_MACD_5X'), row.get('ADX_5X'), sym, direction, width=5)
 
         state = row['State']
         shown_state = _state_display(row)
@@ -1259,8 +1257,7 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
 
         print(
             f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} "
-            f"{row['LTP']:>8.2f} "
-            f"{day_color}{day_pct_str}{COLOR_RESET} | "
+            f"{row['LTP']:>8.2f} | "
             f"{eval_time_str:^5} "
             f"{a_time:^6} "
             f"{row['AnchorPrice']:>9.2f} "
@@ -1290,9 +1287,7 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
                 print(f"   {COLOR_DIM}[track] Historical execution (Live: False) — skipping email transmission.{COLOR_RESET}")
                 return
             
-            # --- R-Multiple for Email (frozen at exit price once stopped) ---
             r_mult = _r_multiple(last_row)
-
             subject = f"[System3] {matched_sym} Alert: {prev_state} -> {last_state}"
             body = (
                 f"System3 detected a state transition for {matched_sym} at checkpoint {last_eval}.\n\n"
@@ -1406,15 +1401,10 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     for symbol, rows in by_symbol.items():
         b, r_, g = merge_symbol_rows(rows)
 
-        # Anchors are detected on the OPTION CONTRACT'S OWN premium series,
-        # not the underlying. A PE's premium rising ("BULL" anchor on the
-        # put) reflects a BEARISH move in the underlying, and a PE's
-        # premium falling ("BEAR" anchor) reflects a BULLISH move -- so PE
-        # signals are flipped into the underlying-direction bucket for
-        # display. CE and stock/cash-equity signals need no flip.
         is_pe = " PE " in symbol or symbol.endswith("PE")
 
         if b:
+            b['PremiumDir'] = "BULL"
             if is_pe:
                 b['AnchorDir'] = "BEAR"
                 if b['State'] == "[ACTIVE BUY]": b['State'] = "[ACTIVE SELL]"
@@ -1423,6 +1413,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
                 bulls.append(b)
 
         if r_:
+            r_['PremiumDir'] = "BEAR"
             if is_pe:
                 r_['AnchorDir'] = "BULL"
                 if r_['State'] == "[ACTIVE SELL]": r_['State'] = "[ACTIVE BUY]"
@@ -1440,10 +1431,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     bull_live = sum(1 for r in bulls if r['State'] != "[STOPPED]")
     bear_live = sum(1 for r in bears if r['State'] != "[STOPPED]")
 
-    def kinetic_score(r, target="Buy"):
-        keys = [f'{ind}_{m}X' for m in (1, 2, 3, 5) for ind in ('BB_RSI', 'BB_MACD', 'ADX')]
-        return sum(1 for k in keys if r.get(k) == target)
-
     def state_rank(st):
         if "[ACTIVE BUY]" in st or "[ACTIVE SELL]" in st:
             return 0
@@ -1451,8 +1438,30 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             return 1
         return 2
 
-    bulls.sort(key=lambda r: (state_rank(r['State']), -r.get('MovePct', 0.0)))
-    bears.sort(key=lambda r: (state_rank(r['State']), r.get('MovePct', 0.0)))
+    # New 7-Tier Sorting Logic:
+    # 1. State (Active first)
+    # 2. Checkpoint Eval Time (Descending - newest signals at top)
+    # 3. R-Multiple (Descending - highest profit)
+    # 4-7. Kinetic Tripwire Scores (1X, 2X, 3X, 5X - Descending)
+    bulls.sort(key=lambda r: (
+        state_rank(r['State']),
+        -int(r['CheckpointTime'].timestamp()),
+        -_r_multiple(r),
+        -_row_aligned_count(r, 1, 'BULL'),
+        -_row_aligned_count(r, 2, 'BULL'),
+        -_row_aligned_count(r, 3, 'BULL'),
+        -_row_aligned_count(r, 5, 'BULL')
+    ))
+
+    bears.sort(key=lambda r: (
+        state_rank(r['State']),
+        -int(r['CheckpointTime'].timestamp()),
+        -_r_multiple(r),
+        -_row_aligned_count(r, 1, 'BEAR'),
+        -_row_aligned_count(r, 2, 'BEAR'),
+        -_row_aligned_count(r, 3, 'BEAR'),
+        -_row_aligned_count(r, 5, 'BEAR')
+    ))
 
     bulls = bulls[:TOP_N_BUYERS]
     bears = bears[:TOP_N_SELLERS]
@@ -1483,28 +1492,25 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         if not data_list: return
         print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
         header_str = (
-            f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP':>8} {'Day%':>7} | "
+            f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP':>8} | "
             f"{'Seen':^5} {'Anchor':^6} {'Anch Val':>9} {'R-Mult':>7} | "
-            f"{'1X (R-M-D)':^11}  {'2X (R-M-D)':^11}  {'3X (R-M-D)':^11}  {'5X (R-M-D)':^11} | "
+            f"{'1X':^5}  {'2X':^5}  {'3X':^5}  {'5X':^5} | "
             f"{'State':^16}{COLOR_RESET}"
         )
         print(header_str)
         print("-" * len(ANSI_RE.sub("", header_str)))
 
         for row in data_list:
-            day_pct_str = f"{row['DayChangePct']:>+6.2f}%"
-            day_color = COLOR_GREEN_FG if row['DayChangePct'] > 0 else COLOR_RED_FG if row['DayChangePct'] < 0 else COLOR_DIM
-            
-            # --- R-Multiple Calculation (frozen at exit price once stopped) ---
             r_mult = _r_multiple(row)
             r_mult_str = f"{r_mult:>+4.2f}R"
             r_color = COLOR_GREEN_FG if r_mult > 0 else COLOR_RED_FG if r_mult < 0 else COLOR_DIM
 
             sym = row['Symbol']
-            k1 = format_kinetic_triad(row.get('BB_RSI_1X'), row.get('BB_MACD_1X'), row.get('ADX_1X'), sym)
-            k2 = format_kinetic_triad(row.get('BB_RSI_2X'), row.get('BB_MACD_2X'), row.get('ADX_2X'), sym)
-            k3 = format_kinetic_triad(row.get('BB_RSI_3X'), row.get('BB_MACD_3X'), row.get('ADX_3X'), sym)
-            k5 = format_kinetic_triad(row.get('BB_RSI_5X'), row.get('BB_MACD_5X'), row.get('ADX_5X'), sym)
+            direction = row.get('AnchorDir') if row.get('AnchorDir') in ("BULL", "BEAR") else "BULL"
+            k1 = format_kinetic_count(row.get('BB_RSI_1X'), row.get('BB_MACD_1X'), row.get('ADX_1X'), sym, direction, width=5)
+            k2 = format_kinetic_count(row.get('BB_RSI_2X'), row.get('BB_MACD_2X'), row.get('ADX_2X'), sym, direction, width=5)
+            k3 = format_kinetic_count(row.get('BB_RSI_3X'), row.get('BB_MACD_3X'), row.get('ADX_3X'), sym, direction, width=5)
+            k5 = format_kinetic_count(row.get('BB_RSI_5X'), row.get('BB_MACD_5X'), row.get('ADX_5X'), sym, direction, width=5)
 
             state = row['State']
             shown_state = _state_display(row)
@@ -1514,8 +1520,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
 
             print(
                 f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} "
-                f"{row['LTP']:>8.2f} "
-                f"{day_color}{day_pct_str}{COLOR_RESET} | "
+                f"{row['LTP']:>8.2f} | "
                 f"{row['CheckpointTime'].strftime('%H:%M'):^5} "
                 f"{row['ActiveAnchor']:^6} "
                 f"{row['AnchorPrice']:>9.2f} "
@@ -1533,7 +1538,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         print(f"\n{COLOR_BOLD}🚫 THE GRAVEYARD (Filtered / Rejected){COLOR_RESET}")
         header_str = (
             f" {COLOR_CYAN}{'Script':<{sym_w}} {'Signal':^6} {'Anchor':^6} {'Anch Val':>9} "
-            f"{'Killed':^6} {'Kill Val':>9} {'LTP':>8} {'Day%':>7} {'Move%':>7} | "
+            f"{'Killed':^6} {'Kill Val':>9} {'LTP':>8} {'Move%':>7} | "
             f"{'Forensic Rejection Reason'}{COLOR_RESET}"
         )
         print(header_str)
@@ -1550,9 +1555,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             k_time = row['KilledTime'] if row['KilledTime'] else '-'
             k_price = f"{row['KilledPrice']:>9.2f}" if row['KilledPrice'] > 0 else f"{'-':>9}"
 
-            day_pct_str = f"{row['DayChangePct']:>+6.2f}%"
-            day_color = COLOR_GREEN_FG if row['DayChangePct'] > 0 else COLOR_RED_FG if row['DayChangePct'] < 0 else COLOR_DIM
-
             if row['AnchorPrice'] > 0 and row['KilledPrice'] > 0:
                 move_pct_str = f"{row['MovePct']:>+6.2f}%"
                 move_color = _fav_color(row['MovePct'], sig)
@@ -1567,7 +1569,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             print(
                 f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} "
                 f"{sig_colored} {a_time:^6} {a_price} {k_time:^6} {k_price} "
-                f"{row['LTP']:>8.2f} {day_color}{day_pct_str}{COLOR_RESET} "
+                f"{row['LTP']:>8.2f} "
                 f"{move_color}{move_pct_str}{COLOR_RESET} | "
                 f"{reason_color}{reason}{COLOR_RESET}"
             )
