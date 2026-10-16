@@ -1238,6 +1238,9 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
 # ==============================================================================
 # MAIN RUNNER
 # ==============================================================================
+# ==============================================================================
+# MAIN RUNNER
+# ==============================================================================
 def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, target_time_str=None, track_symbol=""):
     t_start = time.time()
 
@@ -1245,25 +1248,42 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     if explicit:
         d_str = target_date_str or now_ist().strftime("%Y-%m-%d")
         t_str = target_time_str or "15:30"
-        try: cutoff_dt = datetime.strptime(f"{d_str} {t_str}", "%Y-%m-%d %H:%M")
-        except ValueError: return 1
+        try:
+            cutoff_dt = datetime.strptime(f"{d_str} {t_str}", "%Y-%m-%d %H:%M")
+        except ValueError:
+            print(f"{COLOR_RED_FG}[!] Invalid --date/--time '{d_str} {t_str}' (expected YYYY-MM-DD and HH:MM).{COLOR_RESET}")
+            return 1
     else:
         cutoff_dt = now_ist()
+    
     cutoff_dt = cutoff_dt.replace(second=0, microsecond=0)
     live_run = not explicit
 
     cutoff_dt, notes = resolve_session(cutoff_dt)
-    if STATS.auth_failed: return 1
+    if STATS.auth_failed:
+        print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401). Regenerate UPSTOX_ACCESS_TOKEN -- it expires daily.{COLOR_RESET}")
+        return 1
+        
     target_dt = cutoff_dt.date()
     cutoff_dt = min(cutoff_dt, _close_dt(target_dt))
     today_session = (target_dt == now_ist().date())
 
     print(f"\n{COLOR_CYAN}📡 Initializing Tracker [{mode}] | Time Machine: {cutoff_dt.strftime('%Y-%m-%d %H:%M:%S')} (Live: {live_run}){COLOR_RESET}")
+    for n in notes:
+        print(f"   {COLOR_YELLOW}» {n}{COLOR_RESET}")
 
     needles = [track_symbol] if track_symbol else []
     universe_raw = get_dynamic_universe(mode, cutoff_dt, today_session, needles=needles)
     
-    if STATS.auth_failed or not universe_raw: return 1
+    if STATS.auth_failed:
+        print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401). Regenerate UPSTOX_ACCESS_TOKEN -- it expires daily.{COLOR_RESET}")
+        return 1
+    if not universe_raw:
+        print(f"{COLOR_RED_FG}[!] Universe is EMPTY for mode {mode} -- nothing to scan. See the messages above for why.{COLOR_RESET}")
+        _print_error_summary()
+        return 1
+        
+    print(f"   {COLOR_DIM}» Universe: {len(universe_raw)} instruments{COLOR_RESET}")
 
     if mode == "INDEX_OPTIONS":
         candidates = universe_raw
@@ -1273,109 +1293,169 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
             candidates = [r for r in ex.map(_history_worker_daily, [(it, daily_start, target_dt, prog) for it in universe_raw]) if r is not None]
         prog.done()
-        if STATS.auth_failed or not candidates: return 1
+        if STATS.auth_failed:
+            print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401) during the prefilter.{COLOR_RESET}")
+            return 1
+        if not candidates:
+            print(f"{COLOR_YELLOW}[!] 0 of {len(universe_raw)} instruments passed the price/volume prefilter "
+                  f"(price {MIN_PRICE}-{MAX_PRICE}, volume >= {MIN_DAILY_VOLUME}).{COLOR_RESET}")
+            _print_error_summary()
+            return 1 if (STATS.failed or ERRORS.items) else 0
+        print(f"   {COLOR_DIM}» Prefilter: {len(universe_raw)} -> {len(candidates)} instruments{COLOR_RESET}")
 
     checkpoints = generate_checkpoints(cutoff_dt) if BACKTRACE_CHECKPOINTS else [cutoff_dt]
-    
+    print(f"   {COLOR_DIM}» Backtrace checkpoints ({len(checkpoints)}): "
+          f"{', '.join(c.strftime('%H:%M') for c in checkpoints)}{COLOR_RESET}")
+
     prog = Progress("checkpoints", len(candidates))
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
         per_symbol = list(ex.map(process_stock_checkpoints,
                                   [(item, checkpoints, today_session, MIN1_HISTORY_DAYS, mode, prog) for item in candidates]))
     prog.done()
 
-    if STATS.auth_failed: return 1
+    if STATS.auth_failed:
+        print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401) while fetching candles.{COLOR_RESET}")
+        return 1
 
     outcomes = [o for sym_outcomes in per_symbol for o in sym_outcomes]
     results = [p for _, s, p in outcomes if s == "ok"]
+    counts = {k: sum(1 for _, s, _ in outcomes if s == k) for k in ("no_data", "illiquid", "short_history", "error")}
+    
+    print(f"   {COLOR_DIM}» Scan summary: {len(candidates)} instruments x {len(checkpoints)} checkpoints = "
+          f"{len(outcomes)} evaluations | ok {len(results)} | no data {counts['no_data']} | illiquid {counts['illiquid']} | "
+          f"short history {counts['short_history']} | errors {counts['error']}{COLOR_RESET}")
+          
+    if counts["short_history"]:
+        print(f"   {COLOR_YELLOW}» {counts['short_history']} evaluations skipped: fewer than {ATR_MIN_BARS} completed sessions of "
+              f"history for the ATR (new contracts, or --history-days too small).{COLOR_RESET}")
 
-    if not results: return 1
+    if not results:
+        print(f"{COLOR_RED_FG}[!] No instrument produced usable data at any checkpoint up to {cutoff_dt:%Y-%m-%d %H:%M}. "
+              f"Is that a trading day/time, and does the token have historical-candle access?{COLOR_RESET}")
+        _print_error_summary()
+        return 1
 
+    # --- THE STRICT SEGREGATION PIPELINE ---
     by_symbol = {}
     for row in results:
         by_symbol.setdefault(row['Symbol'], []).append(row)
 
-    bulls, bears, rejected = [], [], []
+    bulls_live, bears_live, graveyard_candidates = [], [], []
+
     for symbol, rows in by_symbol.items():
         b, r_, g = merge_symbol_rows(rows)
         is_pe = " PE " in symbol or symbol.endswith("PE")
 
-        if b:
-            b['PremiumDir'] = "BULL"
+        for item, raw_dir in ((b, "BULL"), (r_, "BEAR")):
+            if not item: continue
+
+            # Assign Directional Inversion
             if is_pe:
-                b['AnchorDir'] = "BEAR"
-                bears.append(b)
-            else: bulls.append(b)
+                item['PremiumDir'] = "BEAR" if raw_dir == "BULL" else "BULL"
+                item['AnchorDir'] = "BEAR" if raw_dir == "BULL" else "BULL"
+            else:
+                item['PremiumDir'] = raw_dir
+                item['AnchorDir'] = raw_dir
 
-        if r_:
-            r_['PremiumDir'] = "BEAR"
-            if is_pe:
-                r_['AnchorDir'] = "BULL"
-                bulls.append(r_)
-            else: bears.append(r_)
+            # STRICT SEGREGATION: Stopped trades go straight to Graveyard
+            if item['State'] == "[STOPPED]" or "[STOP" in str(item.get('State', '')):
+                graveyard_candidates.append(item)
+            else:
+                # ONLY surviving anchors enter active pools
+                if item['PremiumDir'] == "BULL":
+                    bulls_live.append(item)
+                else:
+                    bears_live.append(item)
 
-        if g: rejected.append(g)
+        if g:
+            graveyard_candidates.append(g)
 
-    if track_symbol: print_and_alert_tracked_history(track_symbol, by_symbol, live_run=live_run)
+    if track_symbol:
+        print_and_alert_tracked_history(track_symbol, by_symbol, live_run=live_run)
 
-    # Purge anomalous heavy losers that shouldn't clutter the top lists
-    true_bulls = [r for r in bulls if _r_multiple(r) >= -1.5]
-    true_bears = [r for r in bears if _r_multiple(r) >= -1.5]
-    
-    for r in bulls + bears:
-        if r not in true_bulls and r not in true_bears:
-            r['RejectReason'] = "Adverse Kinetic Drift (Plunged below limits)"
-            rejected.append(r)
+    # --- ADVERSE DRIFT PURGE ---
+    # Filter out negative R-Multiples or degrading drifts from Top Surviving setups
+    surviving_bulls = [r for r in bulls_live if _r_multiple(r) > -0.5]
+    surviving_bears = [r for r in bears_live if _r_multiple(r) > -0.5]
 
-    bulls = true_bulls
-    bears = true_bears
+    # Any live setup bleeding past -0.5R without triggering stop moves to Graveyard
+    for r in bulls_live:
+        if r not in surviving_bulls:
+            r['RejectReason'] = "Adverse Drift (Losing R-Multiple)"
+            graveyard_candidates.append(r)
+
+    for r in bears_live:
+        if r not in surviving_bears:
+            r['RejectReason'] = "Adverse Drift (Losing R-Multiple)"
+            graveyard_candidates.append(r)
 
     def state_rank(st):
         if "[ BB > KC ]" in st: return 0
         if "[ BB < KC ]" in st: return 1
         return 2
 
-    # FIX: Prioritize R-Multiple OVER Checkpoint Timestamp
-    bulls.sort(key=lambda r: (
-        state_rank(r['State']),
+    # --- SORT CRITERIA ---
+    # 1. Highest R-Multiple first
+    # 2. Expanding State [BB > KC] over [BB < KC]
+    # 3. ATR 1X Grid Count (Kinetic intensity)
+    # 4. BB 1X Grid Count (Structural breakout)
+    surviving_bulls.sort(key=lambda r: (
         -_r_multiple(r),
-        -int(r['CheckpointTime'].timestamp()),
+        state_rank(r['State']),
         -r.get('ATR_Grid', {}).get(1, 0),
-        -r.get('BB_Grid', {}).get(1, 0)
+        -r.get('BB_Grid', {}).get(1, 0),
+        -int(r['CheckpointTime'].timestamp())
     ))
 
-    bears.sort(key=lambda r: (
-        state_rank(r['State']),
+    surviving_bears.sort(key=lambda r: (
         -_r_multiple(r),
-        -int(r['CheckpointTime'].timestamp()),
+        state_rank(r['State']),
         -r.get('ATR_Grid', {}).get(1, 0),
-        -r.get('BB_Grid', {}).get(1, 0)
+        -r.get('BB_Grid', {}).get(1, 0),
+        -int(r['CheckpointTime'].timestamp())
     ))
 
-    bull_count_str = f"{len(bulls)}"
-    bear_count_str = f"{len(bears)}"
-    bulls = bulls[:TOP_N_BUYERS]
-    bears = bears[:TOP_N_SELLERS]
+    bulls = surviving_bulls[:TOP_N_BUYERS]
+    bears = surviving_bears[:TOP_N_SELLERS]
 
+    # Graveyard Sorting: Most recent stops & biggest moves first
     def sort_reason(r):
-        reason = r['RejectReason']
-        if "Kinetic SL" in reason or "Hard stop" in reason or "Adverse" in reason: return 0
-        if "Warzone" in reason: return 1
-        if "Alignment" in reason: return 2
+        reason = str(r.get('RejectReason', ''))
+        if "Hard stop" in reason or "Kinetic SL" in reason: return 0
+        if "Adverse" in reason: return 1
+        if "Warzone" in reason: return 2
         return 3
 
-    rejected.sort(key=lambda x: (sort_reason(x), -abs(x['DayChangePct'])))
-    grave_total = len(rejected)
-    grave_shown = rejected if TOP_N_GRAVEYARD <= 0 else rejected[:TOP_N_GRAVEYARD]
+    graveyard_candidates.sort(key=lambda x: (
+        sort_reason(x),
+        -_r_multiple(x) if _r_multiple(x) != 0 else -abs(x.get('DayChangePct', 0.0))
+    ))
 
-    sym_w = max(12, min(MAX_SYMBOL_WIDTH, max((len(r['Symbol']) for r in bulls + bears + grave_shown), default=12)))
+    # --- GRAVEYARD DEDUPLICATION ---
+    dedup_grave = []
+    seen_grave = set()
+    for row in graveyard_candidates:
+        gid = (row['Symbol'], row.get('ActiveAnchor', '-'), row.get('KilledTime', '-'))
+        if gid not in seen_grave:
+            seen_grave.add(gid)
+            dedup_grave.append(row)
+
+    grave_total = len(dedup_grave)
+    grave_shown = dedup_grave if TOP_N_GRAVEYARD <= 0 else dedup_grave[:TOP_N_GRAVEYARD]
+
+    all_shown = bulls + bears + grave_shown
+    sym_w = max(12, min(MAX_SYMBOL_WIDTH, max((len(r['Symbol']) for r in all_shown), default=12)))
 
     print(f"\n{COLOR_BOLD}=== STATEFUL INSTITUTIONAL VOLATILITY TRACKER [{mode}] ==={COLOR_RESET}")
+    print(f"Target Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Scanned: {len(by_symbol)} symbols "
+          f"across {len(checkpoints)} checkpoints | Surviving: {len(bulls)} bull, {len(bears)} bear | "
+          f"Graveyard: {grave_total}\n")
 
+    # --- VISUAL DASHBOARD RENDERER ---
     def print_basket(title, icon, data_list):
         if not data_list: return
         print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
         
-        # Updated Header: LTP replaced with LTP/Exit
         header_str = (
             f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP/Exit':>8} | "
             f"{'Seen':^5} {'Anchor':^6} {'Anch Val':>9} {'R-Mult':>7} | "
@@ -1404,7 +1484,6 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             state = row['State']
             shown_state = _state_display(row)
             if "[ BB > KC ]" in state:
-                # Arrow always matches the basket direction purely.
                 dir_tag = "▲" if basket_dir == "BULL" else "▼"
                 shown_state = f"[ BB > KC ] {dir_tag}".strip()
                 state_text = f"{COLOR_GREEN_FG if dir_tag=='▲' else COLOR_RED_FG}{shown_state:^13}{COLOR_RESET}"
@@ -1430,7 +1509,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
                 f"{b1}  {b2}  {b3}  {b5}  | "
                 f"{state_text}"
             )
-    
+
     print_basket("TOP BULL SETUPS (Valid Anchors Surviving)", "🔥", bulls)
     print_basket("TOP BEAR SETUPS (Valid Anchors Surviving)", "🩸", bears)
 
@@ -1477,6 +1556,8 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             print(f"{COLOR_DIM}   ... {grave_total - len(grave_shown)} more graveyard row(s) not shown.{COLOR_RESET}")
 
     _print_error_summary()
+    total_calls = sum(l.total_calls for l in LIMITERS.values())
+    print(f"\n⏱️ Tracker sync completed in {(time.time() - t_start):.2f} seconds ({total_calls} API calls).\n")
     return 0
 
 def parse_args():
