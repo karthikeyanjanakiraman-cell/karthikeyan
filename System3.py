@@ -746,7 +746,7 @@ def _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts):
     rsi_std = pd.Series(rsi).rolling(BB_PERIOD, min_periods=1).std(ddof=0).values
 
     # Build a gap-adjusted synthetic close for MACD so a 3% overnight jump doesn't blow out hist_std/atr_hist
-    intraday_ close_chain = np.cumsum(delta) + open_[0]
+    intraday_close_chain = np.cumsum(delta) + open_[0]
     macd = _ewm(intraday_close_chain, 2 / 13) - _ewm(intraday_close_chain, 2 / 27)
     hist = macd - _ewm(macd, 2 / 10)
     h_mean = pd.Series(hist).rolling(BB_PERIOD, min_periods=1).mean().values
