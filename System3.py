@@ -2,10 +2,10 @@
 """
 Strict Institutional Volatility Tracker (Upstox) - System 3.0 (Ultimate Full Edition)
 + Modes: STOCK_FNO, CASH_EQUITY, INDEX_OPTIONS
-+ Session-Open Gap Neutralization: Prevents overnight gaps from blinding morning Keltner & Velocity ATRs.
-+ 3-Lock Master Trigger with Quorum Gating (3/4) & Rolling 3-Bar Shock Window (catches 09:15-09:30 movers).
-+ Multi-Anchor Lifecycle: Preserves banked morning R-Multiples when a stock re-anchors in the afternoon.
-+ Strict Segregation Pipeline: Stopped trades route exclusively to The Graveyard.
++ Absolute Session Isolation: Bollinger Bands & Indicators reset at 09:15 to prevent gap contamination.
++ 3-Lock Master Trigger with Quorum Gating (3/4) & Rolling 3-Bar Shock Window.
++ Smart Trailing: Soft Kinetic Stops disable after +2.0R to let massive trends run.
++ Auction Filter: Blocks new anchors after 15:15 to eliminate end-of-day garbage ticks.
 """
 import os
 import sys
@@ -48,7 +48,7 @@ SHOCK_WINDOW_BARS = 3           # Rolling 1m bars (e.g. 3 mins) to align sequent
 HARD_STOP_ATR_MULT = 1.2        # Hard unconditional trailing stop (in Base ATRs from peak)
 SOFT_STOP_ATR_MULT = 1.0        # Soft kinetic trailing stop (in Base ATRs from peak)
 SOFT_STOP_OPPOSING_SCORE = 2    # Opposing indicators (0 to 4 scale) needed to trigger the Soft Stop
-ADVERSE_DRIFT_R_FLOOR = -0.5    # Live setups bleeding past this R-Multiple (without banked R cover) purge to Graveyard
+ADVERSE_DRIFT_R_FLOOR = -0.5    # Live setups bleeding past this R-Multiple purge to Graveyard
 
 # --- INDEX OPTIONS ---
 EXPIRY_SELECTION = "CURRENT"
@@ -68,7 +68,7 @@ HA_ATR_MULTIPLIERS = [1, 2, 3, 5]
 ATR_BASIS_PERIOD = 14
 ATR_BASIS_TF = "15min"
 ATR_MIN_BARS = 5
-MIN_ATR_PCT = 0.001
+MIN_ATR_PCT = 0.005  # Absolute minimum ATR floor (0.5% of stock price) to prevent Wipro/TCS micro-stopouts
 
 TOP_N_BUYERS = 50
 TOP_N_SELLERS = 50
@@ -138,8 +138,7 @@ class BudgetLimiter:
             with self.lock:
                 now = time.time()
                 cut = bisect_left(self.stamps, now - self.horizon)
-                if cut:
-                    del self.stamps[:cut]
+                if cut: del self.stamps[:cut]
                 n = len(self.stamps)
                 wait = max(0.0, self.block_until - now)
                 for span, cap in self.caps:
@@ -187,10 +186,8 @@ LIMITERS = {
 _TLS = threading.local()
 
 def _limiter_for(url):
-    if "market-quote/quotes" in url:
-        return LIMITERS["quotes"]
-    if "/intraday/" in url:
-        return LIMITERS["intraday"]
+    if "market-quote/quotes" in url: return LIMITERS["quotes"]
+    if "/intraday/" in url: return LIMITERS["intraday"]
     return LIMITERS["history"]
 
 def _session():
@@ -203,10 +200,7 @@ def _session():
 
 class Progress:
     def __init__(self, label, total):
-        self.label = label
-        self.total = total
-        self.n = 0
-        self.step = max(1, total // 20)
+        self.label, self.total, self.n, self.step = label, total, 0, max(1, total // 20)
         self.lock = threading.Lock()
 
     def tick(self):
@@ -215,16 +209,14 @@ class Progress:
             if self.n == self.total or self.n % self.step == 0:
                 print(f"\r   {self.label}: {self.n}/{self.total}", end="", file=sys.stderr, flush=True)
 
-    def done(self):
-        print("", file=sys.stderr)
+    def done(self): print("", file=sys.stderr)
 
 # ==============================================================================
 # 1. UPSTOX API
 # ==============================================================================
 def _get(url, params=None, retries=4):
     token = os.environ.get("UPSTOX_ACCESS_TOKEN")
-    if not token or STATS.auth_failed:
-        return 401, None
+    if not token or STATS.auth_failed: return 401, None
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
     limiter = _limiter_for(url)
     short = url.split("/v2/")[-1][:90]
@@ -234,8 +226,7 @@ def _get(url, params=None, retries=4):
         try:
             r = _session().get(url, headers=headers, params=params, timeout=20)
             code = r.status_code
-            if code == 200:
-                return 200, r.json()
+            if code == 200: return 200, r.json()
             if code == 401:
                 STATS.mark_auth_failed()
                 return 401, None
@@ -252,37 +243,27 @@ def _get(url, params=None, retries=4):
     return 0, None
 
 def _to_frame(candles):
-    if not candles:
-        return None
+    if not candles: return None
     df = pd.DataFrame(candles).iloc[:, :6]
     df.columns = ['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']
     ts = df['Timestamp'].astype(str)
-    try:
-        df['Datetime'] = pd.to_datetime(ts.str.slice(0, 19), format="%Y-%m-%dT%H:%M:%S")
-    except ValueError:
-        df['Datetime'] = pd.to_datetime(ts, utc=True).dt.tz_convert(IST).dt.tz_localize(None)
-    for c in ('Open', 'High', 'Low', 'Close', 'Volume'):
-        df[c] = df[c].astype(float)
+    try: df['Datetime'] = pd.to_datetime(ts.str.slice(0, 19), format="%Y-%m-%dT%H:%M:%S")
+    except ValueError: df['Datetime'] = pd.to_datetime(ts, utc=True).dt.tz_convert(IST).dt.tz_localize(None)
+    for c in ('Open', 'High', 'Low', 'Close', 'Volume'): df[c] = df[c].astype(float)
     return df.drop(columns='Timestamp').drop_duplicates(subset='Datetime').sort_values('Datetime').reset_index(drop=True)
 
 def _candles(url):
     status, js = _get(url)
-    if status != 200 or not js:
-        return status, None
+    if status != 200 or not js: return status, None
     try:
         return 200, _to_frame((js.get('data') or {}).get('candles') or [])
     except Exception as e:
         STATS.fail(f"candle parse error ({type(e).__name__}: {e}) for {url.split('/v2/')[-1][:60]}")
         return 200, None
 
-def _url_range_daily(key, start, end):
-    return f"{API_HOST}/v2/historical-candle/{urllib.parse.quote(key)}/day/{end:%Y-%m-%d}/{start:%Y-%m-%d}"
-
-def _url_range_1m(key, start, end):
-    return f"{API_HOST}/v2/historical-candle/{urllib.parse.quote(key)}/1minute/{end:%Y-%m-%d}/{start:%Y-%m-%d}"
-
-def _url_intraday(key):
-    return f"{API_HOST}/v2/historical-candle/intraday/{urllib.parse.quote(key)}/1minute"
+def _url_range_daily(key, start, end): return f"{API_HOST}/v2/historical-candle/{urllib.parse.quote(key)}/day/{end:%Y-%m-%d}/{start:%Y-%m-%d}"
+def _url_range_1m(key, start, end): return f"{API_HOST}/v2/historical-candle/{urllib.parse.quote(key)}/1minute/{end:%Y-%m-%d}/{start:%Y-%m-%d}"
+def _url_intraday(key): return f"{API_HOST}/v2/historical-candle/intraday/{urllib.parse.quote(key)}/1minute"
 
 def _date_chunks(start, end, span=7):
     cur = end
@@ -294,53 +275,40 @@ def _date_chunks(start, end, span=7):
 def generate_checkpoints(cutoff_dt, interval_min=None):
     interval = max(1, int(interval_min or CHECKPOINT_INTERVAL_MIN))
     session_open = _open_dt(cutoff_dt.date())
-    if cutoff_dt <= session_open:
-        return [cutoff_dt]
-    checkpoints = []
-    t = session_open + timedelta(minutes=interval)
+    if cutoff_dt <= session_open: return [cutoff_dt]
+    checkpoints, t = [], session_open + timedelta(minutes=interval)
     while t <= cutoff_dt:
         checkpoints.append(t)
         t += timedelta(minutes=interval)
-    if not checkpoints or checkpoints[-1] < cutoff_dt:
-        checkpoints.append(cutoff_dt)
+    if not checkpoints or checkpoints[-1] < cutoff_dt: checkpoints.append(cutoff_dt)
     return checkpoints
 
 def fetch_quotes(items, batch=200):
     batches = [items[i:i + batch] for i in range(0, len(items), batch)]
-
     def one(b):
         status, js = _get(f"{API_HOST}/v2/market-quote/quotes", params={"instrument_key": ",".join(x['key'] for x in b)})
-        if status != 200 or not js:
-            return {}
+        if status != 200 or not js: return {}
         by_ts = {f"{x['key'].split('|')[0]}:{x['symbol']}": x['key'] for x in b}
-        data = js.get('data') or {}
-        out = {}
+        data, out = js.get('data') or {}, {}
         for k, v in data.items():
             key = v.get('instrument_token') or by_ts.get(k)
-            if not key and len(b) == 1 and len(data) == 1:
-                key = b[0]['key']
-            if key:
-                out[key] = {'ltp': v.get('last_price') or 0.0, 'vol': v.get('volume') or 0}
+            if not key and len(b) == 1 and len(data) == 1: key = b[0]['key']
+            if key: out[key] = {'ltp': v.get('last_price') or 0.0, 'vol': v.get('volume') or 0}
         return out
-
     res = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(WORKERS, max(1, len(batches)))) as ex:
-        for part in ex.map(one, batches):
-            res.update(part)
+        for part in ex.map(one, batches): res.update(part)
     return res
 
 def fetch_today(key):
-    if now_ist().weekday() >= 5:
-        return None
+    if now_ist().weekday() >= 5: return None
     status, df = _candles(_url_intraday(key))
-    if status != 200 or df is None:
-        return None
+    if status != 200 or df is None: return None
     df = df[df['Datetime'].dt.date == now_ist().date()]
     return df if not df.empty else None
 
 def _session_traded(d, today):
-    if d.weekday() >= 5:
-        return False
+    if d.weekday() >= 5: return False
     if d == today:
         df = fetch_today(PROBE_KEY)
         return df is not None and not df.empty
@@ -351,39 +319,28 @@ def resolve_session(cutoff_dt):
     notes = []
     now = now_ist().replace(second=0, microsecond=0)
     if cutoff_dt > now:
-        notes.append(f"snapshot {cutoff_dt:%Y-%m-%d %H:%M} is in the future -- using the current time {now:%Y-%m-%d %H:%M} instead")
+        notes.append(f"snapshot {cutoff_dt:%Y-%m-%d %H:%M} is in the future -- using current time {now:%Y-%m-%d %H:%M} instead")
         cutoff_dt = now
     target = cutoff_dt.date()
 
-    if cutoff_dt <= _open_dt(target):
-        why = f"{cutoff_dt:%Y-%m-%d %H:%M} is at/before the {_open_dt(target):%H:%M} open"
-    elif target.weekday() >= 5:
-        why = f"{target} is a weekend"
-    elif _session_traded(target, now.date()):
-        return min(cutoff_dt, _close_dt(target)), notes
-    elif STATS.auth_failed:
-        return cutoff_dt, notes
-    else:
-        why = f"no trading data for {target} (market holiday?)"
+    if cutoff_dt <= _open_dt(target): why = f"{cutoff_dt:%Y-%m-%d %H:%M} is at/before the {_open_dt(target):%H:%M} open"
+    elif target.weekday() >= 5: why = f"{target} is a weekend"
+    elif _session_traded(target, now.date()): return min(cutoff_dt, _close_dt(target)), notes
+    elif STATS.auth_failed: return cutoff_dt, notes
+    else: why = f"no trading data for {target} (market holiday?)"
 
     d = target - timedelta(days=1)
     for _ in range(14):
-        if STATS.auth_failed:
-            return cutoff_dt, notes
+        if STATS.auth_failed: return cutoff_dt, notes
         if _session_traded(d, now.date()):
             notes.append(f"{why} -> using the last completed session: {d} {SESSION_CLOSE_MIN // 60}:{SESSION_CLOSE_MIN % 60:02d}")
             return _close_dt(d), notes
         d -= timedelta(days=1)
-    notes.append(f"{why}, and no trading session was found in the previous 14 days -- continuing with the requested time")
+    notes.append(f"{why}, and no trading session was found in the previous 14 days -- continuing with requested time")
     return cutoff_dt, notes
 
 def prepare_master(dfs):
-    master = (
-        pd.concat([d[['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume']] for d in dfs], ignore_index=True)
-        .drop_duplicates(subset='Datetime')
-        .sort_values('Datetime')
-        .reset_index(drop=True)
-    )
+    master = pd.concat([d[['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume']] for d in dfs], ignore_index=True).drop_duplicates(subset='Datetime').sort_values('Datetime').reset_index(drop=True)
     dt = master['Datetime']
     day = dt.dt.normalize()
     master['Min'] = dt.dt.hour.values * 60 + dt.dt.minute.values
@@ -392,14 +349,11 @@ def prepare_master(dfs):
     return master
 
 def _unwrap_master(data):
-    if isinstance(data, list):
-        return data
+    if isinstance(data, list): return data
     if isinstance(data, dict):
-        if isinstance(data.get("data"), list):
-            return data["data"]
+        if isinstance(data.get("data"), list): return data["data"]
         for v in data.values():
-            if isinstance(v, list):
-                return v
+            if isinstance(v, list): return v
     return []
 
 def _download_master(name, _is_fallback=False):
@@ -410,102 +364,48 @@ def _download_master(name, _is_fallback=False):
         try:
             resp = requests.get(url, timeout=90)
             if resp.status_code == 200:
-                try:
-                    rows = _unwrap_master(json.loads(gzip.decompress(resp.content).decode('utf-8')))
-                except Exception as e:
-                    last_reason = f"downloaded OK but could not gunzip/parse JSON: {e}"
+                try: rows = _unwrap_master(json.loads(gzip.decompress(resp.content).decode('utf-8')))
+                except Exception as e: last_reason = f"downloaded OK but could not gunzip JSON: {e}"
                 else:
-                    if rows:
-                        return rows
-                    last_reason = "downloaded and parsed OK but the file contained 0 rows"
+                    if rows: return rows
+                    last_reason = "downloaded and parsed OK but file contained 0 rows"
             else:
                 last_reason = f"HTTP {resp.status_code} ({resp.reason})"
-                if resp.status_code == 404:
-                    print(f"   {COLOR_YELLOW}[master:{name}] {last_reason} -- {url}{COLOR_RESET}", file=sys.stderr)
-                    break
-        except requests.RequestException as e:
-            last_reason = f"network error: {e}"
-        except Exception as e:
-            last_reason = f"unexpected error: {type(e).__name__}: {e}"
-        print(f"   {COLOR_YELLOW}[master:{name}] attempt {attempt}/3 failed: {last_reason}{COLOR_RESET}", file=sys.stderr)
+                if resp.status_code == 404: break
+        except requests.RequestException as e: last_reason = f"network error: {e}"
+        except Exception as e: last_reason = f"unexpected error: {type(e).__name__}: {e}"
         time.sleep(1.0)
-
-    print(f"   {COLOR_RED_FG}[master:{name}] FAILED after {attempts_made} attempt(s): {last_reason}{COLOR_RESET}", file=sys.stderr)
-
     if not _is_fallback and name.upper() in ("NSE", "BSE"):
-        print(f"   {COLOR_DIM}[master:{name}] trying combined 'complete' master as fallback...{COLOR_RESET}", file=sys.stderr)
         full = _download_master("complete", _is_fallback=True)
-        rows = [
-            r for r in full
-            if str(r.get("exchange", "")).upper() == name.upper()
-            or str(r.get("segment", "")).upper().startswith(name.upper())
-        ]
-        if rows:
-            print(f"   {COLOR_DIM}[master:{name}] fallback recovered {len(rows)} rows.{COLOR_RESET}", file=sys.stderr)
-            return rows
+        rows = [r for r in full if str(r.get("exchange", "")).upper() == name.upper() or str(r.get("segment", "")).upper().startswith(name.upper())]
+        if rows: return rows
     return []
 
 def resolve_pins(cands, needles, label="symbol"):
     pinned = set()
     norm = [(_norm_sym(sym), sym, key) for sym, key in cands]
-    MAX_PINNED_MATCHES = 8
     for raw in needles:
         n = _norm_sym(raw)
-        if not n:
-            continue
+        if not n: continue
         hits = [c for c in norm if c[0] == n] or [c for c in norm if n in c[0]]
-        if not hits:
-            print(f"   {COLOR_YELLOW}» track '{raw}': no {label} in the instrument master matches it.{COLOR_RESET}")
-            continue
+        if not hits: continue
         hits.sort(key=lambda c: c[2])
-        if len(hits) > MAX_PINNED_MATCHES:
-            print(f"   {COLOR_YELLOW}» track '{raw}': {len(hits)} matches -- keeping the first {MAX_PINNED_MATCHES}; "
-                  f"use a more specific value.{COLOR_RESET}")
-            hits = hits[:MAX_PINNED_MATCHES]
-        names = ", ".join(h[1] for h in hits[:3]) + (" ..." if len(hits) > 3 else "")
-        print(f"   {COLOR_DIM}» track '{raw}': pinned {len(hits)} {label}(s) -- always scanned, filters bypassed: {names}{COLOR_RESET}")
-        pinned.update(h[1] for h in hits)
+        pinned.update(h[1] for h in hits[:8])
     return pinned
 
 def _equity_universe(mode, needles=()):
     nse = _download_master("NSE")
-    if not nse:
-        print(f"{COLOR_RED_FG}[!] NSE instrument master unavailable -- cannot build the {mode} universe.{COLOR_RESET}")
-        return []
-
-    def ts_of(i):
-        return i.get("tradingsymbol", i.get("trading_symbol"))
-
-    def plain(i):
-        return (
-            i.get("segment") == "NSE_EQ"
-            and ts_of(i)
-            and i.get("instrument_key")
-            and (INCLUDE_NON_EQ_SERIES or (i.get("instrument_type") or "EQ") == "EQ")
-        )
-
+    if not nse: return []
+    def ts_of(i): return i.get("tradingsymbol", i.get("trading_symbol"))
+    def plain(i): return (i.get("segment") == "NSE_EQ" and ts_of(i) and i.get("instrument_key") and (INCLUDE_NON_EQ_SERIES or (i.get("instrument_type") or "EQ") == "EQ"))
     fno = {i.get("underlying_symbol") for i in nse if i.get("segment") == "NSE_FO" and i.get("underlying_symbol")}
     everything = {i["instrument_key"]: {"symbol": ts_of(i), "key": i["instrument_key"]} for i in nse if plain(i)}
-    in_mode = {
-        k: v for k, v in everything.items()
-        if ((v["symbol"] in fno) if mode == "STOCK_FNO" else (v["symbol"] not in fno))
-    }
-
+    in_mode = {k: v for k, v in everything.items() if ((v["symbol"] in fno) if mode == "STOCK_FNO" else (v["symbol"] not in fno))}
     pinned = set()
-    if needles:
-        pinned = resolve_pins(
-            [(v["symbol"], (len(v["symbol"]), v["symbol"])) for v in everything.values()],
-            needles,
-            "equity symbol"
-        )
+    if needles: pinned = resolve_pins([(v["symbol"], (len(v["symbol"]), v["symbol"])) for v in everything.values()], needles, "equity symbol")
     out = {k: dict(v, pinned=v["symbol"] in pinned) for k, v in in_mode.items()}
-    extra = 0
     for k, v in everything.items():
-        if v["symbol"] in pinned and k not in out:
-            out[k] = dict(v, pinned=True)
-            extra += 1
-    if extra:
-        print(f"   {COLOR_DIM}» {extra} tracked symbol(s) sit outside the {mode} universe -- added for tracking.{COLOR_RESET}")
+        if v["symbol"] in pinned and k not in out: out[k] = dict(v, pinned=True)
     return list(out.values())
 
 def _resolve_index_spot_price(key, name, cutoff_dt, use_intraday):
@@ -514,35 +414,26 @@ def _resolve_index_spot_price(key, name, cutoff_dt, use_intraday):
         df = fetch_today(key)
         if df is not None and not df.empty:
             sub = df[df['Datetime'] < cutoff_dt]
-            if not sub.empty:
-                return float(sub['Close'].iloc[-1]), "today's 1-min close at snapshot"
+            if not sub.empty: return float(sub['Close'].iloc[-1]), "today's 1-min close at snapshot"
         if now_ist() - cutoff_dt <= timedelta(minutes=3):
             q = fetch_quotes([{"key": key, "symbol": name}], batch=1)
             ltp = q.get(key, {}).get('ltp', 0.0)
-            if ltp and ltp > 0:
-                return float(ltp), "live quote"
-
+            if ltp and ltp > 0: return float(ltp), "live quote"
     status, df = _candles(_url_range_1m(key, target_dt - timedelta(days=5), target_dt + timedelta(days=1)))
     if status == 200 and df is not None and not df.empty:
         sub = df[df['Datetime'] < cutoff_dt]
-        if not sub.empty:
-            return float(sub['Close'].iloc[-1]), "1-min close at snapshot"
-
+        if not sub.empty: return float(sub['Close'].iloc[-1]), "1-min close at snapshot"
     status, df = _candles(_url_range_daily(key, target_dt - timedelta(days=10), target_dt + timedelta(days=1)))
     if status == 200 and df is not None and not df.empty:
         limit = target_dt if cutoff_dt >= _close_dt(target_dt) else target_dt - timedelta(days=1)
         sub = df[df['Datetime'].dt.date <= limit]
-        if not sub.empty:
-            return float(sub['Close'].iloc[-1]), "daily close (fallback)"
-    if STATS.auth_failed:
-        return 0.0, "Upstox rejected the access token (HTTP 401)"
-    return 0.0, f"no candles returned (last API failure: {STATS.samples[-1] if STATS.samples else 'none recorded'})"
+        if not sub.empty: return float(sub['Close'].iloc[-1]), "daily close (fallback)"
+    return 0.0, "no candles returned"
 
 def _field(row, *names):
     for n in names:
         v = row.get(n)
-        if v is None or v == "" or (isinstance(v, float) and v != v):
-            continue
+        if v is None or v == "" or (isinstance(v, float) and v != v): continue
         return v
     return None
 
@@ -550,99 +441,57 @@ def _expiry_to_date(exp):
     try:
         if isinstance(exp, (int, float, np.integer, np.floating)) or (isinstance(exp, str) and exp.strip().isdigit()):
             v = float(exp)
-            if v > 1e11:
-                v /= 1000.0
+            if v > 1e11: v /= 1000.0
             return datetime.fromtimestamp(v, IST).date()
         s = str(exp).strip().split('T')[0].split(' ')[0]
         for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d-%m-%Y", "%d/%m/%Y"):
-            try:
-                return datetime.strptime(s, fmt).date()
-            except ValueError:
-                pass
-    except Exception:
-        pass
+            try: return datetime.strptime(s, fmt).date()
+            except ValueError: pass
+    except Exception: pass
     return None
 
 def _index_options_universe(cutoff_dt, use_intraday, needles=()):
     target_dt = cutoff_dt.date()
-
     spot = {}
     for idx, cfg in INDEX_CONFIG.items():
-        try:
-            price, src = _resolve_index_spot_price(cfg["spot_key"], idx, cutoff_dt, use_intraday)
-        except Exception as e:
-            ERRORS.add(f"spot:{idx}", e)
-            price, src = 0.0, f"{type(e).__name__}: {e}"
-        if price > 0:
-            spot[idx] = price
-            print(f"   {COLOR_DIM}» {idx:<10} spot {price:>10.2f}  ({src}){COLOR_RESET}")
-        else:
-            print(f"   {COLOR_YELLOW}» {idx:<10} spot unavailable -- skipped ({src}){COLOR_RESET}")
-    if not spot and not needles:
-        if not STATS.auth_failed:
-            print(f"{COLOR_RED_FG}[!] Could not resolve a spot price for ANY index, so no ATM strikes can be chosen. "
-                  f"Check the token/API access to index candles (see failure samples below).{COLOR_RESET}")
-        return []
+        try: price, src = _resolve_index_spot_price(cfg["spot_key"], idx, cutoff_dt, use_intraday)
+        except Exception: price, src = 0.0, "error"
+        if price > 0: spot[idx] = price
+    if not spot and not needles: return []
 
-    nse, bse = _download_master("NSE"), _download_master("BSE")
-    print(f"   {COLOR_DIM}» Master rows fetched -- NSE: {len(nse)}, BSE: {len(bse)}{COLOR_RESET}")
-    rows = nse + bse
-    if not rows:
-        print(f"{COLOR_RED_FG}[!] Both NSE and BSE instrument masters came back empty -- see the [master:...] lines above "
-              f"for the exact HTTP status / network error.{COLOR_RESET}")
-        return []
+    rows = _download_master("NSE") + _download_master("BSE")
+    if not rows: return []
 
     by_idx = {idx: [] for idx in INDEX_CONFIG}
     for row in rows:
         segment = str(_field(row, "segment") or "").upper()
-        if segment and segment not in ("NSE_FO", "BSE_FO"):
-            continue
+        if segment and segment not in ("NSE_FO", "BSE_FO"): continue
         ts = str(_field(row, "trading_symbol", "tradingsymbol") or "").upper()
-
         itype = str(_field(row, "option_type", "instrument_type") or "").upper()
         if itype not in ("CE", "PE"):
             m = re.search(r'\b(CE|PE)\b', ts) or re.search(r'\d(CE|PE)$', ts)
-            if not m:
-                continue
+            if not m: continue
             itype = m.group(1)
-
         cands = [str(_field(row, "underlying_symbol") or ""), str(_field(row, "name") or ""), ts.split()[0] if ts else ""]
         idx = next((ALIAS_TO_INDEX[c.upper().strip()] for c in cands if c.upper().strip() in ALIAS_TO_INDEX), None)
-        if idx is None:
-            continue
-
+        if idx is None: continue
         exp_date = _expiry_to_date(_field(row, "expiry"))
-        if exp_date is None:
-            continue
-
+        if exp_date is None: continue
         strike_raw = _field(row, "strike_price", "strike")
-        try:
-            strike = float(strike_raw) if strike_raw is not None else 0.0
-        except (TypeError, ValueError):
-            strike = 0.0
+        try: strike = float(strike_raw) if strike_raw is not None else 0.0
+        except: strike = 0.0
         if strike <= 0:
             m = re.search(r'(\d+(?:\.\d+)?)\s+(?:CE|PE)\b', ts) or re.search(r'(\d+)(?:CE|PE)$', ts)
             strike = float(m.group(1)) if m else 0.0
-        if strike <= 0 or not _field(row, "instrument_key"):
-            continue
-
+        if strike <= 0 or not _field(row, "instrument_key"): continue
         by_idx[idx].append((exp_date, strike, itype, row))
 
-    total_opts = sum(len(v) for v in by_idx.values())
-    if total_opts == 0:
-        sample = sorted(rows[0].keys()) if rows and isinstance(rows[0], dict) else "n/a"
-        print(f"{COLOR_RED_FG}[!] Master downloaded ({len(rows)} rows) but 0 CE/PE contracts matched "
-              f"NIFTY/BANKNIFTY/FINNIFTY/SENSEX. Field names in this master: {sample}{COLOR_RESET}")
-        return []
-
     universe, seen = [], set()
-
     if needles:
         flat = []
         for idx, contracts in by_idx.items():
             for exp_date, strike, itype, row in contracts:
-                if exp_date < target_dt:
-                    continue
+                if exp_date < target_dt: continue
                 key = _field(row, "instrument_key")
                 sym = str(_field(row, "trading_symbol", "tradingsymbol") or key)
                 flat.append((sym, (exp_date, strike, itype, sym), key))
@@ -654,57 +503,34 @@ def _index_options_universe(cutoff_dt, use_intraday, needles=()):
                 universe.append({"key": key, "symbol": sym, "pinned": True})
 
     for idx, contracts in by_idx.items():
-        if idx not in spot:
-            continue
-        if not contracts:
-            print(f"   {COLOR_YELLOW}» {idx:<10} no option contracts found in master -- skipped{COLOR_RESET}")
-            continue
+        if idx not in spot or not contracts: continue
         expiries = sorted({c[0] for c in contracts if c[0] >= target_dt})
-        if not expiries:
-            latest = max(c[0] for c in contracts)
-            print(f"   {COLOR_YELLOW}» {idx:<10} no expiry on/after {target_dt} in this master (latest is {latest}). "
-                  f"Expired contracts need --options-master.{COLOR_RESET}")
-            continue
-
+        if not expiries: continue
         expiry_idx = 1 if str(EXPIRY_SELECTION).upper() == "NEXT" else 0
-        if expiry_idx >= len(expiries):
-            print(f"   {COLOR_YELLOW}  ⚠ {idx:<10} EXPIRY_SELECTION={EXPIRY_SELECTION!r} wants expiry #{expiry_idx + 1} "
-                  f"on/after {target_dt}, but the master only has {len(expiries)}. Using the furthest one available "
-                  f"instead of failing outright.{COLOR_RESET}")
         target_exp = expiries[min(expiry_idx, len(expiries) - 1)]
         chain = [c for c in contracts if c[0] == target_exp]
         strikes = np.array(sorted({c[1] for c in chain}))
         atm_i = int(np.abs(strikes - spot[idx]).argmin())
-
         lo = max(0, atm_i - STRIKES_BELOW_ATM)
         hi = min(len(strikes), atm_i + STRIKES_ABOVE_ATM + 1)
         window = set(strikes[lo:hi].tolist())
-        picked = 0
         for exp_date, strike, itype, row in chain:
             key = _field(row, "instrument_key")
             if strike in window and key not in seen:
                 seen.add(key)
                 universe.append({"key": key, "symbol": str(_field(row, "trading_symbol", "tradingsymbol") or key), "pinned": False})
-                picked += 1
-        print(f"   {COLOR_DIM}» {idx:<10} expiry {target_exp} ({EXPIRY_SELECTION})  "
-              f"strikes {strikes[lo]:.0f}-{strikes[hi-1]:.0f} ({STRIKES_BELOW_ATM}↓/{STRIKES_ABOVE_ATM}↑ of ATM)  "
-              f"-> {picked} contracts{COLOR_RESET}")
     return universe
 
 def get_dynamic_universe(mode, cutoff_dt, use_intraday, needles=()):
-    if mode in ("STOCK_FNO", "CASH_EQUITY"):
-        return _equity_universe(mode, needles)
-    if mode == "INDEX_OPTIONS":
-        return _index_options_universe(cutoff_dt, use_intraday, needles)
-    print(f"{COLOR_RED_FG}[!] Unknown mode '{mode}'.{COLOR_RESET}")
+    if mode in ("STOCK_FNO", "CASH_EQUITY"): return _equity_universe(mode, needles)
+    if mode == "INDEX_OPTIONS": return _index_options_universe(cutoff_dt, use_intraday, needles)
     return []
 
 # ==============================================================================
 # 2. CONTINUOUS KINETIC TRIPWIRE ENGINE
 # ==============================================================================
 def compute_base_atr(m):
-    if m is None or len(m) == 0:
-        return None, 0
+    if m is None or len(m) == 0: return None, 0
     hi, lo, cl = m['High'].values, m['Low'].values, m['Close'].values
     sid = m['SessId'].values
     mins = np.clip(m['Min'].values, SESSION_OPEN_MIN, SESSION_CLOSE_MIN - 1)
@@ -716,49 +542,39 @@ def compute_base_atr(m):
     prev_close = np.concatenate(([np.nan], b_close[:-1]))
     tr = np.fmax(np.fmax(b_high - b_low, np.abs(b_high - prev_close)), np.abs(b_low - prev_close))
     atr = float(tr[-ATR_BASIS_PERIOD:].mean())
-    return max(atr, float(b_close[-1]) * MIN_ATR_PCT, 0.01), len(b_close)
+    return atr, len(b_close)
 
 def _ewm(x, alpha):
     xs = x.tolist()
     out = [0.0] * len(xs)
     prev = out[0] = xs[0]
     keep = 1.0 - alpha
-    for i in range(1, len(xs)):
-        out[i] = prev = keep * prev + alpha * xs[i]
+    for i in range(1, len(xs)): out[i] = prev = keep * prev + alpha * xs[i]
     return np.asarray(out)
 
-def _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts):
+def _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts, sid):
     """
-    Computes 1-minute kinetic indicators and rolling shock windows.
-    Neutralizes overnight gap discontinuities at session-open bars (sess_starts)
-    so morning gap-ups do not artificially inflate Velocity ATRs and block 09:15-09:45 triggers.
+    Computes 1m kinetics and strictly isolates Bollinger Band math per session ID 
+    so morning gap-ups do not artificially inflate std20 and wide bands all morning.
     """
     n = len(close)
     delta = np.diff(close, prepend=close[0])
-    # At session open (09:15), measure true 1m intraday impulse (Close - Open) instead of overnight gap
+    # Neutralize overnight gaps at 09:15
     delta = np.where(sess_starts, close - open_, delta)
 
     gain = _ewm(np.where(delta > 0, delta, 0.0), 1 / RSI_PERIOD)
     loss = _ewm(np.where(delta < 0, -delta, 0.0), 1 / RSI_PERIOD)
     rsi = 100 - (100 / (1 + (gain / (loss + 1e-8))))
 
-    rsi_mean = pd.Series(rsi).rolling(BB_PERIOD, min_periods=1).mean().values
-    rsi_std = pd.Series(rsi).rolling(BB_PERIOD, min_periods=1).std(ddof=0).values
-
-    # Build a gap-adjusted synthetic close for MACD so a 3% overnight jump doesn't blow out hist_std/atr_hist
     intraday_close_chain = np.cumsum(delta) + open_[0]
     macd = _ewm(intraday_close_chain, 2 / 13) - _ewm(intraday_close_chain, 2 / 27)
     hist = macd - _ewm(macd, 2 / 10)
-    h_mean = pd.Series(hist).rolling(BB_PERIOD, min_periods=1).mean().values
-    h_std = pd.Series(hist).rolling(BB_PERIOD, min_periods=1).std(ddof=0).values
 
     up, down = np.zeros(n), np.zeros(n)
     up[1:] = high[1:] - high[:-1]
     down[1:] = low[:-1] - low[1:]
-    # Neutralize overnight gap in directional movement at 09:15 open
     up = np.where(sess_starts, high - open_, up)
     down = np.where(sess_starts, open_ - low, down)
-
     plus_dm = np.where((up > down) & (up > 0), up, 0.0)
     minus_dm = np.where((down > up) & (down > 0), down, 0.0)
 
@@ -774,19 +590,28 @@ def _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts):
     dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-8)
     adx = _ewm(dx, a)
 
-    a_mean = pd.Series(adx).rolling(BB_PERIOD, min_periods=1).mean().values
-    a_std = pd.Series(adx).rolling(BB_PERIOD, min_periods=1).std(ddof=0).values
-
-    p_mean = pd.Series(plus_di).rolling(BB_PERIOD, min_periods=1).mean().values
-    p_std = pd.Series(plus_di).rolling(BB_PERIOD, min_periods=1).std(ddof=0).values
-    m_mean = pd.Series(minus_di).rolling(BB_PERIOD, min_periods=1).mean().values
-    m_std = pd.Series(minus_di).rolling(BB_PERIOD, min_periods=1).std(ddof=0).values
-
     direction = np.where(delta > 0, 1, np.where(delta < 0, -1, 0))
     obv = np.cumsum(direction * vol)
 
-    o_mean = pd.Series(obv).rolling(BB_PERIOD, min_periods=1).mean().values
-    o_std = pd.Series(obv).rolling(BB_PERIOD, min_periods=1).std(ddof=0).values
+    # STRICT SESSION ISOLATION for statistical indicator bands
+    df = pd.DataFrame({'rsi': rsi, 'hist': hist, 'plus_di': plus_di, 'minus_di': minus_di, 'adx': adx, 'obv': obv, 'sid': sid})
+    grouped = df.groupby('sid')
+    
+    def roll_mean(x): return x.rolling(BB_PERIOD, min_periods=1).mean()
+    def roll_std(x): return x.rolling(BB_PERIOD, min_periods=1).std(ddof=0)
+    
+    rsi_mean = grouped['rsi'].transform(roll_mean).values
+    rsi_std = grouped['rsi'].transform(roll_std).values
+    h_mean = grouped['hist'].transform(roll_mean).values
+    h_std = grouped['hist'].transform(roll_std).values
+    p_mean = grouped['plus_di'].transform(roll_mean).values
+    p_std = grouped['plus_di'].transform(roll_std).values
+    m_mean = grouped['minus_di'].transform(roll_mean).values
+    m_std = grouped['minus_di'].transform(roll_std).values
+    a_mean = grouped['adx'].transform(roll_mean).values
+    a_std = grouped['adx'].transform(roll_std).values
+    o_mean = grouped['obv'].transform(roll_mean).values
+    o_std = grouped['obv'].transform(roll_std).values
 
     vel_hist = np.diff(hist, prepend=hist[0])
     vel_obv = np.diff(obv, prepend=obv[0])
@@ -800,7 +625,6 @@ def _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts):
     atr_mdi = _ewm(np.abs(vel_mdi), 1 / 14)
     atr_adx = _ewm(np.abs(vel_adx), 1 / 14)
 
-    # Pre-compute rolling max/min velocity over SHOCK_WINDOW_BARS to catch sequential impulses
     w = max(1, int(SHOCK_WINDOW_BARS))
     win_vh_max = pd.Series(vel_hist).rolling(w, min_periods=1).max().values
     win_vh_min = pd.Series(vel_hist).rolling(w, min_periods=1).min().values
@@ -829,7 +653,6 @@ def _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts):
     }
 
 def get_kinetics(kin_1m, idx):
-    """Evaluates Lock 2 (Structure Quorum), Lock 3 (Rolling Window Shock Quorum), & Granular Opposing Score."""
     hist = kin_1m['hist'][idx]; h_mean = kin_1m['h_mean'][idx]; h_std = kin_1m['h_std'][idx]
     obv = kin_1m['obv'][idx]; o_mean = kin_1m['o_mean'][idx]; o_std = kin_1m['o_std'][idx]
     p_di = kin_1m['plus_di'][idx]; p_mean = kin_1m['p_mean'][idx]; p_std = kin_1m['p_std'][idx]
@@ -847,7 +670,7 @@ def get_kinetics(kin_1m, idx):
     w_vp_max = kin_1m['win_vp_max'][idx]; w_vm_max = kin_1m['win_vm_max'][idx]
     w_va_max = kin_1m['win_va_max'][idx]
 
-    # --- LOCK 2: Indicator Structure Breakout (Quorum of 4) ---
+    # --- LOCK 2: Structure Breakout (Quorum of 4) ---
     b_struct_cnt = (
         int(h_std > 0 and hist > h_mean + IND_BB_PIERCE_STD * h_std) +
         int(o_std > 0 and obv > o_mean + IND_BB_PIERCE_STD * o_std) +
@@ -864,7 +687,7 @@ def get_kinetics(kin_1m, idx):
     bull_struct = (b_struct_cnt >= STRUCT_QUORUM) and (p_di > m_di)
     bear_struct = (br_struct_cnt >= STRUCT_QUORUM) and (m_di > p_di)
 
-    # --- LOCK 3: Institutional Kinetic Shock (Quorum of 4 within Rolling Window) ---
+    # --- LOCK 3: Kinetic Shock (Quorum of 4 within Rolling Window) ---
     b_shock_cnt = (
         int(w_vh_max > KINETIC_SHOCK_ATR_MULT * ah) +
         int(w_vo_max > KINETIC_SHOCK_ATR_MULT * ao) +
@@ -881,27 +704,13 @@ def get_kinetics(kin_1m, idx):
     bull_shock = (b_shock_cnt >= SHOCK_QUORUM) and (vh > 0 or vo > 0)
     bear_shock = (br_shock_cnt >= SHOCK_QUORUM) and (vh < 0 or vo < 0)
 
-    # --- GRANULAR 0-to-4 OPPOSING SCORE FOR SOFT STOPS ---
-    bull_score = (
-        int(p_std > 0 and p_di > p_mean + IND_BB_PIERCE_STD * p_std) +
-        int(vh > 1.0 * ah) +
-        int(vo > 1.0 * ao) +
-        int(h_std > 0 and hist > h_mean + IND_BB_PIERCE_STD * h_std)
-    )
-    bear_score = (
-        int(m_std > 0 and m_di > m_mean + IND_BB_PIERCE_STD * m_std) +
-        int(vh < -1.0 * ah) +
-        int(vo < -1.0 * ao) +
-        int(h_std > 0 and hist < h_mean - IND_BB_PIERCE_STD * h_std)
-    )
+    # --- GRANULAR OPPOSING SCORE ---
+    bull_score = int(p_std > 0 and p_di > p_mean + IND_BB_PIERCE_STD * p_std) + int(vh > 1.0 * ah) + int(vo > 1.0 * ao) + int(h_std > 0 and hist > h_mean + IND_BB_PIERCE_STD * h_std)
+    bear_score = int(m_std > 0 and m_di > m_mean + IND_BB_PIERCE_STD * m_std) + int(vh < -1.0 * ah) + int(vo < -1.0 * ao) + int(h_std > 0 and hist < h_mean - IND_BB_PIERCE_STD * h_std)
 
-    raw_bull_power = bull_score >= 2
-    raw_bear_power = bear_score >= 2
-
-    return bull_score, bear_score, raw_bull_power, raw_bear_power, bull_struct, bear_struct, bull_shock, bear_shock
+    return bull_score, bear_score, bull_score >= 2, bear_score >= 2, bull_struct, bear_struct, bull_shock, bear_shock
 
 def calculate_grids(kin_1m, idx, direction):
-    """Calculates the real-time ATR and BB grids for the active evaluation minute."""
     hist = kin_1m['hist'][idx]; h_mean = kin_1m['h_mean'][idx]; h_std = kin_1m['h_std'][idx]
     obv = kin_1m['obv'][idx]; o_mean = kin_1m['o_mean'][idx]; o_std = kin_1m['o_std'][idx]
     p_di = kin_1m['plus_di'][idx]; p_mean = kin_1m['p_mean'][idx]; p_std = kin_1m['p_std'][idx]
@@ -914,24 +723,19 @@ def calculate_grids(kin_1m, idx, direction):
     vm = kin_1m['vel_mdi'][idx]; am = kin_1m['atr_mdi'][idx]
     va = kin_1m['vel_adx'][idx]; aa = kin_1m['atr_adx'][idx]
 
-    atr_grid = {1: 0, 2: 0, 3: 0, 5: 0}
-    bb_grid = {1: 0, 2: 0, 3: 0, 5: 0}
+    atr_grid, bb_grid = {1: 0, 2: 0, 3: 0, 5: 0}, {1: 0, 2: 0, 3: 0, 5: 0}
 
     def check_bb(val, mean, std, mult, is_bull_ind):
-        if std <= 0:
-            return False
+        if std <= 0: return False
         return (val > mean + (std * mult)) if is_bull_ind else (val < mean - (std * mult))
 
     for mult in [1, 2, 3, 5]:
-        a_count = 0
-        b_count = 0
-
+        a_count, b_count = 0, 0
         if direction == "BULL":
             if vh > mult * ah: a_count += 1
             if vo > mult * ao: a_count += 1
             if vp > mult * ap: a_count += 1
             if va > mult * aa: a_count += 1
-
             if check_bb(hist, h_mean, h_std, mult, True): b_count += 1
             if check_bb(obv, o_mean, o_std, mult, True): b_count += 1
             if check_bb(p_di, p_mean, p_std, mult, True): b_count += 1
@@ -941,157 +745,120 @@ def calculate_grids(kin_1m, idx, direction):
             if vo < -mult * ao: a_count += 1
             if vm > mult * am: a_count += 1
             if va > mult * aa: a_count += 1
-
             if check_bb(hist, h_mean, h_std, mult, False): b_count += 1
             if check_bb(obv, o_mean, o_std, mult, False): b_count += 1
             if check_bb(m_di, m_mean, m_std, mult, True): b_count += 1
             if check_bb(adx, a_mean, a_std, mult, True): b_count += 1
-
-        atr_grid[mult] = a_count
-        bb_grid[mult] = b_count
-
+        atr_grid[mult], bb_grid[mult] = a_count, b_count
     return atr_grid, bb_grid
 
-def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, today_start, end=None):
+def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, today_start, is_late_session, end=None):
     n = len(close) if end is None else min(int(end), len(close))
     if today_start >= n:
-        return None, {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0,
-                      'killed_time': '-', 'killed_price': 0.0, 'reason': 'No data for today', 'kills': []}
+        return None, {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0, 'killed_time': '-', 'killed_price': 0.0, 'reason': 'No data for today', 'kills': []}
 
-    hard_mult = float(HARD_STOP_ATR_MULT or 0.0)
-    soft_mult = float(SOFT_STOP_ATR_MULT)
-    opp_thresh = int(SOFT_STOP_OPPOSING_SCORE)
-
+    hard_mult, soft_mult, opp_thresh = float(HARD_STOP_ATR_MULT or 0.0), float(SOFT_STOP_ATR_MULT), int(SOFT_STOP_OPPOSING_SCORE)
     i = today_start
     survived_anchor = None
-    last_killed_info = {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0,
-                        'killed_time': '-', 'killed_price': 0.0, 'reason': 'Failed Kinetic Alignment'}
-    kills = []
-    warzone_kills = 0
+    last_killed_info = {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0, 'killed_time': '-', 'killed_price': 0.0, 'reason': 'Failed Kinetic Alignment'}
+    kills, warzone_kills = [], 0
 
     while i < n:
         anchor = None
-
         while i < n:
-            (bull_score, bear_score, r_bull, r_bear,
-             bull_struct, bear_struct, bull_shock, bear_shock) = get_kinetics(kin_1m, i)
+            (bull_score, bear_score, r_bull, r_bear, bull_struct, bear_struct, bull_shock, bear_shock) = get_kinetics(kin_1m, i)
 
-            # --- LOCK 1: Price Volatility Expansion (Band Expansion OR Direct Dual-Band Price Breakout) ---
+            # --- LOCK 1: Price Volatility Expansion ---
             bb_kc_bull_fire = (bb_upper[i] > kc_upper[i]) or (close[i] > bb_upper[i] and close[i] > kc_upper[i])
             bb_kc_bear_fire = (bb_lower[i] < kc_lower[i]) or (close[i] < bb_lower[i] and close[i] < kc_lower[i])
 
-            # 3-LOCK MASTER TRIGGER EVALUATION
-            if bull_struct and bull_shock and bb_kc_bull_fire:
-                if r_bear:
-                    warzone_kills += 1
-                else:
-                    anchor = {"dir": "BULL", "idx": i, "time": dt_1m[i], "price": close[i]}
-                    break
+            if not is_late_session[i] and bull_struct and bull_shock and bb_kc_bull_fire:
+                if r_bear: warzone_kills += 1
+                else: anchor = {"dir": "BULL", "idx": i, "time": dt_1m[i], "price": close[i]}; break
 
-            elif bear_struct and bear_shock and bb_kc_bear_fire:
-                if r_bull:
-                    warzone_kills += 1
-                else:
-                    anchor = {"dir": "BEAR", "idx": i, "time": dt_1m[i], "price": close[i]}
-                    break
+            elif not is_late_session[i] and bear_struct and bear_shock and bb_kc_bear_fire:
+                if r_bull: warzone_kills += 1
+                else: anchor = {"dir": "BEAR", "idx": i, "time": dt_1m[i], "price": close[i]}; break
             i += 1
 
-        if not anchor:
-            break
+        if not anchor: break
 
-        survived = True
-        is_bull = anchor['dir'] == "BULL"
-        peak_price = anchor['price']
-        true_peak = anchor['price']
-        j = anchor['idx'] + 1
+        survived, is_bull = True, anchor['dir'] == "BULL"
+        peak_price, true_peak, j = anchor['price'], anchor['price'], anchor['idx'] + 1
 
         while j < n:
             (bull_score, bear_score, _, _, _, _, _, _) = get_kinetics(kin_1m, j)
-
             if is_bull:
-                peak_price = max(peak_price, close[j])
-                true_peak = max(true_peak, close[j])
+                peak_price, true_peak = max(peak_price, close[j]), max(true_peak, close[j])
                 adverse, hard_adverse, opposing = peak_price - close[j], true_peak - close[j], bear_score
                 soft_reason = f"Kinetic SL ({soft_mult:g} ATR Pullback)"
             else:
-                peak_price = min(peak_price, close[j])
-                true_peak = min(true_peak, close[j])
+                peak_price, true_peak = min(peak_price, close[j]), min(true_peak, close[j])
                 adverse, hard_adverse, opposing = close[j] - peak_price, close[j] - true_peak, bull_score
                 soft_reason = f"Kinetic SL ({soft_mult:g} ATR Rally)"
 
+            max_r_reached = (peak_price - anchor['price']) / base_atr if is_bull else (anchor['price'] - peak_price) / base_atr
             reason = None
             if hard_mult > 0 and hard_adverse >= hard_mult * base_atr:
                 reason = f"Hard stop ({hard_mult:g} ATR trailing floor)"
-            elif adverse >= soft_mult * base_atr and opposing >= opp_thresh:
+            # Let massive trends (>2.0R) run freely without soft stop chokes
+            elif adverse >= soft_mult * base_atr and opposing >= opp_thresh and max_r_reached < 2.0:
                 reason = soft_reason
 
             if reason:
-                last_killed_info = {
-                    'dir': anchor['dir'],
-                    'anchor_time': pd.to_datetime(anchor['time']).strftime('%H:%M'),
-                    'anchor_price': float(anchor['price']),
-                    'killed_time': pd.to_datetime(dt_1m[j]).strftime('%H:%M'),
-                    'killed_price': float(close[j]),
-                    'reason': reason
-                }
+                last_killed_info = {'dir': anchor['dir'], 'anchor_time': pd.to_datetime(anchor['time']).strftime('%H:%M'),
+                                    'anchor_price': float(anchor['price']), 'killed_time': pd.to_datetime(dt_1m[j]).strftime('%H:%M'),
+                                    'killed_price': float(close[j]), 'reason': reason}
                 kills.append(last_killed_info)
                 survived = False
                 i = j + 1
                 break
             j += 1
 
-        if survived:
-            survived_anchor = anchor
-            break
+        if survived: survived_anchor = anchor; break
 
-    if survived_anchor:
-        return survived_anchor, {"status": "Survived", "kills": kills}
-
+    if survived_anchor: return survived_anchor, {"status": "Survived", "kills": kills}
     info = dict(last_killed_info)
-    if warzone_kills > 0 and info['dir'] == 'NONE':
-        info['reason'] = f"Warzone Inversion Chop ({warzone_kills}x)"
-    elif info['dir'] == 'NONE':
-        info['reason'] = "Failed Kinetic Alignment"
+    if warzone_kills > 0 and info['dir'] == 'NONE': info['reason'] = f"Warzone Inversion Chop ({warzone_kills}x)"
     info['kills'] = kills
     return None, info
 
 def prepare_series(master, target_dt):
-    if master is None or master.empty:
-        return None, "no_data"
+    if master is None or master.empty: return None, "no_data"
     day_mask = (master['Datetime'].dt.date == target_dt).values
-    if not day_mask.any():
-        return None, "no_data"
+    if not day_mask.any(): return None, "no_data"
     ts = int(np.argmax(day_mask))
 
-    open_ = master['Open'].values.astype(float)
-    close = master['Close'].values.astype(float)
-    high = master['High'].values.astype(float)
-    low = master['Low'].values.astype(float)
-    vol = master['Volume'].values.astype(float)
-    sid = master['SessId'].values
-    n = len(close)
+    open_, close, high, low, vol = master['Open'].values.astype(float), master['Close'].values.astype(float), master['High'].values.astype(float), master['Low'].values.astype(float), master['Volume'].values.astype(float)
+    sid, n = master['SessId'].values, len(close)
 
     sess_starts = np.zeros(n, dtype=bool)
-    sess_starts[0] = True
-    sess_starts[1:] = sid[1:] != sid[:-1]
+    sess_starts[0] = True; sess_starts[1:] = sid[1:] != sid[:-1]
 
-    base_atr, atr_bars = compute_base_atr(master.iloc[:ts])
-    if base_atr is None or atr_bars < ATR_MIN_BARS:
-        return None, "short_history"
+    # Precompute closing auction mask (15:15 to 15:30)
+    dt_series = master['Datetime'].dt
+    is_late_session = ((dt_series.hour == 15) & (dt_series.minute >= 15)).values
 
-    sma20 = pd.Series(close).rolling(20, min_periods=1).mean().values
-    std20 = pd.Series(close).rolling(20, min_periods=1).std(ddof=0).values
-    tr = (high - low).copy()
-    tr[1:] = np.maximum(high[1:] - low[1:], np.maximum(np.abs(high[1:] - close[:-1]), np.abs(low[1:] - close[:-1])))
-    # Prevent overnight gap from inflating Keltner Channel width for the first 20 minutes of the session
-    tr = np.where(sess_starts, high - low, tr)
-    atr20 = pd.Series(tr).rolling(20, min_periods=1).mean().values
+    base_atr_calc, atr_bars = compute_base_atr(master.iloc[:ts])
+    if base_atr_calc is None or atr_bars < ATR_MIN_BARS: return None, "short_history"
+    # Dynamic Minimum Floor: Stop cannot be tighter than 0.5% of the opening price
+    base_atr = max(float(base_atr_calc), float(close[ts]) * MIN_ATR_PCT)
+
+    df_p = pd.DataFrame({'close': close, 'high': high, 'low': low, 'open': open_, 'sid': sid})
+    df_p['tr'] = np.maximum(df_p['high'] - df_p['low'], np.maximum(np.abs(df_p['high'] - df_p['close'].shift(1)), np.abs(df_p['low'] - df_p['close'].shift(1))))
+    df_p['tr'] = np.where(sess_starts, df_p['high'] - df_p['low'], df_p['tr'])
+
+    # STRICT SESSION ISOLATION for Price Bands
+    grouped_p = df_p.groupby('sid')
+    sma20 = grouped_p['close'].transform(lambda x: x.rolling(20, min_periods=1).mean()).values
+    std20 = grouped_p['close'].transform(lambda x: x.rolling(20, min_periods=1).std(ddof=0)).values
+    atr20 = grouped_p['tr'].transform(lambda x: x.rolling(20, min_periods=1).mean()).values
 
     return {
-        'close': close, 'dt': master['Datetime'].values, 'today_start': ts,
-        'day_open': float(master['Open'].iloc[ts]), 'prev_close': float(close[ts - 1]) if ts > 0 else 0.0,
-        'base_atr': float(base_atr), 'atr_bars': int(atr_bars),
-        'kin': _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts),
+        'close': close, 'dt': master['Datetime'].values, 'today_start': ts, 'is_late_session': is_late_session,
+        'day_open': float(open_[ts]), 'prev_close': float(close[ts - 1]) if ts > 0 else 0.0,
+        'base_atr': base_atr, 'atr_bars': int(atr_bars),
+        'kin': _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts, sid),
         'bb_upper': sma20 + 2.0 * std20, 'bb_lower': sma20 - 2.0 * std20,
         'kc_upper': sma20 + 1.5 * atr20, 'kc_lower': sma20 - 1.5 * atr20,
     }, None
@@ -1099,57 +866,35 @@ def prepare_series(master, target_dt):
 def row_at(S, end, symbol):
     ts = S['today_start']
     end = min(int(end), len(S['close']))
-    if end <= ts:
-        return None
+    if end <= ts: return None
     close, base_atr, kin = S['close'], S['base_atr'], S['kin']
     last = end - 1
     ltp = float(close[last])
     ref = S['prev_close'] if (DAY_PCT_BASIS == "PREV_CLOSE" and S['prev_close'] > 0) else S['day_open']
-    day_pct = ((ltp - ref) / ref) * 100 if ref else 0.0
+    
+    row = {'Symbol': symbol, 'LTP': ltp, 'DayChangePct': ((ltp - ref) / ref) * 100 if ref else 0.0,
+           'ActiveAnchor': None, 'AnchorPrice': 0.0, 'AnchorDir': "NONE", 'MovePct': 0.0,
+           'State': "NONE", 'Blocks': 0, 'KilledTime': '-', 'KilledPrice': 0.0, 'RejectReason': "",
+           'Kills': [], 'AtrBars': S['atr_bars'], 'BaseAtr': base_atr, 'PriorStops': 0, 'BankedR': 0.0}
 
-    row = {
-        'Symbol': symbol, 'LTP': ltp, 'DayChangePct': float(day_pct),
-        'ActiveAnchor': None, 'AnchorPrice': 0.0, 'AnchorDir': "NONE", 'MovePct': 0.0,
-        'State': "NONE", 'Blocks': 0, 'KilledTime': '-', 'KilledPrice': 0.0, 'RejectReason': "",
-        'Kills': [], 'AtrBars': S['atr_bars'], 'BaseAtr': base_atr,
-        'ATR_Grid': {1: 0, 2: 0, 3: 0, 5: 0}, 'BB_Grid': {1: 0, 2: 0, 3: 0, 5: 0},
-        'PriorStops': 0, 'BankedR': 0.0
-    }
-
-    anchor, info = evaluate_anchor_tripwire(
-        close, S['dt'], kin, base_atr, S['bb_upper'], S['bb_lower'],
-        S['kc_upper'], S['kc_lower'], ts, end
-    )
+    anchor, info = evaluate_anchor_tripwire(close, S['dt'], kin, base_atr, S['bb_upper'], S['bb_lower'], S['kc_upper'], S['kc_lower'], ts, S['is_late_session'], end)
     row['Kills'] = info.get('kills', [])
-
     eval_dir = anchor['dir'] if anchor else info.get('dir')
-    if not eval_dir or eval_dir == "NONE":
-        eval_dir = "BULL"
-
-    ag, bg = calculate_grids(kin, last, eval_dir)
-    row['ATR_Grid'] = ag
-    row['BB_Grid'] = bg
-
+    if not eval_dir or eval_dir == "NONE": eval_dir = "BULL"
+    
+    row['ATR_Grid'], row['BB_Grid'] = calculate_grids(kin, last, eval_dir)
     bb_expanding = (S['bb_upper'][last] > S['kc_upper'][last]) or (S['bb_lower'][last] < S['kc_lower'][last])
     pure_state = "[ BB > KC ]" if bb_expanding else "[ BB < KC ]"
 
     if anchor:
-        row['ActiveAnchor'] = pd.to_datetime(anchor['time']).strftime("%H:%M")
-        row['AnchorPrice'] = float(anchor['price'])
-        row['AnchorDir'] = anchor['dir']
+        row['ActiveAnchor'], row['AnchorPrice'], row['AnchorDir'] = pd.to_datetime(anchor['time']).strftime("%H:%M"), float(anchor['price']), anchor['dir']
         row['MovePct'] = ((ltp - anchor['price']) / anchor['price']) * 100 if anchor['price'] else 0.0
-        row['State'] = pure_state
-        row['Blocks'] = last - anchor['idx']
+        row['State'], row['Blocks'] = pure_state, last - anchor['idx']
     else:
-        row['AnchorDir'] = info.get('dir', 'NONE')
-        row['ActiveAnchor'] = info.get('anchor_time', '-')
-        row['AnchorPrice'] = float(info.get('anchor_price', 0.0))
-        row['KilledTime'] = info.get('killed_time', '-')
-        row['KilledPrice'] = float(info.get('killed_price', 0.0))
-        row['RejectReason'] = info.get('reason', 'Failed Kinetic Alignment')
-        if row['AnchorPrice'] > 0 and row['KilledPrice'] > 0:
-            row['MovePct'] = ((row['KilledPrice'] - row['AnchorPrice']) / row['AnchorPrice']) * 100
-        row['State'] = "[STOPPED]"
+        row['AnchorDir'], row['ActiveAnchor'], row['AnchorPrice'] = info.get('dir', 'NONE'), info.get('anchor_time', '-'), float(info.get('anchor_price', 0.0))
+        row['KilledTime'], row['KilledPrice'], row['RejectReason'] = info.get('killed_time', '-'), float(info.get('killed_price', 0.0)), info.get('reason', 'Failed Kinetic Alignment')
+        if row['AnchorPrice'] > 0 and row['KilledPrice'] > 0: row['MovePct'] = ((row['KilledPrice'] - row['AnchorPrice']) / row['AnchorPrice']) * 100
+        row['State'] = "[STOPPED]" 
     return row
 
 def compute_row(symbol, master_1m, target_dt):
@@ -1165,21 +910,17 @@ def _history_worker_daily(args):
         frames = []
         for c_start, c_end in _date_chunks(start, end + timedelta(days=1), span=365):
             status, df = _candles(_url_range_daily(item['key'], c_start, c_end))
-            if status == 200 and df is not None:
-                frames.append(df)
-        if not frames:
-            return None
+            if status == 200 and df is not None: frames.append(df)
+        if not frames: return None
         master = prepare_master(frames)
         master = master[master['Datetime'].dt.date < end]
-        if master.empty:
-            return None
+        if master.empty: return None
         close, vol = master['Close'].iloc[-1], master['Volume'].iloc[-1]
         return item if (MIN_PRICE <= close <= MAX_PRICE and vol >= MIN_DAILY_VOLUME) else None
     except Exception as e:
         ERRORS.add(f"prefilter:{item.get('symbol')}", e)
         return None
-    finally:
-        progress.tick()
+    finally: progress.tick()
 
 def process_stock_checkpoints(args):
     item, checkpoints, use_intraday, history_days, mode, progress = args
@@ -1187,761 +928,317 @@ def process_stock_checkpoints(args):
     try:
         final_cutoff = checkpoints[-1]
         target_dt = final_cutoff.date()
-        start_dt = target_dt - timedelta(days=history_days)
         frames = []
-        for c_start, c_end in _date_chunks(start_dt, target_dt + timedelta(days=1), span=7):
+        for c_start, c_end in _date_chunks(target_dt - timedelta(days=history_days), target_dt + timedelta(days=1), span=7):
             status, df = _candles(_url_range_1m(item['key'], c_start, c_end))
-            if status == 200 and df is not None:
-                frames.append(df)
-
+            if status == 200 and df is not None: frames.append(df)
         if use_intraday:
             today_df = fetch_today(item['key'])
-            if today_df is not None:
-                frames.append(today_df)
-
-        if not frames:
-            return [(cp, "no_data", sym) for cp in checkpoints]
+            if today_df is not None: frames.append(today_df)
+        if not frames: return [(cp, "no_data", sym) for cp in checkpoints]
 
         master = prepare_master(frames)
         master = master[master['Datetime'] < final_cutoff].reset_index(drop=True)
-
         if mode == "INDEX_OPTIONS":
             day = master[master['Datetime'].dt.date == target_dt]
-            if day.empty:
-                return [(cp, "no_data", sym) for cp in checkpoints]
-            if day['Close'].iloc[-1] < OPT_MIN_PRICE or day['Volume'].sum() < OPT_MIN_VOLUME:
-                return [(cp, "illiquid", sym) for cp in checkpoints]
+            if day.empty: return [(cp, "no_data", sym) for cp in checkpoints]
+            if day['Close'].iloc[-1] < OPT_MIN_PRICE or day['Volume'].sum() < OPT_MIN_VOLUME: return [(cp, "illiquid", sym) for cp in checkpoints]
 
         S, why = prepare_series(master, target_dt)
-        if S is None:
-            return [(cp, why, sym) for cp in checkpoints]
-
+        if S is None: return [(cp, why, sym) for cp in checkpoints]
         ends = np.searchsorted(S['dt'], np.array(checkpoints, dtype='datetime64[ns]'), side='left')
         out = []
         for cp, end in zip(checkpoints, ends):
             row = row_at(S, int(end), sym)
-            if row is None:
-                out.append((cp, "no_data", sym))
-            else:
-                row['CheckpointTime'] = cp
-                out.append((cp, "ok", row))
+            if row is None: out.append((cp, "no_data", sym))
+            else: row['CheckpointTime'] = cp; out.append((cp, "ok", row))
         return out
     except Exception as e:
         ERRORS.add(f"1m:{item.get('symbol')}", e)
         return [(cp, "error", item.get('symbol')) for cp in checkpoints]
-    finally:
-        progress.tick()
+    finally: progress.tick()
 
-def _clip(s, w):
-    return s if len(s) <= w else s[:w - 1] + "~"
+def _clip(s, w): return s if len(s) <= w else s[:w - 1] + "~"
 
 def _print_error_summary():
-    if STATS.failed:
-        print(f"{COLOR_YELLOW}⚠ {STATS.failed} API request(s) failed after retries. Samples: {'; '.join(STATS.samples)}{COLOR_RESET}")
-    if ERRORS.items:
-        print(f"{COLOR_YELLOW}⚠ {len(ERRORS.items)} instrument(s) raised exceptions. First one:{COLOR_RESET}")
-        where, msg, tb = ERRORS.items[0]
-        print(f"{COLOR_DIM}   [{where}] {msg}\n{tb}{COLOR_RESET}")
+    if STATS.failed: print(f"{COLOR_YELLOW}⚠ {STATS.failed} API requests failed.{COLOR_RESET}")
+    if ERRORS.items: print(f"{COLOR_YELLOW}⚠ {len(ERRORS.items)} instruments raised exceptions. First: [{ERRORS.items[0][0]}] {ERRORS.items[0][1]}{COLOR_RESET}")
 
 ACTIVE_BULL_STATES = ("[ BB > KC ]", "[ BB < KC ]")
 ACTIVE_BEAR_STATES = ("[ BB > KC ]", "[ BB < KC ]")
 
-def _signal_id(row):
-    return (row['AnchorDir'], row['ActiveAnchor'], round(float(row['AnchorPrice']), 6))
-
-def _find_kill(kills, direction, anchor_time):
-    for k in reversed(kills or []):
-        if k.get('dir') == direction and k.get('anchor_time') == anchor_time:
-            return k
-    return None
-
-def _exit_price(row):
-    if row.get('State') == "[STOPPED]" and row.get('KilledPrice', 0) > 0:
-        return float(row['KilledPrice'])
-    return float(row.get('LTP', 0.0) or 0.0)
+def _signal_id(row): return (row['AnchorDir'], row['ActiveAnchor'], round(float(row['AnchorPrice']), 6))
+def _find_kill(kills, d, t): return next((k for k in reversed(kills or []) if k.get('dir') == d and k.get('anchor_time') == t), None)
+def _exit_price(row): return float(row['KilledPrice']) if row.get('State') == "[STOPPED]" and row.get('KilledPrice', 0) > 0 else float(row.get('LTP', 0.0) or 0.0)
 
 def _kill_r_multiple(kill_dict, base_atr):
-    """Calculates the realized R-Multiple of a completed/stopped anchor episode."""
-    ap = float(kill_dict.get('anchor_price', 0.0) or 0.0)
-    kp = float(kill_dict.get('killed_price', 0.0) or 0.0)
-    if ap <= 0 or kp <= 0 or base_atr <= 0:
-        return 0.0
-    raw_dir = kill_dict.get('dir', 'BULL')
-    if raw_dir == 'BULL':
-        return (kp - ap) / base_atr
-    if raw_dir == 'BEAR':
-        return (ap - kp) / base_atr
-    return 0.0
+    ap, kp = float(kill_dict.get('anchor_price', 0.0) or 0.0), float(kill_dict.get('killed_price', 0.0) or 0.0)
+    if ap <= 0 or kp <= 0 or base_atr <= 0: return 0.0
+    return (kp - ap) / base_atr if kill_dict.get('dir', 'BULL') == 'BULL' else (ap - kp) / base_atr
 
 def _r_multiple(row, include_banked=False):
-    anchor_price = row.get('AnchorPrice', 0.0)
-    base_atr = row.get('BaseAtr', 0.0)
-    live_r = 0.0
-    if anchor_price and anchor_price > 0 and base_atr and base_atr > 0:
-        price = _exit_price(row)
-        direction = row.get('PremiumDir', row.get('AnchorDir'))
-        if direction == 'BULL':
-            live_r = (price - anchor_price) / base_atr
-        elif direction == 'BEAR':
-            live_r = (anchor_price - price) / base_atr
-    if include_banked:
-        return live_r + float(row.get('BankedR', 0.0) or 0.0)
-    return live_r
+    ap, base_atr, live_r = row.get('AnchorPrice', 0.0), row.get('BaseAtr', 0.0), 0.0
+    if ap > 0 and base_atr > 0:
+        price, direction = _exit_price(row), row.get('PremiumDir', row.get('AnchorDir'))
+        live_r = (price - ap) / base_atr if direction == 'BULL' else (ap - price) / base_atr
+    return live_r + float(row.get('BankedR', 0.0) or 0.0) if include_banked else live_r
 
 def _merge_signal(sig_rows, last_row, direction):
     first, latest = sig_rows[0], sig_rows[-1]
     row = dict(last_row)
-    row['ActiveAnchor'] = first['ActiveAnchor']
-    row['AnchorPrice'] = first['AnchorPrice']
-    row['AnchorDir'] = direction
+    row['ActiveAnchor'], row['AnchorPrice'], row['AnchorDir'] = first['ActiveAnchor'], first['AnchorPrice'], direction
+    kills, base_atr = last_row.get('Kills') or [], float(last_row.get('BaseAtr', 0.0) or 0.0)
+    prior_kills = [k for k in kills if k.get('dir') == direction and k.get('anchor_time') != first['ActiveAnchor']]
+    row['PriorStops'], row['BankedR'] = len(prior_kills), sum(_kill_r_multiple(k, base_atr) for k in prior_kills)
 
-    kills = last_row.get('Kills') or []
-    base_atr = float(last_row.get('BaseAtr', 0.0) or 0.0)
-
-    prior_kills = [
-        k for k in kills
-        if k.get('dir') == direction and k.get('anchor_time') != first['ActiveAnchor']
-    ]
-    row['PriorStops'] = len(prior_kills)
-    row['BankedR'] = sum(_kill_r_multiple(k, base_atr) for k in prior_kills)
-    row['BestPriorKill'] = max(prior_kills, key=lambda k: _kill_r_multiple(k, base_atr)) if prior_kills else None
-
-    survived_to_end = (
-        latest['CheckpointTime'] == last_row['CheckpointTime']
-        and last_row.get('State') in ACTIVE_BULL_STATES
-        and _signal_id(last_row) == _signal_id(first)
-    )
-
-    if survived_to_end:
-        row['State'] = last_row['State']
-        row['KilledTime'], row['KilledPrice'], row['RejectReason'] = '-', 0.0, ""
+    if latest['CheckpointTime'] == last_row['CheckpointTime'] and last_row.get('State') in ACTIVE_BULL_STATES and _signal_id(last_row) == _signal_id(first):
+        row['State'], row['KilledTime'], row['KilledPrice'], row['RejectReason'] = last_row['State'], '-', 0.0, ""
     else:
         row['State'] = "[STOPPED]"
         k = _find_kill(kills, direction, first['ActiveAnchor'])
-        if k:
-            row['KilledTime'] = k['killed_time']
-            row['KilledPrice'] = float(k['killed_price'])
-            row['RejectReason'] = k['reason']
-        else:
-            row['KilledTime'] = latest['CheckpointTime'].strftime('%H:%M')
-            row['KilledPrice'] = float(latest['LTP'])
-            row['RejectReason'] = "Superseded by newer anchor / Stopped between checkpoints"
-
+        if k: row['KilledTime'], row['KilledPrice'], row['RejectReason'] = k['killed_time'], float(k['killed_price']), k['reason']
+        else: row['KilledTime'], row['KilledPrice'], row['RejectReason'] = latest['CheckpointTime'].strftime('%H:%M'), float(latest['LTP']), "Superseded by newer anchor"
     ap = row['AnchorPrice'] or last_row['LTP']
-    exit_price = _exit_price(row)
-    row['MovePct'] = ((exit_price - ap) / ap) * 100 if ap else 0.0
+    row['MovePct'] = ((_exit_price(row) - ap) / ap) * 100 if ap else 0.0
     return row
 
 def merge_symbol_rows(rows):
-    """
-    Preserves ALL historical anchor episodes for a symbol across the day:
-    - Active surviving latest anchor goes to `active_bull` / `active_bear`.
-    - Every earlier killed anchor (from `Kills` or earlier checkpoints) is converted
-      into a standalone Graveyard record so morning winners are never erased.
-    """
     rows = sorted(rows, key=lambda r: r['CheckpointTime'])
     last_row = rows[-1]
     kills = last_row.get('Kills') or []
-
-    active_merged = {}
-    grave_episodes = []
-    seen_anchor_times = set()
+    active_merged, grave_episodes, seen_anchor_times = {}, [], set()
 
     for direction, active in (("BULL", ACTIVE_BULL_STATES), ("BEAR", ACTIVE_BEAR_STATES)):
-        d_rows = [r for r in rows if r['AnchorDir'] == direction and r['State'] in active]
-
         episodes = {}
-        for r in d_rows:
-            sid = _signal_id(r)
-            episodes.setdefault(sid, []).append(r)
-
-        for sid, ep_rows in episodes.items():
+        for r in [r for r in rows if r['AnchorDir'] == direction and r['State'] in active]: episodes.setdefault(_signal_id(r), []).append(r)
+        for ep_rows in episodes.values():
             merged_ep = _merge_signal(ep_rows, last_row, direction)
             seen_anchor_times.add((direction, merged_ep['ActiveAnchor']))
-            if merged_ep['State'] != "[STOPPED]":
-                active_merged[direction] = merged_ep
-            else:
-                grave_episodes.append(merged_ep)
-
-        for k in kills:
-            if k.get('dir') == direction and (direction, k.get('anchor_time')) not in seen_anchor_times:
-                seen_anchor_times.add((direction, k.get('anchor_time')))
-                g_row = dict(last_row)
-                g_row['AnchorDir'] = direction
-                g_row['ActiveAnchor'] = k['anchor_time']
-                g_row['AnchorPrice'] = float(k['anchor_price'])
-                g_row['KilledTime'] = k['killed_time']
-                g_row['KilledPrice'] = float(k['killed_price'])
-                g_row['RejectReason'] = k['reason']
-                g_row['State'] = "[STOPPED]"
-                ap = g_row['AnchorPrice']
-                g_row['MovePct'] = ((g_row['KilledPrice'] - ap) / ap) * 100 if ap > 0 else 0.0
-                grave_episodes.append(g_row)
-
+            if merged_ep['State'] != "[STOPPED]": active_merged[direction] = merged_ep
+            else: grave_episodes.append(merged_ep)
+        for k in [k for k in kills if k.get('dir') == direction and (direction, k.get('anchor_time')) not in seen_anchor_times]:
+            seen_anchor_times.add((direction, k.get('anchor_time')))
+            g_row = dict(last_row)
+            g_row['AnchorDir'], g_row['ActiveAnchor'], g_row['AnchorPrice'] = direction, k['anchor_time'], float(k['anchor_price'])
+            g_row['KilledTime'], g_row['KilledPrice'], g_row['RejectReason'], g_row['State'] = k['killed_time'], float(k['killed_price']), k['reason'], "[STOPPED]"
+            g_row['MovePct'] = ((g_row['KilledPrice'] - g_row['AnchorPrice']) / g_row['AnchorPrice']) * 100 if g_row['AnchorPrice'] > 0 else 0.0
+            grave_episodes.append(g_row)
     if not active_merged and not grave_episodes:
         grave = dict(last_row)
         grave['CheckpointTime'] = rows[0]['CheckpointTime']
         grave_episodes.append(grave)
-
     return active_merged.get("BULL"), active_merged.get("BEAR"), grave_episodes
 
-def _state_display(row):
-    st = row['State']
-    if st == "[STOPPED]":
-        k = row.get('KilledTime')
-        return f"[STOP {k}]" if k and k != '-' else st
-    return st
-
-def _fav_color(pct, direction):
-    sign = 1 if direction == "BULL" else -1 if direction == "BEAR" else 0
-    fav = pct * sign
-    return COLOR_GREEN_FG if fav > 0 else COLOR_RED_FG if fav < 0 else COLOR_DIM
-
-def _format_val(v, dir_color):
-    return f"{dir_color}{v}{COLOR_RESET}" if v > 0 else f"{COLOR_DIM}{v}{COLOR_RESET}"
+def _state_display(row): return f"[STOP {row.get('KilledTime')}]" if row['State'] == "[STOPPED]" and row.get('KilledTime') and row.get('KilledTime') != '-' else row['State']
+def _fav_color(pct, direction): return COLOR_GREEN_FG if (pct * (1 if direction == "BULL" else -1)) > 0 else COLOR_RED_FG if (pct * (1 if direction == "BULL" else -1)) < 0 else COLOR_DIM
+def _format_val(v, dir_color): return f"{dir_color}{v}{COLOR_RESET}" if v > 0 else f"{COLOR_DIM}{v}{COLOR_RESET}"
 
 # ------------------------------------------------------------------------------
 # TRACKING EMAIL & INTRADAY HISTORY
 # ------------------------------------------------------------------------------
 def _send_watch_email(subject, body, tag="track"):
-    sender = os.environ.get("SENDER_EMAIL")
-    password = os.environ.get("SENDER_PASSWORD")
-    recipient = os.environ.get("RECIPIENT_EMAIL")
-    smtp_server = os.environ.get("SMTP_SERVER") or "smtp.gmail.com"
-    smtp_port = os.environ.get("SMTP_PORT") or "465"
-
-    missing = [name for name, val in (
-        ("SENDER_EMAIL", sender),
-        ("SENDER_PASSWORD", password),
-        ("RECIPIENT_EMAIL", recipient),
-    ) if not val]
-
-    if missing:
-        print(f"   {COLOR_YELLOW}[{tag}] Cannot send email -- missing env var(s): {', '.join(missing)}.{COLOR_RESET}")
-        return False
-
-    try:
-        port = int(smtp_port)
-    except ValueError:
-        print(f"   {COLOR_YELLOW}[{tag}] Cannot send email -- SMTP_PORT='{smtp_port}' is not a valid integer.{COLOR_RESET}")
-        return False
-
-    msg = EmailMessage()
-    msg['Subject'] = subject
-    msg['From'] = sender
-    msg['To'] = recipient
-    msg.set_content(body)
-
+    sender, password, recipient, smtp_server, smtp_port = os.environ.get("SENDER_EMAIL"), os.environ.get("SENDER_PASSWORD"), os.environ.get("RECIPIENT_EMAIL"), os.environ.get("SMTP_SERVER") or "smtp.gmail.com", os.environ.get("SMTP_PORT") or "465"
+    if not sender or not password or not recipient: return False
+    try: port = int(smtp_port)
+    except ValueError: return False
+    msg = EmailMessage(); msg['Subject'], msg['From'], msg['To'] = subject, sender, recipient; msg.set_content(body)
     try:
         if port == 465:
-            with smtplib.SMTP_SSL(smtp_server, port, timeout=20) as server:
-                server.login(sender, password)
-                server.send_message(msg)
+            with smtplib.SMTP_SSL(smtp_server, port, timeout=20) as server: server.login(sender, password); server.send_message(msg)
         else:
-            with smtplib.SMTP(smtp_server, port, timeout=20) as server:
-                server.starttls()
-                server.login(sender, password)
-                server.send_message(msg)
-        print(f"   {COLOR_GREEN_FG}[{tag}] Email successfully sent to {recipient}.{COLOR_RESET}")
+            with smtplib.SMTP(smtp_server, port, timeout=20) as server: server.starttls(); server.login(sender, password); server.send_message(msg)
         return True
-    except Exception as e:
-        print(f"   {COLOR_YELLOW}[{tag}] Failed to send email ({type(e).__name__}: {e}).{COLOR_RESET}")
-        return False
+    except Exception: return False
 
 def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True):
-    if not tracked_symbol_raw:
-        return
+    if not tracked_symbol_raw: return
     n = _norm_sym(tracked_symbol_raw)
-
-    matched_sym = None
-    for sym in by_symbol.keys():
-        if n in _norm_sym(sym):
-            matched_sym = sym
-            break
-
-    if not matched_sym:
-        print(f"{COLOR_YELLOW}» Tracked symbol '{tracked_symbol_raw}' not found in scanned results.{COLOR_RESET}")
-        return
-
+    matched_sym = next((sym for sym in by_symbol.keys() if n in _norm_sym(sym)), None)
+    if not matched_sym: return
     rows = sorted(by_symbol[matched_sym], key=lambda r: r['CheckpointTime'])
-    history = []
-    is_pe = " PE " in matched_sym or matched_sym.endswith("PE")
-
+    history, is_pe = [], " PE " in matched_sym or matched_sym.endswith("PE")
     for i in range(1, len(rows) + 1):
         subset = rows[:i]
-        eval_time = subset[-1]['CheckpointTime']
         b, r_, g_list = merge_symbol_rows(subset)
-
-        selected_row = None
-        if b and b['State'] != "[STOPPED]":
-            selected_row = b
-        elif r_ and r_['State'] != "[STOPPED]":
-            selected_row = r_
-        elif g_list:
-            selected_row = g_list[-1]
-
+        selected_row = b if (b and b['State'] != "[STOPPED]") else r_ if (r_ and r_['State'] != "[STOPPED]") else (g_list[-1] if g_list else None)
         if selected_row:
             row_copy = dict(selected_row)
             raw_d = row_copy.get('AnchorDir', 'BULL')
             if raw_d in ("BULL", "BEAR"):
                 row_copy['PremiumDir'] = raw_d
-                if is_pe:
-                    row_copy['AnchorDir'] = "BEAR" if raw_d == "BULL" else "BULL"
-            row_copy['_EvalTime'] = eval_time
+                if is_pe: row_copy['AnchorDir'] = "BEAR" if raw_d == "BULL" else "BULL"
+            row_copy['_EvalTime'] = subset[-1]['CheckpointTime']
             history.append(row_copy)
-
-    if not history:
-        return
-
+    if not history: return
+    
     print(f"\n{COLOR_BOLD}🔍 INTRADAY HISTORY FOR TRACKED SYMBOL: {matched_sym}{COLOR_RESET}")
     sym_w = max(12, len(matched_sym))
-    header_str = (
-        f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP/Exit':>8} | "
-        f"{'Eval':^5} {'Anchor':^7} {'Anch Val':>9} {'R-Mult (Bank)':>15} | "
-        f"ATR: 1X 2X 3X 5X | "
-        f"BB: 1X 2X 3X 5X | "
-        f"{'State':^13}{COLOR_RESET}"
-    )
-    print(header_str)
-    print("-" * len(ANSI_RE.sub("", header_str)))
-
+    header_str = f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP/Exit':>8} | {'Eval':^5} {'Anchor':^7} {'Anch Val':>9} {'R-Mult (Bank)':>15} | ATR: 1X 2X 3X 5X | BB: 1X 2X 3X 5X | {'State':^13}{COLOR_RESET}"
+    print(header_str); print("-" * len(ANSI_RE.sub("", header_str)))
     for row in history:
-        live_r = _r_multiple(row, include_banked=False)
-        banked_r = float(row.get('BankedR', 0.0) or 0.0)
+        live_r, banked_r = _r_multiple(row, include_banked=False), float(row.get('BankedR', 0.0) or 0.0)
         total_r = live_r + banked_r
         r_color = COLOR_GREEN_FG if total_r > 0 else COLOR_RED_FG if total_r < 0 else COLOR_DIM
-
-        if row.get('PriorStops', 0) > 0 and abs(banked_r) > 0.01:
-            r_mult_str = f"{live_r:>+5.2f}R ({banked_r:>+4.1f}R)"
-            a_time = f"{row.get('ActiveAnchor', '-')}*"
-        else:
-            r_mult_str = f"{live_r:>+5.2f}R        "
-            a_time = f"{row.get('ActiveAnchor', '-')} "
-
+        r_mult_str, a_time = (f"{live_r:>+5.2f}R ({banked_r:>+4.1f}R)", f"{row.get('ActiveAnchor', '-')}*") if row.get('PriorStops', 0) > 0 and abs(banked_r) > 0.01 else (f"{live_r:>+5.2f}R        ", f"{row.get('ActiveAnchor', '-')} ")
         direction = row.get('AnchorDir', 'BULL')
         dir_c = COLOR_GREEN_FG if direction == "BULL" else COLOR_RED_FG
-
         ag, bg = row.get('ATR_Grid', {1: 0, 2: 0, 3: 0, 5: 0}), row.get('BB_Grid', {1: 0, 2: 0, 3: 0, 5: 0})
         a1, a2, a3, a5 = [_format_val(ag[k], dir_c) for k in [1, 2, 3, 5]]
         b1, b2, b3, b5 = [_format_val(bg[k], dir_c) for k in [1, 2, 3, 5]]
-
-        state = row['State']
         shown_state = _state_display(row)
-        if "[ BB > KC ]" in state:
+        if "[ BB > KC ]" in row['State']:
             dir_tag = "▲" if direction == "BULL" else "▼" if direction == "BEAR" else ""
-            shown_state = f"[ BB > KC ] {dir_tag}".strip()
-            state_text = f"{COLOR_GREEN_FG if dir_tag == '▲' else COLOR_RED_FG}{shown_state:^13}{COLOR_RESET}"
-        elif "[ BB < KC ]" in state:
-            state_text = f"{COLOR_YELLOW}{shown_state:^13}{COLOR_RESET}"
+            state_text = f"{COLOR_GREEN_FG if dir_tag == '▲' else COLOR_RED_FG}{f'[ BB > KC ] {dir_tag}'.strip():^13}{COLOR_RESET}"
         else:
-            state_text = f"{COLOR_DIM}{shown_state:^13}{COLOR_RESET}"
+            state_text = f"{COLOR_YELLOW if '[ BB < KC ]' in row['State'] else COLOR_DIM}{shown_state:^13}{COLOR_RESET}"
+        ltp_val = f"{row['KilledPrice']:>7.2f}x" if "[STOP" in shown_state and row.get('KilledPrice', 0) > 0 else f"{row['LTP']:>8.2f} "
+        print(f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} {ltp_val} | {row['_EvalTime'].strftime('%H:%M'):^5} {a_time:^7} {row['AnchorPrice']:>9.2f} {r_color}{r_mult_str:>15}{COLOR_RESET} |   {a1}  {a2}  {a3}  {a5}  |   {b1}  {b2}  {b3}  {b5}  | {state_text}")
 
-        if "[STOP" in shown_state and row.get('KilledPrice', 0) > 0:
-            ltp_val = f"{row['KilledPrice']:>7.2f}x"
-        else:
-            ltp_val = f"{row['LTP']:>8.2f} "
-
-        eval_time_str = row['_EvalTime'].strftime('%H:%M')
-
-        print(
-            f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} "
-            f"{ltp_val} | "
-            f"{eval_time_str:^5} "
-            f"{a_time:^7} "
-            f"{row['AnchorPrice']:>9.2f} "
-            f"{r_color}{r_mult_str:>15}{COLOR_RESET} |   "
-            f"{a1}  {a2}  {a3}  {a5}  |   "
-            f"{b1}  {b2}  {b3}  {b5}  | "
-            f"{state_text}"
-        )
-
-    if len(history) >= 2:
-        last_row = history[-1]
-        prev_row = history[-2]
-
-        def get_full_state(r):
-            return f"{r.get('AnchorDir', 'NONE')} {r.get('State', 'NONE')}"
-
-        last_state = get_full_state(last_row)
-        prev_state = get_full_state(prev_row)
-        last_eval = last_row['_EvalTime'].strftime('%H:%M')
-        prev_eval = prev_row['_EvalTime'].strftime('%H:%M')
-
-        print(f"\n{COLOR_DIM}Stateless Check: Evaluating {last_eval} vs {prev_eval}...{COLOR_RESET}")
-
+    if len(history) >= 2 and live_run:
+        last_row, prev_row = history[-1], history[-2]
+        def get_full_state(r): return f"{r.get('AnchorDir', 'NONE')} {r.get('State', 'NONE')}"
+        last_state, prev_state = get_full_state(last_row), get_full_state(prev_row)
         if last_state != prev_state:
-            print(f"{COLOR_BOLD}🔔 ALERT: State change detected! {prev_state} -> {last_state}{COLOR_RESET}")
-
-            if not live_run:
-                print(f"   {COLOR_DIM}[track] Historical execution (Live: False) — skipping email transmission.{COLOR_RESET}")
-                return
-
-            r_mult = _r_multiple(last_row, include_banked=True)
-            subject = f"[System3] {matched_sym} Alert: {prev_state} -> {last_state}"
-            body = (
-                f"System3 detected a state transition for {matched_sym} at checkpoint {last_eval}.\n\n"
-                f"Previous State ({prev_eval}): {prev_state}\n"
-                f"Current State  ({last_eval}): {last_state}\n\n"
-                f"LTP: {last_row.get('LTP', 0):.2f}\n"
-                f"Day Change: {last_row.get('DayChangePct', 0):+.2f}%\n"
-                f"Total Session Move: {r_mult:+.2f} R-Multiples\n"
-            )
-            _send_watch_email(subject, body, "track")
-        else:
-            print(f"{COLOR_DIM}[track] State is unchanged ({last_state}). No email sent.{COLOR_RESET}")
+            _send_watch_email(f"[System3] {matched_sym} Alert: {prev_state} -> {last_state}", f"System3 detected a state transition for {matched_sym} at checkpoint {last_row['_EvalTime'].strftime('%H:%M')}.\n\nPrevious State: {prev_state}\nCurrent State: {last_state}\n\nLTP: {last_row.get('LTP', 0):.2f}\nTotal Session Move: {_r_multiple(last_row, include_banked=True):+.2f} R-Multiples\n", "track")
 
 # ==============================================================================
 # MAIN RUNNER
 # ==============================================================================
 def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, target_time_str=None, track_symbol=""):
     t_start = time.time()
-
     explicit = bool(target_date_str or target_time_str)
-    if explicit:
-        d_str = target_date_str or now_ist().strftime("%Y-%m-%d")
-        t_str = target_time_str or "15:30"
-        try:
-            cutoff_dt = datetime.strptime(f"{d_str} {t_str}", "%Y-%m-%d %H:%M")
-        except ValueError:
-            print(f"{COLOR_RED_FG}[!] Invalid --date/--time '{d_str} {t_str}' (expected YYYY-MM-DD and HH:MM).{COLOR_RESET}")
-            return 1
-    else:
-        cutoff_dt = now_ist()
-
-    cutoff_dt = cutoff_dt.replace(second=0, microsecond=0)
-    live_run = not explicit
-
-    cutoff_dt, notes = resolve_session(cutoff_dt)
-    if STATS.auth_failed:
-        print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401). Regenerate UPSTOX_ACCESS_TOKEN -- it expires daily.{COLOR_RESET}")
-        return 1
-
-    target_dt = cutoff_dt.date()
+    cutoff_dt = datetime.strptime(f"{target_date_str or now_ist().strftime('%Y-%m-%d')} {target_time_str or '15:30'}", "%Y-%m-%d %H:%M") if explicit else now_ist()
+    cutoff_dt, notes = resolve_session(cutoff_dt.replace(second=0, microsecond=0))
+    if STATS.auth_failed: return 1
+    target_dt, today_session = cutoff_dt.date(), (cutoff_dt.date() == now_ist().date())
     cutoff_dt = min(cutoff_dt, _close_dt(target_dt))
-    today_session = (target_dt == now_ist().date())
 
-    print(f"\n{COLOR_CYAN}📡 Initializing Tracker [{mode}] | Time Machine: {cutoff_dt.strftime('%Y-%m-%d %H:%M:%S')} (Live: {live_run}){COLOR_RESET}")
-    for n in notes:
-        print(f"   {COLOR_YELLOW}» {n}{COLOR_RESET}")
+    print(f"\n{COLOR_CYAN}📡 Initializing Tracker [{mode}] | Time Machine: {cutoff_dt.strftime('%Y-%m-%d %H:%M:%S')} (Live: {not explicit}){COLOR_RESET}")
+    for n in notes: print(f"   {COLOR_YELLOW}» {n}{COLOR_RESET}")
 
-    needles = [track_symbol] if track_symbol else []
-    universe_raw = get_dynamic_universe(mode, cutoff_dt, today_session, needles=needles)
-
-    if STATS.auth_failed:
-        print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401). Regenerate UPSTOX_ACCESS_TOKEN -- it expires daily.{COLOR_RESET}")
-        return 1
-    if not universe_raw:
-        print(f"{COLOR_RED_FG}[!] Universe is EMPTY for mode {mode} -- nothing to scan. See the messages above for why.{COLOR_RESET}")
-        _print_error_summary()
-        return 1
-
+    universe_raw = get_dynamic_universe(mode, cutoff_dt, today_session, needles=[track_symbol] if track_symbol else [])
+    if STATS.auth_failed or not universe_raw: return 1
     print(f"   {COLOR_DIM}» Universe: {len(universe_raw)} instruments{COLOR_RESET}")
 
-    if mode == "INDEX_OPTIONS":
-        candidates = universe_raw
+    if mode == "INDEX_OPTIONS": candidates = universe_raw
     else:
-        daily_start = target_dt - timedelta(days=days * 2 + 6)
         prog = Progress("prefilter", len(universe_raw))
         with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
-            candidates = [r for r in ex.map(_history_worker_daily, [(it, daily_start, target_dt, prog) for it in universe_raw]) if r is not None]
+            candidates = [r for r in ex.map(_history_worker_daily, [(it, target_dt - timedelta(days=days * 2 + 6), target_dt, prog) for it in universe_raw]) if r is not None]
         prog.done()
-        if STATS.auth_failed:
-            print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401) during the prefilter.{COLOR_RESET}")
-            return 1
-        if not candidates:
-            print(f"{COLOR_YELLOW}[!] 0 of {len(universe_raw)} instruments passed the price/volume prefilter "
-                  f"(price {MIN_PRICE}-{MAX_PRICE}, volume >= {MIN_DAILY_VOLUME}).{COLOR_RESET}")
-            _print_error_summary()
-            return 1 if (STATS.failed or ERRORS.items) else 0
+        if STATS.auth_failed or not candidates: return 1
         print(f"   {COLOR_DIM}» Prefilter: {len(universe_raw)} -> {len(candidates)} instruments{COLOR_RESET}")
 
     checkpoints = generate_checkpoints(cutoff_dt) if BACKTRACE_CHECKPOINTS else [cutoff_dt]
-    print(f"   {COLOR_DIM}» Backtrace checkpoints ({len(checkpoints)}): "
-          f"{', '.join(c.strftime('%H:%M') for c in checkpoints)}{COLOR_RESET}")
+    print(f"   {COLOR_DIM}» Backtrace checkpoints ({len(checkpoints)}): {', '.join(c.strftime('%H:%M') for c in checkpoints)}{COLOR_RESET}")
 
     prog = Progress("checkpoints", len(candidates))
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        per_symbol = list(ex.map(
-            process_stock_checkpoints,
-            [(item, checkpoints, today_session, MIN1_HISTORY_DAYS, mode, prog) for item in candidates]
-        ))
+        per_symbol = list(ex.map(process_stock_checkpoints, [(item, checkpoints, today_session, MIN1_HISTORY_DAYS, mode, prog) for item in candidates]))
     prog.done()
 
-    if STATS.auth_failed:
-        print(f"{COLOR_RED_FG}[!] Upstox rejected the access token (HTTP 401) while fetching candles.{COLOR_RESET}")
-        return 1
-
+    if STATS.auth_failed: return 1
     outcomes = [o for sym_outcomes in per_symbol for o in sym_outcomes]
     results = [p for _, s, p in outcomes if s == "ok"]
     counts = {k: sum(1 for _, s, _ in outcomes if s == k) for k in ("no_data", "illiquid", "short_history", "error")}
+    print(f"   {COLOR_DIM}» Scan summary: {len(candidates)} instruments x {len(checkpoints)} checkpoints = {len(outcomes)} evaluations | ok {len(results)} | no data {counts['no_data']} | illiquid {counts['illiquid']} | short history {counts['short_history']} | errors {counts['error']}{COLOR_RESET}")
+    if not results: return 1
 
-    print(f"   {COLOR_DIM}» Scan summary: {len(candidates)} instruments x {len(checkpoints)} checkpoints = "
-          f"{len(outcomes)} evaluations | ok {len(results)} | no data {counts['no_data']} | illiquid {counts['illiquid']} | "
-          f"short history {counts['short_history']} | errors {counts['error']}{COLOR_RESET}")
-
-    if counts["short_history"]:
-        print(f"   {COLOR_YELLOW}» {counts['short_history']} evaluations skipped: fewer than {ATR_MIN_BARS} completed sessions of "
-              f"history for the ATR (new contracts, or --history-days too small).{COLOR_RESET}")
-
-    if not results:
-        print(f"{COLOR_RED_FG}[!] No instrument produced usable data at any checkpoint up to {cutoff_dt:%Y-%m-%d %H:%M}. "
-              f"Is that a trading day/time, and does the token have historical-candle access?{COLOR_RESET}")
-        _print_error_summary()
-        return 1
-
-    # --- THE STRICT SEGREGATION & MULTI-EPISODE PIPELINE ---
-    by_symbol = {}
-    for row in results:
-        by_symbol.setdefault(row['Symbol'], []).append(row)
-
-    bulls_live, bears_live, graveyard_candidates = [], [], []
+    by_symbol, bulls_live, bears_live, graveyard_candidates = {}, [], [], []
+    for row in results: by_symbol.setdefault(row['Symbol'], []).append(row)
 
     for symbol, rows in by_symbol.items():
         b, r_, grave_list = merge_symbol_rows(rows)
         is_pe = " PE " in symbol or symbol.endswith("PE")
-
         def _apply_dir(item, raw_dir):
             item['PremiumDir'] = raw_dir
-            if is_pe:
-                item['AnchorDir'] = "BEAR" if raw_dir == "BULL" else "BULL"
-            else:
-                item['AnchorDir'] = raw_dir
-
+            item['AnchorDir'] = "BEAR" if (raw_dir == "BULL" and is_pe) else ("BULL" if (raw_dir == "BEAR" and is_pe) else raw_dir)
         for item, raw_dir in ((b, "BULL"), (r_, "BEAR")):
-            if not item:
-                continue
+            if not item: continue
             _apply_dir(item, raw_dir)
-
-            if item['State'] == "[STOPPED]" or "[STOP" in str(item.get('State', '')):
-                graveyard_candidates.append(item)
-            else:
-                if item['AnchorDir'] == "BULL":
-                    bulls_live.append(item)
-                else:
-                    bears_live.append(item)
-
+            if item['State'] == "[STOPPED]" or "[STOP" in str(item.get('State', '')): graveyard_candidates.append(item)
+            else: (bulls_live if item['AnchorDir'] == "BULL" else bears_live).append(item)
         for g_item in (grave_list or []):
-            raw_g_dir = g_item.get('AnchorDir', 'NONE')
-            if raw_g_dir in ("BULL", "BEAR"):
-                _apply_dir(g_item, raw_g_dir)
-            else:
-                g_item['PremiumDir'] = "NONE"
+            if g_item.get('AnchorDir', 'NONE') in ("BULL", "BEAR"): _apply_dir(g_item, g_item.get('AnchorDir'))
             graveyard_candidates.append(g_item)
 
-    if track_symbol:
-        print_and_alert_tracked_history(track_symbol, by_symbol, live_run=live_run)
+    if track_symbol: print_and_alert_tracked_history(track_symbol, by_symbol, live_run=not explicit)
 
-    # --- ADVERSE DRIFT PURGE (Protects Re-Anchors with Positive Banked R) ---
-    surviving_bulls = [
-        r for r in bulls_live
-        if _r_multiple(r) > ADVERSE_DRIFT_R_FLOOR or _r_multiple(r, include_banked=True) > 0.5
-    ]
-    surviving_bears = [
-        r for r in bears_live
-        if _r_multiple(r) > ADVERSE_DRIFT_R_FLOOR or _r_multiple(r, include_banked=True) > 0.5
-    ]
-
+    surviving_bulls = [r for r in bulls_live if _r_multiple(r) > ADVERSE_DRIFT_R_FLOOR or _r_multiple(r, include_banked=True) > 0.5]
+    surviving_bears = [r for r in bears_live if _r_multiple(r) > ADVERSE_DRIFT_R_FLOOR or _r_multiple(r, include_banked=True) > 0.5]
     for r in bulls_live:
-        if r not in surviving_bulls:
-            r['RejectReason'] = f"Adverse Drift (Losing R-Multiple < {ADVERSE_DRIFT_R_FLOOR:g}R)"
-            graveyard_candidates.append(r)
-
+        if r not in surviving_bulls: r['RejectReason'] = f"Adverse Drift (Losing R-Multiple < {ADVERSE_DRIFT_R_FLOOR:g}R)"; graveyard_candidates.append(r)
     for r in bears_live:
-        if r not in surviving_bears:
-            r['RejectReason'] = f"Adverse Drift (Losing R-Multiple < {ADVERSE_DRIFT_R_FLOOR:g}R)"
-            graveyard_candidates.append(r)
+        if r not in surviving_bears: r['RejectReason'] = f"Adverse Drift (Losing R-Multiple < {ADVERSE_DRIFT_R_FLOOR:g}R)"; graveyard_candidates.append(r)
 
-    def state_rank(st):
-        if "[ BB > KC ]" in st:
-            return 0
-        if "[ BB < KC ]" in st:
-            return 1
-        return 2
+    def state_rank(st): return 0 if "[ BB > KC ]" in st else 1 if "[ BB < KC ]" in st else 2
+    surviving_bulls.sort(key=lambda r: (-_r_multiple(r, include_banked=True), -_r_multiple(r), state_rank(r['State']), -r.get('ATR_Grid', {}).get(1, 0), -r.get('BB_Grid', {}).get(1, 0), -int(r['CheckpointTime'].timestamp())))
+    surviving_bears.sort(key=lambda r: (-_r_multiple(r, include_banked=True), -_r_multiple(r), state_rank(r['State']), -r.get('ATR_Grid', {}).get(1, 0), -r.get('BB_Grid', {}).get(1, 0), -int(r['CheckpointTime'].timestamp())))
+    bulls, bears = surviving_bulls[:TOP_N_BUYERS], surviving_bears[:TOP_N_SELLERS]
 
-    # --- SORT BY CUMULATIVE SESSION R (Live R + Banked Morning R) ---
-    surviving_bulls.sort(key=lambda r: (
-        -_r_multiple(r, include_banked=True),
-        -_r_multiple(r),
-        state_rank(r['State']),
-        -r.get('ATR_Grid', {}).get(1, 0),
-        -r.get('BB_Grid', {}).get(1, 0),
-        -int(r['CheckpointTime'].timestamp())
-    ))
-
-    surviving_bears.sort(key=lambda r: (
-        -_r_multiple(r, include_banked=True),
-        -_r_multiple(r),
-        state_rank(r['State']),
-        -r.get('ATR_Grid', {}).get(1, 0),
-        -r.get('BB_Grid', {}).get(1, 0),
-        -int(r['CheckpointTime'].timestamp())
-    ))
-
-    bulls = surviving_bulls[:TOP_N_BUYERS]
-    bears = surviving_bears[:TOP_N_SELLERS]
-
-    def sort_reason(r):
-        reason = str(r.get('RejectReason', ''))
-        if "Hard stop" in reason or "Kinetic SL" in reason or "Superseded" in reason:
-            return 0
-        if "Adverse" in reason:
-            return 1
-        if "Warzone" in reason:
-            return 2
-        return 3
-
-    graveyard_candidates.sort(key=lambda x: (
-        sort_reason(x),
-        -_r_multiple(x) if _r_multiple(x) != 0 else -abs(x.get('DayChangePct', 0.0))
-    ))
-
-    # --- GRAVEYARD DEDUPLICATION ---
-    dedup_grave = []
-    seen_grave = set()
+    def sort_reason(r): return 0 if any(x in str(r.get('RejectReason', '')) for x in ["Hard stop", "Kinetic SL", "Superseded"]) else 1 if "Adverse" in str(r.get('RejectReason', '')) else 2 if "Warzone" in str(r.get('RejectReason', '')) else 3
+    graveyard_candidates.sort(key=lambda x: (sort_reason(x), -_r_multiple(x) if _r_multiple(x) != 0 else -abs(x.get('DayChangePct', 0.0))))
+    
+    dedup_grave, seen_grave = [], set()
     for row in graveyard_candidates:
         gid = (row['Symbol'], row.get('ActiveAnchor', '-'), row.get('KilledTime', '-'))
-        if gid not in seen_grave:
-            seen_grave.add(gid)
-            dedup_grave.append(row)
-
-    grave_total = len(dedup_grave)
-    grave_shown = dedup_grave if TOP_N_GRAVEYARD <= 0 else dedup_grave[:TOP_N_GRAVEYARD]
-
-    all_shown = bulls + bears + grave_shown
-    sym_w = max(12, min(MAX_SYMBOL_WIDTH, max((len(r['Symbol']) for r in all_shown), default=12)))
+        if gid not in seen_grave: seen_grave.add(gid); dedup_grave.append(row)
+    grave_total, grave_shown = len(dedup_grave), dedup_grave if TOP_N_GRAVEYARD <= 0 else dedup_grave[:TOP_N_GRAVEYARD]
+    sym_w = max(12, min(MAX_SYMBOL_WIDTH, max((len(r['Symbol']) for r in bulls + bears + grave_shown), default=12)))
 
     print(f"\n{COLOR_BOLD}=== STATEFUL INSTITUTIONAL VOLATILITY TRACKER [{mode}] ==={COLOR_RESET}")
-    print(f"Target Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Scanned: {len(by_symbol)} symbols "
-          f"across {len(checkpoints)} checkpoints | Surviving: {len(bulls)} bull, {len(bears)} bear | "
-          f"Graveyard: {grave_total}\n")
+    print(f"Target Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Scanned: {len(by_symbol)} symbols across {len(checkpoints)} checkpoints | Surviving: {len(bulls)} bull, {len(bears)} bear | Graveyard: {grave_total}\n")
 
-    # --- VISUAL DASHBOARD RENDERER ---
     def print_basket(title, icon, data_list):
-        if not data_list:
-            return
+        if not data_list: return
         print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
-
-        header_str = (
-            f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP/Exit':>8} | "
-            f"{'Seen':^5} {'Anchor':^7} {'Anch Val':>9} {'R-Mult (Bank)':>15} | "
-            f"ATR: 1X 2X 3X 5X | "
-            f"BB: 1X 2X 3X 5X | "
-            f"{'State':^13}{COLOR_RESET}"
-        )
-        print(header_str)
-        print("-" * len(ANSI_RE.sub("", header_str)))
-
+        header_str = f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP/Exit':>8} | {'Seen':^5} {'Anchor':^7} {'Anch Val':>9} {'R-Mult (Bank)':>15} | ATR: 1X 2X 3X 5X | BB: 1X 2X 3X 5X | {'State':^13}{COLOR_RESET}"
+        print(header_str); print("-" * len(ANSI_RE.sub("", header_str)))
         basket_dir = "BULL" if "BULL" in title else "BEAR"
-
         for row in data_list:
-            live_r = _r_multiple(row, include_banked=False)
-            banked_r = float(row.get('BankedR', 0.0) or 0.0)
+            live_r, banked_r = _r_multiple(row, include_banked=False), float(row.get('BankedR', 0.0) or 0.0)
             total_r = live_r + banked_r
             r_color = COLOR_GREEN_FG if total_r > 0 else COLOR_RED_FG if total_r < 0 else COLOR_DIM
-
-            if row.get('PriorStops', 0) > 0 and abs(banked_r) > 0.01:
-                r_mult_str = f"{live_r:>+5.2f}R ({banked_r:>+4.1f}R)"
-                anchor_disp = f"{row['ActiveAnchor']}*"
-            else:
-                r_mult_str = f"{live_r:>+5.2f}R        "
-                anchor_disp = f"{row['ActiveAnchor']} "
-
+            r_mult_str, anchor_disp = (f"{live_r:>+5.2f}R ({banked_r:>+4.1f}R)", f"{row['ActiveAnchor']}*") if row.get('PriorStops', 0) > 0 and abs(banked_r) > 0.01 else (f"{live_r:>+5.2f}R        ", f"{row['ActiveAnchor']} ")
             dir_c = COLOR_GREEN_FG if basket_dir == "BULL" else COLOR_RED_FG
-
             ag, bg = row.get('ATR_Grid', {1: 0, 2: 0, 3: 0, 5: 0}), row.get('BB_Grid', {1: 0, 2: 0, 3: 0, 5: 0})
             a1, a2, a3, a5 = [_format_val(ag[k], dir_c) for k in [1, 2, 3, 5]]
             b1, b2, b3, b5 = [_format_val(bg[k], dir_c) for k in [1, 2, 3, 5]]
-
-            state = row['State']
             shown_state = _state_display(row)
-            if "[ BB > KC ]" in state:
+            if "[ BB > KC ]" in row['State']:
                 dir_tag = "▲" if basket_dir == "BULL" else "▼"
-                shown_state = f"[ BB > KC ] {dir_tag}".strip()
-                state_text = f"{COLOR_GREEN_FG if dir_tag == '▲' else COLOR_RED_FG}{shown_state:^13}{COLOR_RESET}"
-            elif "[ BB < KC ]" in state:
-                state_text = f"{COLOR_YELLOW}{shown_state:^13}{COLOR_RESET}"
+                state_text = f"{COLOR_GREEN_FG if dir_tag == '▲' else COLOR_RED_FG}{f'[ BB > KC ] {dir_tag}'.strip():^13}{COLOR_RESET}"
             else:
-                state_text = f"{COLOR_DIM}{shown_state:^13}{COLOR_RESET}"
-
-            if "[STOP" in shown_state and row.get('KilledPrice', 0) > 0:
-                ltp_val = f"{row['KilledPrice']:>7.2f}x"
-            else:
-                ltp_val = f"{row['LTP']:>8.2f} "
-
-            print(
-                f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} "
-                f"{ltp_val} | "
-                f"{row['CheckpointTime'].strftime('%H:%M'):^5} "
-                f"{anchor_disp:^7} "
-                f"{row['AnchorPrice']:>9.2f} "
-                f"{r_color}{r_mult_str:>15}{COLOR_RESET} |   "
-                f"{a1}  {a2}  {a3}  {a5}  |   "
-                f"{b1}  {b2}  {b3}  {b5}  | "
-                f"{state_text}"
-            )
+                state_text = f"{COLOR_YELLOW if '[ BB < KC ]' in row['State'] else COLOR_DIM}{shown_state:^13}{COLOR_RESET}"
+            ltp_val = f"{row['KilledPrice']:>7.2f}x" if "[STOP" in shown_state and row.get('KilledPrice', 0) > 0 else f"{row['LTP']:>8.2f} "
+            print(f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} {ltp_val} | {row['CheckpointTime'].strftime('%H:%M'):^5} {anchor_disp:^7} {row['AnchorPrice']:>9.2f} {r_color}{r_mult_str:>15}{COLOR_RESET} |   {a1}  {a2}  {a3}  {a5}  |   {b1}  {b2}  {b3}  {b5}  | {state_text}")
 
     print_basket("TOP BULL SETUPS (Valid Anchors Surviving)", "🔥", bulls)
     print_basket("TOP BEAR SETUPS (Valid Anchors Surviving)", "🩸", bears)
-    if not bulls and not bears:
-        print(f"{COLOR_YELLOW}No surviving anchors at this snapshot -- every candidate was rejected (see graveyard).{COLOR_RESET}")
+    if not bulls and not bears: print(f"{COLOR_YELLOW}No surviving anchors at this snapshot -- every candidate was rejected (see graveyard).{COLOR_RESET}")
 
     if grave_shown:
         print(f"\n{COLOR_BOLD}🚫 THE GRAVEYARD (Completed Episodes / Filtered / Rejected){COLOR_RESET}")
-        header_str = (
-            f" {COLOR_CYAN}{'Script':<{sym_w}} {'Signal':^6} {'Anchor':^6} {'Anch Val':>9} "
-            f"{'Killed':^6} {'Kill Val':>9} {'LTP':>8} {'R-Mult':>7} {'Move%':>7} | "
-            f"{'Forensic Rejection / Exit Reason'}{COLOR_RESET}"
-        )
-        print(header_str)
-        print("-" * len(ANSI_RE.sub("", header_str)))
-
+        header_str = f" {COLOR_CYAN}{'Script':<{sym_w}} {'Signal':^6} {'Anchor':^6} {'Anch Val':>9} {'Killed':^6} {'Kill Val':>9} {'LTP':>8} {'R-Mult':>7} {'Move%':>7} | {'Forensic Rejection / Exit Reason'}{COLOR_RESET}"
+        print(header_str); print("-" * len(ANSI_RE.sub("", header_str)))
         for row in grave_shown:
             sig = row.get('AnchorDir', 'NONE')
-            if sig == "BULL":
-                sig_colored = f"{COLOR_GREEN_FG}BULL{COLOR_RESET}  "
-            elif sig == "BEAR":
-                sig_colored = f"{COLOR_RED_FG}BEAR{COLOR_RESET}  "
-            else:
-                sig_colored = f"{COLOR_DIM}NONE{COLOR_RESET}  "
-
-            a_time = row['ActiveAnchor'] if row['ActiveAnchor'] else '-'
-            a_price = f"{row['AnchorPrice']:>9.2f}" if row['AnchorPrice'] > 0 else f"{'-':>9}"
-            k_time = row['KilledTime'] if row['KilledTime'] else '-'
-            k_price = f"{row['KilledPrice']:>9.2f}" if row['KilledPrice'] > 0 else f"{'-':>9}"
-
+            sig_colored = f"{COLOR_GREEN_FG}BULL{COLOR_RESET}  " if sig == "BULL" else f"{COLOR_RED_FG}BEAR{COLOR_RESET}  " if sig == "BEAR" else f"{COLOR_DIM}NONE{COLOR_RESET}  "
+            a_time, a_price = row['ActiveAnchor'] if row['ActiveAnchor'] else '-', f"{row['AnchorPrice']:>9.2f}" if row['AnchorPrice'] > 0 else f"{'-':>9}"
+            k_time, k_price = row['KilledTime'] if row['KilledTime'] else '-', f"{row['KilledPrice']:>9.2f}" if row['KilledPrice'] > 0 else f"{'-':>9}"
             if row['AnchorPrice'] > 0 and (row['KilledPrice'] > 0 or row['LTP'] > 0):
                 g_r = _r_multiple(row, include_banked=False)
-                g_r_str = f"{g_r:>+6.2f}R"
-                g_r_color = COLOR_GREEN_FG if g_r > 0 else COLOR_RED_FG if g_r < 0 else COLOR_DIM
-                move_pct_str = f"{row['MovePct']:>+6.2f}%"
-                move_color = _fav_color(row['MovePct'], row.get('PremiumDir', sig))
+                g_r_str, g_r_color = f"{g_r:>+6.2f}R", COLOR_GREEN_FG if g_r > 0 else COLOR_RED_FG if g_r < 0 else COLOR_DIM
+                move_pct_str, move_color = f"{row['MovePct']:>+6.2f}%", _fav_color(row['MovePct'], row.get('PremiumDir', sig))
             else:
-                g_r_str, g_r_color = f"{'-':>7}", COLOR_DIM
-                move_pct_str, move_color = f"{'-':>7}", COLOR_DIM
-
+                g_r_str, g_r_color, move_pct_str, move_color = f"{'-':>7}", COLOR_DIM, f"{'-':>7}", COLOR_DIM
             reason = row['RejectReason']
-            if "Kinetic SL" in reason or "Hard stop" in reason or "Adverse" in reason or "Superseded" in reason:
-                reason_color = COLOR_YELLOW
-            elif "Chop" in reason or "Warzone" in reason:
-                reason_color = COLOR_RED_FG
-            else:
-                reason_color = COLOR_DIM
-
-            print(
-                f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} "
-                f"{sig_colored} {a_time:^6} {a_price} {k_time:^6} {k_price} "
-                f"{row['LTP']:>8.2f} "
-                f"{g_r_color}{g_r_str}{COLOR_RESET} "
-                f"{move_color}{move_pct_str}{COLOR_RESET} | "
-                f"{reason_color}{reason}{COLOR_RESET}"
-            )
-        if grave_total > len(grave_shown):
-            print(f"{COLOR_DIM}   ... {grave_total - len(grave_shown)} more graveyard row(s) not shown "
-                  f"(--graveyard-max 0 prints them all).{COLOR_RESET}")
+            reason_color = COLOR_YELLOW if any(x in reason for x in ["Kinetic SL", "Hard stop", "Adverse", "Superseded"]) else COLOR_RED_FG if any(x in reason for x in ["Chop", "Warzone"]) else COLOR_DIM
+            print(f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} {sig_colored} {a_time:^6} {a_price} {k_time:^6} {k_price} {row['LTP']:>8.2f} {g_r_color}{g_r_str}{COLOR_RESET} {move_color}{move_pct_str}{COLOR_RESET} | {reason_color}{reason}{COLOR_RESET}")
+        if grave_total > len(grave_shown): print(f"{COLOR_DIM}   ... {grave_total - len(grave_shown)} more graveyard row(s) not shown (--graveyard-max 0 prints them all).{COLOR_RESET}")
 
     _print_error_summary()
-    total_calls = sum(l.total_calls for l in LIMITERS.values())
-    print(f"\n⏱️ Tracker sync completed in {(time.time() - t_start):.2f} seconds ({total_calls} API calls).\n")
+    print(f"\n⏱️ Tracker sync completed in {(time.time() - t_start):.2f} seconds ({sum(l.total_calls for l in LIMITERS.values())} API calls).\n")
     return 0
 
 def parse_args():
@@ -1949,95 +1246,39 @@ def parse_args():
     p.add_argument("--mode", choices=["STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"], default=TRADING_MODE)
     p.add_argument("--days", type=int, default=BACKTRACE_DAYS, help="calendar-day lookback of the daily prefilter fetch (x2 + 6)")
     p.add_argument("--date", type=str, default=None, help="Target date (YYYY-MM-DD). A weekend/holiday rolls back to the last session.")
-    p.add_argument("--time", type=str, default=None,
-                   help="Target time (HH:MM). With --date the default is 15:30; WITHOUT --date it means 'today at that time'.")
-    p.add_argument("--history-days", type=int, default=MIN1_HISTORY_DAYS,
-                   help=f"Calendar days of 1-minute history for indicator math and the ATR (default: {MIN1_HISTORY_DAYS}).")
+    p.add_argument("--time", type=str, default=None, help="Target time (HH:MM).")
+    p.add_argument("--history-days", type=int, default=MIN1_HISTORY_DAYS, help=f"Calendar days of 1-minute history for indicator math and the ATR (default: {MIN1_HISTORY_DAYS}).")
     p.add_argument("--opt-min-price", type=float, default=OPT_MIN_PRICE, help="INDEX_OPTIONS: minimum premium at the snapshot.")
     p.add_argument("--opt-min-volume", type=float, default=OPT_MIN_VOLUME, help="INDEX_OPTIONS: minimum traded volume by the snapshot.")
-    p.add_argument("--expiry", choices=["CURRENT", "NEXT"], default=EXPIRY_SELECTION,
-                   help=f"INDEX_OPTIONS: which expiry to trade -- CURRENT or NEXT. Default: {EXPIRY_SELECTION}.")
-    p.add_argument("--strikes-up", type=int, default=STRIKES_ABOVE_ATM,
-                   help=f"INDEX_OPTIONS: number of strikes ABOVE ATM to include (default {STRIKES_ABOVE_ATM}).")
-    p.add_argument("--strikes-down", type=int, default=STRIKES_BELOW_ATM,
-                   help=f"INDEX_OPTIONS: number of strikes BELOW ATM to include (default {STRIKES_BELOW_ATM}).")
-    p.add_argument("--checkpoint-min", type=int, default=CHECKPOINT_INTERVAL_MIN,
-                   help=f"Size in minutes of each intraday backtrace window (default {CHECKPOINT_INTERVAL_MIN}).")
-    p.add_argument("--single-snapshot", action="store_true",
-                   help="Disable the backtrace -- evaluate only the current run time, like a single snapshot.")
-
-    # --- TRIPWIRE, QUORUM & RISK ARGUMENTS ---
-    p.add_argument("--shock-mult", type=float, default=KINETIC_SHOCK_ATR_MULT,
-                   help=f"Kinetic Shock multiplier vs Velocity ATR (default {KINETIC_SHOCK_ATR_MULT:g}).")
-    p.add_argument("--ind-bb-std", type=float, default=IND_BB_PIERCE_STD,
-                   help=f"Indicator Breakout StdDev multiplier (default {IND_BB_PIERCE_STD:g}).")
-    p.add_argument("--struct-quorum", type=int, default=STRUCT_QUORUM,
-                   help=f"Min indicators (1-4) piercing structure bands for Lock 2 (default {STRUCT_QUORUM}).")
-    p.add_argument("--shock-quorum", type=int, default=SHOCK_QUORUM,
-                   help=f"Min indicators (1-4) hitting velocity shock for Lock 3 (default {SHOCK_QUORUM}).")
-    p.add_argument("--shock-window", type=int, default=SHOCK_WINDOW_BARS,
-                   help=f"Rolling 1m bars to align sequential indicator shocks (default {SHOCK_WINDOW_BARS}).")
-    p.add_argument("--hard-stop-atr", type=float, default=HARD_STOP_ATR_MULT,
-                   help=f"Unconditional trailing floor in ATRs below peak (default {HARD_STOP_ATR_MULT:g}).")
-    p.add_argument("--soft-stop-atr", type=float, default=SOFT_STOP_ATR_MULT,
-                   help=f"Soft pullback floor in ATRs below peak (default {SOFT_STOP_ATR_MULT:g}).")
-    p.add_argument("--soft-stop-score", type=int, default=SOFT_STOP_OPPOSING_SCORE,
-                   help=f"Number of opposing indicators (1-4) needed to trigger Soft Stop (default {SOFT_STOP_OPPOSING_SCORE}).")
-
-    p.add_argument("--day-pct-basis", choices=["PREV_CLOSE", "OPEN"], default=DAY_PCT_BASIS,
-                   help=f"Day%% is measured from the previous close or open. Default {DAY_PCT_BASIS}.")
-    p.add_argument("--graveyard-max", type=int, default=TOP_N_GRAVEYARD,
-                   help=f"Max graveyard rows printed (default {TOP_N_GRAVEYARD}; 0 = all).")
-    p.add_argument("--track", type=str, default="",
-                   help="Specific symbol to track. Prints its intraday history and emails on state change.")
-    args = p.parse_args()
-
-    if args.checkpoint_min < 1:
-        p.error("--checkpoint-min must be >= 1")
-    if args.strikes_up < 0 or args.strikes_down < 0:
-        p.error("--strikes-up / --strikes-down must be >= 0")
-    if args.history_days < 1:
-        p.error("--history-days must be >= 1")
-    if args.hard_stop_atr < 0 or args.soft_stop_atr < 0:
-        p.error("Stop loss multipliers must be >= 0")
-    if not (1 <= args.struct_quorum <= 4):
-        p.error("--struct-quorum must be between 1 and 4")
-    if not (1 <= args.shock_quorum <= 4):
-        p.error("--shock-quorum must be between 1 and 4")
-    if args.shock_window < 1:
-        p.error("--shock-window must be >= 1")
-    return args
+    p.add_argument("--expiry", choices=["CURRENT", "NEXT"], default=EXPIRY_SELECTION, help=f"INDEX_OPTIONS: which expiry to trade -- CURRENT or NEXT. Default: {EXPIRY_SELECTION}.")
+    p.add_argument("--strikes-up", type=int, default=STRIKES_ABOVE_ATM, help=f"INDEX_OPTIONS: number of strikes ABOVE ATM to include (default {STRIKES_ABOVE_ATM}).")
+    p.add_argument("--strikes-down", type=int, default=STRIKES_BELOW_ATM, help=f"INDEX_OPTIONS: number of strikes BELOW ATM to include (default {STRIKES_BELOW_ATM}).")
+    p.add_argument("--checkpoint-min", type=int, default=CHECKPOINT_INTERVAL_MIN, help=f"Size in minutes of each intraday backtrace window (default {CHECKPOINT_INTERVAL_MIN}).")
+    p.add_argument("--single-snapshot", action="store_true", help="Disable the backtrace -- evaluate only the current run time, like a single snapshot.")
+    p.add_argument("--shock-mult", type=float, default=KINETIC_SHOCK_ATR_MULT, help=f"Kinetic Shock multiplier vs Velocity ATR (default {KINETIC_SHOCK_ATR_MULT:g}).")
+    p.add_argument("--ind-bb-std", type=float, default=IND_BB_PIERCE_STD, help=f"Indicator Breakout StdDev multiplier (default {IND_BB_PIERCE_STD:g}).")
+    p.add_argument("--struct-quorum", type=int, default=STRUCT_QUORUM, help=f"Min indicators (1-4) piercing structure bands for Lock 2 (default {STRUCT_QUORUM}).")
+    p.add_argument("--shock-quorum", type=int, default=SHOCK_QUORUM, help=f"Min indicators (1-4) hitting velocity shock for Lock 3 (default {SHOCK_QUORUM}).")
+    p.add_argument("--shock-window", type=int, default=SHOCK_WINDOW_BARS, help=f"Rolling 1m bars to align sequential indicator shocks (default {SHOCK_WINDOW_BARS}).")
+    p.add_argument("--hard-stop-atr", type=float, default=HARD_STOP_ATR_MULT, help=f"Unconditional trailing floor in ATRs below peak (default {HARD_STOP_ATR_MULT:g}).")
+    p.add_argument("--soft-stop-atr", type=float, default=SOFT_STOP_ATR_MULT, help=f"Soft pullback floor in ATRs below peak (default {SOFT_STOP_ATR_MULT:g}).")
+    p.add_argument("--soft-stop-score", type=int, default=SOFT_STOP_OPPOSING_SCORE, help=f"Number of opposing indicators (1-4) needed to trigger Soft Stop (default {SOFT_STOP_OPPOSING_SCORE}).")
+    p.add_argument("--day-pct-basis", choices=["PREV_CLOSE", "OPEN"], default=DAY_PCT_BASIS, help=f"Day%% is measured from the previous close or open. Default {DAY_PCT_BASIS}.")
+    p.add_argument("--graveyard-max", type=int, default=TOP_N_GRAVEYARD, help=f"Max graveyard rows printed (default {TOP_N_GRAVEYARD}; 0 = all).")
+    p.add_argument("--track", type=str, default="", help="Specific symbol to track. Prints its intraday history and emails on state change.")
+    return p.parse_args()
 
 if __name__ == "__main__":
     if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
         print(f"{COLOR_RED_FG}[!] Missing UPSTOX_ACCESS_TOKEN environment variable.{COLOR_RESET}")
         sys.exit(1)
     args = parse_args()
+    MIN1_HISTORY_DAYS, OPT_MIN_PRICE, OPT_MIN_VOLUME, EXPIRY_SELECTION, STRIKES_ABOVE_ATM, STRIKES_BELOW_ATM, CHECKPOINT_INTERVAL_MIN = args.history_days, args.opt_min_price, args.opt_min_volume, args.expiry, args.strikes_up, args.strikes_down, args.checkpoint_min
+    KINETIC_SHOCK_ATR_MULT, IND_BB_PIERCE_STD, STRUCT_QUORUM, SHOCK_QUORUM, SHOCK_WINDOW_BARS, HARD_STOP_ATR_MULT, SOFT_STOP_ATR_MULT, SOFT_STOP_OPPOSING_SCORE = args.shock_mult, args.ind_bb_std, args.struct_quorum, args.shock_quorum, args.shock_window, args.hard_stop_atr, args.soft_stop_atr, args.soft_stop_score
+    DAY_PCT_BASIS, TOP_N_GRAVEYARD = args.day_pct_basis, args.graveyard_max
+    if args.single_snapshot: BACKTRACE_CHECKPOINTS = False
 
-    MIN1_HISTORY_DAYS = args.history_days
-    OPT_MIN_PRICE = args.opt_min_price
-    OPT_MIN_VOLUME = args.opt_min_volume
-    EXPIRY_SELECTION = args.expiry
-    STRIKES_ABOVE_ATM = args.strikes_up
-    STRIKES_BELOW_ATM = args.strikes_down
-    CHECKPOINT_INTERVAL_MIN = args.checkpoint_min
-
-    KINETIC_SHOCK_ATR_MULT = args.shock_mult
-    IND_BB_PIERCE_STD = args.ind_bb_std
-    STRUCT_QUORUM = args.struct_quorum
-    SHOCK_QUORUM = args.shock_quorum
-    SHOCK_WINDOW_BARS = args.shock_window
-    HARD_STOP_ATR_MULT = args.hard_stop_atr
-    SOFT_STOP_ATR_MULT = args.soft_stop_atr
-    SOFT_STOP_OPPOSING_SCORE = args.soft_stop_score
-
-    DAY_PCT_BASIS = args.day_pct_basis
-    TOP_N_GRAVEYARD = args.graveyard_max
-    if args.single_snapshot:
-        BACKTRACE_CHECKPOINTS = False
-
-    try:
-        code = run_screener(args.mode, args.days, args.date, args.time, args.track)
+    try: code = run_screener(args.mode, args.days, args.date, args.time, args.track)
     except Exception:
         print(f"\n{COLOR_RED_FG}💥 FATAL: unhandled exception -- full traceback follows.{COLOR_RESET}")
         traceback.print_exc()
