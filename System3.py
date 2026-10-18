@@ -45,9 +45,9 @@ SHOCK_QUORUM = 3                # Min indicators (out of 4: MACD, OBV, DI, ADX) 
 SHOCK_WINDOW_BARS = 3           # Rolling 1m bars (e.g. 3 mins) to align sequential indicator shocks
 
 # --- RISK & STOP LOSS FLOORS ---
-HARD_STOP_ATR_MULT = 1.2        # Hard unconditional trailing stop (in Base ATRs from peak)
+HARD_STOP_ATR_MULT = 2.5        # Hard unconditional trailing stop (in Base ATRs from peak)
 SOFT_STOP_ATR_MULT = 1.0        # Soft kinetic trailing stop (in Base ATRs from peak)
-SOFT_STOP_OPPOSING_SCORE = 2    # Opposing indicators (0 to 4 scale) needed to trigger the Soft Stop
+SOFT_STOP_OPPOSING_SCORE = 5    # Opposing indicators (0 to 4 scale) needed to trigger the Soft Stop
 ADVERSE_DRIFT_R_FLOOR = -0.5    # Live setups bleeding past this R-Multiple purge to Graveyard
 
 # --- INDEX OPTIONS ---
