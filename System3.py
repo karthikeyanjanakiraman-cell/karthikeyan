@@ -5,6 +5,8 @@ Strict Institutional Volatility Tracker (Upstox) - System 3.0 (Ultimate Full Edi
 + Absolute Session Isolation: Bollinger Bands & Indicators reset at 09:15 to prevent gap contamination.
 + 3-Lock Master Trigger with Quorum Gating (3/4) & Rolling 3-Bar Shock Window.
 + Smart Trailing: Soft Kinetic Stops disable after +2.0R to let massive trends run.
++ Profit Ratchet: Locks in +0.3R breakeven floor once a trade exceeds +1.5R.
++ Dynamic Drift Floor: Automatically aligns the adverse drift filter with your chosen --hard-stop-atr.
 + Auction Filter: Blocks new anchors after 15:15 to eliminate end-of-day garbage ticks.
 """
 import os
@@ -45,10 +47,9 @@ SHOCK_QUORUM = 3                # Min indicators (out of 4: MACD, OBV, DI, ADX) 
 SHOCK_WINDOW_BARS = 3           # Rolling 1m bars (e.g. 3 mins) to align sequential indicator shocks
 
 # --- RISK & STOP LOSS FLOORS ---
-HARD_STOP_ATR_MULT = 2.5        # Hard unconditional trailing stop (in Base ATRs from peak)
+HARD_STOP_ATR_MULT = 1.2        # Hard unconditional trailing stop (in Base ATRs from peak)
 SOFT_STOP_ATR_MULT = 1.0        # Soft kinetic trailing stop (in Base ATRs from peak)
-SOFT_STOP_OPPOSING_SCORE = 5    # Opposing indicators (0 to 4 scale) needed to trigger the Soft Stop
-ADVERSE_DRIFT_R_FLOOR = -0.5    # Live setups bleeding past this R-Multiple purge to Graveyard
+SOFT_STOP_OPPOSING_SCORE = 2    # Opposing indicators (0 to 4 scale) needed to trigger the Soft Stop
 
 # --- INDEX OPTIONS ---
 EXPIRY_SELECTION = "CURRENT"
@@ -68,7 +69,7 @@ HA_ATR_MULTIPLIERS = [1, 2, 3, 5]
 ATR_BASIS_PERIOD = 14
 ATR_BASIS_TF = "15min"
 ATR_MIN_BARS = 5
-MIN_ATR_PCT = 0.005  # Absolute minimum ATR floor (0.5% of stock price) to prevent Wipro/TCS micro-stopouts
+MIN_ATR_PCT = 0.005  # Absolute minimum ATR floor (0.5% of stock price) to prevent micro-stopouts
 
 TOP_N_BUYERS = 50
 TOP_N_SELLERS = 50
@@ -559,7 +560,6 @@ def _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts, sid):
     """
     n = len(close)
     delta = np.diff(close, prepend=close[0])
-    # Neutralize overnight gaps at 09:15
     delta = np.where(sess_starts, close - open_, delta)
 
     gain = _ewm(np.where(delta > 0, delta, 0.0), 1 / RSI_PERIOD)
@@ -586,32 +586,24 @@ def _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts, sid):
     atr = _ewm(tr, a)
     plus_di = 100 * (_ewm(plus_dm, a) / (atr + 1e-8))
     minus_di = 100 * (_ewm(minus_dm, a) / (atr + 1e-8))
-
     dx = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-8)
     adx = _ewm(dx, a)
 
     direction = np.where(delta > 0, 1, np.where(delta < 0, -1, 0))
     obv = np.cumsum(direction * vol)
 
-    # STRICT SESSION ISOLATION for statistical indicator bands
     df = pd.DataFrame({'rsi': rsi, 'hist': hist, 'plus_di': plus_di, 'minus_di': minus_di, 'adx': adx, 'obv': obv, 'sid': sid})
     grouped = df.groupby('sid')
     
     def roll_mean(x): return x.rolling(BB_PERIOD, min_periods=1).mean()
     def roll_std(x): return x.rolling(BB_PERIOD, min_periods=1).std(ddof=0)
     
-    rsi_mean = grouped['rsi'].transform(roll_mean).values
-    rsi_std = grouped['rsi'].transform(roll_std).values
-    h_mean = grouped['hist'].transform(roll_mean).values
-    h_std = grouped['hist'].transform(roll_std).values
-    p_mean = grouped['plus_di'].transform(roll_mean).values
-    p_std = grouped['plus_di'].transform(roll_std).values
-    m_mean = grouped['minus_di'].transform(roll_mean).values
-    m_std = grouped['minus_di'].transform(roll_std).values
-    a_mean = grouped['adx'].transform(roll_mean).values
-    a_std = grouped['adx'].transform(roll_std).values
-    o_mean = grouped['obv'].transform(roll_mean).values
-    o_std = grouped['obv'].transform(roll_std).values
+    rsi_mean, rsi_std = grouped['rsi'].transform(roll_mean).values, grouped['rsi'].transform(roll_std).values
+    h_mean, h_std = grouped['hist'].transform(roll_mean).values, grouped['hist'].transform(roll_std).values
+    p_mean, p_std = grouped['plus_di'].transform(roll_mean).values, grouped['plus_di'].transform(roll_std).values
+    m_mean, m_std = grouped['minus_di'].transform(roll_mean).values, grouped['minus_di'].transform(roll_std).values
+    a_mean, a_std = grouped['adx'].transform(roll_mean).values, grouped['adx'].transform(roll_std).values
+    o_mean, o_std = grouped['obv'].transform(roll_mean).values, grouped['obv'].transform(roll_std).values
 
     vel_hist = np.diff(hist, prepend=hist[0])
     vel_obv = np.diff(obv, prepend=obv[0])
@@ -619,20 +611,13 @@ def _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts, sid):
     vel_mdi = np.diff(minus_di, prepend=minus_di[0])
     vel_adx = np.diff(adx, prepend=adx[0])
 
-    atr_hist = _ewm(np.abs(vel_hist), 1 / 14)
-    atr_obv = _ewm(np.abs(vel_obv), 1 / 14)
-    atr_pdi = _ewm(np.abs(vel_pdi), 1 / 14)
-    atr_mdi = _ewm(np.abs(vel_mdi), 1 / 14)
-    atr_adx = _ewm(np.abs(vel_adx), 1 / 14)
+    atr_hist, atr_obv = _ewm(np.abs(vel_hist), 1 / 14), _ewm(np.abs(vel_obv), 1 / 14)
+    atr_pdi, atr_mdi, atr_adx = _ewm(np.abs(vel_pdi), 1 / 14), _ewm(np.abs(vel_mdi), 1 / 14), _ewm(np.abs(vel_adx), 1 / 14)
 
     w = max(1, int(SHOCK_WINDOW_BARS))
-    win_vh_max = pd.Series(vel_hist).rolling(w, min_periods=1).max().values
-    win_vh_min = pd.Series(vel_hist).rolling(w, min_periods=1).min().values
-    win_vo_max = pd.Series(vel_obv).rolling(w, min_periods=1).max().values
-    win_vo_min = pd.Series(vel_obv).rolling(w, min_periods=1).min().values
-    win_vp_max = pd.Series(vel_pdi).rolling(w, min_periods=1).max().values
-    win_vm_max = pd.Series(vel_mdi).rolling(w, min_periods=1).max().values
-    win_va_max = pd.Series(vel_adx).rolling(w, min_periods=1).max().values
+    win_vh_max, win_vh_min = pd.Series(vel_hist).rolling(w, min_periods=1).max().values, pd.Series(vel_hist).rolling(w, min_periods=1).min().values
+    win_vo_max, win_vo_min = pd.Series(vel_obv).rolling(w, min_periods=1).max().values, pd.Series(vel_obv).rolling(w, min_periods=1).min().values
+    win_vp_max, win_vm_max, win_va_max = pd.Series(vel_pdi).rolling(w, min_periods=1).max().values, pd.Series(vel_mdi).rolling(w, min_periods=1).max().values, pd.Series(vel_adx).rolling(w, min_periods=1).max().values
 
     return {
         'rsi': rsi, 'r_mean': rsi_mean, 'r_std': rsi_std,
@@ -653,22 +638,21 @@ def _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts, sid):
     }
 
 def get_kinetics(kin_1m, idx):
-    hist = kin_1m['hist'][idx]; h_mean = kin_1m['h_mean'][idx]; h_std = kin_1m['h_std'][idx]
-    obv = kin_1m['obv'][idx]; o_mean = kin_1m['o_mean'][idx]; o_std = kin_1m['o_std'][idx]
-    p_di = kin_1m['plus_di'][idx]; p_mean = kin_1m['p_mean'][idx]; p_std = kin_1m['p_std'][idx]
-    m_di = kin_1m['minus_di'][idx]; m_mean = kin_1m['m_mean'][idx]; m_std = kin_1m['m_std'][idx]
-    adx = kin_1m['adx'][idx]; a_mean = kin_1m['a_mean'][idx]; a_std = kin_1m['a_std'][idx]
+    hist, h_mean, h_std = kin_1m['hist'][idx], kin_1m['h_mean'][idx], kin_1m['h_std'][idx]
+    obv, o_mean, o_std = kin_1m['obv'][idx], kin_1m['o_mean'][idx], kin_1m['o_std'][idx]
+    p_di, p_mean, p_std = kin_1m['plus_di'][idx], kin_1m['p_mean'][idx], kin_1m['p_std'][idx]
+    m_di, m_mean, m_std = kin_1m['minus_di'][idx], kin_1m['m_mean'][idx], kin_1m['m_std'][idx]
+    adx, a_mean, a_std = kin_1m['adx'][idx], kin_1m['a_mean'][idx], kin_1m['a_std'][idx]
 
-    vh = kin_1m['vel_hist'][idx]; ah = kin_1m['atr_hist'][idx]
-    vo = kin_1m['vel_obv'][idx]; ao = kin_1m['atr_obv'][idx]
-    vp = kin_1m['vel_pdi'][idx]; ap = kin_1m['atr_pdi'][idx]
-    vm = kin_1m['vel_mdi'][idx]; am = kin_1m['atr_mdi'][idx]
-    va = kin_1m['vel_adx'][idx]; aa = kin_1m['atr_adx'][idx]
+    vh, ah = kin_1m['vel_hist'][idx], kin_1m['atr_hist'][idx]
+    vo, ao = kin_1m['vel_obv'][idx], kin_1m['atr_obv'][idx]
+    vp, ap = kin_1m['vel_pdi'][idx], kin_1m['atr_pdi'][idx]
+    vm, am = kin_1m['vel_mdi'][idx], kin_1m['atr_mdi'][idx]
+    va, aa = kin_1m['vel_adx'][idx], kin_1m['atr_adx'][idx]
 
-    w_vh_max = kin_1m['win_vh_max'][idx]; w_vh_min = kin_1m['win_vh_min'][idx]
-    w_vo_max = kin_1m['win_vo_max'][idx]; w_vo_min = kin_1m['win_vo_min'][idx]
-    w_vp_max = kin_1m['win_vp_max'][idx]; w_vm_max = kin_1m['win_vm_max'][idx]
-    w_va_max = kin_1m['win_va_max'][idx]
+    w_vh_max, w_vh_min = kin_1m['win_vh_max'][idx], kin_1m['win_vh_min'][idx]
+    w_vo_max, w_vo_min = kin_1m['win_vo_max'][idx], kin_1m['win_vo_min'][idx]
+    w_vp_max, w_vm_max, w_va_max = kin_1m['win_vp_max'][idx], kin_1m['win_vm_max'][idx], kin_1m['win_va_max'][idx]
 
     # --- LOCK 2: Structure Breakout (Quorum of 4) ---
     b_struct_cnt = (
@@ -684,8 +668,7 @@ def get_kinetics(kin_1m, idx):
         int(a_std > 0 and adx > a_mean + IND_BB_PIERCE_STD * a_std and m_di > p_di)
     )
 
-    bull_struct = (b_struct_cnt >= STRUCT_QUORUM) and (p_di > m_di)
-    bear_struct = (br_struct_cnt >= STRUCT_QUORUM) and (m_di > p_di)
+    bull_struct, bear_struct = (b_struct_cnt >= STRUCT_QUORUM) and (p_di > m_di), (br_struct_cnt >= STRUCT_QUORUM) and (m_di > p_di)
 
     # --- LOCK 3: Kinetic Shock (Quorum of 4 within Rolling Window) ---
     b_shock_cnt = (
@@ -701,8 +684,7 @@ def get_kinetics(kin_1m, idx):
         int(w_va_max > KINETIC_SHOCK_ATR_MULT * aa)
     )
 
-    bull_shock = (b_shock_cnt >= SHOCK_QUORUM) and (vh > 0 or vo > 0)
-    bear_shock = (br_shock_cnt >= SHOCK_QUORUM) and (vh < 0 or vo < 0)
+    bull_shock, bear_shock = (b_shock_cnt >= SHOCK_QUORUM) and (vh > 0 or vo > 0), (br_shock_cnt >= SHOCK_QUORUM) and (vh < 0 or vo < 0)
 
     # --- GRANULAR OPPOSING SCORE ---
     bull_score = int(p_std > 0 and p_di > p_mean + IND_BB_PIERCE_STD * p_std) + int(vh > 1.0 * ah) + int(vo > 1.0 * ao) + int(h_std > 0 and hist > h_mean + IND_BB_PIERCE_STD * h_std)
@@ -711,17 +693,17 @@ def get_kinetics(kin_1m, idx):
     return bull_score, bear_score, bull_score >= 2, bear_score >= 2, bull_struct, bear_struct, bull_shock, bear_shock
 
 def calculate_grids(kin_1m, idx, direction):
-    hist = kin_1m['hist'][idx]; h_mean = kin_1m['h_mean'][idx]; h_std = kin_1m['h_std'][idx]
-    obv = kin_1m['obv'][idx]; o_mean = kin_1m['o_mean'][idx]; o_std = kin_1m['o_std'][idx]
-    p_di = kin_1m['plus_di'][idx]; p_mean = kin_1m['p_mean'][idx]; p_std = kin_1m['p_std'][idx]
-    m_di = kin_1m['minus_di'][idx]; m_mean = kin_1m['m_mean'][idx]; m_std = kin_1m['m_std'][idx]
-    adx = kin_1m['adx'][idx]; a_mean = kin_1m['a_mean'][idx]; a_std = kin_1m['a_std'][idx]
+    hist, h_mean, h_std = kin_1m['hist'][idx], kin_1m['h_mean'][idx], kin_1m['h_std'][idx]
+    obv, o_mean, o_std = kin_1m['obv'][idx], kin_1m['o_mean'][idx], kin_1m['o_std'][idx]
+    p_di, p_mean, p_std = kin_1m['plus_di'][idx], kin_1m['p_mean'][idx], kin_1m['p_std'][idx]
+    m_di, m_mean, m_std = kin_1m['minus_di'][idx], kin_1m['m_mean'][idx], kin_1m['m_std'][idx]
+    adx, a_mean, a_std = kin_1m['adx'][idx], kin_1m['a_mean'][idx], kin_1m['a_std'][idx]
 
-    vh = kin_1m['vel_hist'][idx]; ah = kin_1m['atr_hist'][idx]
-    vo = kin_1m['vel_obv'][idx]; ao = kin_1m['atr_obv'][idx]
-    vp = kin_1m['vel_pdi'][idx]; ap = kin_1m['atr_pdi'][idx]
-    vm = kin_1m['vel_mdi'][idx]; am = kin_1m['atr_mdi'][idx]
-    va = kin_1m['vel_adx'][idx]; aa = kin_1m['atr_adx'][idx]
+    vh, ah = kin_1m['vel_hist'][idx], kin_1m['atr_hist'][idx]
+    vo, ao = kin_1m['vel_obv'][idx], kin_1m['atr_obv'][idx]
+    vp, ap = kin_1m['vel_pdi'][idx], kin_1m['atr_pdi'][idx]
+    vm, am = kin_1m['vel_mdi'][idx], kin_1m['atr_mdi'][idx]
+    va, aa = kin_1m['vel_adx'][idx], kin_1m['atr_adx'][idx]
 
     atr_grid, bb_grid = {1: 0, 2: 0, 3: 0, 5: 0}, {1: 0, 2: 0, 3: 0, 5: 0}
 
@@ -754,8 +736,7 @@ def calculate_grids(kin_1m, idx, direction):
 
 def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, today_start, is_late_session, end=None):
     n = len(close) if end is None else min(int(end), len(close))
-    if today_start >= n:
-        return None, {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0, 'killed_time': '-', 'killed_price': 0.0, 'reason': 'No data for today', 'kills': []}
+    if today_start >= n: return None, {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0, 'killed_time': '-', 'killed_price': 0.0, 'reason': 'No data for today', 'kills': []}
 
     hard_mult, soft_mult, opp_thresh = float(HARD_STOP_ATR_MULT or 0.0), float(SOFT_STOP_ATR_MULT), int(SOFT_STOP_OPPOSING_SCORE)
     i = today_start
@@ -797,12 +778,21 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                 adverse, hard_adverse, opposing = close[j] - peak_price, close[j] - true_peak, bull_score
                 soft_reason = f"Kinetic SL ({soft_mult:g} ATR Rally)"
 
-            max_r_reached = (peak_price - anchor['price']) / base_atr if is_bull else (anchor['price'] - peak_price) / base_atr
+            max_r = (true_peak - anchor['price']) / base_atr if is_bull else (anchor['price'] - true_peak) / base_atr
+            curr_r = (close[j] - anchor['price']) / base_atr if is_bull else (anchor['price'] - close[j]) / base_atr
+
             reason = None
+
+            # 1. Unconditional Hard Stop Trailing Floor
             if hard_mult > 0 and hard_adverse >= hard_mult * base_atr:
                 reason = f"Hard stop ({hard_mult:g} ATR trailing floor)"
-            # Let massive trends (>2.0R) run freely without soft stop chokes
-            elif adverse >= soft_mult * base_atr and opposing >= opp_thresh and max_r_reached < 2.0:
+            
+            # 2. Profit Ratchet: Once up +1.5R, never let a trade drop below +0.3R (Breakeven+)
+            elif max_r >= 1.5 and curr_r <= 0.3:
+                reason = f"Profit Lock (+1.5R Peak -> +0.3R Breakeven Floor)"
+            
+            # 3. Soft Kinetic Stop (Active before mega-trend territory)
+            elif max_r < 2.0 and adverse >= soft_mult * base_atr and opposing >= opp_thresh:
                 reason = soft_reason
 
             if reason:
@@ -841,7 +831,7 @@ def prepare_series(master, target_dt):
 
     base_atr_calc, atr_bars = compute_base_atr(master.iloc[:ts])
     if base_atr_calc is None or atr_bars < ATR_MIN_BARS: return None, "short_history"
-    # Dynamic Minimum Floor: Stop cannot be tighter than 0.5% of the opening price
+    # Dynamic Minimum Floor: Stop cannot be tighter than chosen % of the opening price
     base_atr = max(float(base_atr_calc), float(close[ts]) * MIN_ATR_PCT)
 
     df_p = pd.DataFrame({'close': close, 'high': high, 'low': low, 'open': open_, 'sid': sid})
@@ -1164,19 +1154,23 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
 
     if track_symbol: print_and_alert_tracked_history(track_symbol, by_symbol, live_run=not explicit)
 
-    surviving_bulls = [r for r in bulls_live if _r_multiple(r) > ADVERSE_DRIFT_R_FLOOR or _r_multiple(r, include_banked=True) > 0.5]
-    surviving_bears = [r for r in bears_live if _r_multiple(r) > ADVERSE_DRIFT_R_FLOOR or _r_multiple(r, include_banked=True) > 0.5]
+    # Automatically align adverse drift floor to match the chosen hard stop ATR 
+    # to avoid contradiction: a 2.5x hard stop needs a -2.5R adverse drift buffer
+    drift_floor = -abs(float(HARD_STOP_ATR_MULT or 1.2))
+
+    surviving_bulls = [r for r in bulls_live if _r_multiple(r) > drift_floor or _r_multiple(r, include_banked=True) > 0.5]
+    surviving_bears = [r for r in bears_live if _r_multiple(r) > drift_floor or _r_multiple(r, include_banked=True) > 0.5]
     for r in bulls_live:
-        if r not in surviving_bulls: r['RejectReason'] = f"Adverse Drift (Losing R-Multiple < {ADVERSE_DRIFT_R_FLOOR:g}R)"; graveyard_candidates.append(r)
+        if r not in surviving_bulls: r['RejectReason'] = f"Adverse Drift (Losing R-Multiple < {drift_floor:g}R)"; graveyard_candidates.append(r)
     for r in bears_live:
-        if r not in surviving_bears: r['RejectReason'] = f"Adverse Drift (Losing R-Multiple < {ADVERSE_DRIFT_R_FLOOR:g}R)"; graveyard_candidates.append(r)
+        if r not in surviving_bears: r['RejectReason'] = f"Adverse Drift (Losing R-Multiple < {drift_floor:g}R)"; graveyard_candidates.append(r)
 
     def state_rank(st): return 0 if "[ BB > KC ]" in st else 1 if "[ BB < KC ]" in st else 2
     surviving_bulls.sort(key=lambda r: (-_r_multiple(r, include_banked=True), -_r_multiple(r), state_rank(r['State']), -r.get('ATR_Grid', {}).get(1, 0), -r.get('BB_Grid', {}).get(1, 0), -int(r['CheckpointTime'].timestamp())))
     surviving_bears.sort(key=lambda r: (-_r_multiple(r, include_banked=True), -_r_multiple(r), state_rank(r['State']), -r.get('ATR_Grid', {}).get(1, 0), -r.get('BB_Grid', {}).get(1, 0), -int(r['CheckpointTime'].timestamp())))
     bulls, bears = surviving_bulls[:TOP_N_BUYERS], surviving_bears[:TOP_N_SELLERS]
 
-    def sort_reason(r): return 0 if any(x in str(r.get('RejectReason', '')) for x in ["Hard stop", "Kinetic SL", "Superseded"]) else 1 if "Adverse" in str(r.get('RejectReason', '')) else 2 if "Warzone" in str(r.get('RejectReason', '')) else 3
+    def sort_reason(r): return 0 if any(x in str(r.get('RejectReason', '')) for x in ["Hard stop", "Profit Lock", "Kinetic SL", "Superseded"]) else 1 if "Adverse" in str(r.get('RejectReason', '')) else 2 if "Warzone" in str(r.get('RejectReason', '')) else 3
     graveyard_candidates.sort(key=lambda x: (sort_reason(x), -_r_multiple(x) if _r_multiple(x) != 0 else -abs(x.get('DayChangePct', 0.0))))
     
     dedup_grave, seen_grave = [], set()
@@ -1233,7 +1227,7 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
             else:
                 g_r_str, g_r_color, move_pct_str, move_color = f"{'-':>7}", COLOR_DIM, f"{'-':>7}", COLOR_DIM
             reason = row['RejectReason']
-            reason_color = COLOR_YELLOW if any(x in reason for x in ["Kinetic SL", "Hard stop", "Adverse", "Superseded"]) else COLOR_RED_FG if any(x in reason for x in ["Chop", "Warzone"]) else COLOR_DIM
+            reason_color = COLOR_YELLOW if any(x in reason for x in ["Kinetic SL", "Hard stop", "Adverse", "Profit Lock", "Superseded"]) else COLOR_RED_FG if any(x in reason for x in ["Chop", "Warzone"]) else COLOR_DIM
             print(f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} {sig_colored} {a_time:^6} {a_price} {k_time:^6} {k_price} {row['LTP']:>8.2f} {g_r_color}{g_r_str}{COLOR_RESET} {move_color}{move_pct_str}{COLOR_RESET} | {reason_color}{reason}{COLOR_RESET}")
         if grave_total > len(grave_shown): print(f"{COLOR_DIM}   ... {grave_total - len(grave_shown)} more graveyard row(s) not shown (--graveyard-max 0 prints them all).{COLOR_RESET}")
 
