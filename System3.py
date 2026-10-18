@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 """
-Strict Institutional Volatility Tracker (Upstox) - System 3.0 (Sectoral Index & Interactive Filter Edition)
-+ Zero Hardcoded Logic: All indicator periods, multipliers, stop ratchets, and sector weights live in Section 0.
+Strict Institutional Volatility Tracker (Upstox) - System 3.0 (Email Sectoral Accordion & Zero-Truncation Edition)
++ Zero Hardcoded Logic: All indicator periods, multipliers, stop ratchets, email toggles, and sector weights live in Section 0.
 + Multi-Index Highest-Weightage Resolver: Assigns dual-listed stocks to the sectoral index where they carry the highest %.
 + Sectoral Index 3-Lock Engine: Evaluates Sectoral Indices first (Top Bulls, Top Bears, Graveyard) before stocks.
-+ Interactive Click-to-Filter HTML Dashboard (`system3_dashboard.html`) & CLI Sector Filter:
-  - Default view shows ALL Sectoral Indices and ALL Stocks.
-  - Clicking any Sectoral Index filters Stock Top Bulls, Top Bears, and Graveyard to that index's stocks.
-  - Clicking "CLEAR FILTER (SHOW ALL)" restores all indices and stocks.
++ Full Email Delivery (Zero Truncation):
+  - Reads SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL, SMTP_SERVER, SMTP_PORT, TRACK_SYMBOL, UPSTOX_ACCESS_TOKEN.
+  - Sends complete, untruncated Plain-Text + Native HTML5 Expand/Collapse Sectoral Accordions + Attached Interactive HTML.
 """
 import os
 import sys
@@ -39,7 +38,36 @@ warnings.filterwarnings("ignore")
 # 0. ENGINE CONSTANTS & CONFIGURATION (SINGLE SOURCE OF TRUTH)
 # ==============================================================================
 
-# --- 0.1 EXECUTION & UNIVERSE FILTERING ---
+# --- 0.1 EMAIL & GITHUB SECRET CONFIGURATION ---
+SEND_DASHBOARD_EMAIL = True             # Master toggle: Send full dashboard email after every run
+SEND_TRACK_ALERT_EMAIL = True           # Master toggle: Send state-change alert email when tracking a symbol
+EMAIL_ATTACH_INTERACTIVE_HTML = True    # Attach full JS click-to-filter HTML file to the email as well
+EMAIL_ATTACHMENT_FILENAME = "System3_Sector_Dashboard.html"
+SAVE_LOCAL_HTML_FILE = False            # False = Do not save local HTML file to disk (send via email instead)
+HTML_DASHBOARD_PATH = "system3_dashboard.html"
+
+# Zero-Truncation Email Controls (0 = Unlimited / Show Every Single Row)
+EMAIL_MAX_BUYERS = 0                    # 0 = Show ALL surviving Bull setups in email without truncation
+EMAIL_MAX_SELLERS = 0                   # 0 = Show ALL surviving Bear setups in email without truncation
+EMAIL_MAX_GRAVEYARD = 0                 # 0 = Show ALL Graveyard rows in email without truncation
+EMAIL_CLIP_SYMBOLS = False              # False = Never truncate/clip long symbol names in email
+
+# Environment Variable Names (Matches GitHub Repository Secrets)
+ENV_UPSTOX_TOKEN = "UPSTOX_ACCESS_TOKEN"
+ENV_FALLBACK_TOKEN = "ACCESS_TOKEN"
+ENV_SENDER_EMAIL = "SENDER_EMAIL"
+ENV_SENDER_PASSWORD = "SENDER_PASSWORD"
+ENV_RECIPIENT_EMAIL = "RECIPIENT_EMAIL"
+ENV_SMTP_SERVER = "SMTP_SERVER"
+ENV_SMTP_PORT = "SMTP_PORT"
+ENV_TRACK_SYMBOL = "TRACK_SYMBOL"
+
+DEFAULT_SMTP_SERVER = "smtp.gmail.com"
+DEFAULT_SMTP_PORT = "465"
+SMTP_SSL_PORT = 465
+SMTP_TIMEOUT_SEC = 30
+
+# --- 0.2 EXECUTION & UNIVERSE FILTERING ---
 TRADING_MODE = "STOCK_FNO"              # Choices: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
 WORKERS = 16                            # Concurrent thread pool workers
 INCLUDE_NON_EQ_SERIES = False           # Include non-EQ segments in cash/FnO scan
@@ -52,7 +80,7 @@ PREFILTER_LOOKBACK_PAD_DAYS = 6         # Extra padding days for prefilter calen
 MIN1_HISTORY_DAYS = 19                  # Calendar days of 1-minute history fetched per symbol
 MAX_PINNED_MATCHES = 8                  # Max symbols pinned via --track substring match
 
-# --- 0.2 SESSION & TIME BOUNDARIES ---
+# --- 0.3 SESSION & TIME BOUNDARIES ---
 IST_OFFSET_HOURS = 5
 IST_OFFSET_MINUTES = 30
 IST = timezone(timedelta(hours=IST_OFFSET_HOURS, minutes=IST_OFFSET_MINUTES))
@@ -66,7 +94,7 @@ DAY_PCT_BASIS = "PREV_CLOSE"            # Choices: "PREV_CLOSE", "OPEN"
 MAX_SESSION_LOOKBACK_DAYS = 14          # Max days to step back when resolving holidays/weekends
 SESSION_BUCKET_MULT = 10000             # Multiplier for isolating session buckets in ATR aggregation
 
-# --- 0.3 LOCK 1: PRICE VOLATILITY BANDS (BOLLINGER vs. KELTNER) ---
+# --- 0.4 LOCK 1: PRICE VOLATILITY BANDS (BOLLINGER vs. KELTNER) ---
 PRICE_BB_PERIOD = 20                    # Price Bollinger Band rolling window (bars)
 PRICE_BB_STD_MULT = 2.0                 # Price Bollinger Band standard deviation multiplier
 PRICE_KC_PERIOD = 20                    # Price Keltner Channel ATR rolling window (bars)
@@ -74,7 +102,7 @@ PRICE_KC_ATR_MULT = 1.5                 # Price Keltner Channel ATR multiplier
 ROLLING_MIN_PERIODS = 1                 # Minimum bars required for rolling stats
 ISOLATE_SESSION_BANDS = False           # False = Gap-Stitched Continuous Baseline; True = hard reset at 09:15
 
-# --- 0.4 KINETIC INDICATOR PERIODS ---
+# --- 0.5 KINETIC INDICATOR PERIODS ---
 RSI_PERIOD = 14                         # 1-minute RSI Wilder smoothing period
 MACD_FAST_PERIOD = 12                   # 1-minute MACD fast EMA period (alpha = 2 / (N + 1))
 MACD_SLOW_PERIOD = 26                   # 1-minute MACD slow EMA period (alpha = 2 / (N + 1))
@@ -85,7 +113,7 @@ VEL_ATR_PERIOD = 14                     # Wilder smoothing period for 1-minute i
 INDEX_SYNTHETIC_VOL_FALLBACK = True     # Synthesize range-velocity volume when spot index candles have 0 volume
 EPSILON = 1e-8                          # Zero-division guard for indicator ratios
 
-# --- 0.5 LOCK 2 & LOCK 3: STRUCTURE & KINETIC SHOCK TRIPWIRES ---
+# --- 0.6 LOCK 2 & LOCK 3: STRUCTURE & KINETIC SHOCK TRIPWIRES ---
 IND_BB_PIERCE_STD = 1.0                 # Lock 2: Indicator StdDev multiplier required for structure breakout
 STRUCT_QUORUM = 3                       # Lock 2: Min indicators (out of 4: MACD, OBV, DI, ADX) required
 KINETIC_SHOCK_ATR_MULT = 1.5            # Lock 3: Velocity must exceed this multiple of its own Velocity ATR
@@ -94,7 +122,7 @@ SHOCK_WINDOW_BARS = 3                   # Lock 3: Rolling 1-minute bars to align
 SHOCK_FLOW_MIN_THRESHOLD = 0.0          # Lock 3: Current bar directional velocity floor (vh or vo > threshold)
 GRID_MULTIPLIERS = [1, 2, 3, 5]         # Multipliers displayed in the ATR & BB dashboard grids
 
-# --- 0.6 BASE ATR, TRAILING STOPS, PROFIT RATCHET & ADVERSE DRIFT ---
+# --- 0.7 BASE ATR, TRAILING STOPS, PROFIT RATCHET & ADVERSE DRIFT ---
 ATR_BASIS_PERIOD = 14                   # Number of historical timeframe bars averaged for Base ATR
 ATR_BASIS_TF = "15min"                  # Timeframe string for Base ATR calculation
 ATR_MIN_BARS = 5                        # Minimum completed timeframe bars required to validate Base ATR
@@ -117,11 +145,10 @@ ADVERSE_DRIFT_R_FLOOR = -0.5            # Explicit R-Multiple floor for live pur
 ADVERSE_DRIFT_STOP_RATIO = 1.0          # Ratio of HARD_STOP_ATR_MULT used when ADVERSE_DRIFT_R_FLOOR is None
 BANKED_R_PROTECTION_FLOOR = 0.5         # Cumulative R threshold that protects re-entries from adverse drift purge
 
-# --- 0.7 SECTORAL INDICES & MULTI-INDEX WEIGHTAGE MATRIX ---
+# --- 0.8 SECTORAL INDICES & MULTI-INDEX WEIGHTAGE MATRIX ---
 ENABLE_SECTORAL_INDICES = True          # Evaluate & display Sectoral Indices before Stock tables
 DEFAULT_UNMAPPED_SECTOR = "NIFTY 500"   # Fallback sector label if a symbol is not in SECTOR_CONSTITUENT_WEIGHTS
 DEFAULT_UNMAPPED_WEIGHT = 0.10          # Fallback weight percentage for unmapped symbols
-HTML_DASHBOARD_PATH = "system3_dashboard.html"  # Interactive click-to-filter HTML output file
 
 SECTORAL_INDEX_CONFIG = {
     "NIFTY BANK":        {"spot_key": "NSE_INDEX|Nifty Bank",              "aliases": {"NIFTY BANK", "BANKNIFTY", "NIFTYBANK"}},
@@ -141,9 +168,7 @@ SECTORAL_INDEX_CONFIG = {
 }
 
 # Constituent weightage (%) per Sectoral Index.
-# If a stock appears in multiple indices (e.g., SBIN in NIFTY PSU BANK, NIFTY BANK, and NIFTY FIN SERVICE;
-# RELIANCE in NIFTY OIL & GAS, NIFTY ENERGY, and NIFTY INFRA), `resolve_primary_sector()` picks the index
-# where the stock has the HIGHEST weightage percentage.
+# When a stock belongs to 2 or more indices, `resolve_primary_sector()` assigns it to the index where it has the HIGHEST %.
 SECTOR_CONSTITUENT_WEIGHTS = {
     "NIFTY IT": {
         "INFY": 31.30, "TCS": 19.08, "HCLTECH": 11.81, "TECHM": 10.47, "COFORGE": 6.59,
@@ -233,7 +258,7 @@ SECTOR_CONSTITUENT_WEIGHTS = {
     },
 }
 
-# --- 0.8 INDEX OPTIONS CONFIGURATION ---
+# --- 0.9 INDEX OPTIONS CONFIGURATION ---
 EXPIRY_SELECTION = "CURRENT"            # Choices: "CURRENT", "NEXT"
 STRIKES_ABOVE_ATM = 5                   # Number of strikes above ATM to scan
 STRIKES_BELOW_ATM = 5                   # Number of strikes below ATM to scan
@@ -251,10 +276,10 @@ INDEX_CONFIG = {
 ALIAS_TO_INDEX = {a: idx for idx, cfg in INDEX_CONFIG.items() for a in cfg["aliases"]}
 PROBE_KEY = INDEX_CONFIG["NIFTY"]["spot_key"]
 
-# --- 0.9 DASHBOARD DISPLAY & FORMATTING ---
-TOP_N_BUYERS = 50                       # Max rows in Top Bull Setups
-TOP_N_SELLERS = 50                      # Max rows in Top Bear Setups
-TOP_N_GRAVEYARD = 100                   # Max rows in The Graveyard (0 = unlimited)
+# --- 0.10 DASHBOARD DISPLAY & FORMATTING ---
+TOP_N_BUYERS = 50                       # Max rows in Console Top Bull Setups (0 = unlimited)
+TOP_N_SELLERS = 50                      # Max rows in Console Top Bear Setups (0 = unlimited)
+TOP_N_GRAVEYARD = 100                   # Max rows in Console Graveyard (0 = unlimited)
 MIN_SYMBOL_WIDTH = 12                   # Minimum width of the Script column
 MAX_SYMBOL_WIDTH = 30                   # Maximum width of the Script column
 SECTOR_COL_WIDTH = 18                   # Width of Sector column in Stock tables
@@ -272,7 +297,7 @@ ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 ACTIVE_BULL_STATES = ("[ BB > KC ]", "[ BB < KC ]")
 ACTIVE_BEAR_STATES = ("[ BB > KC ]", "[ BB < KC ]")
 
-# --- 0.10 UPSTOX API, RATE LIMITER & SMTP INFRASTRUCTURE ---
+# --- 0.11 UPSTOX API & RATE LIMITER INFRASTRUCTURE ---
 API_HOST = "https://api.upstox.com"
 MASTER_BASE_URL = "https://assets.upstox.com/market-quote/instruments/exchange"
 RATE_CAPS = ((1.0, 22), (60.0, 220), (1800.0, 900))
@@ -294,14 +319,12 @@ MASTER_DOWNLOAD_RETRIES = 3
 MASTER_DOWNLOAD_TIMEOUT_SEC = 90
 MASTER_RETRY_SLEEP_SEC = 1.0
 
-DEFAULT_SMTP_SERVER = "smtp.gmail.com"
-DEFAULT_SMTP_PORT = "465"
-SMTP_SSL_PORT = 465
-SMTP_TIMEOUT_SEC = 20
-
 # ==============================================================================
 # HELPERS, SECTOR RESOLVER & RATE LIMITERS
 # ==============================================================================
+def get_upstox_token():
+    return os.environ.get(ENV_UPSTOX_TOKEN) or os.environ.get(ENV_FALLBACK_TOKEN)
+
 def now_ist():
     return datetime.now(IST).replace(tzinfo=None)
 
@@ -318,7 +341,6 @@ def resolve_primary_sector(symbol):
     """
     Checks all Sectoral Indices where `symbol` is a constituent and picks
     the single Sectoral Index where `symbol` has the HIGHEST percentage weight.
-    Returns (sector_name, weight_pct, all_memberships_list).
     """
     clean_sym = str(symbol).upper().strip()
     matches = []
@@ -431,7 +453,7 @@ class Progress:
 # ==============================================================================
 def _get(url, params=None, retries=None):
     max_retries = API_MAX_RETRIES if retries is None else retries
-    token = os.environ.get("UPSTOX_ACCESS_TOKEN")
+    token = get_upstox_token()
     if not token or STATS.auth_failed:
         return 401, None
     headers = {'Accept': 'application/json', 'Authorization': f'Bearer {token}'}
@@ -659,10 +681,6 @@ def resolve_pins(cands, needles, label="symbol"):
     return pinned
 
 def _sectoral_indices_universe():
-    """
-    Resolves Upstox instrument keys for all configured NSE Sectoral Indices.
-    Matches against `segment == 'NSE_INDEX'` in the NSE master, with fallback to `spot_key`.
-    """
     nse = _download_master("NSE")
     master_idx_map = {}
     for row in (nse or []):
@@ -943,7 +961,6 @@ def _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts, sid):
     dx = 100.0 * np.abs(plus_di - minus_di) / (plus_di + minus_di + EPSILON)
     adx = _ewm(dx, alpha_adx)
 
-    # Spot Index candles on Upstox report Volume == 0; synthesize range-expansion volume when needed
     eff_vol = vol
     if INDEX_SYNTHETIC_VOL_FALLBACK and float(np.sum(vol)) <= 0.0:
         eff_vol = np.maximum(high - low, np.abs(delta)) + EPSILON
@@ -1420,7 +1437,9 @@ def process_stock_checkpoints(args):
     finally:
         progress.tick()
 
-def _clip(s, w):
+def _clip(s, w, allow_clip=True):
+    if not allow_clip:
+        return str(s)
     return s if len(s) <= w else s[:w - 1] + "~"
 
 def _print_error_summary():
@@ -1508,11 +1527,6 @@ def merge_symbol_rows(rows):
     return active_merged.get("BULL"), active_merged.get("BEAR"), grave_episodes
 
 def segregate_and_rank_buckets(by_symbol_map):
-    """
-    Runs the identical strict segregation & ranking pipeline on any symbol map
-    (used for both the Sectoral Indices and the Stocks).
-    Returns (surviving_bulls, surviving_bears, dedup_grave).
-    """
     bulls_live, bears_live, graveyard_candidates = [], [], []
 
     for symbol, rows in by_symbol_map.items():
@@ -1591,7 +1605,7 @@ def _format_val(v, dir_color):
     return f"{dir_color}{v}{COLOR_RESET}" if v > 0 else f"{COLOR_DIM}{v}{COLOR_RESET}"
 
 # ==============================================================================
-# 4. TERMINAL RENDERERS & SELF-CONTAINED CLICKABLE HTML DASHBOARD
+# 4. CONSOLE RENDERER & UNTRUNCATED EMAIL / ACCORDION HTML ENGINE
 # ==============================================================================
 def render_console_dashboard(
     mode, cutoff_dt, checkpoints,
@@ -1605,10 +1619,10 @@ def render_console_dashboard(
         f_stock_bulls = [r for r in stock_bulls if _norm_sym(r.get('Sector', '')) == norm_filter or norm_filter in _norm_sym(r.get('Sector', ''))]
         f_stock_bears = [r for r in stock_bears if _norm_sym(r.get('Sector', '')) == norm_filter or norm_filter in _norm_sym(r.get('Sector', ''))]
         f_stock_grave = [r for r in stock_grave if _norm_sym(r.get('Sector', '')) == norm_filter or norm_filter in _norm_sym(r.get('Sector', ''))]
-        filter_banner = f" [ACTIVE SECTOR FILTER: {active_sector_filter.upper()} — Click/Type CLEAR to Show All]"
+        filter_banner = f" [ACTIVE SECTOR FILTER: {active_sector_filter.upper()}]"
     else:
-        f_stock_bulls = stock_bulls[:TOP_N_BUYERS]
-        f_stock_bears = stock_bears[:TOP_N_SELLERS]
+        f_stock_bulls = stock_bulls if TOP_N_BUYERS <= 0 else stock_bulls[:TOP_N_BUYERS]
+        f_stock_bears = stock_bears if TOP_N_SELLERS <= 0 else stock_bears[:TOP_N_SELLERS]
         f_stock_grave = stock_grave if TOP_N_GRAVEYARD <= 0 else stock_grave[:TOP_N_GRAVEYARD]
         filter_banner = " [DEFAULT VIEW: SHOWING ALL INDICES & ALL STOCKS]"
 
@@ -1700,16 +1714,14 @@ def render_console_dashboard(
                 f"{g_r_color}{g_r_str}{COLOR_RESET} {move_color}{move_pct_str}{COLOR_RESET} | {reason_color}{reason}{COLOR_RESET}"
             )
 
-    # --- 1. DISPLAY SECTORAL INDICES FIRST (TOP BULLS, TOP BEARS, GRAVEYARD) ---
     if idx_bulls or idx_bears or idx_grave:
         print(f"{COLOR_CYAN}{'=' * 95}{COLOR_RESET}")
-        print(f"{COLOR_BOLD}🏛️  STAGE 1: SECTORAL INDICES (Click any Index in HTML Dashboard to filter Stocks below){COLOR_RESET}")
+        print(f"{COLOR_BOLD}🏛️  STAGE 1: SECTORAL INDICES (Evaluated with 3-Lock Kinetic Engine){COLOR_RESET}")
         print(f"{COLOR_CYAN}{'=' * 95}{COLOR_RESET}")
         print_active_table("SECTORAL INDICES — TOP BULL SETUPS (Valid Anchors Surviving)", "🏛️🔥", idx_bulls, show_sector_col=False)
         print_active_table("SECTORAL INDICES — TOP BEAR SETUPS (Valid Anchors Surviving)", "🏛️🩸", idx_bears, show_sector_col=False)
         print_grave_table("SECTORAL INDICES — THE GRAVEYARD (Completed / Filtered / Rejected)", "🏛️🚫", idx_grave, show_sector_col=False)
 
-    # --- 2. DISPLAY F&O / EQUITY STOCKS SECOND (TOP BULLS, TOP BEARS, GRAVEYARD) ---
     print(f"\n{COLOR_CYAN}{'=' * 95}{COLOR_RESET}")
     stage2_label = f"STAGE 2: STOCKS FOR SECTOR [{active_sector_filter.upper()}]" if norm_filter else "STAGE 2: ALL STOCKS (Mapped by Highest Sectoral Index Weightage)"
     print(f"{COLOR_BOLD}📈  {stage2_label}{COLOR_RESET}")
@@ -1720,23 +1732,147 @@ def render_console_dashboard(
         print(f"{COLOR_YELLOW}No surviving stock anchors for this view.{COLOR_RESET}")
     print_grave_table("STOCKS — THE GRAVEYARD (Completed Episodes / Filtered / Rejected)", "🚫", f_stock_grave, show_sector_col=True)
 
-def generate_interactive_html_dashboard(
-    out_path, mode, cutoff_dt, checkpoints,
+def build_full_untruncated_plain_text(
+    mode, cutoff_dt, checkpoints,
     idx_bulls, idx_bears, idx_grave,
     stock_bulls, stock_bears, stock_grave
 ):
     """
-    Writes a zero-dependency, clickable HTML dashboard (`system3_dashboard.html`):
-    - Displays Sectoral Indices (Top Bulls, Top Bears, Graveyard) at the top.
-    - Displays Stocks (Top Bulls, Top Bears, Graveyard) below.
-    - Default view shows ALL indices and ALL stocks.
-    - Clicking ANY Sectoral Index row or pill filters Stock Top Bulls, Top Bears, and Graveyard to that index.
-    - Clicking "CLEAR FILTER (SHOW ALL)" restores all indices and stocks.
+    Generates the 100% untruncated Plain-Text email body containing:
+    1. Stage 1: Sectoral Indices (Top Bulls, Top Bears, Graveyard)
+    2. Stage 2: Sector-by-Sector Breakdown (Each Sectoral Index followed by its Bull, Bear, and Graveyard stocks)
+    3. Stage 3: Complete All-Stocks Master Tables (All Top Bulls, All Top Bears, All Graveyard rows)
     """
-    if not out_path:
-        return
+    e_bulls = stock_bulls if EMAIL_MAX_BUYERS <= 0 else stock_bulls[:EMAIL_MAX_BUYERS]
+    e_bears = stock_bears if EMAIL_MAX_SELLERS <= 0 else stock_bears[:EMAIL_MAX_SELLERS]
+    e_grave = stock_grave if EMAIL_MAX_GRAVEYARD <= 0 else stock_grave[:EMAIL_MAX_GRAVEYARD]
 
-    def _serialize_active_row(r, basket_dir):
+    all_rows = idx_bulls + idx_bears + idx_grave + e_bulls + e_bears + e_grave
+    sym_w = max(MIN_SYMBOL_WIDTH, max((len(r['Symbol']) for r in all_rows), default=MIN_SYMBOL_WIDTH))
+    sec_w = max(SECTOR_COL_WIDTH, max((len(r.get('Sector', '')) for r in all_rows), default=SECTOR_COL_WIDTH))
+    lines = []
+
+    lines.append(f"=== SYSTEM 3.0 INSTITUTIONAL VOLATILITY TRACKER [{mode}] — FULL UNTRUNCATED REPORT ===")
+    lines.append(
+        f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Checkpoints: {len(checkpoints)} | "
+        f"Indices (Bull: {len(idx_bulls)}, Bear: {len(idx_bears)}, Grave: {len(idx_grave)}) | "
+        f"Stocks (Bull: {len(e_bulls)}, Bear: {len(e_bears)}, Grave: {len(e_grave)})"
+    )
+    lines.append("")
+
+    def _fmt_active_block(title, data_list, show_sector=True):
+        if not data_list:
+            return
+        lines.append(f"--- {title} ({len(data_list)}) ---")
+        grid_hdr = " ".join(f"{m}X" for m in GRID_MULTIPLIERS)
+        sec_hdr = f"{'Sector (MaxWt%)':<{sec_w}} | " if show_sector else ""
+        hdr = f"{'Script':<{sym_w}} {'LTP/Exit':>9} | {sec_hdr}{'Seen':^5} {'Anchor':^7} {'Anch Val':>9} {'R-Mult (Bank)':>15} | ATR: {grid_hdr} | BB: {grid_hdr} | {'State':^13}"
+        lines.append(hdr)
+        lines.append("-" * len(hdr))
+        basket_dir = "BULL" if "BULL" in title else "BEAR"
+        default_g = {m: 0 for m in GRID_MULTIPLIERS}
+        for r in data_list:
+            live_r, banked_r = _r_multiple(r, include_banked=False), float(r.get('BankedR', 0.0) or 0.0)
+            if r.get('PriorStops', 0) > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON:
+                r_mult_str, anchor_disp = f"{live_r:>+5.2f}R ({banked_r:>+4.1f}R)", f"{r['ActiveAnchor']}*"
+            else:
+                r_mult_str, anchor_disp = f"{live_r:>+5.2f}R        ", f"{r['ActiveAnchor']} "
+            ag, bg = r.get('ATR_Grid', default_g), r.get('BB_Grid', default_g)
+            a_str = "  ".join(str(ag.get(k, 0)) for k in GRID_MULTIPLIERS)
+            b_str = "  ".join(str(bg.get(k, 0)) for k in GRID_MULTIPLIERS)
+            shown_state = _state_display(r)
+            if "[ BB > KC ]" in r['State']:
+                shown_state = f"[ BB > KC ] {'▲' if basket_dir == 'BULL' else '▼'}"
+            ltp_val = f"{r['KilledPrice']:>8.2f}x" if "[STOP" in shown_state and r.get('KilledPrice', 0) > 0 else f"{r['LTP']:>9.2f} "
+            sec_str = f"{r.get('Sector', DEFAULT_UNMAPPED_SECTOR)} ({r.get('SectorWeight', 0.0):.1f}%)"
+            sec_cell = f"{_clip(sec_str, sec_w, EMAIL_CLIP_SYMBOLS):<{sec_w}} | " if show_sector else ""
+            lines.append(
+                f"{_clip(r['Symbol'], sym_w, EMAIL_CLIP_SYMBOLS):<{sym_w}} {ltp_val} | {sec_cell}"
+                f"{r['CheckpointTime'].strftime('%H:%M'):^5} {anchor_disp:^7} {r['AnchorPrice']:>9.2f} "
+                f"{r_mult_str:>15} |   {a_str}  |   {b_str}  | {shown_state:^13}"
+            )
+        lines.append("")
+
+    def _fmt_grave_block(title, data_list, show_sector=True):
+        if not data_list:
+            return
+        lines.append(f"--- {title} ({len(data_list)}) ---")
+        sec_hdr = f"{'Sector':<{sec_w}} | " if show_sector else ""
+        hdr = f"{'Script':<{sym_w}} | {sec_hdr}{'Signal':^6} {'Anchor':^6} {'Anch Val':>9} {'Killed':^6} {'Kill Val':>9} {'LTP':>9} {'R-Mult':>7} {'Move%':>7} | Reason"
+        lines.append(hdr)
+        lines.append("-" * len(hdr))
+        for r in data_list:
+            sig = r.get('AnchorDir', 'NONE')
+            a_time = r['ActiveAnchor'] if r['ActiveAnchor'] else '-'
+            a_price = f"{r['AnchorPrice']:>9.2f}" if r['AnchorPrice'] > 0 else f"{'-':>9}"
+            k_time = r['KilledTime'] if r['KilledTime'] else '-'
+            k_price = f"{r['KilledPrice']:>9.2f}" if r['KilledPrice'] > 0 else f"{'-':>9}"
+            if r['AnchorPrice'] > 0 and (r['KilledPrice'] > 0 or r['LTP'] > 0):
+                g_r = _r_multiple(r, include_banked=False)
+                g_r_str = f"{g_r:>+6.2f}R"
+                move_pct_str = f"{r['MovePct']:>+6.2f}%"
+            else:
+                g_r_str, move_pct_str = f"{'-':>7}", f"{'-':>7}"
+            sec_cell = f"{_clip(r.get('Sector', DEFAULT_UNMAPPED_SECTOR), sec_w, EMAIL_CLIP_SYMBOLS):<{sec_w}} | " if show_sector else ""
+            lines.append(
+                f"{_clip(r['Symbol'], sym_w, EMAIL_CLIP_SYMBOLS):<{sym_w}} | {sec_cell}{sig:^6} "
+                f"{a_time:^6} {a_price} {k_time:^6} {k_price} {r['LTP']:>9.2f} {g_r_str} {move_pct_str} | {r.get('RejectReason', '')}"
+            )
+        lines.append("")
+
+    # 1. Stage 1: Sectoral Indices
+    lines.append("=========================================================================================")
+    lines.append("STAGE 1: SECTORAL INDICES (TOP BULLS, TOP BEARS, GRAVEYARD)")
+    lines.append("=========================================================================================")
+    _fmt_active_block("SECTORAL INDICES — TOP BULL SETUPS", idx_bulls, show_sector=False)
+    _fmt_active_block("SECTORAL INDICES — TOP BEAR SETUPS", idx_bears, show_sector=False)
+    _fmt_grave_block("SECTORAL INDICES — THE GRAVEYARD", idx_grave, show_sector=False)
+
+    # 2. Stage 2: Per-Sector Stock Grouping
+    lines.append("=========================================================================================")
+    lines.append("STAGE 2: STOCKS GROUPED BY SECTORAL INDEX (HIGHEST WEIGHTAGE WINNER)")
+    lines.append("=========================================================================================")
+    all_sec_names = list(SECTORAL_INDEX_CONFIG.keys()) + [DEFAULT_UNMAPPED_SECTOR]
+    for sec in all_sec_names:
+        sb = [r for r in e_bulls if r.get('Sector') == sec]
+        sr = [r for r in e_bears if r.get('Sector') == sec]
+        sg = [r for r in e_grave if r.get('Sector') == sec]
+        if not sb and not sr and not sg:
+            continue
+        lines.append(f"*** SECTOR: {sec} (Bull: {len(sb)} | Bear: {len(sr)} | Graveyard: {len(sg)}) ***")
+        _fmt_active_block(f"[{sec}] TOP BULL STOCKS", sb, show_sector=False)
+        _fmt_active_block(f"[{sec}] TOP BEAR STOCKS", sr, show_sector=False)
+        _fmt_grave_block(f"[{sec}] GRAVEYARD STOCKS", sg, show_sector=False)
+
+    # 3. Stage 3: All Stocks Master Tables
+    lines.append("=========================================================================================")
+    lines.append("STAGE 3: ALL STOCKS MASTER VIEW (DEFAULT SHOW ALL)")
+    lines.append("=========================================================================================")
+    _fmt_active_block("ALL STOCKS — TOP BULL SETUPS", e_bulls, show_sector=True)
+    _fmt_active_block("ALL STOCKS — TOP BEAR SETUPS", e_bears, show_sector=True)
+    _fmt_grave_block("ALL STOCKS — THE GRAVEYARD", e_grave, show_sector=True)
+
+    return "\n".join(lines)
+
+def build_email_and_attachment_html(
+    mode, cutoff_dt, checkpoints,
+    idx_bulls, idx_bears, idx_grave,
+    stock_bulls, stock_bears, stock_grave
+):
+    """
+    Builds TWO HTML representations:
+    1. `email_inline_html`: Uses native HTML5 `<details>` and `<summary>` tags so clicking ANY
+       Sectoral Index inside Gmail / Apple Mail / Outlook expands & collapses that sector's
+       Top Bulls, Top Bears, and Graveyard stocks WITHOUT needing JavaScript! Also includes
+       an open-by-default "SHOW ALL STOCKS & INDICES" master view with zero row truncation.
+    2. `attachment_js_html`: Full standalone HTML dashboard with interactive JS pill buttons,
+       click-on-index-row filtering, and a "CLEAR FILTER (SHOW ALL)" button.
+    """
+    e_bulls = stock_bulls if EMAIL_MAX_BUYERS <= 0 else stock_bulls[:EMAIL_MAX_BUYERS]
+    e_bears = stock_bears if EMAIL_MAX_SELLERS <= 0 else stock_bears[:EMAIL_MAX_SELLERS]
+    e_grave = stock_grave if EMAIL_MAX_GRAVEYARD <= 0 else stock_grave[:EMAIL_MAX_GRAVEYARD]
+
+    def _ser_active(r, basket_dir):
         live_r = _r_multiple(r, include_banked=False)
         banked_r = float(r.get('BankedR', 0.0) or 0.0)
         has_bank = r.get('PriorStops', 0) > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON
@@ -1752,7 +1888,7 @@ def generate_interactive_html_dashboard(
         return {
             "symbol": r['Symbol'],
             "sector": r.get('Sector', DEFAULT_UNMAPPED_SECTOR),
-            "weight": f"{float(r.get('SectorWeight', 0.0)):.2f}%",
+            "weight": f"{float(r.get('SectorWeight', 0.0)):.1f}%",
             "ltp": f"{r['LTP']:.2f}",
             "seen": r['CheckpointTime'].strftime('%H:%M'),
             "anchor": anchor_str,
@@ -1764,12 +1900,12 @@ def generate_interactive_html_dashboard(
             "state": st,
         }
 
-    def _serialize_grave_row(r):
+    def _ser_grave(r):
         g_r = _r_multiple(r, include_banked=False) if r['AnchorPrice'] > 0 else 0.0
         return {
             "symbol": r['Symbol'],
             "sector": r.get('Sector', DEFAULT_UNMAPPED_SECTOR),
-            "weight": f"{float(r.get('SectorWeight', 0.0)):.2f}%",
+            "weight": f"{float(r.get('SectorWeight', 0.0)):.1f}%",
             "sig": r.get('AnchorDir', 'NONE'),
             "anchor": r.get('ActiveAnchor') or '-',
             "anchor_val": f"{r['AnchorPrice']:.2f}" if r['AnchorPrice'] > 0 else '-',
@@ -1782,239 +1918,241 @@ def generate_interactive_html_dashboard(
             "reason": r.get('RejectReason', ''),
         }
 
-    all_sectors = sorted(SECTORAL_INDEX_CONFIG.keys())
-
-    def _build_active_rows_html(rows_data, is_index=False):
-        out_html = []
-        for d in rows_data:
-            sec_attr = html.escape(d["symbol"] if is_index else d["sector"])
-            click_attr = f'onclick="filterBySector(\'{sec_attr}\')" class="clickable-index-row" title="Click to filter stocks in {sec_attr}"' if is_index else f'data-sector="{sec_attr}"'
-            sec_td = "" if is_index else f'<td class="sec-badge">{html.escape(d["sector"])} <span class="wt">({d["weight"]})</span></td>'
-            r_cls = "pos" if d["r_pos"] else "neg"
-            out_html.append(
-                f'<tr {click_attr} data-sector="{sec_attr}">'
-                f'<td class="sym">{html.escape(d["symbol"])}</td>'
-                f'<td class="num">{d["ltp"]}</td>'
-                f'{sec_td}'
-                f'<td class="center">{d["seen"]}</td>'
-                f'<td class="center">{html.escape(d["anchor"])}</td>'
-                f'<td class="num">{d["anchor_val"]}</td>'
-                f'<td class="num {r_cls}">{html.escape(d["r_str"])}</td>'
-                f'<td class="center mono">{d["atr_grid"]}</td>'
-                f'<td class="center mono">{d["bb_grid"]}</td>'
-                f'<td class="center state">{html.escape(d["state"])}</td>'
-                f'</tr>'
+    def _table_active_html(rows_list, basket_dir, show_sec=True, js_clickable_index=False):
+        if not rows_list:
+            return "<p style='color:#94a3b8;margin:4px 0 10px 0;'>None</p>"
+        sec_th = "<th>Sector (Wt%)</th>" if show_sec else ""
+        tr_list = []
+        for r in rows_list:
+            d = _ser_active(r, basket_dir)
+            sec_attr = html.escape(d["symbol"] if not show_sec else d["sector"])
+            click_attr = f'onclick="filterBySector(\'{sec_attr}\')" class="idx-row"' if js_clickable_index else ""
+            sec_td = f"<td class='sec'>{html.escape(d['sector'])} ({d['weight']})</td>" if show_sec else ""
+            c_cls = "g" if d["r_pos"] else "r"
+            tr_list.append(
+                f"<tr {click_attr} data-sector='{sec_attr}'>"
+                f"<td><b>{html.escape(d['symbol'])}</b></td>"
+                f"<td align='right'>{d['ltp']}</td>"
+                f"{sec_td}"
+                f"<td align='center'>{d['seen']}</td>"
+                f"<td align='center'>{html.escape(d['anchor'])}</td>"
+                f"<td align='right'>{d['anchor_val']}</td>"
+                f"<td align='right' class='{c_cls}'>{html.escape(d['r_str'])}</td>"
+                f"<td align='center'>{d['atr_grid']}</td>"
+                f"<td align='center'>{d['bb_grid']}</td>"
+                f"<td align='center'>{html.escape(d['state'])}</td>"
+                f"</tr>"
             )
-        return "\n".join(out_html)
+        return (
+            f"<table><thead><tr><th>Script</th><th align='right'>LTP</th>{sec_th}"
+            f"<th>Seen</th><th>Anchor</th><th align='right'>AnchVal</th><th align='right'>R-Mult (Bank)</th>"
+            f"<th>ATR Grid</th><th>BB Grid</th><th>State</th></tr></thead>"
+            f"<tbody>{''.join(tr_list)}</tbody></table>"
+        )
 
-    def _build_grave_rows_html(rows_data, is_index=False):
-        out_html = []
-        for d in rows_data:
-            sec_attr = html.escape(d["symbol"] if is_index else d["sector"])
-            click_attr = f'onclick="filterBySector(\'{sec_attr}\')" class="clickable-index-row" title="Click to filter stocks in {sec_attr}"' if is_index else f'data-sector="{sec_attr}"'
-            sec_td = "" if is_index else f'<td class="sec-badge">{html.escape(d["sector"])} <span class="wt">({d["weight"]})</span></td>'
-            sig_cls = "pos" if d["sig"] == "BULL" else "neg" if d["sig"] == "BEAR" else "dim"
-            r_cls = "pos" if d["r_pos"] else "neg"
-            out_html.append(
-                f'<tr {click_attr} data-sector="{sec_attr}">'
-                f'<td class="sym">{html.escape(d["symbol"])}</td>'
-                f'{sec_td}'
-                f'<td class="center {sig_cls}">{html.escape(d["sig"])}</td>'
-                f'<td class="center">{html.escape(d["anchor"])}</td>'
-                f'<td class="num">{d["anchor_val"]}</td>'
-                f'<td class="center">{html.escape(d["killed"])}</td>'
-                f'<td class="num">{d["killed_val"]}</td>'
-                f'<td class="num">{d["ltp"]}</td>'
-                f'<td class="num {r_cls}">{html.escape(d["r_str"])}</td>'
-                f'<td class="num">{html.escape(d["move_str"])}</td>'
-                f'<td class="reason">{html.escape(d["reason"])}</td>'
-                f'</tr>'
+    def _table_grave_html(rows_list, show_sec=True, js_clickable_index=False):
+        if not rows_list:
+            return "<p style='color:#94a3b8;margin:4px 0 10px 0;'>None</p>"
+        sec_th = "<th>Sector (Wt%)</th>" if show_sec else ""
+        tr_list = []
+        for r in rows_list:
+            d = _ser_grave(r)
+            sec_attr = html.escape(d["symbol"] if not show_sec else d["sector"])
+            click_attr = f'onclick="filterBySector(\'{sec_attr}\')" class="idx-row"' if js_clickable_index else ""
+            sec_td = f"<td class='sec'>{html.escape(d['sector'])} ({d['weight']})</td>" if show_sec else ""
+            s_cls = "g" if d["sig"] == "BULL" else "r" if d["sig"] == "BEAR" else "d"
+            c_cls = "g" if d["r_pos"] else "r"
+            tr_list.append(
+                f"<tr {click_attr} data-sector='{sec_attr}'>"
+                f"<td><b>{html.escape(d['symbol'])}</b></td>"
+                f"{sec_td}"
+                f"<td align='center' class='{s_cls}'>{html.escape(d['sig'])}</td>"
+                f"<td align='center'>{html.escape(d['anchor'])}</td>"
+                f"<td align='right'>{d['anchor_val']}</td>"
+                f"<td align='center'>{html.escape(d['killed'])}</td>"
+                f"<td align='right'>{d['killed_val']}</td>"
+                f"<td align='right'>{d['ltp']}</td>"
+                f"<td align='right' class='{c_cls}'>{html.escape(d['r_str'])}</td>"
+                f"<td align='right'>{html.escape(d['move_str'])}</td>"
+                f"<td class='rsn'>{html.escape(d['reason'])}</td>"
+                f"</tr>"
             )
-        return "\n".join(out_html)
+        return (
+            f"<table><thead><tr><th>Script</th>{sec_th}<th>Sig</th><th>Anchor</th>"
+            f"<th align='right'>AnchVal</th><th>Killed</th><th align='right'>KillVal</th>"
+            f"<th align='right'>LTP</th><th align='right'>R-Mult</th><th align='right'>Move%</th>"
+            f"<th>Forensic Exit / Rejection Reason</th></tr></thead>"
+            f"<tbody>{''.join(tr_list)}</tbody></table>"
+        )
 
-    pills_html = "\n".join(
-        f'<button class="sec-pill" data-sec="{html.escape(s)}" onclick="filterBySector(\'{html.escape(s)}\')">{html.escape(s)}</button>'
-        for s in all_sectors
+    # Build Native HTML5 <details>/<summary> Accordions for each Sectoral Index (works in Gmail/Apple Mail/Outlook without JS)
+    sector_accordions = []
+    index_status_lookup = {}
+    for r in idx_bulls:
+        index_status_lookup[r['Symbol']] = f"🔥 BULL ({_r_multiple(r, include_banked=False):+.2f}R | Anchor {r['ActiveAnchor']})"
+    for r in idx_bears:
+        index_status_lookup[r['Symbol']] = f"🩸 BEAR ({_r_multiple(r, include_banked=False):+.2f}R | Anchor {r['ActiveAnchor']})"
+    for r in idx_grave:
+        if r['Symbol'] not in index_status_lookup:
+            index_status_lookup[r['Symbol']] = f"🚫 GRAVEYARD ({r.get('RejectReason', 'Stopped')})"
+
+    all_sector_keys = list(SECTORAL_INDEX_CONFIG.keys()) + [DEFAULT_UNMAPPED_SECTOR]
+    for sec in all_sector_keys:
+        sb = [r for r in e_bulls if r.get('Sector') == sec]
+        sr = [r for r in e_bears if r.get('Sector') == sec]
+        sg = [r for r in e_grave if r.get('Sector') == sec]
+        if not sb and not sr and not sg:
+            continue
+        idx_badge = index_status_lookup.get(sec, "Sector Group")
+        sector_accordions.append(
+            f"<details style='margin-bottom:10px;border:1px solid #334155;border-radius:6px;background:#0f172a;padding:8px 12px;'>"
+            f"<summary style='cursor:pointer;font-weight:bold;color:#38bdf8;font-size:14px;outline:none;'>"
+            f"▶ CLICK TO EXPAND/COLLAPSE: {html.escape(sec)} — [{html.escape(idx_badge)}] "
+            f"(Bull Stocks: {len(sb)} | Bear Stocks: {len(sr)} | Graveyard: {len(sg)})"
+            f"</summary>"
+            f"<div style='padding-top:10px;'>"
+            f"<h4>🔥 {html.escape(sec)} — TOP BULL STOCKS ({len(sb)})</h4>"
+            f"{_table_active_html(sb, 'BULL', show_sec=False)}"
+            f"<h4>🩸 {html.escape(sec)} — TOP BEAR STOCKS ({len(sr)})</h4>"
+            f"{_table_active_html(sr, 'BEAR', show_sec=False)}"
+            f"<h4>🚫 {html.escape(sec)} — GRAVEYARD STOCKS ({len(sg)})</h4>"
+            f"{_table_grave_html(sg, show_sec=False)}"
+            f"</div></details>"
+        )
+
+    common_css = (
+        "body{background:#0b0f19;color:#e2e8f0;font-family:Consolas,monospace;font-size:12px;padding:14px;}"
+        "h2,h3,h4{color:#38bdf8;margin:10px 0 6px 0;}"
+        "table{width:100%;border-collapse:collapse;margin-bottom:14px;background:#0f172a;}"
+        "th{background:#1e293b;color:#38bdf8;padding:6px;border:1px solid #334155;text-align:left;}"
+        "td{padding:5px 6px;border:1px solid #1e293b;}"
+        ".g{color:#4ade80;font-weight:bold;}.r{color:#f87171;font-weight:bold;}.d{color:#64748b;}"
+        ".sec{color:#fde047;}.rsn{color:#fbbf24;}"
+        ".idx-row{cursor:pointer;}.idx-row:hover{background:#172554;}"
+        ".pill{background:#1e293b;color:#e2e8f0;border:1px solid #475569;padding:5px 10px;margin:2px;border-radius:4px;cursor:pointer;}"
+        ".pill:hover,.pill.active{background:#0284c7;color:#fff;}"
+        ".clr{background:#ef4444;color:#fff;border:none;padding:6px 14px;border-radius:4px;font-weight:bold;cursor:pointer;}"
     )
 
-    html_doc = f"""<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>System 3.0 Institutional Volatility Tracker — Sectoral & Stock Dashboard</title>
-<style>
-  body {{ background:#0b0f19; color:#e2e8f0; font-family:'JetBrains Mono',Consolas,monospace; margin:0; padding:20px; font-size:13px; }}
-  h1, h2, h3 {{ margin:0 0 10px 0; }}
-  .top-bar {{ position:sticky; top:0; z-index:100; background:#111827; border:1px solid #334155; border-radius:8px; padding:14px 18px; margin-bottom:20px; box-shadow:0 8px 24px rgba(0,0,0,0.5); }}
-  .status-line {{ display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:10px; }}
-  .badge-active {{ background:#1e293b; border:1px solid #38bdf8; color:#38bdf8; padding:6px 12px; border-radius:6px; font-weight:bold; }}
-  .btn-clear {{ background:#ef4444; color:#fff; border:none; padding:8px 16px; border-radius:6px; font-weight:bold; cursor:pointer; font-family:inherit; }}
-  .btn-clear:hover {{ background:#dc2626; }}
-  .pill-bar {{ display:flex; flex-wrap:wrap; gap:6px; }}
-  .sec-pill {{ background:#1e293b; color:#cbd5e1; border:1px solid #475569; padding:5px 10px; border-radius:5px; cursor:pointer; font-family:inherit; font-size:12px; }}
-  .sec-pill:hover, .sec-pill.active {{ background:#0284c7; color:#fff; border-color:#38bdf8; }}
-  .stage-box {{ border:1px solid #1e293b; background:#0f172a; border-radius:8px; padding:16px; margin-bottom:24px; }}
-  .stage-title {{ color:#38bdf8; font-size:16px; border-bottom:1px solid #334155; padding-bottom:8px; margin-bottom:14px; }}
-  table {{ width:100%; border-collapse:collapse; margin-bottom:18px; }}
-  th {{ background:#1e293b; color:#38bdf8; text-align:left; padding:8px; border-bottom:1px solid #334155; }}
-  td {{ padding:7px 8px; border-bottom:1px solid #1e293b; }}
-  tr:hover {{ background:#1e293b; }}
-  .clickable-index-row {{ cursor:pointer; }}
-  .clickable-index-row:hover {{ background:#172554 !important; outline:1px solid #38bdf8; }}
-  .clickable-index-row.selected-index {{ background:#1e3a8a !important; outline:2px solid #38bdf8; }}
-  .sym {{ font-weight:bold; color:#f8fafc; }}
-  .num {{ text-align:right; }}
-  .center {{ text-align:center; }}
-  .pos {{ color:#4ade80; font-weight:bold; }}
-  .neg {{ color:#f87171; font-weight:bold; }}
-  .dim {{ color:#64748b; }}
-  .sec-badge {{ color:#fde047; }}
-  .wt {{ color:#94a3b8; font-size:11px; }}
-  .reason {{ color:#fbbf24; }}
-</style>
-</head>
-<body>
+    email_inline_html = (
+        f"<!DOCTYPE html><html><head><meta charset='utf-8'><style>{common_css}</style></head><body>"
+        f"<h2>📡 SYSTEM 3.0 INSTITUTIONAL VOLATILITY TRACKER [{html.escape(mode)}]</h2>"
+        f"<p><b>Snapshot:</b> {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | <b>Checkpoints:</b> {len(checkpoints)} | "
+        f"<b>Indices:</b> {len(idx_bulls)} Bull, {len(idx_bears)} Bear, {len(idx_grave)} Grave | "
+        f"<b>Stocks:</b> {len(e_bulls)} Bull, {len(e_bears)} Bear, {len(e_grave)} Grave</p>"
+        f"<h3>🏛️ STAGE 1: SECTORAL INDICES (TOP BULLS, TOP BEARS, GRAVEYARD)</h3>"
+        f"<h4>🏛️🔥 SECTORAL INDICES — TOP BULL SETUPS ({len(idx_bulls)})</h4>"
+        f"{_table_active_html(idx_bulls, 'BULL', show_sec=False)}"
+        f"<h4>🏛️🩸 SECTORAL INDICES — TOP BEAR SETUPS ({len(idx_bears)})</h4>"
+        f"{_table_active_html(idx_bears, 'BEAR', show_sec=False)}"
+        f"<h4>🏛️🚫 SECTORAL INDICES — THE GRAVEYARD ({len(idx_grave)})</h4>"
+        f"{_table_grave_html(idx_grave, show_sec=False)}"
+        f"<h3>📂 STAGE 2: CLICK ANY SECTORAL INDEX BELOW TO EXPAND / COLLAPSE ITS STOCKS</h3>"
+        f"{''.join(sector_accordions)}"
+        f"<details open style='margin-top:18px;border:2px solid #38bdf8;border-radius:6px;background:#0f172a;padding:10px;'>"
+        f"<summary style='cursor:pointer;font-weight:bold;color:#4ade80;font-size:15px;'>"
+        f"🌐 STAGE 3: DEFAULT FULL VIEW — ALL STOCKS (CLICK TO COLLAPSE / EXPAND ALL)"
+        f"</summary>"
+        f"<div style='padding-top:10px;'>"
+        f"<h4>🔥 ALL STOCKS — TOP BULL SETUPS ({len(e_bulls)})</h4>"
+        f"{_table_active_html(e_bulls, 'BULL', show_sec=True)}"
+        f"<h4>🩸 ALL STOCKS — TOP BEAR SETUPS ({len(e_bears)})</h4>"
+        f"{_table_active_html(e_bears, 'BEAR', show_sec=True)}"
+        f"<h4>🚫 ALL STOCKS — THE GRAVEYARD ({len(e_grave)})</h4>"
+        f"{_table_grave_html(e_grave, show_sec=True)}"
+        f"</div></details>"
+        f"</body></html>"
+    )
 
-<div class="top-bar">
-  <div class="status-line">
-    <div>
-      <strong>📡 SYSTEM 3.0 INSTITUTIONAL VOLATILITY TRACKER [{html.escape(mode)}]</strong>
-      <span style="color:#94a3b8; margin-left:12px;">Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Checkpoints: {len(checkpoints)}</span>
-    </div>
-    <div style="display:flex; align-items:center; gap:12px;">
-      <span id="filterStatusBadge" class="badge-active">DEFAULT VIEW: ALL INDICES &amp; ALL STOCKS</span>
-      <button class="btn-clear" onclick="clearSectorFilter()">CLEAR FILTER (SHOW ALL)</button>
-    </div>
-  </div>
-  <div class="pill-bar">
-    <span style="color:#94a3b8; align-self:center; margin-right:4px;">Click Index to Filter Stocks:</span>
-    {pills_html}
-  </div>
-</div>
+    pills_js_html = "".join(
+        f"<button class='pill' data-sec='{html.escape(s)}' onclick=\"filterBySector('{html.escape(s)}')\">{html.escape(s)}</button>"
+        for s in sorted(SECTORAL_INDEX_CONFIG.keys())
+    )
 
-<div class="stage-box">
-  <div class="stage-title">🏛️ STAGE 1: SECTORAL INDICES (Click Any Index Row Below to Filter Stock Tables)</div>
+    attachment_js_html = (
+        f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>System 3.0 Dashboard</title><style>{common_css}</style></head><body>"
+        f"<div style='position:sticky;top:0;background:#111827;padding:10px;border:1px solid #334155;border-radius:6px;margin-bottom:14px;'>"
+        f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;'>"
+        f"<b>📡 SYSTEM 3.0 [{html.escape(mode)}] — Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')}</b>"
+        f"<div><span id='statusBadge' style='color:#38bdf8;margin-right:10px;font-weight:bold;'>DEFAULT VIEW: SHOWING ALL</span>"
+        f"<button class='clr' onclick='clearFilter()'>CLEAR FILTER (SHOW ALL)</button></div></div>"
+        f"<div>{pills_js_html}</div></div>"
+        f"<h3>🏛️ STAGE 1: SECTORAL INDICES (Click Any Index Row to Filter Stocks Below)</h3>"
+        f"<h4>🏛️🔥 SECTORAL INDICES — TOP BULL SETUPS ({len(idx_bulls)})</h4>"
+        f"{_table_active_html(idx_bulls, 'BULL', show_sec=False, js_clickable_index=True)}"
+        f"<h4>🏛️🩸 SECTORAL INDICES — TOP BEAR SETUPS ({len(idx_bears)})</h4>"
+        f"{_table_active_html(idx_bears, 'BEAR', show_sec=False, js_clickable_index=True)}"
+        f"<h4>🏛️🚫 SECTORAL INDICES — THE GRAVEYARD ({len(idx_grave)})</h4>"
+        f"{_table_grave_html(idx_grave, show_sec=False, js_clickable_index=True)}"
+        f"<h3 id='stkHeader'>📈 STAGE 2: ALL STOCKS (Default Show All — Click Any Sector Above to Filter)</h3>"
+        f"<div id='stkContainer'>"
+        f"<h4>🔥 STOCKS — TOP BULL SETUPS</h4><div id='stkBullWrap'>{_table_active_html(e_bulls, 'BULL', show_sec=True)}</div>"
+        f"<h4>🩸 STOCKS — TOP BEAR SETUPS</h4><div id='stkBearWrap'>{_table_active_html(e_bears, 'BEAR', show_sec=True)}</div>"
+        f"<h4>🚫 STOCKS — THE GRAVEYARD</h4><div id='stkGraveWrap'>{_table_grave_html(e_grave, show_sec=True)}</div>"
+        f"</div>"
+        f"<script>"
+        f"function filterBySector(sec){{"
+        f"document.querySelectorAll('#stkContainer tbody tr').forEach(r=>{{"
+        f"r.style.display=(r.getAttribute('data-sector')===sec)?'':'none';}});"
+        f"document.querySelectorAll('.pill').forEach(p=>p.classList.toggle('active',p.getAttribute('data-sec')===sec));"
+        f"document.getElementById('statusBadge').textContent='FILTERED BY: '+sec;"
+        f"document.getElementById('stkHeader').textContent='📈 STAGE 2: STOCKS IN SECTOR ['+sec+']';"
+        f"}}"
+        f"function clearFilter(){{"
+        f"document.querySelectorAll('#stkContainer tbody tr').forEach(r=>{{r.style.display='';}});"
+        f"document.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));"
+        f"document.getElementById('statusBadge').textContent='DEFAULT VIEW: SHOWING ALL';"
+        f"document.getElementById('stkHeader').textContent='📈 STAGE 2: ALL STOCKS (Default Show All)';"
+        f"}}"
+        f"</script></body></html>"
+    )
 
-  <h3>🏛️🔥 SECTORAL INDICES — TOP BULL SETUPS (<span id="idxBullCnt">{len(idx_bulls)}</span>)</h3>
-  <table id="idxBullTable">
-    <thead><tr><th>Sectoral Index</th><th class="num">LTP/Exit</th><th class="center">Seen</th><th class="center">Anchor</th><th class="num">Anch Val</th><th class="num">R-Mult (Bank)</th><th class="center">ATR Grid</th><th class="center">BB Grid</th><th class="center">State</th></tr></thead>
-    <tbody>{_build_active_rows_html([_serialize_active_row(r, "BULL") for r in idx_bulls], is_index=True)}</tbody>
-  </table>
-
-  <h3>🏛️🩸 SECTORAL INDICES — TOP BEAR SETUPS (<span id="idxBearCnt">{len(idx_bears)}</span>)</h3>
-  <table id="idxBearTable">
-    <thead><tr><th>Sectoral Index</th><th class="num">LTP/Exit</th><th class="center">Seen</th><th class="center">Anchor</th><th class="num">Anch Val</th><th class="num">R-Mult (Bank)</th><th class="center">ATR Grid</th><th class="center">BB Grid</th><th class="center">State</th></tr></thead>
-    <tbody>{_build_active_rows_html([_serialize_active_row(r, "BEAR") for r in idx_bears], is_index=True)}</tbody>
-  </table>
-
-  <h3>🏛️🚫 SECTORAL INDICES — THE GRAVEYARD (<span id="idxGraveCnt">{len(idx_grave)}</span>)</h3>
-  <table id="idxGraveTable">
-    <thead><tr><th>Sectoral Index</th><th class="center">Signal</th><th class="center">Anchor</th><th class="num">Anch Val</th><th class="center">Killed</th><th class="num">Kill Val</th><th class="num">LTP</th><th class="num">R-Mult</th><th class="num">Move%</th><th>Forensic Exit / Rejection Reason</th></tr></thead>
-    <tbody>{_build_grave_rows_html([_serialize_grave_row(r) for r in idx_grave], is_index=True)}</tbody>
-  </table>
-</div>
-
-<div class="stage-box">
-  <div class="stage-title" id="stockStageTitle">📈 STAGE 2: ALL F&amp;O STOCKS (Assigned by Highest Sectoral Weightage %)</div>
-
-  <h3>🔥 STOCKS — TOP BULL SETUPS (<span id="stkBullCnt">{len(stock_bulls)}</span>)</h3>
-  <table id="stkBullTable">
-    <thead><tr><th>Script</th><th class="num">LTP/Exit</th><th>Primary Sector (Max Wt%)</th><th class="center">Seen</th><th class="center">Anchor</th><th class="num">Anch Val</th><th class="num">R-Mult (Bank)</th><th class="center">ATR Grid</th><th class="center">BB Grid</th><th class="center">State</th></tr></thead>
-    <tbody>{_build_active_rows_html([_serialize_active_row(r, "BULL") for r in stock_bulls], is_index=False)}</tbody>
-  </table>
-
-  <h3>🩸 STOCKS — TOP BEAR SETUPS (<span id="stkBearCnt">{len(stock_bears)}</span>)</h3>
-  <table id="stkBearTable">
-    <thead><tr><th>Script</th><th class="num">LTP/Exit</th><th>Primary Sector (Max Wt%)</th><th class="center">Seen</th><th class="center">Anchor</th><th class="num">Anch Val</th><th class="num">R-Mult (Bank)</th><th class="center">ATR Grid</th><th class="center">BB Grid</th><th class="center">State</th></tr></thead>
-    <tbody>{_build_active_rows_html([_serialize_active_row(r, "BEAR") for r in stock_bears], is_index=False)}</tbody>
-  </table>
-
-  <h3>🚫 STOCKS — THE GRAVEYARD (<span id="stkGraveCnt">{len(stock_grave)}</span>)</h3>
-  <table id="stkGraveTable">
-    <thead><tr><th>Script</th><th>Primary Sector (Max Wt%)</th><th class="center">Signal</th><th class="center">Anchor</th><th class="num">Anch Val</th><th class="center">Killed</th><th class="num">Kill Val</th><th class="num">LTP</th><th class="num">R-Mult</th><th class="num">Move%</th><th>Forensic Exit / Rejection Reason</th></tr></thead>
-    <tbody>{_build_grave_rows_html([_serialize_grave_row(r) for r in stock_grave], is_index=False)}</tbody>
-  </table>
-</div>
-
-<script>
-function filterBySector(sectorName) {{
-  const tables = [
-    {{ id: 'stkBullTable', cntId: 'stkBullCnt' }},
-    {{ id: 'stkBearTable', cntId: 'stkBearCnt' }},
-    {{ id: 'stkGraveTable', cntId: 'stkGraveCnt' }}
-  ];
-  tables.forEach(t => {{
-    const rows = document.querySelectorAll('#' + t.id + ' tbody tr');
-    let visible = 0;
-    rows.forEach(r => {{
-      if (r.getAttribute('data-sector') === sectorName) {{
-        r.style.display = '';
-        visible++;
-      }} else {{
-        r.style.display = 'none';
-      }}
-    }});
-    document.getElementById(t.cntId).textContent = visible;
-  }});
-
-  document.querySelectorAll('.clickable-index-row').forEach(r => {{
-    r.classList.toggle('selected-index', r.getAttribute('data-sector') === sectorName);
-  }});
-  document.querySelectorAll('.sec-pill').forEach(p => {{
-    p.classList.toggle('active', p.getAttribute('data-sec') === sectorName);
-  }});
-
-  document.getElementById('filterStatusBadge').textContent = 'FILTERED BY INDEX: ' + sectorName;
-  document.getElementById('stockStageTitle').textContent = '📈 STAGE 2: STOCKS BELONGING TO [' + sectorName + '] (Highest Weightage Winner)';
-}}
-
-function clearSectorFilter() {{
-  const tables = [
-    {{ id: 'stkBullTable', cntId: 'stkBullCnt' }},
-    {{ id: 'stkBearTable', cntId: 'stkBearCnt' }},
-    {{ id: 'stkGraveTable', cntId: 'stkGraveCnt' }}
-  ];
-  tables.forEach(t => {{
-    const rows = document.querySelectorAll('#' + t.id + ' tbody tr');
-    rows.forEach(r => {{ r.style.display = ''; }});
-    document.getElementById(t.cntId).textContent = rows.length;
-  }});
-
-  document.querySelectorAll('.clickable-index-row').forEach(r => r.classList.remove('selected-index'));
-  document.querySelectorAll('.sec-pill').forEach(p => p.classList.remove('active'));
-
-  document.getElementById('filterStatusBadge').textContent = 'DEFAULT VIEW: ALL INDICES & ALL STOCKS';
-  document.getElementById('stockStageTitle').textContent = '📈 STAGE 2: ALL F&O STOCKS (Assigned by Highest Sectoral Weightage %)';
-}}
-</script>
-</body>
-</html>"""
-
-    try:
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write(html_doc)
-        print(f"   {COLOR_GREEN_FG}» Interactive Click-to-Filter HTML Dashboard saved to: {out_path}{COLOR_RESET}")
-    except Exception as e:
-        print(f"   {COLOR_YELLOW}» Could not write HTML dashboard ({e}){COLOR_RESET}")
+    return email_inline_html, attachment_js_html
 
 # ------------------------------------------------------------------------------
-# TRACKING EMAIL & INTRADAY HISTORY
+# EMAIL TRANSMISSION ENGINE (USES GITHUB REPOSITORY SECRETS)
 # ------------------------------------------------------------------------------
-def _send_watch_email(subject, body, tag="track"):
-    sender = os.environ.get("SENDER_EMAIL")
-    password = os.environ.get("SENDER_PASSWORD")
-    recipient = os.environ.get("RECIPIENT_EMAIL")
-    smtp_server = os.environ.get("SMTP_SERVER") or DEFAULT_SMTP_SERVER
-    smtp_port = os.environ.get("SMTP_PORT") or DEFAULT_SMTP_PORT
-    if not sender or not password or not recipient:
+def _send_email_message(subject, plain_body, html_body=None, attachment_html=None, tag="email"):
+    sender = os.environ.get(ENV_SENDER_EMAIL)
+    password = os.environ.get(ENV_SENDER_PASSWORD)
+    recipient = os.environ.get(ENV_RECIPIENT_EMAIL)
+    smtp_server = os.environ.get(ENV_SMTP_SERVER) or DEFAULT_SMTP_SERVER
+    smtp_port = os.environ.get(ENV_SMTP_PORT) or DEFAULT_SMTP_PORT
+
+    missing = [
+        name for name, val in (
+            (ENV_SENDER_EMAIL, sender),
+            (ENV_SENDER_PASSWORD, password),
+            (ENV_RECIPIENT_EMAIL, recipient),
+        ) if not val
+    ]
+    if missing:
+        print(f"   {COLOR_YELLOW}[{tag}] Cannot send email -- missing secret(s): {', '.join(missing)}{COLOR_RESET}")
         return False
+
     try:
         port = int(smtp_port)
     except ValueError:
+        print(f"   {COLOR_YELLOW}[{tag}] Invalid {ENV_SMTP_PORT}='{smtp_port}'{COLOR_RESET}")
         return False
+
     msg = EmailMessage()
-    msg['Subject'], msg['From'], msg['To'] = subject, sender, recipient
-    msg.set_content(body)
+    msg['Subject'] = subject
+    msg['From'] = sender
+    msg['To'] = recipient
+    msg.set_content(plain_body)
+
+    if html_body:
+        msg.add_alternative(html_body, subtype='html')
+
+    if attachment_html and EMAIL_ATTACH_INTERACTIVE_HTML:
+        msg.add_attachment(
+            attachment_html.encode('utf-8'),
+            maintype='text',
+            subtype='html',
+            filename=EMAIL_ATTACHMENT_FILENAME
+        )
+
     try:
         if port == SMTP_SSL_PORT:
             with smtplib.SMTP_SSL(smtp_server, port, timeout=SMTP_TIMEOUT_SEC) as server:
@@ -2025,12 +2163,14 @@ def _send_watch_email(subject, body, tag="track"):
                 server.starttls()
                 server.login(sender, password)
                 server.send_message(msg)
+        print(f"   {COLOR_GREEN_FG}📧 [{tag}] Full untruncated email sent to {recipient} via {smtp_server}:{port}{COLOR_RESET}")
         return True
-    except Exception:
+    except Exception as e:
+        print(f"   {COLOR_YELLOW}[{tag}] Failed to send email ({type(e).__name__}: {e}){COLOR_RESET}")
         return False
 
 def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True):
-    if not tracked_symbol_raw:
+    if not tracked_symbol_raw or tracked_symbol_raw == "***":
         return
     n = _norm_sym(tracked_symbol_raw)
     matched_sym = next((sym for sym in by_symbol.keys() if n in _norm_sym(sym)), None)
@@ -2084,18 +2224,18 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
         ltp_val = f"{row['KilledPrice']:>7.2f}x" if "[STOP" in shown_state and row.get('KilledPrice', 0) > 0 else f"{row['LTP']:>8.2f} "
         print(f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} {ltp_val} | {row['_EvalTime'].strftime('%H:%M'):^5} {a_time:^7} {row['AnchorPrice']:>9.2f} {r_color}{r_mult_str:>15}{COLOR_RESET} |   {a_str}  |   {b_str}  | {state_text}")
 
-    if len(history) >= 2 and live_run:
+    if len(history) >= 2 and live_run and SEND_TRACK_ALERT_EMAIL:
         last_row, prev_row = history[-1], history[-2]
         def get_full_state(r):
             return f"{r.get('AnchorDir', 'NONE')} {r.get('State', 'NONE')}"
         last_state, prev_state = get_full_state(last_row), get_full_state(prev_row)
         if last_state != prev_state:
-            _send_watch_email(
+            _send_email_message(
                 f"[System3] {matched_sym} Alert: {prev_state} -> {last_state}",
                 f"System3 detected a state transition for {matched_sym} ({sec_name}) at checkpoint {last_row['_EvalTime'].strftime('%H:%M')}.\n\n"
                 f"Previous State: {prev_state}\nCurrent State: {last_state}\n\n"
                 f"LTP: {last_row.get('LTP', 0):.2f}\nTotal Session Move: {_r_multiple(last_row, include_banked=True):+.2f} R-Multiples\n",
-                "track"
+                tag="track"
             )
 
 # ==============================================================================
@@ -2117,11 +2257,15 @@ def run_screener(
     target_dt, today_session = cutoff_dt.date(), (cutoff_dt.date() == now_ist().date())
     cutoff_dt = min(cutoff_dt, _close_dt(target_dt))
 
+    if not track_symbol:
+        track_symbol = os.environ.get(ENV_TRACK_SYMBOL, "").strip()
+
     print(f"\n{COLOR_CYAN}📡 Initializing Tracker [{mode}] | Time Machine: {cutoff_dt.strftime('%Y-%m-%d %H:%M:%S')} (Live: {not explicit}){COLOR_RESET}")
     for n in notes:
         print(f"   {COLOR_YELLOW}» {n}{COLOR_RESET}")
 
-    universe_raw = get_dynamic_universe(mode, cutoff_dt, today_session, needles=[track_symbol] if track_symbol else [])
+    needles = [track_symbol] if (track_symbol and track_symbol != "***") else []
+    universe_raw = get_dynamic_universe(mode, cutoff_dt, today_session, needles=needles)
     if STATS.auth_failed or not universe_raw:
         return 1
     print(f"   {COLOR_DIM}» Universe: {len(universe_raw)} instruments{COLOR_RESET}")
@@ -2171,11 +2315,11 @@ def run_screener(
     idx_bulls, idx_bears, idx_grave = segregate_and_rank_buckets(by_index) if by_index else ([], [], [])
     stock_bulls, stock_bears, stock_grave = segregate_and_rank_buckets(by_stock)
 
-    if track_symbol:
+    if track_symbol and track_symbol != "***":
         combined_map = dict(by_index, **by_stock)
         print_and_alert_tracked_history(track_symbol, combined_map, live_run=not explicit)
 
-    # Render console dashboard (Default = Show All unless --sector was passed)
+    # 1. Render Console Output
     render_console_dashboard(
         mode, cutoff_dt, checkpoints,
         idx_bulls, idx_bears, idx_grave,
@@ -2183,39 +2327,39 @@ def run_screener(
         active_sector_filter=sector_filter
     )
 
-    # Always generate the self-contained interactive clickable HTML dashboard
-    generate_interactive_html_dashboard(
-        html_out, mode, cutoff_dt, checkpoints,
+    # 2. Build Untruncated Email Content & Send via SMTP Secrets (if enabled by SEND_DASHBOARD_EMAIL)
+    email_inline_html, attachment_js_html = build_email_and_attachment_html(
+        mode, cutoff_dt, checkpoints,
         idx_bulls, idx_bears, idx_grave,
         stock_bulls, stock_bears, stock_grave
     )
 
-    # Optional interactive CLI loop for terminal users
-    if interactive_cli and sys.stdin.isatty():
-        while True:
-            try:
-                user_in = input(
-                    f"\n{COLOR_CYAN}[Interactive Filter] Enter a Sectoral Index name (e.g. 'NIFTY IT', 'NIFTY BANK'), "
-                    f"'CLEAR' to show all, or 'Q' to quit: {COLOR_RESET}"
-                ).strip()
-            except (EOFError, KeyboardInterrupt):
-                break
-            if not user_in or user_in.upper() in ("Q", "QUIT", "EXIT"):
-                break
-            if user_in.upper() in ("CLEAR", "ALL", "RESET"):
-                render_console_dashboard(
-                    mode, cutoff_dt, checkpoints,
-                    idx_bulls, idx_bears, idx_grave,
-                    stock_bulls, stock_bears, stock_grave,
-                    active_sector_filter=None
-                )
-            else:
-                render_console_dashboard(
-                    mode, cutoff_dt, checkpoints,
-                    idx_bulls, idx_bears, idx_grave,
-                    stock_bulls, stock_bears, stock_grave,
-                    active_sector_filter=user_in
-                )
+    if SAVE_LOCAL_HTML_FILE and html_out:
+        try:
+            with open(html_out, "w", encoding="utf-8") as f:
+                f.write(attachment_js_html)
+            print(f"   {COLOR_GREEN_FG}» Local HTML Dashboard saved to: {html_out}{COLOR_RESET}")
+        except Exception as e:
+            print(f"   {COLOR_YELLOW}» Could not write local HTML file ({e}){COLOR_RESET}")
+
+    if SEND_DASHBOARD_EMAIL:
+        plain_text_report = build_full_untruncated_plain_text(
+            mode, cutoff_dt, checkpoints,
+            idx_bulls, idx_bears, idx_grave,
+            stock_bulls, stock_bears, stock_grave
+        )
+        email_subject = (
+            f"[System3 {mode}] {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | "
+            f"Indices: {len(idx_bulls)}▲ {len(idx_bears)}▼ | "
+            f"Stocks: {len(stock_bulls)}▲ {len(stock_bears)}▼ ({len(stock_grave)} Grave)"
+        )
+        _send_email_message(
+            subject=email_subject,
+            plain_body=plain_text_report,
+            html_body=email_inline_html,
+            attachment_html=attachment_js_html,
+            tag="dashboard-email"
+        )
 
     _print_error_summary()
     print(f"\n⏱️ Tracker sync completed in {(time.time() - t_start):.2f} seconds ({sum(l.total_calls for l in LIMITERS.values())} API calls).\n")
@@ -2237,11 +2381,14 @@ def parse_args():
     p.add_argument("--single-snapshot", action="store_true")
     p.add_argument("--isolate-session-bands", action="store_true", default=ISOLATE_SESSION_BANDS)
 
-    # --- Sectoral Index & Interactive Dashboard Controls ---
+    # --- Email & Sectoral Controls ---
+    p.add_argument("--send-email", dest="send_email", action="store_true", default=SEND_DASHBOARD_EMAIL, help="Send untruncated dashboard email via SMTP secrets.")
+    p.add_argument("--no-send-email", dest="send_email", action="store_false", help="Disable sending dashboard email.")
+    p.add_argument("--save-html", dest="save_html", action="store_true", default=SAVE_LOCAL_HTML_FILE, help="Save local HTML file to disk.")
     p.add_argument("--no-sector-indices", action="store_true", help="Disable Stage 1 Sectoral Index evaluation.")
-    p.add_argument("--sector", type=str, default="", help="Filter Stock tables to a specific Sectoral Index (default: show all).")
-    p.add_argument("--html-out", type=str, default=HTML_DASHBOARD_PATH, help="Output file path for clickable HTML dashboard.")
-    p.add_argument("--interactive", action="store_true", help="Launch interactive terminal prompt to filter by sector or CLEAR.")
+    p.add_argument("--sector", type=str, default="", help="Filter console Stock tables to a specific Sectoral Index.")
+    p.add_argument("--html-out", type=str, default=HTML_DASHBOARD_PATH)
+    p.add_argument("--interactive", action="store_true")
 
     # --- Indicator Periods & Band Multipliers ---
     p.add_argument("--price-bb-period", type=int, default=PRICE_BB_PERIOD)
@@ -2279,11 +2426,13 @@ def parse_args():
     return p.parse_args()
 
 if __name__ == "__main__":
-    if not os.environ.get("UPSTOX_ACCESS_TOKEN"):
-        print(f"{COLOR_RED_FG}[!] Missing UPSTOX_ACCESS_TOKEN environment variable.{COLOR_RESET}")
+    if not get_upstox_token():
+        print(f"{COLOR_RED_FG}[!] Missing {ENV_UPSTOX_TOKEN} / {ENV_FALLBACK_TOKEN} environment variable.{COLOR_RESET}")
         sys.exit(1)
     args = parse_args()
 
+    SEND_DASHBOARD_EMAIL = args.send_email
+    SAVE_LOCAL_HTML_FILE = args.save_html
     MIN1_HISTORY_DAYS = args.history_days
     OPT_MIN_PRICE = args.opt_min_price
     OPT_MIN_VOLUME = args.opt_min_volume
