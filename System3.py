@@ -1,16 +1,18 @@
 #!/usr/bin/env python3
 """
-Strict Institutional Volatility Tracker (Upstox) - System 3.0 (100% Parameterized Edition)
-+ Zero Hardcoded Logic: Every indicator period, multiplier, stop ratchet, and time gate lives in Section 0.
-+ Modes: STOCK_FNO, CASH_EQUITY, INDEX_OPTIONS
-+ Gap-Stitched Continuous Baseline: Eliminates overnight gap distortion while keeping 09:15 warmup instant.
-+ 3-Lock Master Trigger with Configurable Quorum Gating & Rolling Shock Window.
-+ Smart Trailing & Profit Ratchet: Disables soft stop at +1.5R and locks breakeven floor at +1.8R.
-+ Auction Filter: Blocks new anchors at/after LAST_NEW_ANCHOR_MIN to eliminate closing-auction noise.
+Strict Institutional Volatility Tracker (Upstox) - System 3.0 (Sectoral Index & Interactive Filter Edition)
++ Zero Hardcoded Logic: All indicator periods, multipliers, stop ratchets, and sector weights live in Section 0.
++ Multi-Index Highest-Weightage Resolver: Assigns dual-listed stocks to the sectoral index where they carry the highest %.
++ Sectoral Index 3-Lock Engine: Evaluates Sectoral Indices first (Top Bulls, Top Bears, Graveyard) before stocks.
++ Interactive Click-to-Filter HTML Dashboard (`system3_dashboard.html`) & CLI Sector Filter:
+  - Default view shows ALL Sectoral Indices and ALL Stocks.
+  - Clicking any Sectoral Index filters Stock Top Bulls, Top Bears, and Graveyard to that index's stocks.
+  - Clicking "CLEAR FILTER (SHOW ALL)" restores all indices and stocks.
 """
 import os
 import sys
 import re
+import html
 import argparse
 import traceback
 import urllib.parse
@@ -70,7 +72,7 @@ PRICE_BB_STD_MULT = 2.0                 # Price Bollinger Band standard deviatio
 PRICE_KC_PERIOD = 20                    # Price Keltner Channel ATR rolling window (bars)
 PRICE_KC_ATR_MULT = 1.5                 # Price Keltner Channel ATR multiplier
 ROLLING_MIN_PERIODS = 1                 # Minimum bars required for rolling stats
-ISOLATE_SESSION_BANDS = False           # False = Gap-Stitched Continuous Baseline (catches 09:15 movers); True = hard reset at 09:15
+ISOLATE_SESSION_BANDS = False           # False = Gap-Stitched Continuous Baseline; True = hard reset at 09:15
 
 # --- 0.4 KINETIC INDICATOR PERIODS ---
 RSI_PERIOD = 14                         # 1-minute RSI Wilder smoothing period
@@ -80,6 +82,7 @@ MACD_SIGNAL_PERIOD = 9                  # 1-minute MACD signal EMA period (alpha
 ADX_PERIOD = 14                         # 1-minute DMI / ADX Wilder smoothing period
 IND_BB_PERIOD = 20                      # Rolling window (bars) for indicator Bollinger Bands
 VEL_ATR_PERIOD = 14                     # Wilder smoothing period for 1-minute indicator Velocity ATR
+INDEX_SYNTHETIC_VOL_FALLBACK = True     # Synthesize range-velocity volume when spot index candles have 0 volume
 EPSILON = 1e-8                          # Zero-division guard for indicator ratios
 
 # --- 0.5 LOCK 2 & LOCK 3: STRUCTURE & KINETIC SHOCK TRIPWIRES ---
@@ -95,7 +98,8 @@ GRID_MULTIPLIERS = [1, 2, 3, 5]         # Multipliers displayed in the ATR & BB 
 ATR_BASIS_PERIOD = 14                   # Number of historical timeframe bars averaged for Base ATR
 ATR_BASIS_TF = "15min"                  # Timeframe string for Base ATR calculation
 ATR_MIN_BARS = 5                        # Minimum completed timeframe bars required to validate Base ATR
-MIN_ATR_PCT = 0.005                     # Dynamic minimum Base ATR floor as a fraction of price (0.005 = 0.5%)
+MIN_ATR_PCT = 0.005                     # Dynamic minimum Base ATR floor as a fraction of stock price (0.5%)
+INDEX_MIN_ATR_PCT = 0.0025              # Dynamic minimum Base ATR floor as a fraction of index level (0.25%)
 ABSOLUTE_MIN_ATR = 0.01                 # Absolute numerical floor for Base ATR
 
 HARD_STOP_ATR_MULT = 2.5                # Unconditional hard trailing stop distance (in Base ATRs from peak)
@@ -105,7 +109,7 @@ OPPOSING_VEL_ATR_MULT = 1.0             # Opposing velocity ATR multiple require
 OPPOSING_BB_STD_MULT = 1.0              # Opposing indicator BB StdDev multiple required to add +1 to score
 WARZONE_OPPOSING_SCORE = 2              # Opposing score threshold that blocks anchor creation as Warzone Chop
 
-SOFT_STOP_DISABLE_R = 1.5               # R-Multiple peak above which Soft Stop disables so 2.5 ATR Hard Stop rides the trend
+SOFT_STOP_DISABLE_R = 1.5               # R-Multiple peak above which Soft Stop disables so Hard Stop rides the trend
 PROFIT_LOCK_TRIGGER_R = 1.8             # R-Multiple peak required to activate the Breakeven+ Profit Ratchet
 PROFIT_LOCK_FLOOR_R = 0.3               # Minimum R-Multiple floor locked in once PROFIT_LOCK_TRIGGER_R is hit
 
@@ -113,7 +117,123 @@ ADVERSE_DRIFT_R_FLOOR = -0.5            # Explicit R-Multiple floor for live pur
 ADVERSE_DRIFT_STOP_RATIO = 1.0          # Ratio of HARD_STOP_ATR_MULT used when ADVERSE_DRIFT_R_FLOOR is None
 BANKED_R_PROTECTION_FLOOR = 0.5         # Cumulative R threshold that protects re-entries from adverse drift purge
 
-# --- 0.7 INDEX OPTIONS CONFIGURATION ---
+# --- 0.7 SECTORAL INDICES & MULTI-INDEX WEIGHTAGE MATRIX ---
+ENABLE_SECTORAL_INDICES = True          # Evaluate & display Sectoral Indices before Stock tables
+DEFAULT_UNMAPPED_SECTOR = "NIFTY 500"   # Fallback sector label if a symbol is not in SECTOR_CONSTITUENT_WEIGHTS
+DEFAULT_UNMAPPED_WEIGHT = 0.10          # Fallback weight percentage for unmapped symbols
+HTML_DASHBOARD_PATH = "system3_dashboard.html"  # Interactive click-to-filter HTML output file
+
+SECTORAL_INDEX_CONFIG = {
+    "NIFTY BANK":        {"spot_key": "NSE_INDEX|Nifty Bank",              "aliases": {"NIFTY BANK", "BANKNIFTY", "NIFTYBANK"}},
+    "NIFTY PSU BANK":    {"spot_key": "NSE_INDEX|Nifty PSU Bank",          "aliases": {"NIFTY PSU BANK", "NIFTYSUBANK", "PSUBANK"}},
+    "NIFTY FIN SERVICE": {"spot_key": "NSE_INDEX|Nifty Fin Service",       "aliases": {"NIFTY FIN SERVICE", "FINNIFTY", "NIFTYFINSERVICE"}},
+    "NIFTY IT":          {"spot_key": "NSE_INDEX|Nifty IT",                "aliases": {"NIFTY IT", "NIFTYIT", "CNXIT"}},
+    "NIFTY AUTO":        {"spot_key": "NSE_INDEX|Nifty Auto",              "aliases": {"NIFTY AUTO", "NIFTYAUTO"}},
+    "NIFTY PHARMA":      {"spot_key": "NSE_INDEX|Nifty Pharma",            "aliases": {"NIFTY PHARMA", "NIFTYPHARMA"}},
+    "NIFTY METAL":       {"spot_key": "NSE_INDEX|Nifty Metal",             "aliases": {"NIFTY METAL", "NIFTYMETAL"}},
+    "NIFTY FMCG":        {"spot_key": "NSE_INDEX|Nifty FMCG",              "aliases": {"NIFTY FMCG", "NIFTYFMCG"}},
+    "NIFTY ENERGY":      {"spot_key": "NSE_INDEX|Nifty Energy",            "aliases": {"NIFTY ENERGY", "NIFTYENERGY"}},
+    "NIFTY OIL & GAS":   {"spot_key": "NSE_INDEX|Nifty Oil and Gas",       "aliases": {"NIFTY OIL AND GAS", "NIFTY OIL & GAS", "NIFTYOILGAS"}},
+    "NIFTY REALTY":      {"spot_key": "NSE_INDEX|Nifty Realty",            "aliases": {"NIFTY REALTY", "NIFTYREALTY"}},
+    "NIFTY INFRA":       {"spot_key": "NSE_INDEX|Nifty Infra",             "aliases": {"NIFTY INFRA", "NIFTYINFRA"}},
+    "NIFTY CONSUMPTION": {"spot_key": "NSE_INDEX|Nifty India Consumption", "aliases": {"NIFTY INDIA CONSUMPTION", "NIFTY CONSUMPTION", "NIFTYCONSUMPTION"}},
+    "NIFTY PSE":         {"spot_key": "NSE_INDEX|Nifty PSE",               "aliases": {"NIFTY PSE", "NIFTYPSE", "NIFTY CPSE"}},
+}
+
+# Constituent weightage (%) per Sectoral Index.
+# If a stock appears in multiple indices (e.g., SBIN in NIFTY PSU BANK, NIFTY BANK, and NIFTY FIN SERVICE;
+# RELIANCE in NIFTY OIL & GAS, NIFTY ENERGY, and NIFTY INFRA), `resolve_primary_sector()` picks the index
+# where the stock has the HIGHEST weightage percentage.
+SECTOR_CONSTITUENT_WEIGHTS = {
+    "NIFTY IT": {
+        "INFY": 31.30, "TCS": 19.08, "HCLTECH": 11.81, "TECHM": 10.47, "COFORGE": 6.59,
+        "PERSISTENT": 6.21, "WIPRO": 4.64, "LTM": 4.06, "LTIM": 4.06, "MPHASIS": 3.09,
+        "OFSS": 2.75, "TATAELXSI": 2.40, "KPITTECH": 2.25, "CYIENT": 1.50, "BSOFT": 1.20,
+    },
+    "NIFTY PSU BANK": {
+        "SBIN": 32.50, "BANKBARODA": 16.80, "PNB": 13.40, "CANBK": 12.60, "UNIONBANK": 9.20,
+        "INDIANB": 6.80, "BANKINDIA": 5.10, "MAHABANK": 2.10, "IOB": 1.50,
+    },
+    "NIFTY BANK": {
+        "HDFCBANK": 28.10, "ICICIBANK": 24.30, "SBIN": 9.80, "KOTAKBANK": 10.40, "AXISBANK": 9.90,
+        "INDUSINDBK": 5.40, "FEDERALBNK": 3.10, "IDFCFIRSTB": 2.60, "AUBANK": 2.40, "BANDHANBNK": 1.60,
+        "RBLBANK": 1.40, "BANKBARODA": 2.80, "PNB": 2.10, "CANBK": 1.90, "YESBANK": 1.20,
+    },
+    "NIFTY FIN SERVICE": {
+        "HDFCBANK": 22.40, "ICICIBANK": 19.10, "KOTAKBANK": 8.10, "AXISBANK": 7.60, "SBIN": 6.50,
+        "BAJFINANCE": 9.20, "BAJAJFINSV": 4.30, "SHRIRAMFIN": 3.80, "CHOLAFIN": 3.10, "PFC": 2.95,
+        "RECLTD": 2.85, "HDFCLIFE": 2.75, "SBILIFE": 2.70, "ICICIGI": 2.15, "ICICIPRULI": 1.65,
+        "HDFCAMC": 1.85, "MUTHOOTFIN": 1.75, "BSE": 2.40, "MCX": 1.60, "CDSL": 1.55,
+        "SBICARD": 1.45, "LICHSGFIN": 1.35, "JIOFIN": 3.20, "IREDA": 1.30, "LICI": 1.95,
+        "MFSL": 1.40, "ABCAPITAL": 1.25, "MANAPPURAM": 1.15, "LTF": 1.20, "PNBHOUSING": 1.10,
+        "ANGELONE": 1.25, "CAMS": 1.20, "KFINTECH": 1.05, "360ONE": 1.15, "NAM-INDIA": 1.00,
+        "PAYTM": 1.30, "POLICYBZR": 1.45, "MOTILALOFS": 1.05, "ANANDRATHI": 0.95, "IIFL": 0.90,
+    },
+    "NIFTY AUTO": {
+        "M&M": 23.57, "MARUTI": 14.42, "TMPV": 11.50, "TATAMOTORS": 11.50, "BAJAJ-AUTO": 9.91,
+        "EICHERMOT": 8.38, "TVSMOTOR": 7.87, "HEROMOTOCO": 5.43, "MOTHERSON": 5.17, "BHARATFORG": 4.55,
+        "ASHOKLEY": 3.69, "BOSCHLTD": 3.20, "TIINDIA": 3.10, "MRF": 2.40, "BALKRISIND": 2.10,
+        "SONACOMS": 2.05, "UNOMINDA": 1.95, "APOLLOTYRE": 1.65, "EXIDEIND": 1.55, "ATHERENERG": 1.50,
+    },
+    "NIFTY PHARMA": {
+        "SUNPHARMA": 24.50, "DIVISLAB": 10.20, "CIPLA": 9.80, "DRREDDY": 9.40, "LUPIN": 6.80,
+        "TORNTPHARM": 5.20, "AUROPHARMA": 5.10, "ZYDUSLIFE": 4.80, "MAXHEALTH": 6.40, "APOLLOHOSP": 6.10,
+        "FORTIS": 3.90, "MANKIND": 4.10, "ALKEM": 3.60, "LAURUSLABS": 2.90, "GLENMARK": 2.70,
+        "BIOCON": 2.50, "IPCALAB": 2.20, "SYNGENE": 1.90, "GRANULES": 1.60, "ABBOTINDIA": 1.80,
+    },
+    "NIFTY METAL": {
+        "TATASTEEL": 21.40, "HINDALCO": 18.90, "JSWSTEEL": 16.50, "VEDL": 11.80, "ADANIENT": 10.60,
+        "JINDALSTEL": 8.40, "NMDC": 4.90, "HINDZINC": 4.60, "SAIL": 3.80, "NATIONALUM": 3.50,
+        "APLAPOLLO": 3.40, "JSL": 2.60, "HINDCOPPER": 2.10, "WELCORP": 1.70,
+    },
+    "NIFTY FMCG": {
+        "ITC": 31.20, "HINDUNILVR": 21.80, "NESTLEIND": 8.90, "VBL": 7.60, "BRITANNIA": 6.40,
+        "TATACONSUM": 6.10, "GODREJCP": 4.90, "MARICO": 4.10, "DABUR": 3.80, "COLPAL": 3.50,
+        "UNITDSPR": 3.40, "RADICO": 2.20, "PATANJALI": 2.10, "GODFRYPHLP": 1.80, "UBL": 1.70,
+        "JYOTHYLAB": 1.30,
+    },
+    "NIFTY OIL & GAS": {
+        "RELIANCE": 33.20, "ONGC": 16.50, "IOC": 11.40, "BPCL": 10.80, "GAIL": 8.90,
+        "HINDPETRO": 5.60, "OIL": 4.80, "PETRONET": 4.20, "IGL": 2.90, "MGL": 2.10,
+        "GUJGASLTD": 1.95, "ATGL": 1.50,
+    },
+    "NIFTY ENERGY": {
+        "RELIANCE": 27.40, "NTPC": 15.80, "POWERGRID": 11.90, "ONGC": 10.50, "COALINDIA": 9.40,
+        "TATAPOWER": 6.80, "IOC": 5.20, "BPCL": 4.90, "ADANIGREEN": 4.60, "ADANIPOWER": 4.40,
+        "JSWENERGY": 3.90, "SIEMENS": 4.80, "ABB": 4.20, "CGPOWER": 3.85, "BHEL": 3.40,
+        "ADANIENSOL": 3.10, "NHPC": 2.90, "SUZLON": 3.20, "WAAREEENER": 2.80, "PREMIERENE": 2.60,
+        "INOXWIND": 2.10, "TORNTPOWER": 2.70, "SJVN": 1.80, "CESC": 1.60, "GVT&D": 2.20,
+        "ENRIN": 2.15,
+    },
+    "NIFTY REALTY": {
+        "DLF": 26.80, "GODREJPROP": 17.40, "LODHA": 16.90, "MACROTECH": 16.90, "PHOENIXLTD": 13.50,
+        "PRESTIGE": 11.80, "OBEROIRLTY": 10.60, "BRIGADE": 4.80, "SOBHA": 3.10, "RAYMOND": 2.40,
+    },
+    "NIFTY INFRA": {
+        "LT": 28.50, "RELIANCE": 19.50, "BHARTIARTL": 18.40, "NTPC": 8.20, "ULTRACEMCO": 7.60,
+        "POWERGRID": 6.40, "ADANIPORTS": 5.80, "GRASIM": 5.40, "INDIGO": 5.20, "AMBUJACEM": 4.50,
+        "SHREECEM": 3.60, "ACC": 2.80, "DALBHARAT": 2.60, "CONCOR": 3.10, "INDUSTOWER": 3.40,
+        "CUMMINSIND": 3.90, "GMRAIRPORT": 2.50, "DELHIVERY": 2.70, "IRB": 1.90, "JKCEMENT": 2.10,
+        "RAMCOCEM": 1.80, "RVNL": 2.95,
+    },
+    "NIFTY CONSUMPTION": {
+        "BHARTIARTL": 14.20, "ITC": 11.50, "TRENT": 9.80, "TITAN": 9.40, "ASIANPAINT": 8.60,
+        "DMART": 7.90, "INDHOTEL": 6.80, "NAUKRI": 6.40, "HAVELLS": 5.90, "ZOMATO": 6.20,
+        "ETERNAL": 6.20, "SWIGGY": 4.80, "NYKAA": 4.50, "JUBLFOOD": 4.40, "PIDILITIND": 5.60,
+        "DIXON": 5.20, "POLYCAB": 4.90, "KEI": 4.30, "VOLTAS": 4.10, "BLUESTARCO": 3.80,
+        "CROMPTON": 3.50, "SUPREMEIND": 3.90, "ASTRAL": 3.60, "PAGEIND": 3.20, "KAYNES": 3.40,
+        "AMBER": 2.90, "BERGEPAINT": 2.50, "BATAINDIA": 2.10, "KALYANKJIL": 3.30,
+        "UPL": 3.70, "PIIND": 4.00, "SRF": 4.20, "AARTIIND": 2.60, "DEEPAKNTR": 2.70,
+        "TATACHEM": 2.50, "CHAMBLFERT": 2.30, "COROMANDEL": 2.80,
+    },
+    "NIFTY PSE": {
+        "HAL": 16.40, "BEL": 15.20, "NTPC": 11.00, "POWERGRID": 9.50, "ONGC": 9.00,
+        "COALINDIA": 8.20, "BDL": 5.80, "MAZDOCK": 5.60, "COCHINSHIP": 4.90, "IRCTC": 4.80,
+        "IRFC": 4.50, "NBCC": 3.20, "HUDCO": 2.90, "NLCINDIA": 2.40,
+    },
+}
+
+# --- 0.8 INDEX OPTIONS CONFIGURATION ---
 EXPIRY_SELECTION = "CURRENT"            # Choices: "CURRENT", "NEXT"
 STRIKES_ABOVE_ATM = 5                   # Number of strikes above ATM to scan
 STRIKES_BELOW_ATM = 5                   # Number of strikes below ATM to scan
@@ -131,12 +251,13 @@ INDEX_CONFIG = {
 ALIAS_TO_INDEX = {a: idx for idx, cfg in INDEX_CONFIG.items() for a in cfg["aliases"]}
 PROBE_KEY = INDEX_CONFIG["NIFTY"]["spot_key"]
 
-# --- 0.8 DASHBOARD DISPLAY & FORMATTING ---
+# --- 0.9 DASHBOARD DISPLAY & FORMATTING ---
 TOP_N_BUYERS = 50                       # Max rows in Top Bull Setups
 TOP_N_SELLERS = 50                      # Max rows in Top Bear Setups
 TOP_N_GRAVEYARD = 100                   # Max rows in The Graveyard (0 = unlimited)
 MIN_SYMBOL_WIDTH = 12                   # Minimum width of the Script column
 MAX_SYMBOL_WIDTH = 30                   # Maximum width of the Script column
+SECTOR_COL_WIDTH = 18                   # Width of Sector column in Stock tables
 BANKED_R_DISPLAY_EPSILON = 0.01         # Minimum absolute Banked R to display the (* / BankedR) badge
 
 COLOR_RESET = '\033[0m'
@@ -151,7 +272,7 @@ ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 ACTIVE_BULL_STATES = ("[ BB > KC ]", "[ BB < KC ]")
 ACTIVE_BEAR_STATES = ("[ BB > KC ]", "[ BB < KC ]")
 
-# --- 0.9 UPSTOX API, RATE LIMITER & SMTP INFRASTRUCTURE ---
+# --- 0.10 UPSTOX API, RATE LIMITER & SMTP INFRASTRUCTURE ---
 API_HOST = "https://api.upstox.com"
 MASTER_BASE_URL = "https://assets.upstox.com/market-quote/instruments/exchange"
 RATE_CAPS = ((1.0, 22), (60.0, 220), (1800.0, 900))
@@ -179,7 +300,7 @@ SMTP_SSL_PORT = 465
 SMTP_TIMEOUT_SEC = 20
 
 # ==============================================================================
-# HELPERS & RATE LIMITERS
+# HELPERS, SECTOR RESOLVER & RATE LIMITERS
 # ==============================================================================
 def now_ist():
     return datetime.now(IST).replace(tzinfo=None)
@@ -192,6 +313,23 @@ def _open_dt(day):
 
 def _norm_sym(s):
     return re.sub(r'[\s_\-]+', '', str(s).upper())
+
+def resolve_primary_sector(symbol):
+    """
+    Checks all Sectoral Indices where `symbol` is a constituent and picks
+    the single Sectoral Index where `symbol` has the HIGHEST percentage weight.
+    Returns (sector_name, weight_pct, all_memberships_list).
+    """
+    clean_sym = str(symbol).upper().strip()
+    matches = []
+    for sec_name, weights_map in SECTOR_CONSTITUENT_WEIGHTS.items():
+        if clean_sym in weights_map:
+            matches.append((sec_name, float(weights_map[clean_sym])))
+    if not matches:
+        return DEFAULT_UNMAPPED_SECTOR, float(DEFAULT_UNMAPPED_WEIGHT), [(DEFAULT_UNMAPPED_SECTOR, float(DEFAULT_UNMAPPED_WEIGHT))]
+    matches.sort(key=lambda x: (-x[1], x[0]))
+    best_sector, best_weight = matches[0]
+    return best_sector, best_weight, matches
 
 class BudgetLimiter:
     def __init__(self, caps):
@@ -254,6 +392,7 @@ LIMITERS = {
     "intraday": BudgetLimiter(RATE_CAPS),
 }
 _TLS = threading.local()
+_MASTER_CACHE = {}
 
 def _limiter_for(url):
     if "market-quote/quotes" in url:
@@ -273,9 +412,9 @@ def _session():
 class Progress:
     def __init__(self, label, total):
         self.label = label
-        self.total = total
+        self.total = max(1, total)
         self.n = 0
-        self.step = max(1, total // PROGRESS_STEPS)
+        self.step = max(1, self.total // PROGRESS_STEPS)
         self.lock = threading.Lock()
 
     def tick(self):
@@ -288,7 +427,7 @@ class Progress:
         print("", file=sys.stderr)
 
 # ==============================================================================
-# 1. UPSTOX API
+# 1. UPSTOX API & INSTRUMENT MASTER RESOLUTION
 # ==============================================================================
 def _get(url, params=None, retries=None):
     max_retries = API_MAX_RETRIES if retries is None else retries
@@ -474,6 +613,8 @@ def _unwrap_master(data):
     return []
 
 def _download_master(name, _is_fallback=False):
+    if name in _MASTER_CACHE:
+        return _MASTER_CACHE[name]
     url = f"{MASTER_BASE_URL}/{name}.json.gz"
     for attempt in range(1, MASTER_DOWNLOAD_RETRIES + 1):
         try:
@@ -482,6 +623,7 @@ def _download_master(name, _is_fallback=False):
                 try:
                     rows = _unwrap_master(json.loads(gzip.decompress(resp.content).decode('utf-8')))
                     if rows:
+                        _MASTER_CACHE[name] = rows
                         return rows
                 except Exception:
                     pass
@@ -498,6 +640,7 @@ def _download_master(name, _is_fallback=False):
             or str(r.get("segment", "")).upper().startswith(name.upper())
         ]
         if rows:
+            _MASTER_CACHE[name] = rows
             return rows
     return []
 
@@ -514,6 +657,43 @@ def resolve_pins(cands, needles, label="symbol"):
         hits.sort(key=lambda c: c[2])
         pinned.update(h[1] for h in hits[:MAX_PINNED_MATCHES])
     return pinned
+
+def _sectoral_indices_universe():
+    """
+    Resolves Upstox instrument keys for all configured NSE Sectoral Indices.
+    Matches against `segment == 'NSE_INDEX'` in the NSE master, with fallback to `spot_key`.
+    """
+    nse = _download_master("NSE")
+    master_idx_map = {}
+    for row in (nse or []):
+        if str(row.get("segment", "")).upper() == "NSE_INDEX":
+            ik = row.get("instrument_key")
+            for field_name in ("name", "trading_symbol", "tradingsymbol"):
+                val = row.get(field_name)
+                if val and ik:
+                    master_idx_map[_norm_sym(val)] = ik
+            if ik and "|" in ik:
+                master_idx_map[_norm_sym(ik.split("|", 1)[1])] = ik
+
+    out = []
+    for sec_name, cfg in SECTORAL_INDEX_CONFIG.items():
+        resolved_key = None
+        for alias in [sec_name] + list(cfg.get("aliases", [])):
+            norm_a = _norm_sym(alias)
+            if norm_a in master_idx_map:
+                resolved_key = master_idx_map[norm_a]
+                break
+        if not resolved_key:
+            resolved_key = cfg["spot_key"]
+        out.append({
+            "symbol": sec_name,
+            "key": resolved_key,
+            "pinned": True,
+            "is_sector_index": True,
+            "sector": sec_name,
+            "sector_weight": 100.0,
+        })
+    return out
 
 def _equity_universe(mode, needles=()):
     nse = _download_master("NSE")
@@ -537,10 +717,14 @@ def _equity_universe(mode, needles=()):
     pinned = set()
     if needles:
         pinned = resolve_pins([(v["symbol"], (len(v["symbol"]), v["symbol"])) for v in everything.values()], needles, "equity symbol")
-    out = {k: dict(v, pinned=v["symbol"] in pinned) for k, v in in_mode.items()}
+    out = {}
+    for k, v in in_mode.items():
+        sec_name, sec_wt, all_sec = resolve_primary_sector(v["symbol"])
+        out[k] = dict(v, pinned=v["symbol"] in pinned, is_sector_index=False, sector=sec_name, sector_weight=sec_wt, all_sectors=all_sec)
     for k, v in everything.items():
         if v["symbol"] in pinned and k not in out:
-            out[k] = dict(v, pinned=True)
+            sec_name, sec_wt, all_sec = resolve_primary_sector(v["symbol"])
+            out[k] = dict(v, pinned=True, is_sector_index=False, sector=sec_name, sector_weight=sec_wt, all_sectors=all_sec)
     return list(out.values())
 
 def _resolve_index_spot_price(key, name, cutoff_dt, use_intraday):
@@ -657,7 +841,7 @@ def _index_options_universe(cutoff_dt, use_intraday, needles=()):
             key = sym_to_key[sym]
             if key not in seen:
                 seen.add(key)
-                universe.append({"key": key, "symbol": sym, "pinned": True})
+                universe.append({"key": key, "symbol": sym, "pinned": True, "is_sector_index": False, "sector": "INDEX_OPTIONS", "sector_weight": 100.0})
 
     for idx, contracts in by_idx.items():
         if idx not in spot or not contracts:
@@ -677,7 +861,14 @@ def _index_options_universe(cutoff_dt, use_intraday, needles=()):
             key = _field(row, "instrument_key")
             if strike in window and key not in seen:
                 seen.add(key)
-                universe.append({"key": key, "symbol": str(_field(row, "trading_symbol", "tradingsymbol") or key), "pinned": False})
+                universe.append({
+                    "key": key,
+                    "symbol": str(_field(row, "trading_symbol", "tradingsymbol") or key),
+                    "pinned": False,
+                    "is_sector_index": False,
+                    "sector": idx,
+                    "sector_weight": 100.0,
+                })
     return universe
 
 def get_dynamic_universe(mode, cutoff_dt, use_intraday, needles=()):
@@ -688,7 +879,7 @@ def get_dynamic_universe(mode, cutoff_dt, use_intraday, needles=()):
     return []
 
 # ==============================================================================
-# 2. CONTINUOUS KINETIC TRIPWIRE ENGINE
+# 2. CONTINUOUS KINETIC TRIPWIRE ENGINE (SHARED BY INDICES & STOCKS)
 # ==============================================================================
 def compute_base_atr(m):
     if m is None or len(m) == 0:
@@ -716,10 +907,6 @@ def _ewm(x, alpha):
     return np.asarray(out)
 
 def _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts, sid):
-    """
-    Computes 1m kinetics using global period constants on gap-neutralized continuous
-    series so morning gaps do not distort bands AND 09:15 breakouts fire without warmup lag.
-    """
     n = len(close)
     delta = np.diff(close, prepend=close[0])
     delta = np.where(sess_starts, close - open_, delta)
@@ -756,8 +943,13 @@ def _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts, sid):
     dx = 100.0 * np.abs(plus_di - minus_di) / (plus_di + minus_di + EPSILON)
     adx = _ewm(dx, alpha_adx)
 
+    # Spot Index candles on Upstox report Volume == 0; synthesize range-expansion volume when needed
+    eff_vol = vol
+    if INDEX_SYNTHETIC_VOL_FALLBACK and float(np.sum(vol)) <= 0.0:
+        eff_vol = np.maximum(high - low, np.abs(delta)) + EPSILON
+
     direction = np.where(delta > 0, 1, np.where(delta < 0, -1, 0))
-    obv = np.cumsum(direction * vol)
+    obv = np.cumsum(direction * eff_vol)
 
     if ISOLATE_SESSION_BANDS:
         df = pd.DataFrame({
@@ -774,7 +966,6 @@ def _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts, sid):
         a_mean, a_std = grouped['adx'].transform(roll_mean).values, grouped['adx'].transform(roll_std).values
         o_mean, o_std = grouped['obv'].transform(roll_mean).values, grouped['obv'].transform(roll_std).values
     else:
-        # Continuous rolling stats across gap-neutralized indicator arrays (instant 09:15 readiness)
         rsi_s, hist_s = pd.Series(rsi), pd.Series(hist)
         pdi_s, mdi_s = pd.Series(plus_di), pd.Series(minus_di)
         adx_s, obv_s = pd.Series(adx), pd.Series(obv)
@@ -842,7 +1033,6 @@ def get_kinetics(kin_1m, idx):
     w_vo_max, w_vo_min = kin_1m['win_vo_max'][idx], kin_1m['win_vo_min'][idx]
     w_vp_max, w_vm_max, w_va_max = kin_1m['win_vp_max'][idx], kin_1m['win_vm_max'][idx], kin_1m['win_va_max'][idx]
 
-    # --- LOCK 2: Structure Breakout (Quorum of 4) ---
     b_struct_cnt = (
         int(h_std > 0 and hist > h_mean + IND_BB_PIERCE_STD * h_std) +
         int(o_std > 0 and obv > o_mean + IND_BB_PIERCE_STD * o_std) +
@@ -859,7 +1049,6 @@ def get_kinetics(kin_1m, idx):
     bull_struct = (b_struct_cnt >= STRUCT_QUORUM) and (p_di > m_di)
     bear_struct = (br_struct_cnt >= STRUCT_QUORUM) and (m_di > p_di)
 
-    # --- LOCK 3: Kinetic Shock (Quorum of 4 within Rolling Window) ---
     b_shock_cnt = (
         int(w_vh_max > KINETIC_SHOCK_ATR_MULT * ah) +
         int(w_vo_max > KINETIC_SHOCK_ATR_MULT * ao) +
@@ -876,7 +1065,6 @@ def get_kinetics(kin_1m, idx):
     bull_shock = (b_shock_cnt >= SHOCK_QUORUM) and (vh > SHOCK_FLOW_MIN_THRESHOLD or vo > SHOCK_FLOW_MIN_THRESHOLD)
     bear_shock = (br_shock_cnt >= SHOCK_QUORUM) and (vh < -SHOCK_FLOW_MIN_THRESHOLD or vo < -SHOCK_FLOW_MIN_THRESHOLD)
 
-    # --- GRANULAR OPPOSING SCORE (Parameterized) ---
     bull_score = (
         int(p_std > 0 and p_di > p_mean + OPPOSING_BB_STD_MULT * p_std) +
         int(vh > OPPOSING_VEL_ATR_MULT * ah) +
@@ -969,7 +1157,6 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
         while i < n:
             (bull_score, bear_score, r_bull, r_bear, bull_struct, bear_struct, bull_shock, bear_shock) = get_kinetics(kin_1m, i)
 
-            # --- LOCK 1: Price Volatility Expansion ---
             bb_kc_bull_fire = (bb_upper[i] > kc_upper[i]) or (close[i] > bb_upper[i] and close[i] > kc_upper[i])
             bb_kc_bear_fire = (bb_lower[i] < kc_lower[i]) or (close[i] < bb_lower[i] and close[i] < kc_lower[i])
 
@@ -1009,16 +1196,10 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
             curr_r = (close[j] - anchor['price']) / base_atr if is_bull else (anchor['price'] - close[j]) / base_atr
 
             reason = None
-
-            # 1. Unconditional Hard Stop Trailing Floor
             if hard_mult > 0 and hard_adverse >= hard_mult * base_atr:
                 reason = f"Hard stop ({hard_mult:g} ATR trailing floor)"
-
-            # 2. Profit Ratchet: Once up PROFIT_LOCK_TRIGGER_R, never drop below PROFIT_LOCK_FLOOR_R
             elif lock_trig_r > 0 and max_r >= lock_trig_r and curr_r <= lock_floor_r:
                 reason = f"Profit Lock (+{lock_trig_r:g}R Peak -> +{lock_floor_r:g}R Breakeven Floor)"
-
-            # 3. Soft Kinetic Stop (Active below SOFT_STOP_DISABLE_R)
             elif max_r < soft_disable_r and adverse >= soft_mult * base_atr and opposing >= opp_thresh:
                 reason = soft_reason
 
@@ -1049,7 +1230,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
     info['kills'] = kills
     return None, info
 
-def prepare_series(master, target_dt):
+def prepare_series(master, target_dt, is_sector_index=False):
     if master is None or master.empty:
         return None, "no_data"
     day_mask = (master['Datetime'].dt.date == target_dt).values
@@ -1068,13 +1249,13 @@ def prepare_series(master, target_dt):
     sess_starts[0] = True
     sess_starts[1:] = sid[1:] != sid[:-1]
 
-    # Precompute closing auction mask using global LAST_NEW_ANCHOR_MIN
     is_late_session = (master['Min'].values >= LAST_NEW_ANCHOR_MIN)
 
     base_atr_calc, atr_bars = compute_base_atr(master.iloc[:ts])
     if base_atr_calc is None or atr_bars < ATR_MIN_BARS:
         return None, "short_history"
-    base_atr = max(float(base_atr_calc), float(close[ts]) * float(MIN_ATR_PCT), float(ABSOLUTE_MIN_ATR))
+    atr_pct_floor = float(INDEX_MIN_ATR_PCT) if is_sector_index else float(MIN_ATR_PCT)
+    base_atr = max(float(base_atr_calc), float(close[ts]) * atr_pct_floor, float(ABSOLUTE_MIN_ATR))
 
     tr = np.maximum(
         high - low,
@@ -1090,7 +1271,6 @@ def prepare_series(master, target_dt):
         sma_kc = grouped_p['close'].transform(lambda x: x.rolling(PRICE_KC_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()).values
         atr_kc = grouped_p['tr'].transform(lambda x: x.rolling(PRICE_KC_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()).values
     else:
-        # Gap-Stitched Continuous Price Baseline: removes overnight jump while keeping 19 quiet prior-close bars at 09:15
         delta_p = np.diff(close, prepend=close[0])
         delta_p = np.where(sess_starts, close - open_, delta_p)
         stitched_close = np.cumsum(delta_p) + open_[0]
@@ -1113,7 +1293,7 @@ def prepare_series(master, target_dt):
         'kc_lower': sma_kc - PRICE_KC_ATR_MULT * atr_kc,
     }, None
 
-def row_at(S, end, symbol):
+def row_at(S, end, symbol, sector="", sector_weight=0.0, is_sector_index=False):
     ts = S['today_start']
     end = min(int(end), len(S['close']))
     if end <= ts:
@@ -1127,7 +1307,10 @@ def row_at(S, end, symbol):
         'Symbol': symbol, 'LTP': ltp, 'DayChangePct': ((ltp - ref) / ref) * 100.0 if ref else 0.0,
         'ActiveAnchor': None, 'AnchorPrice': 0.0, 'AnchorDir': "NONE", 'MovePct': 0.0,
         'State': "NONE", 'Blocks': 0, 'KilledTime': '-', 'KilledPrice': 0.0, 'RejectReason': "",
-        'Kills': [], 'AtrBars': S['atr_bars'], 'BaseAtr': base_atr, 'PriorStops': 0, 'BankedR': 0.0
+        'Kills': [], 'AtrBars': S['atr_bars'], 'BaseAtr': base_atr, 'PriorStops': 0, 'BankedR': 0.0,
+        'Sector': sector or DEFAULT_UNMAPPED_SECTOR,
+        'SectorWeight': float(sector_weight or 0.0),
+        'IsSectorIndex': bool(is_sector_index),
     }
 
     anchor, info = evaluate_anchor_tripwire(
@@ -1161,16 +1344,14 @@ def row_at(S, end, symbol):
         row['State'] = "[STOPPED]"
     return row
 
-def compute_row(symbol, master_1m, target_dt):
-    S, _ = prepare_series(master_1m, target_dt)
-    return None if S is None else row_at(S, len(master_1m), symbol)
-
 # ==============================================================================
-# 3. WORKERS, FORMATTERS & MULTI-EPISODE MERGE LOGIC
+# 3. WORKERS, SEGREGATION & MULTI-EPISODE MERGE LOGIC
 # ==============================================================================
 def _history_worker_daily(args):
     item, start, end, progress = args
     try:
+        if item.get("pinned") or item.get("is_sector_index"):
+            return item
         frames = []
         for c_start, c_end in _date_chunks(start, end + timedelta(days=1), span=CHUNK_SPAN_DAILY_DAYS):
             status, df = _candles(_url_range_daily(item['key'], c_start, c_end))
@@ -1193,6 +1374,9 @@ def _history_worker_daily(args):
 def process_stock_checkpoints(args):
     item, checkpoints, use_intraday, history_days, mode, progress = args
     sym = item['symbol']
+    is_sec_idx = bool(item.get('is_sector_index', False))
+    sec_name = item.get('sector', DEFAULT_UNMAPPED_SECTOR)
+    sec_wt = float(item.get('sector_weight', 0.0))
     try:
         final_cutoff = checkpoints[-1]
         target_dt = final_cutoff.date()
@@ -1210,20 +1394,20 @@ def process_stock_checkpoints(args):
 
         master = prepare_master(frames)
         master = master[master['Datetime'] < final_cutoff].reset_index(drop=True)
-        if mode == "INDEX_OPTIONS":
+        if mode == "INDEX_OPTIONS" and not is_sec_idx:
             day = master[master['Datetime'].dt.date == target_dt]
             if day.empty:
                 return [(cp, "no_data", sym) for cp in checkpoints]
             if day['Close'].iloc[-1] < OPT_MIN_PRICE or day['Volume'].sum() < OPT_MIN_VOLUME:
                 return [(cp, "illiquid", sym) for cp in checkpoints]
 
-        S, why = prepare_series(master, target_dt)
+        S, why = prepare_series(master, target_dt, is_sector_index=is_sec_idx)
         if S is None:
             return [(cp, why, sym) for cp in checkpoints]
         ends = np.searchsorted(S['dt'], np.array(checkpoints, dtype='datetime64[ns]'), side='left')
         out = []
         for cp, end in zip(checkpoints, ends):
-            row = row_at(S, int(end), sym)
+            row = row_at(S, int(end), sym, sector=sec_name, sector_weight=sec_wt, is_sector_index=is_sec_idx)
             if row is None:
                 out.append((cp, "no_data", sym))
             else:
@@ -1268,7 +1452,6 @@ def _r_multiple(row, include_banked=False):
     return live_r + float(row.get('BankedR', 0.0) or 0.0) if include_banked else live_r
 
 def _rank_r_score(row):
-    """Ranks setups by the stronger of Live R or Cumulative Session R so an earlier stop never buries a big live winner."""
     live_r = _r_multiple(row, include_banked=False)
     cum_r = _r_multiple(row, include_banked=True)
     return max(live_r, cum_r)
@@ -1324,6 +1507,79 @@ def merge_symbol_rows(rows):
         grave_episodes.append(grave)
     return active_merged.get("BULL"), active_merged.get("BEAR"), grave_episodes
 
+def segregate_and_rank_buckets(by_symbol_map):
+    """
+    Runs the identical strict segregation & ranking pipeline on any symbol map
+    (used for both the Sectoral Indices and the Stocks).
+    Returns (surviving_bulls, surviving_bears, dedup_grave).
+    """
+    bulls_live, bears_live, graveyard_candidates = [], [], []
+
+    for symbol, rows in by_symbol_map.items():
+        b, r_, grave_list = merge_symbol_rows(rows)
+        is_pe = " PE " in symbol or symbol.endswith("PE")
+
+        def _apply_dir(item, raw_dir):
+            item['PremiumDir'] = raw_dir
+            item['AnchorDir'] = "BEAR" if (raw_dir == "BULL" and is_pe) else ("BULL" if (raw_dir == "BEAR" and is_pe) else raw_dir)
+
+        for item, raw_dir in ((b, "BULL"), (r_, "BEAR")):
+            if not item:
+                continue
+            _apply_dir(item, raw_dir)
+            if item['State'] == "[STOPPED]" or "[STOP" in str(item.get('State', '')):
+                graveyard_candidates.append(item)
+            else:
+                (bulls_live if item['AnchorDir'] == "BULL" else bears_live).append(item)
+
+        for g_item in (grave_list or []):
+            if g_item.get('AnchorDir', 'NONE') in ("BULL", "BEAR"):
+                _apply_dir(g_item, g_item.get('AnchorDir'))
+            graveyard_candidates.append(g_item)
+
+    drift_floor = (
+        float(ADVERSE_DRIFT_R_FLOOR)
+        if ADVERSE_DRIFT_R_FLOOR is not None
+        else -abs(float(HARD_STOP_ATR_MULT or 1.2) * float(ADVERSE_DRIFT_STOP_RATIO))
+    )
+
+    surviving_bulls = [r for r in bulls_live if _r_multiple(r) > drift_floor or _r_multiple(r, include_banked=True) > BANKED_R_PROTECTION_FLOOR]
+    surviving_bears = [r for r in bears_live if _r_multiple(r) > drift_floor or _r_multiple(r, include_banked=True) > BANKED_R_PROTECTION_FLOOR]
+    for r in bulls_live:
+        if r not in surviving_bulls:
+            r['RejectReason'] = f"Adverse Drift (Losing R-Multiple < {drift_floor:g}R)"
+            graveyard_candidates.append(r)
+    for r in bears_live:
+        if r not in surviving_bears:
+            r['RejectReason'] = f"Adverse Drift (Losing R-Multiple < {drift_floor:g}R)"
+            graveyard_candidates.append(r)
+
+    first_grid_key = GRID_MULTIPLIERS[0] if GRID_MULTIPLIERS else 1
+    def state_rank(st):
+        return 0 if "[ BB > KC ]" in st else 1 if "[ BB < KC ]" in st else 2
+
+    surviving_bulls.sort(key=lambda r: (
+        -_rank_r_score(r), -_r_multiple(r), state_rank(r['State']),
+        -r.get('ATR_Grid', {}).get(first_grid_key, 0), -r.get('BB_Grid', {}).get(first_grid_key, 0), -int(r['CheckpointTime'].timestamp())
+    ))
+    surviving_bears.sort(key=lambda r: (
+        -_rank_r_score(r), -_r_multiple(r), state_rank(r['State']),
+        -r.get('ATR_Grid', {}).get(first_grid_key, 0), -r.get('BB_Grid', {}).get(first_grid_key, 0), -int(r['CheckpointTime'].timestamp())
+    ))
+
+    def sort_reason(r):
+        return 0 if any(x in str(r.get('RejectReason', '')) for x in ["Hard stop", "Profit Lock", "Kinetic SL", "Superseded"]) else 1 if "Adverse" in str(r.get('RejectReason', '')) else 2 if "Warzone" in str(r.get('RejectReason', '')) else 3
+    graveyard_candidates.sort(key=lambda x: (sort_reason(x), -_r_multiple(x) if _r_multiple(x) != 0 else -abs(x.get('DayChangePct', 0.0))))
+
+    dedup_grave, seen_grave = [], set()
+    for row in graveyard_candidates:
+        gid = (row['Symbol'], row.get('ActiveAnchor', '-'), row.get('KilledTime', '-'))
+        if gid not in seen_grave:
+            seen_grave.add(gid)
+            dedup_grave.append(row)
+
+    return surviving_bulls, surviving_bears, dedup_grave
+
 def _state_display(row):
     return f"[STOP {row.get('KilledTime')}]" if row['State'] == "[STOPPED]" and row.get('KilledTime') and row.get('KilledTime') != '-' else row['State']
 
@@ -1333,6 +1589,413 @@ def _fav_color(pct, direction):
 
 def _format_val(v, dir_color):
     return f"{dir_color}{v}{COLOR_RESET}" if v > 0 else f"{COLOR_DIM}{v}{COLOR_RESET}"
+
+# ==============================================================================
+# 4. TERMINAL RENDERERS & SELF-CONTAINED CLICKABLE HTML DASHBOARD
+# ==============================================================================
+def render_console_dashboard(
+    mode, cutoff_dt, checkpoints,
+    idx_bulls, idx_bears, idx_grave,
+    stock_bulls, stock_bears, stock_grave,
+    active_sector_filter=None
+):
+    norm_filter = _norm_sym(active_sector_filter) if active_sector_filter else ""
+
+    if norm_filter:
+        f_stock_bulls = [r for r in stock_bulls if _norm_sym(r.get('Sector', '')) == norm_filter or norm_filter in _norm_sym(r.get('Sector', ''))]
+        f_stock_bears = [r for r in stock_bears if _norm_sym(r.get('Sector', '')) == norm_filter or norm_filter in _norm_sym(r.get('Sector', ''))]
+        f_stock_grave = [r for r in stock_grave if _norm_sym(r.get('Sector', '')) == norm_filter or norm_filter in _norm_sym(r.get('Sector', ''))]
+        filter_banner = f" [ACTIVE SECTOR FILTER: {active_sector_filter.upper()} — Click/Type CLEAR to Show All]"
+    else:
+        f_stock_bulls = stock_bulls[:TOP_N_BUYERS]
+        f_stock_bears = stock_bears[:TOP_N_SELLERS]
+        f_stock_grave = stock_grave if TOP_N_GRAVEYARD <= 0 else stock_grave[:TOP_N_GRAVEYARD]
+        filter_banner = " [DEFAULT VIEW: SHOWING ALL INDICES & ALL STOCKS]"
+
+    all_shown = idx_bulls + idx_bears + idx_grave + f_stock_bulls + f_stock_bears + f_stock_grave
+    sym_w = max(MIN_SYMBOL_WIDTH, min(MAX_SYMBOL_WIDTH, max((len(r['Symbol']) for r in all_shown), default=MIN_SYMBOL_WIDTH)))
+    sec_w = SECTOR_COL_WIDTH
+
+    print(f"\n{COLOR_BOLD}=== STATEFUL INSTITUTIONAL VOLATILITY TRACKER [{mode}]{filter_banner} ==={COLOR_RESET}")
+    print(
+        f"Target Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Checkpoints: {len(checkpoints)} | "
+        f"Sectoral Indices (Bull: {len(idx_bulls)}, Bear: {len(idx_bears)}, Grave: {len(idx_grave)}) | "
+        f"Stocks Shown (Bull: {len(f_stock_bulls)}, Bear: {len(f_stock_bears)}, Grave: {len(f_stock_grave)})\n"
+    )
+
+    def print_active_table(title, icon, data_list, show_sector_col=True):
+        if not data_list:
+            return
+        print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
+        grid_hdr = " ".join(f"{m}X" for m in GRID_MULTIPLIERS)
+        sec_hdr = f"{'Sector (MaxWt%)':<{sec_w}} | " if show_sector_col else ""
+        header_str = (
+            f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP/Exit':>9} | "
+            f"{sec_hdr}"
+            f"{'Seen':^5} {'Anchor':^7} {'Anch Val':>9} {'R-Mult (Bank)':>15} | "
+            f"ATR: {grid_hdr} | BB: {grid_hdr} | {'State':^13}{COLOR_RESET}"
+        )
+        print(header_str)
+        print("-" * len(ANSI_RE.sub("", header_str)))
+        basket_dir = "BULL" if "BULL" in title else "BEAR"
+        default_g = {m: 0 for m in GRID_MULTIPLIERS}
+
+        for row in data_list:
+            live_r, banked_r = _r_multiple(row, include_banked=False), float(row.get('BankedR', 0.0) or 0.0)
+            rank_r = _rank_r_score(row)
+            r_color = COLOR_GREEN_FG if rank_r > 0 else COLOR_RED_FG if rank_r < 0 else COLOR_DIM
+            if row.get('PriorStops', 0) > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON:
+                r_mult_str, anchor_disp = f"{live_r:>+5.2f}R ({banked_r:>+4.1f}R)", f"{row['ActiveAnchor']}*"
+            else:
+                r_mult_str, anchor_disp = f"{live_r:>+5.2f}R        ", f"{row['ActiveAnchor']} "
+            dir_c = COLOR_GREEN_FG if basket_dir == "BULL" else COLOR_RED_FG
+            ag, bg = row.get('ATR_Grid', default_g), row.get('BB_Grid', default_g)
+            a_str = "  ".join(_format_val(ag.get(k, 0), dir_c) for k in GRID_MULTIPLIERS)
+            b_str = "  ".join(_format_val(bg.get(k, 0), dir_c) for k in GRID_MULTIPLIERS)
+            shown_state = _state_display(row)
+            if "[ BB > KC ]" in row['State']:
+                dir_tag = "▲" if basket_dir == "BULL" else "▼"
+                state_text = f"{COLOR_GREEN_FG if dir_tag == '▲' else COLOR_RED_FG}{f'[ BB > KC ] {dir_tag}'.strip():^13}{COLOR_RESET}"
+            else:
+                state_text = f"{COLOR_YELLOW if '[ BB < KC ]' in row['State'] else COLOR_DIM}{shown_state:^13}{COLOR_RESET}"
+            ltp_val = f"{row['KilledPrice']:>8.2f}x" if "[STOP" in shown_state and row.get('KilledPrice', 0) > 0 else f"{row['LTP']:>9.2f} "
+            sec_label = f"{row.get('Sector', DEFAULT_UNMAPPED_SECTOR)}"
+            sec_cell = f"{_clip(sec_label, sec_w):<{sec_w}} | " if show_sector_col else ""
+            print(
+                f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} {ltp_val} | "
+                f"{sec_cell}"
+                f"{row['CheckpointTime'].strftime('%H:%M'):^5} {anchor_disp:^7} {row['AnchorPrice']:>9.2f} "
+                f"{r_color}{r_mult_str:>15}{COLOR_RESET} |   {a_str}  |   {b_str}  | {state_text}"
+            )
+
+    def print_grave_table(title, icon, data_list, show_sector_col=True):
+        if not data_list:
+            return
+        print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
+        sec_hdr = f"{'Sector':<{sec_w}} | " if show_sector_col else ""
+        header_str = (
+            f" {COLOR_CYAN}{'Script':<{sym_w}} | {sec_hdr}{'Signal':^6} {'Anchor':^6} {'Anch Val':>9} "
+            f"{'Killed':^6} {'Kill Val':>9} {'LTP':>9} {'R-Mult':>7} {'Move%':>7} | "
+            f"{'Forensic Rejection / Exit Reason'}{COLOR_RESET}"
+        )
+        print(header_str)
+        print("-" * len(ANSI_RE.sub("", header_str)))
+        for row in data_list:
+            sig = row.get('AnchorDir', 'NONE')
+            sig_colored = f"{COLOR_GREEN_FG}BULL{COLOR_RESET}  " if sig == "BULL" else f"{COLOR_RED_FG}BEAR{COLOR_RESET}  " if sig == "BEAR" else f"{COLOR_DIM}NONE{COLOR_RESET}  "
+            a_time, a_price = row['ActiveAnchor'] if row['ActiveAnchor'] else '-', f"{row['AnchorPrice']:>9.2f}" if row['AnchorPrice'] > 0 else f"{'-':>9}"
+            k_time, k_price = row['KilledTime'] if row['KilledTime'] else '-', f"{row['KilledPrice']:>9.2f}" if row['KilledPrice'] > 0 else f"{'-':>9}"
+            if row['AnchorPrice'] > 0 and (row['KilledPrice'] > 0 or row['LTP'] > 0):
+                g_r = _r_multiple(row, include_banked=False)
+                g_r_str, g_r_color = f"{g_r:>+6.2f}R", COLOR_GREEN_FG if g_r > 0 else COLOR_RED_FG if g_r < 0 else COLOR_DIM
+                move_pct_str, move_color = f"{row['MovePct']:>+6.2f}%", _fav_color(row['MovePct'], row.get('PremiumDir', sig))
+            else:
+                g_r_str, g_r_color, move_pct_str, move_color = f"{'-':>7}", COLOR_DIM, f"{'-':>7}", COLOR_DIM
+            reason = row['RejectReason']
+            reason_color = COLOR_YELLOW if any(x in reason for x in ["Kinetic SL", "Hard stop", "Adverse", "Profit Lock", "Superseded"]) else COLOR_RED_FG if any(x in reason for x in ["Chop", "Warzone"]) else COLOR_DIM
+            sec_cell = f"{_clip(row.get('Sector', DEFAULT_UNMAPPED_SECTOR), sec_w):<{sec_w}} | " if show_sector_col else ""
+            print(
+                f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} | {sec_cell}{sig_colored} "
+                f"{a_time:^6} {a_price} {k_time:^6} {k_price} {row['LTP']:>9.2f} "
+                f"{g_r_color}{g_r_str}{COLOR_RESET} {move_color}{move_pct_str}{COLOR_RESET} | {reason_color}{reason}{COLOR_RESET}"
+            )
+
+    # --- 1. DISPLAY SECTORAL INDICES FIRST (TOP BULLS, TOP BEARS, GRAVEYARD) ---
+    if idx_bulls or idx_bears or idx_grave:
+        print(f"{COLOR_CYAN}{'=' * 95}{COLOR_RESET}")
+        print(f"{COLOR_BOLD}🏛️  STAGE 1: SECTORAL INDICES (Click any Index in HTML Dashboard to filter Stocks below){COLOR_RESET}")
+        print(f"{COLOR_CYAN}{'=' * 95}{COLOR_RESET}")
+        print_active_table("SECTORAL INDICES — TOP BULL SETUPS (Valid Anchors Surviving)", "🏛️🔥", idx_bulls, show_sector_col=False)
+        print_active_table("SECTORAL INDICES — TOP BEAR SETUPS (Valid Anchors Surviving)", "🏛️🩸", idx_bears, show_sector_col=False)
+        print_grave_table("SECTORAL INDICES — THE GRAVEYARD (Completed / Filtered / Rejected)", "🏛️🚫", idx_grave, show_sector_col=False)
+
+    # --- 2. DISPLAY F&O / EQUITY STOCKS SECOND (TOP BULLS, TOP BEARS, GRAVEYARD) ---
+    print(f"\n{COLOR_CYAN}{'=' * 95}{COLOR_RESET}")
+    stage2_label = f"STAGE 2: STOCKS FOR SECTOR [{active_sector_filter.upper()}]" if norm_filter else "STAGE 2: ALL STOCKS (Mapped by Highest Sectoral Index Weightage)"
+    print(f"{COLOR_BOLD}📈  {stage2_label}{COLOR_RESET}")
+    print(f"{COLOR_CYAN}{'=' * 95}{COLOR_RESET}")
+    print_active_table("STOCKS — TOP BULL SETUPS (Valid Anchors Surviving)", "🔥", f_stock_bulls, show_sector_col=True)
+    print_active_table("STOCKS — TOP BEAR SETUPS (Valid Anchors Surviving)", "🩸", f_stock_bears, show_sector_col=True)
+    if not f_stock_bulls and not f_stock_bears:
+        print(f"{COLOR_YELLOW}No surviving stock anchors for this view.{COLOR_RESET}")
+    print_grave_table("STOCKS — THE GRAVEYARD (Completed Episodes / Filtered / Rejected)", "🚫", f_stock_grave, show_sector_col=True)
+
+def generate_interactive_html_dashboard(
+    out_path, mode, cutoff_dt, checkpoints,
+    idx_bulls, idx_bears, idx_grave,
+    stock_bulls, stock_bears, stock_grave
+):
+    """
+    Writes a zero-dependency, clickable HTML dashboard (`system3_dashboard.html`):
+    - Displays Sectoral Indices (Top Bulls, Top Bears, Graveyard) at the top.
+    - Displays Stocks (Top Bulls, Top Bears, Graveyard) below.
+    - Default view shows ALL indices and ALL stocks.
+    - Clicking ANY Sectoral Index row or pill filters Stock Top Bulls, Top Bears, and Graveyard to that index.
+    - Clicking "CLEAR FILTER (SHOW ALL)" restores all indices and stocks.
+    """
+    if not out_path:
+        return
+
+    def _serialize_active_row(r, basket_dir):
+        live_r = _r_multiple(r, include_banked=False)
+        banked_r = float(r.get('BankedR', 0.0) or 0.0)
+        has_bank = r.get('PriorStops', 0) > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON
+        r_str = f"{live_r:+.2f}R ({banked_r:+.1f}R)" if has_bank else f"{live_r:+.2f}R"
+        anchor_str = f"{r.get('ActiveAnchor', '-')}*" if has_bank else f"{r.get('ActiveAnchor', '-')}"
+        default_g = {m: 0 for m in GRID_MULTIPLIERS}
+        ag, bg = r.get('ATR_Grid', default_g), r.get('BB_Grid', default_g)
+        atr_s = " ".join(str(ag.get(k, 0)) for k in GRID_MULTIPLIERS)
+        bb_s = " ".join(str(bg.get(k, 0)) for k in GRID_MULTIPLIERS)
+        st = _state_display(r)
+        if "[ BB > KC ]" in r['State']:
+            st = f"[ BB > KC ] {'▲' if basket_dir == 'BULL' else '▼'}"
+        return {
+            "symbol": r['Symbol'],
+            "sector": r.get('Sector', DEFAULT_UNMAPPED_SECTOR),
+            "weight": f"{float(r.get('SectorWeight', 0.0)):.2f}%",
+            "ltp": f"{r['LTP']:.2f}",
+            "seen": r['CheckpointTime'].strftime('%H:%M'),
+            "anchor": anchor_str,
+            "anchor_val": f"{r['AnchorPrice']:.2f}",
+            "r_str": r_str,
+            "r_pos": _rank_r_score(r) >= 0,
+            "atr_grid": atr_s,
+            "bb_grid": bb_s,
+            "state": st,
+        }
+
+    def _serialize_grave_row(r):
+        g_r = _r_multiple(r, include_banked=False) if r['AnchorPrice'] > 0 else 0.0
+        return {
+            "symbol": r['Symbol'],
+            "sector": r.get('Sector', DEFAULT_UNMAPPED_SECTOR),
+            "weight": f"{float(r.get('SectorWeight', 0.0)):.2f}%",
+            "sig": r.get('AnchorDir', 'NONE'),
+            "anchor": r.get('ActiveAnchor') or '-',
+            "anchor_val": f"{r['AnchorPrice']:.2f}" if r['AnchorPrice'] > 0 else '-',
+            "killed": r.get('KilledTime') or '-',
+            "killed_val": f"{r['KilledPrice']:.2f}" if r['KilledPrice'] > 0 else '-',
+            "ltp": f"{r['LTP']:.2f}",
+            "r_str": f"{g_r:+.2f}R" if r['AnchorPrice'] > 0 else '-',
+            "r_pos": g_r >= 0,
+            "move_str": f"{r['MovePct']:+.2f}%" if r['AnchorPrice'] > 0 else '-',
+            "reason": r.get('RejectReason', ''),
+        }
+
+    all_sectors = sorted(SECTORAL_INDEX_CONFIG.keys())
+
+    def _build_active_rows_html(rows_data, is_index=False):
+        out_html = []
+        for d in rows_data:
+            sec_attr = html.escape(d["symbol"] if is_index else d["sector"])
+            click_attr = f'onclick="filterBySector(\'{sec_attr}\')" class="clickable-index-row" title="Click to filter stocks in {sec_attr}"' if is_index else f'data-sector="{sec_attr}"'
+            sec_td = "" if is_index else f'<td class="sec-badge">{html.escape(d["sector"])} <span class="wt">({d["weight"]})</span></td>'
+            r_cls = "pos" if d["r_pos"] else "neg"
+            out_html.append(
+                f'<tr {click_attr} data-sector="{sec_attr}">'
+                f'<td class="sym">{html.escape(d["symbol"])}</td>'
+                f'<td class="num">{d["ltp"]}</td>'
+                f'{sec_td}'
+                f'<td class="center">{d["seen"]}</td>'
+                f'<td class="center">{html.escape(d["anchor"])}</td>'
+                f'<td class="num">{d["anchor_val"]}</td>'
+                f'<td class="num {r_cls}">{html.escape(d["r_str"])}</td>'
+                f'<td class="center mono">{d["atr_grid"]}</td>'
+                f'<td class="center mono">{d["bb_grid"]}</td>'
+                f'<td class="center state">{html.escape(d["state"])}</td>'
+                f'</tr>'
+            )
+        return "\n".join(out_html)
+
+    def _build_grave_rows_html(rows_data, is_index=False):
+        out_html = []
+        for d in rows_data:
+            sec_attr = html.escape(d["symbol"] if is_index else d["sector"])
+            click_attr = f'onclick="filterBySector(\'{sec_attr}\')" class="clickable-index-row" title="Click to filter stocks in {sec_attr}"' if is_index else f'data-sector="{sec_attr}"'
+            sec_td = "" if is_index else f'<td class="sec-badge">{html.escape(d["sector"])} <span class="wt">({d["weight"]})</span></td>'
+            sig_cls = "pos" if d["sig"] == "BULL" else "neg" if d["sig"] == "BEAR" else "dim"
+            r_cls = "pos" if d["r_pos"] else "neg"
+            out_html.append(
+                f'<tr {click_attr} data-sector="{sec_attr}">'
+                f'<td class="sym">{html.escape(d["symbol"])}</td>'
+                f'{sec_td}'
+                f'<td class="center {sig_cls}">{html.escape(d["sig"])}</td>'
+                f'<td class="center">{html.escape(d["anchor"])}</td>'
+                f'<td class="num">{d["anchor_val"]}</td>'
+                f'<td class="center">{html.escape(d["killed"])}</td>'
+                f'<td class="num">{d["killed_val"]}</td>'
+                f'<td class="num">{d["ltp"]}</td>'
+                f'<td class="num {r_cls}">{html.escape(d["r_str"])}</td>'
+                f'<td class="num">{html.escape(d["move_str"])}</td>'
+                f'<td class="reason">{html.escape(d["reason"])}</td>'
+                f'</tr>'
+            )
+        return "\n".join(out_html)
+
+    pills_html = "\n".join(
+        f'<button class="sec-pill" data-sec="{html.escape(s)}" onclick="filterBySector(\'{html.escape(s)}\')">{html.escape(s)}</button>'
+        for s in all_sectors
+    )
+
+    html_doc = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>System 3.0 Institutional Volatility Tracker — Sectoral & Stock Dashboard</title>
+<style>
+  body {{ background:#0b0f19; color:#e2e8f0; font-family:'JetBrains Mono',Consolas,monospace; margin:0; padding:20px; font-size:13px; }}
+  h1, h2, h3 {{ margin:0 0 10px 0; }}
+  .top-bar {{ position:sticky; top:0; z-index:100; background:#111827; border:1px solid #334155; border-radius:8px; padding:14px 18px; margin-bottom:20px; box-shadow:0 8px 24px rgba(0,0,0,0.5); }}
+  .status-line {{ display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px; margin-bottom:10px; }}
+  .badge-active {{ background:#1e293b; border:1px solid #38bdf8; color:#38bdf8; padding:6px 12px; border-radius:6px; font-weight:bold; }}
+  .btn-clear {{ background:#ef4444; color:#fff; border:none; padding:8px 16px; border-radius:6px; font-weight:bold; cursor:pointer; font-family:inherit; }}
+  .btn-clear:hover {{ background:#dc2626; }}
+  .pill-bar {{ display:flex; flex-wrap:wrap; gap:6px; }}
+  .sec-pill {{ background:#1e293b; color:#cbd5e1; border:1px solid #475569; padding:5px 10px; border-radius:5px; cursor:pointer; font-family:inherit; font-size:12px; }}
+  .sec-pill:hover, .sec-pill.active {{ background:#0284c7; color:#fff; border-color:#38bdf8; }}
+  .stage-box {{ border:1px solid #1e293b; background:#0f172a; border-radius:8px; padding:16px; margin-bottom:24px; }}
+  .stage-title {{ color:#38bdf8; font-size:16px; border-bottom:1px solid #334155; padding-bottom:8px; margin-bottom:14px; }}
+  table {{ width:100%; border-collapse:collapse; margin-bottom:18px; }}
+  th {{ background:#1e293b; color:#38bdf8; text-align:left; padding:8px; border-bottom:1px solid #334155; }}
+  td {{ padding:7px 8px; border-bottom:1px solid #1e293b; }}
+  tr:hover {{ background:#1e293b; }}
+  .clickable-index-row {{ cursor:pointer; }}
+  .clickable-index-row:hover {{ background:#172554 !important; outline:1px solid #38bdf8; }}
+  .clickable-index-row.selected-index {{ background:#1e3a8a !important; outline:2px solid #38bdf8; }}
+  .sym {{ font-weight:bold; color:#f8fafc; }}
+  .num {{ text-align:right; }}
+  .center {{ text-align:center; }}
+  .pos {{ color:#4ade80; font-weight:bold; }}
+  .neg {{ color:#f87171; font-weight:bold; }}
+  .dim {{ color:#64748b; }}
+  .sec-badge {{ color:#fde047; }}
+  .wt {{ color:#94a3b8; font-size:11px; }}
+  .reason {{ color:#fbbf24; }}
+</style>
+</head>
+<body>
+
+<div class="top-bar">
+  <div class="status-line">
+    <div>
+      <strong>📡 SYSTEM 3.0 INSTITUTIONAL VOLATILITY TRACKER [{html.escape(mode)}]</strong>
+      <span style="color:#94a3b8; margin-left:12px;">Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Checkpoints: {len(checkpoints)}</span>
+    </div>
+    <div style="display:flex; align-items:center; gap:12px;">
+      <span id="filterStatusBadge" class="badge-active">DEFAULT VIEW: ALL INDICES &amp; ALL STOCKS</span>
+      <button class="btn-clear" onclick="clearSectorFilter()">CLEAR FILTER (SHOW ALL)</button>
+    </div>
+  </div>
+  <div class="pill-bar">
+    <span style="color:#94a3b8; align-self:center; margin-right:4px;">Click Index to Filter Stocks:</span>
+    {pills_html}
+  </div>
+</div>
+
+<div class="stage-box">
+  <div class="stage-title">🏛️ STAGE 1: SECTORAL INDICES (Click Any Index Row Below to Filter Stock Tables)</div>
+
+  <h3>🏛️🔥 SECTORAL INDICES — TOP BULL SETUPS (<span id="idxBullCnt">{len(idx_bulls)}</span>)</h3>
+  <table id="idxBullTable">
+    <thead><tr><th>Sectoral Index</th><th class="num">LTP/Exit</th><th class="center">Seen</th><th class="center">Anchor</th><th class="num">Anch Val</th><th class="num">R-Mult (Bank)</th><th class="center">ATR Grid</th><th class="center">BB Grid</th><th class="center">State</th></tr></thead>
+    <tbody>{_build_active_rows_html([_serialize_active_row(r, "BULL") for r in idx_bulls], is_index=True)}</tbody>
+  </table>
+
+  <h3>🏛️🩸 SECTORAL INDICES — TOP BEAR SETUPS (<span id="idxBearCnt">{len(idx_bears)}</span>)</h3>
+  <table id="idxBearTable">
+    <thead><tr><th>Sectoral Index</th><th class="num">LTP/Exit</th><th class="center">Seen</th><th class="center">Anchor</th><th class="num">Anch Val</th><th class="num">R-Mult (Bank)</th><th class="center">ATR Grid</th><th class="center">BB Grid</th><th class="center">State</th></tr></thead>
+    <tbody>{_build_active_rows_html([_serialize_active_row(r, "BEAR") for r in idx_bears], is_index=True)}</tbody>
+  </table>
+
+  <h3>🏛️🚫 SECTORAL INDICES — THE GRAVEYARD (<span id="idxGraveCnt">{len(idx_grave)}</span>)</h3>
+  <table id="idxGraveTable">
+    <thead><tr><th>Sectoral Index</th><th class="center">Signal</th><th class="center">Anchor</th><th class="num">Anch Val</th><th class="center">Killed</th><th class="num">Kill Val</th><th class="num">LTP</th><th class="num">R-Mult</th><th class="num">Move%</th><th>Forensic Exit / Rejection Reason</th></tr></thead>
+    <tbody>{_build_grave_rows_html([_serialize_grave_row(r) for r in idx_grave], is_index=True)}</tbody>
+  </table>
+</div>
+
+<div class="stage-box">
+  <div class="stage-title" id="stockStageTitle">📈 STAGE 2: ALL F&amp;O STOCKS (Assigned by Highest Sectoral Weightage %)</div>
+
+  <h3>🔥 STOCKS — TOP BULL SETUPS (<span id="stkBullCnt">{len(stock_bulls)}</span>)</h3>
+  <table id="stkBullTable">
+    <thead><tr><th>Script</th><th class="num">LTP/Exit</th><th>Primary Sector (Max Wt%)</th><th class="center">Seen</th><th class="center">Anchor</th><th class="num">Anch Val</th><th class="num">R-Mult (Bank)</th><th class="center">ATR Grid</th><th class="center">BB Grid</th><th class="center">State</th></tr></thead>
+    <tbody>{_build_active_rows_html([_serialize_active_row(r, "BULL") for r in stock_bulls], is_index=False)}</tbody>
+  </table>
+
+  <h3>🩸 STOCKS — TOP BEAR SETUPS (<span id="stkBearCnt">{len(stock_bears)}</span>)</h3>
+  <table id="stkBearTable">
+    <thead><tr><th>Script</th><th class="num">LTP/Exit</th><th>Primary Sector (Max Wt%)</th><th class="center">Seen</th><th class="center">Anchor</th><th class="num">Anch Val</th><th class="num">R-Mult (Bank)</th><th class="center">ATR Grid</th><th class="center">BB Grid</th><th class="center">State</th></tr></thead>
+    <tbody>{_build_active_rows_html([_serialize_active_row(r, "BEAR") for r in stock_bears], is_index=False)}</tbody>
+  </table>
+
+  <h3>🚫 STOCKS — THE GRAVEYARD (<span id="stkGraveCnt">{len(stock_grave)}</span>)</h3>
+  <table id="stkGraveTable">
+    <thead><tr><th>Script</th><th>Primary Sector (Max Wt%)</th><th class="center">Signal</th><th class="center">Anchor</th><th class="num">Anch Val</th><th class="center">Killed</th><th class="num">Kill Val</th><th class="num">LTP</th><th class="num">R-Mult</th><th class="num">Move%</th><th>Forensic Exit / Rejection Reason</th></tr></thead>
+    <tbody>{_build_grave_rows_html([_serialize_grave_row(r) for r in stock_grave], is_index=False)}</tbody>
+  </table>
+</div>
+
+<script>
+function filterBySector(sectorName) {{
+  const tables = [
+    {{ id: 'stkBullTable', cntId: 'stkBullCnt' }},
+    {{ id: 'stkBearTable', cntId: 'stkBearCnt' }},
+    {{ id: 'stkGraveTable', cntId: 'stkGraveCnt' }}
+  ];
+  tables.forEach(t => {{
+    const rows = document.querySelectorAll('#' + t.id + ' tbody tr');
+    let visible = 0;
+    rows.forEach(r => {{
+      if (r.getAttribute('data-sector') === sectorName) {{
+        r.style.display = '';
+        visible++;
+      }} else {{
+        r.style.display = 'none';
+      }}
+    }});
+    document.getElementById(t.cntId).textContent = visible;
+  }});
+
+  document.querySelectorAll('.clickable-index-row').forEach(r => {{
+    r.classList.toggle('selected-index', r.getAttribute('data-sector') === sectorName);
+  }});
+  document.querySelectorAll('.sec-pill').forEach(p => {{
+    p.classList.toggle('active', p.getAttribute('data-sec') === sectorName);
+  }});
+
+  document.getElementById('filterStatusBadge').textContent = 'FILTERED BY INDEX: ' + sectorName;
+  document.getElementById('stockStageTitle').textContent = '📈 STAGE 2: STOCKS BELONGING TO [' + sectorName + '] (Highest Weightage Winner)';
+}}
+
+function clearSectorFilter() {{
+  const tables = [
+    {{ id: 'stkBullTable', cntId: 'stkBullCnt' }},
+    {{ id: 'stkBearTable', cntId: 'stkBearCnt' }},
+    {{ id: 'stkGraveTable', cntId: 'stkGraveCnt' }}
+  ];
+  tables.forEach(t => {{
+    const rows = document.querySelectorAll('#' + t.id + ' tbody tr');
+    rows.forEach(r => {{ r.style.display = ''; }});
+    document.getElementById(t.cntId).textContent = rows.length;
+  }});
+
+  document.querySelectorAll('.clickable-index-row').forEach(r => r.classList.remove('selected-index'));
+  document.querySelectorAll('.sec-pill').forEach(p => p.classList.remove('active'));
+
+  document.getElementById('filterStatusBadge').textContent = 'DEFAULT VIEW: ALL INDICES & ALL STOCKS';
+  document.getElementById('stockStageTitle').textContent = '📈 STAGE 2: ALL F&O STOCKS (Assigned by Highest Sectoral Weightage %)';
+}}
+</script>
+</body>
+</html>"""
+
+    try:
+        with open(out_path, "w", encoding="utf-8") as f:
+            f.write(html_doc)
+        print(f"   {COLOR_GREEN_FG}» Interactive Click-to-Filter HTML Dashboard saved to: {out_path}{COLOR_RESET}")
+    except Exception as e:
+        print(f"   {COLOR_YELLOW}» Could not write HTML dashboard ({e}){COLOR_RESET}")
 
 # ------------------------------------------------------------------------------
 # TRACKING EMAIL & INTRADAY HISTORY
@@ -1391,7 +2054,8 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
     if not history:
         return
 
-    print(f"\n{COLOR_BOLD}🔍 INTRADAY HISTORY FOR TRACKED SYMBOL: {matched_sym}{COLOR_RESET}")
+    sec_name, sec_wt, _ = resolve_primary_sector(matched_sym)
+    print(f"\n{COLOR_BOLD}🔍 INTRADAY HISTORY FOR TRACKED SYMBOL: {matched_sym} [Primary Sector: {sec_name} ({sec_wt:.2f}%)]{COLOR_RESET}")
     sym_w = max(MIN_SYMBOL_WIDTH, len(matched_sym))
     grid_hdr = " ".join(f"{m}X" for m in GRID_MULTIPLIERS)
     header_str = f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP/Exit':>8} | {'Eval':^5} {'Anchor':^7} {'Anch Val':>9} {'R-Mult (Bank)':>15} | ATR: {grid_hdr} | BB: {grid_hdr} | {'State':^13}{COLOR_RESET}"
@@ -1428,7 +2092,7 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
         if last_state != prev_state:
             _send_watch_email(
                 f"[System3] {matched_sym} Alert: {prev_state} -> {last_state}",
-                f"System3 detected a state transition for {matched_sym} at checkpoint {last_row['_EvalTime'].strftime('%H:%M')}.\n\n"
+                f"System3 detected a state transition for {matched_sym} ({sec_name}) at checkpoint {last_row['_EvalTime'].strftime('%H:%M')}.\n\n"
                 f"Previous State: {prev_state}\nCurrent State: {last_state}\n\n"
                 f"LTP: {last_row.get('LTP', 0):.2f}\nTotal Session Move: {_r_multiple(last_row, include_banked=True):+.2f} R-Multiples\n",
                 "track"
@@ -1437,7 +2101,10 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
 # ==============================================================================
 # MAIN RUNNER
 # ==============================================================================
-def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, target_time_str=None, track_symbol=""):
+def run_screener(
+    mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, target_time_str=None,
+    track_symbol="", sector_filter="", html_out=HTML_DASHBOARD_PATH, interactive_cli=False
+):
     t_start = time.time()
     explicit = bool(target_date_str or target_time_str)
     cutoff_dt = (
@@ -1460,23 +2127,29 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     print(f"   {COLOR_DIM}» Universe: {len(universe_raw)} instruments{COLOR_RESET}")
 
     if mode == "INDEX_OPTIONS":
-        candidates = universe_raw
+        stock_candidates = universe_raw
     else:
         prog = Progress("prefilter", len(universe_raw))
         lookback_cal_days = days * PREFILTER_LOOKBACK_MULT + PREFILTER_LOOKBACK_PAD_DAYS
         with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
-            candidates = [r for r in ex.map(_history_worker_daily, [(it, target_dt - timedelta(days=lookback_cal_days), target_dt, prog) for it in universe_raw]) if r is not None]
+            stock_candidates = [r for r in ex.map(_history_worker_daily, [(it, target_dt - timedelta(days=lookback_cal_days), target_dt, prog) for it in universe_raw]) if r is not None]
         prog.done()
-        if STATS.auth_failed or not candidates:
+        if STATS.auth_failed or not stock_candidates:
             return 1
-        print(f"   {COLOR_DIM}» Prefilter: {len(universe_raw)} -> {len(candidates)} instruments{COLOR_RESET}")
+        print(f"   {COLOR_DIM}» Prefilter: {len(universe_raw)} -> {len(stock_candidates)} instruments{COLOR_RESET}")
+
+    sector_index_candidates = _sectoral_indices_universe() if (ENABLE_SECTORAL_INDICES and mode != "INDEX_OPTIONS") else []
+    all_candidates = sector_index_candidates + stock_candidates
 
     checkpoints = generate_checkpoints(cutoff_dt) if BACKTRACE_CHECKPOINTS else [cutoff_dt]
     print(f"   {COLOR_DIM}» Backtrace checkpoints ({len(checkpoints)}): {', '.join(c.strftime('%H:%M') for c in checkpoints)}{COLOR_RESET}")
 
-    prog = Progress("checkpoints", len(candidates))
+    prog = Progress("checkpoints (indices + stocks)", len(all_candidates))
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
-        per_symbol = list(ex.map(process_stock_checkpoints, [(item, checkpoints, today_session, MIN1_HISTORY_DAYS, mode, prog) for item in candidates]))
+        per_symbol = list(ex.map(
+            process_stock_checkpoints,
+            [(item, checkpoints, today_session, MIN1_HISTORY_DAYS, mode, prog) for item in all_candidates]
+        ))
     prog.done()
 
     if STATS.auth_failed:
@@ -1484,140 +2157,65 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
     outcomes = [o for sym_outcomes in per_symbol for o in sym_outcomes]
     results = [p for _, s, p in outcomes if s == "ok"]
     counts = {k: sum(1 for _, s, _ in outcomes if s == k) for k in ("no_data", "illiquid", "short_history", "error")}
-    print(f"   {COLOR_DIM}» Scan summary: {len(candidates)} instruments x {len(checkpoints)} checkpoints = {len(outcomes)} evaluations | ok {len(results)} | no data {counts['no_data']} | illiquid {counts['illiquid']} | short history {counts['short_history']} | errors {counts['error']}{COLOR_RESET}")
+    print(f"   {COLOR_DIM}» Scan summary: {len(all_candidates)} instruments ({len(sector_index_candidates)} indices + {len(stock_candidates)} stocks) x {len(checkpoints)} checkpoints = {len(outcomes)} evaluations | ok {len(results)} | no data {counts['no_data']} | illiquid {counts['illiquid']} | short history {counts['short_history']} | errors {counts['error']}{COLOR_RESET}")
     if not results:
         return 1
 
-    by_symbol, bulls_live, bears_live, graveyard_candidates = {}, [], [], []
+    by_index, by_stock = {}, {}
     for row in results:
-        by_symbol.setdefault(row['Symbol'], []).append(row)
+        if row.get('IsSectorIndex'):
+            by_index.setdefault(row['Symbol'], []).append(row)
+        else:
+            by_stock.setdefault(row['Symbol'], []).append(row)
 
-    for symbol, rows in by_symbol.items():
-        b, r_, grave_list = merge_symbol_rows(rows)
-        is_pe = " PE " in symbol or symbol.endswith("PE")
-        def _apply_dir(item, raw_dir):
-            item['PremiumDir'] = raw_dir
-            item['AnchorDir'] = "BEAR" if (raw_dir == "BULL" and is_pe) else ("BULL" if (raw_dir == "BEAR" and is_pe) else raw_dir)
-        for item, raw_dir in ((b, "BULL"), (r_, "BEAR")):
-            if not item:
-                continue
-            _apply_dir(item, raw_dir)
-            if item['State'] == "[STOPPED]" or "[STOP" in str(item.get('State', '')):
-                graveyard_candidates.append(item)
-            else:
-                (bulls_live if item['AnchorDir'] == "BULL" else bears_live).append(item)
-        for g_item in (grave_list or []):
-            if g_item.get('AnchorDir', 'NONE') in ("BULL", "BEAR"):
-                _apply_dir(g_item, g_item.get('AnchorDir'))
-            graveyard_candidates.append(g_item)
+    idx_bulls, idx_bears, idx_grave = segregate_and_rank_buckets(by_index) if by_index else ([], [], [])
+    stock_bulls, stock_bears, stock_grave = segregate_and_rank_buckets(by_stock)
 
     if track_symbol:
-        print_and_alert_tracked_history(track_symbol, by_symbol, live_run=not explicit)
+        combined_map = dict(by_index, **by_stock)
+        print_and_alert_tracked_history(track_symbol, combined_map, live_run=not explicit)
 
-    drift_floor = (
-        float(ADVERSE_DRIFT_R_FLOOR)
-        if ADVERSE_DRIFT_R_FLOOR is not None
-        else -abs(float(HARD_STOP_ATR_MULT or 1.2) * float(ADVERSE_DRIFT_STOP_RATIO))
+    # Render console dashboard (Default = Show All unless --sector was passed)
+    render_console_dashboard(
+        mode, cutoff_dt, checkpoints,
+        idx_bulls, idx_bears, idx_grave,
+        stock_bulls, stock_bears, stock_grave,
+        active_sector_filter=sector_filter
     )
 
-    surviving_bulls = [r for r in bulls_live if _r_multiple(r) > drift_floor or _r_multiple(r, include_banked=True) > BANKED_R_PROTECTION_FLOOR]
-    surviving_bears = [r for r in bears_live if _r_multiple(r) > drift_floor or _r_multiple(r, include_banked=True) > BANKED_R_PROTECTION_FLOOR]
-    for r in bulls_live:
-        if r not in surviving_bulls:
-            r['RejectReason'] = f"Adverse Drift (Losing R-Multiple < {drift_floor:g}R)"
-            graveyard_candidates.append(r)
-    for r in bears_live:
-        if r not in surviving_bears:
-            r['RejectReason'] = f"Adverse Drift (Losing R-Multiple < {drift_floor:g}R)"
-            graveyard_candidates.append(r)
+    # Always generate the self-contained interactive clickable HTML dashboard
+    generate_interactive_html_dashboard(
+        html_out, mode, cutoff_dt, checkpoints,
+        idx_bulls, idx_bears, idx_grave,
+        stock_bulls, stock_bears, stock_grave
+    )
 
-    first_grid_key = GRID_MULTIPLIERS[0] if GRID_MULTIPLIERS else 1
-    def state_rank(st):
-        return 0 if "[ BB > KC ]" in st else 1 if "[ BB < KC ]" in st else 2
-
-    surviving_bulls.sort(key=lambda r: (
-        -_rank_r_score(r), -_r_multiple(r), state_rank(r['State']),
-        -r.get('ATR_Grid', {}).get(first_grid_key, 0), -r.get('BB_Grid', {}).get(first_grid_key, 0), -int(r['CheckpointTime'].timestamp())
-    ))
-    surviving_bears.sort(key=lambda r: (
-        -_rank_r_score(r), -_r_multiple(r), state_rank(r['State']),
-        -r.get('ATR_Grid', {}).get(first_grid_key, 0), -r.get('BB_Grid', {}).get(first_grid_key, 0), -int(r['CheckpointTime'].timestamp())
-    ))
-    bulls, bears = surviving_bulls[:TOP_N_BUYERS], surviving_bears[:TOP_N_SELLERS]
-
-    def sort_reason(r):
-        return 0 if any(x in str(r.get('RejectReason', '')) for x in ["Hard stop", "Profit Lock", "Kinetic SL", "Superseded"]) else 1 if "Adverse" in str(r.get('RejectReason', '')) else 2 if "Warzone" in str(r.get('RejectReason', '')) else 3
-    graveyard_candidates.sort(key=lambda x: (sort_reason(x), -_r_multiple(x) if _r_multiple(x) != 0 else -abs(x.get('DayChangePct', 0.0))))
-
-    dedup_grave, seen_grave = [], set()
-    for row in graveyard_candidates:
-        gid = (row['Symbol'], row.get('ActiveAnchor', '-'), row.get('KilledTime', '-'))
-        if gid not in seen_grave:
-            seen_grave.add(gid)
-            dedup_grave.append(row)
-    grave_total, grave_shown = len(dedup_grave), dedup_grave if TOP_N_GRAVEYARD <= 0 else dedup_grave[:TOP_N_GRAVEYARD]
-    sym_w = max(MIN_SYMBOL_WIDTH, min(MAX_SYMBOL_WIDTH, max((len(r['Symbol']) for r in bulls + bears + grave_shown), default=MIN_SYMBOL_WIDTH)))
-
-    print(f"\n{COLOR_BOLD}=== STATEFUL INSTITUTIONAL VOLATILITY TRACKER [{mode}] ==={COLOR_RESET}")
-    print(f"Target Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Scanned: {len(by_symbol)} symbols across {len(checkpoints)} checkpoints | Surviving: {len(bulls)} bull, {len(bears)} bear | Graveyard: {grave_total}\n")
-
-    def print_basket(title, icon, data_list):
-        if not data_list:
-            return
-        print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
-        grid_hdr = " ".join(f"{m}X" for m in GRID_MULTIPLIERS)
-        header_str = f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP/Exit':>8} | {'Seen':^5} {'Anchor':^7} {'Anch Val':>9} {'R-Mult (Bank)':>15} | ATR: {grid_hdr} | BB: {grid_hdr} | {'State':^13}{COLOR_RESET}"
-        print(header_str)
-        print("-" * len(ANSI_RE.sub("", header_str)))
-        basket_dir = "BULL" if "BULL" in title else "BEAR"
-        default_g = {m: 0 for m in GRID_MULTIPLIERS}
-        for row in data_list:
-            live_r, banked_r = _r_multiple(row, include_banked=False), float(row.get('BankedR', 0.0) or 0.0)
-            rank_r = _rank_r_score(row)
-            r_color = COLOR_GREEN_FG if rank_r > 0 else COLOR_RED_FG if rank_r < 0 else COLOR_DIM
-            if row.get('PriorStops', 0) > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON:
-                r_mult_str, anchor_disp = f"{live_r:>+5.2f}R ({banked_r:>+4.1f}R)", f"{row['ActiveAnchor']}*"
+    # Optional interactive CLI loop for terminal users
+    if interactive_cli and sys.stdin.isatty():
+        while True:
+            try:
+                user_in = input(
+                    f"\n{COLOR_CYAN}[Interactive Filter] Enter a Sectoral Index name (e.g. 'NIFTY IT', 'NIFTY BANK'), "
+                    f"'CLEAR' to show all, or 'Q' to quit: {COLOR_RESET}"
+                ).strip()
+            except (EOFError, KeyboardInterrupt):
+                break
+            if not user_in or user_in.upper() in ("Q", "QUIT", "EXIT"):
+                break
+            if user_in.upper() in ("CLEAR", "ALL", "RESET"):
+                render_console_dashboard(
+                    mode, cutoff_dt, checkpoints,
+                    idx_bulls, idx_bears, idx_grave,
+                    stock_bulls, stock_bears, stock_grave,
+                    active_sector_filter=None
+                )
             else:
-                r_mult_str, anchor_disp = f"{live_r:>+5.2f}R        ", f"{row['ActiveAnchor']} "
-            dir_c = COLOR_GREEN_FG if basket_dir == "BULL" else COLOR_RED_FG
-            ag, bg = row.get('ATR_Grid', default_g), row.get('BB_Grid', default_g)
-            a_str = "  ".join(_format_val(ag.get(k, 0), dir_c) for k in GRID_MULTIPLIERS)
-            b_str = "  ".join(_format_val(bg.get(k, 0), dir_c) for k in GRID_MULTIPLIERS)
-            shown_state = _state_display(row)
-            if "[ BB > KC ]" in row['State']:
-                dir_tag = "▲" if basket_dir == "BULL" else "▼"
-                state_text = f"{COLOR_GREEN_FG if dir_tag == '▲' else COLOR_RED_FG}{f'[ BB > KC ] {dir_tag}'.strip():^13}{COLOR_RESET}"
-            else:
-                state_text = f"{COLOR_YELLOW if '[ BB < KC ]' in row['State'] else COLOR_DIM}{shown_state:^13}{COLOR_RESET}"
-            ltp_val = f"{row['KilledPrice']:>7.2f}x" if "[STOP" in shown_state and row.get('KilledPrice', 0) > 0 else f"{row['LTP']:>8.2f} "
-            print(f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} {ltp_val} | {row['CheckpointTime'].strftime('%H:%M'):^5} {anchor_disp:^7} {row['AnchorPrice']:>9.2f} {r_color}{r_mult_str:>15}{COLOR_RESET} |   {a_str}  |   {b_str}  | {state_text}")
-
-    print_basket("TOP BULL SETUPS (Valid Anchors Surviving)", "🔥", bulls)
-    print_basket("TOP BEAR SETUPS (Valid Anchors Surviving)", "🩸", bears)
-    if not bulls and not bears:
-        print(f"{COLOR_YELLOW}No surviving anchors at this snapshot -- every candidate was rejected (see graveyard).{COLOR_RESET}")
-
-    if grave_shown:
-        print(f"\n{COLOR_BOLD}🚫 THE GRAVEYARD (Completed Episodes / Filtered / Rejected){COLOR_RESET}")
-        header_str = f" {COLOR_CYAN}{'Script':<{sym_w}} {'Signal':^6} {'Anchor':^6} {'Anch Val':>9} {'Killed':^6} {'Kill Val':>9} {'LTP':>8} {'R-Mult':>7} {'Move%':>7} | {'Forensic Rejection / Exit Reason'}{COLOR_RESET}"
-        print(header_str)
-        print("-" * len(ANSI_RE.sub("", header_str)))
-        for row in grave_shown:
-            sig = row.get('AnchorDir', 'NONE')
-            sig_colored = f"{COLOR_GREEN_FG}BULL{COLOR_RESET}  " if sig == "BULL" else f"{COLOR_RED_FG}BEAR{COLOR_RESET}  " if sig == "BEAR" else f"{COLOR_DIM}NONE{COLOR_RESET}  "
-            a_time, a_price = row['ActiveAnchor'] if row['ActiveAnchor'] else '-', f"{row['AnchorPrice']:>9.2f}" if row['AnchorPrice'] > 0 else f"{'-':>9}"
-            k_time, k_price = row['KilledTime'] if row['KilledTime'] else '-', f"{row['KilledPrice']:>9.2f}" if row['KilledPrice'] > 0 else f"{'-':>9}"
-            if row['AnchorPrice'] > 0 and (row['KilledPrice'] > 0 or row['LTP'] > 0):
-                g_r = _r_multiple(row, include_banked=False)
-                g_r_str, g_r_color = f"{g_r:>+6.2f}R", COLOR_GREEN_FG if g_r > 0 else COLOR_RED_FG if g_r < 0 else COLOR_DIM
-                move_pct_str, move_color = f"{row['MovePct']:>+6.2f}%", _fav_color(row['MovePct'], row.get('PremiumDir', sig))
-            else:
-                g_r_str, g_r_color, move_pct_str, move_color = f"{'-':>7}", COLOR_DIM, f"{'-':>7}", COLOR_DIM
-            reason = row['RejectReason']
-            reason_color = COLOR_YELLOW if any(x in reason for x in ["Kinetic SL", "Hard stop", "Adverse", "Profit Lock", "Superseded"]) else COLOR_RED_FG if any(x in reason for x in ["Chop", "Warzone"]) else COLOR_DIM
-            print(f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} {sig_colored} {a_time:^6} {a_price} {k_time:^6} {k_price} {row['LTP']:>8.2f} {g_r_color}{g_r_str}{COLOR_RESET} {move_color}{move_pct_str}{COLOR_RESET} | {reason_color}{reason}{COLOR_RESET}")
-        if grave_total > len(grave_shown):
-            print(f"{COLOR_DIM}   ... {grave_total - len(grave_shown)} more graveyard row(s) not shown (--graveyard-max 0 prints them all).{COLOR_RESET}")
+                render_console_dashboard(
+                    mode, cutoff_dt, checkpoints,
+                    idx_bulls, idx_bears, idx_grave,
+                    stock_bulls, stock_bears, stock_grave,
+                    active_sector_filter=user_in
+                )
 
     _print_error_summary()
     print(f"\n⏱️ Tracker sync completed in {(time.time() - t_start):.2f} seconds ({sum(l.total_calls for l in LIMITERS.values())} API calls).\n")
@@ -1638,6 +2236,12 @@ def parse_args():
     p.add_argument("--checkpoint-min", type=int, default=CHECKPOINT_INTERVAL_MIN)
     p.add_argument("--single-snapshot", action="store_true")
     p.add_argument("--isolate-session-bands", action="store_true", default=ISOLATE_SESSION_BANDS)
+
+    # --- Sectoral Index & Interactive Dashboard Controls ---
+    p.add_argument("--no-sector-indices", action="store_true", help="Disable Stage 1 Sectoral Index evaluation.")
+    p.add_argument("--sector", type=str, default="", help="Filter Stock tables to a specific Sectoral Index (default: show all).")
+    p.add_argument("--html-out", type=str, default=HTML_DASHBOARD_PATH, help="Output file path for clickable HTML dashboard.")
+    p.add_argument("--interactive", action="store_true", help="Launch interactive terminal prompt to filter by sector or CLEAR.")
 
     # --- Indicator Periods & Band Multipliers ---
     p.add_argument("--price-bb-period", type=int, default=PRICE_BB_PERIOD)
@@ -1688,6 +2292,8 @@ if __name__ == "__main__":
     STRIKES_BELOW_ATM = args.strikes_down
     CHECKPOINT_INTERVAL_MIN = args.checkpoint_min
     ISOLATE_SESSION_BANDS = args.isolate_session_bands
+    ENABLE_SECTORAL_INDICES = not args.no_sector_indices
+    HTML_DASHBOARD_PATH = args.html_out
 
     PRICE_BB_PERIOD = args.price_bb_period
     PRICE_BB_STD_MULT = args.price_bb_std
@@ -1722,7 +2328,13 @@ if __name__ == "__main__":
         BACKTRACE_CHECKPOINTS = False
 
     try:
-        code = run_screener(args.mode, args.days, args.date, args.time, args.track)
+        code = run_screener(
+            args.mode, args.days, args.date, args.time,
+            track_symbol=args.track,
+            sector_filter=args.sector,
+            html_out=args.html_out,
+            interactive_cli=args.interactive
+        )
     except Exception:
         print(f"\n{COLOR_RED_FG}💥 FATAL: unhandled exception -- full traceback follows.{COLOR_RESET}")
         traceback.print_exc()
