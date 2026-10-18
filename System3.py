@@ -3,9 +3,9 @@
 Strict Institutional Volatility Tracker (Upstox) - System 3.0 (100% Parameterized Edition)
 + Zero Hardcoded Logic: Every indicator period, multiplier, stop ratchet, and time gate lives in Section 0.
 + Modes: STOCK_FNO, CASH_EQUITY, INDEX_OPTIONS
-+ Absolute Session Isolation: Bollinger Bands & Indicators reset at SESSION_OPEN_MIN to prevent gap contamination.
++ Gap-Stitched Continuous Baseline: Eliminates overnight gap distortion while keeping 09:15 warmup instant.
 + 3-Lock Master Trigger with Configurable Quorum Gating & Rolling Shock Window.
-+ Smart Trailing & Profit Ratchet: Configurable R thresholds for soft-stop disable and breakeven floor lock.
++ Smart Trailing & Profit Ratchet: Disables soft stop at +1.5R and locks breakeven floor at +1.8R.
 + Auction Filter: Blocks new anchors at/after LAST_NEW_ANCHOR_MIN to eliminate closing-auction noise.
 """
 import os
@@ -69,7 +69,8 @@ PRICE_BB_PERIOD = 20                    # Price Bollinger Band rolling window (b
 PRICE_BB_STD_MULT = 2.0                 # Price Bollinger Band standard deviation multiplier
 PRICE_KC_PERIOD = 20                    # Price Keltner Channel ATR rolling window (bars)
 PRICE_KC_ATR_MULT = 1.5                 # Price Keltner Channel ATR multiplier
-ROLLING_MIN_PERIODS = 1                 # Minimum bars required at session start for rolling stats
+ROLLING_MIN_PERIODS = 1                 # Minimum bars required for rolling stats
+ISOLATE_SESSION_BANDS = False           # False = Gap-Stitched Continuous Baseline (catches 09:15 movers); True = hard reset at 09:15
 
 # --- 0.4 KINETIC INDICATOR PERIODS ---
 RSI_PERIOD = 14                         # 1-minute RSI Wilder smoothing period
@@ -104,11 +105,11 @@ OPPOSING_VEL_ATR_MULT = 1.0             # Opposing velocity ATR multiple require
 OPPOSING_BB_STD_MULT = 1.0              # Opposing indicator BB StdDev multiple required to add +1 to score
 WARZONE_OPPOSING_SCORE = 2              # Opposing score threshold that blocks anchor creation as Warzone Chop
 
-SOFT_STOP_DISABLE_R = 5.0               # R-Multiple peak above which Soft Stop disables to ride big trends
-PROFIT_LOCK_TRIGGER_R = 5.5             # R-Multiple peak required to activate the Breakeven+ Profit Ratchet
+SOFT_STOP_DISABLE_R = 1.5               # R-Multiple peak above which Soft Stop disables so 2.5 ATR Hard Stop rides the trend
+PROFIT_LOCK_TRIGGER_R = 1.8             # R-Multiple peak required to activate the Breakeven+ Profit Ratchet
 PROFIT_LOCK_FLOOR_R = 0.3               # Minimum R-Multiple floor locked in once PROFIT_LOCK_TRIGGER_R is hit
 
-ADVERSE_DRIFT_R_FLOOR = None            # Explicit R-Multiple floor for live purge (None = auto-scale with Hard Stop)
+ADVERSE_DRIFT_R_FLOOR = -0.5            # Explicit R-Multiple floor for live purge at snapshot time
 ADVERSE_DRIFT_STOP_RATIO = 1.0          # Ratio of HARD_STOP_ATR_MULT used when ADVERSE_DRIFT_R_FLOOR is None
 BANKED_R_PROTECTION_FLOOR = 0.5         # Cumulative R threshold that protects re-entries from adverse drift purge
 
@@ -716,8 +717,8 @@ def _ewm(x, alpha):
 
 def _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts, sid):
     """
-    Computes 1m kinetics using global period constants and isolates indicator
-    Bollinger Band statistics per session ID so morning gaps do not distort bands.
+    Computes 1m kinetics using global period constants on gap-neutralized continuous
+    series so morning gaps do not distort bands AND 09:15 breakouts fire without warmup lag.
     """
     n = len(close)
     delta = np.diff(close, prepend=close[0])
@@ -758,24 +759,31 @@ def _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts, sid):
     direction = np.where(delta > 0, 1, np.where(delta < 0, -1, 0))
     obv = np.cumsum(direction * vol)
 
-    df = pd.DataFrame({
-        'rsi': rsi, 'hist': hist, 'plus_di': plus_di,
-        'minus_di': minus_di, 'adx': adx, 'obv': obv, 'sid': sid
-    })
-    grouped = df.groupby('sid')
-
-    def roll_mean(x):
-        return x.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()
-
-    def roll_std(x):
-        return x.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0)
-
-    rsi_mean, rsi_std = grouped['rsi'].transform(roll_mean).values, grouped['rsi'].transform(roll_std).values
-    h_mean, h_std = grouped['hist'].transform(roll_mean).values, grouped['hist'].transform(roll_std).values
-    p_mean, p_std = grouped['plus_di'].transform(roll_mean).values, grouped['plus_di'].transform(roll_std).values
-    m_mean, m_std = grouped['minus_di'].transform(roll_mean).values, grouped['minus_di'].transform(roll_std).values
-    a_mean, a_std = grouped['adx'].transform(roll_mean).values, grouped['adx'].transform(roll_std).values
-    o_mean, o_std = grouped['obv'].transform(roll_mean).values, grouped['obv'].transform(roll_std).values
+    if ISOLATE_SESSION_BANDS:
+        df = pd.DataFrame({
+            'rsi': rsi, 'hist': hist, 'plus_di': plus_di,
+            'minus_di': minus_di, 'adx': adx, 'obv': obv, 'sid': sid
+        })
+        grouped = df.groupby('sid')
+        def roll_mean(x): return x.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()
+        def roll_std(x): return x.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0)
+        rsi_mean, rsi_std = grouped['rsi'].transform(roll_mean).values, grouped['rsi'].transform(roll_std).values
+        h_mean, h_std = grouped['hist'].transform(roll_mean).values, grouped['hist'].transform(roll_std).values
+        p_mean, p_std = grouped['plus_di'].transform(roll_mean).values, grouped['plus_di'].transform(roll_std).values
+        m_mean, m_std = grouped['minus_di'].transform(roll_mean).values, grouped['minus_di'].transform(roll_std).values
+        a_mean, a_std = grouped['adx'].transform(roll_mean).values, grouped['adx'].transform(roll_std).values
+        o_mean, o_std = grouped['obv'].transform(roll_mean).values, grouped['obv'].transform(roll_std).values
+    else:
+        # Continuous rolling stats across gap-neutralized indicator arrays (instant 09:15 readiness)
+        rsi_s, hist_s = pd.Series(rsi), pd.Series(hist)
+        pdi_s, mdi_s = pd.Series(plus_di), pd.Series(minus_di)
+        adx_s, obv_s = pd.Series(adx), pd.Series(obv)
+        rsi_mean, rsi_std = rsi_s.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values, rsi_s.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0).values
+        h_mean, h_std = hist_s.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values, hist_s.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0).values
+        p_mean, p_std = pdi_s.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values, pdi_s.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0).values
+        m_mean, m_std = mdi_s.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values, mdi_s.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0).values
+        a_mean, a_std = adx_s.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values, adx_s.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0).values
+        o_mean, o_std = obv_s.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values, obv_s.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0).values
 
     vel_hist = np.diff(hist, prepend=hist[0])
     vel_obv = np.diff(obv, prepend=obv[0])
@@ -1068,19 +1076,31 @@ def prepare_series(master, target_dt):
         return None, "short_history"
     base_atr = max(float(base_atr_calc), float(close[ts]) * float(MIN_ATR_PCT), float(ABSOLUTE_MIN_ATR))
 
-    df_p = pd.DataFrame({'close': close, 'high': high, 'low': low, 'open': open_, 'sid': sid})
-    df_p['tr'] = np.maximum(
-        df_p['high'] - df_p['low'],
-        np.maximum(np.abs(df_p['high'] - df_p['close'].shift(1)), np.abs(df_p['low'] - df_p['close'].shift(1)))
+    tr = np.maximum(
+        high - low,
+        np.maximum(np.abs(high - np.roll(close, 1)), np.abs(low - np.roll(close, 1)))
     )
-    df_p['tr'] = np.where(sess_starts, df_p['high'] - df_p['low'], df_p['tr'])
+    tr = np.where(sess_starts, high - low, tr)
 
-    # STRICT SESSION ISOLATION for Price Bands using global period & multiplier constants
-    grouped_p = df_p.groupby('sid')
-    sma_bb = grouped_p['close'].transform(lambda x: x.rolling(PRICE_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()).values
-    std_bb = grouped_p['close'].transform(lambda x: x.rolling(PRICE_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0)).values
-    sma_kc = grouped_p['close'].transform(lambda x: x.rolling(PRICE_KC_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()).values
-    atr_kc = grouped_p['tr'].transform(lambda x: x.rolling(PRICE_KC_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()).values
+    if ISOLATE_SESSION_BANDS:
+        df_p = pd.DataFrame({'close': close, 'tr': tr, 'sid': sid})
+        grouped_p = df_p.groupby('sid')
+        sma_bb = grouped_p['close'].transform(lambda x: x.rolling(PRICE_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()).values
+        std_bb = grouped_p['close'].transform(lambda x: x.rolling(PRICE_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0)).values
+        sma_kc = grouped_p['close'].transform(lambda x: x.rolling(PRICE_KC_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()).values
+        atr_kc = grouped_p['tr'].transform(lambda x: x.rolling(PRICE_KC_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()).values
+    else:
+        # Gap-Stitched Continuous Price Baseline: removes overnight jump while keeping 19 quiet prior-close bars at 09:15
+        delta_p = np.diff(close, prepend=close[0])
+        delta_p = np.where(sess_starts, close - open_, delta_p)
+        stitched_close = np.cumsum(delta_p) + open_[0]
+        stitched_offset = close - stitched_close
+        sc_series = pd.Series(stitched_close)
+        tr_series = pd.Series(tr)
+        sma_bb = sc_series.rolling(PRICE_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values + stitched_offset
+        std_bb = sc_series.rolling(PRICE_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0).values
+        sma_kc = sc_series.rolling(PRICE_KC_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values + stitched_offset
+        atr_kc = tr_series.rolling(PRICE_KC_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values
 
     return {
         'close': close, 'dt': master['Datetime'].values, 'today_start': ts, 'is_late_session': is_late_session,
@@ -1247,6 +1267,12 @@ def _r_multiple(row, include_banked=False):
         live_r = (price - ap) / base_atr if direction == 'BULL' else (ap - price) / base_atr
     return live_r + float(row.get('BankedR', 0.0) or 0.0) if include_banked else live_r
 
+def _rank_r_score(row):
+    """Ranks setups by the stronger of Live R or Cumulative Session R so an earlier stop never buries a big live winner."""
+    live_r = _r_multiple(row, include_banked=False)
+    cum_r = _r_multiple(row, include_banked=True)
+    return max(live_r, cum_r)
+
 def _merge_signal(sig_rows, last_row, direction):
     first, latest = sig_rows[0], sig_rows[-1]
     row = dict(last_row)
@@ -1373,8 +1399,8 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
     print("-" * len(ANSI_RE.sub("", header_str)))
     for row in history:
         live_r, banked_r = _r_multiple(row, include_banked=False), float(row.get('BankedR', 0.0) or 0.0)
-        total_r = live_r + banked_r
-        r_color = COLOR_GREEN_FG if total_r > 0 else COLOR_RED_FG if total_r < 0 else COLOR_DIM
+        rank_r = _rank_r_score(row)
+        r_color = COLOR_GREEN_FG if rank_r > 0 else COLOR_RED_FG if rank_r < 0 else COLOR_DIM
         if row.get('PriorStops', 0) > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON:
             r_mult_str, a_time = f"{live_r:>+5.2f}R ({banked_r:>+4.1f}R)", f"{row.get('ActiveAnchor', '-')}*"
         else:
@@ -1510,11 +1536,11 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         return 0 if "[ BB > KC ]" in st else 1 if "[ BB < KC ]" in st else 2
 
     surviving_bulls.sort(key=lambda r: (
-        -_r_multiple(r, include_banked=True), -_r_multiple(r), state_rank(r['State']),
+        -_rank_r_score(r), -_r_multiple(r), state_rank(r['State']),
         -r.get('ATR_Grid', {}).get(first_grid_key, 0), -r.get('BB_Grid', {}).get(first_grid_key, 0), -int(r['CheckpointTime'].timestamp())
     ))
     surviving_bears.sort(key=lambda r: (
-        -_r_multiple(r, include_banked=True), -_r_multiple(r), state_rank(r['State']),
+        -_rank_r_score(r), -_r_multiple(r), state_rank(r['State']),
         -r.get('ATR_Grid', {}).get(first_grid_key, 0), -r.get('BB_Grid', {}).get(first_grid_key, 0), -int(r['CheckpointTime'].timestamp())
     ))
     bulls, bears = surviving_bulls[:TOP_N_BUYERS], surviving_bears[:TOP_N_SELLERS]
@@ -1547,8 +1573,8 @@ def run_screener(mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, t
         default_g = {m: 0 for m in GRID_MULTIPLIERS}
         for row in data_list:
             live_r, banked_r = _r_multiple(row, include_banked=False), float(row.get('BankedR', 0.0) or 0.0)
-            total_r = live_r + banked_r
-            r_color = COLOR_GREEN_FG if total_r > 0 else COLOR_RED_FG if total_r < 0 else COLOR_DIM
+            rank_r = _rank_r_score(row)
+            r_color = COLOR_GREEN_FG if rank_r > 0 else COLOR_RED_FG if rank_r < 0 else COLOR_DIM
             if row.get('PriorStops', 0) > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON:
                 r_mult_str, anchor_disp = f"{live_r:>+5.2f}R ({banked_r:>+4.1f}R)", f"{row['ActiveAnchor']}*"
             else:
@@ -1611,6 +1637,7 @@ def parse_args():
     p.add_argument("--strikes-down", type=int, default=STRIKES_BELOW_ATM)
     p.add_argument("--checkpoint-min", type=int, default=CHECKPOINT_INTERVAL_MIN)
     p.add_argument("--single-snapshot", action="store_true")
+    p.add_argument("--isolate-session-bands", action="store_true", default=ISOLATE_SESSION_BANDS)
 
     # --- Indicator Periods & Band Multipliers ---
     p.add_argument("--price-bb-period", type=int, default=PRICE_BB_PERIOD)
@@ -1660,6 +1687,7 @@ if __name__ == "__main__":
     STRIKES_ABOVE_ATM = args.strikes_up
     STRIKES_BELOW_ATM = args.strikes_down
     CHECKPOINT_INTERVAL_MIN = args.checkpoint_min
+    ISOLATE_SESSION_BANDS = args.isolate_session_bands
 
     PRICE_BB_PERIOD = args.price_bb_period
     PRICE_BB_STD_MULT = args.price_bb_std
