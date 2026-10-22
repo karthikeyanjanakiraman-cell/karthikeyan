@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-Strict Institutional Volatility Tracker (Upstox) - System 3.0 (Window-Popups Email & High-Contrast Light Theme Edition)
+Strict Institutional Volatility Tracker (Upstox) - System 3.0 (Pure 1st-Time Email Gate & High-Contrast Light Theme Edition)
 + Zero Hardcoded Logic: All indicator periods, multipliers, stop ratchets, email toggles, and sector weights live in Section 0.
 + Multi-Index Highest-Weightage Resolver: Assigns dual-listed stocks to the sectoral index where they carry the highest %.
 + Sectoral Index 3-Lock Engine: Evaluates Sectoral Indices first (Top Bulls, Top Bears, Graveyard) before stocks.
@@ -8,8 +8,9 @@ Strict Institutional Volatility Tracker (Upstox) - System 3.0 (Window-Popups Ema
   - Evaluates NO_OF_ITERATIONS prior snapshots spaced by TIME_OF_INTERVAL_TO_LOOKBACK minutes purely in memory.
   - Compares current snapshot (e.g. 12:35) against prior iterations (e.g. 12:30, 12:25, 12:20).
   - Segregates Bull & Bear setups popping up with Anchor within the lookback window into a dedicated resultset without touching existing console resultsets.
-+ Focused Window-Popups Email Delivery with Friendly High-Contrast Light Institutional Styling:
-  - Sends ONLY the Lookback Window Popups portion in Email (`EMAIL_ONLY_WINDOW_POPUPS = True`).
++ Pure 1st-Time Email Gate & Content Controls (Two Dedicated Config Variables in Section 0.1):
+  - `EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME_GT_0 = True`: Sends email ONLY when Pure 1st-Time (No *) popup count > 0.
+  - `EMAIL_ONLY_PURE_1ST_TIME_CONTENT = True`: Sends ONLY the Pure 1st-Time (No *) tables & sector accordions in the email.
   - Uses explicit inline cell colors on a crisp light theme so Gmail/Outlook/Apple Mail never render dark-on-dark text.
 """
 import os
@@ -43,19 +44,21 @@ warnings.filterwarnings("ignore")
 # ==============================================================================
 
 # --- 0.1 EMAIL & GITHUB SECRET CONFIGURATION ---
-SEND_DASHBOARD_EMAIL = True             # Master toggle: Send email after every run
-EMAIL_ONLY_WINDOW_POPUPS = True         # True = Send ONLY the Lookback Window Popups portion in Email (not the full session dump)
-SEND_TRACK_ALERT_EMAIL = True           # Master toggle: Send state-change alert email when tracking a symbol
-EMAIL_ATTACH_INTERACTIVE_HTML = True    # Attach interactive HTML file of the report to the email
-EMAIL_ATTACHMENT_FILENAME = "System3_Window_Popups_Dashboard.html"
-SAVE_LOCAL_HTML_FILE = False            # False = Do not save local HTML file to disk (send via email instead)
+SEND_DASHBOARD_EMAIL = True                        # Master toggle: Enable email dispatch after run
+EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME_GT_0 = True     # Config 1: True = Send email ONLY if Pure 1st-Time (No *) count > 0
+EMAIL_ONLY_PURE_1ST_TIME_CONTENT = True            # Config 2: True = Send ONLY Pure 1st-Time (No *) part alone in email
+EMAIL_ONLY_WINDOW_POPUPS = True                    # Fallback scope when EMAIL_ONLY_PURE_1ST_TIME_CONTENT is False
+SEND_TRACK_ALERT_EMAIL = True                      # Master toggle: Send state-change alert email when tracking a symbol
+EMAIL_ATTACH_INTERACTIVE_HTML = True               # Attach interactive HTML file of the report to the email
+EMAIL_ATTACHMENT_FILENAME = "System3_Pure_1stTime_Popups.html"
+SAVE_LOCAL_HTML_FILE = False                       # False = Do not save local HTML file to disk (send via email instead)
 HTML_DASHBOARD_PATH = "system3_dashboard.html"
 
 # Zero-Truncation Email Controls (0 = Unlimited / Show Every Single Row)
-EMAIL_MAX_BUYERS = 0                    # 0 = Show ALL surviving Bull setups without truncation
-EMAIL_MAX_SELLERS = 0                   # 0 = Show ALL surviving Bear setups without truncation
-EMAIL_MAX_GRAVEYARD = 0                 # 0 = Show ALL Graveyard rows without truncation
-EMAIL_CLIP_SYMBOLS = False              # False = Never truncate/clip long symbol names in email
+EMAIL_MAX_BUYERS = 0                               # 0 = Show ALL surviving Bull setups without truncation
+EMAIL_MAX_SELLERS = 0                              # 0 = Show ALL surviving Bear setups without truncation
+EMAIL_MAX_GRAVEYARD = 0                            # 0 = Show ALL Graveyard rows without truncation
+EMAIL_CLIP_SYMBOLS = False                         # False = Never truncate/clip long symbol names in email
 
 # Environment Variable Names (Matches GitHub Repository Secrets)
 ENV_UPSTOX_TOKEN = "UPSTOX_ACCESS_TOKEN"
@@ -70,6 +73,8 @@ ENV_NO_OF_ITERATIONS = "NO_OF_ITERATIONS"
 ENV_LOOKBACK_ITERATIONS = "LOOKBACK_ITERATIONS"
 ENV_TIME_OF_INTERVAL_TO_LOOKBACK = "TIME_OF_INTERVAL_TO_LOOKBACK"
 ENV_LOOKBACK_INTERVAL_MIN = "LOOKBACK_INTERVAL_MIN"
+ENV_EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME = "EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME_GT_0"
+ENV_EMAIL_ONLY_PURE_1ST_TIME_CONTENT = "EMAIL_ONLY_PURE_1ST_TIME_CONTENT"
 
 DEFAULT_SMTP_SERVER = "smtp.gmail.com"
 DEFAULT_SMTP_PORT = "465"
@@ -340,6 +345,17 @@ MASTER_RETRY_SLEEP_SEC = 1.0
 # ==============================================================================
 def get_upstox_token():
     return os.environ.get(ENV_UPSTOX_TOKEN) or os.environ.get(ENV_FALLBACK_TOKEN)
+
+def _parse_bool_env(env_key, default_val):
+    raw = os.environ.get(env_key)
+    if raw is None or str(raw).strip() == "":
+        return bool(default_val)
+    s = str(raw).strip().lower()
+    if s in ("1", "true", "yes", "y", "on"):
+        return True
+    if s in ("0", "false", "no", "n", "off"):
+        return False
+    return bool(default_val)
 
 def get_lookback_iterations_config():
     """
@@ -1468,7 +1484,7 @@ def process_stock_checkpoints(args):
                 out.append((cp, "ok", row))
                 by_cp_row[cp] = row
 
-        # 2. In-memory evaluation for any additional lookback iteration checkpoints (e.g., 09:15 open bar, or 10:19/10:34/10:49)
+        # 2. In-memory evaluation for any additional lookback iteration checkpoints
         extra_out = []
         session_open_dt = _open_dt(target_dt)
         for l_cp in (extra_lookback_cps or []):
@@ -1814,7 +1830,7 @@ def _format_val(v, dir_color):
     return f"{dir_color}{v}{COLOR_RESET}" if v > 0 else f"{COLOR_DIM}{v}{COLOR_RESET}"
 
 # ==============================================================================
-# 4. CONSOLE RENDERER & FOCUSED WINDOW-POPUPS EMAIL / LIGHT-THEME HTML ENGINE
+# 4. CONSOLE RENDERER & PURE 1ST-TIME EMAIL / LIGHT-THEME HTML ENGINE
 # ==============================================================================
 def render_console_dashboard(
     mode, cutoff_dt, checkpoints,
@@ -2040,9 +2056,10 @@ def build_full_untruncated_plain_text(
 ):
     """
     Generates the Plain-Text email body.
-    When `EMAIL_ONLY_WINDOW_POPUPS = True` (default), sends ONLY the Lookback Window Popups
-    portion (All Window Popups & Pure First-Time Popups for Stocks and Sectoral Indices)
-    instead of dumping the entire session's tables.
+    - When `EMAIL_ONLY_PURE_1ST_TIME_CONTENT = True` (default), sends ONLY the
+      Pure 1st-Time (No *) Stock & Sectoral Index popups part alone in the email.
+    - Otherwise, if `EMAIL_ONLY_WINDOW_POPUPS = True`, includes both All Window Popups
+      and Pure 1st-Time Popups.
     """
     new_idx_b = (idx_popup_res or {}).get("new_bulls", [])
     new_idx_r = (idx_popup_res or {}).get("new_bears", [])
@@ -2053,12 +2070,19 @@ def build_full_untruncated_plain_text(
     win_stk_b = (stock_popup_res or {}).get("window_first_bulls", [])
     win_stk_r = (stock_popup_res or {}).get("window_first_bears", [])
 
-    popup_rows = new_idx_b + new_idx_r + win_idx_b + win_idx_r + new_stk_b + new_stk_r + win_stk_b + win_stk_r
+    pure_rows = new_idx_b + new_idx_r + new_stk_b + new_stk_r
+    popup_rows = pure_rows + win_idx_b + win_idx_r + win_stk_b + win_stk_r
     e_bulls = stock_bulls if EMAIL_MAX_BUYERS <= 0 else stock_bulls[:EMAIL_MAX_BUYERS]
     e_bears = stock_bears if EMAIL_MAX_SELLERS <= 0 else stock_bears[:EMAIL_MAX_SELLERS]
     e_grave = stock_grave if EMAIL_MAX_GRAVEYARD <= 0 else stock_grave[:EMAIL_MAX_GRAVEYARD]
 
-    sizing_pool = popup_rows if (EMAIL_ONLY_WINDOW_POPUPS and popup_rows) else (idx_bulls + idx_bears + idx_grave + e_bulls + e_bears + e_grave)
+    if EMAIL_ONLY_PURE_1ST_TIME_CONTENT and pure_rows:
+        sizing_pool = pure_rows
+    elif EMAIL_ONLY_WINDOW_POPUPS and popup_rows:
+        sizing_pool = popup_rows
+    else:
+        sizing_pool = idx_bulls + idx_bears + idx_grave + e_bulls + e_bears + e_grave
+
     sym_w = max(MIN_SYMBOL_WIDTH, max((len(r['Symbol']) for r in sizing_pool), default=MIN_SYMBOL_WIDTH))
     sec_w = max(
         SECTOR_COL_WIDTH,
@@ -2109,7 +2133,7 @@ def build_full_untruncated_plain_text(
             )
         lines.append("")
 
-    if EMAIL_ONLY_WINDOW_POPUPS and lookback_meta and lookback_meta.get("enabled") and stock_popup_res is not None:
+    if lookback_meta and lookback_meta.get("enabled") and stock_popup_res is not None:
         w_start_s = lookback_meta["window_start_dt"].strftime("%H:%M")
         w_end_s = lookback_meta["window_end_dt"].strftime("%H:%M")
         prior_s = ", ".join(d.strftime("%H:%M") for d in lookback_meta["prior_iter_dts_desc"]) or "None"
@@ -2117,27 +2141,49 @@ def build_full_untruncated_plain_text(
             f"{st['iter_time']} (▲{st['bull_count']} ▼{st['bear_count']})"
             for st in (stock_popup_res.get("iter_stats") or [])
         )
-        lines.append(f"=== SYSTEM 3.0 [{mode}] — LOOKBACK WINDOW POPUPS REPORT ({w_start_s}..{w_end_s}) ===")
-        lines.append(
-            f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | "
-            f"NO_OF_ITERATIONS: {lookback_meta['num_iterations']} | "
-            f"TIME_OF_INTERVAL_TO_LOOKBACK: {lookback_meta['interval_min']}m | "
-            f"Prior Iterations Compared: [{prior_s}] vs Current [{w_end_s}]"
-        )
-        if iter_summary_s:
-            lines.append(f"Prior Iteration Stock Counts: {iter_summary_s}")
-        lines.append("")
 
-        _fmt_active_block(f"ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BULL", win_stk_b, show_sector=True, show_first_iter=True)
-        _fmt_active_block(f"ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BEAR", win_stk_r, show_sector=True, show_first_iter=True)
-        _fmt_active_block(f"PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BULL", new_stk_b, show_sector=True, show_first_iter=True)
-        _fmt_active_block(f"PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BEAR", new_stk_r, show_sector=True, show_first_iter=True)
-        if win_idx_b or win_idx_r:
-            _fmt_active_block(f"ALL WINDOW SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BULL", win_idx_b, show_sector=False, show_first_iter=True)
-            _fmt_active_block(f"ALL WINDOW SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BEAR", win_idx_r, show_sector=False, show_first_iter=True)
-        return "\n".join(lines)
+        if EMAIL_ONLY_PURE_1ST_TIME_CONTENT:
+            lines.append(f"=== SYSTEM 3.0 [{mode}] — PURE 1ST-TIME POPUPS (NO *) REPORT ({w_start_s}..{w_end_s}) ===")
+            lines.append(
+                f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | "
+                f"NO_OF_ITERATIONS: {lookback_meta['num_iterations']} | "
+                f"TIME_OF_INTERVAL_TO_LOOKBACK: {lookback_meta['interval_min']}m | "
+                f"Prior Iterations Compared: [{prior_s}] vs Current [{w_end_s}]"
+            )
+            lines.append(f"Pure 1st-Time (No *) Stock Popups ({w_start_s}..{w_end_s}): ▲ {len(new_stk_b)} Bull / ▼ {len(new_stk_r)} Bear")
+            if iter_summary_s:
+                lines.append(f"Prior Iteration Totals: {iter_summary_s}")
+            lines.append("")
 
-    # Fallback if EMAIL_ONLY_WINDOW_POPUPS is False
+            _fmt_active_block(f"PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BULL", new_stk_b, show_sector=True, show_first_iter=True)
+            _fmt_active_block(f"PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BEAR", new_stk_r, show_sector=True, show_first_iter=True)
+            if new_idx_b or new_idx_r:
+                _fmt_active_block(f"PURE FIRST-TIME SECTORAL INDEX POPUPS (No Prior Stops, Anchor {w_start_s}..{w_end_s}) — BULL", new_idx_b, show_sector=False, show_first_iter=True)
+                _fmt_active_block(f"PURE FIRST-TIME SECTORAL INDEX POPUPS (No Prior Stops, Anchor {w_start_s}..{w_end_s}) — BEAR", new_idx_r, show_sector=False, show_first_iter=True)
+            return "\n".join(lines)
+
+        if EMAIL_ONLY_WINDOW_POPUPS:
+            lines.append(f"=== SYSTEM 3.0 [{mode}] — LOOKBACK WINDOW POPUPS REPORT ({w_start_s}..{w_end_s}) ===")
+            lines.append(
+                f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | "
+                f"NO_OF_ITERATIONS: {lookback_meta['num_iterations']} | "
+                f"TIME_OF_INTERVAL_TO_LOOKBACK: {lookback_meta['interval_min']}m | "
+                f"Prior Iterations Compared: [{prior_s}] vs Current [{w_end_s}]"
+            )
+            if iter_summary_s:
+                lines.append(f"Prior Iteration Stock Counts: {iter_summary_s}")
+            lines.append("")
+
+            _fmt_active_block(f"ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BULL", win_stk_b, show_sector=True, show_first_iter=True)
+            _fmt_active_block(f"ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BEAR", win_stk_r, show_sector=True, show_first_iter=True)
+            _fmt_active_block(f"PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BULL", new_stk_b, show_sector=True, show_first_iter=True)
+            _fmt_active_block(f"PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BEAR", new_stk_r, show_sector=True, show_first_iter=True)
+            if win_idx_b or win_idx_r:
+                _fmt_active_block(f"ALL WINDOW SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BULL", win_idx_b, show_sector=False, show_first_iter=True)
+                _fmt_active_block(f"ALL WINDOW SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BEAR", win_idx_r, show_sector=False, show_first_iter=True)
+            return "\n".join(lines)
+
+    # Fallback if both EMAIL_ONLY_PURE_1ST_TIME_CONTENT and EMAIL_ONLY_WINDOW_POPUPS are False
     lines.append(f"=== SYSTEM 3.0 INSTITUTIONAL VOLATILITY TRACKER [{mode}] ===")
     lines.append(f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Checkpoints: {len(checkpoints)}")
     lines.append("")
@@ -2157,11 +2203,11 @@ def build_email_and_attachment_html(
     Builds TWO HTML representations using a high-contrast, email-friendly
     Light Institutional Theme with explicit inline styles on every cell (`<td>` / `<th>`)
     so Gmail, Outlook, and Apple Mail NEVER render dark text on a dark background:
-    1. `email_inline_html`: Sends ONLY the Lookback Window Popups portion (`EMAIL_ONLY_WINDOW_POPUPS = True`),
-       including All Window Stock Popups (Bull & Bear), Pure First-Time Stock Popups (Bull & Bear),
-       Window Sectoral Index Popups, and native HTML5 `<details>/<summary>` Sector Accordions for Window Popups.
-    2. `attachment_js_html`: Standalone interactive HTML dashboard of the Window Popups with
-       one-click Sector filter pills.
+    - When `EMAIL_ONLY_PURE_1ST_TIME_CONTENT = True` (default), includes ONLY the
+      Pure 1st-Time (No *) tables and Pure 1st-Time Sector Accordions in the email
+      and HTML attachment.
+    - When `EMAIL_ONLY_PURE_1ST_TIME_CONTENT = False`, includes both All Window Popups
+      (including * re-anchors) and Pure 1st-Time Popups.
     """
     new_idx_b = (idx_popup_res or {}).get("new_bulls", [])
     new_idx_r = (idx_popup_res or {}).get("new_bears", [])
@@ -2306,34 +2352,46 @@ def build_email_and_attachment_html(
             f"{html.escape(title)}</div>"
         )
 
-    # Sector-wise accordions specifically for Window Popups
-    window_sector_accordions = []
+    # Determine which stock & index lists feed the email based on EMAIL_ONLY_PURE_1ST_TIME_CONTENT
+    email_stk_b = new_stk_b if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else win_stk_b
+    email_stk_r = new_stk_r if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else win_stk_r
+    email_idx_b = new_idx_b if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else win_idx_b
+    email_idx_r = new_idx_r if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else win_idx_r
+
+    # Sector-wise accordions scoped to the active email mode
+    sector_accordions = []
     all_sector_keys = list(SECTORAL_INDEX_CONFIG.keys()) + [DEFAULT_UNMAPPED_SECTOR]
+    accordion_label = "Pure 1st-Time Popups" if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else "Window Popups"
     for sec in all_sector_keys:
-        sb = [r for r in win_stk_b if r.get('Sector') == sec]
-        sr = [r for r in win_stk_r if r.get('Sector') == sec]
+        sb = [r for r in email_stk_b if r.get('Sector') == sec]
+        sr = [r for r in email_stk_r if r.get('Sector') == sec]
         if not sb and not sr:
             continue
-        window_sector_accordions.append(
+        sector_accordions.append(
             f"<details style='margin-bottom:8px;border:1px solid #cbd5e1;border-radius:6px;background-color:#ffffff;padding:8px 12px;'>"
             f"<summary style='cursor:pointer;font-weight:700;color:#0f172a;font-size:13px;outline:none;'>"
-            f"▶ {html.escape(sec)} — Window Popups "
+            f"▶ {html.escape(sec)} — {accordion_label} "
             f"(<span style='color:#15803d;'>Bull: {len(sb)}</span> | <span style='color:#b91c1c;'>Bear: {len(sr)}</span>)"
             f"</summary>"
             f"<div style='padding-top:10px;'>"
-            + (_sec_banner(f"🔥 {sec} — WINDOW BULL POPUPS ({len(sb)})", True) + _table_active_html(sb, 'BULL', show_sec=False, show_first_iter=True) if sb else "")
-            + (_sec_banner(f"🩸 {sec} — WINDOW BEAR POPUPS ({len(sr)})", False) + _table_active_html(sr, 'BEAR', show_sec=False, show_first_iter=True) if sr else "")
+            + (_sec_banner(f"🔥 {sec} — {'PURE 1ST-TIME' if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else 'WINDOW'} BULL POPUPS ({len(sb)})", True) + _table_active_html(sb, 'BULL', show_sec=False, show_first_iter=True) if sb else "")
+            + (_sec_banner(f"🩸 {sec} — {'PURE 1ST-TIME' if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else 'WINDOW'} BEAR POPUPS ({len(sr)})", False) + _table_active_html(sr, 'BEAR', show_sec=False, show_first_iter=True) if sr else "")
             + f"</div></details>"
         )
 
-    idx_window_block_html = ""
-    if win_idx_b or win_idx_r:
-        idx_window_block_html = (
-            f"<h3 style='color:#0f172a;margin:18px 0 8px 0;font-size:15px;'>🏛️ WINDOW SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s})</h3>"
-            + (_sec_banner(f"🏛️⏱️🔥 ALL WINDOW SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}) — BULL ({len(win_idx_b)})", True)
-               + _table_active_html(win_idx_b, 'BULL', show_sec=False, show_first_iter=True) if win_idx_b else "")
-            + (_sec_banner(f"🏛️⏱️🩸 ALL WINDOW SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}) — BEAR ({len(win_idx_r)})", False)
-               + _table_active_html(win_idx_r, 'BEAR', show_sec=False, show_first_iter=True) if win_idx_r else "")
+    idx_block_html = ""
+    if email_idx_b or email_idx_r:
+        idx_hdr_title = (
+            f"🏛️ PURE FIRST-TIME SECTORAL INDEX POPUPS (No Prior Stops, Anchor {w_start_s}..{w_end_s})"
+            if EMAIL_ONLY_PURE_1ST_TIME_CONTENT
+            else f"🏛️ WINDOW SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s})"
+        )
+        idx_block_html = (
+            f"<h3 style='color:#0f172a;margin:18px 0 8px 0;font-size:15px;'>{html.escape(idx_hdr_title)}</h3>"
+            + (_sec_banner(f"🏛️🆕🔥 SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}) — BULL ({len(email_idx_b)})", True)
+               + _table_active_html(email_idx_b, 'BULL', show_sec=False, show_first_iter=True) if email_idx_b else "")
+            + (_sec_banner(f"🏛️🆕🩸 SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}) — BEAR ({len(email_idx_r)})", False)
+               + _table_active_html(email_idx_r, 'BEAR', show_sec=False, show_first_iter=True) if email_idx_r else "")
         )
 
     light_css = (
@@ -2343,11 +2401,47 @@ def build_email_and_attachment_html(
         ".clr{background-color:#dc2626;color:#ffffff;border:none;padding:6px 14px;border-radius:4px;font-weight:700;cursor:pointer;}"
     )
 
+    if EMAIL_ONLY_PURE_1ST_TIME_CONTENT:
+        card_title = f"📡 SYSTEM 3.0 [{html.escape(mode)}] — PURE 1ST-TIME POPUPS (NO *) ({w_start_s}..{w_end_s})"
+        counts_line_html = (
+            f"<b>Pure 1st-Time (No *) ({w_start_s}..{w_end_s}):</b> "
+            f"<span style='color:#15803d;font-weight:700;'>▲ {len(new_stk_b)} Bull</span> &nbsp;/&nbsp; "
+            f"<span style='color:#b91c1c;font-weight:700;'>▼ {len(new_stk_r)} Bear</span>"
+        )
+        main_tables_html = (
+            f"<h3 style='color:#0f172a;margin:16px 0 8px 0;font-size:15px;'>🆕 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s})</h3>"
+            f"{_sec_banner(f'🆕🔥 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BULL ({len(new_stk_b)})', True)}"
+            f"{_table_active_html(new_stk_b, 'BULL', show_sec=True, show_first_iter=True)}"
+            f"{_sec_banner(f'🆕🩸 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BEAR ({len(new_stk_r)})', False)}"
+            f"{_table_active_html(new_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}"
+        )
+    else:
+        card_title = f"📡 SYSTEM 3.0 [{html.escape(mode)}] — LOOKBACK WINDOW POPUPS ({w_start_s}..{w_end_s})"
+        counts_line_html = (
+            f"<b>Window Stock Popups ({w_start_s}..{w_end_s}):</b> "
+            f"<span style='color:#15803d;font-weight:700;'>▲ {len(win_stk_b)} Bull</span> &nbsp;/&nbsp; "
+            f"<span style='color:#b91c1c;font-weight:700;'>▼ {len(win_stk_r)} Bear</span> &nbsp;&nbsp;|&nbsp;&nbsp; "
+            f"<b>Pure 1st-Time (No *):</b> "
+            f"<span style='color:#15803d;font-weight:700;'>▲ {len(new_stk_b)} Bull</span> &nbsp;/&nbsp; "
+            f"<span style='color:#b91c1c;font-weight:700;'>▼ {len(new_stk_r)} Bear</span>"
+        )
+        main_tables_html = (
+            f"<h3 style='color:#0f172a;margin:16px 0 8px 0;font-size:15px;'>⏱️ ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors)</h3>"
+            f"{_sec_banner(f'⏱️🔥 ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BULL ({len(win_stk_b)})', True)}"
+            f"{_table_active_html(win_stk_b, 'BULL', show_sec=True, show_first_iter=True)}"
+            f"{_sec_banner(f'⏱️🩸 ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BEAR ({len(win_stk_r)})', False)}"
+            f"{_table_active_html(win_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}"
+            f"<h3 style='color:#0f172a;margin:20px 0 8px 0;font-size:15px;'>🆕 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s})</h3>"
+            f"{_sec_banner(f'🆕🔥 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BULL ({len(new_stk_b)})', True)}"
+            f"{_table_active_html(new_stk_b, 'BULL', show_sec=True, show_first_iter=True)}"
+            f"{_sec_banner(f'🆕🩸 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BEAR ({len(new_stk_r)})', False)}"
+            f"{_table_active_html(new_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}"
+        )
+
     header_card_html = (
         f"<div style='background-color:#ffffff;border:1px solid #cbd5e1;border-left:6px solid #2563eb;"
         f"border-radius:6px;padding:14px 18px;margin-bottom:16px;'>"
-        f"<div style='font-size:17px;font-weight:800;color:#0f172a;margin-bottom:6px;'>"
-        f"📡 SYSTEM 3.0 [{html.escape(mode)}] — LOOKBACK WINDOW POPUPS ({w_start_s}..{w_end_s})</div>"
+        f"<div style='font-size:17px;font-weight:800;color:#0f172a;margin-bottom:6px;'>{card_title}</div>"
         f"<div style='color:#334155;font-size:13px;margin-bottom:4px;'>"
         f"<b>Target Snapshot:</b> {cutoff_dt.strftime('%Y-%m-%d %H:%M')} &nbsp;|&nbsp; "
         f"<b>NO_OF_ITERATIONS:</b> {lookback_meta['num_iterations'] if lookback_meta else 0} &nbsp;|&nbsp; "
@@ -2355,12 +2449,7 @@ def build_email_and_attachment_html(
         f"<b>Anchor Window:</b> <span style='background-color:#e0f2fe;color:#0369a1;padding:2px 6px;border-radius:4px;font-weight:700;'>{w_start_s} to {w_end_s}</span> &nbsp;|&nbsp; "
         f"<b>Prior Runs Compared:</b> [{html.escape(prior_s)}] vs [{w_end_s}]</div>"
         f"<div style='color:#334155;font-size:12px;'>"
-        f"<b>Window Stock Popups ({w_start_s}..{w_end_s}):</b> "
-        f"<span style='color:#15803d;font-weight:700;'>▲ {len(win_stk_b)} Bull</span> &nbsp;/&nbsp; "
-        f"<span style='color:#b91c1c;font-weight:700;'>▼ {len(win_stk_r)} Bear</span> &nbsp;&nbsp;|&nbsp;&nbsp; "
-        f"<b>Pure 1st-Time (No *):</b> "
-        f"<span style='color:#15803d;font-weight:700;'>▲ {len(new_stk_b)} Bull</span> &nbsp;/&nbsp; "
-        f"<span style='color:#b91c1c;font-weight:700;'>▼ {len(new_stk_r)} Bear</span>"
+        f"{counts_line_html}"
         + (f"<br><b>Prior Iteration Totals:</b> {iter_summary_s}" if iter_summary_s else "")
         + f"</div></div>"
     )
@@ -2370,54 +2459,36 @@ def build_email_and_attachment_html(
         f"<body style='background-color:#f1f5f9;color:#0f172a;font-family:\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif;font-size:13px;margin:0;padding:16px;'>"
         f"<div style='max-width:1280px;margin:0 auto;'>"
         f"{header_card_html}"
-        f"<h3 style='color:#0f172a;margin:16px 0 8px 0;font-size:15px;'>⏱️ ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors)</h3>"
-        f"{_sec_banner(f'⏱️🔥 ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BULL ({len(win_stk_b)})', True)}"
-        f"{_table_active_html(win_stk_b, 'BULL', show_sec=True, show_first_iter=True)}"
-        f"{_sec_banner(f'⏱️🩸 ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BEAR ({len(win_stk_r)})', False)}"
-        f"{_table_active_html(win_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}"
-        f"<h3 style='color:#0f172a;margin:20px 0 8px 0;font-size:15px;'>🆕 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s})</h3>"
-        f"{_sec_banner(f'🆕🔥 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BULL ({len(new_stk_b)})', True)}"
-        f"{_table_active_html(new_stk_b, 'BULL', show_sec=True, show_first_iter=True)}"
-        f"{_sec_banner(f'🆕🩸 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BEAR ({len(new_stk_r)})', False)}"
-        f"{_table_active_html(new_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}"
-        f"{idx_window_block_html}"
+        f"{main_tables_html}"
+        f"{idx_block_html}"
         + (
-            f"<h3 style='color:#0f172a;margin:20px 0 8px 0;font-size:15px;'>📂 WINDOW POPUPS GROUPED BY SECTOR (Click Any Sector to Expand)</h3>"
-            f"{''.join(window_sector_accordions)}"
-            if window_sector_accordions else ""
+            f"<h3 style='color:#0f172a;margin:20px 0 8px 0;font-size:15px;'>📂 {accordion_label.upper()} GROUPED BY SECTOR (Click Any Sector to Expand)</h3>"
+            f"{''.join(sector_accordions)}"
+            if sector_accordions else ""
         )
         + f"</div></body></html>"
     )
 
-    active_popup_sectors = sorted({r.get('Sector', DEFAULT_UNMAPPED_SECTOR) for r in (win_stk_b + win_stk_r)})
+    active_popup_sectors = sorted({r.get('Sector', DEFAULT_UNMAPPED_SECTOR) for r in (email_stk_b + email_stk_r)})
     pills_js_html = "".join(
         f"<button class='pill' data-sec='{html.escape(s)}' onclick=\"filterBySector('{html.escape(s)}')\">{html.escape(s)}</button>"
         for s in active_popup_sectors
     )
 
     attachment_js_html = (
-        f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>System 3.0 Window Popups ({w_start_s}..{w_end_s})</title><style>{light_css}</style></head>"
+        f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>System 3.0 {accordion_label} ({w_start_s}..{w_end_s})</title><style>{light_css}</style></head>"
         f"<body style='background-color:#f1f5f9;color:#0f172a;font-family:\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif;font-size:13px;margin:0;padding:16px;'>"
         f"<div style='max-width:1280px;margin:0 auto;'>"
         f"<div style='position:sticky;top:0;background-color:#ffffff;padding:12px 16px;border:1px solid #cbd5e1;border-radius:6px;margin-bottom:14px;box-shadow:0 2px 4px rgba(0,0,0,0.05);'>"
         f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;'>"
-        f"<b style='font-size:15px;color:#0f172a;'>📡 SYSTEM 3.0 [{html.escape(mode)}] — Window Popups ({w_start_s}..{w_end_s}) @ {cutoff_dt.strftime('%Y-%m-%d %H:%M')}</b>"
-        f"<div><span id='statusBadge' style='color:#2563eb;margin-right:10px;font-weight:700;'>SHOWING ALL WINDOW POPUPS</span>"
+        f"<b style='font-size:15px;color:#0f172a;'>📡 SYSTEM 3.0 [{html.escape(mode)}] — {accordion_label} ({w_start_s}..{w_end_s}) @ {cutoff_dt.strftime('%Y-%m-%d %H:%M')}</b>"
+        f"<div><span id='statusBadge' style='color:#2563eb;margin-right:10px;font-weight:700;'>SHOWING ALL {accordion_label.upper()}</span>"
         f"<button class='clr' onclick='clearFilter()'>SHOW ALL</button></div></div>"
         f"<div>{pills_js_html}</div></div>"
         f"{header_card_html}"
         f"<div id='popupContainer'>"
-        f"<h3 style='color:#0f172a;margin:16px 0 8px 0;font-size:15px;'>⏱️ ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors)</h3>"
-        f"{_sec_banner(f'⏱️🔥 ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BULL ({len(win_stk_b)})', True)}"
-        f"{_table_active_html(win_stk_b, 'BULL', show_sec=True, show_first_iter=True)}"
-        f"{_sec_banner(f'⏱️🩸 ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BEAR ({len(win_stk_r)})', False)}"
-        f"{_table_active_html(win_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}"
-        f"<h3 style='color:#0f172a;margin:20px 0 8px 0;font-size:15px;'>🆕 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s})</h3>"
-        f"{_sec_banner(f'🆕🔥 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BULL ({len(new_stk_b)})', True)}"
-        f"{_table_active_html(new_stk_b, 'BULL', show_sec=True, show_first_iter=True)}"
-        f"{_sec_banner(f'🆕🩸 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BEAR ({len(new_stk_r)})', False)}"
-        f"{_table_active_html(new_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}"
-        f"{idx_window_block_html}"
+        f"{main_tables_html}"
+        f"{idx_block_html}"
         f"</div>"
         f"<script>"
         f"function filterBySector(sec){{"
@@ -2429,7 +2500,7 @@ def build_email_and_attachment_html(
         f"function clearFilter(){{"
         f"document.querySelectorAll('#popupContainer tbody tr').forEach(r=>{{r.style.display='';}});"
         f"document.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));"
-        f"document.getElementById('statusBadge').textContent='SHOWING ALL WINDOW POPUPS';"
+        f"document.getElementById('statusBadge').textContent='SHOWING ALL {accordion_label.upper()}';"
         f"}}"
         f"</script></div></body></html>"
     )
@@ -2490,7 +2561,7 @@ def _send_email_message(subject, plain_body, html_body=None, attachment_html=Non
                 server.starttls()
                 server.login(sender, password)
                 server.send_message(msg)
-        print(f"   {COLOR_GREEN_FG}📧 [{tag}] Window Popups email sent to {recipient} via {smtp_server}:{port}{COLOR_RESET}")
+        print(f"   {COLOR_GREEN_FG}📧 [{tag}] Email sent to {recipient} via {smtp_server}:{port}{COLOR_RESET}")
         return True
     except Exception as e:
         print(f"   {COLOR_YELLOW}[{tag}] Failed to send email ({type(e).__name__}: {e}){COLOR_RESET}")
@@ -2698,7 +2769,7 @@ def run_screener(
         stock_popup_res=stock_popup_res
     )
 
-    # 2. Build Window-Popups-Only Email Content with Friendly High-Contrast Light Theme & Send via SMTP Secrets
+    # 2. Build Email Content & Evaluate Pure 1st-Time Email Gate
     email_inline_html, attachment_js_html = build_email_and_attachment_html(
         mode, cutoff_dt, checkpoints,
         idx_bulls, idx_bears, idx_grave,
@@ -2717,32 +2788,47 @@ def run_screener(
             print(f"   {COLOR_YELLOW}» Could not write local HTML file ({e}){COLOR_RESET}")
 
     if SEND_DASHBOARD_EMAIL:
-        plain_text_report = build_full_untruncated_plain_text(
-            mode, cutoff_dt, checkpoints,
-            idx_bulls, idx_bears, idx_grave,
-            stock_bulls, stock_bears, stock_grave,
-            lookback_meta=lookback_meta,
-            idx_popup_res=idx_popup_res,
-            stock_popup_res=stock_popup_res
-        )
         new_b_cnt = len(stock_popup_res.get("new_bulls", []))
         new_r_cnt = len(stock_popup_res.get("new_bears", []))
         win_b_cnt = len(stock_popup_res.get("window_first_bulls", []))
         win_r_cnt = len(stock_popup_res.get("window_first_bears", []))
-        w_start_s = lookback_meta["window_start_dt"].strftime("%H:%M") if (lookback_meta and lookback_meta.get("enabled")) else ""
-        w_end_s = lookback_meta["window_end_dt"].strftime("%H:%M") if (lookback_meta and lookback_meta.get("enabled")) else cutoff_dt.strftime("%H:%M")
-        email_subject = (
-            f"[System3 {mode}] Window Popups ({w_start_s}..{w_end_s}) | "
-            f"All Window: {win_b_cnt}▲ {win_r_cnt}▼ | "
-            f"Pure 1st-Time: {new_b_cnt}▲ {new_r_cnt}▼"
-        )
-        _send_email_message(
-            subject=email_subject,
-            plain_body=plain_text_report,
-            html_body=email_inline_html,
-            attachment_html=attachment_js_html,
-            tag="dashboard-email"
-        )
+        pure_1st_time_total = new_b_cnt + new_r_cnt
+
+        if EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME_GT_0 and pure_1st_time_total <= 0:
+            print(
+                f"   {COLOR_YELLOW}📧 [dashboard-email] Skipped sending email: "
+                f"Pure 1st-Time (No *) popups = 0 (▲{new_b_cnt} ▼{new_r_cnt}) "
+                f"[EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME_GT_0=True].{COLOR_RESET}"
+            )
+        else:
+            plain_text_report = build_full_untruncated_plain_text(
+                mode, cutoff_dt, checkpoints,
+                idx_bulls, idx_bears, idx_grave,
+                stock_bulls, stock_bears, stock_grave,
+                lookback_meta=lookback_meta,
+                idx_popup_res=idx_popup_res,
+                stock_popup_res=stock_popup_res
+            )
+            w_start_s = lookback_meta["window_start_dt"].strftime("%H:%M") if (lookback_meta and lookback_meta.get("enabled")) else ""
+            w_end_s = lookback_meta["window_end_dt"].strftime("%H:%M") if (lookback_meta and lookback_meta.get("enabled")) else cutoff_dt.strftime("%H:%M")
+            if EMAIL_ONLY_PURE_1ST_TIME_CONTENT:
+                email_subject = (
+                    f"[System3 {mode}] Pure 1st-Time (No *) ({w_start_s}..{w_end_s}): "
+                    f"{new_b_cnt}▲ {new_r_cnt}▼"
+                )
+            else:
+                email_subject = (
+                    f"[System3 {mode}] Window Popups ({w_start_s}..{w_end_s}) | "
+                    f"All Window: {win_b_cnt}▲ {win_r_cnt}▼ | "
+                    f"Pure 1st-Time: {new_b_cnt}▲ {new_r_cnt}▼"
+                )
+            _send_email_message(
+                subject=email_subject,
+                plain_body=plain_text_report,
+                html_body=email_inline_html,
+                attachment_html=attachment_js_html,
+                tag="dashboard-email"
+            )
 
     _print_error_summary()
     print(f"\n⏱️ Tracker sync completed in {(time.time() - t_start):.2f} seconds ({sum(l.total_calls for l in LIMITERS.values())} API calls).\n")
@@ -2770,8 +2856,34 @@ def parse_args():
     p.add_argument("--no-iteration-lookback", action="store_true", help="Disable multi-iteration first-time popup comparison.")
 
     # --- Email & Sectoral Controls ---
-    p.add_argument("--send-email", dest="send_email", action="store_true", default=SEND_DASHBOARD_EMAIL, help="Send window popups email via SMTP secrets.")
+    p.add_argument("--send-email", dest="send_email", action="store_true", default=SEND_DASHBOARD_EMAIL, help="Send email via SMTP secrets.")
     p.add_argument("--no-send-email", dest="send_email", action="store_false", help="Disable sending email.")
+    p.add_argument(
+        "--email-only-when-pure-1st-time",
+        dest="email_only_when_pure_1st_time",
+        action="store_true",
+        default=_parse_bool_env(ENV_EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME, EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME_GT_0),
+        help="Send email ONLY if Pure 1st-Time (No *) popup count > 0."
+    )
+    p.add_argument(
+        "--email-always-send",
+        dest="email_only_when_pure_1st_time",
+        action="store_false",
+        help="Send email even if Pure 1st-Time (No *) count is 0."
+    )
+    p.add_argument(
+        "--email-only-pure-1st-time-content",
+        dest="email_only_pure_1st_time_content",
+        action="store_true",
+        default=_parse_bool_env(ENV_EMAIL_ONLY_PURE_1ST_TIME_CONTENT, EMAIL_ONLY_PURE_1ST_TIME_CONTENT),
+        help="Send ONLY the Pure 1st-Time (No *) part in the email."
+    )
+    p.add_argument(
+        "--email-all-window-popups-content",
+        dest="email_only_pure_1st_time_content",
+        action="store_false",
+        help="Include both All Window Popups (with *) and Pure 1st-Time Popups in the email."
+    )
     p.add_argument("--save-html", dest="save_html", action="store_true", default=SAVE_LOCAL_HTML_FILE, help="Save local HTML file to disk.")
     p.add_argument("--no-sector-indices", action="store_true", help="Disable Stage 1 Sectoral Index evaluation.")
     p.add_argument("--sector", type=str, default="", help="Filter console Stock tables to a specific Sectoral Index.")
@@ -2820,6 +2932,8 @@ if __name__ == "__main__":
     args = parse_args()
 
     SEND_DASHBOARD_EMAIL = args.send_email
+    EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME_GT_0 = args.email_only_when_pure_1st_time
+    EMAIL_ONLY_PURE_1ST_TIME_CONTENT = args.email_only_pure_1st_time_content
     SAVE_LOCAL_HTML_FILE = args.save_html
     MIN1_HISTORY_DAYS = args.history_days
     OPT_MIN_PRICE = args.opt_min_price
