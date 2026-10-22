@@ -1,16 +1,16 @@
 #!/usr/bin/env python3
 """
-Strict Institutional Volatility Tracker (Upstox) - System 3.0 (Email Sectoral Accordion & Zero-Truncation Edition)
+Strict Institutional Volatility Tracker (Upstox) - System 3.0 (Window-Popups Email & High-Contrast Light Theme Edition)
 + Zero Hardcoded Logic: All indicator periods, multipliers, stop ratchets, email toggles, and sector weights live in Section 0.
 + Multi-Index Highest-Weightage Resolver: Assigns dual-listed stocks to the sectoral index where they carry the highest %.
 + Sectoral Index 3-Lock Engine: Evaluates Sectoral Indices first (Top Bulls, Top Bears, Graveyard) before stocks.
 + In-Memory Multi-Iteration First-Time Popup Engine (Zero File/JSON Storage):
   - Evaluates NO_OF_ITERATIONS prior snapshots spaced by TIME_OF_INTERVAL_TO_LOOKBACK minutes purely in memory.
-  - Compares current snapshot (e.g. 09:30 or 11:04) against prior iterations (e.g. 09:25, 09:20, 09:15 or 10:49, 10:34, 10:19).
-  - Segregates Bull & Bear setups popping up for the first time with Anchor within the lookback window into a new resultset without touching existing resultsets.
-+ Full Email Delivery (Zero Truncation):
-  - Reads SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL, SMTP_SERVER, SMTP_PORT, TRACK_SYMBOL, UPSTOX_ACCESS_TOKEN.
-  - Sends complete, untruncated Plain-Text + Native HTML5 Expand/Collapse Sectoral Accordions + Attached Interactive HTML.
+  - Compares current snapshot (e.g. 12:35) against prior iterations (e.g. 12:30, 12:25, 12:20).
+  - Segregates Bull & Bear setups popping up with Anchor within the lookback window into a dedicated resultset without touching existing console resultsets.
++ Focused Window-Popups Email Delivery with Friendly High-Contrast Light Institutional Styling:
+  - Sends ONLY the Lookback Window Popups portion in Email (`EMAIL_ONLY_WINDOW_POPUPS = True`).
+  - Uses explicit inline cell colors on a crisp light theme so Gmail/Outlook/Apple Mail never render dark-on-dark text.
 """
 import os
 import sys
@@ -43,17 +43,18 @@ warnings.filterwarnings("ignore")
 # ==============================================================================
 
 # --- 0.1 EMAIL & GITHUB SECRET CONFIGURATION ---
-SEND_DASHBOARD_EMAIL = True             # Master toggle: Send full dashboard email after every run
+SEND_DASHBOARD_EMAIL = True             # Master toggle: Send email after every run
+EMAIL_ONLY_WINDOW_POPUPS = True         # True = Send ONLY the Lookback Window Popups portion in Email (not the full session dump)
 SEND_TRACK_ALERT_EMAIL = True           # Master toggle: Send state-change alert email when tracking a symbol
-EMAIL_ATTACH_INTERACTIVE_HTML = True    # Attach full JS click-to-filter HTML file to the email as well
-EMAIL_ATTACHMENT_FILENAME = "System3_Sector_Dashboard.html"
+EMAIL_ATTACH_INTERACTIVE_HTML = True    # Attach interactive HTML file of the report to the email
+EMAIL_ATTACHMENT_FILENAME = "System3_Window_Popups_Dashboard.html"
 SAVE_LOCAL_HTML_FILE = False            # False = Do not save local HTML file to disk (send via email instead)
 HTML_DASHBOARD_PATH = "system3_dashboard.html"
 
 # Zero-Truncation Email Controls (0 = Unlimited / Show Every Single Row)
-EMAIL_MAX_BUYERS = 0                    # 0 = Show ALL surviving Bull setups in email without truncation
-EMAIL_MAX_SELLERS = 0                   # 0 = Show ALL surviving Bear setups in email without truncation
-EMAIL_MAX_GRAVEYARD = 0                 # 0 = Show ALL Graveyard rows in email without truncation
+EMAIL_MAX_BUYERS = 0                    # 0 = Show ALL surviving Bull setups without truncation
+EMAIL_MAX_SELLERS = 0                   # 0 = Show ALL surviving Bear setups without truncation
+EMAIL_MAX_GRAVEYARD = 0                 # 0 = Show ALL Graveyard rows without truncation
 EMAIL_CLIP_SYMBOLS = False              # False = Never truncate/clip long symbol names in email
 
 # Environment Variable Names (Matches GitHub Repository Secrets)
@@ -104,7 +105,7 @@ SESSION_BUCKET_MULT = 10000             # Multiplier for isolating session bucke
 
 # --- 0.3B IN-MEMORY MULTI-ITERATION FIRST-TIME POPUP LOOKBACK (ZERO FILE STORAGE) ---
 ENABLE_ITERATION_LOOKBACK = True        # Master toggle: Compare current run against N prior iterations in memory
-NO_OF_ITERATIONS = 3                    # Number of prior lookback iterations (e.g., 3 -> 09:25, 09:20, 09:15 for a 09:30 run)
+NO_OF_ITERATIONS = 3                    # Number of prior lookback iterations (e.g., 3 -> 12:30, 12:25, 12:20 for a 12:35 run)
 TIME_OF_INTERVAL_TO_LOOKBACK = 5        # Lookback interval in minutes between iterations (e.g., 5 mins)
 LOOKBACK_ITERATIONS = NO_OF_ITERATIONS  # Alias for convenience
 LOOKBACK_INTERVAL_MIN = TIME_OF_INTERVAL_TO_LOOKBACK
@@ -1475,7 +1476,6 @@ def process_stock_checkpoints(args):
                 extra_out.append((l_cp, "ok", by_cp_row[l_cp]))
                 continue
             if l_cp == session_open_dt:
-                # At 09:15 session open, include the 09:15 1-minute bar if present
                 l_end = int(np.searchsorted(S['dt'], np.datetime64(l_cp), side='right'))
             else:
                 l_end = int(np.searchsorted(S['dt'], np.datetime64(l_cp), side='left'))
@@ -1653,10 +1653,10 @@ def segregate_and_rank_buckets(by_symbol_map):
 # ==============================================================================
 def compute_lookback_iteration_schedule(cutoff_dt, num_iterations=None, interval_min=None):
     """
-    Given a snapshot `cutoff_dt` (e.g. 09:30 or 11:04), `NO_OF_ITERATIONS` (e.g. 3),
-    and `TIME_OF_INTERVAL_TO_LOOKBACK` (e.g. 5 or 15 mins):
-      - Prior iteration cutoffs: [T - 1*step, T - 2*step, ..., T - N*step] (clamped to >= 09:15 session open)
-      - Window for Anchor Time validation: [window_start_dt, cutoff_dt] (e.g. 09:15..09:30 or 10:19..11:04)
+    Given a snapshot `cutoff_dt` (e.g. 12:35), `NO_OF_ITERATIONS` (e.g. 3),
+    and `TIME_OF_INTERVAL_TO_LOOKBACK` (e.g. 5 mins):
+      - Prior iteration cutoffs: [12:30, 12:25, 12:20] (clamped to >= 09:15 session open)
+      - Window for Anchor Time validation: [12:20, 12:35]
     """
     cfg_iters, cfg_interval = get_lookback_iterations_config()
     n_iters = cfg_iters if num_iterations is None else max(0, int(num_iterations))
@@ -1671,7 +1671,6 @@ def compute_lookback_iteration_schedule(cutoff_dt, num_iterations=None, interval
         if it_dt >= session_open_dt and it_dt not in prior_iter_dts:
             prior_iter_dts.append(it_dt)
 
-    # Sort chronologically (e.g. [10:19, 10:34, 10:49]) for sequential first-seen tracking
     prior_iter_dts_chrono = sorted(prior_iter_dts)
     return {
         "enabled": bool(ENABLE_ITERATION_LOOKBACK and n_iters > 0),
@@ -1703,29 +1702,16 @@ def evaluate_first_time_popups_in_memory(
     """
     Purely in-memory comparison across lookback iterations (zero JSON/file storage):
     1. Evaluates `segregate_and_rank_buckets` for each prior lookback iteration in
-       `prior_iter_dts_chrono` (e.g. [09:15, 09:20, 09:25] or [10:19, 10:34, 10:49]).
-    2. Compares the current run's surviving `current_bulls` and `current_bears`
-       (e.g. 09:30 or 11:04) against the prior iteration results:
-       - Requires `ActiveAnchor` time to be within `[window_start_dt, window_end_dt]`
-         (e.g. 09:15..09:30 or 10:19..11:04).
-       - Note: An anchor formed inside the window (e.g. at 10:22 inside 10:19..11:04)
-         naturally appears at 10:34 and remains active with that SAME anchor at 10:49 and 11:04.
-         Therefore, holding the SAME anchor (`anc == curr_anchor`) across subsequent
-         iterations inside the window is the continuation of that single popup, NOT a prior
-         disqualifying episode!
+       `prior_iter_dts_chrono` (e.g. [12:20, 12:25, 12:30]).
+    2. Compares the current run's surviving `current_bulls` and `current_bears` (e.g. 12:35)
+       against the prior iteration results:
+       - Requires `ActiveAnchor` time to be within `[window_start_dt, window_end_dt]` (e.g. 12:20..12:35).
+       - Holding the SAME anchor (`anc == curr_anchor`) across subsequent iterations inside the
+         window is recognized as the continuation of that single popup, recording its earliest
+         appearance as `FirstPopupIter` (e.g. `12:25` or `12:35`).
        - Segregates into:
-         a) `new_bulls` / `new_bears` (First-Time Popups — Zero Prior Same-Direction Stops, No `*`):
-            Setups with `ActiveAnchor` in `[window_start_dt, window_end_dt]`, `PriorStops == 0`
-            (no `*` re-entry badge in the same direction; opposite-direction kills earlier in the
-            day do NOT disqualify a fresh reversal!), and never seen with a different anchor in
-            any prior iteration.
-            (e.g. at 11:04: NIFTY 22550 CE @ 10:22, SENSEX 73100 PE @ 10:22, SENSEX 73300 CE @ 10:22, SENSEX 73400 CE @ 10:22)
-         b) `window_first_bulls` / `window_first_bears` (All Window Popups in `window_start..window_end`, Including `*` Re-Anchors):
-            All surviving setups at `window_end_dt` whose `ActiveAnchor` formed within
-            `[window_start_dt, window_end_dt]` (both fresh `PriorStops == 0` anchors like `10:22`
-            and new `*` anchors formed inside the window like `10:58*`, `10:59*`, `10:43*`),
-            tagged with `FirstPopupIter` (exact iteration where this anchor first popped up)
-            and `PopupType` (`"1ST-TIME"` vs `"1ST-IN-ITERS*"` vs `"RE-ANCHOR*"`).
+         a) `new_bulls` / `new_bears` (Pure First-Time Popups — Zero Prior Same-Direction Stops, No `*`)
+         b) `window_first_bulls` / `window_first_bears` (All Window Popups in `window_start..window_end`, Including `*` Re-Anchors)
     """
     if not lookback_meta or not lookback_meta.get("enabled"):
         return {
@@ -1740,7 +1726,6 @@ def evaluate_first_time_popups_in_memory(
     w_end = lookback_meta["window_end_dt"]
     prior_dts = lookback_meta["prior_iter_dts_chrono"]
 
-    # Map: sym -> list of (iter_label, active_anchor_str) in prior iterations
     prior_bull_appearances = {}
     prior_bear_appearances = {}
     iter_stats = []
@@ -1801,12 +1786,9 @@ def evaluate_first_time_popups_in_memory(
                 out_pure_first.append(row_copy)
                 out_all_window.append(row_copy)
             elif len(other_anc_iters) == 0:
-                # Never appeared in any prior lookback iteration [e.g. 10:19, 10:34, 10:49],
-                # though it had an earlier stop prior to the lookback window
                 row_copy['PopupType'] = "1ST-IN-ITERS*"
                 out_all_window.append(row_copy)
             else:
-                # Had an older anchor in a prior lookback iteration that stopped out and re-anchored inside the window
                 row_copy['PopupType'] = "RE-ANCHOR*"
                 out_all_window.append(row_copy)
 
@@ -1832,7 +1814,7 @@ def _format_val(v, dir_color):
     return f"{dir_color}{v}{COLOR_RESET}" if v > 0 else f"{COLOR_DIM}{v}{COLOR_RESET}"
 
 # ==============================================================================
-# 4. CONSOLE RENDERER & UNTRUNCATED EMAIL / ACCORDION HTML ENGINE
+# 4. CONSOLE RENDERER & FOCUSED WINDOW-POPUPS EMAIL / LIGHT-THEME HTML ENGINE
 # ==============================================================================
 def render_console_dashboard(
     mode, cutoff_dt, checkpoints,
@@ -2057,31 +2039,38 @@ def build_full_untruncated_plain_text(
     stock_popup_res=None
 ):
     """
-    Generates the 100% untruncated Plain-Text email body containing:
-    1. Stage 1: Sectoral Indices (Top Bulls, Top Bears, Graveyard) [Untouched]
-    2. Stage 2: Sector-by-Sector Breakdown (Each Sectoral Index followed by its Bull, Bear, and Graveyard stocks) [Untouched]
-    3. Stage 3: Complete All-Stocks Master Tables (All Top Bulls, All Top Bears, All Graveyard rows) [Untouched]
-    4. Stage 4: New Segregated First-Time Popup Resultset (Lookback Iteration Comparison) [Added]
+    Generates the Plain-Text email body.
+    When `EMAIL_ONLY_WINDOW_POPUPS = True` (default), sends ONLY the Lookback Window Popups
+    portion (All Window Popups & Pure First-Time Popups for Stocks and Sectoral Indices)
+    instead of dumping the entire session's tables.
     """
+    new_idx_b = (idx_popup_res or {}).get("new_bulls", [])
+    new_idx_r = (idx_popup_res or {}).get("new_bears", [])
+    win_idx_b = (idx_popup_res or {}).get("window_first_bulls", [])
+    win_idx_r = (idx_popup_res or {}).get("window_first_bears", [])
+    new_stk_b = (stock_popup_res or {}).get("new_bulls", [])
+    new_stk_r = (stock_popup_res or {}).get("new_bears", [])
+    win_stk_b = (stock_popup_res or {}).get("window_first_bulls", [])
+    win_stk_r = (stock_popup_res or {}).get("window_first_bears", [])
+
+    popup_rows = new_idx_b + new_idx_r + win_idx_b + win_idx_r + new_stk_b + new_stk_r + win_stk_b + win_stk_r
     e_bulls = stock_bulls if EMAIL_MAX_BUYERS <= 0 else stock_bulls[:EMAIL_MAX_BUYERS]
     e_bears = stock_bears if EMAIL_MAX_SELLERS <= 0 else stock_bears[:EMAIL_MAX_SELLERS]
     e_grave = stock_grave if EMAIL_MAX_GRAVEYARD <= 0 else stock_grave[:EMAIL_MAX_GRAVEYARD]
 
-    all_rows = idx_bulls + idx_bears + idx_grave + e_bulls + e_bears + e_grave
-    sym_w = max(MIN_SYMBOL_WIDTH, max((len(r['Symbol']) for r in all_rows), default=MIN_SYMBOL_WIDTH))
-    sec_w = max(SECTOR_COL_WIDTH, max((len(r.get('Sector', '')) for r in all_rows), default=SECTOR_COL_WIDTH))
-    lines = []
-
-    lines.append(f"=== SYSTEM 3.0 INSTITUTIONAL VOLATILITY TRACKER [{mode}] — FULL UNTRUNCATED REPORT ===")
-    lines.append(
-        f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Checkpoints: {len(checkpoints)} | "
-        f"Indices (Bull: {len(idx_bulls)}, Bear: {len(idx_bears)}, Grave: {len(idx_grave)}) | "
-        f"Stocks (Bull: {len(e_bulls)}, Bear: {len(e_bears)}, Grave: {len(e_grave)})"
+    sizing_pool = popup_rows if (EMAIL_ONLY_WINDOW_POPUPS and popup_rows) else (idx_bulls + idx_bears + idx_grave + e_bulls + e_bears + e_grave)
+    sym_w = max(MIN_SYMBOL_WIDTH, max((len(r['Symbol']) for r in sizing_pool), default=MIN_SYMBOL_WIDTH))
+    sec_w = max(
+        SECTOR_COL_WIDTH,
+        max((len(f"{r.get('Sector', DEFAULT_UNMAPPED_SECTOR)} ({r.get('SectorWeight', 0.0):.1f}%)") for r in sizing_pool), default=SECTOR_COL_WIDTH)
     )
-    lines.append("")
+    lines = []
 
     def _fmt_active_block(title, data_list, show_sector=True, show_first_iter=False):
         if not data_list:
+            lines.append(f"--- {title} (0) ---")
+            lines.append("None")
+            lines.append("")
             return
         lines.append(f"--- {title} ({len(data_list)}) ---")
         grid_hdr = " ".join(f"{m}X" for m in GRID_MULTIPLIERS)
@@ -2120,95 +2109,40 @@ def build_full_untruncated_plain_text(
             )
         lines.append("")
 
-    def _fmt_grave_block(title, data_list, show_sector=True):
-        if not data_list:
-            return
-        lines.append(f"--- {title} ({len(data_list)}) ---")
-        sec_hdr = f"{'Sector':<{sec_w}} | " if show_sector else ""
-        hdr = f"{'Script':<{sym_w}} | {sec_hdr}{'Signal':^6} {'Anchor':^6} {'Anch Val':>9} {'Killed':^6} {'Kill Val':>9} {'LTP':>9} {'R-Mult':>7} {'Move%':>7} | Reason"
-        lines.append(hdr)
-        lines.append("-" * len(hdr))
-        for r in data_list:
-            sig = r.get('AnchorDir', 'NONE')
-            a_time = r['ActiveAnchor'] if r['ActiveAnchor'] else '-'
-            a_price = f"{r['AnchorPrice']:>9.2f}" if r['AnchorPrice'] > 0 else f"{'-':>9}"
-            k_time = r['KilledTime'] if r['KilledTime'] else '-'
-            k_price = f"{r['KilledPrice']:>9.2f}" if r['KilledPrice'] > 0 else f"{'-':>9}"
-            if r['AnchorPrice'] > 0 and (r['KilledPrice'] > 0 or r['LTP'] > 0):
-                g_r = _r_multiple(r, include_banked=False)
-                g_r_str = f"{g_r:>+6.2f}R"
-                move_pct_str = f"{r['MovePct']:>+6.2f}%"
-            else:
-                g_r_str, move_pct_str = f"{'-':>7}", f"{'-':>7}"
-            sec_cell = f"{_clip(r.get('Sector', DEFAULT_UNMAPPED_SECTOR), sec_w, EMAIL_CLIP_SYMBOLS):<{sec_w}} | " if show_sector else ""
-            lines.append(
-                f"{_clip(r['Symbol'], sym_w, EMAIL_CLIP_SYMBOLS):<{sym_w}} | {sec_cell}{sig:^6} "
-                f"{a_time:^6} {a_price} {k_time:^6} {k_price} {r['LTP']:>9.2f} {g_r_str} {move_pct_str} | {r.get('RejectReason', '')}"
-            )
-        lines.append("")
-
-    # 1. Stage 1: Sectoral Indices (Untouched)
-    lines.append("=========================================================================================")
-    lines.append("STAGE 1: SECTORAL INDICES (TOP BULLS, TOP BEARS, GRAVEYARD)")
-    lines.append("=========================================================================================")
-    _fmt_active_block("SECTORAL INDICES — TOP BULL SETUPS", idx_bulls, show_sector=False)
-    _fmt_active_block("SECTORAL INDICES — TOP BEAR SETUPS", idx_bears, show_sector=False)
-    _fmt_grave_block("SECTORAL INDICES — THE GRAVEYARD", idx_grave, show_sector=False)
-
-    # 2. Stage 2: Per-Sector Stock Grouping (Untouched)
-    lines.append("=========================================================================================")
-    lines.append("STAGE 2: STOCKS GROUPED BY SECTORAL INDEX (HIGHEST WEIGHTAGE WINNER)")
-    lines.append("=========================================================================================")
-    all_sec_names = list(SECTORAL_INDEX_CONFIG.keys()) + [DEFAULT_UNMAPPED_SECTOR]
-    for sec in all_sec_names:
-        sb = [r for r in e_bulls if r.get('Sector') == sec]
-        sr = [r for r in e_bears if r.get('Sector') == sec]
-        sg = [r for r in e_grave if r.get('Sector') == sec]
-        if not sb and not sr and not sg:
-            continue
-        lines.append(f"*** SECTOR: {sec} (Bull: {len(sb)} | Bear: {len(sr)} | Graveyard: {len(sg)}) ***")
-        _fmt_active_block(f"[{sec}] TOP BULL STOCKS", sb, show_sector=False)
-        _fmt_active_block(f"[{sec}] TOP BEAR STOCKS", sr, show_sector=False)
-        _fmt_grave_block(f"[{sec}] GRAVEYARD STOCKS", sg, show_sector=False)
-
-    # 3. Stage 3: All Stocks Master Tables (Untouched)
-    lines.append("=========================================================================================")
-    lines.append("STAGE 3: ALL STOCKS MASTER VIEW (DEFAULT SHOW ALL)")
-    lines.append("=========================================================================================")
-    _fmt_active_block("ALL STOCKS — TOP BULL SETUPS", e_bulls, show_sector=True)
-    _fmt_active_block("ALL STOCKS — TOP BEAR SETUPS", e_bears, show_sector=True)
-    _fmt_grave_block("ALL STOCKS — THE GRAVEYARD", e_grave, show_sector=True)
-
-    # 4. Stage 4: New Segregated First-Time Popup Resultset (Added)
-    if lookback_meta and lookback_meta.get("enabled") and stock_popup_res is not None:
+    if EMAIL_ONLY_WINDOW_POPUPS and lookback_meta and lookback_meta.get("enabled") and stock_popup_res is not None:
         w_start_s = lookback_meta["window_start_dt"].strftime("%H:%M")
         w_end_s = lookback_meta["window_end_dt"].strftime("%H:%M")
         prior_s = ", ".join(d.strftime("%H:%M") for d in lookback_meta["prior_iter_dts_desc"]) or "None"
-        new_idx_b = (idx_popup_res or {}).get("new_bulls", [])
-        new_idx_r = (idx_popup_res or {}).get("new_bears", [])
-        win_idx_b = (idx_popup_res or {}).get("window_first_bulls", [])
-        win_idx_r = (idx_popup_res or {}).get("window_first_bears", [])
-        new_stk_b = stock_popup_res.get("new_bulls", [])
-        new_stk_r = stock_popup_res.get("new_bears", [])
-        win_stk_b = stock_popup_res.get("window_first_bulls", [])
-        win_stk_r = stock_popup_res.get("window_first_bears", [])
-
-        lines.append("=========================================================================================")
-        lines.append(
-            f"STAGE 4 (NEW SEGREGATED RESULTSET): FIRST-TIME POPUPS "
-            f"(NO_OF_ITERATIONS={lookback_meta['num_iterations']}, INTERVAL={lookback_meta['interval_min']}m, "
-            f"WINDOW={w_start_s}..{w_end_s}, PRIOR=[{prior_s}] vs CURRENT=[{w_end_s}])"
+        iter_summary_s = " | ".join(
+            f"{st['iter_time']} (▲{st['bull_count']} ▼{st['bear_count']})"
+            for st in (stock_popup_res.get("iter_stats") or [])
         )
-        lines.append("=========================================================================================")
-        _fmt_active_block(f"PURE FIRST-TIME SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}) — BULL", new_idx_b, show_sector=False, show_first_iter=True)
-        _fmt_active_block(f"PURE FIRST-TIME SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}) — BEAR", new_idx_r, show_sector=False, show_first_iter=True)
-        _fmt_active_block(f"PURE FIRST-TIME STOCK POPUPS (NO PRIOR SAME-DIR STOPS, ANCHOR {w_start_s}..{w_end_s}) — BULL", new_stk_b, show_sector=True, show_first_iter=True)
-        _fmt_active_block(f"PURE FIRST-TIME STOCK POPUPS (NO PRIOR SAME-DIR STOPS, ANCHOR {w_start_s}..{w_end_s}) — BEAR", new_stk_r, show_sector=True, show_first_iter=True)
-        _fmt_active_block(f"ALL WINDOW SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}, INCLUDING * RE-ANCHORS) — BULL", win_idx_b, show_sector=False, show_first_iter=True)
-        _fmt_active_block(f"ALL WINDOW SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}, INCLUDING * RE-ANCHORS) — BEAR", win_idx_r, show_sector=False, show_first_iter=True)
-        _fmt_active_block(f"ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, INCLUDING * RE-ANCHORS) — BULL", win_stk_b, show_sector=True, show_first_iter=True)
-        _fmt_active_block(f"ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, INCLUDING * RE-ANCHORS) — BEAR", win_stk_r, show_sector=True, show_first_iter=True)
+        lines.append(f"=== SYSTEM 3.0 [{mode}] — LOOKBACK WINDOW POPUPS REPORT ({w_start_s}..{w_end_s}) ===")
+        lines.append(
+            f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | "
+            f"NO_OF_ITERATIONS: {lookback_meta['num_iterations']} | "
+            f"TIME_OF_INTERVAL_TO_LOOKBACK: {lookback_meta['interval_min']}m | "
+            f"Prior Iterations Compared: [{prior_s}] vs Current [{w_end_s}]"
+        )
+        if iter_summary_s:
+            lines.append(f"Prior Iteration Stock Counts: {iter_summary_s}")
+        lines.append("")
 
+        _fmt_active_block(f"ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BULL", win_stk_b, show_sector=True, show_first_iter=True)
+        _fmt_active_block(f"ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BEAR", win_stk_r, show_sector=True, show_first_iter=True)
+        _fmt_active_block(f"PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BULL", new_stk_b, show_sector=True, show_first_iter=True)
+        _fmt_active_block(f"PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BEAR", new_stk_r, show_sector=True, show_first_iter=True)
+        if win_idx_b or win_idx_r:
+            _fmt_active_block(f"ALL WINDOW SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BULL", win_idx_b, show_sector=False, show_first_iter=True)
+            _fmt_active_block(f"ALL WINDOW SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BEAR", win_idx_r, show_sector=False, show_first_iter=True)
+        return "\n".join(lines)
+
+    # Fallback if EMAIL_ONLY_WINDOW_POPUPS is False
+    lines.append(f"=== SYSTEM 3.0 INSTITUTIONAL VOLATILITY TRACKER [{mode}] ===")
+    lines.append(f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Checkpoints: {len(checkpoints)}")
+    lines.append("")
+    _fmt_active_block("ALL STOCKS — TOP BULL SETUPS", e_bulls, show_sector=True)
+    _fmt_active_block("ALL STOCKS — TOP BEAR SETUPS", e_bears, show_sector=True)
     return "\n".join(lines)
 
 def build_email_and_attachment_html(
@@ -2220,19 +2154,31 @@ def build_email_and_attachment_html(
     stock_popup_res=None
 ):
     """
-    Builds TWO HTML representations:
-    1. `email_inline_html`: Uses native HTML5 `<details>` and `<summary>` tags so clicking ANY
-       Sectoral Index inside Gmail / Apple Mail / Outlook expands & collapses that sector's
-       Top Bulls, Top Bears, and Graveyard stocks WITHOUT needing JavaScript! Also includes
-       an open-by-default "SHOW ALL STOCKS & INDICES" master view and the new segregated
-       "STAGE 4: FIRST-TIME POPUPS ACROSS LOOKBACK ITERATIONS" section.
-    2. `attachment_js_html`: Full standalone HTML dashboard with interactive JS pill buttons,
-       click-on-index-row filtering, a "CLEAR FILTER (SHOW ALL)" button, and the new
-       segregated First-Time Popup tables.
+    Builds TWO HTML representations using a high-contrast, email-friendly
+    Light Institutional Theme with explicit inline styles on every cell (`<td>` / `<th>`)
+    so Gmail, Outlook, and Apple Mail NEVER render dark text on a dark background:
+    1. `email_inline_html`: Sends ONLY the Lookback Window Popups portion (`EMAIL_ONLY_WINDOW_POPUPS = True`),
+       including All Window Stock Popups (Bull & Bear), Pure First-Time Stock Popups (Bull & Bear),
+       Window Sectoral Index Popups, and native HTML5 `<details>/<summary>` Sector Accordions for Window Popups.
+    2. `attachment_js_html`: Standalone interactive HTML dashboard of the Window Popups with
+       one-click Sector filter pills.
     """
-    e_bulls = stock_bulls if EMAIL_MAX_BUYERS <= 0 else stock_bulls[:EMAIL_MAX_BUYERS]
-    e_bears = stock_bears if EMAIL_MAX_SELLERS <= 0 else stock_bears[:EMAIL_MAX_SELLERS]
-    e_grave = stock_grave if EMAIL_MAX_GRAVEYARD <= 0 else stock_grave[:EMAIL_MAX_GRAVEYARD]
+    new_idx_b = (idx_popup_res or {}).get("new_bulls", [])
+    new_idx_r = (idx_popup_res or {}).get("new_bears", [])
+    win_idx_b = (idx_popup_res or {}).get("window_first_bulls", [])
+    win_idx_r = (idx_popup_res or {}).get("window_first_bears", [])
+    new_stk_b = (stock_popup_res or {}).get("new_bulls", [])
+    new_stk_r = (stock_popup_res or {}).get("new_bears", [])
+    win_stk_b = (stock_popup_res or {}).get("window_first_bulls", [])
+    win_stk_r = (stock_popup_res or {}).get("window_first_bears", [])
+
+    w_start_s = lookback_meta["window_start_dt"].strftime("%H:%M") if (lookback_meta and lookback_meta.get("enabled")) else "-"
+    w_end_s = lookback_meta["window_end_dt"].strftime("%H:%M") if (lookback_meta and lookback_meta.get("enabled")) else cutoff_dt.strftime("%H:%M")
+    prior_s = (", ".join(d.strftime("%H:%M") for d in lookback_meta["prior_iter_dts_desc"]) or "None") if (lookback_meta and lookback_meta.get("enabled")) else "None"
+    iter_summary_s = " &nbsp;|&nbsp; ".join(
+        f"<b>{html.escape(st['iter_time'])}</b>: <span style='color:#15803d;'>▲{st['bull_count']}</span> <span style='color:#b91c1c;'>▼{st['bear_count']}</span>"
+        for st in ((stock_popup_res or {}).get("iter_stats") or [])
+    )
 
     def _ser_active(r, basket_dir):
         live_r = _r_multiple(r, include_banked=False)
@@ -2242,8 +2188,8 @@ def build_email_and_attachment_html(
         anchor_str = f"{r.get('ActiveAnchor', '-')}*" if has_bank else f"{r.get('ActiveAnchor', '-')}"
         default_g = {m: 0 for m in GRID_MULTIPLIERS}
         ag, bg = r.get('ATR_Grid', default_g), r.get('BB_Grid', default_g)
-        atr_s = " ".join(str(ag.get(k, 0)) for k in GRID_MULTIPLIERS)
-        bb_s = " ".join(str(bg.get(k, 0)) for k in GRID_MULTIPLIERS)
+        atr_s = "  ".join(str(ag.get(k, 0)) for k in GRID_MULTIPLIERS)
+        bb_s = "  ".join(str(bg.get(k, 0)) for k in GRID_MULTIPLIERS)
         st = _state_display(r)
         if "[ BB > KC ]" in r['State']:
             st = f"[ BB > KC ] {'▲' if basket_dir == 'BULL' else '▼'}"
@@ -2258,273 +2204,234 @@ def build_email_and_attachment_html(
             "anchor": anchor_str,
             "anchor_val": f"{r['AnchorPrice']:.2f}",
             "r_str": r_str,
-            "r_pos": _rank_r_score(r) >= 0,
+            "live_r_pos": live_r >= 0,
+            "rank_r_pos": _rank_r_score(r) >= 0,
             "atr_grid": atr_s,
             "bb_grid": bb_s,
             "state": st,
+            "is_expanding": "[ BB > KC ]" in r['State'],
         }
 
-    def _ser_grave(r):
-        g_r = _r_multiple(r, include_banked=False) if r['AnchorPrice'] > 0 else 0.0
-        return {
-            "symbol": r['Symbol'],
-            "sector": r.get('Sector', DEFAULT_UNMAPPED_SECTOR),
-            "weight": f"{float(r.get('SectorWeight', 0.0)):.1f}%",
-            "sig": r.get('AnchorDir', 'NONE'),
-            "anchor": r.get('ActiveAnchor') or '-',
-            "anchor_val": f"{r['AnchorPrice']:.2f}" if r['AnchorPrice'] > 0 else '-',
-            "killed": r.get('KilledTime') or '-',
-            "killed_val": f"{r['KilledPrice']:.2f}" if r['KilledPrice'] > 0 else '-',
-            "ltp": f"{r['LTP']:.2f}",
-            "r_str": f"{g_r:+.2f}R" if r['AnchorPrice'] > 0 else '-',
-            "r_pos": g_r >= 0,
-            "move_str": f"{r['MovePct']:+.2f}%" if r['AnchorPrice'] > 0 else '-',
-            "reason": r.get('RejectReason', ''),
-        }
-
-    def _table_active_html(rows_list, basket_dir, show_sec=True, js_clickable_index=False, show_first_iter=False):
+    def _table_active_html(rows_list, basket_dir, show_sec=True, js_clickable_index=False, show_first_iter=True):
         if not rows_list:
-            return "<p style='color:#94a3b8;margin:4px 0 10px 0;'>None</p>"
-        sec_th = "<th>Sector (Wt%)</th>" if show_sec else ""
-        iter_th = "<th>1st Iter</th><th>Popup Type</th>" if show_first_iter else ""
+            return (
+                "<div style='background-color:#ffffff;border:1px solid #cbd5e1;border-radius:6px;"
+                "padding:10px 14px;color:#64748b;font-style:italic;margin-bottom:14px;'>"
+                "No setups in this category for the current lookback window.</div>"
+            )
+        th_style = (
+            "background-color:#1e293b;color:#ffffff;padding:8px 10px;"
+            "border:1px solid #334155;font-weight:700;font-size:12px;"
+        )
+        sec_th = f"<th style='{th_style}' align='left'>Sector (MaxWt%)</th>" if show_sec else ""
+        iter_th = (
+            f"<th style='{th_style}' align='center'>1stIter</th>"
+            f"<th style='{th_style}' align='center'>PopupType</th>"
+        ) if show_first_iter else ""
+
         tr_list = []
-        for r in rows_list:
+        for idx_i, r in enumerate(rows_list):
             d = _ser_active(r, basket_dir)
+            row_bg = "#ffffff" if idx_i % 2 == 0 else "#f8fafc"
+            base_td = f"padding:7px 10px;border:1px solid #cbd5e1;background-color:{row_bg};color:#0f172a;font-size:12px;"
             sec_attr = html.escape(d["symbol"] if not show_sec else d["sector"])
             click_attr = f'onclick="filterBySector(\'{sec_attr}\')" class="idx-row"' if js_clickable_index else ""
-            sec_td = f"<td class='sec'>{html.escape(d['sector'])} ({d['weight']})</td>" if show_sec else ""
-            iter_td = (
-                f"<td align='center' style='color:#38bdf8;font-weight:bold;'>{html.escape(d['first_iter'])}</td>"
-                f"<td align='center' style='color:#fde047;'>{html.escape(d['popup_type'])}</td>"
-            ) if show_first_iter else ""
-            c_cls = "g" if d["r_pos"] else "r"
+
+            sec_td = (
+                f"<td style='{base_td}color:#1e40af;font-weight:600;'>"
+                f"{html.escape(d['sector'])} <span style='color:#475569;font-weight:normal;'>({d['weight']})</span></td>"
+            ) if show_sec else ""
+
+            if show_first_iter:
+                is_pure_first = d["popup_type"] == "1ST-TIME"
+                pt_bg = "#dcfce7" if is_pure_first else "#fef3c7"
+                pt_fg = "#166534" if is_pure_first else "#92400e"
+                iter_td = (
+                    f"<td align='center' style='{base_td}background-color:#e0f2fe;color:#075985;font-weight:700;'>{html.escape(d['first_iter'])}</td>"
+                    f"<td align='center' style='{base_td}background-color:{pt_bg};color:{pt_fg};font-weight:700;'>{html.escape(d['popup_type'])}</td>"
+                )
+            else:
+                iter_td = ""
+
+            r_bg = "#dcfce7" if d["rank_r_pos"] else "#fee2e2"
+            r_fg = "#166534" if d["rank_r_pos"] else "#991b1b"
+
+            if d["is_expanding"]:
+                st_bg = "#dcfce7" if basket_dir == "BULL" else "#fee2e2"
+                st_fg = "#166534" if basket_dir == "BULL" else "#991b1b"
+            else:
+                st_bg = "#fef3c7"
+                st_fg = "#92400e"
+
             tr_list.append(
-                f"<tr {click_attr} data-sector='{sec_attr}'>"
-                f"<td><b>{html.escape(d['symbol'])}</b></td>"
-                f"<td align='right'>{d['ltp']}</td>"
+                f"<tr {click_attr} data-sector='{sec_attr}' style='background-color:{row_bg};'>"
+                f"<td style='{base_td}color:#0f172a;font-weight:700;'>{html.escape(d['symbol'])}</td>"
+                f"<td align='right' style='{base_td}color:#0f172a;font-weight:700;'>{d['ltp']}</td>"
                 f"{sec_td}{iter_td}"
-                f"<td align='center'>{d['seen']}</td>"
-                f"<td align='center'>{html.escape(d['anchor'])}</td>"
-                f"<td align='right'>{d['anchor_val']}</td>"
-                f"<td align='right' class='{c_cls}'>{html.escape(d['r_str'])}</td>"
-                f"<td align='center'>{d['atr_grid']}</td>"
-                f"<td align='center'>{d['bb_grid']}</td>"
-                f"<td align='center'>{html.escape(d['state'])}</td>"
+                f"<td align='center' style='{base_td}color:#334155;'>{d['seen']}</td>"
+                f"<td align='center' style='{base_td}color:#0f172a;font-weight:700;'>{html.escape(d['anchor'])}</td>"
+                f"<td align='right' style='{base_td}color:#1e293b;font-weight:600;'>{d['anchor_val']}</td>"
+                f"<td align='right' style='{base_td}background-color:{r_bg};color:{r_fg};font-weight:700;'>{html.escape(d['r_str'])}</td>"
+                f"<td align='center' style='{base_td}color:#1e293b;font-weight:600;'>{d['atr_grid']}</td>"
+                f"<td align='center' style='{base_td}color:#1e293b;font-weight:600;'>{d['bb_grid']}</td>"
+                f"<td align='center' style='{base_td}background-color:{st_bg};color:{st_fg};font-weight:700;'>{html.escape(d['state'])}</td>"
                 f"</tr>"
             )
         return (
-            f"<table><thead><tr><th>Script</th><th align='right'>LTP</th>{sec_th}{iter_th}"
-            f"<th>Seen</th><th>Anchor</th><th align='right'>AnchVal</th><th align='right'>R-Mult (Bank)</th>"
-            f"<th>ATR Grid</th><th>BB Grid</th><th>State</th></tr></thead>"
+            f"<table style='width:100%;border-collapse:collapse;margin-bottom:16px;background-color:#ffffff;"
+            f"border:1px solid #cbd5e1;font-family:Consolas,\"Courier New\",monospace;font-size:12px;'>"
+            f"<thead><tr>"
+            f"<th style='{th_style}' align='left'>Script</th>"
+            f"<th style='{th_style}' align='right'>LTP/Exit</th>"
+            f"{sec_th}{iter_th}"
+            f"<th style='{th_style}' align='center'>Seen</th>"
+            f"<th style='{th_style}' align='center'>Anchor</th>"
+            f"<th style='{th_style}' align='right'>Anch Val</th>"
+            f"<th style='{th_style}' align='right'>R-Mult (Bank)</th>"
+            f"<th style='{th_style}' align='center'>ATR: 1X 2X 3X 5X</th>"
+            f"<th style='{th_style}' align='center'>BB: 1X 2X 3X 5X</th>"
+            f"<th style='{th_style}' align='center'>State</th>"
+            f"</tr></thead>"
             f"<tbody>{''.join(tr_list)}</tbody></table>"
         )
 
-    def _table_grave_html(rows_list, show_sec=True, js_clickable_index=False):
-        if not rows_list:
-            return "<p style='color:#94a3b8;margin:4px 0 10px 0;'>None</p>"
-        sec_th = "<th>Sector (Wt%)</th>" if show_sec else ""
-        tr_list = []
-        for r in rows_list:
-            d = _ser_grave(r)
-            sec_attr = html.escape(d["symbol"] if not show_sec else d["sector"])
-            click_attr = f'onclick="filterBySector(\'{sec_attr}\')" class="idx-row"' if js_clickable_index else ""
-            sec_td = f"<td class='sec'>{html.escape(d['sector'])} ({d['weight']})</td>" if show_sec else ""
-            s_cls = "g" if d["sig"] == "BULL" else "r" if d["sig"] == "BEAR" else "d"
-            c_cls = "g" if d["r_pos"] else "r"
-            tr_list.append(
-                f"<tr {click_attr} data-sector='{sec_attr}'>"
-                f"<td><b>{html.escape(d['symbol'])}</b></td>"
-                f"{sec_td}"
-                f"<td align='center' class='{s_cls}'>{html.escape(d['sig'])}</td>"
-                f"<td align='center'>{html.escape(d['anchor'])}</td>"
-                f"<td align='right'>{d['anchor_val']}</td>"
-                f"<td align='center'>{html.escape(d['killed'])}</td>"
-                f"<td align='right'>{d['killed_val']}</td>"
-                f"<td align='right'>{d['ltp']}</td>"
-                f"<td align='right' class='{c_cls}'>{html.escape(d['r_str'])}</td>"
-                f"<td align='right'>{html.escape(d['move_str'])}</td>"
-                f"<td class='rsn'>{html.escape(d['reason'])}</td>"
-                f"</tr>"
-            )
+    def _sec_banner(title, is_bull=True):
+        if is_bull:
+            bg, border, left_b, fg = "#ecfdf5", "#a7f3d0", "#16a34a", "#065f46"
+        else:
+            bg, border, left_b, fg = "#fef2f2", "#fecaca", "#dc2626", "#991b1b"
         return (
-            f"<table><thead><tr><th>Script</th>{sec_th}<th>Sig</th><th>Anchor</th>"
-            f"<th align='right'>AnchVal</th><th>Killed</th><th align='right'>KillVal</th>"
-            f"<th align='right'>LTP</th><th align='right'>R-Mult</th><th align='right'>Move%</th>"
-            f"<th>Forensic Exit / Rejection Reason</th></tr></thead>"
-            f"<tbody>{''.join(tr_list)}</tbody></table>"
+            f"<div style='background-color:{bg};border:1px solid {border};border-left:5px solid {left_b};"
+            f"color:{fg};padding:8px 12px;font-weight:700;font-size:13px;border-radius:4px;margin:14px 0 8px 0;'>"
+            f"{html.escape(title)}</div>"
         )
 
-    # Build Native HTML5 <details>/<summary> Accordions for each Sectoral Index (works in Gmail/Apple Mail/Outlook without JS)
-    sector_accordions = []
-    index_status_lookup = {}
-    for r in idx_bulls:
-        index_status_lookup[r['Symbol']] = f"🔥 BULL ({_r_multiple(r, include_banked=False):+.2f}R | Anchor {r['ActiveAnchor']})"
-    for r in idx_bears:
-        index_status_lookup[r['Symbol']] = f"🩸 BEAR ({_r_multiple(r, include_banked=False):+.2f}R | Anchor {r['ActiveAnchor']})"
-    for r in idx_grave:
-        if r['Symbol'] not in index_status_lookup:
-            index_status_lookup[r['Symbol']] = f"🚫 GRAVEYARD ({r.get('RejectReason', 'Stopped')})"
-
+    # Sector-wise accordions specifically for Window Popups
+    window_sector_accordions = []
     all_sector_keys = list(SECTORAL_INDEX_CONFIG.keys()) + [DEFAULT_UNMAPPED_SECTOR]
     for sec in all_sector_keys:
-        sb = [r for r in e_bulls if r.get('Sector') == sec]
-        sr = [r for r in e_bears if r.get('Sector') == sec]
-        sg = [r for r in e_grave if r.get('Sector') == sec]
-        if not sb and not sr and not sg:
+        sb = [r for r in win_stk_b if r.get('Sector') == sec]
+        sr = [r for r in win_stk_r if r.get('Sector') == sec]
+        if not sb and not sr:
             continue
-        idx_badge = index_status_lookup.get(sec, "Sector Group")
-        sector_accordions.append(
-            f"<details style='margin-bottom:10px;border:1px solid #334155;border-radius:6px;background:#0f172a;padding:8px 12px;'>"
-            f"<summary style='cursor:pointer;font-weight:bold;color:#38bdf8;font-size:14px;outline:none;'>"
-            f"▶ CLICK TO EXPAND/COLLAPSE: {html.escape(sec)} — [{html.escape(idx_badge)}] "
-            f"(Bull Stocks: {len(sb)} | Bear Stocks: {len(sr)} | Graveyard: {len(sg)})"
+        window_sector_accordions.append(
+            f"<details style='margin-bottom:8px;border:1px solid #cbd5e1;border-radius:6px;background-color:#ffffff;padding:8px 12px;'>"
+            f"<summary style='cursor:pointer;font-weight:700;color:#0f172a;font-size:13px;outline:none;'>"
+            f"▶ {html.escape(sec)} — Window Popups "
+            f"(<span style='color:#15803d;'>Bull: {len(sb)}</span> | <span style='color:#b91c1c;'>Bear: {len(sr)}</span>)"
             f"</summary>"
             f"<div style='padding-top:10px;'>"
-            f"<h4>🔥 {html.escape(sec)} — TOP BULL STOCKS ({len(sb)})</h4>"
-            f"{_table_active_html(sb, 'BULL', show_sec=False)}"
-            f"<h4>🩸 {html.escape(sec)} — TOP BEAR STOCKS ({len(sr)})</h4>"
-            f"{_table_active_html(sr, 'BEAR', show_sec=False)}"
-            f"<h4>🚫 {html.escape(sec)} — GRAVEYARD STOCKS ({len(sg)})</h4>"
-            f"{_table_grave_html(sg, show_sec=False)}"
-            f"</div></details>"
+            + (_sec_banner(f"🔥 {sec} — WINDOW BULL POPUPS ({len(sb)})", True) + _table_active_html(sb, 'BULL', show_sec=False, show_first_iter=True) if sb else "")
+            + (_sec_banner(f"🩸 {sec} — WINDOW BEAR POPUPS ({len(sr)})", False) + _table_active_html(sr, 'BEAR', show_sec=False, show_first_iter=True) if sr else "")
+            + f"</div></details>"
         )
 
-    # Build Stage 4 HTML block for First-Time Popups (if enabled)
-    stage4_email_html = ""
-    stage4_attach_html = ""
-    if lookback_meta and lookback_meta.get("enabled") and stock_popup_res is not None:
-        w_start_s = lookback_meta["window_start_dt"].strftime("%H:%M")
-        w_end_s = lookback_meta["window_end_dt"].strftime("%H:%M")
-        prior_s = ", ".join(d.strftime("%H:%M") for d in lookback_meta["prior_iter_dts_desc"]) or "None"
-        new_idx_b = (idx_popup_res or {}).get("new_bulls", [])
-        new_idx_r = (idx_popup_res or {}).get("new_bears", [])
-        win_idx_b = (idx_popup_res or {}).get("window_first_bulls", [])
-        win_idx_r = (idx_popup_res or {}).get("window_first_bears", [])
-        new_stk_b = stock_popup_res.get("new_bulls", [])
-        new_stk_r = stock_popup_res.get("new_bears", [])
-        win_stk_b = stock_popup_res.get("window_first_bulls", [])
-        win_stk_r = stock_popup_res.get("window_first_bears", [])
-
-        stage4_inner = (
-            f"<p style='color:#cbd5e1;margin:4px 0 10px 0;'>"
-            f"<b>Lookback Config:</b> NO_OF_ITERATIONS = {lookback_meta['num_iterations']} | "
-            f"TIME_OF_INTERVAL_TO_LOOKBACK = {lookback_meta['interval_min']}m | "
-            f"<b>Anchor Window:</b> {w_start_s} to {w_end_s} | "
-            f"<b>Prior Iterations Compared:</b> [{html.escape(prior_s)}] vs Current [{w_end_s}]</p>"
-            f"<h4>🏛️🆕 PURE FIRST-TIME SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}) — BULL ({len(new_idx_b)})</h4>"
-            f"{_table_active_html(new_idx_b, 'BULL', show_sec=False, show_first_iter=True)}"
-            f"<h4>🏛️🆕 PURE FIRST-TIME SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}) — BEAR ({len(new_idx_r)})</h4>"
-            f"{_table_active_html(new_idx_r, 'BEAR', show_sec=False, show_first_iter=True)}"
-            f"<h4>🆕🔥 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BULL ({len(new_stk_b)})</h4>"
-            f"{_table_active_html(new_stk_b, 'BULL', show_sec=True, show_first_iter=True)}"
-            f"<h4>🆕🩸 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BEAR ({len(new_stk_r)})</h4>"
-            f"{_table_active_html(new_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}"
-            f"<h4>⏱️🔥 ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BULL ({len(win_stk_b)})</h4>"
-            f"{_table_active_html(win_stk_b, 'BULL', show_sec=True, show_first_iter=True)}"
-            f"<h4>⏱️🩸 ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BEAR ({len(win_stk_r)})</h4>"
-            f"{_table_active_html(win_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}"
+    idx_window_block_html = ""
+    if win_idx_b or win_idx_r:
+        idx_window_block_html = (
+            f"<h3 style='color:#0f172a;margin:18px 0 8px 0;font-size:15px;'>🏛️ WINDOW SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s})</h3>"
+            + (_sec_banner(f"🏛️⏱️🔥 ALL WINDOW SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}) — BULL ({len(win_idx_b)})", True)
+               + _table_active_html(win_idx_b, 'BULL', show_sec=False, show_first_iter=True) if win_idx_b else "")
+            + (_sec_banner(f"🏛️⏱️🩸 ALL WINDOW SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}) — BEAR ({len(win_idx_r)})", False)
+               + _table_active_html(win_idx_r, 'BEAR', show_sec=False, show_first_iter=True) if win_idx_r else "")
         )
 
-        stage4_email_html = (
-            f"<details open style='margin-top:18px;border:2px solid #f59e0b;border-radius:6px;background:#0f172a;padding:10px;'>"
-            f"<summary style='cursor:pointer;font-weight:bold;color:#fbbf24;font-size:15px;'>"
-            f"🆕 STAGE 4 (NEW SEGREGATED RESULTSET): FIRST-TIME POPUPS ({w_start_s}..{w_end_s} | "
-            f"Pure 1st-Time: {len(new_stk_b)}▲ {len(new_stk_r)}▼ | All Window Popups: {len(win_stk_b)}▲ {len(win_stk_r)}▼)"
-            f"</summary>"
-            f"<div style='padding-top:10px;'>{stage4_inner}</div></details>"
-        )
-        stage4_attach_html = (
-            f"<h3 style='color:#fbbf24;margin-top:20px;'>🆕 STAGE 3 (NEW SEGREGATED RESULTSET): FIRST-TIME POPUPS ({w_start_s}..{w_end_s})</h3>"
-            f"<div id='popupContainer'>{stage4_inner}</div>"
-        )
+    light_css = (
+        "body{background-color:#f1f5f9;color:#0f172a;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:13px;margin:0;padding:16px;}"
+        ".pill{background-color:#ffffff;color:#1e293b;border:1px solid #94a3b8;padding:5px 10px;margin:2px;border-radius:4px;cursor:pointer;font-weight:600;}"
+        ".pill:hover,.pill.active{background-color:#2563eb;color:#ffffff;border-color:#1d4ed8;}"
+        ".clr{background-color:#dc2626;color:#ffffff;border:none;padding:6px 14px;border-radius:4px;font-weight:700;cursor:pointer;}"
+    )
 
-    common_css = (
-        "body{background:#0b0f19;color:#e2e8f0;font-family:Consolas,monospace;font-size:12px;padding:14px;}"
-        "h2,h3,h4{color:#38bdf8;margin:10px 0 6px 0;}"
-        "table{width:100%;border-collapse:collapse;margin-bottom:14px;background:#0f172a;}"
-        "th{background:#1e293b;color:#38bdf8;padding:6px;border:1px solid #334155;text-align:left;}"
-        "td{padding:5px 6px;border:1px solid #1e293b;}"
-        ".g{color:#4ade80;font-weight:bold;}.r{color:#f87171;font-weight:bold;}.d{color:#64748b;}"
-        ".sec{color:#fde047;}.rsn{color:#fbbf24;}"
-        ".idx-row{cursor:pointer;}.idx-row:hover{background:#172554;}"
-        ".pill{background:#1e293b;color:#e2e8f0;border:1px solid #475569;padding:5px 10px;margin:2px;border-radius:4px;cursor:pointer;}"
-        ".pill:hover,.pill.active{background:#0284c7;color:#fff;}"
-        ".clr{background:#ef4444;color:#fff;border:none;padding:6px 14px;border-radius:4px;font-weight:bold;cursor:pointer;}"
+    header_card_html = (
+        f"<div style='background-color:#ffffff;border:1px solid #cbd5e1;border-left:6px solid #2563eb;"
+        f"border-radius:6px;padding:14px 18px;margin-bottom:16px;'>"
+        f"<div style='font-size:17px;font-weight:800;color:#0f172a;margin-bottom:6px;'>"
+        f"📡 SYSTEM 3.0 [{html.escape(mode)}] — LOOKBACK WINDOW POPUPS ({w_start_s}..{w_end_s})</div>"
+        f"<div style='color:#334155;font-size:13px;margin-bottom:4px;'>"
+        f"<b>Target Snapshot:</b> {cutoff_dt.strftime('%Y-%m-%d %H:%M')} &nbsp;|&nbsp; "
+        f"<b>NO_OF_ITERATIONS:</b> {lookback_meta['num_iterations'] if lookback_meta else 0} &nbsp;|&nbsp; "
+        f"<b>INTERVAL:</b> {lookback_meta['interval_min'] if lookback_meta else 0}m &nbsp;|&nbsp; "
+        f"<b>Anchor Window:</b> <span style='background-color:#e0f2fe;color:#0369a1;padding:2px 6px;border-radius:4px;font-weight:700;'>{w_start_s} to {w_end_s}</span> &nbsp;|&nbsp; "
+        f"<b>Prior Runs Compared:</b> [{html.escape(prior_s)}] vs [{w_end_s}]</div>"
+        f"<div style='color:#334155;font-size:12px;'>"
+        f"<b>Window Stock Popups ({w_start_s}..{w_end_s}):</b> "
+        f"<span style='color:#15803d;font-weight:700;'>▲ {len(win_stk_b)} Bull</span> &nbsp;/&nbsp; "
+        f"<span style='color:#b91c1c;font-weight:700;'>▼ {len(win_stk_r)} Bear</span> &nbsp;&nbsp;|&nbsp;&nbsp; "
+        f"<b>Pure 1st-Time (No *):</b> "
+        f"<span style='color:#15803d;font-weight:700;'>▲ {len(new_stk_b)} Bull</span> &nbsp;/&nbsp; "
+        f"<span style='color:#b91c1c;font-weight:700;'>▼ {len(new_stk_r)} Bear</span>"
+        + (f"<br><b>Prior Iteration Totals:</b> {iter_summary_s}" if iter_summary_s else "")
+        + f"</div></div>"
     )
 
     email_inline_html = (
-        f"<!DOCTYPE html><html><head><meta charset='utf-8'><style>{common_css}</style></head><body>"
-        f"<h2>📡 SYSTEM 3.0 INSTITUTIONAL VOLATILITY TRACKER [{html.escape(mode)}]</h2>"
-        f"<p><b>Snapshot:</b> {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | <b>Checkpoints:</b> {len(checkpoints)} | "
-        f"<b>Indices:</b> {len(idx_bulls)} Bull, {len(idx_bears)} Bear, {len(idx_grave)} Grave | "
-        f"<b>Stocks:</b> {len(e_bulls)} Bull, {len(e_bears)} Bear, {len(e_grave)} Grave</p>"
-        f"<h3>🏛️ STAGE 1: SECTORAL INDICES (TOP BULLS, TOP BEARS, GRAVEYARD)</h3>"
-        f"<h4>🏛️🔥 SECTORAL INDICES — TOP BULL SETUPS ({len(idx_bulls)})</h4>"
-        f"{_table_active_html(idx_bulls, 'BULL', show_sec=False)}"
-        f"<h4>🏛️🩸 SECTORAL INDICES — TOP BEAR SETUPS ({len(idx_bears)})</h4>"
-        f"{_table_active_html(idx_bears, 'BEAR', show_sec=False)}"
-        f"<h4>🏛️🚫 SECTORAL INDICES — THE GRAVEYARD ({len(idx_grave)})</h4>"
-        f"{_table_grave_html(idx_grave, show_sec=False)}"
-        f"<h3>📂 STAGE 2: CLICK ANY SECTORAL INDEX BELOW TO EXPAND / COLLAPSE ITS STOCKS</h3>"
-        f"{''.join(sector_accordions)}"
-        f"<details open style='margin-top:18px;border:2px solid #38bdf8;border-radius:6px;background:#0f172a;padding:10px;'>"
-        f"<summary style='cursor:pointer;font-weight:bold;color:#4ade80;font-size:15px;'>"
-        f"🌐 STAGE 3: DEFAULT FULL VIEW — ALL STOCKS (CLICK TO COLLAPSE / EXPAND ALL)"
-        f"</summary>"
-        f"<div style='padding-top:10px;'>"
-        f"<h4>🔥 ALL STOCKS — TOP BULL SETUPS ({len(e_bulls)})</h4>"
-        f"{_table_active_html(e_bulls, 'BULL', show_sec=True)}"
-        f"<h4>🩸 ALL STOCKS — TOP BEAR SETUPS ({len(e_bears)})</h4>"
-        f"{_table_active_html(e_bears, 'BEAR', show_sec=True)}"
-        f"<h4>🚫 ALL STOCKS — THE GRAVEYARD ({len(e_grave)})</h4>"
-        f"{_table_grave_html(e_grave, show_sec=True)}"
-        f"</div></details>"
-        f"{stage4_email_html}"
-        f"</body></html>"
+        f"<!DOCTYPE html><html><head><meta charset='utf-8'><style>{light_css}</style></head>"
+        f"<body style='background-color:#f1f5f9;color:#0f172a;font-family:\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif;font-size:13px;margin:0;padding:16px;'>"
+        f"<div style='max-width:1280px;margin:0 auto;'>"
+        f"{header_card_html}"
+        f"<h3 style='color:#0f172a;margin:16px 0 8px 0;font-size:15px;'>⏱️ ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors)</h3>"
+        f"{_sec_banner(f'⏱️🔥 ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BULL ({len(win_stk_b)})', True)}"
+        f"{_table_active_html(win_stk_b, 'BULL', show_sec=True, show_first_iter=True)}"
+        f"{_sec_banner(f'⏱️🩸 ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BEAR ({len(win_stk_r)})', False)}"
+        f"{_table_active_html(win_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}"
+        f"<h3 style='color:#0f172a;margin:20px 0 8px 0;font-size:15px;'>🆕 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s})</h3>"
+        f"{_sec_banner(f'🆕🔥 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BULL ({len(new_stk_b)})', True)}"
+        f"{_table_active_html(new_stk_b, 'BULL', show_sec=True, show_first_iter=True)}"
+        f"{_sec_banner(f'🆕🩸 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BEAR ({len(new_stk_r)})', False)}"
+        f"{_table_active_html(new_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}"
+        f"{idx_window_block_html}"
+        + (
+            f"<h3 style='color:#0f172a;margin:20px 0 8px 0;font-size:15px;'>📂 WINDOW POPUPS GROUPED BY SECTOR (Click Any Sector to Expand)</h3>"
+            f"{''.join(window_sector_accordions)}"
+            if window_sector_accordions else ""
+        )
+        + f"</div></body></html>"
     )
 
+    active_popup_sectors = sorted({r.get('Sector', DEFAULT_UNMAPPED_SECTOR) for r in (win_stk_b + win_stk_r)})
     pills_js_html = "".join(
         f"<button class='pill' data-sec='{html.escape(s)}' onclick=\"filterBySector('{html.escape(s)}')\">{html.escape(s)}</button>"
-        for s in sorted(SECTORAL_INDEX_CONFIG.keys())
+        for s in active_popup_sectors
     )
 
     attachment_js_html = (
-        f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>System 3.0 Dashboard</title><style>{common_css}</style></head><body>"
-        f"<div style='position:sticky;top:0;background:#111827;padding:10px;border:1px solid #334155;border-radius:6px;margin-bottom:14px;'>"
+        f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>System 3.0 Window Popups ({w_start_s}..{w_end_s})</title><style>{light_css}</style></head>"
+        f"<body style='background-color:#f1f5f9;color:#0f172a;font-family:\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif;font-size:13px;margin:0;padding:16px;'>"
+        f"<div style='max-width:1280px;margin:0 auto;'>"
+        f"<div style='position:sticky;top:0;background-color:#ffffff;padding:12px 16px;border:1px solid #cbd5e1;border-radius:6px;margin-bottom:14px;box-shadow:0 2px 4px rgba(0,0,0,0.05);'>"
         f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;'>"
-        f"<b>📡 SYSTEM 3.0 [{html.escape(mode)}] — Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')}</b>"
-        f"<div><span id='statusBadge' style='color:#38bdf8;margin-right:10px;font-weight:bold;'>DEFAULT VIEW: SHOWING ALL</span>"
-        f"<button class='clr' onclick='clearFilter()'>CLEAR FILTER (SHOW ALL)</button></div></div>"
+        f"<b style='font-size:15px;color:#0f172a;'>📡 SYSTEM 3.0 [{html.escape(mode)}] — Window Popups ({w_start_s}..{w_end_s}) @ {cutoff_dt.strftime('%Y-%m-%d %H:%M')}</b>"
+        f"<div><span id='statusBadge' style='color:#2563eb;margin-right:10px;font-weight:700;'>SHOWING ALL WINDOW POPUPS</span>"
+        f"<button class='clr' onclick='clearFilter()'>SHOW ALL</button></div></div>"
         f"<div>{pills_js_html}</div></div>"
-        f"<h3>🏛️ STAGE 1: SECTORAL INDICES (Click Any Index Row to Filter Stocks Below)</h3>"
-        f"<h4>🏛️🔥 SECTORAL INDICES — TOP BULL SETUPS ({len(idx_bulls)})</h4>"
-        f"{_table_active_html(idx_bulls, 'BULL', show_sec=False, js_clickable_index=True)}"
-        f"<h4>🏛️🩸 SECTORAL INDICES — TOP BEAR SETUPS ({len(idx_bears)})</h4>"
-        f"{_table_active_html(idx_bears, 'BEAR', show_sec=False, js_clickable_index=True)}"
-        f"<h4>🏛️🚫 SECTORAL INDICES — THE GRAVEYARD ({len(idx_grave)})</h4>"
-        f"{_table_grave_html(idx_grave, show_sec=False, js_clickable_index=True)}"
-        f"<h3 id='stkHeader'>📈 STAGE 2: ALL STOCKS (Default Show All — Click Any Sector Above to Filter)</h3>"
-        f"<div id='stkContainer'>"
-        f"<h4>🔥 STOCKS — TOP BULL SETUPS</h4><div id='stkBullWrap'>{_table_active_html(e_bulls, 'BULL', show_sec=True)}</div>"
-        f"<h4>🩸 STOCKS — TOP BEAR SETUPS</h4><div id='stkBearWrap'>{_table_active_html(e_bears, 'BEAR', show_sec=True)}</div>"
-        f"<h4>🚫 STOCKS — THE GRAVEYARD</h4><div id='stkGraveWrap'>{_table_grave_html(e_grave, show_sec=True)}</div>"
+        f"{header_card_html}"
+        f"<div id='popupContainer'>"
+        f"<h3 style='color:#0f172a;margin:16px 0 8px 0;font-size:15px;'>⏱️ ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors)</h3>"
+        f"{_sec_banner(f'⏱️🔥 ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BULL ({len(win_stk_b)})', True)}"
+        f"{_table_active_html(win_stk_b, 'BULL', show_sec=True, show_first_iter=True)}"
+        f"{_sec_banner(f'⏱️🩸 ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BEAR ({len(win_stk_r)})', False)}"
+        f"{_table_active_html(win_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}"
+        f"<h3 style='color:#0f172a;margin:20px 0 8px 0;font-size:15px;'>🆕 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s})</h3>"
+        f"{_sec_banner(f'🆕🔥 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BULL ({len(new_stk_b)})', True)}"
+        f"{_table_active_html(new_stk_b, 'BULL', show_sec=True, show_first_iter=True)}"
+        f"{_sec_banner(f'🆕🩸 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BEAR ({len(new_stk_r)})', False)}"
+        f"{_table_active_html(new_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}"
+        f"{idx_window_block_html}"
         f"</div>"
-        f"{stage4_attach_html}"
         f"<script>"
         f"function filterBySector(sec){{"
-        f"document.querySelectorAll('#stkContainer tbody tr, #popupContainer tbody tr').forEach(r=>{{"
+        f"document.querySelectorAll('#popupContainer tbody tr').forEach(r=>{{"
         f"r.style.display=(r.getAttribute('data-sector')===sec)?'':'none';}});"
         f"document.querySelectorAll('.pill').forEach(p=>p.classList.toggle('active',p.getAttribute('data-sec')===sec));"
-        f"document.getElementById('statusBadge').textContent='FILTERED BY: '+sec;"
-        f"document.getElementById('stkHeader').textContent='📈 STAGE 2: STOCKS IN SECTOR ['+sec+']';"
+        f"document.getElementById('statusBadge').textContent='FILTERED BY SECTOR: '+sec;"
         f"}}"
         f"function clearFilter(){{"
-        f"document.querySelectorAll('#stkContainer tbody tr, #popupContainer tbody tr').forEach(r=>{{r.style.display='';}});"
+        f"document.querySelectorAll('#popupContainer tbody tr').forEach(r=>{{r.style.display='';}});"
         f"document.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));"
-        f"document.getElementById('statusBadge').textContent='DEFAULT VIEW: SHOWING ALL';"
-        f"document.getElementById('stkHeader').textContent='📈 STAGE 2: ALL STOCKS (Default Show All)';"
+        f"document.getElementById('statusBadge').textContent='SHOWING ALL WINDOW POPUPS';"
         f"}}"
-        f"</script></body></html>"
+        f"</script></div></body></html>"
     )
 
     return email_inline_html, attachment_js_html
@@ -2583,7 +2490,7 @@ def _send_email_message(subject, plain_body, html_body=None, attachment_html=Non
                 server.starttls()
                 server.login(sender, password)
                 server.send_message(msg)
-        print(f"   {COLOR_GREEN_FG}📧 [{tag}] Full untruncated email sent to {recipient} via {smtp_server}:{port}{COLOR_RESET}")
+        print(f"   {COLOR_GREEN_FG}📧 [{tag}] Window Popups email sent to {recipient} via {smtp_server}:{port}{COLOR_RESET}")
         return True
     except Exception as e:
         print(f"   {COLOR_YELLOW}[{tag}] Failed to send email ({type(e).__name__}: {e}){COLOR_RESET}")
@@ -2722,7 +2629,6 @@ def run_screener(
     checkpoints = generate_checkpoints(cutoff_dt) if BACKTRACE_CHECKPOINTS else [cutoff_dt]
     print(f"   {COLOR_DIM}» Backtrace checkpoints ({len(checkpoints)}): {', '.join(c.strftime('%H:%M') for c in checkpoints)}{COLOR_RESET}")
 
-    # Collect any extra checkpoints needed by lookback iterations so they are evaluated in-memory without extra API calls
     extra_lookback_cps = []
     if lookback_meta["enabled"]:
         cp_set = set(checkpoints)
@@ -2763,7 +2669,7 @@ def run_screener(
     idx_bulls, idx_bears, idx_grave = segregate_and_rank_buckets(by_index) if by_index else ([], [], [])
     stock_bulls, stock_bears, stock_grave = segregate_and_rank_buckets(by_stock)
 
-    # Build combined in-memory checkpoint map for lookback iterations (includes 09:15 / non-standard step checkpoints)
+    # Build combined in-memory checkpoint map for lookback iterations
     by_index_all_cps = {k: list(v) for k, v in by_index.items()}
     by_stock_all_cps = {k: list(v) for k, v in by_stock.items()}
     for row in extra_results:
@@ -2781,7 +2687,7 @@ def run_screener(
         combined_map = dict(by_index, **by_stock)
         print_and_alert_tracked_history(track_symbol, combined_map, live_run=not explicit)
 
-    # 1. Render Console Output (Existing Stage 1 & Stage 2 untouched + Stage 3 Segregated First-Time Popups added)
+    # 1. Render Console Output (Existing Stage 1 & Stage 2 untouched + Stage 3 Segregated First-Time Popups)
     render_console_dashboard(
         mode, cutoff_dt, checkpoints,
         idx_bulls, idx_bears, idx_grave,
@@ -2792,7 +2698,7 @@ def run_screener(
         stock_popup_res=stock_popup_res
     )
 
-    # 2. Build Untruncated Email Content & Send via SMTP Secrets (if enabled by SEND_DASHBOARD_EMAIL)
+    # 2. Build Window-Popups-Only Email Content with Friendly High-Contrast Light Theme & Send via SMTP Secrets
     email_inline_html, attachment_js_html = build_email_and_attachment_html(
         mode, cutoff_dt, checkpoints,
         idx_bulls, idx_bears, idx_grave,
@@ -2823,11 +2729,12 @@ def run_screener(
         new_r_cnt = len(stock_popup_res.get("new_bears", []))
         win_b_cnt = len(stock_popup_res.get("window_first_bulls", []))
         win_r_cnt = len(stock_popup_res.get("window_first_bears", []))
+        w_start_s = lookback_meta["window_start_dt"].strftime("%H:%M") if (lookback_meta and lookback_meta.get("enabled")) else ""
+        w_end_s = lookback_meta["window_end_dt"].strftime("%H:%M") if (lookback_meta and lookback_meta.get("enabled")) else cutoff_dt.strftime("%H:%M")
         email_subject = (
-            f"[System3 {mode}] {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | "
-            f"Indices: {len(idx_bulls)}▲ {len(idx_bears)}▼ | "
-            f"Stocks: {len(stock_bulls)}▲ {len(stock_bears)}▼ | "
-            f"1stTime: {new_b_cnt}▲ {new_r_cnt}▼ (Win: {win_b_cnt}▲ {win_r_cnt}▼)"
+            f"[System3 {mode}] Window Popups ({w_start_s}..{w_end_s}) | "
+            f"All Window: {win_b_cnt}▲ {win_r_cnt}▼ | "
+            f"Pure 1st-Time: {new_b_cnt}▲ {new_r_cnt}▼"
         )
         _send_email_message(
             subject=email_subject,
@@ -2863,8 +2770,8 @@ def parse_args():
     p.add_argument("--no-iteration-lookback", action="store_true", help="Disable multi-iteration first-time popup comparison.")
 
     # --- Email & Sectoral Controls ---
-    p.add_argument("--send-email", dest="send_email", action="store_true", default=SEND_DASHBOARD_EMAIL, help="Send untruncated dashboard email via SMTP secrets.")
-    p.add_argument("--no-send-email", dest="send_email", action="store_false", help="Disable sending dashboard email.")
+    p.add_argument("--send-email", dest="send_email", action="store_true", default=SEND_DASHBOARD_EMAIL, help="Send window popups email via SMTP secrets.")
+    p.add_argument("--no-send-email", dest="send_email", action="store_false", help="Disable sending email.")
     p.add_argument("--save-html", dest="save_html", action="store_true", default=SAVE_LOCAL_HTML_FILE, help="Save local HTML file to disk.")
     p.add_argument("--no-sector-indices", action="store_true", help="Disable Stage 1 Sectoral Index evaluation.")
     p.add_argument("--sector", type=str, default="", help="Filter console Stock tables to a specific Sectoral Index.")
