@@ -4,6 +4,10 @@ Strict Institutional Volatility Tracker (Upstox) - System 3.0 (Email Sectoral Ac
 + Zero Hardcoded Logic: All indicator periods, multipliers, stop ratchets, email toggles, and sector weights live in Section 0.
 + Multi-Index Highest-Weightage Resolver: Assigns dual-listed stocks to the sectoral index where they carry the highest %.
 + Sectoral Index 3-Lock Engine: Evaluates Sectoral Indices first (Top Bulls, Top Bears, Graveyard) before stocks.
++ In-Memory Multi-Iteration First-Time Popup Engine (Zero File/JSON Storage):
+  - Evaluates NO_OF_ITERATIONS prior snapshots spaced by TIME_OF_INTERVAL_TO_LOOKBACK minutes purely in memory.
+  - Compares current snapshot (e.g. 09:30) against prior iterations (e.g. 09:25, 09:20, 09:15).
+  - Segregates Bull & Bear setups popping up for the first time with Anchor within the lookback window into a new resultset without touching existing resultsets.
 + Full Email Delivery (Zero Truncation):
   - Reads SENDER_EMAIL, SENDER_PASSWORD, RECIPIENT_EMAIL, SMTP_SERVER, SMTP_PORT, TRACK_SYMBOL, UPSTOX_ACCESS_TOKEN.
   - Sends complete, untruncated Plain-Text + Native HTML5 Expand/Collapse Sectoral Accordions + Attached Interactive HTML.
@@ -61,6 +65,10 @@ ENV_RECIPIENT_EMAIL = "RECIPIENT_EMAIL"
 ENV_SMTP_SERVER = "SMTP_SERVER"
 ENV_SMTP_PORT = "SMTP_PORT"
 ENV_TRACK_SYMBOL = "TRACK_SYMBOL"
+ENV_NO_OF_ITERATIONS = "NO_OF_ITERATIONS"
+ENV_LOOKBACK_ITERATIONS = "LOOKBACK_ITERATIONS"
+ENV_TIME_OF_INTERVAL_TO_LOOKBACK = "TIME_OF_INTERVAL_TO_LOOKBACK"
+ENV_LOOKBACK_INTERVAL_MIN = "LOOKBACK_INTERVAL_MIN"
 
 DEFAULT_SMTP_SERVER = "smtp.gmail.com"
 DEFAULT_SMTP_PORT = "465"
@@ -93,6 +101,13 @@ BACKTRACE_CHECKPOINTS = True            # Evaluate across all intraday checkpoin
 DAY_PCT_BASIS = "PREV_CLOSE"            # Choices: "PREV_CLOSE", "OPEN"
 MAX_SESSION_LOOKBACK_DAYS = 14          # Max days to step back when resolving holidays/weekends
 SESSION_BUCKET_MULT = 10000             # Multiplier for isolating session buckets in ATR aggregation
+
+# --- 0.3B IN-MEMORY MULTI-ITERATION FIRST-TIME POPUP LOOKBACK (ZERO FILE STORAGE) ---
+ENABLE_ITERATION_LOOKBACK = True        # Master toggle: Compare current run against N prior iterations in memory
+NO_OF_ITERATIONS = 3                    # Number of prior lookback iterations (e.g., 3 -> 09:25, 09:20, 09:15 for a 09:30 run)
+TIME_OF_INTERVAL_TO_LOOKBACK = 5        # Lookback interval in minutes between iterations (e.g., 5 mins)
+LOOKBACK_ITERATIONS = NO_OF_ITERATIONS  # Alias for convenience
+LOOKBACK_INTERVAL_MIN = TIME_OF_INTERVAL_TO_LOOKBACK
 
 # --- 0.4 LOCK 1: PRICE VOLATILITY BANDS (BOLLINGER vs. KELTNER) ---
 PRICE_BB_PERIOD = 20                    # Price Bollinger Band rolling window (bars)
@@ -324,6 +339,23 @@ MASTER_RETRY_SLEEP_SEC = 1.0
 # ==============================================================================
 def get_upstox_token():
     return os.environ.get(ENV_UPSTOX_TOKEN) or os.environ.get(ENV_FALLBACK_TOKEN)
+
+def get_lookback_iterations_config():
+    """
+    Resolves NO_OF_ITERATIONS and TIME_OF_INTERVAL_TO_LOOKBACK from environment
+    variables (if provided in GitHub Actions) or falls back to Section 0 globals.
+    """
+    raw_iters = os.environ.get(ENV_NO_OF_ITERATIONS) or os.environ.get(ENV_LOOKBACK_ITERATIONS)
+    raw_interval = os.environ.get(ENV_TIME_OF_INTERVAL_TO_LOOKBACK) or os.environ.get(ENV_LOOKBACK_INTERVAL_MIN)
+    try:
+        iters = int(raw_iters) if raw_iters is not None and str(raw_iters).strip() != "" else int(NO_OF_ITERATIONS)
+    except ValueError:
+        iters = int(NO_OF_ITERATIONS)
+    try:
+        interval = int(raw_interval) if raw_interval is not None and str(raw_interval).strip() != "" else int(TIME_OF_INTERVAL_TO_LOOKBACK)
+    except ValueError:
+        interval = int(TIME_OF_INTERVAL_TO_LOOKBACK)
+    return max(0, iters), max(1, interval)
 
 def now_ist():
     return datetime.now(IST).replace(tzinfo=None)
@@ -1389,7 +1421,7 @@ def _history_worker_daily(args):
         progress.tick()
 
 def process_stock_checkpoints(args):
-    item, checkpoints, use_intraday, history_days, mode, progress = args
+    item, checkpoints, extra_lookback_cps, use_intraday, history_days, mode, progress = args
     sym = item['symbol']
     is_sec_idx = bool(item.get('is_sector_index', False))
     sec_name = item.get('sector', DEFAULT_UNMAPPED_SECTOR)
@@ -1407,22 +1439,25 @@ def process_stock_checkpoints(args):
             if today_df is not None:
                 frames.append(today_df)
         if not frames:
-            return [(cp, "no_data", sym) for cp in checkpoints]
+            return [(cp, "no_data", sym) for cp in checkpoints], []
 
         master = prepare_master(frames)
         master = master[master['Datetime'] < final_cutoff].reset_index(drop=True)
         if mode == "INDEX_OPTIONS" and not is_sec_idx:
             day = master[master['Datetime'].dt.date == target_dt]
             if day.empty:
-                return [(cp, "no_data", sym) for cp in checkpoints]
+                return [(cp, "no_data", sym) for cp in checkpoints], []
             if day['Close'].iloc[-1] < OPT_MIN_PRICE or day['Volume'].sum() < OPT_MIN_VOLUME:
-                return [(cp, "illiquid", sym) for cp in checkpoints]
+                return [(cp, "illiquid", sym) for cp in checkpoints], []
 
         S, why = prepare_series(master, target_dt, is_sector_index=is_sec_idx)
         if S is None:
-            return [(cp, why, sym) for cp in checkpoints]
+            return [(cp, why, sym) for cp in checkpoints], []
+
+        # 1. Exact evaluation for primary checkpoints (untouched)
         ends = np.searchsorted(S['dt'], np.array(checkpoints, dtype='datetime64[ns]'), side='left')
         out = []
+        by_cp_row = {}
         for cp, end in zip(checkpoints, ends):
             row = row_at(S, int(end), sym, sector=sec_name, sector_weight=sec_wt, is_sector_index=is_sec_idx)
             if row is None:
@@ -1430,10 +1465,29 @@ def process_stock_checkpoints(args):
             else:
                 row['CheckpointTime'] = cp
                 out.append((cp, "ok", row))
-        return out
+                by_cp_row[cp] = row
+
+        # 2. In-memory evaluation for any additional lookback iteration checkpoints (e.g., 09:15 open bar)
+        extra_out = []
+        session_open_dt = _open_dt(target_dt)
+        for l_cp in (extra_lookback_cps or []):
+            if l_cp in by_cp_row:
+                extra_out.append((l_cp, "ok", by_cp_row[l_cp]))
+                continue
+            if l_cp == session_open_dt:
+                # At 09:15 session open, include the 09:15 1-minute bar if present
+                l_end = int(np.searchsorted(S['dt'], np.datetime64(l_cp), side='right'))
+            else:
+                l_end = int(np.searchsorted(S['dt'], np.datetime64(l_cp), side='left'))
+            l_row = row_at(S, l_end, sym, sector=sec_name, sector_weight=sec_wt, is_sector_index=is_sec_idx)
+            if l_row is not None:
+                l_row['CheckpointTime'] = l_cp
+                extra_out.append((l_cp, "ok", l_row))
+
+        return out, extra_out
     except Exception as e:
         ERRORS.add(f"1m:{item.get('symbol')}", e)
-        return [(cp, "error", item.get('symbol')) for cp in checkpoints]
+        return [(cp, "error", item.get('symbol')) for cp in checkpoints], []
     finally:
         progress.tick()
 
@@ -1594,6 +1648,177 @@ def segregate_and_rank_buckets(by_symbol_map):
 
     return surviving_bulls, surviving_bears, dedup_grave
 
+# ==============================================================================
+# 3B. IN-MEMORY MULTI-ITERATION FIRST-TIME POPUP ENGINE (ZERO FILE STORAGE)
+# ==============================================================================
+def compute_lookback_iteration_schedule(cutoff_dt, num_iterations=None, interval_min=None):
+    """
+    Given a snapshot `cutoff_dt` (e.g. 09:30), `NO_OF_ITERATIONS` (e.g. 3),
+    and `TIME_OF_INTERVAL_TO_LOOKBACK` (e.g. 5 mins):
+      - Prior iteration cutoffs: [09:25, 09:20, 09:15] (clamped to >= 09:15 session open)
+      - Window for Anchor Time validation: [09:15, 09:30]
+    """
+    cfg_iters, cfg_interval = get_lookback_iterations_config()
+    n_iters = cfg_iters if num_iterations is None else max(0, int(num_iterations))
+    step_min = cfg_interval if interval_min is None else max(1, int(interval_min))
+
+    session_open_dt = _open_dt(cutoff_dt.date())
+    window_start_dt = max(session_open_dt, cutoff_dt - timedelta(minutes=n_iters * step_min))
+
+    prior_iter_dts = []
+    for k in range(1, n_iters + 1):
+        it_dt = cutoff_dt - timedelta(minutes=k * step_min)
+        if it_dt >= session_open_dt and it_dt not in prior_iter_dts:
+            prior_iter_dts.append(it_dt)
+
+    # Sort chronologically (e.g. [09:15, 09:20, 09:25]) for sequential first-seen tracking
+    prior_iter_dts_chrono = sorted(prior_iter_dts)
+    return {
+        "enabled": bool(ENABLE_ITERATION_LOOKBACK and n_iters > 0),
+        "num_iterations": n_iters,
+        "interval_min": step_min,
+        "window_start_dt": window_start_dt,
+        "window_end_dt": cutoff_dt,
+        "prior_iter_dts_desc": prior_iter_dts,
+        "prior_iter_dts_chrono": prior_iter_dts_chrono,
+    }
+
+def _anchor_within_lookback_window(anchor_str, window_start_dt, window_end_dt):
+    if not anchor_str or anchor_str == "-":
+        return False
+    clean_t = str(anchor_str).replace("*", "").strip()
+    try:
+        parsed_t = datetime.strptime(clean_t, "%H:%M").time()
+        anchor_dt = datetime.combine(window_end_dt.date(), parsed_t)
+        return window_start_dt <= anchor_dt <= window_end_dt
+    except ValueError:
+        return False
+
+def evaluate_first_time_popups_in_memory(
+    by_symbol_all_cps,
+    current_bulls,
+    current_bears,
+    lookback_meta
+):
+    """
+    Purely in-memory comparison (no JSON or file storage):
+    1. Runs `segregate_and_rank_buckets` for each prior iteration in `prior_iter_dts_chrono`
+       (e.g., 09:15, 09:20, 09:25) using the already-computed 1-minute series rows.
+    2. Compares the `current_bulls` and `current_bears` (e.g., 09:30 run results) against all
+       prior iterations (09:25, 09:20, 09:15):
+       - Anchor value (`ActiveAnchor` time) MUST be within `[window_start_dt, window_end_dt]`
+         (e.g., within 09:15 to 09:30).
+       - Must have zero prior stopped episodes (`PriorStops == 0` and `len(Kills) == 0`).
+       - Segregates:
+         a) `new_at_current_bulls` / `new_at_current_bears`:
+            Popped up in Bull/Bear for the VERY FIRST TIME in the current run (09:30) and
+            never appeared in ANY of the prior lookback iterations (09:25, 09:20, 09:15).
+         b) `first_time_window_bulls` / `first_time_window_bears`:
+            All surviving Bull/Bear setups at 09:30 whose Anchor is within [09:15, 09:30] and
+            which popped up for the first time during one of the evaluated iterations
+            (tagged with `FirstPopupIter` = exact iteration timestamp where it first popped up).
+    """
+    if not lookback_meta or not lookback_meta.get("enabled"):
+        return {
+            "new_bulls": [],
+            "new_bears": [],
+            "window_first_bulls": [],
+            "window_first_bears": [],
+            "iter_stats": [],
+        }
+
+    w_start = lookback_meta["window_start_dt"]
+    w_end = lookback_meta["window_end_dt"]
+    prior_dts = lookback_meta["prior_iter_dts_chrono"]
+
+    # Track symbols seen in Bull, Bear, or Killed in Graveyard in each prior iteration
+    seen_in_prior_bulls = set()
+    seen_in_prior_bears = set()
+    seen_in_prior_killed = set()
+    first_seen_iter_map = {}  # (symbol, direction) -> HH:MM string of first iteration appearance
+    iter_stats = []
+
+    for it_dt in prior_dts:
+        it_cps = set(generate_checkpoints(it_dt, interval_min=CHECKPOINT_INTERVAL_MIN) if BACKTRACE_CHECKPOINTS else [it_dt])
+        it_cps.add(it_dt)
+
+        sub_map = {}
+        for sym, rows in by_symbol_all_cps.items():
+            f_rows = [r for r in rows if r['CheckpointTime'] <= it_dt and r['CheckpointTime'] in it_cps]
+            if not f_rows:
+                f_rows = [r for r in rows if r['CheckpointTime'] <= it_dt]
+            if f_rows:
+                sub_map[sym] = f_rows
+
+        it_bulls, it_bears, it_grave = segregate_and_rank_buckets(sub_map) if sub_map else ([], [], [])
+        it_label = it_dt.strftime("%H:%M")
+        iter_stats.append({
+            "iter_time": it_label,
+            "bull_count": len(it_bulls),
+            "bear_count": len(it_bears),
+            "grave_count": len(it_grave),
+        })
+
+        for r in it_bulls:
+            sym = r['Symbol']
+            seen_in_prior_bulls.add(sym)
+            if (sym, "BULL") not in first_seen_iter_map:
+                first_seen_iter_map[(sym, "BULL")] = it_label
+        for r in it_bears:
+            sym = r['Symbol']
+            seen_in_prior_bears.add(sym)
+            if (sym, "BEAR") not in first_seen_iter_map:
+                first_seen_iter_map[(sym, "BEAR")] = it_label
+        for r in it_grave:
+            if float(r.get('AnchorPrice', 0.0) or 0.0) > 0 and r.get('KilledTime', '-') != '-':
+                seen_in_prior_killed.add(r['Symbol'])
+
+    seen_any_prior = seen_in_prior_bulls | seen_in_prior_bears | seen_in_prior_killed
+    curr_label = w_end.strftime("%H:%M")
+
+    new_bulls, new_bears = [], []
+    window_first_bulls, window_first_bears = [], []
+
+    for row in current_bulls:
+        sym = row['Symbol']
+        in_win = _anchor_within_lookback_window(row.get('ActiveAnchor'), w_start, w_end)
+        first_episode_ever = (int(row.get('PriorStops', 0) or 0) == 0) and (len(row.get('Kills') or []) == 0)
+        if not (in_win and first_episode_ever):
+            continue
+
+        row_copy = dict(row)
+        first_it = first_seen_iter_map.get((sym, "BULL"), curr_label)
+        row_copy['FirstPopupIter'] = first_it
+
+        if sym not in seen_any_prior:
+            new_bulls.append(row_copy)
+        if sym not in seen_in_prior_killed and sym not in seen_in_prior_bears:
+            window_first_bulls.append(row_copy)
+
+    for row in current_bears:
+        sym = row['Symbol']
+        in_win = _anchor_within_lookback_window(row.get('ActiveAnchor'), w_start, w_end)
+        first_episode_ever = (int(row.get('PriorStops', 0) or 0) == 0) and (len(row.get('Kills') or []) == 0)
+        if not (in_win and first_episode_ever):
+            continue
+
+        row_copy = dict(row)
+        first_it = first_seen_iter_map.get((sym, "BEAR"), curr_label)
+        row_copy['FirstPopupIter'] = first_it
+
+        if sym not in seen_any_prior:
+            new_bears.append(row_copy)
+        if sym not in seen_in_prior_killed and sym not in seen_in_prior_bulls:
+            window_first_bears.append(row_copy)
+
+    return {
+        "new_bulls": new_bulls,
+        "new_bears": new_bears,
+        "window_first_bulls": window_first_bulls,
+        "window_first_bears": window_first_bears,
+        "iter_stats": iter_stats,
+    }
+
 def _state_display(row):
     return f"[STOP {row.get('KilledTime')}]" if row['State'] == "[STOPPED]" and row.get('KilledTime') and row.get('KilledTime') != '-' else row['State']
 
@@ -1611,7 +1836,10 @@ def render_console_dashboard(
     mode, cutoff_dt, checkpoints,
     idx_bulls, idx_bears, idx_grave,
     stock_bulls, stock_bears, stock_grave,
-    active_sector_filter=None
+    active_sector_filter=None,
+    lookback_meta=None,
+    idx_popup_res=None,
+    stock_popup_res=None
 ):
     norm_filter = _norm_sym(active_sector_filter) if active_sector_filter else ""
 
@@ -1637,15 +1865,16 @@ def render_console_dashboard(
         f"Stocks Shown (Bull: {len(f_stock_bulls)}, Bear: {len(f_stock_bears)}, Grave: {len(f_stock_grave)})\n"
     )
 
-    def print_active_table(title, icon, data_list, show_sector_col=True):
+    def print_active_table(title, icon, data_list, show_sector_col=True, show_first_iter_col=False):
         if not data_list:
             return
         print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
         grid_hdr = " ".join(f"{m}X" for m in GRID_MULTIPLIERS)
         sec_hdr = f"{'Sector (MaxWt%)':<{sec_w}} | " if show_sector_col else ""
+        iter_hdr = f"{'1stIter':^7} | " if show_first_iter_col else ""
         header_str = (
             f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP/Exit':>9} | "
-            f"{sec_hdr}"
+            f"{sec_hdr}{iter_hdr}"
             f"{'Seen':^5} {'Anchor':^7} {'Anch Val':>9} {'R-Mult (Bank)':>15} | "
             f"ATR: {grid_hdr} | BB: {grid_hdr} | {'State':^13}{COLOR_RESET}"
         )
@@ -1661,7 +1890,7 @@ def render_console_dashboard(
             if row.get('PriorStops', 0) > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON:
                 r_mult_str, anchor_disp = f"{live_r:>+5.2f}R ({banked_r:>+4.1f}R)", f"{row['ActiveAnchor']}*"
             else:
-                r_mult_str, anchor_disp = f"{live_r:>+5.2f}R        ", f"{row['ActiveAnchor']} "
+                r_mult_str, anchor_disp = f"{live_r:>+5.2f}R         ", f"{row['ActiveAnchor']} "
             dir_c = COLOR_GREEN_FG if basket_dir == "BULL" else COLOR_RED_FG
             ag, bg = row.get('ATR_Grid', default_g), row.get('BB_Grid', default_g)
             a_str = "  ".join(_format_val(ag.get(k, 0), dir_c) for k in GRID_MULTIPLIERS)
@@ -1675,9 +1904,10 @@ def render_console_dashboard(
             ltp_val = f"{row['KilledPrice']:>8.2f}x" if "[STOP" in shown_state and row.get('KilledPrice', 0) > 0 else f"{row['LTP']:>9.2f} "
             sec_label = f"{row.get('Sector', DEFAULT_UNMAPPED_SECTOR)}"
             sec_cell = f"{_clip(sec_label, sec_w):<{sec_w}} | " if show_sector_col else ""
+            iter_cell = f"{row.get('FirstPopupIter', row['CheckpointTime'].strftime('%H:%M')):^7} | " if show_first_iter_col else ""
             print(
                 f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} {ltp_val} | "
-                f"{sec_cell}"
+                f"{sec_cell}{iter_cell}"
                 f"{row['CheckpointTime'].strftime('%H:%M'):^5} {anchor_disp:^7} {row['AnchorPrice']:>9.2f} "
                 f"{r_color}{r_mult_str:>15}{COLOR_RESET} |   {a_str}  |   {b_str}  | {state_text}"
             )
@@ -1714,6 +1944,7 @@ def render_console_dashboard(
                 f"{g_r_color}{g_r_str}{COLOR_RESET} {move_color}{move_pct_str}{COLOR_RESET} | {reason_color}{reason}{COLOR_RESET}"
             )
 
+    # --- EXISTING RESULTSET STAGE 1 (UNTOUCHED) ---
     if idx_bulls or idx_bears or idx_grave:
         print(f"{COLOR_CYAN}{'=' * 95}{COLOR_RESET}")
         print(f"{COLOR_BOLD}🏛️  STAGE 1: SECTORAL INDICES (Evaluated with 3-Lock Kinetic Engine){COLOR_RESET}")
@@ -1722,6 +1953,7 @@ def render_console_dashboard(
         print_active_table("SECTORAL INDICES — TOP BEAR SETUPS (Valid Anchors Surviving)", "🏛️🩸", idx_bears, show_sector_col=False)
         print_grave_table("SECTORAL INDICES — THE GRAVEYARD (Completed / Filtered / Rejected)", "🏛️🚫", idx_grave, show_sector_col=False)
 
+    # --- EXISTING RESULTSET STAGE 2 (UNTOUCHED) ---
     print(f"\n{COLOR_CYAN}{'=' * 95}{COLOR_RESET}")
     stage2_label = f"STAGE 2: STOCKS FOR SECTOR [{active_sector_filter.upper()}]" if norm_filter else "STAGE 2: ALL STOCKS (Mapped by Highest Sectoral Index Weightage)"
     print(f"{COLOR_BOLD}📈  {stage2_label}{COLOR_RESET}")
@@ -1732,16 +1964,97 @@ def render_console_dashboard(
         print(f"{COLOR_YELLOW}No surviving stock anchors for this view.{COLOR_RESET}")
     print_grave_table("STOCKS — THE GRAVEYARD (Completed Episodes / Filtered / Rejected)", "🚫", f_stock_grave, show_sector_col=True)
 
+    # --- NEW SEGREGATED RESULTSET: MULTI-ITERATION FIRST-TIME POPUPS (ADDED WITHOUT TOUCHING EXISTING) ---
+    if lookback_meta and lookback_meta.get("enabled") and stock_popup_res is not None:
+        w_start_s = lookback_meta["window_start_dt"].strftime("%H:%M")
+        w_end_s = lookback_meta["window_end_dt"].strftime("%H:%M")
+        prior_s = ", ".join(d.strftime("%H:%M") for d in lookback_meta["prior_iter_dts_desc"]) or "None"
+        iter_summary_s = " | ".join(
+            f"{st['iter_time']} (▲{st['bull_count']} ▼{st['bear_count']})"
+            for st in (stock_popup_res.get("iter_stats") or [])
+        )
+
+        new_idx_bulls = (idx_popup_res or {}).get("new_bulls", [])
+        new_idx_bears = (idx_popup_res or {}).get("new_bears", [])
+        win_idx_bulls = (idx_popup_res or {}).get("window_first_bulls", [])
+        win_idx_bears = (idx_popup_res or {}).get("window_first_bears", [])
+
+        new_stk_bulls = stock_popup_res.get("new_bulls", [])
+        new_stk_bears = stock_popup_res.get("new_bears", [])
+        win_stk_bulls = stock_popup_res.get("window_first_bulls", [])
+        win_stk_bears = stock_popup_res.get("window_first_bears", [])
+
+        if norm_filter:
+            new_stk_bulls = [r for r in new_stk_bulls if _norm_sym(r.get('Sector', '')) == norm_filter or norm_filter in _norm_sym(r.get('Sector', ''))]
+            new_stk_bears = [r for r in new_stk_bears if _norm_sym(r.get('Sector', '')) == norm_filter or norm_filter in _norm_sym(r.get('Sector', ''))]
+            win_stk_bulls = [r for r in win_stk_bulls if _norm_sym(r.get('Sector', '')) == norm_filter or norm_filter in _norm_sym(r.get('Sector', ''))]
+            win_stk_bears = [r for r in win_stk_bears if _norm_sym(r.get('Sector', '')) == norm_filter or norm_filter in _norm_sym(r.get('Sector', ''))]
+
+        print(f"\n{COLOR_CYAN}{'=' * 95}{COLOR_RESET}")
+        print(
+            f"{COLOR_BOLD}🆕  STAGE 3 (NEW SEGREGATED RESULTSET): FIRST-TIME POPUPS ACROSS LOOKBACK ITERATIONS{COLOR_RESET}\n"
+            f"   {COLOR_DIM}» Config: NO_OF_ITERATIONS={lookback_meta['num_iterations']} | "
+            f"TIME_OF_INTERVAL_TO_LOOKBACK={lookback_meta['interval_min']}m | "
+            f"Anchor Window: {w_start_s} to {w_end_s} | Prior Runs Compared: [{prior_s}] vs Current [{w_end_s}]{COLOR_RESET}"
+        )
+        if iter_summary_s:
+            print(f"   {COLOR_DIM}» Prior Iteration Stock Counts: {iter_summary_s}{COLOR_RESET}")
+        print(f"{COLOR_CYAN}{'=' * 95}{COLOR_RESET}")
+
+        if new_idx_bulls or new_idx_bears:
+            print_active_table(
+                f"NEW FIRST-TIME SECTORAL INDEX POPUPS @ {w_end_s} (Not in [{prior_s}], Anchor {w_start_s}-{w_end_s}) — BULL",
+                "🏛️🆕🔥", new_idx_bulls, show_sector_col=False, show_first_iter_col=True
+            )
+            print_active_table(
+                f"NEW FIRST-TIME SECTORAL INDEX POPUPS @ {w_end_s} (Not in [{prior_s}], Anchor {w_start_s}-{w_end_s}) — BEAR",
+                "🏛️🆕🩸", new_idx_bears, show_sector_col=False, show_first_iter_col=True
+            )
+
+        print_active_table(
+            f"NEW FIRST-TIME STOCK POPUPS @ {w_end_s} (Absent in [{prior_s}], Anchor {w_start_s}-{w_end_s}) — BULL ({len(new_stk_bulls)})",
+            "🆕🔥", new_stk_bulls, show_sector_col=True, show_first_iter_col=True
+        )
+        print_active_table(
+            f"NEW FIRST-TIME STOCK POPUPS @ {w_end_s} (Absent in [{prior_s}], Anchor {w_start_s}-{w_end_s}) — BEAR ({len(new_stk_bears)})",
+            "🆕🩸", new_stk_bears, show_sector_col=True, show_first_iter_col=True
+        )
+        if not new_stk_bulls and not new_stk_bears:
+            print(f"\n{COLOR_YELLOW}No strictly new stock popups at {w_end_s} (absent in all prior lookback iterations [{prior_s}]) with Anchor in {w_start_s}..{w_end_s}.{COLOR_RESET}")
+
+        if win_idx_bulls or win_idx_bears:
+            print_active_table(
+                f"ALL FIRST-TIME SECTORAL INDEX POPUPS WITHIN WINDOW ({w_start_s}..{w_end_s}) SURVIVING @ {w_end_s} — BULL",
+                "🏛️⏱️🔥", win_idx_bulls, show_sector_col=False, show_first_iter_col=True
+            )
+            print_active_table(
+                f"ALL FIRST-TIME SECTORAL INDEX POPUPS WITHIN WINDOW ({w_start_s}..{w_end_s}) SURVIVING @ {w_end_s} — BEAR",
+                "🏛️⏱️🩸", win_idx_bears, show_sector_col=False, show_first_iter_col=True
+            )
+
+        print_active_table(
+            f"ALL FIRST-TIME STOCK POPUPS WITHIN WINDOW ({w_start_s}..{w_end_s}) SURVIVING @ {w_end_s} — BULL ({len(win_stk_bulls)})",
+            "⏱️🔥", win_stk_bulls, show_sector_col=True, show_first_iter_col=True
+        )
+        print_active_table(
+            f"ALL FIRST-TIME STOCK POPUPS WITHIN WINDOW ({w_start_s}..{w_end_s}) SURVIVING @ {w_end_s} — BEAR ({len(win_stk_bears)})",
+            "⏱️🩸", win_stk_bears, show_sector_col=True, show_first_iter_col=True
+        )
+
 def build_full_untruncated_plain_text(
     mode, cutoff_dt, checkpoints,
     idx_bulls, idx_bears, idx_grave,
-    stock_bulls, stock_bears, stock_grave
+    stock_bulls, stock_bears, stock_grave,
+    lookback_meta=None,
+    idx_popup_res=None,
+    stock_popup_res=None
 ):
     """
     Generates the 100% untruncated Plain-Text email body containing:
-    1. Stage 1: Sectoral Indices (Top Bulls, Top Bears, Graveyard)
-    2. Stage 2: Sector-by-Sector Breakdown (Each Sectoral Index followed by its Bull, Bear, and Graveyard stocks)
-    3. Stage 3: Complete All-Stocks Master Tables (All Top Bulls, All Top Bears, All Graveyard rows)
+    1. Stage 1: Sectoral Indices (Top Bulls, Top Bears, Graveyard) [Untouched]
+    2. Stage 2: Sector-by-Sector Breakdown (Each Sectoral Index followed by its Bull, Bear, and Graveyard stocks) [Untouched]
+    3. Stage 3: Complete All-Stocks Master Tables (All Top Bulls, All Top Bears, All Graveyard rows) [Untouched]
+    4. Stage 4: New Segregated First-Time Popup Resultset (Lookback Iteration Comparison) [Added]
     """
     e_bulls = stock_bulls if EMAIL_MAX_BUYERS <= 0 else stock_bulls[:EMAIL_MAX_BUYERS]
     e_bears = stock_bears if EMAIL_MAX_SELLERS <= 0 else stock_bears[:EMAIL_MAX_SELLERS]
@@ -1760,13 +2073,14 @@ def build_full_untruncated_plain_text(
     )
     lines.append("")
 
-    def _fmt_active_block(title, data_list, show_sector=True):
+    def _fmt_active_block(title, data_list, show_sector=True, show_first_iter=False):
         if not data_list:
             return
         lines.append(f"--- {title} ({len(data_list)}) ---")
         grid_hdr = " ".join(f"{m}X" for m in GRID_MULTIPLIERS)
         sec_hdr = f"{'Sector (MaxWt%)':<{sec_w}} | " if show_sector else ""
-        hdr = f"{'Script':<{sym_w}} {'LTP/Exit':>9} | {sec_hdr}{'Seen':^5} {'Anchor':^7} {'Anch Val':>9} {'R-Mult (Bank)':>15} | ATR: {grid_hdr} | BB: {grid_hdr} | {'State':^13}"
+        iter_hdr = f"{'1stIter':^7} | " if show_first_iter else ""
+        hdr = f"{'Script':<{sym_w}} {'LTP/Exit':>9} | {sec_hdr}{iter_hdr}{'Seen':^5} {'Anchor':^7} {'Anch Val':>9} {'R-Mult (Bank)':>15} | ATR: {grid_hdr} | BB: {grid_hdr} | {'State':^13}"
         lines.append(hdr)
         lines.append("-" * len(hdr))
         basket_dir = "BULL" if "BULL" in title else "BEAR"
@@ -1776,7 +2090,7 @@ def build_full_untruncated_plain_text(
             if r.get('PriorStops', 0) > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON:
                 r_mult_str, anchor_disp = f"{live_r:>+5.2f}R ({banked_r:>+4.1f}R)", f"{r['ActiveAnchor']}*"
             else:
-                r_mult_str, anchor_disp = f"{live_r:>+5.2f}R        ", f"{r['ActiveAnchor']} "
+                r_mult_str, anchor_disp = f"{live_r:>+5.2f}R         ", f"{r['ActiveAnchor']} "
             ag, bg = r.get('ATR_Grid', default_g), r.get('BB_Grid', default_g)
             a_str = "  ".join(str(ag.get(k, 0)) for k in GRID_MULTIPLIERS)
             b_str = "  ".join(str(bg.get(k, 0)) for k in GRID_MULTIPLIERS)
@@ -1786,8 +2100,9 @@ def build_full_untruncated_plain_text(
             ltp_val = f"{r['KilledPrice']:>8.2f}x" if "[STOP" in shown_state and r.get('KilledPrice', 0) > 0 else f"{r['LTP']:>9.2f} "
             sec_str = f"{r.get('Sector', DEFAULT_UNMAPPED_SECTOR)} ({r.get('SectorWeight', 0.0):.1f}%)"
             sec_cell = f"{_clip(sec_str, sec_w, EMAIL_CLIP_SYMBOLS):<{sec_w}} | " if show_sector else ""
+            iter_cell = f"{r.get('FirstPopupIter', r['CheckpointTime'].strftime('%H:%M')):^7} | " if show_first_iter else ""
             lines.append(
-                f"{_clip(r['Symbol'], sym_w, EMAIL_CLIP_SYMBOLS):<{sym_w}} {ltp_val} | {sec_cell}"
+                f"{_clip(r['Symbol'], sym_w, EMAIL_CLIP_SYMBOLS):<{sym_w}} {ltp_val} | {sec_cell}{iter_cell}"
                 f"{r['CheckpointTime'].strftime('%H:%M'):^5} {anchor_disp:^7} {r['AnchorPrice']:>9.2f} "
                 f"{r_mult_str:>15} |   {a_str}  |   {b_str}  | {shown_state:^13}"
             )
@@ -1820,7 +2135,7 @@ def build_full_untruncated_plain_text(
             )
         lines.append("")
 
-    # 1. Stage 1: Sectoral Indices
+    # 1. Stage 1: Sectoral Indices (Untouched)
     lines.append("=========================================================================================")
     lines.append("STAGE 1: SECTORAL INDICES (TOP BULLS, TOP BEARS, GRAVEYARD)")
     lines.append("=========================================================================================")
@@ -1828,7 +2143,7 @@ def build_full_untruncated_plain_text(
     _fmt_active_block("SECTORAL INDICES — TOP BEAR SETUPS", idx_bears, show_sector=False)
     _fmt_grave_block("SECTORAL INDICES — THE GRAVEYARD", idx_grave, show_sector=False)
 
-    # 2. Stage 2: Per-Sector Stock Grouping
+    # 2. Stage 2: Per-Sector Stock Grouping (Untouched)
     lines.append("=========================================================================================")
     lines.append("STAGE 2: STOCKS GROUPED BY SECTORAL INDEX (HIGHEST WEIGHTAGE WINNER)")
     lines.append("=========================================================================================")
@@ -1844,7 +2159,7 @@ def build_full_untruncated_plain_text(
         _fmt_active_block(f"[{sec}] TOP BEAR STOCKS", sr, show_sector=False)
         _fmt_grave_block(f"[{sec}] GRAVEYARD STOCKS", sg, show_sector=False)
 
-    # 3. Stage 3: All Stocks Master Tables
+    # 3. Stage 3: All Stocks Master Tables (Untouched)
     lines.append("=========================================================================================")
     lines.append("STAGE 3: ALL STOCKS MASTER VIEW (DEFAULT SHOW ALL)")
     lines.append("=========================================================================================")
@@ -1852,21 +2167,56 @@ def build_full_untruncated_plain_text(
     _fmt_active_block("ALL STOCKS — TOP BEAR SETUPS", e_bears, show_sector=True)
     _fmt_grave_block("ALL STOCKS — THE GRAVEYARD", e_grave, show_sector=True)
 
+    # 4. Stage 4: New Segregated First-Time Popup Resultset (Added)
+    if lookback_meta and lookback_meta.get("enabled") and stock_popup_res is not None:
+        w_start_s = lookback_meta["window_start_dt"].strftime("%H:%M")
+        w_end_s = lookback_meta["window_end_dt"].strftime("%H:%M")
+        prior_s = ", ".join(d.strftime("%H:%M") for d in lookback_meta["prior_iter_dts_desc"]) or "None"
+        new_idx_b = (idx_popup_res or {}).get("new_bulls", [])
+        new_idx_r = (idx_popup_res or {}).get("new_bears", [])
+        win_idx_b = (idx_popup_res or {}).get("window_first_bulls", [])
+        win_idx_r = (idx_popup_res or {}).get("window_first_bears", [])
+        new_stk_b = stock_popup_res.get("new_bulls", [])
+        new_stk_r = stock_popup_res.get("new_bears", [])
+        win_stk_b = stock_popup_res.get("window_first_bulls", [])
+        win_stk_r = stock_popup_res.get("window_first_bears", [])
+
+        lines.append("=========================================================================================")
+        lines.append(
+            f"STAGE 4 (NEW SEGREGATED RESULTSET): FIRST-TIME POPUPS "
+            f"(NO_OF_ITERATIONS={lookback_meta['num_iterations']}, INTERVAL={lookback_meta['interval_min']}m, "
+            f"WINDOW={w_start_s}..{w_end_s}, PRIOR=[{prior_s}] vs CURRENT=[{w_end_s}])"
+        )
+        lines.append("=========================================================================================")
+        _fmt_active_block(f"NEW FIRST-TIME SECTORAL INDEX POPUPS @ {w_end_s} — BULL", new_idx_b, show_sector=False, show_first_iter=True)
+        _fmt_active_block(f"NEW FIRST-TIME SECTORAL INDEX POPUPS @ {w_end_s} — BEAR", new_idx_r, show_sector=False, show_first_iter=True)
+        _fmt_active_block(f"NEW FIRST-TIME STOCK POPUPS @ {w_end_s} (ABSENT IN [{prior_s}], ANCHOR {w_start_s}..{w_end_s}) — BULL", new_stk_b, show_sector=True, show_first_iter=True)
+        _fmt_active_block(f"NEW FIRST-TIME STOCK POPUPS @ {w_end_s} (ABSENT IN [{prior_s}], ANCHOR {w_start_s}..{w_end_s}) — BEAR", new_stk_r, show_sector=True, show_first_iter=True)
+        _fmt_active_block(f"ALL FIRST-TIME SECTORAL INDEX POPUPS IN WINDOW ({w_start_s}..{w_end_s}) SURVIVING @ {w_end_s} — BULL", win_idx_b, show_sector=False, show_first_iter=True)
+        _fmt_active_block(f"ALL FIRST-TIME SECTORAL INDEX POPUPS IN WINDOW ({w_start_s}..{w_end_s}) SURVIVING @ {w_end_s} — BEAR", win_idx_r, show_sector=False, show_first_iter=True)
+        _fmt_active_block(f"ALL FIRST-TIME STOCK POPUPS IN WINDOW ({w_start_s}..{w_end_s}) SURVIVING @ {w_end_s} — BULL", win_stk_b, show_sector=True, show_first_iter=True)
+        _fmt_active_block(f"ALL FIRST-TIME STOCK POPUPS IN WINDOW ({w_start_s}..{w_end_s}) SURVIVING @ {w_end_s} — BEAR", win_stk_r, show_sector=True, show_first_iter=True)
+
     return "\n".join(lines)
 
 def build_email_and_attachment_html(
     mode, cutoff_dt, checkpoints,
     idx_bulls, idx_bears, idx_grave,
-    stock_bulls, stock_bears, stock_grave
+    stock_bulls, stock_bears, stock_grave,
+    lookback_meta=None,
+    idx_popup_res=None,
+    stock_popup_res=None
 ):
     """
     Builds TWO HTML representations:
     1. `email_inline_html`: Uses native HTML5 `<details>` and `<summary>` tags so clicking ANY
        Sectoral Index inside Gmail / Apple Mail / Outlook expands & collapses that sector's
        Top Bulls, Top Bears, and Graveyard stocks WITHOUT needing JavaScript! Also includes
-       an open-by-default "SHOW ALL STOCKS & INDICES" master view with zero row truncation.
+       an open-by-default "SHOW ALL STOCKS & INDICES" master view and the new segregated
+       "STAGE 4: FIRST-TIME POPUPS ACROSS LOOKBACK ITERATIONS" section.
     2. `attachment_js_html`: Full standalone HTML dashboard with interactive JS pill buttons,
-       click-on-index-row filtering, and a "CLEAR FILTER (SHOW ALL)" button.
+       click-on-index-row filtering, a "CLEAR FILTER (SHOW ALL)" button, and the new
+       segregated First-Time Popup tables.
     """
     e_bulls = stock_bulls if EMAIL_MAX_BUYERS <= 0 else stock_bulls[:EMAIL_MAX_BUYERS]
     e_bears = stock_bears if EMAIL_MAX_SELLERS <= 0 else stock_bears[:EMAIL_MAX_SELLERS]
@@ -1889,6 +2239,7 @@ def build_email_and_attachment_html(
             "symbol": r['Symbol'],
             "sector": r.get('Sector', DEFAULT_UNMAPPED_SECTOR),
             "weight": f"{float(r.get('SectorWeight', 0.0)):.1f}%",
+            "first_iter": r.get('FirstPopupIter', r['CheckpointTime'].strftime('%H:%M')),
             "ltp": f"{r['LTP']:.2f}",
             "seen": r['CheckpointTime'].strftime('%H:%M'),
             "anchor": anchor_str,
@@ -1918,22 +2269,24 @@ def build_email_and_attachment_html(
             "reason": r.get('RejectReason', ''),
         }
 
-    def _table_active_html(rows_list, basket_dir, show_sec=True, js_clickable_index=False):
+    def _table_active_html(rows_list, basket_dir, show_sec=True, js_clickable_index=False, show_first_iter=False):
         if not rows_list:
             return "<p style='color:#94a3b8;margin:4px 0 10px 0;'>None</p>"
         sec_th = "<th>Sector (Wt%)</th>" if show_sec else ""
+        iter_th = "<th>1st Iter</th>" if show_first_iter else ""
         tr_list = []
         for r in rows_list:
             d = _ser_active(r, basket_dir)
             sec_attr = html.escape(d["symbol"] if not show_sec else d["sector"])
             click_attr = f'onclick="filterBySector(\'{sec_attr}\')" class="idx-row"' if js_clickable_index else ""
             sec_td = f"<td class='sec'>{html.escape(d['sector'])} ({d['weight']})</td>" if show_sec else ""
+            iter_td = f"<td align='center' style='color:#38bdf8;font-weight:bold;'>{html.escape(d['first_iter'])}</td>" if show_first_iter else ""
             c_cls = "g" if d["r_pos"] else "r"
             tr_list.append(
                 f"<tr {click_attr} data-sector='{sec_attr}'>"
                 f"<td><b>{html.escape(d['symbol'])}</b></td>"
                 f"<td align='right'>{d['ltp']}</td>"
-                f"{sec_td}"
+                f"{sec_td}{iter_td}"
                 f"<td align='center'>{d['seen']}</td>"
                 f"<td align='center'>{html.escape(d['anchor'])}</td>"
                 f"<td align='right'>{d['anchor_val']}</td>"
@@ -1944,7 +2297,7 @@ def build_email_and_attachment_html(
                 f"</tr>"
             )
         return (
-            f"<table><thead><tr><th>Script</th><th align='right'>LTP</th>{sec_th}"
+            f"<table><thead><tr><th>Script</th><th align='right'>LTP</th>{sec_th}{iter_th}"
             f"<th>Seen</th><th>Anchor</th><th align='right'>AnchVal</th><th align='right'>R-Mult (Bank)</th>"
             f"<th>ATR Grid</th><th>BB Grid</th><th>State</th></tr></thead>"
             f"<tbody>{''.join(tr_list)}</tbody></table>"
@@ -2020,6 +2373,55 @@ def build_email_and_attachment_html(
             f"</div></details>"
         )
 
+    # Build Stage 4 HTML block for First-Time Popups (if enabled)
+    stage4_email_html = ""
+    stage4_attach_html = ""
+    if lookback_meta and lookback_meta.get("enabled") and stock_popup_res is not None:
+        w_start_s = lookback_meta["window_start_dt"].strftime("%H:%M")
+        w_end_s = lookback_meta["window_end_dt"].strftime("%H:%M")
+        prior_s = ", ".join(d.strftime("%H:%M") for d in lookback_meta["prior_iter_dts_desc"]) or "None"
+        new_idx_b = (idx_popup_res or {}).get("new_bulls", [])
+        new_idx_r = (idx_popup_res or {}).get("new_bears", [])
+        win_idx_b = (idx_popup_res or {}).get("window_first_bulls", [])
+        win_idx_r = (idx_popup_res or {}).get("window_first_bears", [])
+        new_stk_b = stock_popup_res.get("new_bulls", [])
+        new_stk_r = stock_popup_res.get("new_bears", [])
+        win_stk_b = stock_popup_res.get("window_first_bulls", [])
+        win_stk_r = stock_popup_res.get("window_first_bears", [])
+
+        stage4_inner = (
+            f"<p style='color:#cbd5e1;margin:4px 0 10px 0;'>"
+            f"<b>Lookback Config:</b> NO_OF_ITERATIONS = {lookback_meta['num_iterations']} | "
+            f"TIME_OF_INTERVAL_TO_LOOKBACK = {lookback_meta['interval_min']}m | "
+            f"<b>Anchor Window:</b> {w_start_s} to {w_end_s} | "
+            f"<b>Prior Iterations Compared:</b> [{html.escape(prior_s)}] vs Current [{w_end_s}]</p>"
+            f"<h4>🏛️🆕 FIRST-TIME SECTORAL INDEX POPUPS @ {w_end_s} — BULL ({len(new_idx_b)})</h4>"
+            f"{_table_active_html(new_idx_b, 'BULL', show_sec=False, show_first_iter=True)}"
+            f"<h4>🏛️🆕 FIRST-TIME SECTORAL INDEX POPUPS @ {w_end_s} — BEAR ({len(new_idx_r)})</h4>"
+            f"{_table_active_html(new_idx_r, 'BEAR', show_sec=False, show_first_iter=True)}"
+            f"<h4>🆕🔥 NEW FIRST-TIME STOCK POPUPS @ {w_end_s} (Absent in [{html.escape(prior_s)}], Anchor {w_start_s}..{w_end_s}) — BULL ({len(new_stk_b)})</h4>"
+            f"{_table_active_html(new_stk_b, 'BULL', show_sec=True, show_first_iter=True)}"
+            f"<h4>🆕🩸 NEW FIRST-TIME STOCK POPUPS @ {w_end_s} (Absent in [{html.escape(prior_s)}], Anchor {w_start_s}..{w_end_s}) — BEAR ({len(new_stk_r)})</h4>"
+            f"{_table_active_html(new_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}"
+            f"<h4>⏱️🔥 ALL FIRST-TIME STOCK POPUPS IN WINDOW ({w_start_s}..{w_end_s}) SURVIVING @ {w_end_s} — BULL ({len(win_stk_b)})</h4>"
+            f"{_table_active_html(win_stk_b, 'BULL', show_sec=True, show_first_iter=True)}"
+            f"<h4>⏱️🩸 ALL FIRST-TIME STOCK POPUPS IN WINDOW ({w_start_s}..{w_end_s}) SURVIVING @ {w_end_s} — BEAR ({len(win_stk_r)})</h4>"
+            f"{_table_active_html(win_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}"
+        )
+
+        stage4_email_html = (
+            f"<details open style='margin-top:18px;border:2px solid #f59e0b;border-radius:6px;background:#0f172a;padding:10px;'>"
+            f"<summary style='cursor:pointer;font-weight:bold;color:#fbbf24;font-size:15px;'>"
+            f"🆕 STAGE 4 (NEW SEGREGATED RESULTSET): FIRST-TIME POPUPS ({w_start_s}..{w_end_s} | "
+            f"New @ {w_end_s}: {len(new_stk_b)}▲ {len(new_stk_r)}▼ | Window Total: {len(win_stk_b)}▲ {len(win_stk_r)}▼)"
+            f"</summary>"
+            f"<div style='padding-top:10px;'>{stage4_inner}</div></details>"
+        )
+        stage4_attach_html = (
+            f"<h3 style='color:#fbbf24;margin-top:20px;'>🆕 STAGE 3 (NEW SEGREGATED RESULTSET): FIRST-TIME POPUPS ({w_start_s}..{w_end_s})</h3>"
+            f"<div id='popupContainer'>{stage4_inner}</div>"
+        )
+
     common_css = (
         "body{background:#0b0f19;color:#e2e8f0;font-family:Consolas,monospace;font-size:12px;padding:14px;}"
         "h2,h3,h4{color:#38bdf8;margin:10px 0 6px 0;}"
@@ -2061,6 +2463,7 @@ def build_email_and_attachment_html(
         f"<h4>🚫 ALL STOCKS — THE GRAVEYARD ({len(e_grave)})</h4>"
         f"{_table_grave_html(e_grave, show_sec=True)}"
         f"</div></details>"
+        f"{stage4_email_html}"
         f"</body></html>"
     )
 
@@ -2090,16 +2493,17 @@ def build_email_and_attachment_html(
         f"<h4>🩸 STOCKS — TOP BEAR SETUPS</h4><div id='stkBearWrap'>{_table_active_html(e_bears, 'BEAR', show_sec=True)}</div>"
         f"<h4>🚫 STOCKS — THE GRAVEYARD</h4><div id='stkGraveWrap'>{_table_grave_html(e_grave, show_sec=True)}</div>"
         f"</div>"
+        f"{stage4_attach_html}"
         f"<script>"
         f"function filterBySector(sec){{"
-        f"document.querySelectorAll('#stkContainer tbody tr').forEach(r=>{{"
+        f"document.querySelectorAll('#stkContainer tbody tr, #popupContainer tbody tr').forEach(r=>{{"
         f"r.style.display=(r.getAttribute('data-sector')===sec)?'':'none';}});"
         f"document.querySelectorAll('.pill').forEach(p=>p.classList.toggle('active',p.getAttribute('data-sec')===sec));"
         f"document.getElementById('statusBadge').textContent='FILTERED BY: '+sec;"
         f"document.getElementById('stkHeader').textContent='📈 STAGE 2: STOCKS IN SECTOR ['+sec+']';"
         f"}}"
         f"function clearFilter(){{"
-        f"document.querySelectorAll('#stkContainer tbody tr').forEach(r=>{{r.style.display='';}});"
+        f"document.querySelectorAll('#stkContainer tbody tr, #popupContainer tbody tr').forEach(r=>{{r.style.display='';}});"
         f"document.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));"
         f"document.getElementById('statusBadge').textContent='DEFAULT VIEW: SHOWING ALL';"
         f"document.getElementById('stkHeader').textContent='📈 STAGE 2: ALL STOCKS (Default Show All)';"
@@ -2208,7 +2612,7 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
         if row.get('PriorStops', 0) > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON:
             r_mult_str, a_time = f"{live_r:>+5.2f}R ({banked_r:>+4.1f}R)", f"{row.get('ActiveAnchor', '-')}*"
         else:
-            r_mult_str, a_time = f"{live_r:>+5.2f}R        ", f"{row.get('ActiveAnchor', '-')} "
+            r_mult_str, a_time = f"{live_r:>+5.2f}R         ", f"{row.get('ActiveAnchor', '-')} "
         direction = row.get('AnchorDir', 'BULL')
         dir_c = COLOR_GREEN_FG if direction == "BULL" else COLOR_RED_FG
         default_g = {m: 0 for m in GRID_MULTIPLIERS}
@@ -2243,7 +2647,8 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
 # ==============================================================================
 def run_screener(
     mode=TRADING_MODE, days=BACKTRACE_DAYS, target_date_str=None, target_time_str=None,
-    track_symbol="", sector_filter="", html_out=HTML_DASHBOARD_PATH, interactive_cli=False
+    track_symbol="", sector_filter="", html_out=HTML_DASHBOARD_PATH, interactive_cli=False,
+    lookback_iterations=None, lookback_interval_min=None
 ):
     t_start = time.time()
     explicit = bool(target_date_str or target_time_str)
@@ -2260,7 +2665,20 @@ def run_screener(
     if not track_symbol:
         track_symbol = os.environ.get(ENV_TRACK_SYMBOL, "").strip()
 
+    lookback_meta = compute_lookback_iteration_schedule(
+        cutoff_dt,
+        num_iterations=lookback_iterations,
+        interval_min=lookback_interval_min
+    )
+
     print(f"\n{COLOR_CYAN}📡 Initializing Tracker [{mode}] | Time Machine: {cutoff_dt.strftime('%Y-%m-%d %H:%M:%S')} (Live: {not explicit}){COLOR_RESET}")
+    if lookback_meta["enabled"]:
+        prior_str = ", ".join(d.strftime("%H:%M") for d in lookback_meta["prior_iter_dts_desc"]) or "None"
+        print(
+            f"   {COLOR_DIM}» Lookback Iteration Engine: NO_OF_ITERATIONS={lookback_meta['num_iterations']} | "
+            f"TIME_OF_INTERVAL_TO_LOOKBACK={lookback_meta['interval_min']}m | "
+            f"Prior Runs: [{prior_str}] | Anchor Window: {lookback_meta['window_start_dt']:%H:%M}..{lookback_meta['window_end_dt']:%H:%M}{COLOR_RESET}"
+        )
     for n in notes:
         print(f"   {COLOR_YELLOW}» {n}{COLOR_RESET}")
 
@@ -2288,23 +2706,37 @@ def run_screener(
     checkpoints = generate_checkpoints(cutoff_dt) if BACKTRACE_CHECKPOINTS else [cutoff_dt]
     print(f"   {COLOR_DIM}» Backtrace checkpoints ({len(checkpoints)}): {', '.join(c.strftime('%H:%M') for c in checkpoints)}{COLOR_RESET}")
 
+    # Collect any extra checkpoints needed by lookback iterations so they are evaluated in-memory without extra API calls
+    extra_lookback_cps = []
+    if lookback_meta["enabled"]:
+        cp_set = set(checkpoints)
+        extra_set = set()
+        for it_dt in lookback_meta["prior_iter_dts_chrono"]:
+            it_cps = generate_checkpoints(it_dt) if BACKTRACE_CHECKPOINTS else [it_dt]
+            for c in it_cps + [it_dt]:
+                if c not in cp_set:
+                    extra_set.add(c)
+        extra_lookback_cps = sorted(extra_set)
+
     prog = Progress("checkpoints (indices + stocks)", len(all_candidates))
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
         per_symbol = list(ex.map(
             process_stock_checkpoints,
-            [(item, checkpoints, today_session, MIN1_HISTORY_DAYS, mode, prog) for item in all_candidates]
+            [(item, checkpoints, extra_lookback_cps, today_session, MIN1_HISTORY_DAYS, mode, prog) for item in all_candidates]
         ))
     prog.done()
 
     if STATS.auth_failed:
         return 1
-    outcomes = [o for sym_outcomes in per_symbol for o in sym_outcomes]
+    outcomes = [o for sym_outcomes, _ in per_symbol for o in sym_outcomes]
     results = [p for _, s, p in outcomes if s == "ok"]
+    extra_results = [p for _, extra_outcomes in per_symbol for _, s, p in extra_outcomes if s == "ok"]
     counts = {k: sum(1 for _, s, _ in outcomes if s == k) for k in ("no_data", "illiquid", "short_history", "error")}
     print(f"   {COLOR_DIM}» Scan summary: {len(all_candidates)} instruments ({len(sector_index_candidates)} indices + {len(stock_candidates)} stocks) x {len(checkpoints)} checkpoints = {len(outcomes)} evaluations | ok {len(results)} | no data {counts['no_data']} | illiquid {counts['illiquid']} | short history {counts['short_history']} | errors {counts['error']}{COLOR_RESET}")
     if not results:
         return 1
 
+    # Primary by_index and by_stock maps (100% untouched for existing resultset)
     by_index, by_stock = {}, {}
     for row in results:
         if row.get('IsSectorIndex'):
@@ -2315,23 +2747,43 @@ def run_screener(
     idx_bulls, idx_bears, idx_grave = segregate_and_rank_buckets(by_index) if by_index else ([], [], [])
     stock_bulls, stock_bears, stock_grave = segregate_and_rank_buckets(by_stock)
 
+    # Build combined in-memory checkpoint map for lookback iterations (includes 09:15 / non-standard step checkpoints)
+    by_index_all_cps = {k: list(v) for k, v in by_index.items()}
+    by_stock_all_cps = {k: list(v) for k, v in by_stock.items()}
+    for row in extra_results:
+        if row.get('IsSectorIndex'):
+            by_index_all_cps.setdefault(row['Symbol'], []).append(row)
+        else:
+            by_stock_all_cps.setdefault(row['Symbol'], []).append(row)
+
+    idx_popup_res = evaluate_first_time_popups_in_memory(by_index_all_cps, idx_bulls, idx_bears, lookback_meta) if by_index_all_cps else {
+        "new_bulls": [], "new_bears": [], "window_first_bulls": [], "window_first_bears": [], "iter_stats": []
+    }
+    stock_popup_res = evaluate_first_time_popups_in_memory(by_stock_all_cps, stock_bulls, stock_bears, lookback_meta)
+
     if track_symbol and track_symbol != "***":
         combined_map = dict(by_index, **by_stock)
         print_and_alert_tracked_history(track_symbol, combined_map, live_run=not explicit)
 
-    # 1. Render Console Output
+    # 1. Render Console Output (Existing Stage 1 & Stage 2 untouched + Stage 3 Segregated First-Time Popups added)
     render_console_dashboard(
         mode, cutoff_dt, checkpoints,
         idx_bulls, idx_bears, idx_grave,
         stock_bulls, stock_bears, stock_grave,
-        active_sector_filter=sector_filter
+        active_sector_filter=sector_filter,
+        lookback_meta=lookback_meta,
+        idx_popup_res=idx_popup_res,
+        stock_popup_res=stock_popup_res
     )
 
     # 2. Build Untruncated Email Content & Send via SMTP Secrets (if enabled by SEND_DASHBOARD_EMAIL)
     email_inline_html, attachment_js_html = build_email_and_attachment_html(
         mode, cutoff_dt, checkpoints,
         idx_bulls, idx_bears, idx_grave,
-        stock_bulls, stock_bears, stock_grave
+        stock_bulls, stock_bears, stock_grave,
+        lookback_meta=lookback_meta,
+        idx_popup_res=idx_popup_res,
+        stock_popup_res=stock_popup_res
     )
 
     if SAVE_LOCAL_HTML_FILE and html_out:
@@ -2346,12 +2798,18 @@ def run_screener(
         plain_text_report = build_full_untruncated_plain_text(
             mode, cutoff_dt, checkpoints,
             idx_bulls, idx_bears, idx_grave,
-            stock_bulls, stock_bears, stock_grave
+            stock_bulls, stock_bears, stock_grave,
+            lookback_meta=lookback_meta,
+            idx_popup_res=idx_popup_res,
+            stock_popup_res=stock_popup_res
         )
+        new_b_cnt = len(stock_popup_res.get("new_bulls", []))
+        new_r_cnt = len(stock_popup_res.get("new_bears", []))
         email_subject = (
             f"[System3 {mode}] {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | "
             f"Indices: {len(idx_bulls)}▲ {len(idx_bears)}▼ | "
-            f"Stocks: {len(stock_bulls)}▲ {len(stock_bears)}▼ ({len(stock_grave)} Grave)"
+            f"Stocks: {len(stock_bulls)}▲ {len(stock_bears)}▼ ({len(stock_grave)} Grave) | "
+            f"1stTimePopups: {new_b_cnt}▲ {new_r_cnt}▼"
         )
         _send_email_message(
             subject=email_subject,
@@ -2380,6 +2838,11 @@ def parse_args():
     p.add_argument("--checkpoint-min", type=int, default=CHECKPOINT_INTERVAL_MIN)
     p.add_argument("--single-snapshot", action="store_true")
     p.add_argument("--isolate-session-bands", action="store_true", default=ISOLATE_SESSION_BANDS)
+
+    # --- Multi-Iteration Lookback Controls ---
+    p.add_argument("--no-of-iterations", "--iterations", dest="no_of_iterations", type=int, default=None, help="Number of prior lookback iterations to compare against (default: NO_OF_ITERATIONS in Section 0).")
+    p.add_argument("--lookback-interval", "--time-of-interval-to-lookback", dest="lookback_interval", type=int, default=None, help="Lookback interval in minutes between iterations (default: TIME_OF_INTERVAL_TO_LOOKBACK in Section 0).")
+    p.add_argument("--no-iteration-lookback", action="store_true", help="Disable multi-iteration first-time popup comparison.")
 
     # --- Email & Sectoral Controls ---
     p.add_argument("--send-email", dest="send_email", action="store_true", default=SEND_DASHBOARD_EMAIL, help="Send untruncated dashboard email via SMTP secrets.")
@@ -2442,6 +2905,13 @@ if __name__ == "__main__":
     CHECKPOINT_INTERVAL_MIN = args.checkpoint_min
     ISOLATE_SESSION_BANDS = args.isolate_session_bands
     ENABLE_SECTORAL_INDICES = not args.no_sector_indices
+    ENABLE_ITERATION_LOOKBACK = not args.no_iteration_lookback
+    if args.no_of_iterations is not None:
+        NO_OF_ITERATIONS = args.no_of_iterations
+        LOOKBACK_ITERATIONS = NO_OF_ITERATIONS
+    if args.lookback_interval is not None:
+        TIME_OF_INTERVAL_TO_LOOKBACK = args.lookback_interval
+        LOOKBACK_INTERVAL_MIN = TIME_OF_INTERVAL_TO_LOOKBACK
     HTML_DASHBOARD_PATH = args.html_out
 
     PRICE_BB_PERIOD = args.price_bb_period
@@ -2482,7 +2952,9 @@ if __name__ == "__main__":
             track_symbol=args.track,
             sector_filter=args.sector,
             html_out=args.html_out,
-            interactive_cli=args.interactive
+            interactive_cli=args.interactive,
+            lookback_iterations=args.no_of_iterations,
+            lookback_interval_min=args.lookback_interval
         )
     except Exception:
         print(f"\n{COLOR_RED_FG}💥 FATAL: unhandled exception -- full traceback follows.{COLOR_RESET}")
