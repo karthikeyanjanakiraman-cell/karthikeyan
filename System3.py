@@ -105,7 +105,7 @@ SESSION_BUCKET_MULT = 10000             # Multiplier for isolating session bucke
 # --- 0.3B IN-MEMORY MULTI-ITERATION FIRST-TIME POPUP LOOKBACK (ZERO FILE STORAGE) ---
 ENABLE_ITERATION_LOOKBACK = True        # Master toggle: Compare current run against N prior iterations in memory
 NO_OF_ITERATIONS = 3                    # Number of prior lookback iterations (e.g., 3 -> 09:25, 09:20, 09:15 for a 09:30 run)
-TIME_OF_INTERVAL_TO_LOOKBACK = 5        # Lookback interval in minutes between iterations (e.g., 5 mins)
+TIME_OF_INTERVAL_TO_LOOKBACK = 15        # Lookback interval in minutes between iterations (e.g., 5 mins)
 LOOKBACK_ITERATIONS = NO_OF_ITERATIONS  # Alias for convenience
 LOOKBACK_INTERVAL_MIN = TIME_OF_INTERVAL_TO_LOOKBACK
 
