@@ -48,7 +48,7 @@ SEND_DASHBOARD_EMAIL = True                        # Master toggle: Enable email
 EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME_GT_0 = True     # Config 1: True = Send email ONLY if Pure 1st-Time (No *) count > 0
 EMAIL_ONLY_PURE_1ST_TIME_CONTENT = True            # Config 2: True = Send ONLY Pure 1st-Time (No *) part alone in email
 EMAIL_ONLY_WINDOW_POPUPS = True                    # Fallback scope when EMAIL_ONLY_PURE_1ST_TIME_CONTENT is False
-SEND_TRACK_ALERT_EMAIL = True                      # Master toggle: Send state-change alert email when tracking a symbol
+SEND_TRACK_ALERT_EMAIL = False                      # Master toggle: Send state-change alert email when tracking a symbol
 EMAIL_ATTACH_INTERACTIVE_HTML = True               # Attach interactive HTML file of the report to the email
 EMAIL_ATTACHMENT_FILENAME = "System3_Pure_1stTime_Popups.html"
 SAVE_LOCAL_HTML_FILE = False                       # False = Do not save local HTML file to disk (send via email instead)
@@ -1596,6 +1596,56 @@ def merge_symbol_rows(rows):
         grave_episodes.append(grave)
     return active_merged.get("BULL"), active_merged.get("BEAR"), grave_episodes
 
+def _script_group_key(row):
+    """
+    Extracts the base script / underlying group name (e.g. FINNIFTY, NIFTY, SENSEX, BANKNIFTY,
+    or the base symbol token) so rows for the same script are grouped together and ordered by
+    how many rows exist for that script in the table.
+    """
+    sym = str(row.get("Symbol") or "").upper().strip()
+    sec = str(row.get("Sector") or "").upper().strip()
+    if sec in INDEX_CONFIG:
+        return sec
+    first_tok = sym.split()[0] if sym else ""
+    if first_tok in ALIAS_TO_INDEX:
+        return ALIAS_TO_INDEX[first_tok]
+    for idx_name in INDEX_CONFIG:
+        if sym.startswith(idx_name):
+            return idx_name
+    return first_tok or sym
+
+def sort_rows_by_script_count(rows_list):
+    """
+    Sorts a table of active setups by:
+      1. Number of rows existing for that single script/underlying in `rows_list` (descending)
+      2. Script group name (A-Z, keeping all contracts/rows of the same script contiguous)
+      3. R-Multiple rank score (descending)
+      4. State rank ([ BB > KC ] first)
+      5. Symbol name (A-Z)
+    """
+    if not rows_list:
+        return rows_list
+    first_grid_key = GRID_MULTIPLIERS[0] if GRID_MULTIPLIERS else 1
+    def state_rank(st):
+        return 0 if "[ BB > KC ]" in str(st) else 1 if "[ BB < KC ]" in str(st) else 2
+
+    counts = {}
+    for r in rows_list:
+        gk = _script_group_key(r)
+        counts[gk] = counts.get(gk, 0) + 1
+
+    rows_list.sort(key=lambda r: (
+        -counts.get(_script_group_key(r), 0),
+        _script_group_key(r),
+        -_rank_r_score(r),
+        -_r_multiple(r),
+        state_rank(r.get("State", "")),
+        -r.get("ATR_Grid", {}).get(first_grid_key, 0),
+        -r.get("BB_Grid", {}).get(first_grid_key, 0),
+        str(r.get("Symbol", "")),
+    ))
+    return rows_list
+
 def segregate_and_rank_buckets(by_symbol_map):
     bulls_live, bears_live, graveyard_candidates = [], [], []
 
@@ -1642,18 +1692,11 @@ def segregate_and_rank_buckets(by_symbol_map):
     def state_rank(st):
         return 0 if "[ BB > KC ]" in st else 1 if "[ BB < KC ]" in st else 2
 
-    surviving_bulls.sort(key=lambda r: (
-        -_rank_r_score(r), -_r_multiple(r), state_rank(r['State']),
-        -r.get('ATR_Grid', {}).get(first_grid_key, 0), -r.get('BB_Grid', {}).get(first_grid_key, 0), -int(r['CheckpointTime'].timestamp())
-    ))
-    surviving_bears.sort(key=lambda r: (
-        -_rank_r_score(r), -_r_multiple(r), state_rank(r['State']),
-        -r.get('ATR_Grid', {}).get(first_grid_key, 0), -r.get('BB_Grid', {}).get(first_grid_key, 0), -int(r['CheckpointTime'].timestamp())
-    ))
+    sort_rows_by_script_count(surviving_bulls)
+    sort_rows_by_script_count(surviving_bears)
 
     def sort_reason(r):
         return 0 if any(x in str(r.get('RejectReason', '')) for x in ["Hard stop", "Profit Lock", "Kinetic SL", "Superseded"]) else 1 if "Adverse" in str(r.get('RejectReason', '')) else 2 if "Warzone" in str(r.get('RejectReason', '')) else 3
-    graveyard_candidates.sort(key=lambda x: (sort_reason(x), -_r_multiple(x) if _r_multiple(x) != 0 else -abs(x.get('DayChangePct', 0.0))))
 
     dedup_grave, seen_grave = [], set()
     for row in graveyard_candidates:
@@ -1661,6 +1704,12 @@ def segregate_and_rank_buckets(by_symbol_map):
         if gid not in seen_grave:
             seen_grave.add(gid)
             dedup_grave.append(row)
+
+    grave_counts = {}
+    for x in dedup_grave:
+        gk = _script_group_key(x)
+        grave_counts[gk] = grave_counts.get(gk, 0) + 1
+    dedup_grave.sort(key=lambda x: (-grave_counts.get(_script_group_key(x), 0), _script_group_key(x), sort_reason(x), -_r_multiple(x) if _r_multiple(x) != 0 else -abs(x.get('DayChangePct', 0.0)), str(x.get('Symbol', ''))))
 
     return surviving_bulls, surviving_bears, dedup_grave
 
@@ -1810,6 +1859,11 @@ def evaluate_first_time_popups_in_memory(
 
     _classify_rows(current_bulls, prior_bull_appearances, new_bulls, window_first_bulls)
     _classify_rows(current_bears, prior_bear_appearances, new_bears, window_first_bears)
+
+    sort_rows_by_script_count(new_bulls)
+    sort_rows_by_script_count(new_bears)
+    sort_rows_by_script_count(window_first_bulls)
+    sort_rows_by_script_count(window_first_bears)
 
     return {
         "new_bulls": new_bulls,
@@ -2510,7 +2564,15 @@ def build_email_and_attachment_html(
 # ------------------------------------------------------------------------------
 # EMAIL TRANSMISSION ENGINE (USES GITHUB REPOSITORY SECRETS)
 # ------------------------------------------------------------------------------
+_EMAIL_SEND_LOCK = threading.Lock()
+_EMAIL_SENT_TAGS = set()
+
 def _send_email_message(subject, plain_body, html_body=None, attachment_html=None, tag="email"):
+    with _EMAIL_SEND_LOCK:
+        if tag in _EMAIL_SENT_TAGS:
+            print(f"   {COLOR_DIM}[{tag}] Duplicate email dispatch prevented (already sent once in this run).{COLOR_RESET}")
+            return False
+        _EMAIL_SENT_TAGS.add(tag)
     sender = os.environ.get(ENV_SENDER_EMAIL)
     password = os.environ.get(ENV_SENDER_PASSWORD)
     recipient = os.environ.get(ENV_RECIPIENT_EMAIL)
@@ -2535,9 +2597,16 @@ def _send_email_message(subject, plain_body, html_body=None, attachment_html=Non
         return False
 
     msg = EmailMessage()
+    unique_recipients = []
+    for addr in re.split(r"[,;]+", str(recipient)):
+        clean_addr = addr.strip()
+        if clean_addr and clean_addr.lower() not in [u.lower() for u in unique_recipients]:
+            unique_recipients.append(clean_addr)
+    recipient_clean = ", ".join(unique_recipients) if unique_recipients else str(recipient).strip()
+
     msg['Subject'] = subject
     msg['From'] = sender
-    msg['To'] = recipient
+    msg['To'] = recipient_clean
     msg.set_content(plain_body)
 
     if html_body:
