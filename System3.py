@@ -4,14 +4,16 @@ Strict Institutional Volatility Tracker (Upstox) - System 3.0 (Pure 1st-Time Ema
 + Zero Hardcoded Logic: All indicator periods, multipliers, stop ratchets, email toggles, and sector weights live in Section 0.
 + Multi-Index Highest-Weightage Resolver: Assigns dual-listed stocks to the sectoral index where they carry the highest %.
 + Sectoral Index 3-Lock Engine: Evaluates Sectoral Indices first (Top Bulls, Top Bears, Graveyard) before stocks.
++ Option Buying Mode for Index Options (`OPTIONS_BUYING_ONLY = True`):
+  - In INDEX_OPTIONS mode, triggers exclusively on long option premium breakouts (rising CEs -> BULL, rising PEs -> BEAR).
+  - Guarantees Target is always above AnchorPrice/entry and SL is always below AnchorPrice for both CE and PE setups.
 + In-Memory Multi-Iteration First-Time Popup Engine (Zero File/JSON Storage):
   - Evaluates NO_OF_ITERATIONS prior snapshots spaced by TIME_OF_INTERVAL_TO_LOOKBACK minutes purely in memory.
-  - Compares current snapshot (e.g. 12:35) against prior iterations (e.g. 12:30, 12:25, 12:20).
-  - Segregates Bull & Bear setups popping up with Anchor within the lookback window into a dedicated resultset without touching existing console resultsets.
+  - Enforces Strict First-Time Popup Filtering (positive R-Multiple, non-zero ATR & BB kinetic grids, zero prior stops).
 + Pure 1st-Time Email Gate & Content Controls (Two Dedicated Config Variables in Section 0.1):
   - `EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME_GT_0 = True`: Sends email ONLY when Pure 1st-Time (No *) popup count > 0.
   - `EMAIL_ONLY_PURE_1ST_TIME_CONTENT = True`: Sends ONLY the Pure 1st-Time (No *) tables & sector accordions in the email.
-  - Displays CE(x) PE(y) breakdown counts in section headers and Target & SL columns (computed via Base ATR) next to LTP/Exit.
+  - Displays CE(x) PE(y) breakdown counts in section headers and Target & SL columns (computed from AnchorPrice via Base ATR) next to LTP/Exit.
   - Uses explicit inline cell colors on a crisp light theme so Gmail/Outlook/Apple Mail never render dark-on-dark text.
 """
 import os
@@ -116,6 +118,12 @@ TIME_OF_INTERVAL_TO_LOOKBACK = 5        # Lookback interval in minutes between i
 LOOKBACK_ITERATIONS = NO_OF_ITERATIONS  # Alias for convenience
 LOOKBACK_INTERVAL_MIN = TIME_OF_INTERVAL_TO_LOOKBACK
 
+# Strict First-Time Popup Quality Filters
+STRICT_FIRST_TIME_POPUP_FILTER = True   # Master toggle for strict popup validation
+POPUP_REQUIRE_NON_ZERO_GRID = True      # Drop stale rows where current ATR 1X or BB 1X grid has decayed to 0
+POPUP_MIN_R_MULTIPLE = 0.0              # Minimum live R-Multiple required at snapshot time (blocks losing/underwater popups)
+PURE_1ST_TIME_CURRENT_ITER_ONLY = False # True = Only include setups where FirstPopupIter == current snapshot time
+
 # --- 0.4 LOCK 1: PRICE VOLATILITY BANDS (BOLLINGER vs. KELTNER) ---
 PRICE_BB_PERIOD = 20                    # Price Bollinger Band rolling window (bars)
 PRICE_BB_STD_MULT = 2.0                 # Price Bollinger Band standard deviation multiplier
@@ -163,10 +171,10 @@ SOFT_STOP_DISABLE_R = 1.5               # R-Multiple peak above which Soft Stop 
 PROFIT_LOCK_TRIGGER_R = 1.8             # R-Multiple peak required to activate the Breakeven+ Profit Ratchet
 PROFIT_LOCK_FLOOR_R = 0.3               # Minimum R-Multiple floor locked in once PROFIT_LOCK_TRIGGER_R is hit
 
-# Target & SL Display Multipliers (Calculated from Base ATR)
-TARGET_ATR_MULT = PROFIT_LOCK_TRIGGER_R # Target distance in Base ATRs (default: 1.8x Base ATR = Profit Lock Trigger)
-SL_ATR_MULT = SOFT_STOP_ATR_MULT        # Stop-Loss distance in Base ATRs (default: 1.0x Base ATR = Kinetic Soft Stop)
-TARGET_SL_FROM_ANCHOR = True            # True = Compute Target & SL from AnchorPrice (fallback to LTP); False = from LTP
+# Target & SL Display Multipliers (Calculated from AnchorPrice using Base ATR)
+TARGET_ATR_MULT = PROFIT_LOCK_TRIGGER_R # Target distance in Base ATRs from AnchorPrice (default: 1.8x Base ATR)
+SL_ATR_MULT = SOFT_STOP_ATR_MULT        # Stop-Loss distance in Base ATRs from AnchorPrice (default: 1.0x Base ATR)
+TARGET_SL_FROM_ANCHOR = True            # True = Compute Target & SL strictly from AnchorPrice (fallback to LTP)
 
 ADVERSE_DRIFT_R_FLOOR = -0.5            # Explicit R-Multiple floor for live purge at snapshot time
 ADVERSE_DRIFT_STOP_RATIO = 1.0          # Ratio of HARD_STOP_ATR_MULT used when ADVERSE_DRIFT_R_FLOOR is None
@@ -286,6 +294,7 @@ SECTOR_CONSTITUENT_WEIGHTS = {
 }
 
 # --- 0.9 INDEX OPTIONS CONFIGURATION ---
+OPTIONS_BUYING_ONLY = True              # True = Trigger ONLY on long option breakouts (Rising CE -> BULL, Rising PE -> BEAR)
 EXPIRY_SELECTION = "CURRENT"            # Choices: "CURRENT", "NEXT"
 STRIKES_ABOVE_ATM = 5                   # Number of strikes above ATM to scan
 STRIKES_BELOW_ATM = 5                   # Number of strikes below ATM to scan
@@ -400,6 +409,9 @@ def _is_pe_symbol(symbol):
     s = str(symbol or "").upper().strip()
     return bool(" PE " in s or s.endswith(" PE") or re.search(r'\dPE$', s) or re.search(r'\bPE\b', s))
 
+def _is_option_symbol(symbol):
+    return _is_ce_symbol(symbol) or _is_pe_symbol(symbol)
+
 def _ce_pe_counts(rows_list):
     """Returns (ce_count, pe_count) for a list of row dicts."""
     ce_cnt = sum(1 for r in (rows_list or []) if _is_ce_symbol(r.get("Symbol", "")))
@@ -414,9 +426,13 @@ def _format_count_with_ce_pe(rows_list):
 
 def _compute_target_sl(row):
     """
-    Computes Target and Stop-Loss (SL) prices from the already-calculated BaseAtr
-    and AnchorPrice (or LTP fallback) aligned to the instrument's actual price
-    direction (PremiumDir / AnchorDir).
+    Computes Target and Stop-Loss (SL) prices strictly from AnchorPrice (with LTP fallback)
+    using the already-calculated BaseAtr:
+      - In Option Buying mode (or any long breakout where PremiumDir == 'BULL'), Target is
+        ALWAYS above AnchorPrice (`AnchorPrice + TARGET_ATR_MULT * BaseAtr`) and SL is
+        ALWAYS below AnchorPrice (`AnchorPrice - SL_ATR_MULT * BaseAtr`).
+      - For short equity/futures setups (`PremiumDir == 'BEAR'` on non-option symbols),
+        Target is `AnchorPrice - TARGET_ATR_MULT * BaseAtr` and SL is `AnchorPrice + SL_ATR_MULT * BaseAtr`.
     """
     ap = float(row.get('AnchorPrice', 0.0) or 0.0)
     ltp = float(row.get('LTP', 0.0) or 0.0)
@@ -425,7 +441,12 @@ def _compute_target_sl(row):
     if ref_price <= 0 or base_atr <= 0:
         return 0.0, 0.0
 
-    p_dir = str(row.get('PremiumDir') or row.get('AnchorDir') or 'BULL').upper()
+    sym = str(row.get('Symbol') or '')
+    if OPTIONS_BUYING_ONLY and _is_option_symbol(sym):
+        p_dir = 'BULL'
+    else:
+        p_dir = str(row.get('PremiumDir') or row.get('AnchorDir') or 'BULL').upper()
+
     t_mult = float(TARGET_ATR_MULT)
     s_mult = float(SL_ATR_MULT)
 
@@ -1247,7 +1268,10 @@ def calculate_grids(kin_1m, idx, direction):
         atr_grid[mult], bb_grid[mult] = a_count, b_count
     return atr_grid, bb_grid
 
-def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, today_start, is_late_session, end=None):
+def evaluate_anchor_tripwire(
+    close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower,
+    today_start, is_late_session, end=None, allow_bull=True, allow_bear=True
+):
     n = len(close) if end is None else min(int(end), len(close))
     if today_start >= n:
         return None, {
@@ -1278,14 +1302,14 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
             bb_kc_bull_fire = (bb_upper[i] > kc_upper[i]) or (close[i] > bb_upper[i] and close[i] > kc_upper[i])
             bb_kc_bear_fire = (bb_lower[i] < kc_lower[i]) or (close[i] < bb_lower[i] and close[i] < kc_lower[i])
 
-            if not is_late_session[i] and bull_struct and bull_shock and bb_kc_bull_fire:
+            if allow_bull and not is_late_session[i] and bull_struct and bull_shock and bb_kc_bull_fire:
                 if r_bear:
                     warzone_kills += 1
                 else:
                     anchor = {"dir": "BULL", "idx": i, "time": dt_1m[i], "price": close[i]}
                     break
 
-            elif not is_late_session[i] and bear_struct and bear_shock and bb_kc_bear_fire:
+            elif allow_bear and not is_late_session[i] and bear_struct and bear_shock and bb_kc_bear_fire:
                 if r_bull:
                     warzone_kills += 1
                 else:
@@ -1421,6 +1445,11 @@ def row_at(S, end, symbol, sector="", sector_weight=0.0, is_sector_index=False):
     ltp = float(close[last])
     ref = S['prev_close'] if (DAY_PCT_BASIS == "PREV_CLOSE" and S['prev_close'] > 0) else S['day_open']
 
+    # Option Buying Only: for CE & PE contracts, only evaluate long (upward premium) breakouts
+    is_opt = _is_option_symbol(symbol)
+    allow_bull_anchor = True
+    allow_bear_anchor = not (OPTIONS_BUYING_ONLY and is_opt)
+
     row = {
         'Symbol': symbol, 'LTP': ltp, 'DayChangePct': ((ltp - ref) / ref) * 100.0 if ref else 0.0,
         'ActiveAnchor': None, 'AnchorPrice': 0.0, 'AnchorDir': "NONE", 'MovePct': 0.0,
@@ -1434,7 +1463,8 @@ def row_at(S, end, symbol, sector="", sector_weight=0.0, is_sector_index=False):
 
     anchor, info = evaluate_anchor_tripwire(
         close, S['dt'], kin, base_atr, S['bb_upper'], S['bb_lower'],
-        S['kc_upper'], S['kc_lower'], ts, S['is_late_session'], end
+        S['kc_upper'], S['kc_lower'], ts, S['is_late_session'], end,
+        allow_bull=allow_bull_anchor, allow_bear=allow_bear_anchor
     )
     row['Kills'] = info.get('kills', [])
     eval_dir = anchor['dir'] if anchor else info.get('dir')
@@ -1442,7 +1472,10 @@ def row_at(S, end, symbol, sector="", sector_weight=0.0, is_sector_index=False):
         eval_dir = "BULL"
 
     row['ATR_Grid'], row['BB_Grid'] = calculate_grids(kin, last, eval_dir)
-    bb_expanding = (S['bb_upper'][last] > S['kc_upper'][last]) or (S['bb_lower'][last] < S['kc_lower'][last])
+    if eval_dir == "BULL":
+        bb_expanding = (S['bb_upper'][last] > S['kc_upper'][last]) or (close[last] > S['bb_upper'][last] and close[last] > S['kc_upper'][last])
+    else:
+        bb_expanding = (S['bb_lower'][last] < S['kc_lower'][last]) or (close[last] < S['bb_lower'][last] and close[last] < S['kc_lower'][last])
     pure_state = "[ BB > KC ]" if bb_expanding else "[ BB < KC ]"
 
     if anchor:
@@ -1714,6 +1747,7 @@ def segregate_and_rank_buckets(by_symbol_map):
     for symbol, rows in by_symbol_map.items():
         b, r_, grave_list = merge_symbol_rows(rows)
         is_pe = _is_pe_symbol(symbol)
+        is_opt = _is_option_symbol(symbol)
 
         def _apply_dir(item, raw_dir):
             item['PremiumDir'] = raw_dir
@@ -1722,6 +1756,13 @@ def segregate_and_rank_buckets(by_symbol_map):
 
         for item, raw_dir in ((b, "BULL"), (r_, "BEAR")):
             if not item:
+                continue
+            # Option Buying Only: ignore short/falling option premium setups
+            if OPTIONS_BUYING_ONLY and is_opt and raw_dir != "BULL":
+                item['PremiumDir'] = raw_dir
+                item['State'] = "[STOPPED]"
+                item['RejectReason'] = "Filtered (Option Buying Only — Falling Option Ignored)"
+                graveyard_candidates.append(item)
                 continue
             _apply_dir(item, raw_dir)
             if item['State'] == "[STOPPED]" or "[STOP" in str(item.get('State', '')):
@@ -1817,6 +1858,38 @@ def _anchor_within_lookback_window(anchor_str, window_start_dt, window_end_dt):
     except ValueError:
         return False
 
+def _passes_strict_popup_quality(row):
+    """
+    Enforces Strict First-Time Popup Filtering at snapshot time:
+      1. In Option Buying mode, BULL rows must be CE and BEAR rows must be PE, with PremiumDir == 'BULL'.
+      2. Live R-Multiple must be >= POPUP_MIN_R_MULTIPLE (default 0.0 -> never negative/underwater).
+      3. If POPUP_REQUIRE_NON_ZERO_GRID is True, both ATR_Grid and BB_Grid must have active (> 0) counts.
+    """
+    sym = str(row.get('Symbol') or '')
+    if OPTIONS_BUYING_ONLY and _is_option_symbol(sym):
+        if str(row.get('PremiumDir') or 'BULL').upper() != 'BULL':
+            return False
+        anc_dir = str(row.get('AnchorDir') or '').upper()
+        if anc_dir == 'BULL' and not _is_ce_symbol(sym):
+            return False
+        if anc_dir == 'BEAR' and not _is_pe_symbol(sym):
+            return False
+
+    if not STRICT_FIRST_TIME_POPUP_FILTER:
+        return True
+
+    live_r = _r_multiple(row, include_banked=False)
+    if live_r < float(POPUP_MIN_R_MULTIPLE) - 1e-6:
+        return False
+
+    if POPUP_REQUIRE_NON_ZERO_GRID:
+        ag = row.get('ATR_Grid') or {}
+        bg = row.get('BB_Grid') or {}
+        if sum(int(v or 0) for v in ag.values()) <= 0 or sum(int(v or 0) for v in bg.values()) <= 0:
+            return False
+
+    return True
+
 def evaluate_first_time_popups_in_memory(
     by_symbol_all_cps,
     current_bulls,
@@ -1829,10 +1902,9 @@ def evaluate_first_time_popups_in_memory(
        `prior_iter_dts_chrono` (e.g. [12:20, 12:25, 12:30]).
     2. Compares the current run's surviving `current_bulls` and `current_bears` (e.g. 12:35)
        against the prior iteration results:
-       - Requires `ActiveAnchor` time to be within `[window_start_dt, window_end_dt]` (e.g. 12:20..12:35).
-       - Holding the SAME anchor (`anc == curr_anchor`) across subsequent iterations inside the
-         window is recognized as the continuation of that single popup, recording its earliest
-         appearance as `FirstPopupIter` (e.g. `12:25` or `12:35`).
+       - Requires `ActiveAnchor` time to be within `[window_start_dt, window_end_dt]`.
+       - Enforces `_passes_strict_popup_quality(row)` so dead `0 0 0 0` grids, negative R-Multiples,
+         and non-buying option setups are strictly excluded.
        - Segregates into:
          a) `new_bulls` / `new_bears` (Pure First-Time Popups — Zero Prior Same-Direction Stops, No `*`)
          b) `window_first_bulls` / `window_first_bears` (All Window Popups in `window_start..window_end`, Including `*` Re-Anchors)
@@ -1892,10 +1964,15 @@ def evaluate_first_time_popups_in_memory(
             curr_anc = str(row.get('ActiveAnchor') or '-').replace('*', '').strip()
             if not _anchor_within_lookback_window(curr_anc, w_start, w_end):
                 continue
+            if not _passes_strict_popup_quality(row):
+                continue
 
             appearances = prior_app_map.get(sym, [])
             same_anc_iters = [it_lbl for (it_lbl, anc) in appearances if anc == curr_anc]
             other_anc_iters = [it_lbl for (it_lbl, anc) in appearances if anc != curr_anc]
+
+            if PURE_1ST_TIME_CURRENT_ITER_ONLY and len(same_anc_iters) > 0:
+                continue
 
             first_it = same_anc_iters[0] if same_anc_iters else curr_label
             prior_stops_same_dir = int(row.get('PriorStops', 0) or 0)
@@ -2177,7 +2254,7 @@ def build_full_untruncated_plain_text(
     """
     Generates the Plain-Text email body.
     - Includes CE(x) PE(y) breakdown counts in section headers.
-    - Displays Target and SL columns (computed via Base ATR) right next to LTP/Exit.
+    - Displays Target and SL columns (computed from AnchorPrice via Base ATR) right next to LTP/Exit.
     """
     new_idx_b = (idx_popup_res or {}).get("new_bulls", [])
     new_idx_r = (idx_popup_res or {}).get("new_bears", [])
@@ -2335,7 +2412,7 @@ def build_email_and_attachment_html(
     so Gmail, Outlook, and Apple Mail NEVER render dark text on a dark background:
     - Adds `CE(x) PE(y)` counts to section headers and banners (e.g.
       `PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor 09:56..10:46) — BULL (10) CE(4) PE(6)`).
-    - Adds `Target` and `SL` columns right next to `LTP/Exit`, calculated using Base ATR.
+    - Adds `Target` and `SL` columns right next to `LTP/Exit`, calculated from AnchorPrice using Base ATR.
     """
     new_idx_b = (idx_popup_res or {}).get("new_bulls", [])
     new_idx_r = (idx_popup_res or {}).get("new_bears", [])
@@ -2598,7 +2675,7 @@ def build_email_and_attachment_html(
         f"<b>INTERVAL:</b> {lookback_meta['interval_min'] if lookback_meta else 0}m &nbsp;|&nbsp; "
         f"<b>Anchor Window:</b> <span style='background-color:#e0f2fe;color:#0369a1;padding:2px 6px;border-radius:4px;font-weight:700;'>{w_start_s} to {w_end_s}</span> &nbsp;|&nbsp; "
         f"<b>Prior Runs Compared:</b> [{html.escape(prior_s)}] vs [{w_end_s}] &nbsp;|&nbsp; "
-        f"<b>Target/SL Basis:</b> +{TARGET_ATR_MULT:g} ATR / -{SL_ATR_MULT:g} ATR</div>"
+        f"<b>Target/SL Basis:</b> Anchor +{TARGET_ATR_MULT:g} ATR / -{SL_ATR_MULT:g} ATR</div>"
         f"<div style='color:#334155;font-size:12px;'>"
         f"{counts_line_html}"
         + (f"<br><b>Prior Iteration Totals:</b> {iter_summary_s}" if iter_summary_s else "")
@@ -3025,11 +3102,14 @@ def parse_args():
     p.add_argument("--checkpoint-min", type=int, default=CHECKPOINT_INTERVAL_MIN)
     p.add_argument("--single-snapshot", action="store_true")
     p.add_argument("--isolate-session-bands", action="store_true", default=ISOLATE_SESSION_BANDS)
+    p.add_argument("--options-buying-only", dest="options_buying_only", action="store_true", default=OPTIONS_BUYING_ONLY, help="Trigger only on long option breakouts (rising CE -> BULL, rising PE -> BEAR).")
+    p.add_argument("--allow-option-selling", dest="options_buying_only", action="store_false", help="Allow short/falling option premium triggers.")
 
     # --- Multi-Iteration Lookback Controls ---
     p.add_argument("--no-of-iterations", "--iterations", dest="no_of_iterations", type=int, default=None, help="Number of prior lookback iterations to compare against (default: NO_OF_ITERATIONS in Section 0).")
     p.add_argument("--lookback-interval", "--time-of-interval-to-lookback", dest="lookback_interval", type=int, default=None, help="Lookback interval in minutes between iterations (default: TIME_OF_INTERVAL_TO_LOOKBACK in Section 0).")
     p.add_argument("--no-iteration-lookback", action="store_true", help="Disable multi-iteration first-time popup comparison.")
+    p.add_argument("--only-current-iter-popups", dest="only_current_iter_popups", action="store_true", default=PURE_1ST_TIME_CURRENT_ITER_ONLY, help="Only include setups whose FirstPopupIter equals the current snapshot time.")
 
     # --- Email & Sectoral Controls ---
     p.add_argument("--send-email", dest="send_email", action="store_true", default=SEND_DASHBOARD_EMAIL, help="Send email via SMTP secrets.")
@@ -3121,6 +3201,8 @@ if __name__ == "__main__":
     STRIKES_BELOW_ATM = args.strikes_down
     CHECKPOINT_INTERVAL_MIN = args.checkpoint_min
     ISOLATE_SESSION_BANDS = args.isolate_session_bands
+    OPTIONS_BUYING_ONLY = args.options_buying_only
+    PURE_1ST_TIME_CURRENT_ITER_ONLY = args.only_current_iter_popups
     ENABLE_SECTORAL_INDICES = not args.no_sector_indices
     ENABLE_ITERATION_LOOKBACK = not args.no_iteration_lookback
     if args.no_of_iterations is not None:
