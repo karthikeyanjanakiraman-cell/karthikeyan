@@ -398,6 +398,49 @@ def _close_dt(day):
 def _open_dt(day):
     return datetime.combine(day, dtime(SESSION_OPEN_MIN // 60, SESSION_OPEN_MIN % 60))
 
+def _parse_snapshot_datetime(target_date_str, target_time_str):
+    """
+    Flexibly parses `--date` (supports YYYY-MM-DD, DD-MM-YYYY, DD/MM/YYYY, YYYY/MM/DD,
+    DD-MMM-YYYY, etc.) and `--time` (supports HH:MM, HH:MM:SS, 12-hour AM/PM).
+    Treats blank or '***' placeholders as unset (live IST clock).
+    """
+    clean_d = str(target_date_str or "").strip()
+    clean_t = str(target_time_str or "").strip()
+    if clean_d in ("", "***", "NONE", "NULL", "TODAY", "LIVE"):
+        clean_d = ""
+    if clean_t in ("", "***", "NONE", "NULL", "NOW", "LIVE"):
+        clean_t = ""
+
+    if not clean_d and not clean_t:
+        return now_ist(), False
+
+    now = now_ist()
+    parsed_date = None
+    if clean_d:
+        for dfmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d", "%d-%b-%Y", "%d-%B-%Y", "%d.%m.%Y", "%Y.%m.%d"):
+            try:
+                parsed_date = datetime.strptime(clean_d, dfmt).date()
+                break
+            except ValueError:
+                pass
+        if parsed_date is None:
+            parsed_date = pd.to_datetime(clean_d, dayfirst=True).date()
+    else:
+        parsed_date = now.date()
+
+    time_s = clean_t or DEFAULT_SNAPSHOT_TIME
+    parsed_time = None
+    for tfmt in ("%H:%M", "%H:%M:%S", "%I:%M %p", "%I:%M%p", "%H.%M"):
+        try:
+            parsed_time = datetime.strptime(time_s.upper(), tfmt).time()
+            break
+        except ValueError:
+            pass
+    if parsed_time is None:
+        parsed_time = pd.to_datetime(time_s).time()
+
+    return datetime.combine(parsed_date, parsed_time.replace(second=0, microsecond=0)), True
+
 def _norm_sym(s):
     return re.sub(r'[\s_\-]+', '', str(s).upper())
 
@@ -2892,11 +2935,7 @@ def run_screener(
     lookback_iterations=None, lookback_interval_min=None
 ):
     t_start = time.time()
-    explicit = bool(target_date_str or target_time_str)
-    cutoff_dt = (
-        datetime.strptime(f"{target_date_str or now_ist().strftime('%Y-%m-%d')} {target_time_str or DEFAULT_SNAPSHOT_TIME}", "%Y-%m-%d %H:%M")
-        if explicit else now_ist()
-    )
+    cutoff_dt, explicit = _parse_snapshot_datetime(target_date_str, target_time_str)
     cutoff_dt, notes = resolve_session(cutoff_dt.replace(second=0, microsecond=0))
     if STATS.auth_failed:
         return 1
