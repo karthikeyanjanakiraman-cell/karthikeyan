@@ -104,6 +104,7 @@ IST = timezone(timedelta(hours=IST_OFFSET_HOURS, minutes=IST_OFFSET_MINUTES))
 SESSION_OPEN_MIN = 9 * 60 + 15          # 09:15 IST session start (in minutes from midnight)
 SESSION_CLOSE_MIN = 15 * 60 + 30        # 15:30 IST session close (in minutes from midnight)
 LAST_NEW_ANCHOR_MIN = 15 * 60 + 15      # 15:15 IST cutoff: blocks new anchors during closing auction
+ANCHOR_OPEN_WARMUP_BARS = 5             # Skip 09:15..09:19 opening-bell auction bars before first 09:20 checkpoint
 DEFAULT_SNAPSHOT_TIME = "15:30"         # Default time string when --date is used without --time
 CHECKPOINT_INTERVAL_MIN = 5             # Intraday evaluation checkpoint step (in minutes)
 BACKTRACE_CHECKPOINTS = True            # Evaluate across all intraday checkpoints
@@ -158,6 +159,7 @@ ATR_BASIS_TF = "15min"                  # Timeframe string for Base ATR calculat
 ATR_MIN_BARS = 5                        # Minimum completed timeframe bars required to validate Base ATR
 MIN_ATR_PCT = 0.005                     # Dynamic minimum Base ATR floor as a fraction of stock price (0.5%)
 INDEX_MIN_ATR_PCT = 0.0025              # Dynamic minimum Base ATR floor as a fraction of index level (0.25%)
+OPT_MIN_ATR_PCT = 0.04                  # Dynamic minimum Base ATR floor as a fraction of option premium (4.0%)
 ABSOLUTE_MIN_ATR = 0.01                 # Absolute numerical floor for Base ATR
 
 HARD_STOP_ATR_MULT = 2.5                # Unconditional hard trailing stop distance (in Base ATRs from peak)
@@ -1158,11 +1160,11 @@ def _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts, sid):
         a_mean, a_std = adx_s.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values, adx_s.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0).values
         o_mean, o_std = obv_s.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values, obv_s.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0).values
 
-    vel_hist = np.diff(hist, prepend=hist[0])
-    vel_obv = np.diff(obv, prepend=obv[0])
-    vel_pdi = np.diff(plus_di, prepend=plus_di[0])
-    vel_mdi = np.diff(minus_di, prepend=minus_di[0])
-    vel_adx = np.diff(adx, prepend=adx[0])
+    vel_hist = np.where(sess_starts, 0.0, np.diff(hist, prepend=hist[0]))
+    vel_obv = np.where(sess_starts, 0.0, np.diff(obv, prepend=obv[0]))
+    vel_pdi = np.where(sess_starts, 0.0, np.diff(plus_di, prepend=plus_di[0]))
+    vel_mdi = np.where(sess_starts, 0.0, np.diff(minus_di, prepend=minus_di[0]))
+    vel_adx = np.where(sess_starts, 0.0, np.diff(adx, prepend=adx[0]))
 
     alpha_vel = 1.0 / float(VEL_ATR_PERIOD)
     atr_hist = _ewm(np.abs(vel_hist), alpha_vel)
@@ -1274,11 +1276,16 @@ def calculate_grids(kin_1m, idx, direction):
     m_di, m_mean, m_std = kin_1m['minus_di'][idx], kin_1m['m_mean'][idx], kin_1m['m_std'][idx]
     adx, a_mean, a_std = kin_1m['adx'][idx], kin_1m['a_mean'][idx], kin_1m['a_std'][idx]
 
-    vh, ah = kin_1m['vel_hist'][idx], kin_1m['atr_hist'][idx]
-    vo, ao = kin_1m['vel_obv'][idx], kin_1m['atr_obv'][idx]
-    vp, ap = kin_1m['vel_pdi'][idx], kin_1m['atr_pdi'][idx]
-    vm, am = kin_1m['vel_mdi'][idx], kin_1m['atr_mdi'][idx]
-    va, aa = kin_1m['vel_adx'][idx], kin_1m['atr_adx'][idx]
+    ah = kin_1m['atr_hist'][idx]
+    ao = kin_1m['atr_obv'][idx]
+    ap = kin_1m['atr_pdi'][idx]
+    am = kin_1m['atr_mdi'][idx]
+    aa = kin_1m['atr_adx'][idx]
+    vh = max(kin_1m['vel_hist'][idx], kin_1m['win_vh_max'][idx]) if direction == "BULL" else min(kin_1m['vel_hist'][idx], kin_1m['win_vh_min'][idx])
+    vo = max(kin_1m['vel_obv'][idx], kin_1m['win_vo_max'][idx]) if direction == "BULL" else min(kin_1m['vel_obv'][idx], kin_1m['win_vo_min'][idx])
+    vp = max(kin_1m['vel_pdi'][idx], kin_1m['win_vp_max'][idx])
+    vm = max(kin_1m['vel_mdi'][idx], kin_1m['win_vm_max'][idx])
+    va = max(kin_1m['vel_adx'][idx], kin_1m['win_va_max'][idx])
 
     atr_grid = {m: 0 for m in GRID_MULTIPLIERS}
     bb_grid = {m: 0 for m in GRID_MULTIPLIERS}
@@ -1329,7 +1336,8 @@ def evaluate_anchor_tripwire(
     lock_floor_r = float(PROFIT_LOCK_FLOOR_R)
     soft_disable_r = float(SOFT_STOP_DISABLE_R)
 
-    i = today_start
+    warmup = max(0, int(ANCHOR_OPEN_WARMUP_BARS or 0))
+    i = min(n, today_start + warmup) if (today_start + warmup < n) else today_start
     survived_anchor = None
     last_killed_info = {
         'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0,
@@ -1415,7 +1423,7 @@ def evaluate_anchor_tripwire(
     info['kills'] = kills
     return None, info
 
-def prepare_series(master, target_dt, is_sector_index=False):
+def prepare_series(master, target_dt, is_sector_index=False, is_option=False):
     if master is None or master.empty:
         return None, "no_data"
     day_mask = (master['Datetime'].dt.date == target_dt).values
@@ -1439,7 +1447,12 @@ def prepare_series(master, target_dt, is_sector_index=False):
     base_atr_calc, atr_bars = compute_base_atr(master.iloc[:ts])
     if base_atr_calc is None or atr_bars < ATR_MIN_BARS:
         return None, "short_history"
-    atr_pct_floor = float(INDEX_MIN_ATR_PCT) if is_sector_index else float(MIN_ATR_PCT)
+    if is_sector_index:
+        atr_pct_floor = float(INDEX_MIN_ATR_PCT)
+    elif is_option:
+        atr_pct_floor = float(OPT_MIN_ATR_PCT)
+    else:
+        atr_pct_floor = float(MIN_ATR_PCT)
     base_atr = max(float(base_atr_calc), float(close[ts]) * atr_pct_floor, float(ABSOLUTE_MIN_ATR))
 
     tr = np.maximum(
@@ -1600,7 +1613,7 @@ def process_stock_checkpoints(args):
             if day['Close'].iloc[-1] < OPT_MIN_PRICE or day['Volume'].sum() < OPT_MIN_VOLUME:
                 return [(cp, "illiquid", sym) for cp in checkpoints], []
 
-        S, why = prepare_series(master, target_dt, is_sector_index=is_sec_idx)
+        S, why = prepare_series(master, target_dt, is_sector_index=is_sec_idx, is_option=(mode == "INDEX_OPTIONS" or _is_option_symbol(sym)))
         if S is None:
             return [(cp, why, sym) for cp in checkpoints], []
 
@@ -1824,16 +1837,38 @@ def segregate_and_rank_buckets(by_symbol_map):
         else -abs(float(HARD_STOP_ATR_MULT or 1.2) * float(ADVERSE_DRIFT_STOP_RATIO))
     )
 
-    surviving_bulls = [r for r in bulls_live if _r_multiple(r) > drift_floor or _r_multiple(r, include_banked=True) > BANKED_R_PROTECTION_FLOOR]
-    surviving_bears = [r for r in bears_live if _r_multiple(r) > drift_floor or _r_multiple(r, include_banked=True) > BANKED_R_PROTECTION_FLOOR]
+    surviving_bulls, surviving_bears = [], []
     for r in bulls_live:
-        if r not in surviving_bulls:
+        if not (_r_multiple(r) > drift_floor or _r_multiple(r, include_banked=True) > BANKED_R_PROTECTION_FLOOR):
             r['RejectReason'] = f"Adverse Drift (Losing R-Multiple < {drift_floor:g}R)"
             graveyard_candidates.append(r)
+        elif STRICT_FIRST_TIME_POPUP_FILTER and _r_multiple(r) < float(POPUP_MIN_R_MULTIPLE) - 1e-6:
+            r['RejectReason'] = f"Underwater Setup (Live R-Multiple {_r_multiple(r):+.2f}R < {POPUP_MIN_R_MULTIPLE:g}R)"
+            graveyard_candidates.append(r)
+        elif STRICT_FIRST_TIME_POPUP_FILTER and POPUP_REQUIRE_NON_ZERO_GRID and (
+            sum(int(v or 0) for v in (r.get('ATR_Grid') or {}).values()) <= 0
+            and sum(int(v or 0) for v in (r.get('BB_Grid') or {}).values()) <= 0
+        ):
+            r['RejectReason'] = "Kinetic Decay (Both ATR & BB Grids at 0 0 0 0)"
+            graveyard_candidates.append(r)
+        else:
+            surviving_bulls.append(r)
+
     for r in bears_live:
-        if r not in surviving_bears:
+        if not (_r_multiple(r) > drift_floor or _r_multiple(r, include_banked=True) > BANKED_R_PROTECTION_FLOOR):
             r['RejectReason'] = f"Adverse Drift (Losing R-Multiple < {drift_floor:g}R)"
             graveyard_candidates.append(r)
+        elif STRICT_FIRST_TIME_POPUP_FILTER and _r_multiple(r) < float(POPUP_MIN_R_MULTIPLE) - 1e-6:
+            r['RejectReason'] = f"Underwater Setup (Live R-Multiple {_r_multiple(r):+.2f}R < {POPUP_MIN_R_MULTIPLE:g}R)"
+            graveyard_candidates.append(r)
+        elif STRICT_FIRST_TIME_POPUP_FILTER and POPUP_REQUIRE_NON_ZERO_GRID and (
+            sum(int(v or 0) for v in (r.get('ATR_Grid') or {}).values()) <= 0
+            and sum(int(v or 0) for v in (r.get('BB_Grid') or {}).values()) <= 0
+        ):
+            r['RejectReason'] = "Kinetic Decay (Both ATR & BB Grids at 0 0 0 0)"
+            graveyard_candidates.append(r)
+        else:
+            surviving_bears.append(r)
 
     sort_rows_by_script_count(surviving_bulls)
     sort_rows_by_script_count(surviving_bears)
@@ -1928,7 +1963,7 @@ def _passes_strict_popup_quality(row):
     if POPUP_REQUIRE_NON_ZERO_GRID:
         ag = row.get('ATR_Grid') or {}
         bg = row.get('BB_Grid') or {}
-        if sum(int(v or 0) for v in ag.values()) <= 0 or sum(int(v or 0) for v in bg.values()) <= 0:
+        if sum(int(v or 0) for v in ag.values()) <= 0 and sum(int(v or 0) for v in bg.values()) <= 0:
             return False
 
     return True
@@ -2012,7 +2047,10 @@ def evaluate_first_time_popups_in_memory(
 
             appearances = prior_app_map.get(sym, [])
             same_anc_iters = [it_lbl for (it_lbl, anc) in appearances if anc == curr_anc]
-            other_anc_iters = [it_lbl for (it_lbl, anc) in appearances if anc != curr_anc]
+            other_anc_iters = [
+                it_lbl for (it_lbl, anc) in appearances
+                if anc != curr_anc and _anchor_within_lookback_window(anc, w_start, w_end)
+            ]
 
             if PURE_1ST_TIME_CURRENT_ITER_ONLY and len(same_anc_iters) > 0:
                 continue
@@ -2099,7 +2137,7 @@ def render_console_dashboard(
         f"Stocks Shown (Bull: {len(f_stock_bulls)}, Bear: {len(f_stock_bears)}, Grave: {len(f_stock_grave)})\n"
     )
 
-    def print_active_table(title, icon, data_list, show_sector_col=True, show_first_iter_col=False, show_target_sl=False):
+    def print_active_table(title, icon, data_list, show_sector_col=True, show_first_iter_col=False, show_target_sl=True):
         if not data_list:
             return
         print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
@@ -2203,8 +2241,8 @@ def render_console_dashboard(
     stage2_label = f"STAGE 2: STOCKS FOR SECTOR [{active_sector_filter.upper()}]" if norm_filter else "STAGE 2: ALL STOCKS (Mapped by Highest Sectoral Index Weightage)"
     print(f"{COLOR_BOLD}📈  {stage2_label}{COLOR_RESET}")
     print(f"{COLOR_CYAN}{'=' * 95}{COLOR_RESET}")
-    print_active_table("STOCKS — TOP BULL SETUPS (Valid Anchors Surviving)", "🔥", f_stock_bulls, show_sector_col=True)
-    print_active_table("STOCKS — TOP BEAR SETUPS (Valid Anchors Surviving)", "🩸", f_stock_bears, show_sector_col=True)
+    print_active_table(f"STOCKS — TOP BULL SETUPS (Valid Anchors Surviving) — BULL {_format_count_with_ce_pe(f_stock_bulls)}", "🔥", f_stock_bulls, show_sector_col=True, show_target_sl=True)
+    print_active_table(f"STOCKS — TOP BEAR SETUPS (Valid Anchors Surviving) — BEAR {_format_count_with_ce_pe(f_stock_bears)}", "🩸", f_stock_bears, show_sector_col=True, show_target_sl=True)
     if not f_stock_bulls and not f_stock_bears:
         print(f"{COLOR_YELLOW}No surviving stock anchors for this view.{COLOR_RESET}")
     print_grave_table("STOCKS — THE GRAVEYARD (Completed Episodes / Filtered / Rejected)", "🚫", f_stock_grave, show_sector_col=True)
