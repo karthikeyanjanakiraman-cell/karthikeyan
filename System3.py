@@ -1,39 +1,14 @@
 #!/usr/bin/env python3
 """
-Strict Institutional Volatility Tracker (Upstox) - System 3.0 (Pure 1st-Time Email Gate & High-Contrast Light Theme Edition)
-+ Zero Hardcoded Logic: All indicator periods, multipliers, stop ratchets, email toggles, and sector weights live in Section 0.
-+ Multi-Index Highest-Weightage Resolver: Assigns dual-listed stocks to the sectoral index where they carry the highest %.
-+ Sectoral Index 3-Lock Engine: Evaluates Sectoral Indices first (Top Bulls, Top Bears, Graveyard) before stocks.
-+ Option Buying Mode for Index Options (`OPTIONS_BUYING_ONLY = True`):
-  - In INDEX_OPTIONS mode, triggers exclusively on long option premium breakouts (rising CEs -> BULL, rising PEs -> BEAR).
-  - Guarantees Target is always above AnchorPrice/entry and SL is always below AnchorPrice for both CE and PE setups.
-+ In-Memory Multi-Iteration First-Time Popup Engine (Zero File/JSON Storage):
-  - Evaluates NO_OF_ITERATIONS prior snapshots spaced by TIME_OF_INTERVAL_TO_LOOKBACK minutes purely in memory.
-  - Enforces Strict First-Time Popup Filtering (positive R-Multiple, non-zero ATR & BB kinetic grids, zero prior stops).
-+ Pure 1st-Time Email Gate & Content Controls (Two Dedicated Config Variables in Section 0.1):
-  - `EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME_GT_0 = True`: Sends email ONLY when Pure 1st-Time (No *) popup count > 0.
-  - `EMAIL_ONLY_PURE_1ST_TIME_CONTENT = True`: Sends ONLY the Pure 1st-Time (No *) tables & sector accordions in the email.
-  - Displays CE(x) PE(y) breakdown counts in section headers and Target & SL columns (computed from AnchorPrice via Base ATR) next to LTP/Exit.
-  - Uses explicit inline cell colors on a crisp light theme so Gmail/Outlook/Apple Mail never render dark-on-dark text.
+Strict Institutional Volatility Tracker (Upstox) - System 3.0
++ Configurable Timestamp Gap Check: Filters stale setups where (Seen - Anchor) > MAX_TIMESTAMP_GAP_MINUTES.
++ Risk-to-Reward (R:R) Column: Formatted like 0.1:1, 0.28:1 before LTP/Exit, sorted ascending for Bulls and Bears.
 """
-import os
-import sys
-import re
-import html
-import argparse
-import traceback
-import urllib.parse
-import gzip
-import json
-import time
-import threading
+import os, sys, re, html, argparse, traceback, urllib.parse, gzip, json, time, threading
 from bisect import bisect_left
 from datetime import datetime, timedelta, timezone, time as dtime
-import concurrent.futures
-
-import smtplib
+import concurrent.futures, smtplib
 from email.message import EmailMessage
-
 import requests
 from requests.adapters import HTTPAdapter
 import pandas as pd
@@ -47,23 +22,21 @@ warnings.filterwarnings("ignore")
 # ==============================================================================
 
 # --- 0.1 EMAIL & GITHUB SECRET CONFIGURATION ---
-SEND_DASHBOARD_EMAIL = True                     # Master toggle: Enable email dispatch after run
-EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME_GT_0 = True  # Config 1: True = Send email ONLY if Pure 1st-Time (No *) count > 0
-EMAIL_ONLY_PURE_1ST_TIME_CONTENT = True         # Config 2: True = Send ONLY Pure 1st-Time (No *) part alone in email
-EMAIL_ONLY_WINDOW_POPUPS = True                 # Fallback scope when EMAIL_ONLY_PURE_1ST_TIME_CONTENT is False
-SEND_TRACK_ALERT_EMAIL = False                  # Master toggle: Send state-change alert email when tracking a symbol
-EMAIL_ATTACH_INTERACTIVE_HTML = True            # Attach interactive HTML file of the report to the email
+SEND_DASHBOARD_EMAIL = True
+EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME_GT_0 = True
+EMAIL_ONLY_PURE_1ST_TIME_CONTENT = True
+EMAIL_ONLY_WINDOW_POPUPS = True
+SEND_TRACK_ALERT_EMAIL = False
+EMAIL_ATTACH_INTERACTIVE_HTML = True
 EMAIL_ATTACHMENT_FILENAME = "System3_Pure_1stTime_Popups.html"
-SAVE_LOCAL_HTML_FILE = False                    # False = Do not save local HTML file to disk (send via email instead)
+SAVE_LOCAL_HTML_FILE = False
 HTML_DASHBOARD_PATH = "system3_dashboard.html"
 
-# Zero-Truncation Email Controls (0 = Unlimited / Show Every Single Row)
-EMAIL_MAX_BUYERS = 0                            # 0 = Show ALL surviving Bull setups without truncation
-EMAIL_MAX_SELLERS = 0                           # 0 = Show ALL surviving Bear setups without truncation
-EMAIL_MAX_GRAVEYARD = 0                         # 0 = Show ALL Graveyard rows without truncation
-EMAIL_CLIP_SYMBOLS = False                      # False = Never truncate/clip long symbol names in email
+EMAIL_MAX_BUYERS = 0
+EMAIL_MAX_SELLERS = 0
+EMAIL_MAX_GRAVEYARD = 0
+EMAIL_CLIP_SYMBOLS = False
 
-# Environment Variable Names (Matches GitHub Repository Secrets)
 ENV_UPSTOX_TOKEN = "UPSTOX_ACCESS_TOKEN"
 ENV_FALLBACK_TOKEN = "ACCESS_TOKEN"
 ENV_SENDER_EMAIL = "SENDER_EMAIL"
@@ -85,107 +58,117 @@ SMTP_SSL_PORT = 465
 SMTP_TIMEOUT_SEC = 30
 
 # --- 0.2 EXECUTION & UNIVERSE FILTERING ---
-TRADING_MODE = "STOCK_FNO"              # Choices: "STOCK_FNO", "CASH_EQUITY", "INDEX_OPTIONS"
-WORKERS = 16                            # Concurrent thread pool workers
-INCLUDE_NON_EQ_SERIES = False           # Include non-EQ segments in cash/FnO scan
-MIN_PRICE = 100.0                       # Equity prefilter minimum price
-MAX_PRICE = 5000.0                      # Equity prefilter maximum price
-MIN_DAILY_VOLUME = 100000               # Equity prefilter minimum daily volume
-BACKTRACE_DAYS = 30                     # Base lookback days for daily prefilter
-PREFILTER_LOOKBACK_MULT = 2             # Multiplier applied to BACKTRACE_DAYS for calendar fetch
-PREFILTER_LOOKBACK_PAD_DAYS = 6         # Extra padding days for prefilter calendar fetch
-MIN1_HISTORY_DAYS = 19                  # Calendar days of 1-minute history fetched per symbol
-MAX_PINNED_MATCHES = 8                  # Max symbols pinned via --track substring match
+TRADING_MODE = "STOCK_FNO"
+WORKERS = 16
+INCLUDE_NON_EQ_SERIES = False
+MIN_PRICE = 100.0
+MAX_PRICE = 5000.0
+MIN_DAILY_VOLUME = 100000
+BACKTRACE_DAYS = 30
+PREFILTER_LOOKBACK_MULT = 2
+PREFILTER_LOOKBACK_PAD_DAYS = 6
+MIN1_HISTORY_DAYS = 19
+MAX_PINNED_MATCHES = 8
 
 # --- 0.3 SESSION & TIME BOUNDARIES ---
 IST_OFFSET_HOURS = 5
 IST_OFFSET_MINUTES = 30
 IST = timezone(timedelta(hours=IST_OFFSET_HOURS, minutes=IST_OFFSET_MINUTES))
-SESSION_OPEN_MIN = 9 * 60 + 15          # 09:15 IST session start (in minutes from midnight)
-SESSION_CLOSE_MIN = 15 * 60 + 30        # 15:30 IST session close (in minutes from midnight)
-LAST_NEW_ANCHOR_MIN = 15 * 60 + 15      # 15:15 IST cutoff: blocks new anchors during closing auction
-ANCHOR_OPEN_WARMUP_BARS = 5             # Skip 09:15..09:19 opening-bell auction bars before first 09:20 checkpoint
-DEFAULT_SNAPSHOT_TIME = "15:30"         # Default time string when --date is used without --time
-CHECKPOINT_INTERVAL_MIN = 5             # Intraday evaluation checkpoint step (in minutes)
-BACKTRACE_CHECKPOINTS = True            # Evaluate across all intraday checkpoints
-DAY_PCT_BASIS = "PREV_CLOSE"            # Choices: "PREV_CLOSE", "OPEN"
-MAX_SESSION_LOOKBACK_DAYS = 14          # Max days to step back when resolving holidays/weekends
-SESSION_BUCKET_MULT = 10000             # Multiplier for isolating session buckets in ATR aggregation
+SESSION_OPEN_MIN = 9 * 60 + 15
+SESSION_CLOSE_MIN = 15 * 60 + 30
+LAST_NEW_ANCHOR_MIN = 15 * 60 + 15
+ANCHOR_OPEN_WARMUP_BARS = 5
+DEFAULT_SNAPSHOT_TIME = "15:30"
+CHECKPOINT_INTERVAL_MIN = 5
+BACKTRACE_CHECKPOINTS = True
+DAY_PCT_BASIS = "PREV_CLOSE"
+MAX_SESSION_LOOKBACK_DAYS = 14
+SESSION_BUCKET_MULT = 10000
 
-# --- 0.3B IN-MEMORY MULTI-ITERATION FIRST-TIME POPUP LOOKBACK (ZERO FILE STORAGE) ---
-ENABLE_ITERATION_LOOKBACK = True        # Master toggle: Compare current run against N prior iterations in memory
-NO_OF_ITERATIONS = 10                   # Number of prior lookback iterations (e.g., 3 -> 12:30, 12:25, 12:20 for a 12:35 run)
-TIME_OF_INTERVAL_TO_LOOKBACK = 5        # Lookback interval in minutes between iterations (e.g., 5 mins)
-LOOKBACK_ITERATIONS = NO_OF_ITERATIONS  # Alias for convenience
+# --- 0.3B IN-MEMORY MULTI-ITERATION FIRST-TIME POPUP LOOKBACK ---
+ENABLE_ITERATION_LOOKBACK = True
+NO_OF_ITERATIONS = 10
+TIME_OF_INTERVAL_TO_LOOKBACK = 5
+LOOKBACK_ITERATIONS = NO_OF_ITERATIONS
 LOOKBACK_INTERVAL_MIN = TIME_OF_INTERVAL_TO_LOOKBACK
 
-# Strict First-Time Popup Quality Filters
-STRICT_FIRST_TIME_POPUP_FILTER = True   # Master toggle for strict popup validation
-POPUP_REQUIRE_NON_ZERO_GRID = True      # Drop stale rows where current ATR 1X or BB 1X grid has decayed to 0
-POPUP_MIN_R_MULTIPLE = 0.0              # Minimum live R-Multiple required at snapshot time (blocks losing/underwater popups)
-PURE_1ST_TIME_CURRENT_ITER_ONLY = False # True = Only include setups where FirstPopupIter == current snapshot time
+STRICT_FIRST_TIME_POPUP_FILTER = True
+POPUP_REQUIRE_NON_ZERO_GRID = True
+POPUP_MIN_R_MULTIPLE = 0.0
+PURE_1ST_TIME_CURRENT_ITER_ONLY = False
 
-# --- 0.4 LOCK 1: PRICE VOLATILITY BANDS (BOLLINGER vs. KELTNER) ---
-PRICE_BB_PERIOD = 20                    # Price Bollinger Band rolling window (bars)
-PRICE_BB_STD_MULT = 2.0                 # Price Bollinger Band standard deviation multiplier
-PRICE_KC_PERIOD = 20                    # Price Keltner Channel ATR rolling window (bars)
-PRICE_KC_ATR_MULT = 1.5                 # Price Keltner Channel ATR multiplier
-ROLLING_MIN_PERIODS = 1                 # Minimum bars required for rolling stats
-ISOLATE_SESSION_BANDS = False           # False = Gap-Stitched Continuous Baseline; True = hard reset at 09:15
+# --- 0.3C TIMESTAMP GAP CHECK CONFIGURATION ---
+ENABLE_TIMESTAMP_GAP_CHECK = True       # Master toggle: filter setups where (Seen - Anchor) exceeds threshold
+MAX_TIMESTAMP_GAP_MINUTES = 15          # Max allowed gap in minutes between Seen Time and Anchor Time (0 = disabled)
+ENV_ENABLE_TIMESTAMP_GAP_CHECK = "ENABLE_TIMESTAMP_GAP_CHECK"
+ENV_MAX_TIMESTAMP_GAP_MINUTES = "MAX_TIMESTAMP_GAP_MINUTES"
+
+# --- 0.4 LOCK 1: PRICE VOLATILITY BANDS ---
+PRICE_BB_PERIOD = 20
+PRICE_BB_STD_MULT = 2.0
+PRICE_KC_PERIOD = 20
+PRICE_KC_ATR_MULT = 1.5
+ROLLING_MIN_PERIODS = 1
+ISOLATE_SESSION_BANDS = False
 
 # --- 0.5 KINETIC INDICATOR PERIODS ---
-RSI_PERIOD = 14                         # 1-minute RSI Wilder smoothing period
-MACD_FAST_PERIOD = 12                   # 1-minute MACD fast EMA period (alpha = 2 / (N + 1))
-MACD_SLOW_PERIOD = 26                   # 1-minute MACD slow EMA period (alpha = 2 / (N + 1))
-MACD_SIGNAL_PERIOD = 9                  # 1-minute MACD signal EMA period (alpha = 2 / (N + 1))
-ADX_PERIOD = 14                         # 1-minute DMI / ADX Wilder smoothing period
-IND_BB_PERIOD = 20                      # Rolling window (bars) for indicator Bollinger Bands
-VEL_ATR_PERIOD = 14                     # Wilder smoothing period for 1-minute indicator Velocity ATR
-INDEX_SYNTHETIC_VOL_FALLBACK = True     # Synthesize range-velocity volume when spot index candles have 0 volume
-EPSILON = 1e-8                          # Zero-division guard for indicator ratios
+RSI_PERIOD = 14
+MACD_FAST_PERIOD = 12
+MACD_SLOW_PERIOD = 26
+MACD_SIGNAL_PERIOD = 9
+ADX_PERIOD = 14
+IND_BB_PERIOD = 20
+VEL_ATR_PERIOD = 14
+INDEX_SYNTHETIC_VOL_FALLBACK = True
+EPSILON = 1e-8
 
 # --- 0.6 LOCK 2 & LOCK 3: STRUCTURE & KINETIC SHOCK TRIPWIRES ---
-IND_BB_PIERCE_STD = 1.0                 # Lock 2: Indicator StdDev multiplier required for structure breakout
-STRUCT_QUORUM = 3                       # Lock 2: Min indicators (out of 4: MACD, OBV, DI, ADX) required
-KINETIC_SHOCK_ATR_MULT = 1.5            # Lock 3: Velocity must exceed this multiple of its own Velocity ATR
-SHOCK_QUORUM = 3                        # Lock 3: Min indicators (out of 4: MACD, OBV, DI, ADX) required
-SHOCK_WINDOW_BARS = 3                   # Lock 3: Rolling 1-minute bars to align sequential indicator shocks
-SHOCK_FLOW_MIN_THRESHOLD = 0.0          # Lock 3: Current bar directional velocity floor (vh or vo > threshold)
-GRID_MULTIPLIERS = [1, 2, 3, 5]         # Multipliers displayed in the ATR & BB dashboard grids
+IND_BB_PIERCE_STD = 1.0
+STRUCT_QUORUM = 3
+KINETIC_SHOCK_ATR_MULT = 1.5
+SHOCK_QUORUM = 3
+SHOCK_WINDOW_BARS = 3
+SHOCK_FLOW_MIN_THRESHOLD = 0.0
+GRID_MULTIPLIERS = [1, 2, 3, 5]
 
-# --- 0.7 BASE ATR, TRAILING STOPS, PROFIT RATCHET, TARGET/SL & ADVERSE DRIFT ---
-ATR_BASIS_PERIOD = 14                   # Number of historical timeframe bars averaged for Base ATR
-ATR_BASIS_TF = "15min"                  # Timeframe string for Base ATR calculation
-ATR_MIN_BARS = 5                        # Minimum completed timeframe bars required to validate Base ATR
-MIN_ATR_PCT = 0.005                     # Dynamic minimum Base ATR floor as a fraction of stock price (0.5%)
-INDEX_MIN_ATR_PCT = 0.0025              # Dynamic minimum Base ATR floor as a fraction of index level (0.25%)
-OPT_MIN_ATR_PCT = 0.04                  # Dynamic minimum Base ATR floor as a fraction of option premium (4.0%)
-ABSOLUTE_MIN_ATR = 0.01                 # Absolute numerical floor for Base ATR
+# --- 0.7 BASE ATR, TRAILING STOPS, PROFIT RATCHET & TARGET/SL ---
+ATR_BASIS_PERIOD = 14
+ATR_BASIS_TF = "15min"
+ATR_MIN_BARS = 5
+MIN_ATR_PCT = 0.005
+INDEX_MIN_ATR_PCT = 0.0025
+OPT_MIN_ATR_PCT = 0.04
+ABSOLUTE_MIN_ATR = 0.01
 
-HARD_STOP_ATR_MULT = 2.5                # Unconditional hard trailing stop distance (in Base ATRs from peak)
-SOFT_STOP_ATR_MULT = 1.0                # Soft kinetic trailing stop distance (in Base ATRs from peak)
-SOFT_STOP_OPPOSING_SCORE = 4            # Opposing indicator count (0-4) required to fire Soft Stop
-OPPOSING_VEL_ATR_MULT = 1.0             # Opposing velocity ATR multiple required to add +1 to opposing score
-OPPOSING_BB_STD_MULT = 1.0              # Opposing indicator BB StdDev multiple required to add +1 to score
-WARZONE_OPPOSING_SCORE = 2              # Opposing score threshold that blocks anchor creation as Warzone Chop
+HARD_STOP_ATR_MULT = 2.5
+SOFT_STOP_ATR_MULT = 1.0
+SOFT_STOP_OPPOSING_SCORE = 4
+OPPOSING_VEL_ATR_MULT = 1.0
+OPPOSING_BB_STD_MULT = 1.0
+WARZONE_OPPOSING_SCORE = 2
 
-SOFT_STOP_DISABLE_R = 1.5               # R-Multiple peak above which Soft Stop disables so Hard Stop rides the trend
-PROFIT_LOCK_TRIGGER_R = 1.8             # R-Multiple peak required to activate the Breakeven+ Profit Ratchet
-PROFIT_LOCK_FLOOR_R = 0.3               # Minimum R-Multiple floor locked in once PROFIT_LOCK_TRIGGER_R is hit
+SOFT_STOP_DISABLE_R = 1.5
+PROFIT_LOCK_TRIGGER_R = 1.8
+PROFIT_LOCK_FLOOR_R = 0.3
 
-# Target & SL Display Multipliers (Calculated from AnchorPrice using Base ATR)
-TARGET_ATR_MULT = PROFIT_LOCK_TRIGGER_R # Target distance in Base ATRs from AnchorPrice (default: 1.8x Base ATR)
-SL_ATR_MULT = SOFT_STOP_ATR_MULT        # Stop-Loss distance in Base ATRs from AnchorPrice (default: 1.0x Base ATR)
-TARGET_SL_FROM_ANCHOR = True            # True = Compute Target & SL strictly from AnchorPrice (fallback to LTP)
+TARGET_ATR_MULT = PROFIT_LOCK_TRIGGER_R
+SL_ATR_MULT = SOFT_STOP_ATR_MULT
+TARGET_SL_FROM_ANCHOR = True
 
-ADVERSE_DRIFT_R_FLOOR = -0.5            # Explicit R-Multiple floor for live purge at snapshot time
-ADVERSE_DRIFT_STOP_RATIO = 1.0          # Ratio of HARD_STOP_ATR_MULT used when ADVERSE_DRIFT_R_FLOOR is None
-BANKED_R_PROTECTION_FLOOR = 0.5         # Cumulative R threshold that protects re-entries from adverse drift purge
+# --- 0.7B RISK-TO-REWARD (R:R) ENGINE CONFIGURATION ---
+RR_RATIO_TYPE = "RISK_TO_REWARD"        # Choices: "RISK_TO_REWARD" (Risk/Reward : 1) or "REWARD_TO_RISK" (Reward/Risk : 1)
+RR_SORT_ORDER = "ASC"                   # Choices: "ASC" (e.g. 0.1:1, 0.28:1 ascending) or "DESC"
+ENV_RR_RATIO_TYPE = "RR_RATIO_TYPE"
+ENV_RR_SORT_ORDER = "RR_SORT_ORDER"
+
+ADVERSE_DRIFT_R_FLOOR = -0.5
+ADVERSE_DRIFT_STOP_RATIO = 1.0
+BANKED_R_PROTECTION_FLOOR = 0.5
 
 # --- 0.8 SECTORAL INDICES & MULTI-INDEX WEIGHTAGE MATRIX ---
-ENABLE_SECTORAL_INDICES = True          # Evaluate & display Sectoral Indices before Stock tables
-DEFAULT_UNMAPPED_SECTOR = "NIFTY 500"   # Fallback sector label if a symbol is not in SECTOR_CONSTITUENT_WEIGHTS
-DEFAULT_UNMAPPED_WEIGHT = 0.10          # Fallback weight percentage for unmapped symbols
+ENABLE_SECTORAL_INDICES = True
+DEFAULT_UNMAPPED_SECTOR = "NIFTY 500"
+DEFAULT_UNMAPPED_WEIGHT = 0.10
 
 SECTORAL_INDEX_CONFIG = {
     "NIFTY BANK":        {"spot_key": "NSE_INDEX|Nifty Bank",              "aliases": {"NIFTY BANK", "BANKNIFTY", "NIFTYBANK"}},
@@ -204,8 +187,6 @@ SECTORAL_INDEX_CONFIG = {
     "NIFTY PSE":         {"spot_key": "NSE_INDEX|Nifty PSE",               "aliases": {"NIFTY PSE", "NIFTYPSE", "NIFTY CPSE"}},
 }
 
-# Constituent weightage (%) per Sectoral Index.
-# When a stock belongs to 2 or more indices, `resolve_primary_sector()` assigns it to the index where it has the HIGHEST %.
 SECTOR_CONSTITUENT_WEIGHTS = {
     "NIFTY IT": {
         "INFY": 31.30, "TCS": 19.08, "HCLTECH": 11.81, "TECHM": 10.47, "COFORGE": 6.59,
@@ -251,21 +232,18 @@ SECTOR_CONSTITUENT_WEIGHTS = {
     "NIFTY FMCG": {
         "ITC": 31.20, "HINDUNILVR": 21.80, "NESTLEIND": 8.90, "VBL": 7.60, "BRITANNIA": 6.40,
         "TATACONSUM": 6.10, "GODREJCP": 4.90, "MARICO": 4.10, "DABUR": 3.80, "COLPAL": 3.50,
-        "UNITDSPR": 3.40, "RADICO": 2.20, "PATANJALI": 2.10, "GODFRYPHLP": 1.80, "UBL": 1.70,
-        "JYOTHYLAB": 1.30,
+        "UNITDSPR": 3.40, "RADICO": 2.20, "PATANJALI": 2.10, "GODFRYPHLP": 1.80, "UBL": 1.70, "JYOTHYLAB": 1.30,
     },
     "NIFTY OIL & GAS": {
         "RELIANCE": 33.20, "ONGC": 16.50, "IOC": 11.40, "BPCL": 10.80, "GAIL": 8.90,
-        "HINDPETRO": 5.60, "OIL": 4.80, "PETRONET": 4.20, "IGL": 2.90, "MGL": 2.10,
-        "GUJGASLTD": 1.95, "ATGL": 1.50,
+        "HINDPETRO": 5.60, "OIL": 4.80, "PETRONET": 4.20, "IGL": 2.90, "MGL": 2.10, "GUJGASLTD": 1.95, "ATGL": 1.50,
     },
     "NIFTY ENERGY": {
         "RELIANCE": 27.40, "NTPC": 15.80, "POWERGRID": 11.90, "ONGC": 10.50, "COALINDIA": 9.40,
         "TATAPOWER": 6.80, "IOC": 5.20, "BPCL": 4.90, "ADANIGREEN": 4.60, "ADANIPOWER": 4.40,
         "JSWENERGY": 3.90, "SIEMENS": 4.80, "ABB": 4.20, "CGPOWER": 3.85, "BHEL": 3.40,
         "ADANIENSOL": 3.10, "NHPC": 2.90, "SUZLON": 3.20, "WAAREEENER": 2.80, "PREMIERENE": 2.60,
-        "INOXWIND": 2.10, "TORNTPOWER": 2.70, "SJVN": 1.80, "CESC": 1.60, "GVT&D": 2.20,
-        "ENRIN": 2.15,
+        "INOXWIND": 2.10, "TORNTPOWER": 2.70, "SJVN": 1.80, "CESC": 1.60, "GVT&D": 2.20, "ENRIN": 2.15,
     },
     "NIFTY REALTY": {
         "DLF": 26.80, "GODREJPROP": 17.40, "LODHA": 16.90, "MACROTECH": 16.90, "PHOENIXLTD": 13.50,
@@ -284,9 +262,9 @@ SECTOR_CONSTITUENT_WEIGHTS = {
         "ETERNAL": 6.20, "SWIGGY": 4.80, "NYKAA": 4.50, "JUBLFOOD": 4.40, "PIDILITIND": 5.60,
         "DIXON": 5.20, "POLYCAB": 4.90, "KEI": 4.30, "VOLTAS": 4.10, "BLUESTARCO": 3.80,
         "CROMPTON": 3.50, "SUPREMEIND": 3.90, "ASTRAL": 3.60, "PAGEIND": 3.20, "KAYNES": 3.40,
-        "AMBER": 2.90, "BERGEPAINT": 2.50, "BATAINDIA": 2.10, "KALYANKJIL": 3.30,
-        "UPL": 3.70, "PIIND": 4.00, "SRF": 4.20, "AARTIIND": 2.60, "DEEPAKNTR": 2.70,
-        "TATACHEM": 2.50, "CHAMBLFERT": 2.30, "COROMANDEL": 2.80,
+        "AMBER": 2.90, "BERGEPAINT": 2.50, "BATAINDIA": 2.10, "KALYANKJIL": 3.30, "UPL": 3.70,
+        "PIIND": 4.00, "SRF": 4.20, "AARTIIND": 2.60, "DEEPAKNTR": 2.70, "TATACHEM": 2.50,
+        "CHAMBLFERT": 2.30, "COROMANDEL": 2.80,
     },
     "NIFTY PSE": {
         "HAL": 16.40, "BEL": 15.20, "NTPC": 11.00, "POWERGRID": 9.50, "ONGC": 9.00,
@@ -296,15 +274,15 @@ SECTOR_CONSTITUENT_WEIGHTS = {
 }
 
 # --- 0.9 INDEX OPTIONS CONFIGURATION ---
-OPTIONS_BUYING_ONLY = True              # True = Trigger ONLY on long option breakouts (Rising CE -> BULL, Rising PE -> BEAR)
-EXPIRY_SELECTION = "CURRENT"            # Choices: "CURRENT", "NEXT"
-STRIKES_ABOVE_ATM = 5                   # Number of strikes above ATM to scan
-STRIKES_BELOW_ATM = 5                   # Number of strikes below ATM to scan
-OPT_MIN_PRICE = 10.0                    # Minimum option LTP at snapshot
-OPT_MIN_VOLUME = 5000                   # Minimum cumulative option volume at snapshot
-LIVE_QUOTE_FALLBACK_MIN = 3             # Minutes from current clock within which live quote spot fallback is allowed
-SPOT_1M_LOOKBACK_DAYS = 5               # Calendar days lookback for 1m index spot resolution
-SPOT_DAILY_LOOKBACK_DAYS = 10           # Calendar days lookback for daily index spot resolution
+OPTIONS_BUYING_ONLY = True
+EXPIRY_SELECTION = "CURRENT"
+STRIKES_ABOVE_ATM = 5
+STRIKES_BELOW_ATM = 5
+OPT_MIN_PRICE = 10.0
+OPT_MIN_VOLUME = 5000
+LIVE_QUOTE_FALLBACK_MIN = 3
+SPOT_1M_LOOKBACK_DAYS = 5
+SPOT_DAILY_LOOKBACK_DAYS = 10
 INDEX_CONFIG = {
     "NIFTY":     {"spot_key": "NSE_INDEX|Nifty 50",          "aliases": {"NIFTY", "NIFTY 50"}},
     "BANKNIFTY": {"spot_key": "NSE_INDEX|Nifty Bank",        "aliases": {"BANKNIFTY", "NIFTY BANK"}},
@@ -315,13 +293,13 @@ ALIAS_TO_INDEX = {a: idx for idx, cfg in INDEX_CONFIG.items() for a in cfg["alia
 PROBE_KEY = INDEX_CONFIG["NIFTY"]["spot_key"]
 
 # --- 0.10 DASHBOARD DISPLAY & FORMATTING ---
-TOP_N_BUYERS = 50                       # Max rows in Console Top Bull Setups (0 = unlimited)
-TOP_N_SELLERS = 50                      # Max rows in Console Top Bear Setups (0 = unlimited)
-TOP_N_GRAVEYARD = 100                   # Max rows in Console Graveyard (0 = unlimited)
-MIN_SYMBOL_WIDTH = 12                   # Minimum width of the Script column
-MAX_SYMBOL_WIDTH = 30                   # Maximum width of the Script column
-SECTOR_COL_WIDTH = 18                   # Width of Sector column in Stock tables
-BANKED_R_DISPLAY_EPSILON = 0.01         # Minimum absolute Banked R to display the (* / BankedR) badge
+TOP_N_BUYERS = 50
+TOP_N_SELLERS = 50
+TOP_N_GRAVEYARD = 100
+MIN_SYMBOL_WIDTH = 12
+MAX_SYMBOL_WIDTH = 30
+SECTOR_COL_WIDTH = 18
+BANKED_R_DISPLAY_EPSILON = 0.01
 
 COLOR_RESET = '\033[0m'
 COLOR_BOLD = '\033[1m'
@@ -358,7 +336,7 @@ MASTER_DOWNLOAD_TIMEOUT_SEC = 90
 MASTER_RETRY_SLEEP_SEC = 1.0
 
 # ==============================================================================
-# HELPERS, SECTOR RESOLVER, CE/PE COUNTERS, TARGET/SL & RATE LIMITERS
+# HELPERS, SECTOR RESOLVER, CE/PE COUNTERS, TARGET/SL, R:R & RATE LIMITERS
 # ==============================================================================
 def get_upstox_token():
     return os.environ.get(ENV_UPSTOX_TOKEN) or os.environ.get(ENV_FALLBACK_TOKEN)
@@ -368,25 +346,17 @@ def _parse_bool_env(env_key, default_val):
     if raw is None or str(raw).strip() == "":
         return bool(default_val)
     s = str(raw).strip().lower()
-    if s in ("1", "true", "yes", "y", "on"):
-        return True
-    if s in ("0", "false", "no", "n", "off"):
-        return False
-    return bool(default_val)
+    return s in ("1", "true", "yes", "y", "on")
 
 def get_lookback_iterations_config():
-    """
-    Resolves NO_OF_ITERATIONS and TIME_OF_INTERVAL_TO_LOOKBACK from environment
-    variables (if provided in GitHub Actions) or falls back to Section 0 globals.
-    """
     raw_iters = os.environ.get(ENV_NO_OF_ITERATIONS) or os.environ.get(ENV_LOOKBACK_ITERATIONS)
     raw_interval = os.environ.get(ENV_TIME_OF_INTERVAL_TO_LOOKBACK) or os.environ.get(ENV_LOOKBACK_INTERVAL_MIN)
     try:
-        iters = int(raw_iters) if raw_iters is not None and str(raw_iters).strip() != "" else int(NO_OF_ITERATIONS)
+        iters = int(raw_iters) if raw_iters and str(raw_iters).strip() != "" else int(NO_OF_ITERATIONS)
     except ValueError:
         iters = int(NO_OF_ITERATIONS)
     try:
-        interval = int(raw_interval) if raw_interval is not None and str(raw_interval).strip() != "" else int(TIME_OF_INTERVAL_TO_LOOKBACK)
+        interval = int(raw_interval) if raw_interval and str(raw_interval).strip() != "" else int(TIME_OF_INTERVAL_TO_LOOKBACK)
     except ValueError:
         interval = int(TIME_OF_INTERVAL_TO_LOOKBACK)
     return max(0, iters), max(1, interval)
@@ -401,17 +371,10 @@ def _open_dt(day):
     return datetime.combine(day, dtime(SESSION_OPEN_MIN // 60, SESSION_OPEN_MIN % 60))
 
 def _parse_snapshot_datetime(target_date_str, target_time_str):
-    """
-    Flexibly parses `--date` (supports YYYY-MM-DD, DD-MM-YYYY, DD/MM/YYYY, YYYY/MM/DD,
-    DD-MMM-YYYY, etc.) and `--time` (supports HH:MM, HH:MM:SS, 12-hour AM/PM).
-    Treats blank or '***' placeholders as unset (live IST clock).
-    """
     clean_d = str(target_date_str or "").strip()
     clean_t = str(target_time_str or "").strip()
-    if clean_d in ("", "***", "NONE", "NULL", "TODAY", "LIVE"):
-        clean_d = ""
-    if clean_t in ("", "***", "NONE", "NULL", "NOW", "LIVE"):
-        clean_t = ""
+    if clean_d in ("", "***", "NONE", "NULL", "TODAY", "LIVE"): clean_d = ""
+    if clean_t in ("", "***", "NONE", "NULL", "NOW", "LIVE"): clean_t = ""
 
     if not clean_d and not clean_t:
         return now_ist(), False
@@ -458,27 +421,16 @@ def _is_option_symbol(symbol):
     return _is_ce_symbol(symbol) or _is_pe_symbol(symbol)
 
 def _ce_pe_counts(rows_list):
-    """Returns (ce_count, pe_count) for a list of row dicts."""
     ce_cnt = sum(1 for r in (rows_list or []) if _is_ce_symbol(r.get("Symbol", "")))
     pe_cnt = sum(1 for r in (rows_list or []) if _is_pe_symbol(r.get("Symbol", "")))
     return ce_cnt, pe_cnt
 
 def _format_count_with_ce_pe(rows_list):
-    """Formats total and CE/PE breakdown as `(Total) CE(x) PE(y)`."""
     total = len(rows_list or [])
     ce_cnt, pe_cnt = _ce_pe_counts(rows_list)
     return f"({total}) CE({ce_cnt}) PE({pe_cnt})"
 
 def _compute_target_sl(row):
-    """
-    Computes Target and Stop-Loss (SL) prices strictly from AnchorPrice (with LTP fallback)
-    using the already-calculated BaseAtr:
-      - In Option Buying mode (or any long breakout where PremiumDir == 'BULL'), Target is
-        ALWAYS above AnchorPrice (`AnchorPrice + TARGET_ATR_MULT * BaseAtr`) and SL is
-        ALWAYS below AnchorPrice (`AnchorPrice - SL_ATR_MULT * BaseAtr`).
-      - For short equity/futures setups (`PremiumDir == 'BEAR'` on non-option symbols),
-        Target is `AnchorPrice - TARGET_ATR_MULT * BaseAtr` and SL is `AnchorPrice + SL_ATR_MULT * BaseAtr`.
-    """
     ap = float(row.get('AnchorPrice', 0.0) or 0.0)
     ltp = float(row.get('LTP', 0.0) or 0.0)
     ref_price = ap if (TARGET_SL_FROM_ANCHOR and ap > 0) else ltp
@@ -504,11 +456,58 @@ def _compute_target_sl(row):
 
     return round(target_price, 2), round(sl_price, 2)
 
+def compute_risk_reward_ratio(row):
+    """
+    Computes Risk-to-Reward ratio for active setups.
+    Returns: (ratio_val, ratio_str) e.g. (0.28, "0.28:1", or 0.1, "0.1:1")
+    """
+    tgt_p = float(row.get('TargetPrice', 0.0) or 0.0)
+    sl_p = float(row.get('SLPrice', 0.0) or 0.0)
+    if tgt_p <= 0 or sl_p <= 0:
+        tgt_p, sl_p = _compute_target_sl(row)
+    ltp = float(row.get('LTP', 0.0) or 0.0)
+    if ltp <= 0 or tgt_p <= 0 or sl_p <= 0:
+        return 999.0, "-:1"
+
+    sym = str(row.get('Symbol') or '')
+    if OPTIONS_BUYING_ONLY and _is_option_symbol(sym):
+        p_dir = 'BULL'
+    else:
+        p_dir = str(row.get('PremiumDir') or row.get('AnchorDir') or 'BULL').upper()
+
+    if p_dir == 'BEAR':
+        reward = max(0.0, ltp - tgt_p)
+        risk = max(0.0, sl_p - ltp)
+    else:
+        reward = max(0.0, tgt_p - ltp)
+        risk = max(0.0, ltp - sl_p)
+
+    if RR_RATIO_TYPE == "REWARD_TO_RISK":
+        val = (reward / risk) if risk > 0 else 99.9
+    else:
+        val = (risk / reward) if reward > 0 else 99.9
+
+    val = round(val, 2)
+    return val, f"{val:g}:1"
+
+def _get_timestamp_gap_min(row):
+    """Computes elapsed minutes between CheckpointTime (Seen Time) and ActiveAnchor time."""
+    try:
+        anc_str = str(row.get('ActiveAnchor') or '').replace('*', '').strip()
+        if not anc_str or anc_str == '-':
+            return 9999
+        cp_dt = row.get('CheckpointTime')
+        if not cp_dt:
+            return 0
+        anc_t = datetime.strptime(anc_str, "%H:%M").time()
+        cp_min = cp_dt.hour * 60 + cp_dt.minute
+        anc_min = anc_t.hour * 60 + anc_t.minute
+        gap = cp_min - anc_min
+        return gap if gap >= 0 else gap + 1440
+    except Exception:
+        return 0
+
 def resolve_primary_sector(symbol):
-    """
-    Checks all Sectoral Indices where `symbol` is a constituent and picks
-    the single Sectoral Index where `symbol` has the HIGHEST percentage weight.
-    """
     clean_sym = str(symbol).upper().strip()
     matches = []
     for sec_name, weights_map in SECTOR_CONSTITUENT_WEIGHTS.items():
@@ -584,10 +583,8 @@ _TLS = threading.local()
 _MASTER_CACHE = {}
 
 def _limiter_for(url):
-    if "market-quote/quotes" in url:
-        return LIMITERS["quotes"]
-    if "/intraday/" in url:
-        return LIMITERS["intraday"]
+    if "market-quote/quotes" in url: return LIMITERS["quotes"]
+    if "/intraday/" in url: return LIMITERS["intraday"]
     return LIMITERS["history"]
 
 def _session():
@@ -632,8 +629,7 @@ def _get(url, params=None, retries=None):
         try:
             r = _session().get(url, headers=headers, params=params, timeout=API_TIMEOUT_SEC)
             code = r.status_code
-            if code == 200:
-                return 200, r.json()
+            if code == 200: return 200, r.json()
             if code == 401:
                 STATS.mark_auth_failed()
                 return 401, None
@@ -651,8 +647,7 @@ def _get(url, params=None, retries=None):
     return 0, None
 
 def _to_frame(candles):
-    if not candles:
-        return None
+    if not candles: return None
     df = pd.DataFrame(candles).iloc[:, :6]
     df.columns = ['Timestamp', 'Open', 'High', 'Low', 'Close', 'Volume']
     ts = df['Timestamp'].astype(str)
@@ -666,8 +661,7 @@ def _to_frame(candles):
 
 def _candles(url):
     status, js = _get(url)
-    if status != 200 or not js:
-        return status, None
+    if status != 200 or not js: return status, None
     try:
         return 200, _to_frame((js.get('data') or {}).get('candles') or [])
     except Exception as e:
@@ -694,8 +688,7 @@ def _date_chunks(start, end, span=None):
 def generate_checkpoints(cutoff_dt, interval_min=None):
     interval = max(1, int(interval_min or CHECKPOINT_INTERVAL_MIN))
     session_open = _open_dt(cutoff_dt.date())
-    if cutoff_dt <= session_open:
-        return [cutoff_dt]
+    if cutoff_dt <= session_open: return [cutoff_dt]
     checkpoints, t = [], session_open + timedelta(minutes=interval)
     while t <= cutoff_dt:
         checkpoints.append(t)
@@ -710,36 +703,29 @@ def fetch_quotes(items, batch=None):
 
     def one(b):
         status, js = _get(f"{API_HOST}/v2/market-quote/quotes", params={"instrument_key": ",".join(x['key'] for x in b)})
-        if status != 200 or not js:
-            return {}
+        if status != 200 or not js: return {}
         by_ts = {f"{x['key'].split('|')[0]}:{x['symbol']}": x['key'] for x in b}
         data, out = js.get('data') or {}, {}
         for k, v in data.items():
             key = v.get('instrument_token') or by_ts.get(k)
-            if not key and len(b) == 1 and len(data) == 1:
-                key = b[0]['key']
-            if key:
-                out[key] = {'ltp': v.get('last_price') or 0.0, 'vol': v.get('volume') or 0}
+            if not key and len(b) == 1 and len(data) == 1: key = b[0]['key']
+            if key: out[key] = {'ltp': v.get('last_price') or 0.0, 'vol': v.get('volume') or 0}
         return out
 
     res = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=min(WORKERS, max(1, len(batches)))) as ex:
-        for part in ex.map(one, batches):
-            res.update(part)
+        for part in ex.map(one, batches): res.update(part)
     return res
 
 def fetch_today(key):
-    if now_ist().weekday() >= 5:
-        return None
+    if now_ist().weekday() >= 5: return None
     status, df = _candles(_url_intraday(key))
-    if status != 200 or df is None:
-        return None
+    if status != 200 or df is None: return None
     df = df[df['Datetime'].dt.date == now_ist().date()]
     return df if not df.empty else None
 
 def _session_traded(d, today):
-    if d.weekday() >= 5:
-        return False
+    if d.weekday() >= 5: return False
     if d == today:
         df = fetch_today(PROBE_KEY)
         return df is not None and not df.empty
@@ -750,12 +736,12 @@ def resolve_session(cutoff_dt):
     notes = []
     now = now_ist().replace(second=0, microsecond=0)
     if cutoff_dt > now:
-        notes.append(f"snapshot {cutoff_dt:%Y-%m-%d %H:%M} is in the future -- using current time {now:%Y-%m-%d %H:%M} instead")
+        notes.append(f"snapshot {cutoff_dt:%Y-%m-%d %H:%M} is in future -> using current {now:%Y-%m-%d %H:%M}")
         cutoff_dt = now
     target = cutoff_dt.date()
 
     if cutoff_dt <= _open_dt(target):
-        why = f"{cutoff_dt:%Y-%m-%d %H:%M} is at/before the {_open_dt(target):%H:%M} open"
+        why = f"{cutoff_dt:%Y-%m-%d %H:%M} is before {_open_dt(target):%H:%M} open"
     elif target.weekday() >= 5:
         why = f"{target} is a weekend"
     elif _session_traded(target, now.date()):
@@ -763,17 +749,15 @@ def resolve_session(cutoff_dt):
     elif STATS.auth_failed:
         return cutoff_dt, notes
     else:
-        why = f"no trading data for {target} (market holiday?)"
+        why = f"no trading data for {target}"
 
     d = target - timedelta(days=1)
     for _ in range(MAX_SESSION_LOOKBACK_DAYS):
-        if STATS.auth_failed:
-            return cutoff_dt, notes
+        if STATS.auth_failed: return cutoff_dt, notes
         if _session_traded(d, now.date()):
-            notes.append(f"{why} -> using the last completed session: {d} {SESSION_CLOSE_MIN // 60}:{SESSION_CLOSE_MIN % 60:02d}")
+            notes.append(f"{why} -> using last completed session: {d} {SESSION_CLOSE_MIN // 60}:{SESSION_CLOSE_MIN % 60:02d}")
             return _close_dt(d), notes
         d -= timedelta(days=1)
-    notes.append(f"{why}, and no trading session was found in the previous {MAX_SESSION_LOOKBACK_DAYS} days -- continuing with requested time")
     return cutoff_dt, notes
 
 def prepare_master(dfs):
@@ -791,43 +775,31 @@ def prepare_master(dfs):
     return master
 
 def _unwrap_master(data):
-    if isinstance(data, list):
-        return data
+    if isinstance(data, list): return data
     if isinstance(data, dict):
-        if isinstance(data.get("data"), list):
-            return data["data"]
+        if isinstance(data.get("data"), list): return data["data"]
         for v in data.values():
-            if isinstance(v, list):
-                return v
+            if isinstance(v, list): return v
     return []
 
 def _download_master(name, _is_fallback=False):
-    if name in _MASTER_CACHE:
-        return _MASTER_CACHE[name]
+    if name in _MASTER_CACHE: return _MASTER_CACHE[name]
     url = f"{MASTER_BASE_URL}/{name}.json.gz"
-    for attempt in range(1, MASTER_DOWNLOAD_RETRIES + 1):
+    for _ in range(MASTER_DOWNLOAD_RETRIES):
         try:
             resp = requests.get(url, timeout=MASTER_DOWNLOAD_TIMEOUT_SEC)
             if resp.status_code == 200:
-                try:
-                    rows = _unwrap_master(json.loads(gzip.decompress(resp.content).decode('utf-8')))
-                    if rows:
-                        _MASTER_CACHE[name] = rows
-                        return rows
-                except Exception:
-                    pass
-            elif resp.status_code == 404:
-                break
+                rows = _unwrap_master(json.loads(gzip.decompress(resp.content).decode('utf-8')))
+                if rows:
+                    _MASTER_CACHE[name] = rows
+                    return rows
+            elif resp.status_code == 404: break
         except Exception:
             pass
         time.sleep(MASTER_RETRY_SLEEP_SEC)
     if not _is_fallback and name.upper() in ("NSE", "BSE"):
         full = _download_master("complete", _is_fallback=True)
-        rows = [
-            r for r in full
-            if str(r.get("exchange", "")).upper() == name.upper()
-            or str(r.get("segment", "")).upper().startswith(name.upper())
-        ]
+        rows = [r for r in full if str(r.get("exchange", "")).upper() == name.upper() or str(r.get("segment", "")).upper().startswith(name.upper())]
         if rows:
             _MASTER_CACHE[name] = rows
             return rows
@@ -838,11 +810,9 @@ def resolve_pins(cands, needles, label="symbol"):
     norm = [(_norm_sym(sym), sym, key) for sym, key in cands]
     for raw in needles:
         n = _norm_sym(raw)
-        if not n:
-            continue
+        if not n: continue
         hits = [c for c in norm if c[0] == n] or [c for c in norm if n in c[0]]
-        if not hits:
-            continue
+        if not hits: continue
         hits.sort(key=lambda c: c[2])
         pinned.update(h[1] for h in hits[:MAX_PINNED_MATCHES])
     return pinned
@@ -855,10 +825,8 @@ def _sectoral_indices_universe():
             ik = row.get("instrument_key")
             for field_name in ("name", "trading_symbol", "tradingsymbol"):
                 val = row.get(field_name)
-                if val and ik:
-                    master_idx_map[_norm_sym(val)] = ik
-            if ik and "|" in ik:
-                master_idx_map[_norm_sym(ik.split("|", 1)[1])] = ik
+                if val and ik: master_idx_map[_norm_sym(val)] = ik
+            if ik and "|" in ik: master_idx_map[_norm_sym(ik.split("|", 1)[1])] = ik
 
     out = []
     for sec_name, cfg in SECTORAL_INDEX_CONFIG.items():
@@ -868,31 +836,18 @@ def _sectoral_indices_universe():
             if norm_a in master_idx_map:
                 resolved_key = master_idx_map[norm_a]
                 break
-        if not resolved_key:
-            resolved_key = cfg["spot_key"]
-        out.append({
-            "symbol": sec_name,
-            "key": resolved_key,
-            "pinned": True,
-            "is_sector_index": True,
-            "sector": sec_name,
-            "sector_weight": 100.0,
-        })
+        if not resolved_key: resolved_key = cfg["spot_key"]
+        out.append({"symbol": sec_name, "key": resolved_key, "pinned": True, "is_sector_index": True, "sector": sec_name, "sector_weight": 100.0})
     return out
 
 def _equity_universe(mode, needles=()):
     nse = _download_master("NSE")
-    if not nse:
-        return []
+    if not nse: return []
 
-    def ts_of(i):
-        return i.get("tradingsymbol", i.get("trading_symbol"))
-
+    def ts_of(i): return i.get("tradingsymbol", i.get("trading_symbol"))
     def plain(i):
         return (
-            i.get("segment") == "NSE_EQ"
-            and ts_of(i)
-            and i.get("instrument_key")
+            i.get("segment") == "NSE_EQ" and ts_of(i) and i.get("instrument_key")
             and (INCLUDE_NON_EQ_SERIES or (i.get("instrument_type") or "EQ") == "EQ")
         )
 
@@ -918,97 +873,75 @@ def _resolve_index_spot_price(key, name, cutoff_dt, use_intraday):
         df = fetch_today(key)
         if df is not None and not df.empty:
             sub = df[df['Datetime'] < cutoff_dt]
-            if not sub.empty:
-                return float(sub['Close'].iloc[-1]), "today's 1-min close at snapshot"
+            if not sub.empty: return float(sub['Close'].iloc[-1]), "today's 1-min close"
         if now_ist() - cutoff_dt <= timedelta(minutes=LIVE_QUOTE_FALLBACK_MIN):
             q = fetch_quotes([{"key": key, "symbol": name}], batch=1)
             ltp = q.get(key, {}).get('ltp', 0.0)
-            if ltp and ltp > 0:
-                return float(ltp), "live quote"
+            if ltp and ltp > 0: return float(ltp), "live quote"
     status, df = _candles(_url_range_1m(key, target_dt - timedelta(days=SPOT_1M_LOOKBACK_DAYS), target_dt + timedelta(days=1)))
     if status == 200 and df is not None and not df.empty:
         sub = df[df['Datetime'] < cutoff_dt]
-        if not sub.empty:
-            return float(sub['Close'].iloc[-1]), "1-min close at snapshot"
+        if not sub.empty: return float(sub['Close'].iloc[-1]), "1-min close"
     status, df = _candles(_url_range_daily(key, target_dt - timedelta(days=SPOT_DAILY_LOOKBACK_DAYS), target_dt + timedelta(days=1)))
     if status == 200 and df is not None and not df.empty:
         limit = target_dt if cutoff_dt >= _close_dt(target_dt) else target_dt - timedelta(days=1)
         sub = df[df['Datetime'].dt.date <= limit]
-        if not sub.empty:
-            return float(sub['Close'].iloc[-1]), "daily close (fallback)"
+        if not sub.empty: return float(sub['Close'].iloc[-1]), "daily close"
     return 0.0, "no candles returned"
 
 def _field(row, *names):
     for n in names:
         v = row.get(n)
-        if v is None or v == "" or (isinstance(v, float) and v != v):
-            continue
-        return v
+        if v is not None and v != "" and not (isinstance(v, float) and v != v): return v
     return None
 
 def _expiry_to_date(exp):
     try:
         if isinstance(exp, (int, float, np.integer, np.floating)) or (isinstance(exp, str) and exp.strip().isdigit()):
             v = float(exp)
-            if v > 1e11:
-                v /= 1000.0
+            if v > 1e11: v /= 1000.0
             return datetime.fromtimestamp(v, IST).date()
         s = str(exp).strip().split('T')[0].split(' ')[0]
         for fmt in ("%Y-%m-%d", "%d-%b-%Y", "%d-%m-%Y", "%d/%m/%Y"):
-            try:
-                return datetime.strptime(s, fmt).date()
-            except ValueError:
-                pass
-    except Exception:
-        pass
+            try: return datetime.strptime(s, fmt).date()
+            except ValueError: pass
+    except Exception: pass
     return None
 
 def _index_options_universe(cutoff_dt, use_intraday, needles=()):
     target_dt = cutoff_dt.date()
     spot = {}
     for idx, cfg in INDEX_CONFIG.items():
-        try:
-            price, _ = _resolve_index_spot_price(cfg["spot_key"], idx, cutoff_dt, use_intraday)
-        except Exception:
-            price = 0.0
-        if price > 0:
-            spot[idx] = price
-    if not spot and not needles:
-        return []
+        try: price, _ = _resolve_index_spot_price(cfg["spot_key"], idx, cutoff_dt, use_intraday)
+        except Exception: price = 0.0
+        if price > 0: spot[idx] = price
+    if not spot and not needles: return []
 
     rows = _download_master("NSE") + _download_master("BSE")
-    if not rows:
-        return []
+    if not rows: return []
 
     by_idx = {idx: [] for idx in INDEX_CONFIG}
     for row in rows:
         segment = str(_field(row, "segment") or "").upper()
-        if segment and segment not in ("NSE_FO", "BSE_FO"):
-            continue
+        if segment and segment not in ("NSE_FO", "BSE_FO"): continue
         ts = str(_field(row, "trading_symbol", "tradingsymbol") or "").upper()
         itype = str(_field(row, "option_type", "instrument_type") or "").upper()
         if itype not in ("CE", "PE"):
             m = re.search(r'\b(CE|PE)\b', ts) or re.search(r'\d(CE|PE)$', ts)
-            if not m:
-                continue
+            if not m: continue
             itype = m.group(1)
         cands = [str(_field(row, "underlying_symbol") or ""), str(_field(row, "name") or ""), ts.split()[0] if ts else ""]
         idx = next((ALIAS_TO_INDEX[c.upper().strip()] for c in cands if c.upper().strip() in ALIAS_TO_INDEX), None)
-        if idx is None:
-            continue
+        if idx is None: continue
         exp_date = _expiry_to_date(_field(row, "expiry"))
-        if exp_date is None:
-            continue
+        if exp_date is None: continue
         strike_raw = _field(row, "strike_price", "strike")
-        try:
-            strike = float(strike_raw) if strike_raw is not None else 0.0
-        except Exception:
-            strike = 0.0
+        try: strike = float(strike_raw) if strike_raw is not None else 0.0
+        except Exception: strike = 0.0
         if strike <= 0:
             m = re.search(r'(\d+(?:\.\d+)?)\s+(?:CE|PE)\b', ts) or re.search(r'(\d+)(?:CE|PE)$', ts)
             strike = float(m.group(1)) if m else 0.0
-        if strike <= 0 or not _field(row, "instrument_key"):
-            continue
+        if strike <= 0 or not _field(row, "instrument_key"): continue
         by_idx[idx].append((exp_date, strike, itype, row))
 
     universe, seen = [], set()
@@ -1016,8 +949,7 @@ def _index_options_universe(cutoff_dt, use_intraday, needles=()):
         flat = []
         for idx, contracts in by_idx.items():
             for exp_date, strike, itype, row in contracts:
-                if exp_date < target_dt:
-                    continue
+                if exp_date < target_dt: continue
                 key = _field(row, "instrument_key")
                 sym = str(_field(row, "trading_symbol", "tradingsymbol") or key)
                 flat.append((sym, (exp_date, strike, itype, sym), key))
@@ -1029,11 +961,9 @@ def _index_options_universe(cutoff_dt, use_intraday, needles=()):
                 universe.append({"key": key, "symbol": sym, "pinned": True, "is_sector_index": False, "sector": "INDEX_OPTIONS", "sector_weight": 100.0})
 
     for idx, contracts in by_idx.items():
-        if idx not in spot or not contracts:
-            continue
+        if idx not in spot or not contracts: continue
         expiries = sorted({c[0] for c in contracts if c[0] >= target_dt})
-        if not expiries:
-            continue
+        if not expiries: continue
         expiry_idx = 1 if str(EXPIRY_SELECTION).upper() == "NEXT" else 0
         target_exp = expiries[min(expiry_idx, len(expiries) - 1)]
         chain = [c for c in contracts if c[0] == target_exp]
@@ -1047,28 +977,21 @@ def _index_options_universe(cutoff_dt, use_intraday, needles=()):
             if strike in window and key not in seen:
                 seen.add(key)
                 universe.append({
-                    "key": key,
-                    "symbol": str(_field(row, "trading_symbol", "tradingsymbol") or key),
-                    "pinned": False,
-                    "is_sector_index": False,
-                    "sector": idx,
-                    "sector_weight": 100.0,
+                    "key": key, "symbol": str(_field(row, "trading_symbol", "tradingsymbol") or key),
+                    "pinned": False, "is_sector_index": False, "sector": idx, "sector_weight": 100.0,
                 })
     return universe
 
 def get_dynamic_universe(mode, cutoff_dt, use_intraday, needles=()):
-    if mode in ("STOCK_FNO", "CASH_EQUITY"):
-        return _equity_universe(mode, needles)
-    if mode == "INDEX_OPTIONS":
-        return _index_options_universe(cutoff_dt, use_intraday, needles)
+    if mode in ("STOCK_FNO", "CASH_EQUITY"): return _equity_universe(mode, needles)
+    if mode == "INDEX_OPTIONS": return _index_options_universe(cutoff_dt, use_intraday, needles)
     return []
 
 # ==============================================================================
 # 2. CONTINUOUS KINETIC TRIPWIRE ENGINE (SHARED BY INDICES & STOCKS)
 # ==============================================================================
 def compute_base_atr(m):
-    if m is None or len(m) == 0:
-        return None, 0
+    if m is None or len(m) == 0: return None, 0
     hi, lo, cl = m['High'].values, m['Low'].values, m['Close'].values
     sid = m['SessId'].values
     mins = np.clip(m['Min'].values, SESSION_OPEN_MIN, SESSION_CLOSE_MIN - 1)
@@ -1079,8 +1002,7 @@ def compute_base_atr(m):
     b_high, b_low, b_close = np.maximum.reduceat(hi, starts), np.minimum.reduceat(lo, starts), cl[ends]
     prev_close = np.concatenate(([np.nan], b_close[:-1]))
     tr = np.fmax(np.fmax(b_high - b_low, np.abs(b_high - prev_close)), np.abs(b_low - prev_close))
-    atr = float(tr[-ATR_BASIS_PERIOD:].mean())
-    return atr, len(b_close)
+    return float(tr[-ATR_BASIS_PERIOD:].mean()), len(b_close)
 
 def _ewm(x, alpha):
     xs = x.tolist()
@@ -1136,19 +1058,14 @@ def _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts, sid):
     obv = np.cumsum(direction * eff_vol)
 
     if ISOLATE_SESSION_BANDS:
-        df = pd.DataFrame({
-            'rsi': rsi, 'hist': hist, 'plus_di': plus_di,
-            'minus_di': minus_di, 'adx': adx, 'obv': obv, 'sid': sid
-        })
+        df = pd.DataFrame({'rsi': rsi, 'hist': hist, 'plus_di': plus_di, 'minus_di': minus_di, 'adx': adx, 'obv': obv, 'sid': sid})
         grouped = df.groupby('sid')
-        def roll_mean(x): return x.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()
-        def roll_std(x): return x.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0)
-        rsi_mean, rsi_std = grouped['rsi'].transform(roll_mean).values, grouped['rsi'].transform(roll_std).values
-        h_mean, h_std = grouped['hist'].transform(roll_mean).values, grouped['hist'].transform(roll_std).values
-        p_mean, p_std = grouped['plus_di'].transform(roll_mean).values, grouped['plus_di'].transform(roll_std).values
-        m_mean, m_std = grouped['minus_di'].transform(roll_mean).values, grouped['minus_di'].transform(roll_std).values
-        a_mean, a_std = grouped['adx'].transform(roll_mean).values, grouped['adx'].transform(roll_std).values
-        o_mean, o_std = grouped['obv'].transform(roll_mean).values, grouped['obv'].transform(roll_std).values
+        rsi_mean, rsi_std = grouped['rsi'].transform(lambda x: x.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()).values, grouped['rsi'].transform(lambda x: x.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0)).values
+        h_mean, h_std = grouped['hist'].transform(lambda x: x.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()).values, grouped['hist'].transform(lambda x: x.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0)).values
+        p_mean, p_std = grouped['plus_di'].transform(lambda x: x.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()).values, grouped['plus_di'].transform(lambda x: x.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0)).values
+        m_mean, m_std = grouped['minus_di'].transform(lambda x: x.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()).values, grouped['minus_di'].transform(lambda x: x.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0)).values
+        a_mean, a_std = grouped['adx'].transform(lambda x: x.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()).values, grouped['adx'].transform(lambda x: x.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0)).values
+        o_mean, o_std = grouped['obv'].transform(lambda x: x.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()).values, grouped['obv'].transform(lambda x: x.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0)).values
     else:
         rsi_s, hist_s = pd.Series(rsi), pd.Series(hist)
         pdi_s, mdi_s = pd.Series(plus_di), pd.Series(minus_di)
@@ -1167,21 +1084,10 @@ def _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts, sid):
     vel_adx = np.where(sess_starts, 0.0, np.diff(adx, prepend=adx[0]))
 
     alpha_vel = 1.0 / float(VEL_ATR_PERIOD)
-    atr_hist = _ewm(np.abs(vel_hist), alpha_vel)
-    atr_obv = _ewm(np.abs(vel_obv), alpha_vel)
-    atr_pdi = _ewm(np.abs(vel_pdi), alpha_vel)
-    atr_mdi = _ewm(np.abs(vel_mdi), alpha_vel)
-    atr_adx = _ewm(np.abs(vel_adx), alpha_vel)
+    atr_hist, atr_obv = _ewm(np.abs(vel_hist), alpha_vel), _ewm(np.abs(vel_obv), alpha_vel)
+    atr_pdi, atr_mdi, atr_adx = _ewm(np.abs(vel_pdi), alpha_vel), _ewm(np.abs(vel_mdi), alpha_vel), _ewm(np.abs(vel_adx), alpha_vel)
 
     w = max(1, int(SHOCK_WINDOW_BARS))
-    win_vh_max = pd.Series(vel_hist).rolling(w, min_periods=ROLLING_MIN_PERIODS).max().values
-    win_vh_min = pd.Series(vel_hist).rolling(w, min_periods=ROLLING_MIN_PERIODS).min().values
-    win_vo_max = pd.Series(vel_obv).rolling(w, min_periods=ROLLING_MIN_PERIODS).max().values
-    win_vo_min = pd.Series(vel_obv).rolling(w, min_periods=ROLLING_MIN_PERIODS).min().values
-    win_vp_max = pd.Series(vel_pdi).rolling(w, min_periods=ROLLING_MIN_PERIODS).max().values
-    win_vm_max = pd.Series(vel_mdi).rolling(w, min_periods=ROLLING_MIN_PERIODS).max().values
-    win_va_max = pd.Series(vel_adx).rolling(w, min_periods=ROLLING_MIN_PERIODS).max().values
-
     return {
         'rsi': rsi, 'r_mean': rsi_mean, 'r_std': rsi_std,
         'hist': hist, 'h_mean': h_mean, 'h_std': h_std,
@@ -1194,10 +1100,13 @@ def _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts, sid):
         'vel_pdi': vel_pdi, 'atr_pdi': atr_pdi,
         'vel_mdi': vel_mdi, 'atr_mdi': atr_mdi,
         'vel_adx': vel_adx, 'atr_adx': atr_adx,
-        'win_vh_max': win_vh_max, 'win_vh_min': win_vh_min,
-        'win_vo_max': win_vo_max, 'win_vo_min': win_vo_min,
-        'win_vp_max': win_vp_max, 'win_vm_max': win_vm_max,
-        'win_va_max': win_va_max
+        'win_vh_max': pd.Series(vel_hist).rolling(w, min_periods=ROLLING_MIN_PERIODS).max().values,
+        'win_vh_min': pd.Series(vel_hist).rolling(w, min_periods=ROLLING_MIN_PERIODS).min().values,
+        'win_vo_max': pd.Series(vel_obv).rolling(w, min_periods=ROLLING_MIN_PERIODS).max().values,
+        'win_vo_min': pd.Series(vel_obv).rolling(w, min_periods=ROLLING_MIN_PERIODS).min().values,
+        'win_vp_max': pd.Series(vel_pdi).rolling(w, min_periods=ROLLING_MIN_PERIODS).max().values,
+        'win_vm_max': pd.Series(vel_mdi).rolling(w, min_periods=ROLLING_MIN_PERIODS).max().values,
+        'win_va_max': pd.Series(vel_adx).rolling(w, min_periods=ROLLING_MIN_PERIODS).max().values
     }
 
 def get_kinetics(kin_1m, idx):
@@ -1234,16 +1143,12 @@ def get_kinetics(kin_1m, idx):
     bear_struct = (br_struct_cnt >= STRUCT_QUORUM) and (m_di > p_di)
 
     b_shock_cnt = (
-        int(w_vh_max > KINETIC_SHOCK_ATR_MULT * ah) +
-        int(w_vo_max > KINETIC_SHOCK_ATR_MULT * ao) +
-        int(w_vp_max > KINETIC_SHOCK_ATR_MULT * ap) +
-        int(w_va_max > KINETIC_SHOCK_ATR_MULT * aa)
+        int(w_vh_max > KINETIC_SHOCK_ATR_MULT * ah) + int(w_vo_max > KINETIC_SHOCK_ATR_MULT * ao) +
+        int(w_vp_max > KINETIC_SHOCK_ATR_MULT * ap) + int(w_va_max > KINETIC_SHOCK_ATR_MULT * aa)
     )
     br_shock_cnt = (
-        int(w_vh_min < -KINETIC_SHOCK_ATR_MULT * ah) +
-        int(w_vo_min < -KINETIC_SHOCK_ATR_MULT * ao) +
-        int(w_vm_max > KINETIC_SHOCK_ATR_MULT * am) +
-        int(w_va_max > KINETIC_SHOCK_ATR_MULT * aa)
+        int(w_vh_min < -KINETIC_SHOCK_ATR_MULT * ah) + int(w_vo_min < -KINETIC_SHOCK_ATR_MULT * ao) +
+        int(w_vm_max > KINETIC_SHOCK_ATR_MULT * am) + int(w_va_max > KINETIC_SHOCK_ATR_MULT * aa)
     )
 
     bull_shock = (b_shock_cnt >= SHOCK_QUORUM) and (vh > SHOCK_FLOW_MIN_THRESHOLD or vo > SHOCK_FLOW_MIN_THRESHOLD)
@@ -1251,21 +1156,18 @@ def get_kinetics(kin_1m, idx):
 
     bull_score = (
         int(p_std > 0 and p_di > p_mean + OPPOSING_BB_STD_MULT * p_std) +
-        int(vh > OPPOSING_VEL_ATR_MULT * ah) +
-        int(vo > OPPOSING_VEL_ATR_MULT * ao) +
+        int(vh > OPPOSING_VEL_ATR_MULT * ah) + int(vo > OPPOSING_VEL_ATR_MULT * ao) +
         int(h_std > 0 and hist > h_mean + OPPOSING_BB_STD_MULT * h_std)
     )
     bear_score = (
         int(m_std > 0 and m_di > m_mean + OPPOSING_BB_STD_MULT * m_std) +
-        int(vh < -OPPOSING_VEL_ATR_MULT * ah) +
-        int(vo < -OPPOSING_VEL_ATR_MULT * ao) +
+        int(vh < -OPPOSING_VEL_ATR_MULT * ah) + int(vo < -OPPOSING_VEL_ATR_MULT * ao) +
         int(h_std > 0 and hist < h_mean - OPPOSING_BB_STD_MULT * h_std)
     )
 
     return (
         bull_score, bear_score,
-        bull_score >= WARZONE_OPPOSING_SCORE,
-        bear_score >= WARZONE_OPPOSING_SCORE,
+        bull_score >= WARZONE_OPPOSING_SCORE, bear_score >= WARZONE_OPPOSING_SCORE,
         bull_struct, bear_struct, bull_shock, bear_shock
     )
 
@@ -1276,11 +1178,7 @@ def calculate_grids(kin_1m, idx, direction):
     m_di, m_mean, m_std = kin_1m['minus_di'][idx], kin_1m['m_mean'][idx], kin_1m['m_std'][idx]
     adx, a_mean, a_std = kin_1m['adx'][idx], kin_1m['a_mean'][idx], kin_1m['a_std'][idx]
 
-    ah = kin_1m['atr_hist'][idx]
-    ao = kin_1m['atr_obv'][idx]
-    ap = kin_1m['atr_pdi'][idx]
-    am = kin_1m['atr_mdi'][idx]
-    aa = kin_1m['atr_adx'][idx]
+    ah, ao, ap, am, aa = kin_1m['atr_hist'][idx], kin_1m['atr_obv'][idx], kin_1m['atr_pdi'][idx], kin_1m['atr_mdi'][idx], kin_1m['atr_adx'][idx]
     vh = max(kin_1m['vel_hist'][idx], kin_1m['win_vh_max'][idx]) if direction == "BULL" else min(kin_1m['vel_hist'][idx], kin_1m['win_vh_min'][idx])
     vo = max(kin_1m['vel_obv'][idx], kin_1m['win_vo_max'][idx]) if direction == "BULL" else min(kin_1m['vel_obv'][idx], kin_1m['win_vo_min'][idx])
     vp = max(kin_1m['vel_pdi'][idx], kin_1m['win_vp_max'][idx])
@@ -1291,8 +1189,7 @@ def calculate_grids(kin_1m, idx, direction):
     bb_grid = {m: 0 for m in GRID_MULTIPLIERS}
 
     def check_bb(val, mean, std, mult, is_bull_ind):
-        if std <= 0:
-            return False
+        if std <= 0: return False
         return (val > mean + (std * mult)) if is_bull_ind else (val < mean - (std * mult))
 
     for mult in GRID_MULTIPLIERS:
@@ -1318,16 +1215,10 @@ def calculate_grids(kin_1m, idx, direction):
         atr_grid[mult], bb_grid[mult] = a_count, b_count
     return atr_grid, bb_grid
 
-def evaluate_anchor_tripwire(
-    close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower,
-    today_start, is_late_session, end=None, allow_bull=True, allow_bear=True
-):
+def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, today_start, is_late_session, end=None, allow_bull=True, allow_bear=True):
     n = len(close) if end is None else min(int(end), len(close))
     if today_start >= n:
-        return None, {
-            'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0,
-            'killed_time': '-', 'killed_price': 0.0, 'reason': 'No data for today', 'kills': []
-        }
+        return None, {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0, 'killed_time': '-', 'killed_price': 0.0, 'reason': 'No data for today', 'kills': []}
 
     hard_mult = float(HARD_STOP_ATR_MULT or 0.0)
     soft_mult = float(SOFT_STOP_ATR_MULT)
@@ -1339,38 +1230,25 @@ def evaluate_anchor_tripwire(
     warmup = max(0, int(ANCHOR_OPEN_WARMUP_BARS or 0))
     i = min(n, today_start + warmup) if (today_start + warmup < n) else today_start
     survived_anchor = None
-    last_killed_info = {
-        'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0,
-        'killed_time': '-', 'killed_price': 0.0, 'reason': 'Failed Kinetic Alignment'
-    }
+    last_killed_info = {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0, 'killed_time': '-', 'killed_price': 0.0, 'reason': 'Failed Kinetic Alignment'}
     kills, warzone_kills = [], 0
 
     while i < n:
         anchor = None
         while i < n:
             (bull_score, bear_score, r_bull, r_bear, bull_struct, bear_struct, bull_shock, bear_shock) = get_kinetics(kin_1m, i)
-
             bb_kc_bull_fire = (bb_upper[i] > kc_upper[i]) or (close[i] > bb_upper[i] and close[i] > kc_upper[i])
             bb_kc_bear_fire = (bb_lower[i] < kc_lower[i]) or (close[i] < bb_lower[i] and close[i] < kc_lower[i])
 
             if allow_bull and not is_late_session[i] and bull_struct and bull_shock and bb_kc_bull_fire:
-                if r_bear:
-                    warzone_kills += 1
-                else:
-                    anchor = {"dir": "BULL", "idx": i, "time": dt_1m[i], "price": close[i]}
-                    break
-
+                if r_bear: warzone_kills += 1
+                else: anchor = {"dir": "BULL", "idx": i, "time": dt_1m[i], "price": close[i]}; break
             elif allow_bear and not is_late_session[i] and bear_struct and bear_shock and bb_kc_bear_fire:
-                if r_bull:
-                    warzone_kills += 1
-                else:
-                    anchor = {"dir": "BEAR", "idx": i, "time": dt_1m[i], "price": close[i]}
-                    break
+                if r_bull: warzone_kills += 1
+                else: anchor = {"dir": "BEAR", "idx": i, "time": dt_1m[i], "price": close[i]}; break
             i += 1
 
-        if not anchor:
-            break
-
+        if not anchor: break
         survived, is_bull = True, anchor['dir'] == "BULL"
         peak_price, true_peak, j = anchor['price'], anchor['price'], anchor['idx'] + 1
 
@@ -1398,12 +1276,9 @@ def evaluate_anchor_tripwire(
 
             if reason:
                 last_killed_info = {
-                    'dir': anchor['dir'],
-                    'anchor_time': pd.to_datetime(anchor['time']).strftime('%H:%M'),
-                    'anchor_price': float(anchor['price']),
-                    'killed_time': pd.to_datetime(dt_1m[j]).strftime('%H:%M'),
-                    'killed_price': float(close[j]),
-                    'reason': reason
+                    'dir': anchor['dir'], 'anchor_time': pd.to_datetime(anchor['time']).strftime('%H:%M'),
+                    'anchor_price': float(anchor['price']), 'killed_time': pd.to_datetime(dt_1m[j]).strftime('%H:%M'),
+                    'killed_price': float(close[j]), 'reason': reason
                 }
                 kills.append(last_killed_info)
                 survived = False
@@ -1415,20 +1290,16 @@ def evaluate_anchor_tripwire(
             survived_anchor = anchor
             break
 
-    if survived_anchor:
-        return survived_anchor, {"status": "Survived", "kills": kills}
+    if survived_anchor: return survived_anchor, {"status": "Survived", "kills": kills}
     info = dict(last_killed_info)
-    if warzone_kills > 0 and info['dir'] == 'NONE':
-        info['reason'] = f"Warzone Inversion Chop ({warzone_kills}x)"
+    if warzone_kills > 0 and info['dir'] == 'NONE': info['reason'] = f"Warzone Inversion Chop ({warzone_kills}x)"
     info['kills'] = kills
     return None, info
 
 def prepare_series(master, target_dt, is_sector_index=False, is_option=False):
-    if master is None or master.empty:
-        return None, "no_data"
+    if master is None or master.empty: return None, "no_data"
     day_mask = (master['Datetime'].dt.date == target_dt).values
-    if not day_mask.any():
-        return None, "no_data"
+    if not day_mask.any(): return None, "no_data"
     ts = int(np.argmax(day_mask))
 
     open_ = master['Open'].values.astype(float)
@@ -1441,67 +1312,50 @@ def prepare_series(master, target_dt, is_sector_index=False, is_option=False):
     sess_starts = np.zeros(n, dtype=bool)
     sess_starts[0] = True
     sess_starts[1:] = sid[1:] != sid[:-1]
-
     is_late_session = (master['Min'].values >= LAST_NEW_ANCHOR_MIN)
 
     base_atr_calc, atr_bars = compute_base_atr(master.iloc[:ts])
-    if base_atr_calc is None or atr_bars < ATR_MIN_BARS:
-        return None, "short_history"
-    if is_sector_index:
-        atr_pct_floor = float(INDEX_MIN_ATR_PCT)
-    elif is_option:
-        atr_pct_floor = float(OPT_MIN_ATR_PCT)
-    else:
-        atr_pct_floor = float(MIN_ATR_PCT)
+    if base_atr_calc is None or atr_bars < ATR_MIN_BARS: return None, "short_history"
+    atr_pct_floor = float(INDEX_MIN_ATR_PCT) if is_sector_index else (float(OPT_MIN_ATR_PCT) if is_option else float(MIN_ATR_PCT))
     base_atr = max(float(base_atr_calc), float(close[ts]) * atr_pct_floor, float(ABSOLUTE_MIN_ATR))
 
-    tr = np.maximum(
-        high - low,
-        np.maximum(np.abs(high - np.roll(close, 1)), np.abs(low - np.roll(close, 1)))
-    )
+    tr = np.maximum(high - low, np.maximum(np.abs(high - np.roll(close, 1)), np.abs(low - np.roll(close, 1))))
     tr = np.where(sess_starts, high - low, tr)
 
     if ISOLATE_SESSION_BANDS:
-        df_p = pd.DataFrame({'close': close, 'tr': tr, 'sid': sid})
-        grouped_p = df_p.groupby('sid')
-        sma_bb = grouped_p['close'].transform(lambda x: x.rolling(PRICE_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()).values
-        std_bb = grouped_p['close'].transform(lambda x: x.rolling(PRICE_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0)).values
-        sma_kc = grouped_p['close'].transform(lambda x: x.rolling(PRICE_KC_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()).values
-        atr_kc = grouped_p['tr'].transform(lambda x: x.rolling(PRICE_KC_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()).values
+        df_p = pd.DataFrame({'close': close, 'tr': tr, 'sid': sid}).groupby('sid')
+        sma_bb = df_p['close'].transform(lambda x: x.rolling(PRICE_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()).values
+        std_bb = df_p['close'].transform(lambda x: x.rolling(PRICE_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0)).values
+        sma_kc = df_p['close'].transform(lambda x: x.rolling(PRICE_KC_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()).values
+        atr_kc = df_p['tr'].transform(lambda x: x.rolling(PRICE_KC_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean()).values
     else:
         delta_p = np.diff(close, prepend=close[0])
         delta_p = np.where(sess_starts, close - open_, delta_p)
         stitched_close = np.cumsum(delta_p) + open_[0]
         stitched_offset = close - stitched_close
-        sc_series = pd.Series(stitched_close)
-        tr_series = pd.Series(tr)
-        sma_bb = sc_series.rolling(PRICE_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values + stitched_offset
-        std_bb = sc_series.rolling(PRICE_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0).values
-        sma_kc = sc_series.rolling(PRICE_KC_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values + stitched_offset
-        atr_kc = tr_series.rolling(PRICE_KC_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values
+        sma_bb = pd.Series(stitched_close).rolling(PRICE_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values + stitched_offset
+        std_bb = pd.Series(stitched_close).rolling(PRICE_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0).values
+        sma_kc = pd.Series(stitched_close).rolling(PRICE_KC_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values + stitched_offset
+        atr_kc = pd.Series(tr).rolling(PRICE_KC_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values
 
     return {
         'close': close, 'dt': master['Datetime'].values, 'today_start': ts, 'is_late_session': is_late_session,
         'day_open': float(open_[ts]), 'prev_close': float(close[ts - 1]) if ts > 0 else 0.0,
         'base_atr': base_atr, 'atr_bars': int(atr_bars),
         'kin': _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts, sid),
-        'bb_upper': sma_bb + PRICE_BB_STD_MULT * std_bb,
-        'bb_lower': sma_bb - PRICE_BB_STD_MULT * std_bb,
-        'kc_upper': sma_kc + PRICE_KC_ATR_MULT * atr_kc,
-        'kc_lower': sma_kc - PRICE_KC_ATR_MULT * atr_kc,
+        'bb_upper': sma_bb + PRICE_BB_STD_MULT * std_bb, 'bb_lower': sma_bb - PRICE_BB_STD_MULT * std_bb,
+        'kc_upper': sma_kc + PRICE_KC_ATR_MULT * atr_kc, 'kc_lower': sma_kc - PRICE_KC_ATR_MULT * atr_kc,
     }, None
 
 def row_at(S, end, symbol, sector="", sector_weight=0.0, is_sector_index=False):
     ts = S['today_start']
     end = min(int(end), len(S['close']))
-    if end <= ts:
-        return None
+    if end <= ts: return None
     close, base_atr, kin = S['close'], S['base_atr'], S['kin']
     last = end - 1
     ltp = float(close[last])
     ref = S['prev_close'] if (DAY_PCT_BASIS == "PREV_CLOSE" and S['prev_close'] > 0) else S['day_open']
 
-    # Option Buying Only: for CE & PE contracts, only evaluate long (upward premium) breakouts
     is_opt = _is_option_symbol(symbol)
     allow_bull_anchor = True
     allow_bear_anchor = not (OPTIONS_BUYING_ONLY and is_opt)
@@ -1511,27 +1365,20 @@ def row_at(S, end, symbol, sector="", sector_weight=0.0, is_sector_index=False):
         'ActiveAnchor': None, 'AnchorPrice': 0.0, 'AnchorDir': "NONE", 'MovePct': 0.0,
         'State': "NONE", 'Blocks': 0, 'KilledTime': '-', 'KilledPrice': 0.0, 'RejectReason': "",
         'Kills': [], 'AtrBars': S['atr_bars'], 'BaseAtr': base_atr, 'PriorStops': 0, 'BankedR': 0.0,
-        'TargetPrice': 0.0, 'SLPrice': 0.0,
-        'Sector': sector or DEFAULT_UNMAPPED_SECTOR,
-        'SectorWeight': float(sector_weight or 0.0),
-        'IsSectorIndex': bool(is_sector_index),
+        'TargetPrice': 0.0, 'SLPrice': 0.0, 'Sector': sector or DEFAULT_UNMAPPED_SECTOR,
+        'SectorWeight': float(sector_weight or 0.0), 'IsSectorIndex': bool(is_sector_index),
     }
 
     anchor, info = evaluate_anchor_tripwire(
-        close, S['dt'], kin, base_atr, S['bb_upper'], S['bb_lower'],
-        S['kc_upper'], S['kc_lower'], ts, S['is_late_session'], end,
-        allow_bull=allow_bull_anchor, allow_bear=allow_bear_anchor
+        close, S['dt'], kin, base_atr, S['bb_upper'], S['bb_lower'], S['kc_upper'], S['kc_lower'],
+        ts, S['is_late_session'], end, allow_bull=allow_bull_anchor, allow_bear=allow_bear_anchor
     )
     row['Kills'] = info.get('kills', [])
     eval_dir = anchor['dir'] if anchor else info.get('dir')
-    if not eval_dir or eval_dir == "NONE":
-        eval_dir = "BULL"
+    if not eval_dir or eval_dir == "NONE": eval_dir = "BULL"
 
     row['ATR_Grid'], row['BB_Grid'] = calculate_grids(kin, last, eval_dir)
-    if eval_dir == "BULL":
-        bb_expanding = (S['bb_upper'][last] > S['kc_upper'][last]) or (close[last] > S['bb_upper'][last] and close[last] > S['kc_upper'][last])
-    else:
-        bb_expanding = (S['bb_lower'][last] < S['kc_lower'][last]) or (close[last] < S['bb_lower'][last] and close[last] < S['kc_lower'][last])
+    bb_expanding = (S['bb_upper'][last] > S['kc_upper'][last] or (close[last] > S['bb_upper'][last] and close[last] > S['kc_upper'][last])) if eval_dir == "BULL" else (S['bb_lower'][last] < S['kc_lower'][last] or (close[last] < S['bb_lower'][last] and close[last] < S['kc_lower'][last]))
     pure_state = "[ BB > KC ]" if bb_expanding else "[ BB < KC ]"
 
     if anchor:
@@ -1554,6 +1401,8 @@ def row_at(S, end, symbol, sector="", sector_weight=0.0, is_sector_index=False):
             row['MovePct'] = ((row['KilledPrice'] - row['AnchorPrice']) / row['AnchorPrice']) * 100.0
         row['State'] = "[STOPPED]"
         row['TargetPrice'], row['SLPrice'] = _compute_target_sl(row)
+
+    row['RR_Val'], row['RR_Str'] = compute_risk_reward_ratio(row)
     return row
 
 # ==============================================================================
@@ -1562,19 +1411,15 @@ def row_at(S, end, symbol, sector="", sector_weight=0.0, is_sector_index=False):
 def _history_worker_daily(args):
     item, start, end, progress = args
     try:
-        if item.get("pinned") or item.get("is_sector_index"):
-            return item
+        if item.get("pinned") or item.get("is_sector_index"): return item
         frames = []
         for c_start, c_end in _date_chunks(start, end + timedelta(days=1), span=CHUNK_SPAN_DAILY_DAYS):
             status, df = _candles(_url_range_daily(item['key'], c_start, c_end))
-            if status == 200 and df is not None:
-                frames.append(df)
-        if not frames:
-            return None
+            if status == 200 and df is not None: frames.append(df)
+        if not frames: return None
         master = prepare_master(frames)
         master = master[master['Datetime'].dt.date < end]
-        if master.empty:
-            return None
+        if master.empty: return None
         close, vol = master['Close'].iloc[-1], master['Volume'].iloc[-1]
         return item if (MIN_PRICE <= close <= MAX_PRICE and vol >= MIN_DAILY_VOLUME) else None
     except Exception as e:
@@ -1595,32 +1440,24 @@ def process_stock_checkpoints(args):
         frames = []
         for c_start, c_end in _date_chunks(target_dt - timedelta(days=history_days), target_dt + timedelta(days=1), span=CHUNK_SPAN_1M_DAYS):
             status, df = _candles(_url_range_1m(item['key'], c_start, c_end))
-            if status == 200 and df is not None:
-                frames.append(df)
+            if status == 200 and df is not None: frames.append(df)
         if use_intraday:
             today_df = fetch_today(item['key'])
-            if today_df is not None:
-                frames.append(today_df)
-        if not frames:
-            return [(cp, "no_data", sym) for cp in checkpoints], []
+            if today_df is not None: frames.append(today_df)
+        if not frames: return [(cp, "no_data", sym) for cp in checkpoints], []
 
         master = prepare_master(frames)
         master = master[master['Datetime'] < final_cutoff].reset_index(drop=True)
         if mode == "INDEX_OPTIONS" and not is_sec_idx:
             day = master[master['Datetime'].dt.date == target_dt]
-            if day.empty:
-                return [(cp, "no_data", sym) for cp in checkpoints], []
-            if day['Close'].iloc[-1] < OPT_MIN_PRICE or day['Volume'].sum() < OPT_MIN_VOLUME:
+            if day.empty or day['Close'].iloc[-1] < OPT_MIN_PRICE or day['Volume'].sum() < OPT_MIN_VOLUME:
                 return [(cp, "illiquid", sym) for cp in checkpoints], []
 
         S, why = prepare_series(master, target_dt, is_sector_index=is_sec_idx, is_option=(mode == "INDEX_OPTIONS" or _is_option_symbol(sym)))
-        if S is None:
-            return [(cp, why, sym) for cp in checkpoints], []
+        if S is None: return [(cp, why, sym) for cp in checkpoints], []
 
-        # 1. Exact evaluation for primary checkpoints (untouched)
         ends = np.searchsorted(S['dt'], np.array(checkpoints, dtype='datetime64[ns]'), side='left')
-        out = []
-        by_cp_row = {}
+        out, by_cp_row = [], {}
         for cp, end in zip(checkpoints, ends):
             row = row_at(S, int(end), sym, sector=sec_name, sector_weight=sec_wt, is_sector_index=is_sec_idx)
             if row is None:
@@ -1630,17 +1467,13 @@ def process_stock_checkpoints(args):
                 out.append((cp, "ok", row))
                 by_cp_row[cp] = row
 
-        # 2. In-memory evaluation for any additional lookback iteration checkpoints
         extra_out = []
         session_open_dt = _open_dt(target_dt)
         for l_cp in (extra_lookback_cps or []):
             if l_cp in by_cp_row:
                 extra_out.append((l_cp, "ok", by_cp_row[l_cp]))
                 continue
-            if l_cp == session_open_dt:
-                l_end = int(np.searchsorted(S['dt'], np.datetime64(l_cp), side='right'))
-            else:
-                l_end = int(np.searchsorted(S['dt'], np.datetime64(l_cp), side='left'))
+            l_end = int(np.searchsorted(S['dt'], np.datetime64(l_cp), side='right' if l_cp == session_open_dt else 'left'))
             l_row = row_at(S, l_end, sym, sector=sec_name, sector_weight=sec_wt, is_sector_index=is_sec_idx)
             if l_row is not None:
                 l_row['CheckpointTime'] = l_cp
@@ -1654,15 +1487,12 @@ def process_stock_checkpoints(args):
         progress.tick()
 
 def _clip(s, w, allow_clip=True):
-    if not allow_clip:
-        return str(s)
+    if not allow_clip: return str(s)
     return s if len(s) <= w else s[:w - 1] + "~"
 
 def _print_error_summary():
-    if STATS.failed:
-        print(f"{COLOR_YELLOW}⚠ {STATS.failed} API requests failed.{COLOR_RESET}")
-    if ERRORS.items:
-        print(f"{COLOR_YELLOW}⚠ {len(ERRORS.items)} instruments raised exceptions. First: [{ERRORS.items[0][0]}] {ERRORS.items[0][1]}{COLOR_RESET}")
+    if STATS.failed: print(f"{COLOR_YELLOW}⚠ {STATS.failed} API requests failed.{COLOR_RESET}")
+    if ERRORS.items: print(f"{COLOR_YELLOW}⚠ {len(ERRORS.items)} instruments raised exceptions.{COLOR_RESET}")
 
 def _signal_id(row):
     return (row['AnchorDir'], row['ActiveAnchor'], round(float(row['AnchorPrice']), 6))
@@ -1675,8 +1505,7 @@ def _exit_price(row):
 
 def _kill_r_multiple(kill_dict, base_atr):
     ap, kp = float(kill_dict.get('anchor_price', 0.0) or 0.0), float(kill_dict.get('killed_price', 0.0) or 0.0)
-    if ap <= 0 or kp <= 0 or base_atr <= 0:
-        return 0.0
+    if ap <= 0 or kp <= 0 or base_atr <= 0: return 0.0
     return (kp - ap) / base_atr if kill_dict.get('dir', 'BULL') == 'BULL' else (ap - kp) / base_atr
 
 def _r_multiple(row, include_banked=False):
@@ -1687,9 +1516,7 @@ def _r_multiple(row, include_banked=False):
     return live_r + float(row.get('BankedR', 0.0) or 0.0) if include_banked else live_r
 
 def _rank_r_score(row):
-    live_r = _r_multiple(row, include_banked=False)
-    cum_r = _r_multiple(row, include_banked=True)
-    return max(live_r, cum_r)
+    return max(_r_multiple(row, False), _r_multiple(row, True))
 
 def _merge_signal(sig_rows, last_row, direction):
     first, latest = sig_rows[0], sig_rows[-1]
@@ -1712,6 +1539,7 @@ def _merge_signal(sig_rows, last_row, direction):
     ap = row['AnchorPrice'] or last_row['LTP']
     row['MovePct'] = ((_exit_price(row) - ap) / ap) * 100.0 if ap else 0.0
     row['TargetPrice'], row['SLPrice'] = _compute_target_sl(row)
+    row['RR_Val'], row['RR_Str'] = compute_risk_reward_ratio(row)
     return row
 
 def merge_symbol_rows(rows):
@@ -1727,10 +1555,8 @@ def merge_symbol_rows(rows):
         for ep_rows in episodes.values():
             merged_ep = _merge_signal(ep_rows, last_row, direction)
             seen_anchor_times.add((direction, merged_ep['ActiveAnchor']))
-            if merged_ep['State'] != "[STOPPED]":
-                active_merged[direction] = merged_ep
-            else:
-                grave_episodes.append(merged_ep)
+            if merged_ep['State'] != "[STOPPED]": active_merged[direction] = merged_ep
+            else: grave_episodes.append(merged_ep)
         for k in [k for k in kills if k.get('dir') == direction and (direction, k.get('anchor_time')) not in seen_anchor_times]:
             seen_anchor_times.add((direction, k.get('anchor_time')))
             g_row = dict(last_row)
@@ -1739,53 +1565,52 @@ def merge_symbol_rows(rows):
             g_row['KilledTime'], g_row['KilledPrice'], g_row['RejectReason'], g_row['State'] = k['killed_time'], float(k['killed_price']), k['reason'], "[STOPPED]"
             g_row['MovePct'] = ((g_row['KilledPrice'] - g_row['AnchorPrice']) / g_row['AnchorPrice']) * 100.0 if g_row['AnchorPrice'] > 0 else 0.0
             g_row['TargetPrice'], g_row['SLPrice'] = _compute_target_sl(g_row)
+            g_row['RR_Val'], g_row['RR_Str'] = compute_risk_reward_ratio(g_row)
             grave_episodes.append(g_row)
     if not active_merged and not grave_episodes:
         grave = dict(last_row)
         grave['CheckpointTime'] = rows[0]['CheckpointTime']
         grave['TargetPrice'], grave['SLPrice'] = _compute_target_sl(grave)
+        grave['RR_Val'], grave['RR_Str'] = compute_risk_reward_ratio(grave)
         grave_episodes.append(grave)
     return active_merged.get("BULL"), active_merged.get("BEAR"), grave_episodes
 
 def _script_group_key(row):
-    """
-    Extracts the base script / underlying group name (e.g. FINNIFTY, NIFTY, SENSEX, BANKNIFTY,
-    or the base symbol token) so rows for the same script are grouped together and ordered by
-    how many rows exist for that script in the table.
-    """
     sym = str(row.get("Symbol") or "").upper().strip()
     sec = str(row.get("Sector") or "").upper().strip()
-    if sec in INDEX_CONFIG:
-        return sec
+    if sec in INDEX_CONFIG: return sec
     first_tok = sym.split()[0] if sym else ""
-    if first_tok in ALIAS_TO_INDEX:
-        return ALIAS_TO_INDEX[first_tok]
+    if first_tok in ALIAS_TO_INDEX: return ALIAS_TO_INDEX[first_tok]
     for idx_name in INDEX_CONFIG:
-        if sym.startswith(idx_name):
-            return idx_name
+        if sym.startswith(idx_name): return idx_name
     return first_tok or sym
 
 def sort_rows_by_script_count(rows_list):
     """
     Sorts a table of active setups by:
-      1. Number of rows existing for that single script/underlying in `rows_list` (descending)
-      2. Script group name (A-Z, keeping all contracts/rows of the same script contiguous)
-      3. R-Multiple rank score (descending)
-      4. State rank ([ BB > KC ] first)
-      5. Symbol name (A-Z)
+      1. Risk-to-Reward ratio (ascending or descending as configured by RR_SORT_ORDER, e.g. 0.1:1, 0.28:1)
+      2. Number of rows existing for that single script/underlying (descending)
+      3. Script group name (A-Z)
+      4. R-Multiple rank score (descending)
+      5. State rank ([ BB > KC ] first)
+      6. Symbol name (A-Z)
     """
-    if not rows_list:
-        return rows_list
+    if not rows_list: return rows_list
     first_grid_key = GRID_MULTIPLIERS[0] if GRID_MULTIPLIERS else 1
-    def state_rank(st):
-        return 0 if "[ BB > KC ]" in str(st) else 1 if "[ BB < KC ]" in str(st) else 2
+    def state_rank(st): return 0 if "[ BB > KC ]" in str(st) else 1 if "[ BB < KC ]" in str(st) else 2
 
     counts = {}
     for r in rows_list:
         gk = _script_group_key(r)
         counts[gk] = counts.get(gk, 0) + 1
+        if 'RR_Val' not in r or 'RR_Str' not in r:
+            rr_val, rr_str = compute_risk_reward_ratio(r)
+            r['RR_Val'] = rr_val
+            r['RR_Str'] = rr_str
 
+    is_asc = (str(RR_SORT_ORDER).upper() == "ASC")
     rows_list.sort(key=lambda r: (
+        r.get('RR_Val', 999.0) if is_asc else -r.get('RR_Val', 0.0),
         -counts.get(_script_group_key(r), 0),
         _script_group_key(r),
         -_rank_r_score(r),
@@ -1809,11 +1634,10 @@ def segregate_and_rank_buckets(by_symbol_map):
             item['PremiumDir'] = raw_dir
             item['AnchorDir'] = "BEAR" if (raw_dir == "BULL" and is_pe) else ("BULL" if (raw_dir == "BEAR" and is_pe) else raw_dir)
             item['TargetPrice'], item['SLPrice'] = _compute_target_sl(item)
+            item['RR_Val'], item['RR_Str'] = compute_risk_reward_ratio(item)
 
         for item, raw_dir in ((b, "BULL"), (r_, "BEAR")):
-            if not item:
-                continue
-            # Option Buying Only: ignore short/falling option premium setups
+            if not item: continue
             if OPTIONS_BUYING_ONLY and is_opt and raw_dir != "BULL":
                 item['PremiumDir'] = raw_dir
                 item['State'] = "[STOPPED]"
@@ -1831,23 +1655,21 @@ def segregate_and_rank_buckets(by_symbol_map):
                 _apply_dir(g_item, g_item.get('AnchorDir'))
             graveyard_candidates.append(g_item)
 
-    drift_floor = (
-        float(ADVERSE_DRIFT_R_FLOOR)
-        if ADVERSE_DRIFT_R_FLOOR is not None
-        else -abs(float(HARD_STOP_ATR_MULT or 1.2) * float(ADVERSE_DRIFT_STOP_RATIO))
-    )
+    drift_floor = float(ADVERSE_DRIFT_R_FLOOR) if ADVERSE_DRIFT_R_FLOOR is not None else -abs(float(HARD_STOP_ATR_MULT or 1.2) * float(ADVERSE_DRIFT_STOP_RATIO))
 
     surviving_bulls, surviving_bears = [], []
     for r in bulls_live:
         if not (_r_multiple(r) > drift_floor or _r_multiple(r, include_banked=True) > BANKED_R_PROTECTION_FLOOR):
             r['RejectReason'] = f"Adverse Drift (Losing R-Multiple < {drift_floor:g}R)"
             graveyard_candidates.append(r)
+        elif ENABLE_TIMESTAMP_GAP_CHECK and MAX_TIMESTAMP_GAP_MINUTES > 0 and _get_timestamp_gap_min(r) > MAX_TIMESTAMP_GAP_MINUTES:
+            r['RejectReason'] = f"Timestamp Gap Stale ({_get_timestamp_gap_min(r)}m > {MAX_TIMESTAMP_GAP_MINUTES}m)"
+            graveyard_candidates.append(r)
         elif STRICT_FIRST_TIME_POPUP_FILTER and _r_multiple(r) < float(POPUP_MIN_R_MULTIPLE) - 1e-6:
             r['RejectReason'] = f"Underwater Setup (Live R-Multiple {_r_multiple(r):+.2f}R < {POPUP_MIN_R_MULTIPLE:g}R)"
             graveyard_candidates.append(r)
         elif STRICT_FIRST_TIME_POPUP_FILTER and POPUP_REQUIRE_NON_ZERO_GRID and (
-            sum(int(v or 0) for v in (r.get('ATR_Grid') or {}).values()) <= 0
-            and sum(int(v or 0) for v in (r.get('BB_Grid') or {}).values()) <= 0
+            sum(int(v or 0) for v in (r.get('ATR_Grid') or {}).values()) <= 0 and sum(int(v or 0) for v in (r.get('BB_Grid') or {}).values()) <= 0
         ):
             r['RejectReason'] = "Kinetic Decay (Both ATR & BB Grids at 0 0 0 0)"
             graveyard_candidates.append(r)
@@ -1858,12 +1680,14 @@ def segregate_and_rank_buckets(by_symbol_map):
         if not (_r_multiple(r) > drift_floor or _r_multiple(r, include_banked=True) > BANKED_R_PROTECTION_FLOOR):
             r['RejectReason'] = f"Adverse Drift (Losing R-Multiple < {drift_floor:g}R)"
             graveyard_candidates.append(r)
+        elif ENABLE_TIMESTAMP_GAP_CHECK and MAX_TIMESTAMP_GAP_MINUTES > 0 and _get_timestamp_gap_min(r) > MAX_TIMESTAMP_GAP_MINUTES:
+            r['RejectReason'] = f"Timestamp Gap Stale ({_get_timestamp_gap_min(r)}m > {MAX_TIMESTAMP_GAP_MINUTES}m)"
+            graveyard_candidates.append(r)
         elif STRICT_FIRST_TIME_POPUP_FILTER and _r_multiple(r) < float(POPUP_MIN_R_MULTIPLE) - 1e-6:
             r['RejectReason'] = f"Underwater Setup (Live R-Multiple {_r_multiple(r):+.2f}R < {POPUP_MIN_R_MULTIPLE:g}R)"
             graveyard_candidates.append(r)
         elif STRICT_FIRST_TIME_POPUP_FILTER and POPUP_REQUIRE_NON_ZERO_GRID and (
-            sum(int(v or 0) for v in (r.get('ATR_Grid') or {}).values()) <= 0
-            and sum(int(v or 0) for v in (r.get('BB_Grid') or {}).values()) <= 0
+            sum(int(v or 0) for v in (r.get('ATR_Grid') or {}).values()) <= 0 and sum(int(v or 0) for v in (r.get('BB_Grid') or {}).values()) <= 0
         ):
             r['RejectReason'] = "Kinetic Decay (Both ATR & BB Grids at 0 0 0 0)"
             graveyard_candidates.append(r)
@@ -1895,12 +1719,6 @@ def segregate_and_rank_buckets(by_symbol_map):
 # 3B. IN-MEMORY MULTI-ITERATION FIRST-TIME POPUP ENGINE (ZERO FILE STORAGE)
 # ==============================================================================
 def compute_lookback_iteration_schedule(cutoff_dt, num_iterations=None, interval_min=None):
-    """
-    Given a snapshot `cutoff_dt` (e.g. 12:35), `NO_OF_ITERATIONS` (e.g. 3),
-    and `TIME_OF_INTERVAL_TO_LOOKBACK` (e.g. 5 mins):
-      - Prior iteration cutoffs: [12:30, 12:25, 12:20] (clamped to >= 09:15 session open)
-      - Window for Anchor Time validation: [12:20, 12:35]
-    """
     cfg_iters, cfg_interval = get_lookback_iterations_config()
     n_iters = cfg_iters if num_iterations is None else max(0, int(num_iterations))
     step_min = cfg_interval if interval_min is None else max(1, int(interval_min))
@@ -1914,7 +1732,6 @@ def compute_lookback_iteration_schedule(cutoff_dt, num_iterations=None, interval
         if it_dt >= session_open_dt and it_dt not in prior_iter_dts:
             prior_iter_dts.append(it_dt)
 
-    prior_iter_dts_chrono = sorted(prior_iter_dts)
     return {
         "enabled": bool(ENABLE_ITERATION_LOOKBACK and n_iters > 0),
         "num_iterations": n_iters,
@@ -1922,12 +1739,11 @@ def compute_lookback_iteration_schedule(cutoff_dt, num_iterations=None, interval
         "window_start_dt": window_start_dt,
         "window_end_dt": cutoff_dt,
         "prior_iter_dts_desc": prior_iter_dts,
-        "prior_iter_dts_chrono": prior_iter_dts_chrono,
+        "prior_iter_dts_chrono": sorted(prior_iter_dts),
     }
 
 def _anchor_within_lookback_window(anchor_str, window_start_dt, window_end_dt):
-    if not anchor_str or anchor_str == "-":
-        return False
+    if not anchor_str or anchor_str == "-": return False
     clean_t = str(anchor_str).replace("*", "").strip()
     try:
         parsed_t = datetime.strptime(clean_t, "%H:%M").time()
@@ -1937,72 +1753,35 @@ def _anchor_within_lookback_window(anchor_str, window_start_dt, window_end_dt):
         return False
 
 def _passes_strict_popup_quality(row):
-    """
-    Enforces Strict First-Time Popup Filtering at snapshot time:
-      1. In Option Buying mode, BULL rows must be CE and BEAR rows must be PE, with PremiumDir == 'BULL'.
-      2. Live R-Multiple must be >= POPUP_MIN_R_MULTIPLE (default 0.0 -> never negative/underwater).
-      3. If POPUP_REQUIRE_NON_ZERO_GRID is True, both ATR_Grid and BB_Grid must have active (> 0) counts.
-    """
     sym = str(row.get('Symbol') or '')
     if OPTIONS_BUYING_ONLY and _is_option_symbol(sym):
-        if str(row.get('PremiumDir') or 'BULL').upper() != 'BULL':
-            return False
+        if str(row.get('PremiumDir') or 'BULL').upper() != 'BULL': return False
         anc_dir = str(row.get('AnchorDir') or '').upper()
-        if anc_dir == 'BULL' and not _is_ce_symbol(sym):
-            return False
-        if anc_dir == 'BEAR' and not _is_pe_symbol(sym):
+        if anc_dir == 'BULL' and not _is_ce_symbol(sym): return False
+        if anc_dir == 'BEAR' and not _is_pe_symbol(sym): return False
+
+    if ENABLE_TIMESTAMP_GAP_CHECK and MAX_TIMESTAMP_GAP_MINUTES > 0:
+        if _get_timestamp_gap_min(row) > MAX_TIMESTAMP_GAP_MINUTES:
             return False
 
-    if not STRICT_FIRST_TIME_POPUP_FILTER:
-        return True
-
-    live_r = _r_multiple(row, include_banked=False)
-    if live_r < float(POPUP_MIN_R_MULTIPLE) - 1e-6:
-        return False
+    if not STRICT_FIRST_TIME_POPUP_FILTER: return True
+    if _r_multiple(row, include_banked=False) < float(POPUP_MIN_R_MULTIPLE) - 1e-6: return False
 
     if POPUP_REQUIRE_NON_ZERO_GRID:
-        ag = row.get('ATR_Grid') or {}
-        bg = row.get('BB_Grid') or {}
+        ag, bg = row.get('ATR_Grid') or {}, row.get('BB_Grid') or {}
         if sum(int(v or 0) for v in ag.values()) <= 0 and sum(int(v or 0) for v in bg.values()) <= 0:
             return False
-
     return True
 
-def evaluate_first_time_popups_in_memory(
-    by_symbol_all_cps,
-    current_bulls,
-    current_bears,
-    lookback_meta
-):
-    """
-    Purely in-memory comparison across lookback iterations (zero JSON/file storage):
-    1. Evaluates `segregate_and_rank_buckets` for each prior lookback iteration in
-       `prior_iter_dts_chrono` (e.g. [12:20, 12:25, 12:30]).
-    2. Compares the current run's surviving `current_bulls` and `current_bears` (e.g. 12:35)
-       against the prior iteration results:
-       - Requires `ActiveAnchor` time to be within `[window_start_dt, window_end_dt]`.
-       - Enforces `_passes_strict_popup_quality(row)` so dead `0 0 0 0` grids, negative R-Multiples,
-         and non-buying option setups are strictly excluded.
-       - Segregates into:
-         a) `new_bulls` / `new_bears` (Pure First-Time Popups — Zero Prior Same-Direction Stops, No `*`)
-         b) `window_first_bulls` / `window_first_bears` (All Window Popups in `window_start..window_end`, Including `*` Re-Anchors)
-    """
+def evaluate_first_time_popups_in_memory(by_symbol_all_cps, current_bulls, current_bears, lookback_meta):
     if not lookback_meta or not lookback_meta.get("enabled"):
-        return {
-            "new_bulls": [],
-            "new_bears": [],
-            "window_first_bulls": [],
-            "window_first_bears": [],
-            "iter_stats": [],
-        }
+        return {"new_bulls": [], "new_bears": [], "window_first_bulls": [], "window_first_bears": [], "iter_stats": []}
 
     w_start = lookback_meta["window_start_dt"]
     w_end = lookback_meta["window_end_dt"]
     prior_dts = lookback_meta["prior_iter_dts_chrono"]
 
-    prior_bull_appearances = {}
-    prior_bear_appearances = {}
-    iter_stats = []
+    prior_bull_appearances, prior_bear_appearances, iter_stats = {}, {}, []
 
     for it_dt in prior_dts:
         it_cps = set(generate_checkpoints(it_dt, interval_min=CHECKPOINT_INTERVAL_MIN) if BACKTRACE_CHECKPOINTS else [it_dt])
@@ -2011,60 +1790,43 @@ def evaluate_first_time_popups_in_memory(
         sub_map = {}
         for sym, rows in by_symbol_all_cps.items():
             f_rows = [r for r in rows if r['CheckpointTime'] <= it_dt and r['CheckpointTime'] in it_cps]
-            if not f_rows:
-                f_rows = [r for r in rows if r['CheckpointTime'] <= it_dt]
-            if f_rows:
-                sub_map[sym] = f_rows
+            if not f_rows: f_rows = [r for r in rows if r['CheckpointTime'] <= it_dt]
+            if f_rows: sub_map[sym] = f_rows
 
         it_bulls, it_bears, it_grave = segregate_and_rank_buckets(sub_map) if sub_map else ([], [], [])
         it_label = it_dt.strftime("%H:%M")
-        iter_stats.append({
-            "iter_time": it_label,
-            "bull_count": len(it_bulls),
-            "bear_count": len(it_bears),
-            "grave_count": len(it_grave),
-        })
+        iter_stats.append({"iter_time": it_label, "bull_count": len(it_bulls), "bear_count": len(it_bears), "grave_count": len(it_grave)})
 
-        for r in it_bulls:
-            sym = r['Symbol']
-            prior_bull_appearances.setdefault(sym, []).append((it_label, str(r.get('ActiveAnchor') or '-').replace('*', '').strip()))
-        for r in it_bears:
-            sym = r['Symbol']
-            prior_bear_appearances.setdefault(sym, []).append((it_label, str(r.get('ActiveAnchor') or '-').replace('*', '').strip()))
+        for r in it_bulls: prior_bull_appearances.setdefault(r['Symbol'], []).append((it_label, str(r.get('ActiveAnchor') or '-').replace('*', '').strip()))
+        for r in it_bears: prior_bear_appearances.setdefault(r['Symbol'], []).append((it_label, str(r.get('ActiveAnchor') or '-').replace('*', '').strip()))
 
     curr_label = w_end.strftime("%H:%M")
-    new_bulls, new_bears = [], []
-    window_first_bulls, window_first_bears = [], []
+    new_bulls, new_bears, window_first_bulls, window_first_bears = [], [], [], []
 
     def _classify_rows(current_list, prior_app_map, out_pure_first, out_all_window):
         for row in current_list:
             sym = row['Symbol']
             curr_anc = str(row.get('ActiveAnchor') or '-').replace('*', '').strip()
-            if not _anchor_within_lookback_window(curr_anc, w_start, w_end):
-                continue
-            if not _passes_strict_popup_quality(row):
+            if not _anchor_within_lookback_window(curr_anc, w_start, w_end) or not _passes_strict_popup_quality(row):
                 continue
 
             appearances = prior_app_map.get(sym, [])
             same_anc_iters = [it_lbl for (it_lbl, anc) in appearances if anc == curr_anc]
-            other_anc_iters = [
-                it_lbl for (it_lbl, anc) in appearances
-                if anc != curr_anc and _anchor_within_lookback_window(anc, w_start, w_end)
-            ]
+            other_anc_iters = [it_lbl for (it_lbl, anc) in appearances if anc != curr_anc and _anchor_within_lookback_window(anc, w_start, w_end)]
 
-            if PURE_1ST_TIME_CURRENT_ITER_ONLY and len(same_anc_iters) > 0:
-                continue
+            if PURE_1ST_TIME_CURRENT_ITER_ONLY and len(same_anc_iters) > 0: continue
 
             first_it = same_anc_iters[0] if same_anc_iters else curr_label
-            prior_stops_same_dir = int(row.get('PriorStops', 0) or 0)
+            prior_stops = int(row.get('PriorStops', 0) or 0)
             banked_r = float(row.get('BankedR', 0.0) or 0.0)
-            has_star_badge = (prior_stops_same_dir > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON)
+            has_star_badge = (prior_stops > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON)
 
             row_copy = dict(row)
             row_copy['FirstPopupIter'] = first_it
             row_copy['TargetPrice'], row_copy['SLPrice'] = _compute_target_sl(row_copy)
+            row_copy['RR_Val'], row_copy['RR_Str'] = compute_risk_reward_ratio(row_copy)
 
-            if prior_stops_same_dir == 0 and not has_star_badge and len(other_anc_iters) == 0:
+            if prior_stops == 0 and not has_star_badge and len(other_anc_iters) == 0:
                 row_copy['PopupType'] = "1ST-TIME"
                 out_pure_first.append(row_copy)
                 out_all_window.append(row_copy)
@@ -2083,13 +1845,7 @@ def evaluate_first_time_popups_in_memory(
     sort_rows_by_script_count(window_first_bulls)
     sort_rows_by_script_count(window_first_bears)
 
-    return {
-        "new_bulls": new_bulls,
-        "new_bears": new_bears,
-        "window_first_bulls": window_first_bulls,
-        "window_first_bears": window_first_bears,
-        "iter_stats": iter_stats,
-    }
+    return {"new_bulls": new_bulls, "new_bears": new_bears, "window_first_bulls": window_first_bulls, "window_first_bears": window_first_bears, "iter_stats": iter_stats}
 
 def _state_display(row):
     return f"[STOP {row.get('KilledTime')}]" if row['State'] == "[STOPPED]" and row.get('KilledTime') and row.get('KilledTime') != '-' else row['State']
@@ -2114,7 +1870,6 @@ def render_console_dashboard(
     stock_popup_res=None
 ):
     norm_filter = _norm_sym(active_sector_filter) if active_sector_filter else ""
-
     if norm_filter:
         f_stock_bulls = [r for r in stock_bulls if _norm_sym(r.get('Sector', '')) == norm_filter or norm_filter in _norm_sym(r.get('Sector', ''))]
         f_stock_bears = [r for r in stock_bears if _norm_sym(r.get('Sector', '')) == norm_filter or norm_filter in _norm_sym(r.get('Sector', ''))]
@@ -2138,15 +1893,14 @@ def render_console_dashboard(
     )
 
     def print_active_table(title, icon, data_list, show_sector_col=True, show_first_iter_col=False, show_target_sl=True):
-        if not data_list:
-            return
+        if not data_list: return
         print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
         grid_hdr = " ".join(f"{m}X" for m in GRID_MULTIPLIERS)
         tsl_hdr = f"{'Target':>9} {'SL':>9} | " if show_target_sl else ""
         sec_hdr = f"{'Sector (MaxWt%)':<{sec_w}} | " if show_sector_col else ""
         iter_hdr = f"{'1stIter':^7} {'PopupType':^13} | " if show_first_iter_col else ""
         header_str = (
-            f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP/Exit':>9} | "
+            f" {COLOR_CYAN}{'Script':<{sym_w}} {'R:R':^7} {'LTP/Exit':>9} | "
             f"{tsl_hdr}{sec_hdr}{iter_hdr}"
             f"{'Seen':^5} {'Anchor':^7} {'Anch Val':>9} {'R-Mult (Bank)':>15} | "
             f"ATR: {grid_hdr} | BB: {grid_hdr} | {'State':^13}{COLOR_RESET}"
@@ -2175,29 +1929,20 @@ def render_console_dashboard(
             else:
                 state_text = f"{COLOR_YELLOW if '[ BB < KC ]' in row['State'] else COLOR_DIM}{shown_state:^13}{COLOR_RESET}"
             ltp_val = f"{row['KilledPrice']:>8.2f}x" if "[STOP" in shown_state and row.get('KilledPrice', 0) > 0 else f"{row['LTP']:>9.2f} "
-            if show_target_sl:
-                tgt_p, sl_p = _compute_target_sl(row)
-                tsl_cell = f"{COLOR_GREEN_FG}{tgt_p:>9.2f}{COLOR_RESET} {COLOR_RED_FG}{sl_p:>9.2f}{COLOR_RESET} | "
-            else:
-                tsl_cell = ""
-            sec_label = f"{row.get('Sector', DEFAULT_UNMAPPED_SECTOR)}"
-            sec_cell = f"{_clip(sec_label, sec_w):<{sec_w}} | " if show_sector_col else ""
-            if show_first_iter_col:
-                f_it = row.get('FirstPopupIter', row['CheckpointTime'].strftime('%H:%M'))
-                p_type = row.get('PopupType', '1ST-TIME')
-                iter_cell = f"{f_it:^7} {p_type:^13} | "
-            else:
-                iter_cell = ""
+            tsl_cell = f"{COLOR_GREEN_FG}{row['TargetPrice']:>9.2f}{COLOR_RESET} {COLOR_RED_FG}{row['SLPrice']:>9.2f}{COLOR_RESET} | " if show_target_sl else ""
+            sec_cell = f"{_clip(row.get('Sector', DEFAULT_UNMAPPED_SECTOR), sec_w):<{sec_w}} | " if show_sector_col else ""
+            iter_cell = f"{row.get('FirstPopupIter', row['CheckpointTime'].strftime('%H:%M')):^7} {row.get('PopupType', '1ST-TIME'):^13} | " if show_first_iter_col else ""
+            rr_str = row.get('RR_Str') or compute_risk_reward_ratio(row)[1]
+
             print(
-                f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} {ltp_val} | "
+                f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} {COLOR_CYAN}{rr_str:^7}{COLOR_RESET} {ltp_val} | "
                 f"{tsl_cell}{sec_cell}{iter_cell}"
                 f"{row['CheckpointTime'].strftime('%H:%M'):^5} {anchor_disp:^7} {row['AnchorPrice']:>9.2f} "
                 f"{r_color}{r_mult_str:>15}{COLOR_RESET} |   {a_str}  |   {b_str}  | {state_text}"
             )
 
     def print_grave_table(title, icon, data_list, show_sector_col=True):
-        if not data_list:
-            return
+        if not data_list: return
         print(f"\n{COLOR_BOLD}{icon} {title}{COLOR_RESET}")
         sec_hdr = f"{'Sector':<{sec_w}} | " if show_sector_col else ""
         header_str = (
@@ -2219,7 +1964,7 @@ def render_console_dashboard(
             else:
                 g_r_str, g_r_color, move_pct_str, move_color = f"{'-':>7}", COLOR_DIM, f"{'-':>7}", COLOR_DIM
             reason = row['RejectReason']
-            reason_color = COLOR_YELLOW if any(x in reason for x in ["Kinetic SL", "Hard stop", "Adverse", "Profit Lock", "Superseded"]) else COLOR_RED_FG if any(x in reason for x in ["Chop", "Warzone"]) else COLOR_DIM
+            reason_color = COLOR_YELLOW if any(x in reason for x in ["Kinetic SL", "Hard stop", "Adverse", "Profit Lock", "Superseded", "Timestamp"]) else COLOR_RED_FG if any(x in reason for x in ["Chop", "Warzone"]) else COLOR_DIM
             sec_cell = f"{_clip(row.get('Sector', DEFAULT_UNMAPPED_SECTOR), sec_w):<{sec_w}} | " if show_sector_col else ""
             print(
                 f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} | {sec_cell}{sig_colored} "
@@ -2227,45 +1972,31 @@ def render_console_dashboard(
                 f"{g_r_color}{g_r_str}{COLOR_RESET} {move_color}{move_pct_str}{COLOR_RESET} | {reason_color}{reason}{COLOR_RESET}"
             )
 
-    # --- EXISTING RESULTSET STAGE 1 (UNTOUCHED) ---
     if idx_bulls or idx_bears or idx_grave:
         print(f"{COLOR_CYAN}{'=' * 95}{COLOR_RESET}")
         print(f"{COLOR_BOLD}🏛️  STAGE 1: SECTORAL INDICES (Evaluated with 3-Lock Kinetic Engine){COLOR_RESET}")
         print(f"{COLOR_CYAN}{'=' * 95}{COLOR_RESET}")
-        print_active_table("SECTORAL INDICES — TOP BULL SETUPS (Valid Anchors Surviving)", "🏛️🔥", idx_bulls, show_sector_col=False)
-        print_active_table("SECTORAL INDICES — TOP BEAR SETUPS (Valid Anchors Surviving)", "🏛️🩸", idx_bears, show_sector_col=False)
-        print_grave_table("SECTORAL INDICES — THE GRAVEYARD (Completed / Filtered / Rejected)", "🏛️🚫", idx_grave, show_sector_col=False)
+        print_active_table("SECTORAL INDICES — TOP BULL SETUPS", "🏛️🔥", idx_bulls, show_sector_col=False)
+        print_active_table("SECTORAL INDICES — TOP BEAR SETUPS", "🏛️🩸", idx_bears, show_sector_col=False)
+        print_grave_table("SECTORAL INDICES — THE GRAVEYARD", "🏛️🚫", idx_grave, show_sector_col=False)
 
-    # --- EXISTING RESULTSET STAGE 2 (UNTOUCHED) ---
     print(f"\n{COLOR_CYAN}{'=' * 95}{COLOR_RESET}")
     stage2_label = f"STAGE 2: STOCKS FOR SECTOR [{active_sector_filter.upper()}]" if norm_filter else "STAGE 2: ALL STOCKS (Mapped by Highest Sectoral Index Weightage)"
     print(f"{COLOR_BOLD}📈  {stage2_label}{COLOR_RESET}")
     print(f"{COLOR_CYAN}{'=' * 95}{COLOR_RESET}")
-    print_active_table(f"STOCKS — TOP BULL SETUPS (Valid Anchors Surviving) — BULL {_format_count_with_ce_pe(f_stock_bulls)}", "🔥", f_stock_bulls, show_sector_col=True, show_target_sl=True)
-    print_active_table(f"STOCKS — TOP BEAR SETUPS (Valid Anchors Surviving) — BEAR {_format_count_with_ce_pe(f_stock_bears)}", "🩸", f_stock_bears, show_sector_col=True, show_target_sl=True)
+    print_active_table(f"STOCKS — TOP BULL SETUPS — BULL {_format_count_with_ce_pe(f_stock_bulls)}", "🔥", f_stock_bulls, show_sector_col=True, show_target_sl=True)
+    print_active_table(f"STOCKS — TOP BEAR SETUPS — BEAR {_format_count_with_ce_pe(f_stock_bears)}", "🩸", f_stock_bears, show_sector_col=True, show_target_sl=True)
     if not f_stock_bulls and not f_stock_bears:
         print(f"{COLOR_YELLOW}No surviving stock anchors for this view.{COLOR_RESET}")
-    print_grave_table("STOCKS — THE GRAVEYARD (Completed Episodes / Filtered / Rejected)", "🚫", f_stock_grave, show_sector_col=True)
+    print_grave_table("STOCKS — THE GRAVEYARD", "🚫", f_stock_grave, show_sector_col=True)
 
-    # --- NEW SEGREGATED RESULTSET: MULTI-ITERATION FIRST-TIME POPUPS ---
     if lookback_meta and lookback_meta.get("enabled") and stock_popup_res is not None:
         w_start_s = lookback_meta["window_start_dt"].strftime("%H:%M")
         w_end_s = lookback_meta["window_end_dt"].strftime("%H:%M")
-        prior_s = ", ".join(d.strftime("%H:%M") for d in lookback_meta["prior_iter_dts_desc"]) or "None"
-        iter_summary_s = " | ".join(
-            f"{st['iter_time']} (▲{st['bull_count']} ▼{st['bear_count']})"
-            for st in (stock_popup_res.get("iter_stats") or [])
-        )
-
-        new_idx_bulls = (idx_popup_res or {}).get("new_bulls", [])
-        new_idx_bears = (idx_popup_res or {}).get("new_bears", [])
-        win_idx_bulls = (idx_popup_res or {}).get("window_first_bulls", [])
-        win_idx_bears = (idx_popup_res or {}).get("window_first_bears", [])
-
-        new_stk_bulls = stock_popup_res.get("new_bulls", [])
-        new_stk_bears = stock_popup_res.get("new_bears", [])
-        win_stk_bulls = stock_popup_res.get("window_first_bulls", [])
-        win_stk_bears = stock_popup_res.get("window_first_bears", [])
+        new_idx_bulls, new_idx_bears = (idx_popup_res or {}).get("new_bulls", []), (idx_popup_res or {}).get("new_bears", [])
+        win_idx_bulls, win_idx_bears = (idx_popup_res or {}).get("window_first_bulls", []), (idx_popup_res or {}).get("window_first_bears", [])
+        new_stk_bulls, new_stk_bears = stock_popup_res.get("new_bulls", []), stock_popup_res.get("new_bears", [])
+        win_stk_bulls, win_stk_bears = stock_popup_res.get("window_first_bulls", []), stock_popup_res.get("window_first_bears", [])
 
         if norm_filter:
             new_stk_bulls = [r for r in new_stk_bulls if _norm_sym(r.get('Sector', '')) == norm_filter or norm_filter in _norm_sym(r.get('Sector', ''))]
@@ -2274,69 +2005,28 @@ def render_console_dashboard(
             win_stk_bears = [r for r in win_stk_bears if _norm_sym(r.get('Sector', '')) == norm_filter or norm_filter in _norm_sym(r.get('Sector', ''))]
 
         print(f"\n{COLOR_CYAN}{'=' * 95}{COLOR_RESET}")
-        print(
-            f"{COLOR_BOLD}🆕  STAGE 3 (NEW SEGREGATED RESULTSET): FIRST-TIME POPUPS ACROSS LOOKBACK ITERATIONS{COLOR_RESET}\n"
-            f"   {COLOR_DIM}» Config: NO_OF_ITERATIONS={lookback_meta['num_iterations']} | "
-            f"TIME_OF_INTERVAL_TO_LOOKBACK={lookback_meta['interval_min']}m | "
-            f"Anchor Window: {w_start_s} to {w_end_s} | Prior Runs Compared: [{prior_s}] vs Current [{w_end_s}]{COLOR_RESET}"
-        )
-        if iter_summary_s:
-            print(f"   {COLOR_DIM}» Prior Iteration Stock Counts: {iter_summary_s}{COLOR_RESET}")
+        print(f"{COLOR_BOLD}🆕  STAGE 3: FIRST-TIME POPUPS (Anchor Window: {w_start_s}..{w_end_s}){COLOR_RESET}")
         print(f"{COLOR_CYAN}{'=' * 95}{COLOR_RESET}")
 
         if new_idx_bulls or new_idx_bears:
-            print_active_table(
-                f"PURE FIRST-TIME SECTORAL INDEX POPUPS (No Prior Stops, Anchor {w_start_s}..{w_end_s}) — BULL ({len(new_idx_bulls)})",
-                "🏛️🆕🔥", new_idx_bulls, show_sector_col=False, show_first_iter_col=True, show_target_sl=True
-            )
-            print_active_table(
-                f"PURE FIRST-TIME SECTORAL INDEX POPUPS (No Prior Stops, Anchor {w_start_s}..{w_end_s}) — BEAR ({len(new_idx_bears)})",
-                "🏛️🆕🩸", new_idx_bears, show_sector_col=False, show_first_iter_col=True, show_target_sl=True
-            )
+            print_active_table(f"PURE FIRST-TIME SECTORAL INDEX POPUPS — BULL ({len(new_idx_bulls)})", "🏛️🆕🔥", new_idx_bulls, show_sector_col=False, show_first_iter_col=True, show_target_sl=True)
+            print_active_table(f"PURE FIRST-TIME SECTORAL INDEX POPUPS — BEAR ({len(new_idx_bears)})", "🏛️🆕🩸", new_idx_bears, show_sector_col=False, show_first_iter_col=True, show_target_sl=True)
 
-        print_active_table(
-            f"PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BULL {_format_count_with_ce_pe(new_stk_bulls)}",
-            "🆕🔥", new_stk_bulls, show_sector_col=True, show_first_iter_col=True, show_target_sl=True
-        )
-        print_active_table(
-            f"PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BEAR {_format_count_with_ce_pe(new_stk_bears)}",
-            "🆕🩸", new_stk_bears, show_sector_col=True, show_first_iter_col=True, show_target_sl=True
-        )
-        if not new_stk_bulls and not new_stk_bears:
-            print(f"\n{COLOR_YELLOW}No pure first-time (non-*) stock popups in window {w_start_s}..{w_end_s}.{COLOR_RESET}")
+        print_active_table(f"PURE FIRST-TIME STOCK POPUPS — BULL {_format_count_with_ce_pe(new_stk_bulls)}", "🆕🔥", new_stk_bulls, show_sector_col=True, show_first_iter_col=True, show_target_sl=True)
+        print_active_table(f"PURE FIRST-TIME STOCK POPUPS — BEAR {_format_count_with_ce_pe(new_stk_bears)}", "🆕🩸", new_stk_bears, show_sector_col=True, show_first_iter_col=True, show_target_sl=True)
 
         if win_idx_bulls or win_idx_bears:
-            print_active_table(
-                f"ALL WINDOW SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BULL ({len(win_idx_bulls)})",
-                "🏛️⏱️🔥", win_idx_bulls, show_sector_col=False, show_first_iter_col=True, show_target_sl=True
-            )
-            print_active_table(
-                f"ALL WINDOW SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BEAR ({len(win_idx_bears)})",
-                "🏛️⏱️🩸", win_idx_bears, show_sector_col=False, show_first_iter_col=True, show_target_sl=True
-            )
+            print_active_table(f"ALL WINDOW SECTORAL INDEX POPUPS — BULL ({len(win_idx_bulls)})", "🏛️⏱️🔥", win_idx_bulls, show_sector_col=False, show_first_iter_col=True, show_target_sl=True)
+            print_active_table(f"ALL WINDOW SECTORAL INDEX POPUPS — BEAR ({len(win_idx_bears)})", "🏛️⏱️🩸", win_idx_bears, show_sector_col=False, show_first_iter_col=True, show_target_sl=True)
 
-        print_active_table(
-            f"ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BULL {_format_count_with_ce_pe(win_stk_bulls)}",
-            "⏱️🔥", win_stk_bulls, show_sector_col=True, show_first_iter_col=True, show_target_sl=True
-        )
-        print_active_table(
-            f"ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BEAR {_format_count_with_ce_pe(win_stk_bears)}",
-            "⏱️🩸", win_stk_bears, show_sector_col=True, show_first_iter_col=True, show_target_sl=True
-        )
+        print_active_table(f"ALL WINDOW STOCK POPUPS — BULL {_format_count_with_ce_pe(win_stk_bulls)}", "⏱️🔥", win_stk_bulls, show_sector_col=True, show_first_iter_col=True, show_target_sl=True)
+        print_active_table(f"ALL WINDOW STOCK POPUPS — BEAR {_format_count_with_ce_pe(win_stk_bears)}", "⏱️🩸", win_stk_bears, show_sector_col=True, show_first_iter_col=True, show_target_sl=True)
 
 def build_full_untruncated_plain_text(
-    mode, cutoff_dt, checkpoints,
-    idx_bulls, idx_bears, idx_grave,
-    stock_bulls, stock_bears, stock_grave,
-    lookback_meta=None,
-    idx_popup_res=None,
-    stock_popup_res=None
+    mode, cutoff_dt, checkpoints, idx_bulls, idx_bears, idx_grave,
+    stock_bulls, stock_bears, stock_grave, lookback_meta=None,
+    idx_popup_res=None, stock_popup_res=None
 ):
-    """
-    Generates the Plain-Text email body.
-    - Includes CE(x) PE(y) breakdown counts in section headers.
-    - Displays Target and SL columns (computed from AnchorPrice via Base ATR) right next to LTP/Exit.
-    """
     new_idx_b = (idx_popup_res or {}).get("new_bulls", [])
     new_idx_r = (idx_popup_res or {}).get("new_bears", [])
     win_idx_b = (idx_popup_res or {}).get("window_first_bulls", [])
@@ -2352,33 +2042,23 @@ def build_full_untruncated_plain_text(
     e_bears = stock_bears if EMAIL_MAX_SELLERS <= 0 else stock_bears[:EMAIL_MAX_SELLERS]
     e_grave = stock_grave if EMAIL_MAX_GRAVEYARD <= 0 else stock_grave[:EMAIL_MAX_GRAVEYARD]
 
-    if EMAIL_ONLY_PURE_1ST_TIME_CONTENT and pure_rows:
-        sizing_pool = pure_rows
-    elif EMAIL_ONLY_WINDOW_POPUPS and popup_rows:
-        sizing_pool = popup_rows
-    else:
-        sizing_pool = idx_bulls + idx_bears + idx_grave + e_bulls + e_bears + e_grave
-
+    sizing_pool = pure_rows if (EMAIL_ONLY_PURE_1ST_TIME_CONTENT and pure_rows) else (popup_rows if (EMAIL_ONLY_WINDOW_POPUPS and popup_rows) else idx_bulls + idx_bears + idx_grave + e_bulls + e_bears + e_grave)
     sym_w = max(MIN_SYMBOL_WIDTH, max((len(r['Symbol']) for r in sizing_pool), default=MIN_SYMBOL_WIDTH))
-    sec_w = max(
-        SECTOR_COL_WIDTH,
-        max((len(f"{r.get('Sector', DEFAULT_UNMAPPED_SECTOR)} ({r.get('SectorWeight', 0.0):.1f}%)") for r in sizing_pool), default=SECTOR_COL_WIDTH)
-    )
+    sec_w = max(SECTOR_COL_WIDTH, max((len(f"{r.get('Sector', DEFAULT_UNMAPPED_SECTOR)} ({r.get('SectorWeight', 0.0):.1f}%)") for r in sizing_pool), default=SECTOR_COL_WIDTH))
     lines = []
 
     def _fmt_active_block(title, data_list, show_sector=True, show_first_iter=False, include_ce_pe_counts=True):
         count_suffix = _format_count_with_ce_pe(data_list) if include_ce_pe_counts else f"({len(data_list)})"
         if not data_list:
             lines.append(f"--- {title} {count_suffix} ---")
-            lines.append("None")
-            lines.append("")
+            lines.append("None\n")
             return
         lines.append(f"--- {title} {count_suffix} ---")
         grid_hdr = " ".join(f"{m}X" for m in GRID_MULTIPLIERS)
         sec_hdr = f"{'Sector (MaxWt%)':<{sec_w}} | " if show_sector else ""
         iter_hdr = f"{'1stIter':^7} {'PopupType':^13} | " if show_first_iter else ""
         hdr = (
-            f"{'Script':<{sym_w}} {'LTP/Exit':>9} {'Target':>9} {'SL':>9} | "
+            f"{'Script':<{sym_w}} {'R:R':^7} {'LTP/Exit':>9} {'Target':>9} {'SL':>9} | "
             f"{sec_hdr}{iter_hdr}{'Seen':^5} {'Anchor':^7} {'Anch Val':>9} {'R-Mult (Bank)':>15} | "
             f"ATR: {grid_hdr} | BB: {grid_hdr} | {'State':^13}"
         )
@@ -2388,28 +2068,21 @@ def build_full_untruncated_plain_text(
         default_g = {m: 0 for m in GRID_MULTIPLIERS}
         for r in data_list:
             live_r, banked_r = _r_multiple(r, include_banked=False), float(r.get('BankedR', 0.0) or 0.0)
-            if r.get('PriorStops', 0) > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON:
-                r_mult_str, anchor_disp = f"{live_r:>+5.2f}R ({banked_r:>+4.1f}R)", f"{r['ActiveAnchor']}*"
-            else:
-                r_mult_str, anchor_disp = f"{live_r:>+5.2f}R          ", f"{r['ActiveAnchor']} "
+            r_mult_str = f"{live_r:>+5.2f}R ({banked_r:>+4.1f}R)" if (r.get('PriorStops', 0) > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON) else f"{live_r:>+5.2f}R          "
+            anchor_disp = f"{r['ActiveAnchor']}*" if (r.get('PriorStops', 0) > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON) else f"{r['ActiveAnchor']} "
             ag, bg = r.get('ATR_Grid', default_g), r.get('BB_Grid', default_g)
             a_str = "  ".join(str(ag.get(k, 0)) for k in GRID_MULTIPLIERS)
             b_str = "  ".join(str(bg.get(k, 0)) for k in GRID_MULTIPLIERS)
             shown_state = _state_display(r)
-            if "[ BB > KC ]" in r['State']:
-                shown_state = f"[ BB > KC ] {'▲' if basket_dir == 'BULL' else '▼'}"
+            if "[ BB > KC ]" in r['State']: shown_state = f"[ BB > KC ] {'▲' if basket_dir == 'BULL' else '▼'}"
             ltp_val = f"{r['KilledPrice']:>8.2f}x" if "[STOP" in shown_state and r.get('KilledPrice', 0) > 0 else f"{r['LTP']:>9.2f} "
-            tgt_p, sl_p = _compute_target_sl(r)
+            tgt_p, sl_p = r.get('TargetPrice', 0.0), r.get('SLPrice', 0.0)
+            rr_str = r.get('RR_Str') or compute_risk_reward_ratio(r)[1]
             sec_str = f"{r.get('Sector', DEFAULT_UNMAPPED_SECTOR)} ({r.get('SectorWeight', 0.0):.1f}%)"
             sec_cell = f"{_clip(sec_str, sec_w, EMAIL_CLIP_SYMBOLS):<{sec_w}} | " if show_sector else ""
-            if show_first_iter:
-                f_it = r.get('FirstPopupIter', r['CheckpointTime'].strftime('%H:%M'))
-                p_type = r.get('PopupType', '1ST-TIME')
-                iter_cell = f"{f_it:^7} {p_type:^13} | "
-            else:
-                iter_cell = ""
+            iter_cell = f"{r.get('FirstPopupIter', r['CheckpointTime'].strftime('%H:%M')):^7} {r.get('PopupType', '1ST-TIME'):^13} | " if show_first_iter else ""
             lines.append(
-                f"{_clip(r['Symbol'], sym_w, EMAIL_CLIP_SYMBOLS):<{sym_w}} {ltp_val} {tgt_p:>9.2f} {sl_p:>9.2f} | {sec_cell}{iter_cell}"
+                f"{_clip(r['Symbol'], sym_w, EMAIL_CLIP_SYMBOLS):<{sym_w}} {rr_str:^7} {ltp_val} {tgt_p:>9.2f} {sl_p:>9.2f} | {sec_cell}{iter_cell}"
                 f"{r['CheckpointTime'].strftime('%H:%M'):^5} {anchor_disp:^7} {r['AnchorPrice']:>9.2f} "
                 f"{r_mult_str:>15} |   {a_str}  |   {b_str}  | {shown_state:^13}"
             )
@@ -2418,83 +2091,28 @@ def build_full_untruncated_plain_text(
     if lookback_meta and lookback_meta.get("enabled") and stock_popup_res is not None:
         w_start_s = lookback_meta["window_start_dt"].strftime("%H:%M")
         w_end_s = lookback_meta["window_end_dt"].strftime("%H:%M")
-        prior_s = ", ".join(d.strftime("%H:%M") for d in lookback_meta["prior_iter_dts_desc"]) or "None"
-        iter_summary_s = " | ".join(
-            f"{st['iter_time']} (▲{st['bull_count']} ▼{st['bear_count']})"
-            for st in (stock_popup_res.get("iter_stats") or [])
-        )
         nb_ce, nb_pe = _ce_pe_counts(new_stk_b)
         nr_ce, nr_pe = _ce_pe_counts(new_stk_r)
 
         if EMAIL_ONLY_PURE_1ST_TIME_CONTENT:
             lines.append(f"=== SYSTEM 3.0 [{mode}] — PURE 1ST-TIME POPUPS (NO *) REPORT ({w_start_s}..{w_end_s}) ===")
-            lines.append(
-                f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | "
-                f"NO_OF_ITERATIONS: {lookback_meta['num_iterations']} | "
-                f"TIME_OF_INTERVAL_TO_LOOKBACK: {lookback_meta['interval_min']}m | "
-                f"Prior Iterations Compared: [{prior_s}] vs Current [{w_end_s}]"
-            )
-            lines.append(
-                f"Pure 1st-Time (No *) Stock Popups ({w_start_s}..{w_end_s}): "
-                f"▲ {len(new_stk_b)} Bull [CE({nb_ce}) PE({nb_pe})] / "
-                f"▼ {len(new_stk_r)} Bear [CE({nr_ce}) PE({nr_pe})]"
-            )
-            if iter_summary_s:
-                lines.append(f"Prior Iteration Totals: {iter_summary_s}")
-            lines.append("")
-
-            _fmt_active_block(f"PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BULL", new_stk_b, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
-            _fmt_active_block(f"PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BEAR", new_stk_r, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
-            if new_idx_b or new_idx_r:
-                _fmt_active_block(f"PURE FIRST-TIME SECTORAL INDEX POPUPS (No Prior Stops, Anchor {w_start_s}..{w_end_s}) — BULL", new_idx_b, show_sector=False, show_first_iter=True, include_ce_pe_counts=False)
-                _fmt_active_block(f"PURE FIRST-TIME SECTORAL INDEX POPUPS (No Prior Stops, Anchor {w_start_s}..{w_end_s}) — BEAR", new_idx_r, show_sector=False, show_first_iter=True, include_ce_pe_counts=False)
+            lines.append(f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Anchor Window: {w_start_s} to {w_end_s}")
+            lines.append(f"Pure 1st-Time Popups: ▲ {len(new_stk_b)} Bull [CE({nb_ce}) PE({nb_pe})] / ▼ {len(new_stk_r)} Bear [CE({nr_ce}) PE({nr_pe})]\n")
+            _fmt_active_block(f"PURE FIRST-TIME STOCK POPUPS — BULL", new_stk_b, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
+            _fmt_active_block(f"PURE FIRST-TIME STOCK POPUPS — BEAR", new_stk_r, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
             return "\n".join(lines)
 
-        if EMAIL_ONLY_WINDOW_POPUPS:
-            lines.append(f"=== SYSTEM 3.0 [{mode}] — LOOKBACK WINDOW POPUPS REPORT ({w_start_s}..{w_end_s}) ===")
-            lines.append(
-                f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | "
-                f"NO_OF_ITERATIONS: {lookback_meta['num_iterations']} | "
-                f"TIME_OF_INTERVAL_TO_LOOKBACK: {lookback_meta['interval_min']}m | "
-                f"Prior Iterations Compared: [{prior_s}] vs Current [{w_end_s}]"
-            )
-            if iter_summary_s:
-                lines.append(f"Prior Iteration Stock Counts: {iter_summary_s}")
-            lines.append("")
-
-            _fmt_active_block(f"ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BULL", win_stk_b, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
-            _fmt_active_block(f"ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BEAR", win_stk_r, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
-            _fmt_active_block(f"PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BULL", new_stk_b, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
-            _fmt_active_block(f"PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BEAR", new_stk_r, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
-            if win_idx_b or win_idx_r:
-                _fmt_active_block(f"ALL WINDOW SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BULL", win_idx_b, show_sector=False, show_first_iter=True, include_ce_pe_counts=False)
-                _fmt_active_block(f"ALL WINDOW SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BEAR", win_idx_r, show_sector=False, show_first_iter=True, include_ce_pe_counts=False)
-            return "\n".join(lines)
-
-    # Fallback if both EMAIL_ONLY_PURE_1ST_TIME_CONTENT and EMAIL_ONLY_WINDOW_POPUPS are False
     lines.append(f"=== SYSTEM 3.0 INSTITUTIONAL VOLATILITY TRACKER [{mode}] ===")
-    lines.append(f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Checkpoints: {len(checkpoints)}")
-    lines.append("")
+    lines.append(f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')}\n")
     _fmt_active_block("ALL STOCKS — TOP BULL SETUPS", e_bulls, show_sector=True, include_ce_pe_counts=True)
     _fmt_active_block("ALL STOCKS — TOP BEAR SETUPS", e_bears, show_sector=True, include_ce_pe_counts=True)
     return "\n".join(lines)
 
 def build_email_and_attachment_html(
-    mode, cutoff_dt, checkpoints,
-    idx_bulls, idx_bears, idx_grave,
-    stock_bulls, stock_bears, stock_grave,
-    lookback_meta=None,
-    idx_popup_res=None,
-    stock_popup_res=None
+    mode, cutoff_dt, checkpoints, idx_bulls, idx_bears, idx_grave,
+    stock_bulls, stock_bears, stock_grave, lookback_meta=None,
+    idx_popup_res=None, stock_popup_res=None
 ):
-    """
-    Builds TWO HTML representations using a high-contrast, email-friendly
-    Light Institutional Theme with explicit inline styles on every cell (`<td>` / `<th>`)
-    so Gmail, Outlook, and Apple Mail NEVER render dark text on a dark background:
-    - Adds `CE(x) PE(y)` counts to section headers and banners (e.g.
-      `PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor 09:56..10:46) — BULL (10) CE(4) PE(6)`).
-    - Adds `Target` and `SL` columns right next to `LTP/Exit`, calculated from AnchorPrice using Base ATR.
-    """
     new_idx_b = (idx_popup_res or {}).get("new_bulls", [])
     new_idx_r = (idx_popup_res or {}).get("new_bears", [])
     win_idx_b = (idx_popup_res or {}).get("window_first_bulls", [])
@@ -2506,63 +2124,42 @@ def build_email_and_attachment_html(
 
     w_start_s = lookback_meta["window_start_dt"].strftime("%H:%M") if (lookback_meta and lookback_meta.get("enabled")) else "-"
     w_end_s = lookback_meta["window_end_dt"].strftime("%H:%M") if (lookback_meta and lookback_meta.get("enabled")) else cutoff_dt.strftime("%H:%M")
-    prior_s = (", ".join(d.strftime("%H:%M") for d in lookback_meta["prior_iter_dts_desc"]) or "None") if (lookback_meta and lookback_meta.get("enabled")) else "None"
-    iter_summary_s = " &nbsp;|&nbsp; ".join(
-        f"<b>{html.escape(st['iter_time'])}</b>: <span style='color:#15803d;'>▲{st['bull_count']}</span> <span style='color:#b91c1c;'>▼{st['bear_count']}</span>"
-        for st in ((stock_popup_res or {}).get("iter_stats") or [])
-    )
 
     def _ser_active(r, basket_dir):
         live_r = _r_multiple(r, include_banked=False)
         banked_r = float(r.get('BankedR', 0.0) or 0.0)
         has_bank = r.get('PriorStops', 0) > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON
-        r_str = f"{live_r:+.2f}R ({banked_r:+.1f}R)" if has_bank else f"{live_r:+.2f}R"
-        anchor_str = f"{r.get('ActiveAnchor', '-')}*" if has_bank else f"{r.get('ActiveAnchor', '-')}"
         default_g = {m: 0 for m in GRID_MULTIPLIERS}
         ag, bg = r.get('ATR_Grid', default_g), r.get('BB_Grid', default_g)
-        atr_s = "  ".join(str(ag.get(k, 0)) for k in GRID_MULTIPLIERS)
-        bb_s = "  ".join(str(bg.get(k, 0)) for k in GRID_MULTIPLIERS)
         st = _state_display(r)
-        if "[ BB > KC ]" in r['State']:
-            st = f"[ BB > KC ] {'▲' if basket_dir == 'BULL' else '▼'}"
-        tgt_p, sl_p = _compute_target_sl(r)
+        if "[ BB > KC ]" in r['State']: st = f"[ BB > KC ] {'▲' if basket_dir == 'BULL' else '▼'}"
         return {
             "symbol": r['Symbol'],
+            "rr": r.get('RR_Str') or compute_risk_reward_ratio(r)[1],
             "sector": r.get('Sector', DEFAULT_UNMAPPED_SECTOR),
             "weight": f"{float(r.get('SectorWeight', 0.0)):.1f}%",
             "first_iter": r.get('FirstPopupIter', r['CheckpointTime'].strftime('%H:%M')),
             "popup_type": r.get('PopupType', '1ST-TIME'),
             "ltp": f"{r['LTP']:.2f}",
-            "target": f"{tgt_p:.2f}" if tgt_p > 0 else "-",
-            "sl": f"{sl_p:.2f}" if sl_p > 0 else "-",
+            "target": f"{r.get('TargetPrice', 0.0):.2f}" if r.get('TargetPrice', 0.0) > 0 else "-",
+            "sl": f"{r.get('SLPrice', 0.0):.2f}" if r.get('SLPrice', 0.0) > 0 else "-",
             "seen": r['CheckpointTime'].strftime('%H:%M'),
-            "anchor": anchor_str,
+            "anchor": f"{r.get('ActiveAnchor', '-')}{'*' if has_bank else ''}",
             "anchor_val": f"{r['AnchorPrice']:.2f}",
-            "r_str": r_str,
-            "live_r_pos": live_r >= 0,
+            "r_str": f"{live_r:+.2f}R ({banked_r:+.1f}R)" if has_bank else f"{live_r:+.2f}R",
             "rank_r_pos": _rank_r_score(r) >= 0,
-            "atr_grid": atr_s,
-            "bb_grid": bb_s,
+            "atr_grid": "  ".join(str(ag.get(k, 0)) for k in GRID_MULTIPLIERS),
+            "bb_grid": "  ".join(str(bg.get(k, 0)) for k in GRID_MULTIPLIERS),
             "state": st,
             "is_expanding": "[ BB > KC ]" in r['State'],
         }
 
     def _table_active_html(rows_list, basket_dir, show_sec=True, js_clickable_index=False, show_first_iter=True):
         if not rows_list:
-            return (
-                "<div style='background-color:#ffffff;border:1px solid #cbd5e1;border-radius:6px;"
-                "padding:10px 14px;color:#64748b;font-style:italic;margin-bottom:14px;'>"
-                "No setups in this category for the current lookback window.</div>"
-            )
-        th_style = (
-            "background-color:#1e293b;color:#ffffff;padding:8px 10px;"
-            "border:1px solid #334155;font-weight:700;font-size:12px;"
-        )
+            return "<div style='background-color:#ffffff;border:1px solid #cbd5e1;border-radius:6px;padding:10px 14px;color:#64748b;font-style:italic;margin-bottom:14px;'>No setups in this category for the current lookback window.</div>"
+        th_style = "background-color:#1e293b;color:#ffffff;padding:8px 10px;border:1px solid #334155;font-weight:700;font-size:12px;"
         sec_th = f"<th style='{th_style}' align='left'>Sector (MaxWt%)</th>" if show_sec else ""
-        iter_th = (
-            f"<th style='{th_style}' align='center'>1stIter</th>"
-            f"<th style='{th_style}' align='center'>PopupType</th>"
-        ) if show_first_iter else ""
+        iter_th = f"<th style='{th_style}' align='center'>1stIter</th><th style='{th_style}' align='center'>PopupType</th>" if show_first_iter else ""
 
         tr_list = []
         for idx_i, r in enumerate(rows_list):
@@ -2571,36 +2168,17 @@ def build_email_and_attachment_html(
             base_td = f"padding:7px 10px;border:1px solid #cbd5e1;background-color:{row_bg};color:#0f172a;font-size:12px;"
             sec_attr = html.escape(d["symbol"] if not show_sec else d["sector"])
             click_attr = f'onclick="filterBySector(\'{sec_attr}\')" class="idx-row"' if js_clickable_index else ""
-
-            sec_td = (
-                f"<td style='{base_td}color:#1e40af;font-weight:600;'>"
-                f"{html.escape(d['sector'])} <span style='color:#475569;font-weight:normal;'>({d['weight']})</span></td>"
-            ) if show_sec else ""
-
-            if show_first_iter:
-                is_pure_first = d["popup_type"] == "1ST-TIME"
-                pt_bg = "#dcfce7" if is_pure_first else "#fef3c7"
-                pt_fg = "#166534" if is_pure_first else "#92400e"
-                iter_td = (
-                    f"<td align='center' style='{base_td}background-color:#e0f2fe;color:#075985;font-weight:700;'>{html.escape(d['first_iter'])}</td>"
-                    f"<td align='center' style='{base_td}background-color:{pt_bg};color:{pt_fg};font-weight:700;'>{html.escape(d['popup_type'])}</td>"
-                )
-            else:
-                iter_td = ""
-
+            sec_td = f"<td style='{base_td}color:#1e40af;font-weight:600;'>{html.escape(d['sector'])} <span style='color:#475569;font-weight:normal;'>({d['weight']})</span></td>" if show_sec else ""
+            iter_td = f"<td align='center' style='{base_td}background-color:#e0f2fe;color:#075985;font-weight:700;'>{html.escape(d['first_iter'])}</td><td align='center' style='{base_td}background-color:#dcfce7;color:#166534;font-weight:700;'>{html.escape(d['popup_type'])}</td>" if show_first_iter else ""
             r_bg = "#dcfce7" if d["rank_r_pos"] else "#fee2e2"
             r_fg = "#166534" if d["rank_r_pos"] else "#991b1b"
-
-            if d["is_expanding"]:
-                st_bg = "#dcfce7" if basket_dir == "BULL" else "#fee2e2"
-                st_fg = "#166534" if basket_dir == "BULL" else "#991b1b"
-            else:
-                st_bg = "#fef3c7"
-                st_fg = "#92400e"
+            st_bg = ("#dcfce7" if basket_dir == "BULL" else "#fee2e2") if d["is_expanding"] else "#fef3c7"
+            st_fg = ("#166534" if basket_dir == "BULL" else "#991b1b") if d["is_expanding"] else "#92400e"
 
             tr_list.append(
                 f"<tr {click_attr} data-sector='{sec_attr}' style='background-color:{row_bg};'>"
                 f"<td style='{base_td}color:#0f172a;font-weight:700;'>{html.escape(d['symbol'])}</td>"
+                f"<td align='center' style='{base_td}background-color:#f0f9ff;color:#0284c7;font-weight:700;'>{html.escape(d['rr'])}</td>"
                 f"<td align='right' style='{base_td}color:#0f172a;font-weight:700;'>{d['ltp']}</td>"
                 f"<td align='right' style='{base_td}background-color:#f0fdf4;color:#15803d;font-weight:700;'>{html.escape(d['target'])}</td>"
                 f"<td align='right' style='{base_td}background-color:#fef2f2;color:#b91c1c;font-weight:700;'>{html.escape(d['sl'])}</td>"
@@ -2615,202 +2193,89 @@ def build_email_and_attachment_html(
                 f"</tr>"
             )
         return (
-            f"<table style='width:100%;border-collapse:collapse;margin-bottom:16px;background-color:#ffffff;"
-            f"border:1px solid #cbd5e1;font-family:Consolas,\"Courier New\",monospace;font-size:12px;'>"
+            f"<table style='width:100%;border-collapse:collapse;margin-bottom:16px;background-color:#ffffff;border:1px solid #cbd5e1;font-family:Consolas,monospace;font-size:12px;'>"
             f"<thead><tr>"
-            f"<th style='{th_style}' align='left'>Script</th>"
-            f"<th style='{th_style}' align='right'>LTP/Exit</th>"
-            f"<th style='{th_style}' align='right'>Target</th>"
-            f"<th style='{th_style}' align='right'>SL</th>"
+            f"<th style='{th_style}' align='left'>Script</th><th style='{th_style}' align='center'>R:R</th><th style='{th_style}' align='right'>LTP/Exit</th>"
+            f"<th style='{th_style}' align='right'>Target</th><th style='{th_style}' align='right'>SL</th>"
             f"{sec_th}{iter_th}"
-            f"<th style='{th_style}' align='center'>Seen</th>"
-            f"<th style='{th_style}' align='center'>Anchor</th>"
-            f"<th style='{th_style}' align='right'>Anch Val</th>"
-            f"<th style='{th_style}' align='right'>R-Mult (Bank)</th>"
-            f"<th style='{th_style}' align='center'>ATR: 1X 2X 3X 5X</th>"
-            f"<th style='{th_style}' align='center'>BB: 1X 2X 3X 5X</th>"
-            f"<th style='{th_style}' align='center'>State</th>"
-            f"</tr></thead>"
-            f"<tbody>{''.join(tr_list)}</tbody></table>"
+            f"<th style='{th_style}' align='center'>Seen</th><th style='{th_style}' align='center'>Anchor</th><th style='{th_style}' align='right'>Anch Val</th>"
+            f"<th style='{th_style}' align='right'>R-Mult (Bank)</th><th style='{th_style}' align='center'>ATR: 1X 2X 3X 5X</th>"
+            f"<th style='{th_style}' align='center'>BB: 1X 2X 3X 5X</th><th style='{th_style}' align='center'>State</th>"
+            f"</tr></thead><tbody>{''.join(tr_list)}</tbody></table>"
         )
 
     def _sec_banner(title, is_bull=True):
-        if is_bull:
-            bg, border, left_b, fg = "#ecfdf5", "#a7f3d0", "#16a34a", "#065f46"
-        else:
-            bg, border, left_b, fg = "#fef2f2", "#fecaca", "#dc2626", "#991b1b"
-        return (
-            f"<div style='background-color:{bg};border:1px solid {border};border-left:5px solid {left_b};"
-            f"color:{fg};padding:8px 12px;font-weight:700;font-size:13px;border-radius:4px;margin:14px 0 8px 0;'>"
-            f"{html.escape(title)}</div>"
-        )
+        bg, border, left_b, fg = ("#ecfdf5", "#a7f3d0", "#16a34a", "#065f46") if is_bull else ("#fef2f2", "#fecaca", "#dc2626", "#991b1b")
+        return f"<div style='background-color:{bg};border:1px solid {border};border-left:5px solid {left_b};color:{fg};padding:8px 12px;font-weight:700;font-size:13px;border-radius:4px;margin:14px 0 8px 0;'>{html.escape(title)}</div>"
 
-    # Determine which stock & index lists feed the email based on EMAIL_ONLY_PURE_1ST_TIME_CONTENT
     email_stk_b = new_stk_b if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else win_stk_b
     email_stk_r = new_stk_r if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else win_stk_r
-    email_idx_b = new_idx_b if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else win_idx_b
-    email_idx_r = new_idx_r if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else win_idx_r
 
-    # Sector-wise accordions scoped to the active email mode
     sector_accordions = []
-    all_sector_keys = list(SECTORAL_INDEX_CONFIG.keys()) + list(INDEX_CONFIG.keys()) + [DEFAULT_UNMAPPED_SECTOR]
-    seen_sec_keys = set()
-    ordered_sec_keys = []
-    for sk in all_sector_keys:
-        if sk not in seen_sec_keys:
-            seen_sec_keys.add(sk)
-            ordered_sec_keys.append(sk)
-
+    all_sector_keys = list(dict.fromkeys(list(SECTORAL_INDEX_CONFIG.keys()) + list(INDEX_CONFIG.keys()) + [DEFAULT_UNMAPPED_SECTOR]))
     accordion_label = "Pure 1st-Time Popups" if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else "Window Popups"
-    for sec in ordered_sec_keys:
+    for sec in all_sector_keys:
         sb = [r for r in email_stk_b if r.get('Sector') == sec]
         sr = [r for r in email_stk_r if r.get('Sector') == sec]
-        if not sb and not sr:
-            continue
+        if not sb and not sr: continue
         sb_ce, sb_pe = _ce_pe_counts(sb)
         sr_ce, sr_pe = _ce_pe_counts(sr)
         sector_accordions.append(
             f"<details style='margin-bottom:8px;border:1px solid #cbd5e1;border-radius:6px;background-color:#ffffff;padding:8px 12px;'>"
-            f"<summary style='cursor:pointer;font-weight:700;color:#0f172a;font-size:13px;outline:none;'>"
-            f"▶ {html.escape(sec)} — {accordion_label} "
-            f"(<span style='color:#15803d;'>Bull: {len(sb)} CE({sb_ce}) PE({sb_pe})</span> | "
-            f"<span style='color:#b91c1c;'>Bear: {len(sr)} CE({sr_ce}) PE({sr_pe})</span>)"
-            f"</summary>"
+            f"<summary style='cursor:pointer;font-weight:700;color:#0f172a;font-size:13px;'>▶ {html.escape(sec)} — {accordion_label} "
+            f"(<span style='color:#15803d;'>Bull: {len(sb)} CE({sb_ce}) PE({sb_pe})</span> | <span style='color:#b91c1c;'>Bear: {len(sr)} CE({sr_ce}) PE({sr_pe})</span>)</summary>"
             f"<div style='padding-top:10px;'>"
-            + (_sec_banner(f"🔥 {sec} — {'PURE 1ST-TIME' if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else 'WINDOW'} BULL POPUPS {_format_count_with_ce_pe(sb)}", True) + _table_active_html(sb, 'BULL', show_sec=False, show_first_iter=True) if sb else "")
-            + (_sec_banner(f"🩸 {sec} — {'PURE 1ST-TIME' if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else 'WINDOW'} BEAR POPUPS {_format_count_with_ce_pe(sr)}", False) + _table_active_html(sr, 'BEAR', show_sec=False, show_first_iter=True) if sr else "")
+            + (_sec_banner(f"🔥 {sec} — BULL {_format_count_with_ce_pe(sb)}", True) + _table_active_html(sb, 'BULL', show_sec=False, show_first_iter=True) if sb else "")
+            + (_sec_banner(f"🩸 {sec} — BEAR {_format_count_with_ce_pe(sr)}", False) + _table_active_html(sr, 'BEAR', show_sec=False, show_first_iter=True) if sr else "")
             + f"</div></details>"
         )
 
-    idx_block_html = ""
-    if email_idx_b or email_idx_r:
-        idx_hdr_title = (
-            f"🏛️ PURE FIRST-TIME SECTORAL INDEX POPUPS (No Prior Stops, Anchor {w_start_s}..{w_end_s})"
-            if EMAIL_ONLY_PURE_1ST_TIME_CONTENT
-            else f"🏛️ WINDOW SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s})"
-        )
-        idx_block_html = (
-            f"<h3 style='color:#0f172a;margin:18px 0 8px 0;font-size:15px;'>{html.escape(idx_hdr_title)}</h3>"
-            + (_sec_banner(f"🏛️🆕🔥 SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}) — BULL ({len(email_idx_b)})", True)
-               + _table_active_html(email_idx_b, 'BULL', show_sec=False, show_first_iter=True) if email_idx_b else "")
-            + (_sec_banner(f"🏛️🆕🩸 SECTORAL INDEX POPUPS ({w_start_s}..{w_end_s}) — BEAR ({len(email_idx_r)})", False)
-               + _table_active_html(email_idx_r, 'BEAR', show_sec=False, show_first_iter=True) if email_idx_r else "")
-        )
-
-    light_css = (
-        "body{background-color:#f1f5f9;color:#0f172a;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:13px;margin:0;padding:16px;}"
-        ".pill{background-color:#ffffff;color:#1e293b;border:1px solid #94a3b8;padding:5px 10px;margin:2px;border-radius:4px;cursor:pointer;font-weight:600;}"
-        ".pill:hover,.pill.active{background-color:#2563eb;color:#ffffff;border-color:#1d4ed8;}"
-        ".clr{background-color:#dc2626;color:#ffffff;border:none;padding:6px 14px;border-radius:4px;font-weight:700;cursor:pointer;}"
-    )
-
+    light_css = "body{background-color:#f1f5f9;color:#0f172a;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:13px;margin:0;padding:16px;}.pill{background-color:#ffffff;color:#1e293b;border:1px solid #94a3b8;padding:5px 10px;margin:2px;border-radius:4px;cursor:pointer;font-weight:600;}.pill:hover,.pill.active{background-color:#2563eb;color:#ffffff;border-color:#1d4ed8;}.clr{background-color:#dc2626;color:#ffffff;border:none;padding:6px 14px;border-radius:4px;font-weight:700;cursor:pointer;}"
     nb_ce, nb_pe = _ce_pe_counts(new_stk_b)
     nr_ce, nr_pe = _ce_pe_counts(new_stk_r)
-    wb_ce, wb_pe = _ce_pe_counts(win_stk_b)
-    wr_ce, wr_pe = _ce_pe_counts(win_stk_r)
-
-    if EMAIL_ONLY_PURE_1ST_TIME_CONTENT:
-        card_title = f"📡 SYSTEM 3.0 [{html.escape(mode)}] — PURE 1ST-TIME POPUPS (NO *) ({w_start_s}..{w_end_s})"
-        counts_line_html = (
-            f"<b>Pure 1st-Time (No *) ({w_start_s}..{w_end_s}):</b> "
-            f"<span style='color:#15803d;font-weight:700;'>▲ {len(new_stk_b)} Bull [CE({nb_ce}) PE({nb_pe})]</span> &nbsp;/&nbsp; "
-            f"<span style='color:#b91c1c;font-weight:700;'>▼ {len(new_stk_r)} Bear [CE({nr_ce}) PE({nr_pe})]</span>"
-        )
-        main_tables_html = (
-            f"<h3 style='color:#0f172a;margin:16px 0 8px 0;font-size:15px;'>🆕 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s})</h3>"
-            f"{_sec_banner(f'🆕🔥 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BULL {_format_count_with_ce_pe(new_stk_b)}', True)}"
-            f"{_table_active_html(new_stk_b, 'BULL', show_sec=True, show_first_iter=True)}"
-            f"{_sec_banner(f'🆕🩸 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BEAR {_format_count_with_ce_pe(new_stk_r)}', False)}"
-            f"{_table_active_html(new_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}"
-        )
-    else:
-        card_title = f"📡 SYSTEM 3.0 [{html.escape(mode)}] — LOOKBACK WINDOW POPUPS ({w_start_s}..{w_end_s})"
-        counts_line_html = (
-            f"<b>Window Stock Popups ({w_start_s}..{w_end_s}):</b> "
-            f"<span style='color:#15803d;font-weight:700;'>▲ {len(win_stk_b)} Bull [CE({wb_ce}) PE({wb_pe})]</span> &nbsp;/&nbsp; "
-            f"<span style='color:#b91c1c;font-weight:700;'>▼ {len(win_stk_r)} Bear [CE({wr_ce}) PE({wr_pe})]</span> &nbsp;&nbsp;|&nbsp;&nbsp; "
-            f"<b>Pure 1st-Time (No *):</b> "
-            f"<span style='color:#15803d;font-weight:700;'>▲ {len(new_stk_b)} Bull [CE({nb_ce}) PE({nb_pe})]</span> &nbsp;/&nbsp; "
-            f"<span style='color:#b91c1c;font-weight:700;'>▼ {len(new_stk_r)} Bear [CE({nr_ce}) PE({nr_pe})]</span>"
-        )
-        main_tables_html = (
-            f"<h3 style='color:#0f172a;margin:16px 0 8px 0;font-size:15px;'>⏱️ ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors)</h3>"
-            f"{_sec_banner(f'⏱️🔥 ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BULL {_format_count_with_ce_pe(win_stk_b)}', True)}"
-            f"{_table_active_html(win_stk_b, 'BULL', show_sec=True, show_first_iter=True)}"
-            f"{_sec_banner(f'⏱️🩸 ALL WINDOW STOCK POPUPS ({w_start_s}..{w_end_s}, Including * Re-Anchors) — BEAR {_format_count_with_ce_pe(win_stk_r)}', False)}"
-            f"{_table_active_html(win_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}"
-            f"<h3 style='color:#0f172a;margin:20px 0 8px 0;font-size:15px;'>🆕 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s})</h3>"
-            f"{_sec_banner(f'🆕🔥 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BULL {_format_count_with_ce_pe(new_stk_b)}', True)}"
-            f"{_table_active_html(new_stk_b, 'BULL', show_sec=True, show_first_iter=True)}"
-            f"{_sec_banner(f'🆕🩸 PURE FIRST-TIME STOCK POPUPS (No Prior Same-Dir Stops, Anchor {w_start_s}..{w_end_s}) — BEAR {_format_count_with_ce_pe(new_stk_r)}', False)}"
-            f"{_table_active_html(new_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}"
-        )
 
     header_card_html = (
-        f"<div style='background-color:#ffffff;border:1px solid #cbd5e1;border-left:6px solid #2563eb;"
-        f"border-radius:6px;padding:14px 18px;margin-bottom:16px;'>"
-        f"<div style='font-size:17px;font-weight:800;color:#0f172a;margin-bottom:6px;'>{card_title}</div>"
+        f"<div style='background-color:#ffffff;border:1px solid #cbd5e1;border-left:6px solid #2563eb;border-radius:6px;padding:14px 18px;margin-bottom:16px;'>"
+        f"<div style='font-size:17px;font-weight:800;color:#0f172a;margin-bottom:6px;'>📡 SYSTEM 3.0 [{html.escape(mode)}] — PURE 1ST-TIME POPUPS ({w_start_s}..{w_end_s})</div>"
         f"<div style='color:#334155;font-size:13px;margin-bottom:4px;'>"
-        f"<b>Target Snapshot:</b> {cutoff_dt.strftime('%Y-%m-%d %H:%M')} &nbsp;|&nbsp; "
-        f"<b>NO_OF_ITERATIONS:</b> {lookback_meta['num_iterations'] if lookback_meta else 0} &nbsp;|&nbsp; "
-        f"<b>INTERVAL:</b> {lookback_meta['interval_min'] if lookback_meta else 0}m &nbsp;|&nbsp; "
-        f"<b>Anchor Window:</b> <span style='background-color:#e0f2fe;color:#0369a1;padding:2px 6px;border-radius:4px;font-weight:700;'>{w_start_s} to {w_end_s}</span> &nbsp;|&nbsp; "
-        f"<b>Prior Runs Compared:</b> [{html.escape(prior_s)}] vs [{w_end_s}] &nbsp;|&nbsp; "
-        f"<b>Target/SL Basis:</b> Anchor +{TARGET_ATR_MULT:g} ATR / -{SL_ATR_MULT:g} ATR</div>"
+        f"<b>Target Snapshot:</b> {cutoff_dt.strftime('%Y-%m-%d %H:%M')} &nbsp;|&nbsp; <b>Anchor Window:</b> <span style='background-color:#e0f2fe;color:#0369a1;padding:2px 6px;border-radius:4px;font-weight:700;'>{w_start_s} to {w_end_s}</span> &nbsp;|&nbsp; <b>Max Gap:</b> {MAX_TIMESTAMP_GAP_MINUTES}m</div>"
         f"<div style='color:#334155;font-size:12px;'>"
-        f"{counts_line_html}"
-        + (f"<br><b>Prior Iteration Totals:</b> {iter_summary_s}" if iter_summary_s else "")
-        + f"</div></div>"
+        f"<b>Pure 1st-Time:</b> <span style='color:#15803d;font-weight:700;'>▲ {len(new_stk_b)} Bull [CE({nb_ce}) PE({nb_pe})]</span> &nbsp;/&nbsp; <span style='color:#b91c1c;font-weight:700;'>▼ {len(new_stk_r)} Bear [CE({nr_ce}) PE({nr_pe})]</span>"
+        f"</div></div>"
+    )
+
+    main_tables_html = (
+        f"{_sec_banner(f'🆕🔥 PURE FIRST-TIME STOCK POPUPS — BULL {_format_count_with_ce_pe(new_stk_b)}', True)}"
+        f"{_table_active_html(new_stk_b, 'BULL', show_sec=True, show_first_iter=True)}"
+        f"{_sec_banner(f'🆕🩸 PURE FIRST-TIME STOCK POPUPS — BEAR {_format_count_with_ce_pe(new_stk_r)}', False)}"
+        f"{_table_active_html(new_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}"
     )
 
     email_inline_html = (
         f"<!DOCTYPE html><html><head><meta charset='utf-8'><style>{light_css}</style></head>"
-        f"<body style='background-color:#f1f5f9;color:#0f172a;font-family:\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif;font-size:13px;margin:0;padding:16px;'>"
+        f"<body style='background-color:#f1f5f9;color:#0f172a;font-family:Segoe UI,sans-serif;font-size:13px;margin:0;padding:16px;'>"
         f"<div style='max-width:1280px;margin:0 auto;'>"
-        f"{header_card_html}"
-        f"{main_tables_html}"
-        f"{idx_block_html}"
-        + (
-            f"<h3 style='color:#0f172a;margin:20px 0 8px 0;font-size:15px;'>📂 {accordion_label.upper()} GROUPED BY SECTOR (Click Any Sector to Expand)</h3>"
-            f"{''.join(sector_accordions)}"
-            if sector_accordions else ""
-        )
+        f"{header_card_html}{main_tables_html}"
+        + (f"<h3 style='color:#0f172a;margin:20px 0 8px 0;font-size:15px;'>📂 GROUPED BY SECTOR</h3>{''.join(sector_accordions)}" if sector_accordions else "")
         + f"</div></body></html>"
     )
 
     active_popup_sectors = sorted({r.get('Sector', DEFAULT_UNMAPPED_SECTOR) for r in (email_stk_b + email_stk_r)})
-    pills_js_html = "".join(
-        f"<button class='pill' data-sec='{html.escape(s)}' onclick=\"filterBySector('{html.escape(s)}')\">{html.escape(s)}</button>"
-        for s in active_popup_sectors
-    )
+    pills_js_html = "".join(f"<button class='pill' data-sec='{html.escape(s)}' onclick=\"filterBySector('{html.escape(s)}')\">{html.escape(s)}</button>" for s in active_popup_sectors)
 
     attachment_js_html = (
-        f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>System 3.0 {accordion_label} ({w_start_s}..{w_end_s})</title><style>{light_css}</style></head>"
-        f"<body style='background-color:#f1f5f9;color:#0f172a;font-family:\"Segoe UI\",Roboto,Helvetica,Arial,sans-serif;font-size:13px;margin:0;padding:16px;'>"
+        f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>System 3.0 Popups</title><style>{light_css}</style></head>"
+        f"<body style='background-color:#f1f5f9;color:#0f172a;font-family:Segoe UI,sans-serif;font-size:13px;margin:0;padding:16px;'>"
         f"<div style='max-width:1280px;margin:0 auto;'>"
         f"<div style='position:sticky;top:0;background-color:#ffffff;padding:12px 16px;border:1px solid #cbd5e1;border-radius:6px;margin-bottom:14px;box-shadow:0 2px 4px rgba(0,0,0,0.05);'>"
         f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;'>"
-        f"<b style='font-size:15px;color:#0f172a;'>📡 SYSTEM 3.0 [{html.escape(mode)}] — {accordion_label} ({w_start_s}..{w_end_s}) @ {cutoff_dt.strftime('%Y-%m-%d %H:%M')}</b>"
-        f"<div><span id='statusBadge' style='color:#2563eb;margin-right:10px;font-weight:700;'>SHOWING ALL {accordion_label.upper()}</span>"
-        f"<button class='clr' onclick='clearFilter()'>SHOW ALL</button></div></div>"
+        f"<b style='font-size:15px;color:#0f172a;'>📡 SYSTEM 3.0 [{html.escape(mode)}] @ {cutoff_dt.strftime('%Y-%m-%d %H:%M')}</b>"
+        f"<div><span id='statusBadge' style='color:#2563eb;margin-right:10px;font-weight:700;'>SHOWING ALL</span><button class='clr' onclick='clearFilter()'>SHOW ALL</button></div></div>"
         f"<div>{pills_js_html}</div></div>"
-        f"{header_card_html}"
-        f"<div id='popupContainer'>"
-        f"{main_tables_html}"
-        f"{idx_block_html}"
-        f"</div>"
+        f"{header_card_html}<div id='popupContainer'>{main_tables_html}</div>"
         f"<script>"
-        f"function filterBySector(sec){{"
-        f"document.querySelectorAll('#popupContainer tbody tr').forEach(r=>{{"
-        f"r.style.display=(r.getAttribute('data-sector')===sec)?'':'none';}});"
-        f"document.querySelectorAll('.pill').forEach(p=>p.classList.toggle('active',p.getAttribute('data-sec')===sec));"
-        f"document.getElementById('statusBadge').textContent='FILTERED BY SECTOR: '+sec;"
-        f"}}"
-        f"function clearFilter(){{"
-        f"document.querySelectorAll('#popupContainer tbody tr').forEach(r=>{{r.style.display='';}});"
-        f"document.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));"
-        f"document.getElementById('statusBadge').textContent='SHOWING ALL {accordion_label.upper()}';"
-        f"}}"
+        f"function filterBySector(sec){{document.querySelectorAll('#popupContainer tbody tr').forEach(r=>{{r.style.display=(r.getAttribute('data-sector')===sec)?'':'none';}});document.querySelectorAll('.pill').forEach(p=>p.classList.toggle('active',p.getAttribute('data-sec')===sec));document.getElementById('statusBadge').textContent='FILTERED BY: '+sec;}}"
+        f"function clearFilter(){{document.querySelectorAll('#popupContainer tbody tr').forEach(r=>{{r.style.display='';}});document.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));document.getElementById('statusBadge').textContent='SHOWING ALL';}}"
         f"</script></div></body></html>"
     )
 
@@ -2824,9 +2289,7 @@ _EMAIL_SENT_TAGS = set()
 
 def _send_email_message(subject, plain_body, html_body=None, attachment_html=None, tag="email"):
     with _EMAIL_SEND_LOCK:
-        if tag in _EMAIL_SENT_TAGS:
-            print(f"   {COLOR_DIM}[{tag}] Duplicate email dispatch prevented (already sent once in this run).{COLOR_RESET}")
-            return False
+        if tag in _EMAIL_SENT_TAGS: return False
         _EMAIL_SENT_TAGS.add(tag)
     sender = os.environ.get(ENV_SENDER_EMAIL)
     password = os.environ.get(ENV_SENDER_PASSWORD)
@@ -2834,46 +2297,18 @@ def _send_email_message(subject, plain_body, html_body=None, attachment_html=Non
     smtp_server = os.environ.get(ENV_SMTP_SERVER) or DEFAULT_SMTP_SERVER
     smtp_port = os.environ.get(ENV_SMTP_PORT) or DEFAULT_SMTP_PORT
 
-    missing = [
-        name for name, val in (
-            (ENV_SENDER_EMAIL, sender),
-            (ENV_SENDER_PASSWORD, password),
-            (ENV_RECIPIENT_EMAIL, recipient),
-        ) if not val
-    ]
-    if missing:
-        print(f"   {COLOR_YELLOW}[{tag}] Cannot send email -- missing secret(s): {', '.join(missing)}{COLOR_RESET}")
-        return False
-
-    try:
-        port = int(smtp_port)
-    except ValueError:
-        print(f"   {COLOR_YELLOW}[{tag}] Invalid {ENV_SMTP_PORT}='{smtp_port}'{COLOR_RESET}")
-        return False
+    if not sender or not password or not recipient: return False
+    try: port = int(smtp_port)
+    except ValueError: return False
 
     msg = EmailMessage()
-    unique_recipients = []
-    for addr in re.split(r"[,;]+", str(recipient)):
-        clean_addr = addr.strip()
-        if clean_addr and clean_addr.lower() not in [u.lower() for u in unique_recipients]:
-            unique_recipients.append(clean_addr)
-    recipient_clean = ", ".join(unique_recipients) if unique_recipients else str(recipient).strip()
-
     msg['Subject'] = subject
     msg['From'] = sender
-    msg['To'] = recipient_clean
+    msg['To'] = recipient
     msg.set_content(plain_body)
-
-    if html_body:
-        msg.add_alternative(html_body, subtype='html')
-
+    if html_body: msg.add_alternative(html_body, subtype='html')
     if attachment_html and EMAIL_ATTACH_INTERACTIVE_HTML:
-        msg.add_attachment(
-            attachment_html.encode('utf-8'),
-            maintype='text',
-            subtype='html',
-            filename=EMAIL_ATTACHMENT_FILENAME
-        )
+        msg.add_attachment(attachment_html.encode('utf-8'), maintype='text', subtype='html', filename=EMAIL_ATTACHMENT_FILENAME)
 
     try:
         if port == SMTP_SSL_PORT:
@@ -2885,19 +2320,17 @@ def _send_email_message(subject, plain_body, html_body=None, attachment_html=Non
                 server.starttls()
                 server.login(sender, password)
                 server.send_message(msg)
-        print(f"   {COLOR_GREEN_FG}📧 [{tag}] Email sent to {recipient} via {smtp_server}:{port}{COLOR_RESET}")
+        print(f"   {COLOR_GREEN_FG}📧 [{tag}] Email sent to {recipient}{COLOR_RESET}")
         return True
     except Exception as e:
-        print(f"   {COLOR_YELLOW}[{tag}] Failed to send email ({type(e).__name__}: {e}){COLOR_RESET}")
+        print(f"   {COLOR_YELLOW}[{tag}] Failed to send email ({e}){COLOR_RESET}")
         return False
 
 def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True):
-    if not tracked_symbol_raw or tracked_symbol_raw == "***":
-        return
+    if not tracked_symbol_raw or tracked_symbol_raw == "***": return
     n = _norm_sym(tracked_symbol_raw)
     matched_sym = next((sym for sym in by_symbol.keys() if n in _norm_sym(sym)), None)
-    if not matched_sym:
-        return
+    if not matched_sym: return
     rows = sorted(by_symbol[matched_sym], key=lambda r: r['CheckpointTime'])
     history, is_pe = [], _is_pe_symbol(matched_sym)
     for i in range(1, len(rows) + 1):
@@ -2909,29 +2342,26 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
             raw_d = row_copy.get('AnchorDir', 'BULL')
             if raw_d in ("BULL", "BEAR"):
                 row_copy['PremiumDir'] = raw_d
-                if is_pe:
-                    row_copy['AnchorDir'] = "BEAR" if raw_d == "BULL" else "BULL"
+                if is_pe: row_copy['AnchorDir'] = "BEAR" if raw_d == "BULL" else "BULL"
                 row_copy['TargetPrice'], row_copy['SLPrice'] = _compute_target_sl(row_copy)
+                row_copy['RR_Val'], row_copy['RR_Str'] = compute_risk_reward_ratio(row_copy)
             row_copy['_EvalTime'] = subset[-1]['CheckpointTime']
             history.append(row_copy)
-    if not history:
-        return
+    if not history: return
 
     sec_name, sec_wt, _ = resolve_primary_sector(matched_sym)
-    print(f"\n{COLOR_BOLD}🔍 INTRADAY HISTORY FOR TRACKED SYMBOL: {matched_sym} [Primary Sector: {sec_name} ({sec_wt:.2f}%)]{COLOR_RESET}")
+    print(f"\n{COLOR_BOLD}🔍 INTRADAY HISTORY FOR TRACKED SYMBOL: {matched_sym} [{sec_name} ({sec_wt:.2f}%)]{COLOR_RESET}")
     sym_w = max(MIN_SYMBOL_WIDTH, len(matched_sym))
     grid_hdr = " ".join(f"{m}X" for m in GRID_MULTIPLIERS)
-    header_str = f" {COLOR_CYAN}{'Script':<{sym_w}} {'LTP/Exit':>8} {'Target':>9} {'SL':>9} | {'Eval':^5} {'Anchor':^7} {'Anch Val':>9} {'R-Mult (Bank)':>15} | ATR: {grid_hdr} | BB: {grid_hdr} | {'State':^13}{COLOR_RESET}"
+    header_str = f" {COLOR_CYAN}{'Script':<{sym_w}} {'R:R':^7} {'LTP/Exit':>8} {'Target':>9} {'SL':>9} | {'Eval':^5} {'Anchor':^7} {'Anch Val':>9} {'R-Mult (Bank)':>15} | ATR: {grid_hdr} | BB: {grid_hdr} | {'State':^13}{COLOR_RESET}"
     print(header_str)
     print("-" * len(ANSI_RE.sub("", header_str)))
     for row in history:
         live_r, banked_r = _r_multiple(row, include_banked=False), float(row.get('BankedR', 0.0) or 0.0)
         rank_r = _rank_r_score(row)
         r_color = COLOR_GREEN_FG if rank_r > 0 else COLOR_RED_FG if rank_r < 0 else COLOR_DIM
-        if row.get('PriorStops', 0) > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON:
-            r_mult_str, a_time = f"{live_r:>+5.2f}R ({banked_r:>+4.1f}R)", f"{row.get('ActiveAnchor', '-')}*"
-        else:
-            r_mult_str, a_time = f"{live_r:>+5.2f}R          ", f"{row.get('ActiveAnchor', '-')} "
+        r_mult_str = f"{live_r:>+5.2f}R ({banked_r:>+4.1f}R)" if (row.get('PriorStops', 0) > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON) else f"{live_r:>+5.2f}R          "
+        a_time = f"{row.get('ActiveAnchor', '-')}{'*' if (row.get('PriorStops', 0) > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON) else ' '}"
         direction = row.get('AnchorDir', 'BULL')
         dir_c = COLOR_GREEN_FG if direction == "BULL" else COLOR_RED_FG
         default_g = {m: 0 for m in GRID_MULTIPLIERS}
@@ -2945,24 +2375,8 @@ def print_and_alert_tracked_history(tracked_symbol_raw, by_symbol, live_run=True
         else:
             state_text = f"{COLOR_YELLOW if '[ BB < KC ]' in row['State'] else COLOR_DIM}{shown_state:^13}{COLOR_RESET}"
         ltp_val = f"{row['KilledPrice']:>7.2f}x" if "[STOP" in shown_state and row.get('KilledPrice', 0) > 0 else f"{row['LTP']:>8.2f} "
-        tgt_p, sl_p = _compute_target_sl(row)
-        print(f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} {ltp_val} {COLOR_GREEN_FG}{tgt_p:>9.2f}{COLOR_RESET} {COLOR_RED_FG}{sl_p:>9.2f}{COLOR_RESET} | {row['_EvalTime'].strftime('%H:%M'):^5} {a_time:^7} {row['AnchorPrice']:>9.2f} {r_color}{r_mult_str:>15}{COLOR_RESET} |   {a_str}  |   {b_str}  | {state_text}")
-
-    if len(history) >= 2 and live_run and SEND_TRACK_ALERT_EMAIL:
-        last_row, prev_row = history[-1], history[-2]
-        def get_full_state(r):
-            return f"{r.get('AnchorDir', 'NONE')} {r.get('State', 'NONE')}"
-        last_state, prev_state = get_full_state(last_row), get_full_state(prev_row)
-        if last_state != prev_state:
-            tgt_p, sl_p = _compute_target_sl(last_row)
-            _send_email_message(
-                f"[System3] {matched_sym} Alert: {prev_state} -> {last_state}",
-                f"System3 detected a state transition for {matched_sym} ({sec_name}) at checkpoint {last_row['_EvalTime'].strftime('%H:%M')}.\n\n"
-                f"Previous State: {prev_state}\nCurrent State: {last_state}\n\n"
-                f"LTP: {last_row.get('LTP', 0):.2f} | Target: {tgt_p:.2f} | SL: {sl_p:.2f}\n"
-                f"Total Session Move: {_r_multiple(last_row, include_banked=True):+.2f} R-Multiples\n",
-                tag="track"
-            )
+        rr_str = row.get('RR_Str') or compute_risk_reward_ratio(row)[1]
+        print(f" {COLOR_BOLD}{_clip(row['Symbol'], sym_w):<{sym_w}}{COLOR_RESET} {COLOR_CYAN}{rr_str:^7}{COLOR_RESET} {ltp_val} {COLOR_GREEN_FG}{row.get('TargetPrice', 0.0):>9.2f}{COLOR_RESET} {COLOR_RED_FG}{row.get('SLPrice', 0.0):>9.2f}{COLOR_RESET} | {row['_EvalTime'].strftime('%H:%M'):^5} {a_time:^7} {row['AnchorPrice']:>9.2f} {r_color}{r_mult_str:>15}{COLOR_RESET} |   {a_str}  |   {b_str}  | {state_text}")
 
 # ==============================================================================
 # MAIN RUNNER
@@ -2975,35 +2389,25 @@ def run_screener(
     t_start = time.time()
     cutoff_dt, explicit = _parse_snapshot_datetime(target_date_str, target_time_str)
     cutoff_dt, notes = resolve_session(cutoff_dt.replace(second=0, microsecond=0))
-    if STATS.auth_failed:
-        return 1
+    if STATS.auth_failed: return 1
     target_dt, today_session = cutoff_dt.date(), (cutoff_dt.date() == now_ist().date())
     cutoff_dt = min(cutoff_dt, _close_dt(target_dt))
 
-    if not track_symbol:
-        track_symbol = os.environ.get(ENV_TRACK_SYMBOL, "").strip()
+    if not track_symbol: track_symbol = os.environ.get(ENV_TRACK_SYMBOL, "").strip()
 
     lookback_meta = compute_lookback_iteration_schedule(
-        cutoff_dt,
-        num_iterations=lookback_iterations,
-        interval_min=lookback_interval_min
+        cutoff_dt, num_iterations=lookback_iterations, interval_min=lookback_interval_min
     )
 
-    print(f"\n{COLOR_CYAN}📡 Initializing Tracker [{mode}] | Time Machine: {cutoff_dt.strftime('%Y-%m-%d %H:%M:%S')} (Live: {not explicit}){COLOR_RESET}")
+    print(f"\n{COLOR_CYAN}📡 Initializing Tracker [{mode}] | Time Machine: {cutoff_dt:%Y-%m-%d %H:%M:%S} (Live: {not explicit}){COLOR_RESET}")
     if lookback_meta["enabled"]:
         prior_str = ", ".join(d.strftime("%H:%M") for d in lookback_meta["prior_iter_dts_desc"]) or "None"
-        print(
-            f"   {COLOR_DIM}» Lookback Iteration Engine: NO_OF_ITERATIONS={lookback_meta['num_iterations']} | "
-            f"TIME_OF_INTERVAL_TO_LOOKBACK={lookback_meta['interval_min']}m | "
-            f"Prior Runs: [{prior_str}] | Anchor Window: {lookback_meta['window_start_dt']:%H:%M}..{lookback_meta['window_end_dt']:%H:%M}{COLOR_RESET}"
-        )
-    for n in notes:
-        print(f"   {COLOR_YELLOW}» {n}{COLOR_RESET}")
+        print(f"   {COLOR_DIM}» Lookback Engine: NO_OF_ITERATIONS={lookback_meta['num_iterations']} | INTERVAL={lookback_meta['interval_min']}m | Prior Runs: [{prior_str}] | Window: {lookback_meta['window_start_dt']:%H:%M}..{lookback_meta['window_end_dt']:%H:%M} | Max Gap: {MAX_TIMESTAMP_GAP_MINUTES}m{COLOR_RESET}")
+    for n in notes: print(f"   {COLOR_YELLOW}» {n}{COLOR_RESET}")
 
     needles = [track_symbol] if (track_symbol and track_symbol != "***") else []
     universe_raw = get_dynamic_universe(mode, cutoff_dt, today_session, needles=needles)
-    if STATS.auth_failed or not universe_raw:
-        return 1
+    if STATS.auth_failed or not universe_raw: return 1
     print(f"   {COLOR_DIM}» Universe: {len(universe_raw)} instruments{COLOR_RESET}")
 
     if mode == "INDEX_OPTIONS":
@@ -3014,15 +2418,13 @@ def run_screener(
         with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
             stock_candidates = [r for r in ex.map(_history_worker_daily, [(it, target_dt - timedelta(days=lookback_cal_days), target_dt, prog) for it in universe_raw]) if r is not None]
         prog.done()
-        if STATS.auth_failed or not stock_candidates:
-            return 1
+        if STATS.auth_failed or not stock_candidates: return 1
         print(f"   {COLOR_DIM}» Prefilter: {len(universe_raw)} -> {len(stock_candidates)} instruments{COLOR_RESET}")
 
     sector_index_candidates = _sectoral_indices_universe() if (ENABLE_SECTORAL_INDICES and mode != "INDEX_OPTIONS") else []
     all_candidates = sector_index_candidates + stock_candidates
-
     checkpoints = generate_checkpoints(cutoff_dt) if BACKTRACE_CHECKPOINTS else [cutoff_dt]
-    print(f"   {COLOR_DIM}» Backtrace checkpoints ({len(checkpoints)}): {', '.join(c.strftime('%H:%M') for c in checkpoints)}{COLOR_RESET}")
+    print(f"   {COLOR_DIM}» Checkpoints ({len(checkpoints)}): {', '.join(c.strftime('%H:%M') for c in checkpoints)}{COLOR_RESET}")
 
     extra_lookback_cps = []
     if lookback_meta["enabled"]:
@@ -3031,47 +2433,34 @@ def run_screener(
         for it_dt in lookback_meta["prior_iter_dts_chrono"]:
             it_cps = generate_checkpoints(it_dt) if BACKTRACE_CHECKPOINTS else [it_dt]
             for c in it_cps + [it_dt]:
-                if c not in cp_set:
-                    extra_set.add(c)
+                if c not in cp_set: extra_set.add(c)
         extra_lookback_cps = sorted(extra_set)
 
-    prog = Progress("checkpoints (indices + stocks)", len(all_candidates))
+    prog = Progress("checkpoints", len(all_candidates))
     with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
         per_symbol = list(ex.map(
             process_stock_checkpoints,
             [(item, checkpoints, extra_lookback_cps, today_session, MIN1_HISTORY_DAYS, mode, prog) for item in all_candidates]
         ))
     prog.done()
+    if STATS.auth_failed: return 1
 
-    if STATS.auth_failed:
-        return 1
     outcomes = [o for sym_outcomes, _ in per_symbol for o in sym_outcomes]
     results = [p for _, s, p in outcomes if s == "ok"]
     extra_results = [p for _, extra_outcomes in per_symbol for _, s, p in extra_outcomes if s == "ok"]
-    counts = {k: sum(1 for _, s, _ in outcomes if s == k) for k in ("no_data", "illiquid", "short_history", "error")}
-    print(f"   {COLOR_DIM}» Scan summary: {len(all_candidates)} instruments ({len(sector_index_candidates)} indices + {len(stock_candidates)} stocks) x {len(checkpoints)} checkpoints = {len(outcomes)} evaluations | ok {len(results)} | no data {counts['no_data']} | illiquid {counts['illiquid']} | short history {counts['short_history']} | errors {counts['error']}{COLOR_RESET}")
-    if not results:
-        return 1
+    if not results: return 1
 
-    # Primary by_index and by_stock maps (100% untouched for existing resultset)
     by_index, by_stock = {}, {}
     for row in results:
-        if row.get('IsSectorIndex'):
-            by_index.setdefault(row['Symbol'], []).append(row)
-        else:
-            by_stock.setdefault(row['Symbol'], []).append(row)
+        (by_index if row.get('IsSectorIndex') else by_stock).setdefault(row['Symbol'], []).append(row)
 
     idx_bulls, idx_bears, idx_grave = segregate_and_rank_buckets(by_index) if by_index else ([], [], [])
     stock_bulls, stock_bears, stock_grave = segregate_and_rank_buckets(by_stock)
 
-    # Build combined in-memory checkpoint map for lookback iterations
     by_index_all_cps = {k: list(v) for k, v in by_index.items()}
     by_stock_all_cps = {k: list(v) for k, v in by_stock.items()}
     for row in extra_results:
-        if row.get('IsSectorIndex'):
-            by_index_all_cps.setdefault(row['Symbol'], []).append(row)
-        else:
-            by_stock_all_cps.setdefault(row['Symbol'], []).append(row)
+        (by_index_all_cps if row.get('IsSectorIndex') else by_stock_all_cps).setdefault(row['Symbol'], []).append(row)
 
     idx_popup_res = evaluate_first_time_popups_in_memory(by_index_all_cps, idx_bulls, idx_bears, lookback_meta) if by_index_all_cps else {
         "new_bulls": [], "new_bears": [], "window_first_bulls": [], "window_first_bears": [], "iter_stats": []
@@ -3082,31 +2471,21 @@ def run_screener(
         combined_map = dict(by_index, **by_stock)
         print_and_alert_tracked_history(track_symbol, combined_map, live_run=not explicit)
 
-    # 1. Render Console Output (Existing Stage 1 & Stage 2 untouched + Stage 3 Segregated First-Time Popups)
     render_console_dashboard(
-        mode, cutoff_dt, checkpoints,
-        idx_bulls, idx_bears, idx_grave,
-        stock_bulls, stock_bears, stock_grave,
-        active_sector_filter=sector_filter,
-        lookback_meta=lookback_meta,
-        idx_popup_res=idx_popup_res,
-        stock_popup_res=stock_popup_res
+        mode, cutoff_dt, checkpoints, idx_bulls, idx_bears, idx_grave,
+        stock_bulls, stock_bears, stock_grave, active_sector_filter=sector_filter,
+        lookback_meta=lookback_meta, idx_popup_res=idx_popup_res, stock_popup_res=stock_popup_res
     )
 
-    # 2. Build Email Content & Evaluate Pure 1st-Time Email Gate
     email_inline_html, attachment_js_html = build_email_and_attachment_html(
-        mode, cutoff_dt, checkpoints,
-        idx_bulls, idx_bears, idx_grave,
-        stock_bulls, stock_bears, stock_grave,
-        lookback_meta=lookback_meta,
-        idx_popup_res=idx_popup_res,
-        stock_popup_res=stock_popup_res
+        mode, cutoff_dt, checkpoints, idx_bulls, idx_bears, idx_grave,
+        stock_bulls, stock_bears, stock_grave, lookback_meta=lookback_meta,
+        idx_popup_res=idx_popup_res, stock_popup_res=stock_popup_res
     )
 
     if SAVE_LOCAL_HTML_FILE and html_out:
         try:
-            with open(html_out, "w", encoding="utf-8") as f:
-                f.write(attachment_js_html)
+            with open(html_out, "w", encoding="utf-8") as f: f.write(attachment_js_html)
             print(f"   {COLOR_GREEN_FG}» Local HTML Dashboard saved to: {html_out}{COLOR_RESET}")
         except Exception as e:
             print(f"   {COLOR_YELLOW}» Could not write local HTML file ({e}){COLOR_RESET}")
@@ -3114,51 +2493,23 @@ def run_screener(
     if SEND_DASHBOARD_EMAIL:
         new_stk_b = stock_popup_res.get("new_bulls", [])
         new_stk_r = stock_popup_res.get("new_bears", [])
-        win_stk_b = stock_popup_res.get("window_first_bulls", [])
-        win_stk_r = stock_popup_res.get("window_first_bears", [])
-        new_b_cnt = len(new_stk_b)
-        new_r_cnt = len(new_stk_r)
-        win_b_cnt = len(win_stk_b)
-        win_r_cnt = len(win_stk_r)
-        pure_1st_time_total = new_b_cnt + new_r_cnt
+        new_b_cnt, new_r_cnt = len(new_stk_b), len(new_stk_r)
+        pure_total = new_b_cnt + new_r_cnt
         nb_ce, nb_pe = _ce_pe_counts(new_stk_b)
         nr_ce, nr_pe = _ce_pe_counts(new_stk_r)
 
-        if EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME_GT_0 and pure_1st_time_total <= 0:
-            print(
-                f"   {COLOR_YELLOW}📧 [dashboard-email] Skipped sending email: "
-                f"Pure 1st-Time (No *) popups = 0 (▲{new_b_cnt} ▼{new_r_cnt}) "
-                f"[EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME_GT_0=True].{COLOR_RESET}"
-            )
+        if EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME_GT_0 and pure_total <= 0:
+            print(f"   {COLOR_YELLOW}📧 [dashboard-email] Skipped sending: Pure 1st-Time count is 0 (▲{new_b_cnt} ▼{new_r_cnt}).{COLOR_RESET}")
         else:
             plain_text_report = build_full_untruncated_plain_text(
-                mode, cutoff_dt, checkpoints,
-                idx_bulls, idx_bears, idx_grave,
-                stock_bulls, stock_bears, stock_grave,
-                lookback_meta=lookback_meta,
-                idx_popup_res=idx_popup_res,
-                stock_popup_res=stock_popup_res
+                mode, cutoff_dt, checkpoints, idx_bulls, idx_bears, idx_grave,
+                stock_bulls, stock_bears, stock_grave, lookback_meta=lookback_meta,
+                idx_popup_res=idx_popup_res, stock_popup_res=stock_popup_res
             )
             w_start_s = lookback_meta["window_start_dt"].strftime("%H:%M") if (lookback_meta and lookback_meta.get("enabled")) else ""
             w_end_s = lookback_meta["window_end_dt"].strftime("%H:%M") if (lookback_meta and lookback_meta.get("enabled")) else cutoff_dt.strftime("%H:%M")
-            if EMAIL_ONLY_PURE_1ST_TIME_CONTENT:
-                email_subject = (
-                    f"[System3 {mode}] Pure 1st-Time (No *) ({w_start_s}..{w_end_s}): "
-                    f"{new_b_cnt}▲ (CE:{nb_ce} PE:{nb_pe}) | {new_r_cnt}▼ (CE:{nr_ce} PE:{nr_pe})"
-                )
-            else:
-                email_subject = (
-                    f"[System3 {mode}] Window Popups ({w_start_s}..{w_end_s}) | "
-                    f"All Window: {win_b_cnt}▲ {win_r_cnt}▼ | "
-                    f"Pure 1st-Time: {new_b_cnt}▲ (CE:{nb_ce} PE:{nb_pe}) {new_r_cnt}▼ (CE:{nr_ce} PE:{nr_pe})"
-                )
-            _send_email_message(
-                subject=email_subject,
-                plain_body=plain_text_report,
-                html_body=email_inline_html,
-                attachment_html=attachment_js_html,
-                tag="dashboard-email"
-            )
+            email_subject = f"[System3 {mode}] Pure 1st-Time (No *) ({w_start_s}..{w_end_s}): {new_b_cnt}▲ (CE:{nb_ce} PE:{nb_pe}) | {new_r_cnt}▼ (CE:{nr_ce} PE:{nr_pe})"
+            _send_email_message(subject=email_subject, plain_body=plain_text_report, html_body=email_inline_html, attachment_html=attachment_js_html, tag="dashboard-email")
 
     _print_error_summary()
     print(f"\n⏱️ Tracker sync completed in {(time.time() - t_start):.2f} seconds ({sum(l.total_calls for l in LIMITERS.values())} API calls).\n")
@@ -3179,51 +2530,36 @@ def parse_args():
     p.add_argument("--checkpoint-min", type=int, default=CHECKPOINT_INTERVAL_MIN)
     p.add_argument("--single-snapshot", action="store_true")
     p.add_argument("--isolate-session-bands", action="store_true", default=ISOLATE_SESSION_BANDS)
-    p.add_argument("--options-buying-only", dest="options_buying_only", action="store_true", default=OPTIONS_BUYING_ONLY, help="Trigger only on long option breakouts (rising CE -> BULL, rising PE -> BEAR).")
-    p.add_argument("--allow-option-selling", dest="options_buying_only", action="store_false", help="Allow short/falling option premium triggers.")
+    p.add_argument("--options-buying-only", dest="options_buying_only", action="store_true", default=OPTIONS_BUYING_ONLY)
+    p.add_argument("--allow-option-selling", dest="options_buying_only", action="store_false")
 
-    # --- Multi-Iteration Lookback Controls ---
-    p.add_argument("--no-of-iterations", "--iterations", dest="no_of_iterations", type=int, default=None, help="Number of prior lookback iterations to compare against (default: NO_OF_ITERATIONS in Section 0).")
-    p.add_argument("--lookback-interval", "--time-of-interval-to-lookback", dest="lookback_interval", type=int, default=None, help="Lookback interval in minutes between iterations (default: TIME_OF_INTERVAL_TO_LOOKBACK in Section 0).")
-    p.add_argument("--no-iteration-lookback", action="store_true", help="Disable multi-iteration first-time popup comparison.")
-    p.add_argument("--only-current-iter-popups", dest="only_current_iter_popups", action="store_true", default=PURE_1ST_TIME_CURRENT_ITER_ONLY, help="Only include setups whose FirstPopupIter equals the current snapshot time.")
+    # Multi-Iteration Lookback Controls
+    p.add_argument("--no-of-iterations", "--iterations", dest="no_of_iterations", type=int, default=None)
+    p.add_argument("--lookback-interval", "--time-of-interval-to-lookback", dest="lookback_interval", type=int, default=None)
+    p.add_argument("--no-iteration-lookback", action="store_true")
+    p.add_argument("--only-current-iter-popups", dest="only_current_iter_popups", action="store_true", default=PURE_1ST_TIME_CURRENT_ITER_ONLY)
 
-    # --- Email & Sectoral Controls ---
-    p.add_argument("--send-email", dest="send_email", action="store_true", default=SEND_DASHBOARD_EMAIL, help="Send email via SMTP secrets.")
-    p.add_argument("--no-send-email", dest="send_email", action="store_false", help="Disable sending email.")
-    p.add_argument(
-        "--email-only-when-pure-1st-time",
-        dest="email_only_when_pure_1st_time",
-        action="store_true",
-        default=_parse_bool_env(ENV_EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME, EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME_GT_0),
-        help="Send email ONLY if Pure 1st-Time (No *) popup count > 0."
-    )
-    p.add_argument(
-        "--email-always-send",
-        dest="email_only_when_pure_1st_time",
-        action="store_false",
-        help="Send email even if Pure 1st-Time (No *) count is 0."
-    )
-    p.add_argument(
-        "--email-only-pure-1st-time-content",
-        dest="email_only_pure_1st_time_content",
-        action="store_true",
-        default=_parse_bool_env(ENV_EMAIL_ONLY_PURE_1ST_TIME_CONTENT, EMAIL_ONLY_PURE_1ST_TIME_CONTENT),
-        help="Send ONLY the Pure 1st-Time (No *) part in the email."
-    )
-    p.add_argument(
-        "--email-all-window-popups-content",
-        dest="email_only_pure_1st_time_content",
-        action="store_false",
-        help="Include both All Window Popups (with *) and Pure 1st-Time Popups in the email."
-    )
-    p.add_argument("--save-html", dest="save_html", action="store_true", default=SAVE_LOCAL_HTML_FILE, help="Save local HTML file to disk.")
-    p.add_argument("--no-sector-indices", action="store_true", help="Disable Stage 1 Sectoral Index evaluation.")
-    p.add_argument("--sector", type=str, default="", help="Filter console Stock tables to a specific Sectoral Index.")
+    # Timestamp Gap & Risk-to-Reward Controls
+    p.add_argument("--max-timestamp-gap", type=int, default=None, help="Max gap in minutes between Seen Time and Anchor Time (default: MAX_TIMESTAMP_GAP_MINUTES).")
+    p.add_argument("--enable-timestamp-gap-check", dest="enable_timestamp_gap_check", action="store_true", default=None)
+    p.add_argument("--no-timestamp-gap-check", dest="enable_timestamp_gap_check", action="store_false")
+    p.add_argument("--rr-type", choices=["RISK_TO_REWARD", "REWARD_TO_RISK"], default=RR_RATIO_TYPE)
+    p.add_argument("--rr-sort", choices=["ASC", "DESC"], default=RR_SORT_ORDER)
+
+    # Email & Sectoral Controls
+    p.add_argument("--send-email", dest="send_email", action="store_true", default=SEND_DASHBOARD_EMAIL)
+    p.add_argument("--no-send-email", dest="send_email", action="store_false")
+    p.add_argument("--email-only-when-pure-1st-time", dest="email_only_when_pure_1st_time", action="store_true", default=_parse_bool_env(ENV_EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME, EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME_GT_0))
+    p.add_argument("--email-always-send", dest="email_only_when_pure_1st_time", action="store_false")
+    p.add_argument("--email-only-pure-1st-time-content", dest="email_only_pure_1st_time_content", action="store_true", default=_parse_bool_env(ENV_EMAIL_ONLY_PURE_1ST_TIME_CONTENT, EMAIL_ONLY_PURE_1ST_TIME_CONTENT))
+    p.add_argument("--email-all-window-popups-content", dest="email_only_pure_1st_time_content", action="store_false")
+    p.add_argument("--save-html", dest="save_html", action="store_true", default=SAVE_LOCAL_HTML_FILE)
+    p.add_argument("--no-sector-indices", action="store_true")
+    p.add_argument("--sector", type=str, default="")
     p.add_argument("--html-out", type=str, default=HTML_DASHBOARD_PATH)
     p.add_argument("--interactive", action="store_true")
 
-    # --- Indicator Periods & Band Multipliers ---
+    # Indicator Periods & Band Multipliers
     p.add_argument("--price-bb-period", type=int, default=PRICE_BB_PERIOD)
     p.add_argument("--price-bb-std", type=float, default=PRICE_BB_STD_MULT)
     p.add_argument("--price-kc-period", type=int, default=PRICE_KC_PERIOD)
@@ -3236,25 +2572,24 @@ def parse_args():
     p.add_argument("--ind-bb-period", type=int, default=IND_BB_PERIOD)
     p.add_argument("--vel-atr-period", type=int, default=VEL_ATR_PERIOD)
 
-    # --- 3-Lock Tripwires & Quorums ---
+    # 3-Lock Tripwires & Quorums
     p.add_argument("--shock-mult", type=float, default=KINETIC_SHOCK_ATR_MULT)
     p.add_argument("--ind-bb-std", type=float, default=IND_BB_PIERCE_STD)
     p.add_argument("--struct-quorum", type=int, default=STRUCT_QUORUM)
     p.add_argument("--shock-quorum", type=int, default=SHOCK_QUORUM)
     p.add_argument("--shock-window", type=int, default=SHOCK_WINDOW_BARS)
 
-    # --- Risk, Ratchet, Target/SL & Stop Floors ---
+    # Risk, Ratchet, Target/SL & Stop Floors
     p.add_argument("--min-atr-pct", type=float, default=MIN_ATR_PCT)
     p.add_argument("--hard-stop-atr", type=float, default=HARD_STOP_ATR_MULT)
     p.add_argument("--soft-stop-atr", type=float, default=SOFT_STOP_ATR_MULT)
-    p.add_argument("--target-atr", type=float, default=TARGET_ATR_MULT, help="Target distance in Base ATRs (default: TARGET_ATR_MULT in Section 0.7).")
-    p.add_argument("--sl-atr", type=float, default=SL_ATR_MULT, help="Stop-Loss distance in Base ATRs (default: SL_ATR_MULT in Section 0.7).")
+    p.add_argument("--target-atr", type=float, default=TARGET_ATR_MULT)
+    p.add_argument("--sl-atr", type=float, default=SL_ATR_MULT)
     p.add_argument("--soft-stop-score", type=int, default=SOFT_STOP_OPPOSING_SCORE)
     p.add_argument("--soft-disable-r", type=float, default=SOFT_STOP_DISABLE_R)
     p.add_argument("--profit-lock-trig-r", type=float, default=PROFIT_LOCK_TRIGGER_R)
     p.add_argument("--profit-lock-floor-r", type=float, default=PROFIT_LOCK_FLOOR_R)
     p.add_argument("--adverse-drift-r", type=float, default=ADVERSE_DRIFT_R_FLOOR)
-
     p.add_argument("--day-pct-basis", choices=["PREV_CLOSE", "OPEN"], default=DAY_PCT_BASIS)
     p.add_argument("--graveyard-max", type=int, default=TOP_N_GRAVEYARD)
     p.add_argument("--track", type=str, default="")
@@ -3282,14 +2617,31 @@ if __name__ == "__main__":
     PURE_1ST_TIME_CURRENT_ITER_ONLY = args.only_current_iter_popups
     ENABLE_SECTORAL_INDICES = not args.no_sector_indices
     ENABLE_ITERATION_LOOKBACK = not args.no_iteration_lookback
+
     if args.no_of_iterations is not None:
         NO_OF_ITERATIONS = args.no_of_iterations
         LOOKBACK_ITERATIONS = NO_OF_ITERATIONS
     if args.lookback_interval is not None:
         TIME_OF_INTERVAL_TO_LOOKBACK = args.lookback_interval
         LOOKBACK_INTERVAL_MIN = TIME_OF_INTERVAL_TO_LOOKBACK
-    HTML_DASHBOARD_PATH = args.html_out
 
+    if args.max_timestamp_gap is not None:
+        MAX_TIMESTAMP_GAP_MINUTES = args.max_timestamp_gap
+    else:
+        env_gap = os.environ.get(ENV_MAX_TIMESTAMP_GAP_MINUTES)
+        if env_gap and env_gap.strip() != "":
+            try: MAX_TIMESTAMP_GAP_MINUTES = int(env_gap)
+            except ValueError: pass
+
+    if args.enable_timestamp_gap_check is not None:
+        ENABLE_TIMESTAMP_GAP_CHECK = args.enable_timestamp_gap_check
+    else:
+        ENABLE_TIMESTAMP_GAP_CHECK = _parse_bool_env(ENV_ENABLE_TIMESTAMP_GAP_CHECK, ENABLE_TIMESTAMP_GAP_CHECK)
+
+    RR_RATIO_TYPE = args.rr_type or os.environ.get(ENV_RR_RATIO_TYPE, RR_RATIO_TYPE)
+    RR_SORT_ORDER = args.rr_sort or os.environ.get(ENV_RR_SORT_ORDER, RR_SORT_ORDER)
+
+    HTML_DASHBOARD_PATH = args.html_out
     PRICE_BB_PERIOD = args.price_bb_period
     PRICE_BB_STD_MULT = args.price_bb_std
     PRICE_KC_PERIOD = args.price_kc_period
@@ -3321,18 +2673,14 @@ if __name__ == "__main__":
 
     DAY_PCT_BASIS = args.day_pct_basis
     TOP_N_GRAVEYARD = args.graveyard_max
-    if args.single_snapshot:
-        BACKTRACE_CHECKPOINTS = False
+    if args.single_snapshot: BACKTRACE_CHECKPOINTS = False
 
     try:
         code = run_screener(
             args.mode, args.days, args.date, args.time,
-            track_symbol=args.track,
-            sector_filter=args.sector,
-            html_out=args.html_out,
-            interactive_cli=args.interactive,
-            lookback_iterations=args.no_of_iterations,
-            lookback_interval_min=args.lookback_interval
+            track_symbol=args.track, sector_filter=args.sector,
+            html_out=args.html_out, interactive_cli=args.interactive,
+            lookback_iterations=args.no_of_iterations, lookback_interval_min=args.lookback_interval
         )
     except Exception:
         print(f"\n{COLOR_RED_FG}💥 FATAL: unhandled exception -- full traceback follows.{COLOR_RESET}")
