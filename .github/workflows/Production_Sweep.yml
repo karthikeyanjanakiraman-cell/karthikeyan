@@ -9,7 +9,7 @@ on:
       trading_mode:
         description: 'Trading Universe'
         required: true
-        default: 'INDEX_OPTIONS'
+        default: 'STOCK_FNO'
         type: choice
         options:
           - STOCK_FNO
