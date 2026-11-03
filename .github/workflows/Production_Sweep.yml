@@ -68,39 +68,14 @@ jobs:
         # Tracking Security Variable (Priority 1)
         SECRET_TRACK: ${{ secrets.TRACK_SYMBOL }}
         
-        # GitHub Actions Manual Inputs (Priority 2)
-        PARAM_MODE: ${{ inputs.trading_mode }}
-        PARAM_BACKTEST_DATE: ${{ inputs.backtest_date }}
-        PARAM_BACKTEST_TIME: ${{ inputs.backtest_time }}
-        PARAM_TRACK: ${{ inputs.track_symbol }}
+        # Default fallback context for scheduled triggers
+        TRADING_MODE: ${{ github.event.inputs.trading_mode || 'INDEX_OPTIONS' }}
+        BACKTEST_DATE: ${{ github.event.inputs.backtest_date }}
+        BACKTEST_TIME: ${{ github.event.inputs.backtest_time }}
+        TRACK_SYMBOL: ${{ github.event.inputs.track_symbol }}
       run: |
-        # Base Execution Command
-        CMD="python -u System3.py"
+        # Run 1: Override TRADING_MODE explicitly for INDEX_OPTIONS
+        TRADING_MODE=INDEX_OPTIONS python main.py
         
-        # 1. Inject Trading Mode (Defaults to STOCK_FNO for automated cron runs)
-        if [ -n "$PARAM_MODE" ]; then
-          CMD="$CMD --mode $PARAM_MODE"
-        else
-          CMD="$CMD --mode STOCK_FNO"
-        fi
-        
-        # 2. Inject Optional Backtest Date
-        if [ -n "$PARAM_BACKTEST_DATE" ]; then
-          CMD="$CMD --date $PARAM_BACKTEST_DATE"
-        fi
-        
-        # 3. Inject Optional Backtest Time
-        if [ -n "$PARAM_BACKTEST_TIME" ]; then
-          CMD="$CMD --time $PARAM_BACKTEST_TIME"
-        fi
-
-        # 4. Inject Stateless Tracking Symbol (Secret > Manual Input)
-        if [ -n "$SECRET_TRACK" ]; then
-          CMD="$CMD --track \"$SECRET_TRACK\""
-        elif [ -n "$PARAM_TRACK" ]; then
-          CMD="$CMD --track \"$PARAM_TRACK\""
-        fi
-        
-        # Log and Execute
-        echo "Executing Command: $CMD"
-        eval $CMD
+        # Run 2: Override TRADING_MODE explicitly for STOCK_FNO
+        TRADING_MODE=STOCK_FNO python main.py
