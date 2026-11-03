@@ -33,7 +33,7 @@ on:
         type: string
 
 jobs:
-  # Job 1: Resolve which modes to include in the matrix
+  # Job 1: Resolve matrix modes
   setup_matrix:
     runs-on: ubuntu-latest
     outputs:
@@ -44,19 +44,18 @@ jobs:
         run: |
           INPUT_MODE="${{ inputs.trading_mode }}"
           
-          # If scheduled (empty input) or default dual option selected, run both in parallel
           if [ -z "$INPUT_MODE" ] || [ "$INPUT_MODE" = "BOTH (STOCK_FNO & INDEX_OPTIONS)" ]; then
-            echo 'modes=["STOCK_FNO", "INDEX_OPTIONS"]' >> $GITHUB_OUTPUT
+            echo 'modes=["STOCK_FNO", "INDEX_OPTIONS"]' >> "$GITHUB_OUTPUT"
           else
-            echo "modes=[\"$INPUT_MODE\"]" >> $GITHUB_OUTPUT
+            echo "modes=[\"$INPUT_MODE\"]" >> "$GITHUB_OUTPUT"
           fi
 
-  # Job 2: Runs concurrently for each mode output by Job 1
+  # Job 2: Run engines in parallel
   run_quant_engine:
     needs: setup_matrix
     runs-on: ubuntu-latest
     strategy:
-      fail-fast: false # Prevents one failing mode from aborting the other
+      fail-fast: false
       matrix:
         trading_mode: ${{ fromJson(needs:setup_matrix.outputs.matrix_modes) }}
 
@@ -68,59 +67,65 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
+          cache-dependency-path: '**/requirements.txt'
 
-      - name: Install AI Architecture Dependencies
+      - name: Cache Pip Wheelhouse (Fallback if no requirements.txt)
+        if: hashFiles('**/requirements.txt') == ''
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('**/requirements.txt') || 'v1-quant-deps' }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
+
+      - name: Install CPU-Optimized Architecture Dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install torch numpy pandas faiss-cpu xgboost scikit-learn requests yfinance fyers_apiv3
+          
+          # Install CPU-only PyTorch first to prevent 2GB+ CUDA download & runner OOMs
+          pip install --no-cache-dir torch --index-url https://download.pytorch.org/whl/cpu
+          
+          # Install analytical & broker packages
+          pip install numpy pandas faiss-cpu xgboost scikit-learn requests yfinance fyers_apiv3
 
       - name: Execute Stateful Hybrid Engine Scan
         env:
-          # Fyers Configurations
           FYERS_CLIENT_ID: ${{ secrets.CLIENT_ID }}
           FYERS_ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-          
-          # Email Alert Configurations
           SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
           SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
           RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
           SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
-          
-          # Upstox Token
           UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
-          
-          # Tracking Security Variable (Priority 1)
           SECRET_TRACK: ${{ secrets.TRACK_SYMBOL }}
-          
-          # GitHub Actions Inputs & Matrix Values
           CURRENT_MODE: ${{ matrix.trading_mode }}
           PARAM_BACKTEST_DATE: ${{ inputs.backtest_date }}
           PARAM_BACKTEST_TIME: ${{ inputs.backtest_time }}
           PARAM_TRACK: ${{ inputs.track_symbol }}
         run: |
-          # Base execution command with the active matrix mode
-          CMD="python -u System3.py --mode $CURRENT_MODE"
-          
-          # Optional backtest date
+          # Construct arguments using a bash array to avoid quoting/eval escape errors
+          ARGS=("-u" "System3.py" "--mode" "$CURRENT_MODE")
+
           if [ -n "$PARAM_BACKTEST_DATE" ]; then
-            CMD="$CMD --date $PARAM_BACKTEST_DATE"
+            ARGS+=("--date" "$PARAM_BACKTEST_DATE")
           fi
-          
-          # Optional backtest time
+
           if [ -n "$PARAM_BACKTEST_TIME" ]; then
-            CMD="$CMD --time $PARAM_BACKTEST_TIME"
+            ARGS+=("--time" "$PARAM_BACKTEST_TIME")
           fi
 
-          # Stateless tracking symbol (Secret > Manual Input)
           if [ -n "$SECRET_TRACK" ]; then
-            CMD="$CMD --track \"$SECRET_TRACK\""
+            ARGS+=("--track" "$SECRET_TRACK")
           elif [ -n "$PARAM_TRACK" ]; then
-            CMD="$CMD --track \"$PARAM_TRACK\""
+            ARGS+=("--track" "$PARAM_TRACK")
           fi
 
           echo "=============================================="
-          echo "Running parallel sweep for: $CURRENT_MODE"
-          echo "Command: $CMD"
+          echo "Executing parallel scan for: $CURRENT_MODE"
+          echo "Arguments: ${ARGS[*]}"
           echo "=============================================="
-          eval $CMD
+
+          # Direct execution preserves exact arguments, quotes, and exit codes
+          python "${ARGS[@]}"
