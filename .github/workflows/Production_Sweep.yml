@@ -33,30 +33,8 @@ on:
         type: string
 
 jobs:
-  setup_matrix:
-    runs-on: ubuntu-latest
-    outputs:
-      matrix_modes: ${{ steps.set_modes.outputs.modes }}
-    steps:
-      - name: Resolve Execution Matrix
-        id: set_modes
-        run: |
-          INPUT_MODE="${{ inputs.trading_mode }}"
-          
-          if [ -z "$INPUT_MODE" ] || [ "$INPUT_MODE" = "BOTH (STOCK_FNO & INDEX_OPTIONS)" ]; then
-            echo 'modes=["STOCK_FNO", "INDEX_OPTIONS"]' >> "$GITHUB_OUTPUT"
-          else
-            echo "modes=[\"$INPUT_MODE\"]" >> "$GITHUB_OUTPUT"
-          fi
-
   run_quant_engine:
-    needs: setup_matrix
     runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        # FIXED: Uses dot notation (needs.setup_matrix) instead of a colon
-        trading_mode: ${{ fromJson(needs.setup_matrix.outputs.matrix_modes) }}
 
     steps:
       - name: Checkout Code Repository
@@ -67,13 +45,13 @@ jobs:
         with:
           python-version: '3.11'
 
-      - name: Cache Pip Packages
+      - name: Cache Pip Wheelhouse
         uses: actions/cache@v4
         with:
           path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-v2-${{ github.job }}
+          key: ${{ runner.os }}-pip-v4
           restore-keys: |
-            ${{ runner.os }}-pip-v2-
+            ${{ runner.os }}-pip-
 
       - name: Install Architecture Dependencies
         run: |
@@ -81,7 +59,7 @@ jobs:
           pip install torch --index-url https://download.pytorch.org/whl/cpu
           pip install numpy pandas faiss-cpu xgboost scikit-learn requests yfinance fyers_apiv3
 
-      - name: Execute Stateful Hybrid Engine Scan
+      - name: Execute Sequential AI Sweep
         env:
           FYERS_CLIENT_ID: ${{ secrets.CLIENT_ID }}
           FYERS_ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
@@ -92,30 +70,55 @@ jobs:
           SMTP_PORT: ${{ secrets.SMTP_PORT }}
           UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
           SECRET_TRACK: ${{ secrets.TRACK_SYMBOL }}
-          CURRENT_MODE: ${{ matrix.trading_mode }}
+          INPUT_MODE: ${{ inputs.trading_mode }}
           PARAM_BACKTEST_DATE: ${{ inputs.backtest_date }}
           PARAM_BACKTEST_TIME: ${{ inputs.backtest_time }}
           PARAM_TRACK: ${{ inputs.track_symbol }}
         run: |
-          ARGS=("-u" "System3.py" "--mode" "$CURRENT_MODE")
+          # 1. Determine modes to run
+          if [ -z "$INPUT_MODE" ] || [ "$INPUT_MODE" = "BOTH (STOCK_FNO & INDEX_OPTIONS)" ]; then
+            MODES=("STOCK_FNO" "INDEX_OPTIONS")
+          else
+            MODES=("$INPUT_MODE")
+          fi
+
+          # 2. Build common CLI arguments
+          EXTRA_ARGS=()
 
           if [ -n "$PARAM_BACKTEST_DATE" ]; then
-            ARGS+=("--date" "$PARAM_BACKTEST_DATE")
+            EXTRA_ARGS+=("--date" "$PARAM_BACKTEST_DATE")
           fi
 
           if [ -n "$PARAM_BACKTEST_TIME" ]; then
-            ARGS+=("--time" "$PARAM_BACKTEST_TIME")
+            EXTRA_ARGS+=("--time" "$PARAM_BACKTEST_TIME")
           fi
 
           if [ -n "$SECRET_TRACK" ]; then
-            ARGS+=("--track" "$SECRET_TRACK")
+            EXTRA_ARGS+=("--track" "$SECRET_TRACK")
           elif [ -n "$PARAM_TRACK" ]; then
-            ARGS+=("--track" "$PARAM_TRACK")
+            EXTRA_ARGS+=("--track" "$PARAM_TRACK")
           fi
 
-          echo "=============================================="
-          echo "Executing parallel scan for: $CURRENT_MODE"
-          echo "Arguments: ${ARGS[*]}"
-          echo "=============================================="
+          # 3. Iterate sequentially
+          for MODE in "${MODES[@]}"; do
+            echo "=============================================="
+            echo "Starting Engine for Mode: $MODE"
+            echo "=============================================="
 
-          python "${ARGS[@]}"
+            # Build command array for this mode
+            CMD_ARGS=("-u" "System3.py" "--mode" "$MODE")
+
+            # For INDEX_OPTIONS, force email send so it doesn't get skipped when pure popups = 0
+            if [ "$MODE" = "INDEX_OPTIONS" ]; then
+              CMD_ARGS+=("--email-always-send" "--email-all-window-popups-content")
+            fi
+
+            CMD_ARGS+=("${EXTRA_ARGS[@]}")
+
+            # Run Python script
+            python "${CMD_ARGS[@]}"
+
+            echo "Finished execution for $MODE"
+            # 5-second pause to prevent SMTP throttle / API concurrency lockouts
+            sleep 5
+          done
