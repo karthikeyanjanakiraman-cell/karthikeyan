@@ -55,7 +55,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        trading_mode: ${{ fromJson(needs:setup_matrix.outputs.matrix_modes) }}
+        # FIXED: Uses dot notation (needs.setup_matrix) instead of a colon
+        trading_mode: ${{ fromJson(needs.setup_matrix.outputs.matrix_modes) }}
 
     steps:
       - name: Checkout Code Repository
@@ -66,7 +67,6 @@ jobs:
         with:
           python-version: '3.11'
 
-      # Standard pip directory caching (safe even if requirements.txt does not exist)
       - name: Cache Pip Packages
         uses: actions/cache@v4
         with:
@@ -78,11 +78,7 @@ jobs:
       - name: Install Architecture Dependencies
         run: |
           python -m pip install --upgrade pip
-          
-          # Install CPU PyTorch to prevent gigabytes of CUDA packages on CPU runner
           pip install torch --index-url https://download.pytorch.org/whl/cpu
-          
-          # Install analytical & trading packages
           pip install numpy pandas faiss-cpu xgboost scikit-learn requests yfinance fyers_apiv3
 
       - name: Execute Stateful Hybrid Engine Scan
