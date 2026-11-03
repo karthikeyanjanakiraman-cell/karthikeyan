@@ -9,12 +9,13 @@ on:
       trading_mode:
         description: 'Trading Universe'
         required: true
-        default: 'INDEX_OPTIONS'
+        default: 'BOTH (STOCK_FNO & INDEX_OPTIONS)'
         type: choice
         options:
+          - 'BOTH (STOCK_FNO & INDEX_OPTIONS)'
           - STOCK_FNO
-          - CASH_EQUITY
           - INDEX_OPTIONS
+          - CASH_EQUITY
       backtest_date:
         description: 'Optional Backtest Date (YYYY-MM-DD)'
         required: false
@@ -32,75 +33,94 @@ on:
         type: string
 
 jobs:
-  run_quant_engine:
+  # Job 1: Resolve which modes to include in the matrix
+  setup_matrix:
     runs-on: ubuntu-latest
-    
+    outputs:
+      matrix_modes: ${{ steps.set_modes.outputs.modes }}
     steps:
-    - name: Checkout Code Repository
-      uses: actions/checkout@v4
+      - name: Resolve Execution Matrix
+        id: set_modes
+        run: |
+          INPUT_MODE="${{ inputs.trading_mode }}"
+          
+          # If scheduled (empty input) or default dual option selected, run both in parallel
+          if [ -z "$INPUT_MODE" ] || [ "$INPUT_MODE" = "BOTH (STOCK_FNO & INDEX_OPTIONS)" ]; then
+            echo 'modes=["STOCK_FNO", "INDEX_OPTIONS"]' >> $GITHUB_OUTPUT
+          else
+            echo "modes=[\"$INPUT_MODE\"]" >> $GITHUB_OUTPUT
+          fi
 
-    - name: Initialize Python 3.11 Runtime
-      uses: actions/setup-python@v5
-      with:
-        python-version: '3.11'
+  # Job 2: Runs concurrently for each mode output by Job 1
+  run_quant_engine:
+    needs: setup_matrix
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false # Prevents one failing mode from aborting the other
+      matrix:
+        trading_mode: ${{ fromJson(needs:setup_matrix.outputs.matrix_modes) }}
 
-    - name: Install AI Architecture Dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install torch numpy pandas faiss-cpu xgboost scikit-learn requests yfinance fyers_apiv3
+    steps:
+      - name: Checkout Code Repository
+        uses: actions/checkout@v4
 
-    - name: Execute Stateful Hybrid Engine Scan
-      env:
-        # Fyers Configurations
-        FYERS_CLIENT_ID: ${{ secrets.CLIENT_ID }}
-        FYERS_ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
-        
-        # Email Alert Configurations
-        SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
-        SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
-        RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
-        SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
-        SMTP_PORT: ${{ secrets.SMTP_PORT }}
-        
-        # Upstox Token
-        UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
-        
-        # Tracking Security Variable (Priority 1)
-        SECRET_TRACK: ${{ secrets.TRACK_SYMBOL }}
-        
-        # GitHub Actions Manual Inputs (Priority 2)
-        PARAM_MODE: ${{ inputs.trading_mode }}
-        PARAM_BACKTEST_DATE: ${{ inputs.backtest_date }}
-        PARAM_BACKTEST_TIME: ${{ inputs.backtest_time }}
-        PARAM_TRACK: ${{ inputs.track_symbol }}
-      run: |
-        # Base Execution Command
-        CMD="python -u System3.py"
-        
-        # 1. Inject Trading Mode (Defaults to STOCK_FNO for automated cron runs)
-        if [ -n "$PARAM_MODE" ]; then
-          CMD="$CMD --mode $PARAM_MODE"
-        else
-          CMD="$CMD --mode STOCK_FNO"
-        fi
-        
-        # 2. Inject Optional Backtest Date
-        if [ -n "$PARAM_BACKTEST_DATE" ]; then
-          CMD="$CMD --date $PARAM_BACKTEST_DATE"
-        fi
-        
-        # 3. Inject Optional Backtest Time
-        if [ -n "$PARAM_BACKTEST_TIME" ]; then
-          CMD="$CMD --time $PARAM_BACKTEST_TIME"
-        fi
+      - name: Initialize Python 3.11 Runtime
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
 
-        # 4. Inject Stateless Tracking Symbol (Secret > Manual Input)
-        if [ -n "$SECRET_TRACK" ]; then
-          CMD="$CMD --track \"$SECRET_TRACK\""
-        elif [ -n "$PARAM_TRACK" ]; then
-          CMD="$CMD --track \"$PARAM_TRACK\""
-        fi
-        
-        # Log and Execute
-        echo "Executing Command: $CMD"
-        eval $CMD
+      - name: Install AI Architecture Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install torch numpy pandas faiss-cpu xgboost scikit-learn requests yfinance fyers_apiv3
+
+      - name: Execute Stateful Hybrid Engine Scan
+        env:
+          # Fyers Configurations
+          FYERS_CLIENT_ID: ${{ secrets.CLIENT_ID }}
+          FYERS_ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          
+          # Email Alert Configurations
+          SENDER_EMAIL: ${{ secrets.SENDER_EMAIL }}
+          SENDER_PASSWORD: ${{ secrets.SENDER_PASSWORD }}
+          RECIPIENT_EMAIL: ${{ secrets.RECIPIENT_EMAIL }}
+          SMTP_SERVER: ${{ secrets.SMTP_SERVER }}
+          SMTP_PORT: ${{ secrets.SMTP_PORT }}
+          
+          # Upstox Token
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+          
+          # Tracking Security Variable (Priority 1)
+          SECRET_TRACK: ${{ secrets.TRACK_SYMBOL }}
+          
+          # GitHub Actions Inputs & Matrix Values
+          CURRENT_MODE: ${{ matrix.trading_mode }}
+          PARAM_BACKTEST_DATE: ${{ inputs.backtest_date }}
+          PARAM_BACKTEST_TIME: ${{ inputs.backtest_time }}
+          PARAM_TRACK: ${{ inputs.track_symbol }}
+        run: |
+          # Base execution command with the active matrix mode
+          CMD="python -u System3.py --mode $CURRENT_MODE"
+          
+          # Optional backtest date
+          if [ -n "$PARAM_BACKTEST_DATE" ]; then
+            CMD="$CMD --date $PARAM_BACKTEST_DATE"
+          fi
+          
+          # Optional backtest time
+          if [ -n "$PARAM_BACKTEST_TIME" ]; then
+            CMD="$CMD --time $PARAM_BACKTEST_TIME"
+          fi
+
+          # Stateless tracking symbol (Secret > Manual Input)
+          if [ -n "$SECRET_TRACK" ]; then
+            CMD="$CMD --track \"$SECRET_TRACK\""
+          elif [ -n "$PARAM_TRACK" ]; then
+            CMD="$CMD --track \"$PARAM_TRACK\""
+          fi
+
+          echo "=============================================="
+          echo "Running parallel sweep for: $CURRENT_MODE"
+          echo "Command: $CMD"
+          echo "=============================================="
+          eval $CMD
