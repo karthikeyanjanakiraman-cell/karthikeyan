@@ -2104,7 +2104,7 @@ def build_full_untruncated_plain_text(
             iter_cell = f"{r.get('FirstPopupIter', r['CheckpointTime'].strftime('%H:%M')):^7} {r.get('PopupType', '1ST-TIME'):^13} | " if show_first_iter else ""
             lines.append(
                 f"{_clip(r['Symbol'], sym_w, EMAIL_CLIP_SYMBOLS):<{sym_w}} {rr_str:^7} {ltp_val} {tgt_p:>9.2f} {sl_p:>9.2f} | {sec_cell}{iter_cell}"
-                f"{r['CheckpointTime'].strftime('%H:%M'):^5} {anchor_disp:^7} {row['AnchorPrice']:>9.2f} "
+                f"{r['CheckpointTime'].strftime('%H:%M'):^5} {anchor_disp:^7} {r['AnchorPrice']:>9.2f} "
                 f"{r_mult_str:>15} |   {a_str}  |   {b_str}  | {shown_state:^13}"
             )
         lines.append("")
@@ -2125,8 +2125,8 @@ def build_full_untruncated_plain_text(
             if new_idx_b or new_idx_r:
                 _fmt_active_block("PURE FIRST-TIME SECTORAL INDEX POPUPS — BULL", new_idx_b, show_sector=False, show_first_iter=True, include_ce_pe_counts=False)
                 _fmt_active_block("PURE FIRST-TIME SECTORAL INDEX POPUPS — BEAR", new_idx_r, show_sector=False, show_first_iter=True, include_ce_pe_counts=False)
-            _fmt_active_block(f"PURE FIRST-TIME STOCK POPUPS — BULL", new_stk_b, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
-            _fmt_active_block(f"PURE FIRST-TIME STOCK POPUPS — BEAR", new_stk_r, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
+            _fmt_active_block("PURE FIRST-TIME STOCK POPUPS — BULL", new_stk_b, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
+            _fmt_active_block("PURE FIRST-TIME STOCK POPUPS — BEAR", new_stk_r, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
             return "\n".join(lines)
 
     lines.append(f"=== SYSTEM 3.0 INSTITUTIONAL VOLATILITY TRACKER [{mode}] ===")
