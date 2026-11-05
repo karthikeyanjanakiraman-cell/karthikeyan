@@ -3,6 +3,8 @@
 Strict Institutional Volatility Tracker (Upstox) - System 3.0
 + Configurable Timestamp Gap Check: Filters stale setups where (Seen - Anchor) > MAX_TIMESTAMP_GAP_MINUTES.
 + Risk-to-Reward (R:R) Column: Formatted like 0.1:1, 0.28:1 before LTP/Exit, sorted ascending for Bulls and Bears.
++ Dedicated Still-Holding Good Email: Sends a separate email for active setups that triggered earlier (e.g. 09:43) and still hold good at snapshot time.
++ Sectoral Indices in Pure 1st-Time Email: Sectoral index popups are now seamlessly included alongside stock popups in the Pure 1st-Time email.
 """
 import os, sys, re, html, argparse, traceback, urllib.parse, gzip, json, time, threading
 from bisect import bisect_left
@@ -31,6 +33,14 @@ EMAIL_ATTACH_INTERACTIVE_HTML = True
 EMAIL_ATTACHMENT_FILENAME = "System3_Pure_1stTime_Popups.html"
 SAVE_LOCAL_HTML_FILE = False
 HTML_DASHBOARD_PATH = "system3_dashboard.html"
+
+# --- 0.1B STILL HOLDING GOOD EMAIL CONFIGURATION ---
+SEND_STILL_HOLDING_EMAIL = True                  # Master toggle: send separate email for setups that still hold good
+EMAIL_SEND_ONLY_WHEN_STILL_HOLDING_GT_0 = True   # Only send if at least 1 setup still holds good
+EMAIL_ATTACH_STILL_HOLDING_HTML = True           # Attach interactive HTML for still-holding setups
+EMAIL_STILL_HOLDING_ATTACHMENT_FILENAME = "System3_Still_Holding_Setups.html"
+ENV_SEND_STILL_HOLDING_EMAIL = "SEND_STILL_HOLDING_EMAIL"
+ENV_EMAIL_SEND_ONLY_WHEN_STILL_HOLDING_GT_0 = "EMAIL_SEND_ONLY_WHEN_STILL_HOLDING_GT_0"
 
 EMAIL_MAX_BUYERS = 0
 EMAIL_MAX_SELLERS = 0
@@ -284,7 +294,7 @@ LIVE_QUOTE_FALLBACK_MIN = 3
 SPOT_1M_LOOKBACK_DAYS = 5
 SPOT_DAILY_LOOKBACK_DAYS = 10
 INDEX_CONFIG = {
-    "NIFTY":     {"spot_key": "NSE_INDEX|Nifty 50",          "aliases": {"NIFTY", "NIFTY 50"}},
+    "NIFTY":      {"spot_key": "NSE_INDEX|Nifty 50",          "aliases": {"NIFTY", "NIFTY 50"}},
     "BANKNIFTY": {"spot_key": "NSE_INDEX|Nifty Bank",        "aliases": {"BANKNIFTY", "NIFTY BANK"}},
     "FINNIFTY":  {"spot_key": "NSE_INDEX|Nifty Fin Service", "aliases": {"FINNIFTY", "NIFTY FIN SERVICE"}},
     "SENSEX":    {"spot_key": "BSE_INDEX|SENSEX",            "aliases": {"SENSEX", "BSE SENSEX", "BSESN"}},
@@ -1622,7 +1632,18 @@ def sort_rows_by_script_count(rows_list):
     ))
     return rows_list
 
-def segregate_and_rank_buckets(by_symbol_map):
+def segregate_and_rank_buckets(by_symbol_map, filter_timestamp_gap=None, filter_popup_strict=None):
+    """
+    Segregates raw checkpoints into Bulls Live, Bears Live and Graveyard.
+    filter_timestamp_gap: If True, filters out setups where (Seen - Anchor) > MAX_TIMESTAMP_GAP_MINUTES.
+                          Pass False to retrieve ALL active setups that still hold good regardless of age.
+    filter_popup_strict:  If True, applies strict popup checks (R-Multiple floor and kinetic decay).
+    """
+    if filter_timestamp_gap is None:
+        filter_timestamp_gap = ENABLE_TIMESTAMP_GAP_CHECK
+    if filter_popup_strict is None:
+        filter_popup_strict = STRICT_FIRST_TIME_POPUP_FILTER
+
     bulls_live, bears_live, graveyard_candidates = [], [], []
 
     for symbol, rows in by_symbol_map.items():
@@ -1662,13 +1683,13 @@ def segregate_and_rank_buckets(by_symbol_map):
         if not (_r_multiple(r) > drift_floor or _r_multiple(r, include_banked=True) > BANKED_R_PROTECTION_FLOOR):
             r['RejectReason'] = f"Adverse Drift (Losing R-Multiple < {drift_floor:g}R)"
             graveyard_candidates.append(r)
-        elif ENABLE_TIMESTAMP_GAP_CHECK and MAX_TIMESTAMP_GAP_MINUTES > 0 and _get_timestamp_gap_min(r) > MAX_TIMESTAMP_GAP_MINUTES:
+        elif filter_timestamp_gap and MAX_TIMESTAMP_GAP_MINUTES > 0 and _get_timestamp_gap_min(r) > MAX_TIMESTAMP_GAP_MINUTES:
             r['RejectReason'] = f"Timestamp Gap Stale ({_get_timestamp_gap_min(r)}m > {MAX_TIMESTAMP_GAP_MINUTES}m)"
             graveyard_candidates.append(r)
-        elif STRICT_FIRST_TIME_POPUP_FILTER and _r_multiple(r) < float(POPUP_MIN_R_MULTIPLE) - 1e-6:
+        elif filter_popup_strict and _r_multiple(r) < float(POPUP_MIN_R_MULTIPLE) - 1e-6:
             r['RejectReason'] = f"Underwater Setup (Live R-Multiple {_r_multiple(r):+.2f}R < {POPUP_MIN_R_MULTIPLE:g}R)"
             graveyard_candidates.append(r)
-        elif STRICT_FIRST_TIME_POPUP_FILTER and POPUP_REQUIRE_NON_ZERO_GRID and (
+        elif filter_popup_strict and POPUP_REQUIRE_NON_ZERO_GRID and (
             sum(int(v or 0) for v in (r.get('ATR_Grid') or {}).values()) <= 0 and sum(int(v or 0) for v in (r.get('BB_Grid') or {}).values()) <= 0
         ):
             r['RejectReason'] = "Kinetic Decay (Both ATR & BB Grids at 0 0 0 0)"
@@ -1680,13 +1701,13 @@ def segregate_and_rank_buckets(by_symbol_map):
         if not (_r_multiple(r) > drift_floor or _r_multiple(r, include_banked=True) > BANKED_R_PROTECTION_FLOOR):
             r['RejectReason'] = f"Adverse Drift (Losing R-Multiple < {drift_floor:g}R)"
             graveyard_candidates.append(r)
-        elif ENABLE_TIMESTAMP_GAP_CHECK and MAX_TIMESTAMP_GAP_MINUTES > 0 and _get_timestamp_gap_min(r) > MAX_TIMESTAMP_GAP_MINUTES:
+        elif filter_timestamp_gap and MAX_TIMESTAMP_GAP_MINUTES > 0 and _get_timestamp_gap_min(r) > MAX_TIMESTAMP_GAP_MINUTES:
             r['RejectReason'] = f"Timestamp Gap Stale ({_get_timestamp_gap_min(r)}m > {MAX_TIMESTAMP_GAP_MINUTES}m)"
             graveyard_candidates.append(r)
-        elif STRICT_FIRST_TIME_POPUP_FILTER and _r_multiple(r) < float(POPUP_MIN_R_MULTIPLE) - 1e-6:
+        elif filter_popup_strict and _r_multiple(r) < float(POPUP_MIN_R_MULTIPLE) - 1e-6:
             r['RejectReason'] = f"Underwater Setup (Live R-Multiple {_r_multiple(r):+.2f}R < {POPUP_MIN_R_MULTIPLE:g}R)"
             graveyard_candidates.append(r)
-        elif STRICT_FIRST_TIME_POPUP_FILTER and POPUP_REQUIRE_NON_ZERO_GRID and (
+        elif filter_popup_strict and POPUP_REQUIRE_NON_ZERO_GRID and (
             sum(int(v or 0) for v in (r.get('ATR_Grid') or {}).values()) <= 0 and sum(int(v or 0) for v in (r.get('BB_Grid') or {}).values()) <= 0
         ):
             r['RejectReason'] = "Kinetic Decay (Both ATR & BB Grids at 0 0 0 0)"
@@ -2083,7 +2104,7 @@ def build_full_untruncated_plain_text(
             iter_cell = f"{r.get('FirstPopupIter', r['CheckpointTime'].strftime('%H:%M')):^7} {r.get('PopupType', '1ST-TIME'):^13} | " if show_first_iter else ""
             lines.append(
                 f"{_clip(r['Symbol'], sym_w, EMAIL_CLIP_SYMBOLS):<{sym_w}} {rr_str:^7} {ltp_val} {tgt_p:>9.2f} {sl_p:>9.2f} | {sec_cell}{iter_cell}"
-                f"{r['CheckpointTime'].strftime('%H:%M'):^5} {anchor_disp:^7} {r['AnchorPrice']:>9.2f} "
+                f"{r['CheckpointTime'].strftime('%H:%M'):^5} {anchor_disp:^7} {row['AnchorPrice']:>9.2f} "
                 f"{r_mult_str:>15} |   {a_str}  |   {b_str}  | {shown_state:^13}"
             )
         lines.append("")
@@ -2097,13 +2118,22 @@ def build_full_untruncated_plain_text(
         if EMAIL_ONLY_PURE_1ST_TIME_CONTENT:
             lines.append(f"=== SYSTEM 3.0 [{mode}] — PURE 1ST-TIME POPUPS (NO *) REPORT ({w_start_s}..{w_end_s}) ===")
             lines.append(f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Anchor Window: {w_start_s} to {w_end_s}")
-            lines.append(f"Pure 1st-Time Popups: ▲ {len(new_stk_b)} Bull [CE({nb_ce}) PE({nb_pe})] / ▼ {len(new_stk_r)} Bear [CE({nr_ce}) PE({nr_pe})]\n")
+            lines.append(
+                f"Sectoral Indices Pure 1st-Time: ▲ {len(new_idx_b)} Bull / ▼ {len(new_idx_r)} Bear | "
+                f"Stocks Pure 1st-Time: ▲ {len(new_stk_b)} Bull [CE({nb_ce}) PE({nb_pe})] / ▼ {len(new_stk_r)} Bear [CE({nr_ce}) PE({nr_pe})]\n"
+            )
+            if new_idx_b or new_idx_r:
+                _fmt_active_block("PURE FIRST-TIME SECTORAL INDEX POPUPS — BULL", new_idx_b, show_sector=False, show_first_iter=True, include_ce_pe_counts=False)
+                _fmt_active_block("PURE FIRST-TIME SECTORAL INDEX POPUPS — BEAR", new_idx_r, show_sector=False, show_first_iter=True, include_ce_pe_counts=False)
             _fmt_active_block(f"PURE FIRST-TIME STOCK POPUPS — BULL", new_stk_b, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
             _fmt_active_block(f"PURE FIRST-TIME STOCK POPUPS — BEAR", new_stk_r, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
             return "\n".join(lines)
 
     lines.append(f"=== SYSTEM 3.0 INSTITUTIONAL VOLATILITY TRACKER [{mode}] ===")
     lines.append(f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')}\n")
+    if idx_bulls or idx_bears:
+        _fmt_active_block("SECTORAL INDICES — TOP BULL SETUPS", idx_bulls, show_sector=False, include_ce_pe_counts=False)
+        _fmt_active_block("SECTORAL INDICES — TOP BEAR SETUPS", idx_bears, show_sector=False, include_ce_pe_counts=False)
     _fmt_active_block("ALL STOCKS — TOP BULL SETUPS", e_bulls, show_sector=True, include_ce_pe_counts=True)
     _fmt_active_block("ALL STOCKS — TOP BEAR SETUPS", e_bears, show_sector=True, include_ce_pe_counts=True)
     return "\n".join(lines)
@@ -2210,6 +2240,8 @@ def build_email_and_attachment_html(
 
     email_stk_b = new_stk_b if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else win_stk_b
     email_stk_r = new_stk_r if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else win_stk_r
+    email_idx_b = new_idx_b if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else win_idx_b
+    email_idx_r = new_idx_r if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else win_idx_r
 
     sector_accordions = []
     all_sector_keys = list(dict.fromkeys(list(SECTORAL_INDEX_CONFIG.keys()) + list(INDEX_CONFIG.keys()) + [DEFAULT_UNMAPPED_SECTOR]))
@@ -2239,17 +2271,31 @@ def build_email_and_attachment_html(
         f"<div style='font-size:17px;font-weight:800;color:#0f172a;margin-bottom:6px;'>📡 SYSTEM 3.0 [{html.escape(mode)}] — PURE 1ST-TIME POPUPS ({w_start_s}..{w_end_s})</div>"
         f"<div style='color:#334155;font-size:13px;margin-bottom:4px;'>"
         f"<b>Target Snapshot:</b> {cutoff_dt.strftime('%Y-%m-%d %H:%M')} &nbsp;|&nbsp; <b>Anchor Window:</b> <span style='background-color:#e0f2fe;color:#0369a1;padding:2px 6px;border-radius:4px;font-weight:700;'>{w_start_s} to {w_end_s}</span> &nbsp;|&nbsp; <b>Max Gap:</b> {MAX_TIMESTAMP_GAP_MINUTES}m</div>"
-        f"<div style='color:#334155;font-size:12px;'>"
-        f"<b>Pure 1st-Time:</b> <span style='color:#15803d;font-weight:700;'>▲ {len(new_stk_b)} Bull [CE({nb_ce}) PE({nb_pe})]</span> &nbsp;/&nbsp; <span style='color:#b91c1c;font-weight:700;'>▼ {len(new_stk_r)} Bear [CE({nr_ce}) PE({nr_pe})]</span>"
+        f"<div style='color:#334155;font-size:12px;margin-top:4px;'>"
+        f"<b>Sectoral Indices:</b> <span style='color:#15803d;font-weight:700;'>▲ {len(email_idx_b)} Bull</span> &nbsp;/&nbsp; <span style='color:#b91c1c;font-weight:700;'>▼ {len(email_idx_r)} Bear</span> &nbsp;|&nbsp; "
+        f"<b>Stocks:</b> <span style='color:#15803d;font-weight:700;'>▲ {len(email_stk_b)} Bull [CE({nb_ce}) PE({nb_pe})]</span> &nbsp;/&nbsp; <span style='color:#b91c1c;font-weight:700;'>▼ {len(email_stk_r)} Bear [CE({nr_ce}) PE({nr_pe})]</span>"
         f"</div></div>"
     )
 
-    main_tables_html = (
-        f"{_sec_banner(f'🆕🔥 PURE FIRST-TIME STOCK POPUPS — BULL {_format_count_with_ce_pe(new_stk_b)}', True)}"
-        f"{_table_active_html(new_stk_b, 'BULL', show_sec=True, show_first_iter=True)}"
-        f"{_sec_banner(f'🆕🩸 PURE FIRST-TIME STOCK POPUPS — BEAR {_format_count_with_ce_pe(new_stk_r)}', False)}"
-        f"{_table_active_html(new_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}"
+    idx_section_html = ""
+    if email_idx_b or email_idx_r:
+        idx_section_html = (
+            f"<div style='font-size:15px;font-weight:800;color:#0f172a;margin:18px 0 6px 0;'>🏛️ SECTORAL INDICES — PURE FIRST-TIME POPUPS</div>"
+            + (f"{_sec_banner(f'🏛️🆕🔥 PURE FIRST-TIME SECTORAL INDEX POPUPS — BULL ({len(email_idx_b)})', True)}"
+               f"{_table_active_html(email_idx_b, 'BULL', show_sec=False, show_first_iter=True)}" if email_idx_b else "")
+            + (f"{_sec_banner(f'🏛️🆕🩸 PURE FIRST-TIME SECTORAL INDEX POPUPS — BEAR ({len(email_idx_r)})', False)}"
+               f"{_table_active_html(email_idx_r, 'BEAR', show_sec=False, show_first_iter=True)}" if email_idx_r else "")
+        )
+
+    stk_section_html = (
+        f"<div style='font-size:15px;font-weight:800;color:#0f172a;margin:18px 0 6px 0;'>📈 STOCKS — PURE FIRST-TIME POPUPS</div>"
+        f"{_sec_banner(f'🆕🔥 PURE FIRST-TIME STOCK POPUPS — BULL {_format_count_with_ce_pe(email_stk_b)}', True)}"
+        f"{_table_active_html(email_stk_b, 'BULL', show_sec=True, show_first_iter=True)}"
+        f"{_sec_banner(f'🆕🩸 PURE FIRST-TIME STOCK POPUPS — BEAR {_format_count_with_ce_pe(email_stk_r)}', False)}"
+        f"{_table_active_html(email_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}"
     )
+
+    main_tables_html = f"{idx_section_html}{stk_section_html}"
 
     email_inline_html = (
         f"<!DOCTYPE html><html><head><meta charset='utf-8'><style>{light_css}</style></head>"
@@ -2281,13 +2327,249 @@ def build_email_and_attachment_html(
 
     return email_inline_html, attachment_js_html
 
+# ==============================================================================
+# 4B. DEDICATED STILL-HOLDING GOOD EMAIL & HTML ATTACHMENT BUILDER
+# ==============================================================================
+def build_still_holding_plain_text(
+    mode, cutoff_dt, checkpoints, idx_hold_bulls, idx_hold_bears,
+    stock_hold_bulls, stock_hold_bears
+):
+    hb_ce, hb_pe = _ce_pe_counts(stock_hold_bulls)
+    hr_ce, hr_pe = _ce_pe_counts(stock_hold_bears)
+
+    all_shown = idx_hold_bulls + idx_hold_bears + stock_hold_bulls + stock_hold_bears
+    sym_w = max(MIN_SYMBOL_WIDTH, max((len(r['Symbol']) for r in all_shown), default=MIN_SYMBOL_WIDTH))
+    sec_w = max(SECTOR_COL_WIDTH, max((len(f"{r.get('Sector', DEFAULT_UNMAPPED_SECTOR)} ({r.get('SectorWeight', 0.0):.1f}%)") for r in all_shown), default=SECTOR_COL_WIDTH))
+
+    lines = []
+    lines.append(f"=== SYSTEM 3.0 [{mode}] — SETUPS STILL HOLDING GOOD REPORT ===")
+    lines.append(f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Active Holding Setups (Alive & Not Stopped Out)")
+    lines.append(
+        f"Sectoral Indices Still Holding: ▲ {len(idx_hold_bulls)} Bull / ▼ {len(idx_hold_bears)} Bear | "
+        f"Stocks Still Holding: ▲ {len(stock_hold_bulls)} Bull [CE({hb_ce}) PE({hb_pe})] / ▼ {len(stock_hold_bears)} Bear [CE({hr_ce}) PE({hr_pe})]\n"
+    )
+
+    def _fmt_holding_block(title, data_list, show_sector=True, include_ce_pe_counts=True):
+        count_suffix = _format_count_with_ce_pe(data_list) if include_ce_pe_counts else f"({len(data_list)})"
+        if not data_list:
+            lines.append(f"--- {title} {count_suffix} ---")
+            lines.append("None\n")
+            return
+        lines.append(f"--- {title} {count_suffix} ---")
+        grid_hdr = " ".join(f"{m}X" for m in GRID_MULTIPLIERS)
+        sec_hdr = f"{'Sector (MaxWt%)':<{sec_w}} | " if show_sector else ""
+        hdr = (
+            f"{'Script':<{sym_w}} {'R:R':^7} {'LTP/Exit':>9} {'Target':>9} {'SL':>9} | "
+            f"{sec_hdr}{'Seen':^5} {'Anchor':^7} {'Anch Val':>9} {'R-Mult (Bank)':>15} | "
+            f"ATR: {grid_hdr} | BB: {grid_hdr} | {'State':^13}"
+        )
+        lines.append(hdr)
+        lines.append("-" * len(hdr))
+        basket_dir = "BULL" if "BULL" in title else "BEAR"
+        default_g = {m: 0 for m in GRID_MULTIPLIERS}
+        for r in data_list:
+            live_r, banked_r = _r_multiple(r, include_banked=False), float(r.get('BankedR', 0.0) or 0.0)
+            r_mult_str = f"{live_r:>+5.2f}R ({banked_r:>+4.1f}R)" if (r.get('PriorStops', 0) > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON) else f"{live_r:>+5.2f}R          "
+            anchor_disp = f"{r['ActiveAnchor']}*" if (r.get('PriorStops', 0) > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON) else f"{r['ActiveAnchor']} "
+            ag, bg = r.get('ATR_Grid', default_g), r.get('BB_Grid', default_g)
+            a_str = "  ".join(str(ag.get(k, 0)) for k in GRID_MULTIPLIERS)
+            b_str = "  ".join(str(bg.get(k, 0)) for k in GRID_MULTIPLIERS)
+            shown_state = _state_display(r)
+            if "[ BB > KC ]" in r['State']: shown_state = f"[ BB > KC ] {'▲' if basket_dir == 'BULL' else '▼'}"
+            ltp_val = f"{r['KilledPrice']:>8.2f}x" if "[STOP" in shown_state and r.get('KilledPrice', 0) > 0 else f"{r['LTP']:>9.2f} "
+            tgt_p, sl_p = r.get('TargetPrice', 0.0), r.get('SLPrice', 0.0)
+            rr_str = r.get('RR_Str') or compute_risk_reward_ratio(r)[1]
+            sec_str = f"{r.get('Sector', DEFAULT_UNMAPPED_SECTOR)} ({r.get('SectorWeight', 0.0):.1f}%)"
+            sec_cell = f"{_clip(sec_str, sec_w, EMAIL_CLIP_SYMBOLS):<{sec_w}} | " if show_sector else ""
+            lines.append(
+                f"{_clip(r['Symbol'], sym_w, EMAIL_CLIP_SYMBOLS):<{sym_w}} {rr_str:^7} {ltp_val} {tgt_p:>9.2f} {sl_p:>9.2f} | {sec_cell}"
+                f"{r['CheckpointTime'].strftime('%H:%M'):^5} {anchor_disp:^7} {r['AnchorPrice']:>9.2f} "
+                f"{r_mult_str:>15} |   {a_str}  |   {b_str}  | {shown_state:^13}"
+            )
+        lines.append("")
+
+    if idx_hold_bulls or idx_hold_bears:
+        _fmt_holding_block("SECTORAL INDICES — STILL HOLDING BULL", idx_hold_bulls, show_sector=False, include_ce_pe_counts=False)
+        _fmt_holding_block("SECTORAL INDICES — STILL HOLDING BEAR", idx_hold_bears, show_sector=False, include_ce_pe_counts=False)
+
+    _fmt_holding_block("STOCKS — STILL HOLDING BULL", stock_hold_bulls, show_sector=True, include_ce_pe_counts=True)
+    _fmt_holding_block("STOCKS — STILL HOLDING BEAR", stock_hold_bears, show_sector=True, include_ce_pe_counts=True)
+    return "\n".join(lines)
+
+def build_still_holding_email_and_attachment_html(
+    mode, cutoff_dt, checkpoints, idx_hold_bulls, idx_hold_bears,
+    stock_hold_bulls, stock_hold_bears
+):
+    hb_ce, hb_pe = _ce_pe_counts(stock_hold_bulls)
+    hr_ce, hr_pe = _ce_pe_counts(stock_hold_bears)
+
+    def _ser_holding(r, basket_dir):
+        live_r = _r_multiple(r, include_banked=False)
+        banked_r = float(r.get('BankedR', 0.0) or 0.0)
+        has_bank = r.get('PriorStops', 0) > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON
+        default_g = {m: 0 for m in GRID_MULTIPLIERS}
+        ag, bg = r.get('ATR_Grid', default_g), r.get('BB_Grid', default_g)
+        st = _state_display(r)
+        if "[ BB > KC ]" in r['State']: st = f"[ BB > KC ] {'▲' if basket_dir == 'BULL' else '▼'}"
+        return {
+            "symbol": r['Symbol'],
+            "rr": r.get('RR_Str') or compute_risk_reward_ratio(r)[1],
+            "sector": r.get('Sector', DEFAULT_UNMAPPED_SECTOR),
+            "weight": f"{float(r.get('SectorWeight', 0.0)):.1f}%",
+            "ltp": f"{r['LTP']:.2f}",
+            "target": f"{r.get('TargetPrice', 0.0):.2f}" if r.get('TargetPrice', 0.0) > 0 else "-",
+            "sl": f"{r.get('SLPrice', 0.0):.2f}" if r.get('SLPrice', 0.0) > 0 else "-",
+            "seen": r['CheckpointTime'].strftime('%H:%M'),
+            "anchor": f"{r.get('ActiveAnchor', '-')}{'*' if has_bank else ''}",
+            "anchor_val": f"{r['AnchorPrice']:.2f}",
+            "r_str": f"{live_r:+.2f}R ({banked_r:+.1f}R)" if has_bank else f"{live_r:+.2f}R",
+            "rank_r_pos": _rank_r_score(r) >= 0,
+            "atr_grid": "  ".join(str(ag.get(k, 0)) for k in GRID_MULTIPLIERS),
+            "bb_grid": "  ".join(str(bg.get(k, 0)) for k in GRID_MULTIPLIERS),
+            "state": st,
+            "is_expanding": "[ BB > KC ]" in r['State'],
+        }
+
+    def _table_holding_html(rows_list, basket_dir, show_sec=True, js_clickable_index=False):
+        if not rows_list:
+            return "<div style='background-color:#ffffff;border:1px solid #cbd5e1;border-radius:6px;padding:10px 14px;color:#64748b;font-style:italic;margin-bottom:14px;'>No setups currently holding in this category.</div>"
+        th_style = "background-color:#1e293b;color:#ffffff;padding:8px 10px;border:1px solid #334155;font-weight:700;font-size:12px;"
+        sec_th = f"<th style='{th_style}' align='left'>Sector (MaxWt%)</th>" if show_sec else ""
+
+        tr_list = []
+        for idx_i, r in enumerate(rows_list):
+            d = _ser_holding(r, basket_dir)
+            row_bg = "#ffffff" if idx_i % 2 == 0 else "#f8fafc"
+            base_td = f"padding:7px 10px;border:1px solid #cbd5e1;background-color:{row_bg};color:#0f172a;font-size:12px;"
+            sec_attr = html.escape(d["symbol"] if not show_sec else d["sector"])
+            click_attr = f'onclick="filterBySector(\'{sec_attr}\')" class="idx-row"' if js_clickable_index else ""
+            sec_td = f"<td style='{base_td}color:#1e40af;font-weight:600;'>{html.escape(d['sector'])} <span style='color:#475569;font-weight:normal;'>({d['weight']})</span></td>" if show_sec else ""
+            r_bg = "#dcfce7" if d["rank_r_pos"] else "#fee2e2"
+            r_fg = "#166534" if d["rank_r_pos"] else "#991b1b"
+            st_bg = ("#dcfce7" if basket_dir == "BULL" else "#fee2e2") if d["is_expanding"] else "#fef3c7"
+            st_fg = ("#166534" if basket_dir == "BULL" else "#991b1b") if d["is_expanding"] else "#92400e"
+
+            tr_list.append(
+                f"<tr {click_attr} data-sector='{sec_attr}' style='background-color:{row_bg};'>"
+                f"<td style='{base_td}color:#0f172a;font-weight:700;'>{html.escape(d['symbol'])}</td>"
+                f"<td align='center' style='{base_td}background-color:#f0f9ff;color:#0284c7;font-weight:700;'>{html.escape(d['rr'])}</td>"
+                f"<td align='right' style='{base_td}color:#0f172a;font-weight:700;'>{d['ltp']}</td>"
+                f"<td align='right' style='{base_td}background-color:#f0fdf4;color:#15803d;font-weight:700;'>{html.escape(d['target'])}</td>"
+                f"<td align='right' style='{base_td}background-color:#fef2f2;color:#b91c1c;font-weight:700;'>{html.escape(d['sl'])}</td>"
+                f"{sec_td}"
+                f"<td align='center' style='{base_td}color:#334155;'>{d['seen']}</td>"
+                f"<td align='center' style='{base_td}color:#0f172a;font-weight:700;'>{html.escape(d['anchor'])}</td>"
+                f"<td align='right' style='{base_td}color:#1e293b;font-weight:600;'>{d['anchor_val']}</td>"
+                f"<td align='right' style='{base_td}background-color:{r_bg};color:{r_fg};font-weight:700;'>{html.escape(d['r_str'])}</td>"
+                f"<td align='center' style='{base_td}color:#1e293b;font-weight:600;'>{d['atr_grid']}</td>"
+                f"<td align='center' style='{base_td}color:#1e293b;font-weight:600;'>{d['bb_grid']}</td>"
+                f"<td align='center' style='{base_td}background-color:{st_bg};color:{st_fg};font-weight:700;'>{html.escape(d['state'])}</td>"
+                f"</tr>"
+            )
+        return (
+            f"<table style='width:100%;border-collapse:collapse;margin-bottom:16px;background-color:#ffffff;border:1px solid #cbd5e1;font-family:Consolas,monospace;font-size:12px;'>"
+            f"<thead><tr>"
+            f"<th style='{th_style}' align='left'>Script</th><th style='{th_style}' align='center'>R:R</th><th style='{th_style}' align='right'>LTP/Exit</th>"
+            f"<th style='{th_style}' align='right'>Target</th><th style='{th_style}' align='right'>SL</th>"
+            f"{sec_th}"
+            f"<th style='{th_style}' align='center'>Seen</th><th style='{th_style}' align='center'>Anchor</th><th style='{th_style}' align='right'>Anch Val</th>"
+            f"<th style='{th_style}' align='right'>R-Mult (Bank)</th><th style='{th_style}' align='center'>ATR: 1X 2X 3X 5X</th>"
+            f"<th style='{th_style}' align='center'>BB: 1X 2X 3X 5X</th><th style='{th_style}' align='center'>State</th>"
+            f"</tr></thead><tbody>{''.join(tr_list)}</tbody></table>"
+        )
+
+    def _sec_banner(title, is_bull=True):
+        bg, border, left_b, fg = ("#ecfdf5", "#a7f3d0", "#16a34a", "#065f46") if is_bull else ("#fef2f2", "#fecaca", "#dc2626", "#991b1b")
+        return f"<div style='background-color:{bg};border:1px solid {border};border-left:5px solid {left_b};color:{fg};padding:8px 12px;font-weight:700;font-size:13px;border-radius:4px;margin:14px 0 8px 0;'>{html.escape(title)}</div>"
+
+    sector_accordions = []
+    all_sector_keys = list(dict.fromkeys(list(SECTORAL_INDEX_CONFIG.keys()) + list(INDEX_CONFIG.keys()) + [DEFAULT_UNMAPPED_SECTOR]))
+    for sec in all_sector_keys:
+        sb = [r for r in stock_hold_bulls if r.get('Sector') == sec]
+        sr = [r for r in stock_hold_bears if r.get('Sector') == sec]
+        if not sb and not sr: continue
+        sb_ce, sb_pe = _ce_pe_counts(sb)
+        sr_ce, sr_pe = _ce_pe_counts(sr)
+        sector_accordions.append(
+            f"<details style='margin-bottom:8px;border:1px solid #cbd5e1;border-radius:6px;background-color:#ffffff;padding:8px 12px;'>"
+            f"<summary style='cursor:pointer;font-weight:700;color:#0f172a;font-size:13px;'>▶ {html.escape(sec)} — Still Holding "
+            f"(<span style='color:#15803d;'>Bull: {len(sb)} CE({sb_ce}) PE({sb_pe})</span> | <span style='color:#b91c1c;'>Bear: {len(sr)} CE({sr_ce}) PE({sr_pe})</span>)</summary>"
+            f"<div style='padding-top:10px;'>"
+            + (_sec_banner(f"🔥 {sec} — BULL {_format_count_with_ce_pe(sb)}", True) + _table_holding_html(sb, 'BULL', show_sec=False) if sb else "")
+            + (_sec_banner(f"🩸 {sec} — BEAR {_format_count_with_ce_pe(sr)}", False) + _table_holding_html(sr, 'BEAR', show_sec=False) if sr else "")
+            + f"</div></details>"
+        )
+
+    light_css = "body{background-color:#f1f5f9;color:#0f172a;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:13px;margin:0;padding:16px;}.pill{background-color:#ffffff;color:#1e293b;border:1px solid #94a3b8;padding:5px 10px;margin:2px;border-radius:4px;cursor:pointer;font-weight:600;}.pill:hover,.pill.active{background-color:#2563eb;color:#ffffff;border-color:#1d4ed8;}.clr{background-color:#dc2626;color:#ffffff;border:none;padding:6px 14px;border-radius:4px;font-weight:700;cursor:pointer;}"
+
+    header_card_html = (
+        f"<div style='background-color:#ffffff;border:1px solid #cbd5e1;border-left:6px solid #16a34a;border-radius:6px;padding:14px 18px;margin-bottom:16px;'>"
+        f"<div style='font-size:17px;font-weight:800;color:#0f172a;margin-bottom:6px;'>🛡️ SYSTEM 3.0 [{html.escape(mode)}] — SETUPS STILL HOLDING GOOD</div>"
+        f"<div style='color:#334155;font-size:13px;margin-bottom:4px;'>"
+        f"<b>Target Snapshot:</b> {cutoff_dt.strftime('%Y-%m-%d %H:%M')} &nbsp;|&nbsp; <b>Status:</b> <span style='background-color:#dcfce7;color:#166534;padding:2px 6px;border-radius:4px;font-weight:700;'>Active Survived Setups</span></div>"
+        f"<div style='color:#334155;font-size:12px;margin-top:4px;'>"
+        f"<b>Sectoral Indices:</b> <span style='color:#15803d;font-weight:700;'>▲ {len(idx_hold_bulls)} Bull</span> &nbsp;/&nbsp; <span style='color:#b91c1c;font-weight:700;'>▼ {len(idx_hold_bears)} Bear</span> &nbsp;|&nbsp; "
+        f"<b>Stocks:</b> <span style='color:#15803d;font-weight:700;'>▲ {len(stock_hold_bulls)} Bull [CE({hb_ce}) PE({hb_pe})]</span> &nbsp;/&nbsp; <span style='color:#b91c1c;font-weight:700;'>▼ {len(stock_hold_bears)} Bear [CE({hr_ce}) PE({hr_pe})]</span>"
+        f"</div></div>"
+    )
+
+    idx_section_html = ""
+    if idx_hold_bulls or idx_hold_bears:
+        idx_section_html = (
+            f"<div style='font-size:15px;font-weight:800;color:#0f172a;margin:18px 0 6px 0;'>🏛️ SECTORAL INDICES — STILL HOLDING</div>"
+            + (f"{_sec_banner(f'🏛️🔥 SECTORAL INDICES — STILL HOLDING BULL ({len(idx_hold_bulls)})', True)}"
+               f"{_table_holding_html(idx_hold_bulls, 'BULL', show_sec=False)}" if idx_hold_bulls else "")
+            + (f"{_sec_banner(f'🏛️🩸 SECTORAL INDICES — STILL HOLDING BEAR ({len(idx_hold_bears)})', False)}"
+               f"{_table_holding_html(idx_hold_bears, 'BEAR', show_sec=False)}" if idx_hold_bears else "")
+        )
+
+    stk_section_html = (
+        f"<div style='font-size:15px;font-weight:800;color:#0f172a;margin:18px 0 6px 0;'>📈 STOCKS — STILL HOLDING</div>"
+        f"{_sec_banner(f'🔥 STOCKS — STILL HOLDING BULL {_format_count_with_ce_pe(stock_hold_bulls)}', True)}"
+        f"{_table_holding_html(stock_hold_bulls, 'BULL', show_sec=True)}"
+        f"{_sec_banner(f'🩸 STOCKS — STILL HOLDING BEAR {_format_count_with_ce_pe(stock_hold_bears)}', False)}"
+        f"{_table_holding_html(stock_hold_bears, 'BEAR', show_sec=True)}"
+    )
+
+    main_tables_html = f"{idx_section_html}{stk_section_html}"
+
+    email_inline_html = (
+        f"<!DOCTYPE html><html><head><meta charset='utf-8'><style>{light_css}</style></head>"
+        f"<body style='background-color:#f1f5f9;color:#0f172a;font-family:Segoe UI,sans-serif;font-size:13px;margin:0;padding:16px;'>"
+        f"<div style='max-width:1280px;margin:0 auto;'>"
+        f"{header_card_html}{main_tables_html}"
+        + (f"<h3 style='color:#0f172a;margin:20px 0 8px 0;font-size:15px;'>📂 GROUPED BY SECTOR</h3>{''.join(sector_accordions)}" if sector_accordions else "")
+        + f"</div></body></html>"
+    )
+
+    active_holding_sectors = sorted({r.get('Sector', DEFAULT_UNMAPPED_SECTOR) for r in (stock_hold_bulls + stock_hold_bears)})
+    pills_js_html = "".join(f"<button class='pill' data-sec='{html.escape(s)}' onclick=\"filterBySector('{html.escape(s)}')\">{html.escape(s)}</button>" for s in active_holding_sectors)
+
+    attachment_js_html = (
+        f"<!DOCTYPE html><html><head><meta charset='utf-8'><title>System 3.0 Still Holding Setups</title><style>{light_css}</style></head>"
+        f"<body style='background-color:#f1f5f9;color:#0f172a;font-family:Segoe UI,sans-serif;font-size:13px;margin:0;padding:16px;'>"
+        f"<div style='max-width:1280px;margin:0 auto;'>"
+        f"<div style='position:sticky;top:0;background-color:#ffffff;padding:12px 16px;border:1px solid #cbd5e1;border-radius:6px;margin-bottom:14px;box-shadow:0 2px 4px rgba(0,0,0,0.05);'>"
+        f"<div style='display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;'>"
+        f"<b style='font-size:15px;color:#0f172a;'>🛡️ SYSTEM 3.0 STILL HOLDING [{html.escape(mode)}] @ {cutoff_dt.strftime('%Y-%m-%d %H:%M')}</b>"
+        f"<div><span id='statusBadge' style='color:#16a34a;margin-right:10px;font-weight:700;'>SHOWING ALL</span><button class='clr' onclick='clearFilter()'>SHOW ALL</button></div></div>"
+        f"<div>{pills_js_html}</div></div>"
+        f"{header_card_html}<div id='holdingContainer'>{main_tables_html}</div>"
+        f"<script>"
+        f"function filterBySector(sec){{document.querySelectorAll('#holdingContainer tbody tr').forEach(r=>{{r.style.display=(r.getAttribute('data-sector')===sec)?'':'none';}});document.querySelectorAll('.pill').forEach(p=>p.classList.toggle('active',p.getAttribute('data-sec')===sec));document.getElementById('statusBadge').textContent='FILTERED BY: '+sec;}}"
+        f"function clearFilter(){{document.querySelectorAll('#holdingContainer tbody tr').forEach(r=>{{r.style.display='';}});document.querySelectorAll('.pill').forEach(p=>p.classList.remove('active'));document.getElementById('statusBadge').textContent='SHOWING ALL';}}"
+        f"</script></div></body></html>"
+    )
+
+    return email_inline_html, attachment_js_html
+
 # ------------------------------------------------------------------------------
 # EMAIL TRANSMISSION ENGINE (USES GITHUB REPOSITORY SECRETS)
 # ------------------------------------------------------------------------------
 _EMAIL_SEND_LOCK = threading.Lock()
 _EMAIL_SENT_TAGS = set()
 
-def _send_email_message(subject, plain_body, html_body=None, attachment_html=None, tag="email"):
+def _send_email_message(subject, plain_body, html_body=None, attachment_html=None, tag="email", attachment_filename=None):
     with _EMAIL_SEND_LOCK:
         if tag in _EMAIL_SENT_TAGS: return False
         _EMAIL_SENT_TAGS.add(tag)
@@ -2307,8 +2589,9 @@ def _send_email_message(subject, plain_body, html_body=None, attachment_html=Non
     msg['To'] = recipient
     msg.set_content(plain_body)
     if html_body: msg.add_alternative(html_body, subtype='html')
-    if attachment_html and EMAIL_ATTACH_INTERACTIVE_HTML:
-        msg.add_attachment(attachment_html.encode('utf-8'), maintype='text', subtype='html', filename=EMAIL_ATTACHMENT_FILENAME)
+    att_name = attachment_filename or EMAIL_ATTACHMENT_FILENAME
+    if attachment_html:
+        msg.add_attachment(attachment_html.encode('utf-8'), maintype='text', subtype='html', filename=att_name)
 
     try:
         if port == SMTP_SSL_PORT:
@@ -2320,7 +2603,7 @@ def _send_email_message(subject, plain_body, html_body=None, attachment_html=Non
                 server.starttls()
                 server.login(sender, password)
                 server.send_message(msg)
-        print(f"   {COLOR_GREEN_FG}📧 [{tag}] Email sent to {recipient}{COLOR_RESET}")
+        print(f"   {COLOR_GREEN_FG}📧 [{tag}] Email sent to {recipient} (Subject: {subject}){COLOR_RESET}")
         return True
     except Exception as e:
         print(f"   {COLOR_YELLOW}[{tag}] Failed to send email ({e}){COLOR_RESET}")
@@ -2457,6 +2740,10 @@ def run_screener(
     idx_bulls, idx_bears, idx_grave = segregate_and_rank_buckets(by_index) if by_index else ([], [], [])
     stock_bulls, stock_bears, stock_grave = segregate_and_rank_buckets(by_stock)
 
+    # Compute still-holding setups across both Sectoral Indices and Stocks (pure trading survival, no timestamp gap cutoff)
+    idx_hold_bulls, idx_hold_bears, _ = segregate_and_rank_buckets(by_index, filter_timestamp_gap=False, filter_popup_strict=False) if by_index else ([], [], [])
+    stock_hold_bulls, stock_hold_bears, _ = segregate_and_rank_buckets(by_stock, filter_timestamp_gap=False, filter_popup_strict=False)
+
     by_index_all_cps = {k: list(v) for k, v in by_index.items()}
     by_stock_all_cps = {k: list(v) for k, v in by_stock.items()}
     for row in extra_results:
@@ -2477,39 +2764,83 @@ def run_screener(
         lookback_meta=lookback_meta, idx_popup_res=idx_popup_res, stock_popup_res=stock_popup_res
     )
 
-    email_inline_html, attachment_js_html = build_email_and_attachment_html(
-        mode, cutoff_dt, checkpoints, idx_bulls, idx_bears, idx_grave,
-        stock_bulls, stock_bears, stock_grave, lookback_meta=lookback_meta,
-        idx_popup_res=idx_popup_res, stock_popup_res=stock_popup_res
-    )
-
-    if SAVE_LOCAL_HTML_FILE and html_out:
-        try:
-            with open(html_out, "w", encoding="utf-8") as f: f.write(attachment_js_html)
-            print(f"   {COLOR_GREEN_FG}» Local HTML Dashboard saved to: {html_out}{COLOR_RESET}")
-        except Exception as e:
-            print(f"   {COLOR_YELLOW}» Could not write local HTML file ({e}){COLOR_RESET}")
-
+    # 1. PURE 1ST-TIME POPUPS EMAIL DISPATCH (WITH SECTORAL INDICES INCLUDED)
     if SEND_DASHBOARD_EMAIL:
-        new_stk_b = stock_popup_res.get("new_bulls", [])
-        new_stk_r = stock_popup_res.get("new_bears", [])
+        new_idx_b = (idx_popup_res or {}).get("new_bulls", [])
+        new_idx_r = (idx_popup_res or {}).get("new_bears", [])
+        new_stk_b = (stock_popup_res or {}).get("new_bulls", [])
+        new_stk_r = (stock_popup_res or {}).get("new_bears", [])
+
         new_b_cnt, new_r_cnt = len(new_stk_b), len(new_stk_r)
-        pure_total = new_b_cnt + new_r_cnt
+        new_idx_b_cnt, new_idx_r_cnt = len(new_idx_b), len(new_idx_r)
+        pure_total = new_b_cnt + new_r_cnt + new_idx_b_cnt + new_idx_r_cnt
+
         nb_ce, nb_pe = _ce_pe_counts(new_stk_b)
         nr_ce, nr_pe = _ce_pe_counts(new_stk_r)
 
         if EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME_GT_0 and pure_total <= 0:
-            print(f"   {COLOR_YELLOW}📧 [dashboard-email] Skipped sending: Pure 1st-Time count is 0 (▲{new_b_cnt} ▼{new_r_cnt}).{COLOR_RESET}")
+            print(f"   {COLOR_YELLOW}📧 [dashboard-email] Skipped sending: Pure 1st-Time count is 0 (Index: ▲{new_idx_b_cnt} ▼{new_idx_r_cnt} | Stocks: ▲{new_b_cnt} ▼{new_r_cnt}).{COLOR_RESET}")
         else:
             plain_text_report = build_full_untruncated_plain_text(
                 mode, cutoff_dt, checkpoints, idx_bulls, idx_bears, idx_grave,
                 stock_bulls, stock_bears, stock_grave, lookback_meta=lookback_meta,
                 idx_popup_res=idx_popup_res, stock_popup_res=stock_popup_res
             )
+            email_inline_html, attachment_js_html = build_email_and_attachment_html(
+                mode, cutoff_dt, checkpoints, idx_bulls, idx_bears, idx_grave,
+                stock_bulls, stock_bears, stock_grave, lookback_meta=lookback_meta,
+                idx_popup_res=idx_popup_res, stock_popup_res=stock_popup_res
+            )
+            if SAVE_LOCAL_HTML_FILE and html_out:
+                try:
+                    with open(html_out, "w", encoding="utf-8") as f: f.write(attachment_js_html)
+                    print(f"   {COLOR_GREEN_FG}» Local HTML Dashboard saved to: {html_out}{COLOR_RESET}")
+                except Exception as e:
+                    print(f"   {COLOR_YELLOW}» Could not write local HTML file ({e}){COLOR_RESET}")
+
             w_start_s = lookback_meta["window_start_dt"].strftime("%H:%M") if (lookback_meta and lookback_meta.get("enabled")) else ""
             w_end_s = lookback_meta["window_end_dt"].strftime("%H:%M") if (lookback_meta and lookback_meta.get("enabled")) else cutoff_dt.strftime("%H:%M")
-            email_subject = f"[System3 {mode}] Pure 1st-Time (No *) ({w_start_s}..{w_end_s}): {new_b_cnt}▲ (CE:{nb_ce} PE:{nb_pe}) | {new_r_cnt}▼ (CE:{nr_ce} PE:{nr_pe})"
-            _send_email_message(subject=email_subject, plain_body=plain_text_report, html_body=email_inline_html, attachment_html=attachment_js_html, tag="dashboard-email")
+            email_subject = f"[System3 {mode}] Pure 1st-Time (No *) ({w_start_s}..{w_end_s}): Index(▲{new_idx_b_cnt} ▼{new_idx_r_cnt}) | Stocks: {new_b_cnt}▲ (CE:{nb_ce} PE:{nb_pe}) | {new_r_cnt}▼ (CE:{nr_ce} PE:{nr_pe})"
+            _send_email_message(
+                subject=email_subject,
+                plain_body=plain_text_report,
+                html_body=email_inline_html,
+                attachment_html=attachment_js_html if EMAIL_ATTACH_INTERACTIVE_HTML else None,
+                tag="dashboard-email",
+                attachment_filename=EMAIL_ATTACHMENT_FILENAME
+            )
+
+    # 2. DEDICATED STILL-HOLDING GOOD EMAIL DISPATCH
+    if SEND_STILL_HOLDING_EMAIL:
+        total_holding = len(idx_hold_bulls) + len(idx_hold_bears) + len(stock_hold_bulls) + len(stock_hold_bears)
+        hb_ce, hb_pe = _ce_pe_counts(stock_hold_bulls)
+        hr_ce, hr_pe = _ce_pe_counts(stock_hold_bears)
+
+        if EMAIL_SEND_ONLY_WHEN_STILL_HOLDING_GT_0 and total_holding <= 0:
+            print(f"   {COLOR_YELLOW}📧 [still-holding-email] Skipped sending: Still-Holding count is 0.{COLOR_RESET}")
+        else:
+            holding_plain_text = build_still_holding_plain_text(
+                mode, cutoff_dt, checkpoints, idx_hold_bulls, idx_hold_bears,
+                stock_hold_bulls, stock_hold_bears
+            )
+            holding_inline_html, holding_attachment_html = build_still_holding_email_and_attachment_html(
+                mode, cutoff_dt, checkpoints, idx_hold_bulls, idx_hold_bears,
+                stock_hold_bulls, stock_hold_bears
+            )
+            holding_subject = (
+                f"[System3 {mode}] Still Holding Good: "
+                f"Index(▲{len(idx_hold_bulls)} ▼{len(idx_hold_bears)}) | "
+                f"Stocks: {len(stock_hold_bulls)}▲ (CE:{hb_ce} PE:{hb_pe}) | "
+                f"{len(stock_hold_bears)}▼ (CE:{hr_ce} PE:{hr_pe})"
+            )
+            _send_email_message(
+                subject=holding_subject,
+                plain_body=holding_plain_text,
+                html_body=holding_inline_html,
+                attachment_html=holding_attachment_html if EMAIL_ATTACH_STILL_HOLDING_HTML else None,
+                tag="still-holding-email",
+                attachment_filename=EMAIL_STILL_HOLDING_ATTACHMENT_FILENAME
+            )
 
     _print_error_summary()
     print(f"\n⏱️ Tracker sync completed in {(time.time() - t_start):.2f} seconds ({sum(l.total_calls for l in LIMITERS.values())} API calls).\n")
@@ -2553,6 +2884,13 @@ def parse_args():
     p.add_argument("--email-always-send", dest="email_only_when_pure_1st_time", action="store_false")
     p.add_argument("--email-only-pure-1st-time-content", dest="email_only_pure_1st_time_content", action="store_true", default=_parse_bool_env(ENV_EMAIL_ONLY_PURE_1ST_TIME_CONTENT, EMAIL_ONLY_PURE_1ST_TIME_CONTENT))
     p.add_argument("--email-all-window-popups-content", dest="email_only_pure_1st_time_content", action="store_false")
+
+    # Still-Holding Email Controls
+    p.add_argument("--send-still-holding-email", dest="send_still_holding_email", action="store_true", default=_parse_bool_env(ENV_SEND_STILL_HOLDING_EMAIL, SEND_STILL_HOLDING_EMAIL))
+    p.add_argument("--no-send-still-holding-email", dest="send_still_holding_email", action="store_false")
+    p.add_argument("--email-only-when-still-holding-gt-0", dest="email_only_when_still_holding_gt_0", action="store_true", default=_parse_bool_env(ENV_EMAIL_SEND_ONLY_WHEN_STILL_HOLDING_GT_0, EMAIL_SEND_ONLY_WHEN_STILL_HOLDING_GT_0))
+    p.add_argument("--email-always-send-still-holding", dest="email_only_when_still_holding_gt_0", action="store_false")
+
     p.add_argument("--save-html", dest="save_html", action="store_true", default=SAVE_LOCAL_HTML_FILE)
     p.add_argument("--no-sector-indices", action="store_true")
     p.add_argument("--sector", type=str, default="")
@@ -2604,6 +2942,9 @@ if __name__ == "__main__":
     SEND_DASHBOARD_EMAIL = args.send_email
     EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME_GT_0 = args.email_only_when_pure_1st_time
     EMAIL_ONLY_PURE_1ST_TIME_CONTENT = args.email_only_pure_1st_time_content
+    SEND_STILL_HOLDING_EMAIL = args.send_still_holding_email
+    EMAIL_SEND_ONLY_WHEN_STILL_HOLDING_GT_0 = args.email_only_when_still_holding_gt_0
+
     SAVE_LOCAL_HTML_FILE = args.save_html
     MIN1_HISTORY_DAYS = args.history_days
     OPT_MIN_PRICE = args.opt_min_price
