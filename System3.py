@@ -487,12 +487,18 @@ def _format_count_with_ce_pe(rows_list):
     ce_cnt, pe_cnt = _ce_pe_counts(rows_list)
     return f"({total}) CE({ce_cnt}) PE({pe_cnt})"
 
+def _to_float(v, default=0.0):
+    try:
+        if v is None: return default
+        return float(v)
+    except (ValueError, TypeError):
+        return default
+
 def _compute_target_sl(row):
-    ap = float(row.get('AnchorPrice', 0.0) or 0.0)
-    ltp = float(row.get('LTP', 0.0) or 0.0)
-    ref_price = ap if (TARGET_SL_FROM_ANCHOR and ap > 0) else ltp
-    base_atr = float(row.get('BaseAtr', 0.0) or 0.0)
-    if ref_price <= 0 or base_atr <= 0:
+    ap = _to_float(row.get('AnchorPrice', 0.0))
+    ltp = _to_float(row.get('LTP', 0.0))
+    base_atr = _to_float(row.get('BaseAtr', 0.0))
+    if ap <= 0 or base_atr <= 0 or ltp <= 0:
         return 0.0, 0.0
 
     sym = str(row.get('Symbol') or '')
@@ -501,15 +507,56 @@ def _compute_target_sl(row):
     else:
         p_dir = str(row.get('PremiumDir') or row.get('AnchorDir') or 'BULL').upper()
 
-    t_mult = float(TARGET_ATR_MULT)
-    s_mult = float(SL_ATR_MULT)
+    is_bull = (p_dir == 'BULL')
+    curr_r = (ltp - ap) / base_atr if is_bull else (ap - ltp) / base_atr
+    peak_p = _to_float(row.get('PeakPrice', ltp) or ltp)
+    max_r = _to_float(row.get('MaxR', max(0.0, curr_r)) or 0.0)
 
-    if p_dir == 'BEAR':
-        target_price = max(0.05, ref_price - (t_mult * base_atr))
-        sl_price = ref_price + (s_mult * base_atr)
+    hard_mult = _to_float(HARD_STOP_ATR_MULT, 2.5)
+    soft_mult = _to_float(SL_ATR_MULT, 1.0)
+    lock_trig_r = _to_float(PROFIT_LOCK_TRIGGER_R, 1.8)
+    lock_floor_r = _to_float(PROFIT_LOCK_FLOOR_R, 0.3)
+
+    # 1. Real Engine Trailing Protection Floor
+    if is_bull:
+        initial_sl = ap - (soft_mult * base_atr)
+        trailing_hard_sl = peak_p - (hard_mult * base_atr) if hard_mult > 0 else initial_sl
+        effective_sl = max(initial_sl, trailing_hard_sl)
+        if max_r >= lock_trig_r:
+            profit_lock_floor = ap + (lock_floor_r * base_atr)
+            effective_sl = max(effective_sl, profit_lock_floor)
+        effective_sl = min(effective_sl, ltp - 0.05)
+        sl_price = max(0.05, effective_sl)
     else:
-        target_price = ref_price + (t_mult * base_atr)
-        sl_price = max(0.05, ref_price - (s_mult * base_atr))
+        initial_sl = ap + (soft_mult * base_atr)
+        trailing_hard_sl = peak_p + (hard_mult * base_atr) if hard_mult > 0 else initial_sl
+        effective_sl = min(initial_sl, trailing_hard_sl)
+        if max_r >= lock_trig_r:
+            profit_lock_floor = ap - (lock_floor_r * base_atr)
+            effective_sl = min(effective_sl, profit_lock_floor)
+        effective_sl = max(effective_sl, ltp + 0.05)
+        sl_price = effective_sl
+
+    # 2. Dynamic Forward-Looking Target Escalation (1.8R, 3R, 5R, etc.)
+    init_t = _to_float(TARGET_ATR_MULT, 1.8)
+    target_multipliers = [init_t, 3.0, 5.0, 8.0, 10.0]
+    next_t_mult = target_multipliers[0]
+    for m in target_multipliers:
+        if curr_r < m - 0.05:
+            next_t_mult = m
+            break
+    else:
+        next_t_mult = max(target_multipliers[-1] + 2.0, float(int(curr_r) + 2.0))
+
+    if is_bull:
+        target_price = ap + (next_t_mult * base_atr)
+        if target_price <= ltp:
+            target_price = ltp + (1.0 * base_atr)
+    else:
+        target_price = ap - (next_t_mult * base_atr)
+        if target_price >= ltp:
+            target_price = ltp - (1.0 * base_atr)
+        target_price = max(0.05, target_price)
 
     return round(target_price, 2), round(sl_price, 2)
 
@@ -518,11 +565,11 @@ def compute_risk_reward_ratio(row):
     Computes Risk-to-Reward ratio for active setups.
     Returns: (ratio_val, ratio_str) e.g. (0.28, "0.28:1", or 0.1, "0.1:1")
     """
-    tgt_p = float(row.get('TargetPrice', 0.0) or 0.0)
-    sl_p = float(row.get('SLPrice', 0.0) or 0.0)
+    tgt_p = _to_float(row.get('TargetPrice', 0.0))
+    sl_p = _to_float(row.get('SLPrice', 0.0))
+    ltp = _to_float(row.get('LTP', 0.0))
     if tgt_p <= 0 or sl_p <= 0:
         tgt_p, sl_p = _compute_target_sl(row)
-    ltp = float(row.get('LTP', 0.0) or 0.0)
     if ltp <= 0 or tgt_p <= 0 or sl_p <= 0:
         return 999.0, "-:1"
 
@@ -533,11 +580,11 @@ def compute_risk_reward_ratio(row):
         p_dir = str(row.get('PremiumDir') or row.get('AnchorDir') or 'BULL').upper()
 
     if p_dir == 'BEAR':
-        reward = max(0.0, ltp - tgt_p)
-        risk = max(0.0, sl_p - ltp)
+        reward = max(0.05, ltp - tgt_p)
+        risk = max(0.05, sl_p - ltp)
     else:
-        reward = max(0.0, tgt_p - ltp)
-        risk = max(0.0, ltp - sl_p)
+        reward = max(0.05, tgt_p - ltp)
+        risk = max(0.05, ltp - sl_p)
 
     if RR_RATIO_TYPE == "REWARD_TO_RISK":
         val = (reward / risk) if risk > 0 else 99.9
@@ -1352,6 +1399,8 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
             j += 1
 
         if survived:
+            anchor['peak_price'] = float(true_peak)
+            anchor['max_r'] = float((true_peak - anchor['price']) / base_atr if is_bull else (anchor['price'] - true_peak) / base_atr)
             survived_anchor = anchor
             break
 
@@ -1451,6 +1500,8 @@ def row_at(S, end, symbol, sector="", sector_weight=0.0, is_sector_index=False):
         row['AnchorPrice'] = float(anchor['price'])
         row['AnchorDir'] = anchor['dir']
         row['PremiumDir'] = anchor['dir']
+        row['PeakPrice'] = float(anchor.get('peak_price', anchor['price']))
+        row['MaxR'] = float(anchor.get('max_r', 0.0))
         row['MovePct'] = ((ltp - anchor['price']) / anchor['price']) * 100.0 if anchor['price'] else 0.0
         row['State'], row['Blocks'] = pure_state, last - anchor['idx']
         row['TargetPrice'], row['SLPrice'] = _compute_target_sl(row)
@@ -1560,25 +1611,29 @@ def _print_error_summary():
     if ERRORS.items: print(f"{COLOR_YELLOW}⚠ {len(ERRORS.items)} instruments raised exceptions.{COLOR_RESET}")
 
 def _signal_id(row):
-    return (row['AnchorDir'], row['ActiveAnchor'], round(float(row['AnchorPrice']), 6))
+    return (row.get('AnchorDir', 'NONE'), row.get('ActiveAnchor', '-'), round(_to_float(row.get('AnchorPrice', 0.0)), 6))
 
 def _find_kill(kills, d, t):
     return next((k for k in reversed(kills or []) if k.get('dir') == d and k.get('anchor_time') == t), None)
 
 def _exit_price(row):
-    return float(row['KilledPrice']) if row.get('State') == "[STOPPED]" and row.get('KilledPrice', 0) > 0 else float(row.get('LTP', 0.0) or 0.0)
+    if row.get('State') == "[STOPPED]" and _to_float(row.get('KilledPrice', 0)) > 0:
+        return _to_float(row.get('KilledPrice'))
+    return _to_float(row.get('LTP', 0.0))
 
 def _kill_r_multiple(kill_dict, base_atr):
-    ap, kp = float(kill_dict.get('anchor_price', 0.0) or 0.0), float(kill_dict.get('killed_price', 0.0) or 0.0)
-    if ap <= 0 or kp <= 0 or base_atr <= 0: return 0.0
-    return (kp - ap) / base_atr if kill_dict.get('dir', 'BULL') == 'BULL' else (ap - kp) / base_atr
+    ap, kp = _to_float(kill_dict.get('anchor_price', 0.0)), _to_float(kill_dict.get('killed_price', 0.0))
+    b_atr = _to_float(base_atr)
+    if ap <= 0 or kp <= 0 or b_atr <= 0: return 0.0
+    return (kp - ap) / b_atr if kill_dict.get('dir', 'BULL') == 'BULL' else (ap - kp) / b_atr
 
 def _r_multiple(row, include_banked=False):
-    ap, base_atr, live_r = row.get('AnchorPrice', 0.0), row.get('BaseAtr', 0.0), 0.0
+    ap, base_atr, live_r = _to_float(row.get('AnchorPrice', 0.0)), _to_float(row.get('BaseAtr', 0.0)), 0.0
     if ap > 0 and base_atr > 0:
-        price, direction = _exit_price(row), row.get('PremiumDir', row.get('AnchorDir'))
+        price = _exit_price(row)
+        direction = row.get('PremiumDir', row.get('AnchorDir', 'BULL'))
         live_r = (price - ap) / base_atr if direction == 'BULL' else (ap - price) / base_atr
-    return live_r + float(row.get('BankedR', 0.0) or 0.0) if include_banked else live_r
+    return live_r + _to_float(row.get('BankedR', 0.0)) if include_banked else live_r
 
 def _rank_r_score(row):
     return max(_r_multiple(row, False), _r_multiple(row, True))
@@ -1592,7 +1647,10 @@ def _merge_signal(sig_rows, last_row, direction):
     prior_kills = [k for k in kills if k.get('dir') == direction and k.get('anchor_time') != first['ActiveAnchor']]
     row['PriorStops'], row['BankedR'] = len(prior_kills), sum(_kill_r_multiple(k, base_atr) for k in prior_kills)
 
-    if latest['CheckpointTime'] == last_row['CheckpointTime'] and last_row.get('State') in ACTIVE_BULL_STATES and _signal_id(last_row) == _signal_id(first):
+    row['PeakPrice'] = float(last_row.get('PeakPrice') or latest.get('PeakPrice') or row['AnchorPrice'])
+    row['MaxR'] = float(last_row.get('MaxR') or latest.get('MaxR') or 0.0)
+    active_states = ACTIVE_BULL_STATES if direction == "BULL" else ACTIVE_BEAR_STATES
+    if latest['CheckpointTime'] == last_row['CheckpointTime'] and last_row.get('State') in active_states and _signal_id(last_row) == _signal_id(first):
         row['State'], row['KilledTime'], row['KilledPrice'], row['RejectReason'] = last_row['State'], '-', 0.0, ""
     else:
         row['State'] = "[STOPPED]"
