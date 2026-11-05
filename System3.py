@@ -386,20 +386,67 @@ def _parse_snapshot_datetime(target_date_str, target_time_str):
     if clean_d in ("", "***", "NONE", "NULL", "TODAY", "LIVE"): clean_d = ""
     if clean_t in ("", "***", "NONE", "NULL", "NOW", "LIVE"): clean_t = ""
 
-    if not clean_d and not clean_t:
-        return now_ist(), False
+    # If date string looks like a time (e.g. '12:18'), but clean_t is empty, swap to clean_t
+    if clean_d and ":" in clean_d and not clean_t:
+        clean_t = clean_d
+        clean_d = ""
 
     now = now_ist()
+    if not clean_d and not clean_t:
+        return now, False
+
     parsed_date = None
     if clean_d:
-        for dfmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d", "%d-%b-%Y", "%d-%B-%Y", "%d.%m.%Y", "%Y.%m.%d"):
-            try:
-                parsed_date = datetime.strptime(clean_d, dfmt).date()
-                break
-            except ValueError:
-                pass
+        m_iso = re.match(r"^(\d{4})[-/.](0?[1-9]|1[0-2])[-/.](0?[1-9]|[12]\d|3[01])$", clean_d)
+        if m_iso:
+            y, m, d = int(m_iso.group(1)), int(m_iso.group(2)), int(m_iso.group(3))
+            parsed_date = datetime(y, m, d).date()
+        else:
+            parts = re.findall(r"\d+", clean_d)
+            if len(parts) == 3:
+                p1, p2, p3 = int(parts[0]), int(parts[1]), int(parts[2])
+                if p3 >= 1000:
+                    y = p3
+                    if y == now.year and ((p1 == now.month and p2 == now.day) or (p1 == now.day and p2 == now.month)):
+                        parsed_date = now.date()
+                    elif p1 > 12 >= p2:
+                        parsed_date = datetime(y, p2, p1).date()
+                    elif p2 > 12 >= p1:
+                        parsed_date = datetime(y, p1, p2).date()
+                    else:
+                        d1 = datetime(y, p2, p1).date()
+                        d2 = datetime(y, p1, p2).date()
+                        if d1 > now.date() >= d2: parsed_date = d2
+                        elif d2 > now.date() >= d1: parsed_date = d1
+                        else: parsed_date = d1
+                elif p1 >= 1000:
+                    y = p1
+                    parsed_date = datetime(y, p2, p3).date()
+            elif len(parts) == 2:
+                p1, p2 = int(parts[0]), int(parts[1])
+                y = now.year
+                if (p1 == now.month and p2 == now.day) or (p1 == now.day and p2 == now.month):
+                    parsed_date = now.date()
+                elif p1 > 12 >= p2:
+                    parsed_date = datetime(y, p2, p1).date()
+                elif p2 > 12 >= p1:
+                    parsed_date = datetime(y, p1, p2).date()
+                else:
+                    d1 = datetime(y, p2, p1).date()
+                    d2 = datetime(y, p1, p2).date()
+                    if d1 > now.date() >= d2: parsed_date = d2
+                    elif d2 > now.date() >= d1: parsed_date = d1
+                    else: parsed_date = d1
+
         if parsed_date is None:
-            parsed_date = pd.to_datetime(clean_d, dayfirst=True).date()
+            for dfmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%m-%d-%Y", "%m/%d/%Y", "%Y/%m/%d", "%d-%b-%Y", "%d-%B-%Y", "%d.%m.%Y", "%Y.%m.%d"):
+                try:
+                    parsed_date = datetime.strptime(clean_d, dfmt).date()
+                    break
+                except ValueError:
+                    pass
+            if parsed_date is None:
+                parsed_date = pd.to_datetime(clean_d, dayfirst=True).date()
     else:
         parsed_date = now.date()
 
@@ -667,7 +714,7 @@ def _to_frame(candles):
         df['Datetime'] = pd.to_datetime(ts, utc=True).dt.tz_convert(IST).dt.tz_localize(None)
     for c in ('Open', 'High', 'Low', 'Close', 'Volume'):
         df[c] = df[c].astype(float)
-    return df.drop(columns='Timestamp').drop_duplicates(subset='Datetime').sort_values('Datetime').reset_index(drop=True)
+    return df.drop(columns='Timestamp').drop_duplicates(subset='Datetime', keep='last').sort_values('Datetime').reset_index(drop=True)
 
 def _candles(url):
     status, js = _get(url)
@@ -773,7 +820,7 @@ def resolve_session(cutoff_dt):
 def prepare_master(dfs):
     master = (
         pd.concat([d[['Datetime', 'Open', 'High', 'Low', 'Close', 'Volume']] for d in dfs], ignore_index=True)
-        .drop_duplicates(subset='Datetime')
+        .drop_duplicates(subset='Datetime', keep='last')
         .sort_values('Datetime')
         .reset_index(drop=True)
     )
@@ -862,19 +909,27 @@ def _equity_universe(mode, needles=()):
         )
 
     fno = {i.get("underlying_symbol") for i in nse if i.get("segment") == "NSE_FO" and i.get("underlying_symbol")}
-    everything = {i["instrument_key"]: {"symbol": ts_of(i), "key": i["instrument_key"]} for i in nse if plain(i)}
-    in_mode = {k: v for k, v in everything.items() if ((v["symbol"] in fno) if mode == "STOCK_FNO" else (v["symbol"] not in fno))}
+    everything = {}
+    for i in nse:
+        if not plain(i): continue
+        sym = ts_of(i)
+        if not sym: continue
+        k = i["instrument_key"]
+        if sym not in everything or (i.get("series") == "EQ" and everything[sym].get("series") != "EQ"):
+            everything[sym] = {"symbol": sym, "key": k, "series": i.get("series", "EQ")}
+
+    in_mode = {sym: v for sym, v in everything.items() if ((sym in fno) if mode == "STOCK_FNO" else (sym not in fno))}
     pinned = set()
     if needles:
         pinned = resolve_pins([(v["symbol"], (len(v["symbol"]), v["symbol"])) for v in everything.values()], needles, "equity symbol")
     out = {}
-    for k, v in in_mode.items():
+    for sym, v in in_mode.items():
         sec_name, sec_wt, all_sec = resolve_primary_sector(v["symbol"])
-        out[k] = dict(v, pinned=v["symbol"] in pinned, is_sector_index=False, sector=sec_name, sector_weight=sec_wt, all_sectors=all_sec)
-    for k, v in everything.items():
-        if v["symbol"] in pinned and k not in out:
+        out[v["key"]] = dict(v, pinned=v["symbol"] in pinned, is_sector_index=False, sector=sec_name, sector_weight=sec_wt, all_sectors=all_sec)
+    for sym, v in everything.items():
+        if v["symbol"] in pinned and v["key"] not in out:
             sec_name, sec_wt, all_sec = resolve_primary_sector(v["symbol"])
-            out[k] = dict(v, pinned=True, is_sector_index=False, sector=sec_name, sector_weight=sec_wt, all_sectors=all_sec)
+            out[v["key"]] = dict(v, pinned=True, is_sector_index=False, sector=sec_name, sector_weight=sec_wt, all_sectors=all_sec)
     return list(out.values())
 
 def _resolve_index_spot_price(key, name, cutoff_dt, use_intraday):
