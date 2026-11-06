@@ -7,7 +7,8 @@ Strict Institutional Volatility Tracker (Upstox) - System 3.0
 + Sectoral Indices in Pure 1st-Time Email: Sectoral index popups are now seamlessly included alongside stock popups in the Pure 1st-Time email.
 + Target Ladder: once T1 is achieved the target steps up (T2 = 1.5x, T3 = 2.0x ...) so R:R never collapses to 99.9:1; row shows a T2/T3 tag.
 + Profit-Lock SL Trail: once the lock is armed (peak >= PROFIT_LOCK_TRIGGER_R) the SL column shows the lock floor, so R:R reflects real remaining risk.
-+ Prior-Attempts Line: rows with '*' print the earlier stopped-out same-direction attempts (why the anchor looks late) + Day% context.
++ Attempts Line On EVERY Row: Bull or Bear, stock or index, STOCK_FNO / CASH_EQUITY / INDEX_OPTIONS, every email + console: earlier stopped-out attempts, current attempt R, Day%.
++ Attempt-Tier Row Order: 1) all attempts +R, 2) net +R, 3) net -R; newest anchor first inside each tier (ATTEMPT_SORT_ENABLED; same order in every email).
 """
 import os, sys, re, html, argparse, traceback, urllib.parse, gzip, json, time, threading
 from bisect import bisect_left
@@ -192,7 +193,19 @@ ENV_SL_TRAIL_TO_LOCK_FLOOR = "SL_TRAIL_TO_LOCK_FLOOR"
 # A '*' on the anchor means earlier same-direction anchors today were stopped out and the engine re-anchored later
 # (e.g. stock is down since morning but the surviving anchor is 12:10). This prints the earlier attempts under the row.
 SHOW_PRIOR_ATTEMPTS_LINE = True
-PRIOR_ATTEMPTS_MAX_SHOWN = 4            # Max earlier attempts listed per row (most recent first, rest summarised)
+SHOW_ATTEMPTS_LINE_FOR_ALL_ROWS = True  # True: EVERY row (Bull or Bear, stock or index, any mode) gets the line, also first attempts of the day
+                                        # False: only rows that carry a '*' (earlier attempts exist)
+PRIOR_ATTEMPTS_MAX_SHOWN = 4            # Max earlier attempts listed per row (most recent ones, older ones are summarised)
+ENV_SHOW_ATTEMPTS_LINE_FOR_ALL_ROWS = "SHOW_ATTEMPTS_LINE_FOR_ALL_ROWS"
+
+# --- 0.7E ATTEMPT-TIER ROW ORDER (console + every email, Bull and Bear, STOCK_FNO / CASH_EQUITY / INDEX_OPTIONS) ---
+#   Tier 1 (✅): every attempt today (earlier ones + the current one) is +R
+#   Tier 2 (🟡): some earlier attempt lost, but earlier + current attempts net to +R
+#   Tier 3 (🔻): earlier + current attempts net to -R
+#   Inside a tier: newest anchor first (ATTEMPT_SORT_TIME_DESC), then R:R (RR_SORT_ORDER) and the old tie-breakers.
+ATTEMPT_SORT_ENABLED = True             # False = legacy order (R:R first)
+ATTEMPT_SORT_TIME_DESC = True           # True = most recent anchor first inside a tier, False = oldest first
+ENV_ATTEMPT_SORT_ENABLED = "ATTEMPT_SORT_ENABLED"
 
 ADVERSE_DRIFT_R_FLOOR = -0.5
 ADVERSE_DRIFT_STOP_RATIO = 1.0
@@ -609,33 +622,84 @@ def _target_cell_text(row):
     """Fixed 12-char text cell: 3-char ladder tag + right-aligned 9-char target price (decimals stay aligned)."""
     return f"{_target_tag(row):<3}{float(row.get('TargetPrice', 0.0) or 0.0):>9.2f}"
 
+def _hhmm_to_min(s):
+    """'13:58' / '13:58*' -> minutes since midnight (0 when unparseable)."""
+    try:
+        h, m_ = str(s).replace('*', '').strip().split(':')[:2]
+        return int(h) * 60 + int(m_)
+    except Exception:
+        return 0
+
+def _attempt_history(row):
+    """
+    Same-direction attempts today for this script: the earlier (stopped-out) ones plus the current one.
+    'prior' = [(anchor_time, killed_time, R)] oldest first; 'cur_r' = live R of the current attempt (bank excluded).
+    Earlier attempts use the RAW premium direction (a PE's falling underlying is still a rising-premium BULL attempt),
+    the label uses the basket the row is shown in.
+    """
+    d_raw = str(row.get('PremiumDir') or row.get('AnchorDir') or '').upper()
+    label = str(row.get('AnchorDir') or d_raw or 'BULL').upper()
+    cur_anchor = str(row.get('ActiveAnchor') or '').replace('*', '').strip()
+    atr = float(row.get('BaseAtr', 0.0) or 0.0)
+    ks = [k for k in (row.get('Kills') or []) if str(k.get('dir', '')).upper() == d_raw and str(k.get('anchor_time', '')) != cur_anchor]
+    ks.sort(key=lambda k: str(k.get('anchor_time', '')))
+    prior = [(str(k.get('anchor_time', '?')), str(k.get('killed_time', '?')), float(_kill_r_multiple(k, atr))) for k in ks]
+    return {"label": label, "cur_anchor": cur_anchor, "prior": prior, "cur_r": float(_r_multiple(row, include_banked=False))}
+
+def _attempt_tier(row):
+    """
+    Row-order tier (same rule for Bull and Bear, every mode, every email):
+      1 = every attempt today (earlier ones + the current one) is +R
+      2 = not every attempt is +R, but earlier + current attempts net to +R
+      3 = earlier + current attempts net to -R
+    """
+    try:
+        h = _attempt_history(row)
+        rs = [r for _, _, r in h["prior"]] + [h["cur_r"]]
+        if all(round(r, 2) >= 0 for r in rs):
+            return 1
+        return 2 if round(sum(rs), 2) >= 0 else 3
+    except Exception:
+        return 3
+
+ATTEMPT_TIER_ICONS = {1: "✅", 2: "🟡", 3: "🔻"}
+
 def _prior_attempts_text(row):
     """
-    One-line history for rows that carry a '*' (earlier same-direction anchors were stopped out, then the engine re-anchored).
-    Explains a late-looking anchor, e.g. 'Earlier BEAR attempts (3, net -8.0R): 09:35>09:52 -2.1R | ... -> re-anchored 12:10'.
+    One-line attempt history printed under EVERY row (Bull or Bear, stock or index, any mode).
+      with earlier attempts: '🟡 Earlier BULL attempts (1, net -1.3R): 10:30>10:42 -1.3R → re-anchored 13:42 (now +0.80R) | first BULL anchor today 10:30 | Day +0.43%'
+      first attempt of the day: '✅ Earlier BULL attempts (0) → first BULL anchor today 13:59 (now +0.04R) | Day +0.12%'
     """
     if not SHOW_PRIOR_ATTEMPTS_LINE:
         return ""
     try:
-        if int(row.get('PriorStops', 0) or 0) <= 0:
+        h = _attempt_history(row)
+        prior, lab, cur, cur_r = h["prior"], h["label"], h["cur_anchor"], h["cur_r"]
+        if not prior and not SHOW_ATTEMPTS_LINE_FOR_ALL_ROWS:
             return ""
-        d = str(row.get('PremiumDir') or row.get('AnchorDir') or '').upper()
-        cur_anchor = str(row.get('ActiveAnchor') or '').replace('*', '').strip()
-        atr = float(row.get('BaseAtr', 0.0) or 0.0)
-        ks = [k for k in (row.get('Kills') or []) if str(k.get('dir', '')).upper() == d and str(k.get('anchor_time', '')) != cur_anchor]
-        if not ks:
-            return ""
-        ks = sorted(ks, key=lambda k: str(k.get('anchor_time', '')))
-        net = sum(_kill_r_multiple(k, atr) for k in ks)
-        n_show = int(PRIOR_ATTEMPTS_MAX_SHOWN)
-        shown = ks[-n_show:] if n_show > 0 else ks
-        parts = [f"{k.get('anchor_time', '?')}>{k.get('killed_time', '?')} {_kill_r_multiple(k, atr):+.1f}R" for k in shown]
-        more = f"{len(ks) - len(shown)} older, " if len(ks) > len(shown) else ""
+        icon = ATTEMPT_TIER_ICONS.get(_attempt_tier(row), "")
         day = float(row.get('DayChangePct', 0.0) or 0.0)
-        return (f"Earlier {d} attempts ({len(ks)}, net {net:+.1f}R): {more}{' | '.join(parts)} "
-                f"→ re-anchored {cur_anchor} | first {d} anchor today {ks[0].get('anchor_time', '?')} | Day {day:+.2f}%")
+        if not prior:
+            return f"{icon} Earlier {lab} attempts (0) → first {lab} anchor today {cur} (now {cur_r:+.2f}R) | Day {day:+.2f}%"
+        net = sum(r for _, _, r in prior)
+        n_show = int(PRIOR_ATTEMPTS_MAX_SHOWN)
+        shown = prior[-n_show:] if n_show > 0 else prior
+        parts = [f"{a}>{k} {r:+.1f}R" for a, k, r in shown]
+        more = f"{len(prior) - len(shown)} older, " if len(prior) > len(shown) else ""
+        return (f"{icon} Earlier {lab} attempts ({len(prior)}, net {net:+.1f}R): {more}{' | '.join(parts)} "
+                f"→ re-anchored {cur} (now {cur_r:+.2f}R) | first {lab} anchor today {prior[0][0]} | Day {day:+.2f}%")
     except Exception:
         return ""
+
+def _report_legend_text():
+    """One shared legend line for the console and every email."""
+    parts = []
+    if ATTEMPT_SORT_ENABLED:
+        parts.append("Order: ✅ all attempts +R → 🟡 net +R (an earlier attempt lost) → 🔻 net -R, newest anchor first inside each group")
+    if TARGET_LADDER_ENABLED:
+        parts.append("T2/T3.. = target stepped up (earlier target achieved) | SL moves to profit-lock floor once armed")
+    parts.append("↳ = today's attempts on this script (earlier stopped-out anchors, current one, Day %)")
+    return "Legend: " + " | ".join(parts)
 
 def _get_timestamp_gap_min(row):
     """Computes elapsed minutes between CheckpointTime (Seen Time) and ActiveAnchor time."""
@@ -1750,7 +1814,9 @@ def _script_group_key(row):
 
 def sort_rows_by_script_count(rows_list):
     """
-    Sorts a table of active setups by:
+    Sorts a table of active setups (Bull or Bear, every mode, every email) by:
+      0. Attempt tier (ATTEMPT_SORT_ENABLED): 1 = all attempts today +R, 2 = net +R, 3 = net -R   (see _attempt_tier)
+         then anchor time, newest first (ATTEMPT_SORT_TIME_DESC)
       1. Risk-to-Reward ratio (ascending or descending as configured by RR_SORT_ORDER, e.g. 0.1:1, 0.28:1)
       2. Number of rows existing for that single script/underlying (descending)
       3. Script group name (A-Z)
@@ -1772,7 +1838,11 @@ def sort_rows_by_script_count(rows_list):
             r['RR_Str'] = rr_str
 
     is_asc = (str(RR_SORT_ORDER).upper() == "ASC")
+    tiers = ATTEMPT_SORT_ENABLED
+    t_sign = -1 if ATTEMPT_SORT_TIME_DESC else 1
     rows_list.sort(key=lambda r: (
+        _attempt_tier(r) if tiers else 0,
+        t_sign * _hhmm_to_min(r.get('ActiveAnchor')) if tiers else 0,
         r.get('RR_Val', 999.0) if is_asc else -r.get('RR_Val', 0.0),
         -counts.get(_script_group_key(r), 0),
         _script_group_key(r),
@@ -2064,6 +2134,7 @@ def render_console_dashboard(
         f"Target Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Checkpoints: {len(checkpoints)} | "
         f"Sectoral Indices (Bull: {len(idx_bulls)}, Bear: {len(idx_bears)}, Grave: {len(idx_grave)}) | "
         f"Stocks Shown (Bull: {len(f_stock_bulls)}, Bear: {len(f_stock_bears)}, Grave: {len(f_stock_grave)})\n"
+        f"{COLOR_DIM}{_report_legend_text()}{COLOR_RESET}\n"
     )
 
     def print_active_table(title, icon, data_list, show_sector_col=True, show_first_iter_col=False, show_target_sl=True):
@@ -2278,8 +2349,7 @@ def build_full_untruncated_plain_text(
         if EMAIL_ONLY_PURE_1ST_TIME_CONTENT:
             lines.append(f"=== SYSTEM 3.0 [{mode}] — PURE 1ST-TIME POPUPS (NO *) REPORT ({w_start_s}..{w_end_s}) ===")
             lines.append(f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Anchor Window: {w_start_s} to {w_end_s}")
-            if TARGET_LADDER_ENABLED:
-                lines.append("Legend: T2/T3.. = target stepped up (earlier target already achieved) | SL moves to profit-lock floor once armed | ↳ = earlier stopped-out attempts behind a '*' anchor")
+            lines.append(_report_legend_text())
             lines.append(
                 f"Sectoral Indices Pure 1st-Time: ▲ {len(new_idx_b)} Bull / ▼ {len(new_idx_r)} Bear | "
                 f"Stocks Pure 1st-Time: ▲ {len(new_stk_b)} Bull [CE({nb_ce}) PE({nb_pe})] / ▼ {len(new_stk_r)} Bear [CE({nr_ce}) PE({nr_pe})]\n"
@@ -2292,7 +2362,8 @@ def build_full_untruncated_plain_text(
             return "\n".join(lines)
 
     lines.append(f"=== SYSTEM 3.0 INSTITUTIONAL VOLATILITY TRACKER [{mode}] ===")
-    lines.append(f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')}\n")
+    lines.append(f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')}")
+    lines.append(_report_legend_text() + "\n")
     if idx_bulls or idx_bears:
         _fmt_active_block("SECTORAL INDICES — TOP BULL SETUPS", idx_bulls, show_sector=False, include_ce_pe_counts=False)
         _fmt_active_block("SECTORAL INDICES — TOP BEAR SETUPS", idx_bears, show_sector=False, include_ce_pe_counts=False)
@@ -2358,7 +2429,7 @@ def build_email_and_attachment_html(
         tr_list = []
         for idx_i, r in enumerate(rows_list):
             d = _ser_active(r, basket_dir)
-            tgt_badge = f"<span style='font-size:10px;background-color:#fef3c7;color:#92400e;border-radius:3px;padding:1px 4px;margin-right:5px;'>{d['tgt_tag']}</span>" if d["tgt_tag"] else ""
+            tgt_badge = f"<span style='font-size:10px;background-color:#fef3c7;color:#92400e;border-radius:3px;padding:1px 4px;margin-right:3px;'>{d['tgt_tag']}</span> " if d["tgt_tag"] else ""
             row_bg = "#ffffff" if idx_i % 2 == 0 else "#f8fafc"
             base_td = f"padding:7px 10px;border:1px solid #cbd5e1;background-color:{row_bg};color:#0f172a;font-size:12px;"
             sec_attr = html.escape(d["symbol"] if not show_sec else d["sector"])
@@ -2441,6 +2512,7 @@ def build_email_and_attachment_html(
         f"<div style='font-size:17px;font-weight:800;color:#0f172a;margin-bottom:6px;'>📡 SYSTEM 3.0 [{html.escape(mode)}] — PURE 1ST-TIME POPUPS ({w_start_s}..{w_end_s})</div>"
         f"<div style='color:#334155;font-size:13px;margin-bottom:4px;'>"
         f"<b>Target Snapshot:</b> {cutoff_dt.strftime('%Y-%m-%d %H:%M')} &nbsp;|&nbsp; <b>Anchor Window:</b> <span style='background-color:#e0f2fe;color:#0369a1;padding:2px 6px;border-radius:4px;font-weight:700;'>{w_start_s} to {w_end_s}</span> &nbsp;|&nbsp; <b>Max Gap:</b> {MAX_TIMESTAMP_GAP_MINUTES}m</div>"
+        f"<div style='color:#64748b;font-size:11px;margin-bottom:4px;'>{html.escape(_report_legend_text())}</div>"
         f"<div style='color:#334155;font-size:12px;margin-top:4px;'>"
         f"<b>Sectoral Indices:</b> <span style='color:#15803d;font-weight:700;'>▲ {len(email_idx_b)} Bull</span> &nbsp;/&nbsp; <span style='color:#b91c1c;font-weight:700;'>▼ {len(email_idx_r)} Bear</span> &nbsp;|&nbsp; "
         f"<b>Stocks:</b> <span style='color:#15803d;font-weight:700;'>▲ {len(email_stk_b)} Bull [CE({nb_ce}) PE({nb_pe})]</span> &nbsp;/&nbsp; <span style='color:#b91c1c;font-weight:700;'>▼ {len(email_stk_r)} Bear [CE({nr_ce}) PE({nr_pe})]</span>"
@@ -2514,8 +2586,7 @@ def build_still_holding_plain_text(
     lines = []
     lines.append(f"=== SYSTEM 3.0 [{mode}] — SETUPS STILL HOLDING GOOD REPORT ===")
     lines.append(f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Active Holding Setups (Alive & Not Stopped Out)")
-    if TARGET_LADDER_ENABLED:
-        lines.append("Legend: T2/T3.. = target stepped up (earlier target already achieved) | SL moves to profit-lock floor once armed | ↳ = earlier stopped-out attempts behind a '*' anchor")
+    lines.append(_report_legend_text())
     lines.append(
         f"Sectoral Indices Still Holding: ▲ {len(idx_hold_bulls)} Bull / ▼ {len(idx_hold_bears)} Bear | "
         f"Stocks Still Holding: ▲ {len(stock_hold_bulls)} Bull [CE({hb_ce}) PE({hb_pe})] / ▼ {len(stock_hold_bears)} Bear [CE({hr_ce}) PE({hr_pe})]\n"
@@ -2616,7 +2687,7 @@ def build_still_holding_email_and_attachment_html(
         tr_list = []
         for idx_i, r in enumerate(rows_list):
             d = _ser_holding(r, basket_dir)
-            tgt_badge = f"<span style='font-size:10px;background-color:#fef3c7;color:#92400e;border-radius:3px;padding:1px 4px;margin-right:5px;'>{d['tgt_tag']}</span>" if d["tgt_tag"] else ""
+            tgt_badge = f"<span style='font-size:10px;background-color:#fef3c7;color:#92400e;border-radius:3px;padding:1px 4px;margin-right:3px;'>{d['tgt_tag']}</span> " if d["tgt_tag"] else ""
             row_bg = "#ffffff" if idx_i % 2 == 0 else "#f8fafc"
             base_td = f"padding:7px 10px;border:1px solid #cbd5e1;background-color:{row_bg};color:#0f172a;font-size:12px;"
             sec_attr = html.escape(d["symbol"] if not show_sec else d["sector"])
@@ -2690,6 +2761,7 @@ def build_still_holding_email_and_attachment_html(
         f"<div style='font-size:17px;font-weight:800;color:#0f172a;margin-bottom:6px;'>🛡️ SYSTEM 3.0 [{html.escape(mode)}] — SETUPS STILL HOLDING GOOD</div>"
         f"<div style='color:#334155;font-size:13px;margin-bottom:4px;'>"
         f"<b>Target Snapshot:</b> {cutoff_dt.strftime('%Y-%m-%d %H:%M')} &nbsp;|&nbsp; <b>Status:</b> <span style='background-color:#dcfce7;color:#166534;padding:2px 6px;border-radius:4px;font-weight:700;'>Active Survived Setups</span></div>"
+        f"<div style='color:#64748b;font-size:11px;margin-bottom:4px;'>{html.escape(_report_legend_text())}</div>"
         f"<div style='color:#334155;font-size:12px;margin-top:4px;'>"
         f"<b>Sectoral Indices:</b> <span style='color:#15803d;font-weight:700;'>▲ {len(idx_hold_bulls)} Bull</span> &nbsp;/&nbsp; <span style='color:#b91c1c;font-weight:700;'>▼ {len(idx_hold_bears)} Bear</span> &nbsp;|&nbsp; "
         f"<b>Stocks:</b> <span style='color:#15803d;font-weight:700;'>▲ {len(stock_hold_bulls)} Bull [CE({hb_ce}) PE({hb_pe})]</span> &nbsp;/&nbsp; <span style='color:#b91c1c;font-weight:700;'>▼ {len(stock_hold_bears)} Bear [CE({hr_ce}) PE({hr_pe})]</span>"
@@ -3064,6 +3136,10 @@ def parse_args():
     p.add_argument("--ladder-step", type=float, default=None, help="Target ladder increment per level (default: TARGET_LADDER_STEP; 0.5 -> 1.0x, 1.5x, 2.0x ...).")
     p.add_argument("--sl-trail-lock", dest="sl_trail_lock", action="store_true", default=None, help="Show SL at the profit-lock floor once the lock is armed (default: SL_TRAIL_TO_LOCK_FLOOR).")
     p.add_argument("--no-sl-trail-lock", dest="sl_trail_lock", action="store_false")
+    p.add_argument("--attempt-sort", dest="attempt_sort", action="store_true", default=None, help="Order rows by attempt tier (all +R, net +R, net -R), newest anchor first inside a tier (default: ATTEMPT_SORT_ENABLED).")
+    p.add_argument("--no-attempt-sort", dest="attempt_sort", action="store_false")
+    p.add_argument("--attempts-line-all-rows", dest="attempts_line_all_rows", action="store_true", default=None, help="Print the attempts line under EVERY row, not only '*' rows (default: SHOW_ATTEMPTS_LINE_FOR_ALL_ROWS).")
+    p.add_argument("--no-attempts-line-all-rows", dest="attempts_line_all_rows", action="store_false")
 
     # Email & Sectoral Controls
     p.add_argument("--send-email", dest="send_email", action="store_true", default=SEND_DASHBOARD_EMAIL)
@@ -3172,6 +3248,8 @@ if __name__ == "__main__":
 
     TARGET_LADDER_ENABLED = args.target_ladder if args.target_ladder is not None else _parse_bool_env(ENV_TARGET_LADDER_ENABLED, TARGET_LADDER_ENABLED)
     SL_TRAIL_TO_LOCK_FLOOR = args.sl_trail_lock if args.sl_trail_lock is not None else _parse_bool_env(ENV_SL_TRAIL_TO_LOCK_FLOOR, SL_TRAIL_TO_LOCK_FLOOR)
+    ATTEMPT_SORT_ENABLED = args.attempt_sort if args.attempt_sort is not None else _parse_bool_env(ENV_ATTEMPT_SORT_ENABLED, ATTEMPT_SORT_ENABLED)
+    SHOW_ATTEMPTS_LINE_FOR_ALL_ROWS = args.attempts_line_all_rows if args.attempts_line_all_rows is not None else _parse_bool_env(ENV_SHOW_ATTEMPTS_LINE_FOR_ALL_ROWS, SHOW_ATTEMPTS_LINE_FOR_ALL_ROWS)
     if args.ladder_step is not None:
         TARGET_LADDER_STEP = args.ladder_step
     else:
