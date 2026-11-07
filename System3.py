@@ -175,7 +175,7 @@ OPT_MIN_ATR_PCT = 0.04
 MAX_ATR_PCT = 0.06                      # stocks / cash equity
 INDEX_MAX_ATR_PCT = 0.04                # sectoral indices
 OPT_MAX_ATR_PCT = 0.35                  # option premiums
-RISK_ATR_TF = "60min"                  # ATR used ONLY for the SL / Target / R:R distances: "360min" = one daily bar (a true daily ATR). None = same ATR as the engine.
+RISK_ATR_TF = "15min"                  # ATR used ONLY for the SL / Target / R:R distances: "360min" = one daily bar (a true daily ATR). None = same ATR as the engine.
                                         # The engine's kill rules (hard / soft stop, profit lock) and every R-multiple stay on ATR_BASIS_TF, so anchors and
                                         # re-anchors keep reacting at intraday speed. Setting ATR_BASIS_TF itself to 360min would also widen every kill rule ~5x.
 ENV_RISK_ATR_TF = "RISK_ATR_TF"
