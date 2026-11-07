@@ -645,15 +645,12 @@ def _is_positive_attempt_reanchor(row):
 def _is_still_holding_qualified(row):
     """
     Qualifies setups for the Still-Holding Good report:
-    1. Current live attempt must be positive (+R): _r_multiple(row) > 0.
-    2. If re-anchored (earlier attempts exist today):
-       - First attempt today occurred and resulted in +R (prior[0][2] > 0).
-       - ALL previous attempts today must be positive (all(round(r, 2) > 0 for _, _, r in prior)).
-       - Re-anchor must have occurred within STILL_HOLDING_REANCHOR_WINDOW_MINUTES (default 60 mins):
-         _get_timestamp_gap_min(row) <= STILL_HOLDING_REANCHOR_WINDOW_MINUTES.
-       - Current re-anchor attempt must also be positive (+R): cur_r > 0.
-    3. If first attempt of the day (no prior attempts):
-       - Current attempt is +R: cur_r > 0.
+    1. The first time must have ALREADY occurred today and closed in +R: prior[0][2] > 0.
+    2. Re-anchored setup must have occurred: len(prior) >= 1. (Earlier attempts (0) excluded).
+    3. ALL previous attempts today must be positive (+R): all(round(r, 2) > 0 for _, _, r in prior).
+    4. Re-anchor must have occurred within STILL_HOLDING_REANCHOR_WINDOW_MINUTES (default 60 mins):
+       _get_timestamp_gap_min(row) <= STILL_HOLDING_REANCHOR_WINDOW_MINUTES.
+    5. Current re-anchor attempt must also be positive (+R): cur_r > 0.
     """
     try:
         cur_r = float(_r_multiple(row, include_banked=False))
@@ -662,18 +659,23 @@ def _is_still_holding_qualified(row):
 
         h = _attempt_history(row)
         prior = h.get("prior", [])
-        if prior:
-            # First attempt must be +R
-            if round(prior[0][2], 2) <= 0.0:
-                return False
-            # ALL previous attempts must be +R
-            if not all(round(r, 2) > 0.0 for _, _, r in prior):
-                return False
-            # Re-anchor must have occurred within STILL_HOLDING_REANCHOR_WINDOW_MINUTES (default: 60 mins)
-            gap = _get_timestamp_gap_min(row)
-            window_min = int(STILL_HOLDING_REANCHOR_WINDOW_MINUTES or 60)
-            if gap > window_min:
-                return False
+        # Must have already occurred and re-anchored (at least 1 prior attempt today)
+        if not prior:
+            return False
+
+        # First attempt must be +R
+        if round(prior[0][2], 2) <= 0.0:
+            return False
+
+        # ALL previous attempts must be +R (no negative attempts allowed)
+        if not all(round(r, 2) > 0.0 for _, _, r in prior):
+            return False
+
+        # Re-anchor must have occurred within the configured window (default 60 mins)
+        gap = _get_timestamp_gap_min(row)
+        window_min = int(STILL_HOLDING_REANCHOR_WINDOW_MINUTES or 60)
+        if gap > window_min:
+            return False
 
         return True
     except Exception:
