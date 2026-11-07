@@ -1,15 +1,9 @@
 #!/usr/bin/env python3
 """
 Strict Institutional Volatility Tracker (Upstox) - System 3.0
-+ Configurable Timestamp Gap Check: Filters stale setups where (Seen - Anchor) > MAX_TIMESTAMP_GAP_MINUTES.
-+ Risk-to-Reward (R:R) Column: Formatted like 0.1:1, 0.28:1 before LTP/Exit, sorted ascending for Bulls and Bears.
-+ Dedicated Still-Holding Good Email: Sends a separate email for active setups that triggered earlier (e.g. 09:43) and still hold good at snapshot time.
-+ Sectoral Indices in Pure 1st-Time Email: Sectoral index popups are now seamlessly included alongside stock popups in the Pure 1st-Time email.
-+ Target Ladder: once T1 is achieved the target steps up (T2 = 1.5x, T3 = 2.0x ...) so R:R never collapses to 99.9:1; row shows a T2/T3 tag.
-+ Profit-Lock SL Trail: once the lock is armed (peak >= PROFIT_LOCK_TRIGGER_R) the SL column shows the lock floor, so R:R reflects real remaining risk.
-+ Attempts Line On EVERY Row: Bull or Bear, stock or index, STOCK_FNO / CASH_EQUITY / INDEX_OPTIONS, every email + console: earlier stopped-out attempts, current attempt R, Day%.
-+ Attempt-Tier Row Order: 1) all attempts +R, 2) net +R, 3) net -R; newest anchor first inside each tier (ATTEMPT_SORT_ENABLED; same order in every email).
-+ Pure 1st-Time & Positive Re-Anchor Engine: Popups search between Seen and Anchor, including fresh 1st-time setups AND re-anchored setups with positive earlier attempts (Attempt 1 > 0 or net > 0).
++ Pure 1st-Time: Strictly the first anchor time of the day (no prior attempts, no earlier day appearances).
++ Still Holding Good: Must have re-anchored with all earlier attempts having positive R (> 0).
++ Still Holding Good Sorting: Sorted by latest re-anchored first (newest ActiveAnchor time descending).
 """
 import os, sys, re, html, argparse, traceback, urllib.parse, gzip, json, time, threading
 from bisect import bisect_left
@@ -111,7 +105,6 @@ STRICT_FIRST_TIME_POPUP_FILTER = True
 POPUP_REQUIRE_NON_ZERO_GRID = True
 POPUP_MIN_R_MULTIPLE = 0.0
 PURE_1ST_TIME_CURRENT_ITER_ONLY = False
-POPUP_INCLUDE_POSITIVE_REANCHORS = True          # Include re-anchored setups where earlier Attempt 1 > 0 or any attempt > 0
 
 # --- 0.3C TIMESTAMP GAP CHECK CONFIGURATION ---
 ENABLE_TIMESTAMP_GAP_CHECK = True       # Master toggle: filter setups where (Seen - Anchor) exceeds threshold
@@ -172,36 +165,32 @@ SL_ATR_MULT = SOFT_STOP_ATR_MULT
 TARGET_SL_FROM_ANCHOR = True
 
 # --- 0.7B RISK-TO-REWARD (R:R) ENGINE CONFIGURATION ---
-RR_RATIO_TYPE = "RISK_TO_REWARD"        # Choices: "RISK_TO_REWARD" (Risk/Reward : 1) or "REWARD_TO_RISK" (Reward/Risk : 1)
-RR_SORT_ORDER = "ASC"                   # Choices: "ASC" (e.g. 0.1:1, 0.28:1 ascending) or "DESC"
+RR_RATIO_TYPE = "RISK_TO_REWARD"
+RR_SORT_ORDER = "ASC"
 ENV_RR_RATIO_TYPE = "RR_RATIO_TYPE"
 ENV_RR_SORT_ORDER = "RR_SORT_ORDER"
 
-# --- 0.7C TARGET LADDER (AUTO-EXTEND THE TARGET ONCE AN EARLIER TARGET IS ACHIEVED) ---
-TARGET_LADDER_ENABLED = True            # Master toggle (False = old behaviour: fixed T1, R:R 99.9:1 once achieved)
-TARGET_LADDER_STEP = 0.5                # Increment of the multiplier per level (0.5 -> 1.0x, 1.5x, 2.0x, 2.5x ...)
-TARGET_LADDER_MAX_LEVELS = 50           # Safety cap on the number of ladder levels
-SL_TRAIL_TO_LOCK_FLOOR = True           # Once Profit-Lock is armed, show SL = lock floor so R:R is honest
+TARGET_LADDER_ENABLED = True
+TARGET_LADDER_STEP = 0.5
+TARGET_LADDER_MAX_LEVELS = 50
+SL_TRAIL_TO_LOCK_FLOOR = True
 ENV_TARGET_LADDER_ENABLED = "TARGET_LADDER_ENABLED"
 ENV_TARGET_LADDER_STEP = "TARGET_LADDER_STEP"
 ENV_SL_TRAIL_TO_LOCK_FLOOR = "SL_TRAIL_TO_LOCK_FLOOR"
 
-# --- 0.7D PRIOR-ATTEMPT CONTEXT (WHY IS THE ANCHOR LATE?) ---
 SHOW_PRIOR_ATTEMPTS_LINE = True
-SHOW_ATTEMPTS_LINE_FOR_ALL_ROWS = True  # True: EVERY row gets the line
-PRIOR_ATTEMPTS_MAX_SHOWN = 4            # Max earlier attempts listed per row
+SHOW_ATTEMPTS_LINE_FOR_ALL_ROWS = True
+PRIOR_ATTEMPTS_MAX_SHOWN = 4
 ENV_SHOW_ATTEMPTS_LINE_FOR_ALL_ROWS = "SHOW_ATTEMPTS_LINE_FOR_ALL_ROWS"
 
-# --- 0.7E ATTEMPT-TIER ROW ORDER ---
-ATTEMPT_SORT_ENABLED = True             # False = legacy order (R:R first)
-ATTEMPT_SORT_TIME_DESC = True           # True = most recent anchor first inside a tier
+ATTEMPT_SORT_ENABLED = True
+ATTEMPT_SORT_TIME_DESC = True
 ENV_ATTEMPT_SORT_ENABLED = "ATTEMPT_SORT_ENABLED"
 
 ADVERSE_DRIFT_R_FLOOR = -0.5
 ADVERSE_DRIFT_STOP_RATIO = 1.0
 BANKED_R_PROTECTION_FLOOR = 0.5
 
-# --- 0.8 SECTORAL INDICES & MULTI-INDEX WEIGHTAGE MATRIX ---
 ENABLE_SECTORAL_INDICES = True
 DEFAULT_UNMAPPED_SECTOR = "NIFTY 500"
 DEFAULT_UNMAPPED_WEIGHT = 0.10
@@ -309,7 +298,6 @@ SECTOR_CONSTITUENT_WEIGHTS = {
     },
 }
 
-# --- 0.9 INDEX OPTIONS CONFIGURATION ---
 OPTIONS_BUYING_ONLY = True
 EXPIRY_SELECTION = "CURRENT"
 STRIKES_ABOVE_ATM = 5
@@ -328,7 +316,6 @@ INDEX_CONFIG = {
 ALIAS_TO_INDEX = {a: idx for idx, cfg in INDEX_CONFIG.items() for a in cfg["aliases"]}
 PROBE_KEY = INDEX_CONFIG["NIFTY"]["spot_key"]
 
-# --- 0.10 DASHBOARD DISPLAY & FORMATTING ---
 TOP_N_BUYERS = 50
 TOP_N_SELLERS = 50
 TOP_N_GRAVEYARD = 100
@@ -349,7 +336,6 @@ ANSI_RE = re.compile(r'\x1b\[[0-9;]*m')
 ACTIVE_BULL_STATES = ("[ BB > KC ]", "[ BB < KC ]")
 ACTIVE_BEAR_STATES = ("[ BB > KC ]", "[ BB < KC ]")
 
-# --- 0.11 UPSTOX API & RATE LIMITER INFRASTRUCTURE ---
 API_HOST = "https://api.upstox.com"
 MASTER_BASE_URL = "https://assets.upstox.com/market-quote/instruments/exchange"
 RATE_CAPS = ((1.0, 22), (60.0, 220), (1800.0, 900))
@@ -512,18 +498,11 @@ def _format_count_with_ce_pe(rows_list):
     ce_cnt, pe_cnt = _ce_pe_counts(rows_list)
     return f"({total}) CE({ce_cnt}) PE({pe_cnt})"
 
-def _to_float(v, default=0.0):
-    try:
-        if v is None: return default
-        return float(v)
-    except (ValueError, TypeError):
-        return default
-
 def _compute_target_sl(row):
-    ap = _to_float(row.get('AnchorPrice', 0.0))
-    ltp = _to_float(row.get('LTP', 0.0))
+    ap = float(row.get('AnchorPrice', 0.0) or 0.0)
+    ltp = float(row.get('LTP', 0.0) or 0.0)
     ref_price = ap if (TARGET_SL_FROM_ANCHOR and ap > 0) else ltp
-    base_atr = _to_float(row.get('BaseAtr', 0.0))
+    base_atr = float(row.get('BaseAtr', 0.0) or 0.0)
     if ref_price <= 0 or base_atr <= 0:
         return 0.0, 0.0
 
@@ -533,24 +512,23 @@ def _compute_target_sl(row):
     else:
         p_dir = str(row.get('PremiumDir') or row.get('AnchorDir') or 'BULL').upper()
 
-    t_mult = _to_float(TARGET_ATR_MULT, 1.8)
-    s_mult = _to_float(SL_ATR_MULT, 1.0)
+    t_mult = float(TARGET_ATR_MULT)
+    s_mult = float(SL_ATR_MULT)
 
-    # --- Target ladder: step target up once earlier target achieved since anchor ---
     level, fav_r = 1, 0.0
     if TARGET_LADDER_ENABLED and TARGET_SL_FROM_ANCHOR and ap > 0:
         peak = ltp
         try:
             pk, pk_for = row.get('PeakPrice'), row.get('PeakFor')
-            if pk is not None and float(pk) > 0 and (pk_for is None or abs(_to_float(pk_for) - ap) < 1e-6):
-                peak = min(_to_float(pk), ltp) if p_dir == 'BEAR' else max(_to_float(pk), ltp)
+            if pk is not None and pk_for is not None and float(pk) > 0 and abs(float(pk_for) - ap) < 1e-6:
+                peak = min(float(pk), ltp) if p_dir == 'BEAR' else max(float(pk), ltp)
         except Exception:
             peak = ltp
         fav_r = ((ap - peak) if p_dir == 'BEAR' else (peak - ap)) / base_atr
-        step, max_lv = _to_float(TARGET_LADDER_STEP, 0.5), max(1, int(TARGET_LADDER_MAX_LEVELS))
+        step, max_lv = float(TARGET_LADDER_STEP), max(1, int(TARGET_LADDER_MAX_LEVELS))
         if t_mult > 0 and step > 0 and fav_r + 1e-9 >= t_mult:
             level = min(max_lv, int(((fav_r / t_mult - 1.0) / step + 1e-9) // 1) + 2)
-    eff_t_mult = t_mult * (1.0 + (level - 1) * _to_float(TARGET_LADDER_STEP, 0.5)) if level > 1 else t_mult
+    eff_t_mult = t_mult * (1.0 + (level - 1) * float(TARGET_LADDER_STEP)) if level > 1 else t_mult
 
     if p_dir == 'BEAR':
         target_price = max(0.05, ref_price - (eff_t_mult * base_atr))
@@ -559,10 +537,9 @@ def _compute_target_sl(row):
         target_price = ref_price + (eff_t_mult * base_atr)
         sl_price = max(0.05, ref_price - (s_mult * base_atr))
 
-    # --- Profit-Lock SL Trail: trail to breakeven floor once armed ---
-    lock_trig = _to_float(PROFIT_LOCK_TRIGGER_R or 0.0)
+    lock_trig = float(PROFIT_LOCK_TRIGGER_R or 0.0)
     if SL_TRAIL_TO_LOCK_FLOOR and TARGET_LADDER_ENABLED and lock_trig > 0 and fav_r + 1e-9 >= lock_trig:
-        floor_r = _to_float(PROFIT_LOCK_FLOOR_R or 0.0)
+        floor_r = float(PROFIT_LOCK_FLOOR_R or 0.0)
         lock_sl = (ref_price - floor_r * base_atr) if p_dir == 'BEAR' else (ref_price + floor_r * base_atr)
         if (p_dir == 'BEAR' and lock_sl > ltp) or (p_dir != 'BEAR' and 0.05 < lock_sl < ltp):
             sl_price = lock_sl
@@ -572,11 +549,11 @@ def _compute_target_sl(row):
     return round(target_price, 2), round(sl_price, 2)
 
 def compute_risk_reward_ratio(row):
-    tgt_p = _to_float(row.get('TargetPrice', 0.0))
-    sl_p = _to_float(row.get('SLPrice', 0.0))
+    tgt_p = float(row.get('TargetPrice', 0.0) or 0.0)
+    sl_p = float(row.get('SLPrice', 0.0) or 0.0)
     if tgt_p <= 0 or sl_p <= 0:
         tgt_p, sl_p = _compute_target_sl(row)
-    ltp = _to_float(row.get('LTP', 0.0))
+    ltp = float(row.get('LTP', 0.0) or 0.0)
     if ltp <= 0 or tgt_p <= 0 or sl_p <= 0:
         return 999.0, "-:1"
 
@@ -587,11 +564,11 @@ def compute_risk_reward_ratio(row):
         p_dir = str(row.get('PremiumDir') or row.get('AnchorDir') or 'BULL').upper()
 
     if p_dir == 'BEAR':
-        reward = max(0.05, ltp - tgt_p)
-        risk = max(0.05, sl_p - ltp)
+        reward = max(0.0, ltp - tgt_p)
+        risk = max(0.0, sl_p - ltp)
     else:
-        reward = max(0.05, tgt_p - ltp)
-        risk = max(0.05, ltp - sl_p)
+        reward = max(0.0, tgt_p - ltp)
+        risk = max(0.0, ltp - sl_p)
 
     if RR_RATIO_TYPE == "REWARD_TO_RISK":
         val = (reward / risk) if risk > 0 else 99.9
@@ -609,7 +586,7 @@ def _target_tag(row):
     return f"T{lvl}" if lvl > 1 else ""
 
 def _target_cell_text(row):
-    return f"{_target_tag(row):<3}{_to_float(row.get('TargetPrice', 0.0)):>9.2f}"
+    return f"{_target_tag(row):<3}{float(row.get('TargetPrice', 0.0) or 0.0):>9.2f}"
 
 def _hhmm_to_min(s):
     try:
@@ -622,30 +599,11 @@ def _attempt_history(row):
     d_raw = str(row.get('PremiumDir') or row.get('AnchorDir') or '').upper()
     label = str(row.get('AnchorDir') or d_raw or 'BULL').upper()
     cur_anchor = str(row.get('ActiveAnchor') or '').replace('*', '').strip()
-    atr = _to_float(row.get('BaseAtr', 0.0))
+    atr = float(row.get('BaseAtr', 0.0) or 0.0)
     ks = [k for k in (row.get('Kills') or []) if str(k.get('dir', '')).upper() == d_raw and str(k.get('anchor_time', '')) != cur_anchor]
     ks.sort(key=lambda k: str(k.get('anchor_time', '')))
     prior = [(str(k.get('anchor_time', '?')), str(k.get('killed_time', '?')), float(_kill_r_multiple(k, atr))) for k in ks]
     return {"label": label, "cur_anchor": cur_anchor, "prior": prior, "cur_r": float(_r_multiple(row, include_banked=False))}
-
-def _is_positive_attempt_reanchor(row):
-    """
-    Returns True if row is a re-anchored setup where:
-    - Earlier Attempt 1 was positive (prior[0][2] > 0), OR
-    - Any previous attempt was positive (any(r > 0)), OR
-    - Net of earlier attempts is positive (sum(r) > 0 / Tier 1 or Tier 2).
-    """
-    try:
-        h = _attempt_history(row)
-        prior = h.get("prior", [])
-        if not prior:
-            return False
-        attempt_1_pos = len(prior) > 0 and round(prior[0][2], 2) > 0
-        any_prior_pos = any(round(r, 2) > 0 for _, _, r in prior)
-        net_prior_pos = round(sum(r for _, _, r in prior), 2) > 0
-        return bool(attempt_1_pos or any_prior_pos or net_prior_pos)
-    except Exception:
-        return False
 
 def _attempt_tier(row):
     try:
@@ -668,7 +626,7 @@ def _prior_attempts_text(row):
         if not prior and not SHOW_ATTEMPTS_LINE_FOR_ALL_ROWS:
             return ""
         icon = ATTEMPT_TIER_ICONS.get(_attempt_tier(row), "")
-        day = _to_float(row.get('DayChangePct', 0.0))
+        day = float(row.get('DayChangePct', 0.0) or 0.0)
         if not prior:
             return f"{icon} Earlier {lab} attempts (0) → first {lab} anchor today {cur} (now {cur_r:+.2f}R) | Day {day:+.2f}%"
         net = sum(r for _, _, r in prior)
@@ -1051,11 +1009,6 @@ def _equity_universe(mode, needles=()):
         )
 
     fno = {i.get("underlying_symbol") for i in nse if i.get("segment") == "NSE_FO" and i.get("underlying_symbol")}
-    if mode == "STOCK_FNO" and not fno:
-        complete_rows = _download_master("complete")
-        if complete_rows:
-            fno = {i.get("underlying_symbol") for i in complete_rows if i.get("segment") == "NSE_FO" and i.get("underlying_symbol")}
-
     everything = {}
     for i in nse:
         if not plain(i): continue
@@ -1499,8 +1452,6 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
             j += 1
 
         if survived:
-            anchor['peak_price'] = float(true_peak)
-            anchor['max_r'] = float((true_peak - anchor['price']) / base_atr if is_bull else (anchor['price'] - true_peak) / base_atr)
             survived_anchor = anchor
             break
 
@@ -1609,7 +1560,6 @@ def row_at(S, end, symbol, sector="", sector_weight=0.0, is_sector_index=False):
         else:
             row['PeakPrice'] = _ap
         row['PeakFor'] = _ap
-        row['MaxR'] = float(anchor.get('max_r', 0.0))
         row['TargetPrice'], row['SLPrice'] = _compute_target_sl(row)
     else:
         row['AnchorDir'] = info.get('dir', 'NONE')
@@ -1717,28 +1667,25 @@ def _print_error_summary():
     if ERRORS.items: print(f"{COLOR_YELLOW}⚠ {len(ERRORS.items)} instruments raised exceptions.{COLOR_RESET}")
 
 def _signal_id(row):
-    return (row.get('AnchorDir', 'NONE'), row.get('ActiveAnchor', '-'), round(_to_float(row.get('AnchorPrice', 0.0)), 6))
+    return (row['AnchorDir'], row['ActiveAnchor'], round(float(row['AnchorPrice']), 6))
 
 def _find_kill(kills, d, t):
     return next((k for k in reversed(kills or []) if k.get('dir') == d and k.get('anchor_time') == t), None)
 
 def _exit_price(row):
-    if row.get('State') == "[STOPPED]" and _to_float(row.get('KilledPrice', 0)) > 0:
-        return _to_float(row.get('KilledPrice'))
-    return _to_float(row.get('LTP', 0.0))
+    return float(row['KilledPrice']) if row.get('State') == "[STOPPED]" and row.get('KilledPrice', 0) > 0 else float(row.get('LTP', 0.0) or 0.0)
 
 def _kill_r_multiple(kill_dict, base_atr):
-    ap, kp = _to_float(kill_dict.get('anchor_price', 0.0)), _to_float(kill_dict.get('killed_price', 0.0))
-    b_atr = _to_float(base_atr)
-    if ap <= 0 or kp <= 0 or b_atr <= 0: return 0.0
-    return (kp - ap) / b_atr if kill_dict.get('dir', 'BULL') == 'BULL' else (ap - kp) / b_atr
+    ap, kp = float(kill_dict.get('anchor_price', 0.0) or 0.0), float(kill_dict.get('killed_price', 0.0) or 0.0)
+    if ap <= 0 or kp <= 0 or base_atr <= 0: return 0.0
+    return (kp - ap) / base_atr if kill_dict.get('dir', 'BULL') == 'BULL' else (ap - kp) / base_atr
 
 def _r_multiple(row, include_banked=False):
-    ap, base_atr, live_r = _to_float(row.get('AnchorPrice', 0.0)), _to_float(row.get('BaseAtr', 0.0)), 0.0
+    ap, base_atr, live_r = row.get('AnchorPrice', 0.0), row.get('BaseAtr', 0.0), 0.0
     if ap > 0 and base_atr > 0:
         price, direction = _exit_price(row), row.get('PremiumDir', row.get('AnchorDir'))
         live_r = (price - ap) / base_atr if direction == 'BULL' else (ap - price) / base_atr
-    return live_r + _to_float(row.get('BankedR', 0.0)) if include_banked else live_r
+    return live_r + float(row.get('BankedR', 0.0) or 0.0) if include_banked else live_r
 
 def _rank_r_score(row):
     return max(_r_multiple(row, False), _r_multiple(row, True))
@@ -1748,16 +1695,11 @@ def _merge_signal(sig_rows, last_row, direction):
     row = dict(last_row)
     row['ActiveAnchor'], row['AnchorPrice'], row['AnchorDir'] = first['ActiveAnchor'], first['AnchorPrice'], direction
     row['PremiumDir'] = direction
-    kills, base_atr = last_row.get('Kills') or [], _to_float(last_row.get('BaseAtr', 0.0))
+    kills, base_atr = last_row.get('Kills') or [], float(last_row.get('BaseAtr', 0.0) or 0.0)
     prior_kills = [k for k in kills if k.get('dir') == direction and k.get('anchor_time') != first['ActiveAnchor']]
     row['PriorStops'], row['BankedR'] = len(prior_kills), sum(_kill_r_multiple(k, base_atr) for k in prior_kills)
 
-    row['PeakPrice'] = _to_float(last_row.get('PeakPrice') or latest.get('PeakPrice') or row['AnchorPrice'])
-    row['PeakFor'] = _to_float(row['AnchorPrice'])
-    row['MaxR'] = _to_float(last_row.get('MaxR') or latest.get('MaxR') or 0.0)
-
-    active_states = ACTIVE_BULL_STATES if direction == "BULL" else ACTIVE_BEAR_STATES
-    if latest['CheckpointTime'] == last_row['CheckpointTime'] and last_row.get('State') in active_states and _signal_id(last_row) == _signal_id(first):
+    if latest['CheckpointTime'] == last_row['CheckpointTime'] and last_row.get('State') in ACTIVE_BULL_STATES and _signal_id(last_row) == _signal_id(first):
         row['State'], row['KilledTime'], row['KilledPrice'], row['RejectReason'] = last_row['State'], '-', 0.0, ""
     else:
         row['State'] = "[STOPPED]"
@@ -1846,6 +1788,30 @@ def sort_rows_by_script_count(rows_list):
         str(r.get("Symbol", "")),
     ))
     return rows_list
+
+def filter_and_sort_still_holding(rows_list):
+    """
+    Requirement 2 & 3:
+    1. Must have re-anchored (earlier attempts exist today).
+    2. Earlier attempts must have positive R value (each earlier attempt > 0 and banked_r > 0).
+    3. Sorted by latest re-anchored first (newest ActiveAnchor timestamp descending).
+    """
+    valid_reanchored = []
+    for r in (rows_list or []):
+        h = _attempt_history(r)
+        prior = h.get("prior", [])
+        banked_r = float(r.get('BankedR', 0.0) or 0.0)
+        # Must have re-anchored, banked_r > 0, and every stopped attempt today had R > 0
+        if len(prior) > 0 and banked_r > 0 and all(r_val > 0 for _, _, r_val in prior):
+            valid_reanchored.append(r)
+
+    # Sort descending by latest re-anchored ActiveAnchor timestamp
+    valid_reanchored.sort(key=lambda r: (
+        -_hhmm_to_min(r.get('ActiveAnchor')),
+        r.get('RR_Val', 999.0),
+        str(r.get('Symbol', ''))
+    ))
+    return valid_reanchored
 
 def segregate_and_rank_buckets(by_symbol_map, filter_timestamp_gap=None, filter_popup_strict=None):
     if filter_timestamp_gap is None:
@@ -1982,7 +1948,7 @@ def _anchor_within_lookback_window(anchor_str, window_start_dt, window_end_dt):
     except ValueError:
         return False
 
-def _passes_strict_popup_quality(row, window_span_min=None):
+def _passes_strict_popup_quality(row):
     sym = str(row.get('Symbol') or '')
     if OPTIONS_BUYING_ONLY and _is_option_symbol(sym):
         if str(row.get('PremiumDir') or 'BULL').upper() != 'BULL': return False
@@ -1991,8 +1957,7 @@ def _passes_strict_popup_quality(row, window_span_min=None):
         if anc_dir == 'BEAR' and not _is_pe_symbol(sym): return False
 
     if ENABLE_TIMESTAMP_GAP_CHECK and MAX_TIMESTAMP_GAP_MINUTES > 0:
-        allowed_gap = max(MAX_TIMESTAMP_GAP_MINUTES, int(window_span_min or 0)) if window_span_min else MAX_TIMESTAMP_GAP_MINUTES
-        if _get_timestamp_gap_min(row) > allowed_gap:
+        if _get_timestamp_gap_min(row) > MAX_TIMESTAMP_GAP_MINUTES:
             return False
 
     if not STRICT_FIRST_TIME_POPUP_FILTER: return True
@@ -2011,7 +1976,6 @@ def evaluate_first_time_popups_in_memory(by_symbol_all_cps, current_bulls, curre
     w_start = lookback_meta["window_start_dt"]
     w_end = lookback_meta["window_end_dt"]
     prior_dts = lookback_meta["prior_iter_dts_chrono"]
-    window_span_min = int((w_end - w_start).total_seconds() // 60)
 
     prior_bull_appearances, prior_bear_appearances, iter_stats = {}, {}, []
 
@@ -2025,7 +1989,7 @@ def evaluate_first_time_popups_in_memory(by_symbol_all_cps, current_bulls, curre
             if not f_rows: f_rows = [r for r in rows if r['CheckpointTime'] <= it_dt]
             if f_rows: sub_map[sym] = f_rows
 
-        it_bulls, it_bears, it_grave = segregate_and_rank_buckets(sub_map, filter_timestamp_gap=False) if sub_map else ([], [], [])
+        it_bulls, it_bears, it_grave = segregate_and_rank_buckets(sub_map) if sub_map else ([], [], [])
         it_label = it_dt.strftime("%H:%M")
         iter_stats.append({"iter_time": it_label, "bull_count": len(it_bulls), "bear_count": len(it_bears), "grave_count": len(it_grave)})
 
@@ -2039,7 +2003,7 @@ def evaluate_first_time_popups_in_memory(by_symbol_all_cps, current_bulls, curre
         for row in current_list:
             sym = row['Symbol']
             curr_anc = str(row.get('ActiveAnchor') or '-').replace('*', '').strip()
-            if not _anchor_within_lookback_window(curr_anc, w_start, w_end) or not _passes_strict_popup_quality(row, window_span_min=window_span_min):
+            if not _anchor_within_lookback_window(curr_anc, w_start, w_end) or not _passes_strict_popup_quality(row):
                 continue
 
             appearances = prior_app_map.get(sym, [])
@@ -2058,15 +2022,11 @@ def evaluate_first_time_popups_in_memory(by_symbol_all_cps, current_bulls, curre
             row_copy['TargetPrice'], row_copy['SLPrice'] = _compute_target_sl(row_copy)
             row_copy['RR_Val'], row_copy['RR_Str'] = compute_risk_reward_ratio(row_copy)
 
-            is_pure_first = (prior_stops == 0 and not has_star_badge and len(other_anc_iters) == 0)
-            is_pos_reanchor = bool(POPUP_INCLUDE_POSITIVE_REANCHORS and _is_positive_attempt_reanchor(row))
+            # Requirement 1: Pure 1st-Time must strictly be the first anchor time of the day
+            is_first_anchor_today = (prior_stops == 0 and not has_star_badge and len(other_anc_iters) == 0 and len(same_anc_iters) == 0)
 
-            if is_pure_first:
+            if is_first_anchor_today:
                 row_copy['PopupType'] = "1ST-TIME"
-                out_pure_first.append(row_copy)
-                out_all_window.append(row_copy)
-            elif is_pos_reanchor:
-                row_copy['PopupType'] = "RE-ANCHOR (+R)"
                 out_pure_first.append(row_copy)
                 out_all_window.append(row_copy)
             elif len(other_anc_iters) == 0:
@@ -2320,7 +2280,7 @@ def build_full_untruncated_plain_text(
             shown_state = _state_display(r)
             if "[ BB > KC ]" in r['State']: shown_state = f"[ BB > KC ] {'▲' if basket_dir == 'BULL' else '▼'}"
             ltp_val = f"{r['KilledPrice']:>8.2f}x" if "[STOP" in shown_state and r.get('KilledPrice', 0) > 0 else f"{r['LTP']:>9.2f} "
-            sl_p = r.get('SLPrice', 0.0)
+            tgt_p, sl_p = r.get('TargetPrice', 0.0), r.get('SLPrice', 0.0)
             rr_str = r.get('RR_Str') or compute_risk_reward_ratio(r)[1]
             sec_str = f"{r.get('Sector', DEFAULT_UNMAPPED_SECTOR)} ({r.get('SectorWeight', 0.0):.1f}%)"
             sec_cell = f"{_clip(sec_str, sec_w, EMAIL_CLIP_SYMBOLS):<{sec_w}} | " if show_sector else ""
@@ -2342,18 +2302,18 @@ def build_full_untruncated_plain_text(
         nr_ce, nr_pe = _ce_pe_counts(new_stk_r)
 
         if EMAIL_ONLY_PURE_1ST_TIME_CONTENT:
-            lines.append(f"=== SYSTEM 3.0 [{mode}] — PURE 1ST-TIME & POSITIVE RE-ANCHOR POPUPS ({w_start_s}..{w_end_s}) ===")
+            lines.append(f"=== SYSTEM 3.0 [{mode}] — PURE 1ST-TIME POPUPS (NO *) REPORT ({w_start_s}..{w_end_s}) ===")
             lines.append(f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Anchor Window: {w_start_s} to {w_end_s}")
             lines.append(_report_legend_text())
             lines.append(
-                f"Sectoral Indices Pure/PosReanchor: ▲ {len(new_idx_b)} Bull / ▼ {len(new_idx_r)} Bear | "
-                f"Stocks Pure/PosReanchor: ▲ {len(new_stk_b)} Bull [CE({nb_ce}) PE({nb_pe})] / ▼ {len(new_stk_r)} Bear [CE({nr_ce}) PE({nr_pe})]\n"
+                f"Sectoral Indices Pure 1st-Time: ▲ {len(new_idx_b)} Bull / ▼ {len(new_idx_r)} Bear | "
+                f"Stocks Pure 1st-Time: ▲ {len(new_stk_b)} Bull [CE({nb_ce}) PE({nb_pe})] / ▼ {len(new_stk_r)} Bear [CE({nr_ce}) PE({nr_pe})]\n"
             )
             if new_idx_b or new_idx_r:
-                _fmt_active_block("PURE 1ST-TIME / POS-REANCHOR SECTORAL INDEX POPUPS — BULL", new_idx_b, show_sector=False, show_first_iter=True, include_ce_pe_counts=False)
-                _fmt_active_block("PURE 1ST-TIME / POS-REANCHOR SECTORAL INDEX POPUPS — BEAR", new_idx_r, show_sector=False, show_first_iter=True, include_ce_pe_counts=False)
-            _fmt_active_block("PURE 1ST-TIME / POS-REANCHOR STOCK POPUPS — BULL", new_stk_b, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
-            _fmt_active_block("PURE 1ST-TIME / POS-REANCHOR STOCK POPUPS — BEAR", new_stk_r, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
+                _fmt_active_block("PURE FIRST-TIME SECTORAL INDEX POPUPS — BULL", new_idx_b, show_sector=False, show_first_iter=True, include_ce_pe_counts=False)
+                _fmt_active_block("PURE FIRST-TIME SECTORAL INDEX POPUPS — BEAR", new_idx_r, show_sector=False, show_first_iter=True, include_ce_pe_counts=False)
+            _fmt_active_block("PURE FIRST-TIME STOCK POPUPS — BULL", new_stk_b, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
+            _fmt_active_block("PURE FIRST-TIME STOCK POPUPS — BEAR", new_stk_r, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
             return "\n".join(lines)
 
     lines.append(f"=== SYSTEM 3.0 INSTITUTIONAL VOLATILITY TRACKER [{mode}] ===")
