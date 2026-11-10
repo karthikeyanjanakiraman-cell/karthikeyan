@@ -1619,12 +1619,18 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
             curr_r = (close[j] - anchor['price']) / base_atr if is_bull else (anchor['price'] - close[j]) / base_atr
 
             reason = None
-            if hard_mult > 0 and hard_adverse >= hard_mult * base_atr:
+            # --- THE ANCHOR PRICE NEVER BREAKS RULE ---
+            if is_bull and close[j] < anchor['price']:
+                reason = f"Anchor Breached (Price {close[j]:.2f} < Anchor {anchor['price']:.2f})"
+            elif not is_bull and close[j] > anchor['price']:
+                reason = f"Anchor Breached (Price {close[j]:.2f} > Anchor {anchor['price']:.2f})"
+            # ------------------------------------------
+            elif hard_mult > 0 and hard_adverse >= hard_mult * base_atr:
                 reason = f"Hard stop ({hard_mult:g} ATR trailing floor)"
             elif lock_trig_r > 0 and max_r >= lock_trig_r and curr_r <= lock_floor_r:
                 reason = f"Profit Lock (+{lock_trig_r:g}R Peak -> +{lock_floor_r:g}R Breakeven Floor)"
             elif max_r < soft_disable_r and adverse >= soft_mult * base_atr and opposing >= opp_thresh:
-                reason = soft_reason
+                reason = soft_reason  
 
             if reason:
                 last_killed_info = {
