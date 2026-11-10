@@ -9,7 +9,8 @@ Strict Institutional Volatility Tracker (Upstox) - System 3.0
 + Profit-Lock SL Trail: once the lock is armed (peak >= PROFIT_LOCK_TRIGGER_R) the SL column shows the lock floor, so R:R reflects real remaining risk.
 + Attempts Line On EVERY Row: Bull or Bear, stock or index, STOCK_FNO / CASH_EQUITY / INDEX_OPTIONS, every email + console: earlier stopped-out attempts, current attempt R, Day%.
 + Attempt-Tier Row Order: 1) all attempts +R, 2) net +R, 3) net -R; newest anchor first inside each tier (ATTEMPT_SORT_ENABLED; same order in every email).
-+ Pure 1st-Time + Re-anchor, ONE RULE: first anchors and re-anchors go through the same test (Anchor column inside the last 60 min = PURE_ANCHOR_LOOKBACK_MIN, still holding, R >= 0, same freshness/grid switches). A re-anchored ('*') row additionally needs a +R earlier attempt today (PopupType RE-ANCHOR+).
++ Pure 1st-Time + Re-anchor: a first anchor needs its Anchor column inside the last 60 min (PURE_ANCHOR_LOOKBACK_MIN); a re-anchored row may have re-anchored at ANY time after the first anchor today (PURE_REANCHOR_ANY_TIME) if an earlier attempt was meaningfully +R (PRIOR_ATTEMPT_MIN_POSITIVE_R). Both need to be still holding with R >= 0 (PopupType 1ST-TIME / RE-ANCHOR+).
++ Earlier-attempt line now shows each attempt's prices and peak R; an earlier attempt only counts as +R when it exited >= PRIOR_ATTEMPT_MIN_POSITIVE_R (0.10R) so a +0.03R scratch is not a win. Open warm-up bars are skipped at EVERY checkpoint (no ghost 09:16 anchors at the 09:20 checkpoint).
 + Trailing Stop Loss: SL trails the best price since the anchor (never loosens); R:R prints 'SL hit' when LTP is already through it (SL_TRAILING_ENABLED / SL_TRAIL_ATR_MULT).
 + ATR basis fix: 360min (or any TF) folds the short end-of-day stub bar into the last full bar, falls back to ATR_FALLBACK_TF for young contracts, caps ATR at a % of price (--atr-tf, --atr-period).
 + RISK_ATR_TF ("360min" by default): SL / Target / R:R distances use a daily-sized ATR while anchors, kills and R-multiples stay on the intraday ATR_BASIS_TF (--risk-atr-tf).
@@ -43,9 +44,9 @@ SAVE_LOCAL_HTML_FILE = False
 HTML_DASHBOARD_PATH = "system3_dashboard.html"
 
 # --- 0.1B STILL HOLDING GOOD EMAIL CONFIGURATION ---
-SEND_STILL_HOLDING_EMAIL = True                  # Master toggle: send separate email for setups that still hold good
+SEND_STILL_HOLDING_EMAIL = False                  # Master toggle: send separate email for setups that still hold good
 EMAIL_SEND_ONLY_WHEN_STILL_HOLDING_GT_0 = True   # Only send if at least 1 setup still holds good
-EMAIL_ATTACH_STILL_HOLDING_HTML = True           # Attach interactive HTML for still-holding setups
+EMAIL_ATTACH_STILL_HOLDING_HTML = False           # Attach interactive HTML for still-holding setups
 EMAIL_STILL_HOLDING_ATTACHMENT_FILENAME = "System3_Still_Holding_Setups.html"
 ENV_SEND_STILL_HOLDING_EMAIL = "SEND_STILL_HOLDING_EMAIL"
 ENV_EMAIL_SEND_ONLY_WHEN_STILL_HOLDING_GT_0 = "EMAIL_SEND_ONLY_WHEN_STILL_HOLDING_GT_0"
@@ -115,20 +116,24 @@ POPUP_REQUIRE_NON_ZERO_GRID = True
 POPUP_MIN_R_MULTIPLE = 0.0
 PURE_1ST_TIME_CURRENT_ITER_ONLY = False
 
-# --- 0.3B-2 PURE 1ST-TIME POPUPS: ANCHORS AND RE-ANCHORS RUN THROUGH ONE RULE ---
-# A re-anchor is just an anchor that fired again after an earlier attempt was stopped, so it is judged EXACTLY like a first anchor:
-#   * the CURRENT anchor (Anchor column; the NEW one for a '*' row) must have happened inside the window (PURE_ANCHOR_LOOKBACK_MIN),
-#   * the same freshness rule, the same R floor and the same grid rule apply to both (the PURE_ANCHOR_* switches below).
-# The ONLY extra test a re-anchor gets is its history: it needs a +R earlier attempt today (PURE_REANCHOR_PRIOR_MODE). A first anchor has none.
-PURE_ANCHOR_LOOKBACK_MIN = 60       # Window for anchors AND re-anchors: Anchor column within the last N minutes of the run. Lifts the NO_OF_ITERATIONS x INTERVAL window up to this length (never shorter). 0 = off
-PURE_ANCHOR_IGNORE_GAP = False       # True: the window is the freshness rule (MAX_TIMESTAMP_GAP_MINUTES is not applied to popups). False = strict "Seen - Anchor <= MAX_TIMESTAMP_GAP_MINUTES" for both
-PURE_ANCHOR_REQUIRE_GRID = True    # False: never reject an all-zero ATR/BB grid (momentum fades long before a setup stops holding). True = apply POPUP_REQUIRE_NON_ZERO_GRID to both
+# --- 0.3B-2 PURE 1ST-TIME POPUPS: FIRST ANCHORS AND RE-ANCHORS ---
+#   FIRST ANCHOR  (no earlier attempt today) : Anchor column inside the last PURE_ANCHOR_LOOKBACK_MIN minutes.
+#   RE-ANCHOR     (an earlier attempt exists): the re-anchor may have happened at ANY time after the first anchor today (PURE_REANCHOR_ANY_TIME),
+#                                              e.g. run at 13:25 -> a stock first anchored 10:22, stopped, re-anchored 11:40 and still holding is listed.
+#   Both kinds share the same R floor / grid switches below. A re-anchor additionally needs a meaningfully +R earlier attempt (PURE_REANCHOR_PRIOR_MODE).
+PURE_ANCHOR_LOOKBACK_MIN = 60       # Window for FIRST anchors: Anchor column within the last N minutes of the run. Lifts the NO_OF_ITERATIONS x INTERVAL window up to this length (never shorter). 0 = off
+PURE_REANCHOR_ANY_TIME = True       # True: a re-anchored row is listed whenever it re-anchored today (no minutes limit, no Seen-Anchor gap limit). False = re-anchors obey the same window as first anchors
+PURE_ANCHOR_IGNORE_GAP = True       # True: the window is the freshness rule (MAX_TIMESTAMP_GAP_MINUTES is not applied to popups). False = strict "Seen - Anchor <= MAX_TIMESTAMP_GAP_MINUTES" for first anchors
+PURE_ANCHOR_REQUIRE_GRID = False    # False: never reject an all-zero ATR/BB grid (momentum fades long before a setup stops holding). True = apply POPUP_REQUIRE_NON_ZERO_GRID to both
 PURE_ANCHOR_MIN_R = None            # Lowest CURRENT R (since the current anchor) for both. None = POPUP_MIN_R_MULTIPLE (0.0 = not underwater). E.g. -0.5 also keeps slightly red rows
 PURE_ALLOW_REANCHOR_WITH_POSITIVE_PRIOR = True   # Master toggle for re-anchors (False = old behaviour: every '*' row is kept out of the pure list)
-PURE_REANCHOR_PRIOR_MODE = "ANY"    # The only re-anchor-specific test: ANY = at least one earlier attempt > 0R | ALL = every earlier attempt >= 0R | NET = earlier attempts net >= 0R | NONE = no test
+PURE_REANCHOR_PRIOR_MODE = "ANY"    # Re-anchor history test: ANY = at least one earlier attempt is +R | ALL = every earlier attempt is +R | NET = earlier attempts net +R | NONE = every re-anchor
+PRIOR_ATTEMPT_MIN_POSITIVE_R = 0.10 # "+R" for an earlier attempt = it exited at least this many R in profit. A +0.03R scratch is NOT a win. 0 = any R > 0
 PURE_INCLUDE_PLAIN_FIRST_TIME = True             # True: first anchors of the day (no earlier attempt) are listed too | False: pure list = re-anchors only
 ENV_PURE_ALLOW_REANCHOR = "PURE_ALLOW_REANCHOR_WITH_POSITIVE_PRIOR"
 ENV_PURE_REANCHOR_PRIOR_MODE = "PURE_REANCHOR_PRIOR_MODE"
+ENV_PURE_REANCHOR_ANY_TIME = "PURE_REANCHOR_ANY_TIME"
+ENV_PRIOR_ATTEMPT_MIN_POSITIVE_R = "PRIOR_ATTEMPT_MIN_POSITIVE_R"
 ENV_PURE_ANCHOR_LOOKBACK_MIN = "PURE_ANCHOR_LOOKBACK_MIN"
 ENV_PURE_ANCHOR_REQUIRE_GRID = "PURE_ANCHOR_REQUIRE_GRID"
 ENV_PURE_ANCHOR_MIN_R = "PURE_ANCHOR_MIN_R"
@@ -722,20 +727,30 @@ def _attempt_history(row):
     ks = [k for k in (row.get('Kills') or []) if str(k.get('dir', '')).upper() == d_raw and str(k.get('anchor_time', '')) != cur_anchor]
     ks.sort(key=lambda k: str(k.get('anchor_time', '')))
     prior = [(str(k.get('anchor_time', '?')), str(k.get('killed_time', '?')), float(_kill_r_multiple(k, atr))) for k in ks]
-    return {"label": label, "cur_anchor": cur_anchor, "prior": prior, "cur_r": float(_r_multiple(row, include_banked=False))}
+    peaks = []                                    # best R each earlier attempt reached before it was stopped (None when unknown)
+    for k in ks:
+        try:
+            ap, pk = float(k.get('anchor_price', 0.0) or 0.0), float(k.get('peak_price', 0.0) or 0.0)
+            peaks.append(None if (ap <= 0 or pk <= 0 or atr <= 0) else ((pk - ap) / atr if d_raw != 'BEAR' else (ap - pk) / atr))
+        except Exception:
+            peaks.append(None)
+    return {"label": label, "cur_anchor": cur_anchor, "prior": prior, "peaks": peaks, "kills": ks, "cur_r": float(_r_multiple(row, include_banked=False))}
 
 def _attempt_tier(row):
     """
     Row-order tier (same rule for Bull and Bear, every mode, every email):
-      1 = every attempt today (earlier ones + the current one) is +R
-      2 = not every attempt is +R, but earlier + current attempts net to +R
+      1 = every earlier attempt today is meaningfully +R (>= PRIOR_ATTEMPT_MIN_POSITIVE_R) and the current attempt is not negative
+      2 = not every attempt is +R (one was flat or lost), but earlier + current attempts net to +R
       3 = earlier + current attempts net to -R
     """
     try:
         h = _attempt_history(row)
-        rs = [r for _, _, r in h["prior"]] + [h["cur_r"]]
-        if all(round(r, 2) >= 0 for r in rs):
-            return 1
+        try: floor_r = max(0.0, float(PRIOR_ATTEMPT_MIN_POSITIVE_R or 0.0))
+        except Exception: floor_r = 0.0
+        prior_rs = [r for _, _, r in h["prior"]]
+        rs = prior_rs + [h["cur_r"]]
+        if all(round(r, 2) >= max(round(floor_r, 2), 0.01) - 1e-9 for r in prior_rs) and round(h["cur_r"], 2) >= 0:
+            return 1                                  # every earlier attempt really made money (a +0.03R scratch does not) and the current one is not negative
         return 2 if round(sum(rs), 2) >= 0 else 3
     except Exception:
         return 3
@@ -743,19 +758,25 @@ def _attempt_tier(row):
 def _prior_attempts_qualify(prior_rs):
     """
     True when the row HAS earlier same-direction attempts today (= it is a re-anchor) and they are good enough for the Pure 1st-Time list.
-    PURE_REANCHOR_PRIOR_MODE: ANY = at least one earlier attempt > 0R | ALL = every attempt >= 0R | NET = they net to >= 0R | NONE = no condition.
+    "+R" means an earlier attempt exited at least PRIOR_ATTEMPT_MIN_POSITIVE_R in profit (a +0.03R scratch is not a win).
+    PURE_REANCHOR_PRIOR_MODE: ANY = at least one earlier attempt is +R | ALL = every earlier attempt is +R | NET = they net to +R | NONE = no condition.
     """
     if not PURE_ALLOW_REANCHOR_WITH_POSITIVE_PRIOR or not prior_rs:
         return False
+    try:
+        floor_r = max(0.0, float(PRIOR_ATTEMPT_MIN_POSITIVE_R or 0.0))
+    except Exception:
+        floor_r = 0.0
     rs = [round(float(r), 2) for r in prior_rs]
+    pos = lambda r: (r >= round(floor_r, 2) - 1e-9) and r > 0
     mode = str(PURE_REANCHOR_PRIOR_MODE or "ANY").strip().upper()
     if mode == "NONE":
         return True
     if mode == "NET":
-        return round(sum(rs), 2) >= 0
+        return pos(round(sum(rs), 2))
     if mode == "ALL":
-        return all(r >= 0 for r in rs)
-    return any(r > 0 for r in rs)
+        return all(pos(r) for r in rs)
+    return any(pos(r) for r in rs)
 
 def _pure_label():
     """Wording of the pure list in the email subject / report header (the old '(No *)' is only true when re-anchors are off)."""
@@ -768,19 +789,28 @@ def _pure_note_text():
     if not PURE_ALLOW_REANCHOR_WITH_POSITIVE_PRIOR:
         return "Pure list = first anchor of the day only (rows with '*' are kept out)."
     min_r = POPUP_MIN_R_MULTIPLE if PURE_ANCHOR_MIN_R is None else PURE_ANCHOR_MIN_R
-    checks = ["Anchor time inside the window", "still holding", f"current R >= {float(min_r):g}"]
-    if not PURE_ANCHOR_IGNORE_GAP and ENABLE_TIMESTAMP_GAP_CHECK and MAX_TIMESTAMP_GAP_MINUTES > 0:
-        checks.append(f"Seen-Anchor gap <= {MAX_TIMESTAMP_GAP_MINUTES}m")
+    base = f"All rows: still holding, current R >= {float(min_r):g}"
     if PURE_ANCHOR_REQUIRE_GRID and POPUP_REQUIRE_NON_ZERO_GRID:
-        checks.append("ATR/BB grid not all 0")
+        base += ", ATR/BB grid not all 0"
     mode = str(PURE_REANCHOR_PRIOR_MODE or "ANY").strip().upper()
-    rule = {"NET": "earlier attempts net +R", "ALL": "every earlier attempt +R", "NONE": "any earlier attempt"}.get(mode, "at least one earlier attempt +R")
-    base = f"Anchors and re-anchors use ONE rule: {', '.join(checks)}. RE-ANCHOR+ = re-anchored row that also had {rule} (see the ↳ line)"
-    return (base + "; 1ST-TIME = first anchor of the day.") if PURE_INCLUDE_PLAIN_FIRST_TIME else (base + "; first anchors of the day are not listed here.")
+    try: mr = float(PRIOR_ATTEMPT_MIN_POSITIVE_R or 0.0)
+    except Exception: mr = 0.0
+    pos = f"+R (>= {mr:g}R)" if mr > 0 else "+R"
+    rule = {"NET": f"earlier attempts net {pos}", "ALL": f"every earlier attempt {pos}", "NONE": "any earlier attempt"}.get(mode, f"at least one earlier attempt {pos}")
+    gap_txt = ""
+    if not PURE_ANCHOR_IGNORE_GAP and ENABLE_TIMESTAMP_GAP_CHECK and MAX_TIMESTAMP_GAP_MINUTES > 0:
+        gap_txt = f" (Seen-Anchor gap <= {MAX_TIMESTAMP_GAP_MINUTES}m)"
+    lb = int(PURE_ANCHOR_LOOKBACK_MIN or 0)
+    first_txt = f"1ST-TIME = first anchor of the day, Anchor column inside the window{gap_txt}" if PURE_INCLUDE_PLAIN_FIRST_TIME else "first anchors of the day are not listed here"
+    re_when = "re-anchored at ANY time after the first anchor today" if PURE_REANCHOR_ANY_TIME else f"re-anchor inside the same {lb}-minute window"
+    return f"{base}. {first_txt}. RE-ANCHOR+ = {re_when}, with {rule} (see the ↳ line)."
 
-def _popup_row_ok(row):
-    """The ONE quality rule shared by first anchors and re-anchors (PURE_ANCHOR_* switches): option direction, freshness, R floor, grid."""
-    return _passes_strict_popup_quality(row, check_gap=(not PURE_ANCHOR_IGNORE_GAP), check_grid=PURE_ANCHOR_REQUIRE_GRID, min_r=PURE_ANCHOR_MIN_R)
+def _popup_row_ok(row, any_time=False):
+    """
+    The shared quality rule for pure popups (PURE_ANCHOR_* switches): option direction, R floor, grid, optional freshness gap.
+    any_time=True (a re-anchor listed at any time after the first anchor) skips the Seen-Anchor gap: its age is not a criterion.
+    """
+    return _passes_strict_popup_quality(row, check_gap=(not PURE_ANCHOR_IGNORE_GAP and not any_time), check_grid=PURE_ANCHOR_REQUIRE_GRID, min_r=PURE_ANCHOR_MIN_R)
 
 ATTEMPT_TIER_ICONS = {1: "✅", 2: "🟡", 3: "🔻"}
 
@@ -803,10 +833,22 @@ def _prior_attempts_text(row):
             return f"{icon} Earlier {lab} attempts (0) → first {lab} anchor today {cur} (now {cur_r:+.2f}R) | Day {day:+.2f}%"
         net = sum(r for _, _, r in prior)
         n_show = int(PRIOR_ATTEMPTS_MAX_SHOWN)
-        shown = prior[-n_show:] if n_show > 0 else prior
-        parts = [f"{a}>{k} {r:+.1f}R" for a, k, r in shown]
-        more = f"{len(prior) - len(shown)} older, " if len(prior) > len(shown) else ""
-        return (f"{icon} Earlier {lab} attempts ({len(prior)}, net {net:+.1f}R): {more}{' | '.join(parts)} "
+        peaks = list(h.get("peaks") or [None] * len(prior))
+        ks_by_ix = {i_: k_ for i_, k_ in enumerate(h.get("kills") or [])}
+        idx_shown = list(range(len(prior)))[-n_show:] if n_show > 0 else list(range(len(prior)))
+        fmt_r = lambda v: (f"{v:+.2f}R" if abs(v) < 1.0 else f"{v:+.1f}R")      # +0.03R must not print as '+0.0R'
+        parts = []
+        for ix in idx_shown:
+            a, k, r = prior[ix]
+            pk = peaks[ix] if ix < len(peaks) else None
+            kd = ks_by_ix.get(ix) or {}
+            try: px_txt = f"px {float(kd.get('anchor_price')):.2f}→{float(kd.get('killed_price')):.2f}" if kd else ""
+            except Exception: px_txt = ""
+            pk_txt = f"peak {pk:+.1f}R" if (pk is not None and pk - r >= 0.25) else ""
+            extra = ", ".join(x for x in (px_txt, pk_txt) if x)
+            parts.append(f"{a}>{k} {fmt_r(r)}" + (f" ({extra})" if extra else ""))
+        more = f"{len(prior) - len(idx_shown)} older, " if len(prior) > len(idx_shown) else ""
+        return (f"{icon} Earlier {lab} attempts ({len(prior)}, net {fmt_r(net)}): {more}{' | '.join(parts)} "
                 f"→ re-anchored {cur} (now {cur_r:+.2f}R) | first {lab} anchor today {prior[0][0]} | Day {day:+.2f}%")
     except Exception:
         return ""
@@ -815,14 +857,19 @@ def _report_legend_text():
     """One shared legend line for the console and every email."""
     parts = []
     if ATTEMPT_SORT_ENABLED:
-        parts.append("Order: ✅ all attempts +R → 🟡 net +R (an earlier attempt lost) → 🔻 net -R, newest anchor first inside each group")
+        parts.append("Order: ✅ every earlier attempt +R → 🟡 net +R (an earlier attempt was flat or lost) → 🔻 net -R, newest anchor first inside each group")
     if SL_TRAILING_ENABLED:
         try: _tm = float(SL_TRAIL_ATR_MULT) if (SL_TRAIL_ATR_MULT not in (None, "") and float(SL_TRAIL_ATR_MULT) > 0) else float(SL_ATR_MULT)
         except Exception: _tm = float(SL_ATR_MULT)
         parts.append(f"SL trails the best price since the anchor ({_tm:g} ATR behind, never loosens; 'SL hit' = LTP already through it)")
     if TARGET_LADDER_ENABLED:
         parts.append("T2/T3.. = target stepped up (earlier target achieved)")
-    parts.append("↳ = today's attempts on this script (earlier stopped-out anchors, current one, Day %)")
+    _rt = str(RISK_ATR_TF if RISK_ATR_TF is not None else "").strip()
+    if _rt and _rt.lower() not in ("none", "off", "same", "0", "false") and _rt != str(ATR_BASIS_TF):
+        parts.append(f"R = move ÷ {ATR_BASIS_TF} ATR (engine); Target / SL distances use the {_rt} ATR")
+    else:
+        parts.append(f"R = move ÷ {ATR_BASIS_TF} ATR (also used for Target / SL)")
+    parts.append("↳ = today's attempts on this script (earlier stopped-out anchors with their prices, current one, Day %)")
     return "Legend: " + " | ".join(parts)
 
 def _get_timestamp_gap_min(row):
@@ -1600,7 +1647,9 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
     soft_disable_r = float(SOFT_STOP_DISABLE_R)
 
     warmup = max(0, int(ANCHOR_OPEN_WARMUP_BARS or 0))
-    i = min(n, today_start + warmup) if (today_start + warmup < n) else today_start
+    i = today_start + warmup
+    if i >= n:      # still inside the open warm-up: no anchor yet (same rule at every checkpoint, so an early checkpoint never invents an anchor later checkpoints do not see)
+        return None, {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0, 'killed_time': '-', 'killed_price': 0.0, 'reason': f'Open warm-up ({warmup} bars)', 'kills': []}
     survived_anchor = None
     last_killed_info = {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0, 'killed_time': '-', 'killed_price': 0.0, 'reason': 'Failed Kinetic Alignment'}
     kills, warzone_kills = [], 0
@@ -1650,7 +1699,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                 last_killed_info = {
                     'dir': anchor['dir'], 'anchor_time': pd.to_datetime(anchor['time']).strftime('%H:%M'),
                     'anchor_price': float(anchor['price']), 'killed_time': pd.to_datetime(dt_1m[j]).strftime('%H:%M'),
-                    'killed_price': float(close[j]), 'reason': reason
+                    'killed_price': float(close[j]), 'reason': reason, 'peak_price': float(true_peak)
                 }
                 kills.append(last_killed_info)
                 survived = False
@@ -2195,9 +2244,9 @@ def _passes_strict_popup_quality(row, check_gap=True, check_grid=True, min_r=Non
 
 def evaluate_first_time_popups_in_memory(by_symbol_all_cps, current_bulls, current_bears, lookback_meta, pool_bulls=None, pool_bears=None):
     """
-    pool_*: every alive Bull/Bear row (no gap / strict filter applied yet). Each row goes through the ONE popup rule (_popup_row_ok + the
-    Anchor column inside the window), whether it is a first anchor (PopupType '1ST-TIME') or a re-anchor with a +R earlier attempt
-    ('RE-ANCHOR+'). current_* is only the fallback when no pool is given.
+    pool_*: every alive Bull/Bear row (no gap / strict filter applied yet). A first anchor (PopupType '1ST-TIME') needs its Anchor column inside the
+    window; a re-anchor with a +R earlier attempt ('RE-ANCHOR+') may have happened at ANY time after the first anchor (PURE_REANCHOR_ANY_TIME).
+    Both go through the same _popup_row_ok quality test. current_* is only the fallback when no pool is given.
     """
     if not lookback_meta or not lookback_meta.get("enabled"):
         return {"new_bulls": [], "new_bears": [], "window_first_bulls": [], "window_first_bears": [], "iter_stats": []}
@@ -2234,13 +2283,13 @@ def evaluate_first_time_popups_in_memory(by_symbol_all_cps, current_bulls, curre
         for row in pool_list:
             sym = row['Symbol']
             curr_anc = str(row.get('ActiveAnchor') or '-').replace('*', '').strip()
-            # ONE rule for first anchors and re-anchors: the CURRENT anchor inside the window + the shared quality test
-            if not _anchor_within_lookback_window(curr_anc, w_start, w_end) or not _popup_row_ok(row):
-                continue
-
-            # Re-anchor history (the only extra test): earlier same-direction attempts today, e.g. 09:20>10:44 +2.8R -> re-anchored 12:10
+            # Earlier same-direction attempts today (e.g. 09:20>10:44 +2.8R -> re-anchored 12:10): a RE-ANCHOR. Its history decides RE-ANCHOR+.
             prior_rs = [r for _, _, r in _attempt_history(row)["prior"]]
             reanchor_pos = _prior_attempts_qualify(prior_rs)
+            in_window = _anchor_within_lookback_window(curr_anc, w_start, w_end)
+            any_time = bool(PURE_REANCHOR_ANY_TIME and reanchor_pos)       # re-anchor at ANY time after the first anchor: no window, no gap
+            if not (in_window or any_time) or not _popup_row_ok(row, any_time=any_time):
+                continue
 
             appearances = prior_app_map.get(sym, [])
             same_anc_iters = [it_lbl for (it_lbl, anc) in appearances if anc == curr_anc]
@@ -2248,7 +2297,8 @@ def evaluate_first_time_popups_in_memory(by_symbol_all_cps, current_bulls, curre
 
             if PURE_1ST_TIME_CURRENT_ITER_ONLY and len(same_anc_iters) > 0: continue
 
-            first_it = same_anc_iters[0] if same_anc_iters else curr_label
+            # 1stIter = first run in which this anchor was visible. An anchor older than the lookback window cannot be traced further back than its own time.
+            first_it = (same_anc_iters[0] if same_anc_iters else curr_label) if in_window else curr_anc
             prior_stops = int(row.get('PriorStops', 0) or 0)
             banked_r = float(row.get('BankedR', 0.0) or 0.0)
             has_star_badge = (prior_stops > 0 and abs(banked_r) > BANKED_R_DISPLAY_EPSILON)
@@ -2703,9 +2753,9 @@ def build_email_and_attachment_html(
 
     header_card_html = (
         f"<div style='background-color:#ffffff;border:1px solid #cbd5e1;border-left:6px solid #2563eb;border-radius:6px;padding:14px 18px;margin-bottom:16px;'>"
-        f"<div style='font-size:17px;font-weight:800;color:#0f172a;margin-bottom:6px;'>📡 SYSTEM 3.0 [{html.escape(mode)}] — PURE 1ST-TIME POPUPS ({w_start_s}..{w_end_s})</div>"
+        f"<div style='font-size:17px;font-weight:800;color:#0f172a;margin-bottom:6px;'>📡 SYSTEM 3.0 [{html.escape(mode)}] — {html.escape(_pure_label().upper())} POPUPS ({w_start_s}..{w_end_s})</div>"
         f"<div style='color:#334155;font-size:13px;margin-bottom:4px;'>"
-        f"<b>Target Snapshot:</b> {cutoff_dt.strftime('%Y-%m-%d %H:%M')} &nbsp;|&nbsp; <b>Anchor Window:</b> <span style='background-color:#e0f2fe;color:#0369a1;padding:2px 6px;border-radius:4px;font-weight:700;'>{w_start_s} to {w_end_s}</span> &nbsp;|&nbsp; <b>Max Gap:</b> {MAX_TIMESTAMP_GAP_MINUTES}m</div>"
+        f"<b>Target Snapshot:</b> {cutoff_dt.strftime('%Y-%m-%d %H:%M')} &nbsp;|&nbsp; <b>Anchor Window:</b> <span style='background-color:#e0f2fe;color:#0369a1;padding:2px 6px;border-radius:4px;font-weight:700;'>{w_start_s} to {w_end_s}</span> &nbsp;|&nbsp; <b>Max Gap:</b> {('off' if (PURE_ANCHOR_IGNORE_GAP or not ENABLE_TIMESTAMP_GAP_CHECK or MAX_TIMESTAMP_GAP_MINUTES <= 0) else str(MAX_TIMESTAMP_GAP_MINUTES) + 'm')}</div>"
         f"<div style='color:#64748b;font-size:11px;margin-bottom:4px;'>{html.escape(_report_legend_text())}</div>"
         f"<div style='color:#0369a1;font-size:11px;margin-bottom:4px;'>{html.escape(_pure_note_text())}</div>"
         f"<div style='color:#334155;font-size:12px;margin-top:4px;'>"
@@ -3351,6 +3401,9 @@ def parse_args():
     p.add_argument("--pure-anchor-min-r", "--pure-reanchor-min-r", dest="pure_anchor_min_r", type=float, default=None, help="Lowest current R for anchors and re-anchors, e.g. -0.5 (default: PURE_ANCHOR_MIN_R, None = POPUP_MIN_R_MULTIPLE).")
     p.add_argument("--pure-include-plain", dest="pure_include_plain", action="store_true", default=None, help="Keep never-stopped first-time anchors in the pure list (default: PURE_INCLUDE_PLAIN_FIRST_TIME).")
     p.add_argument("--no-pure-include-plain", dest="pure_include_plain", action="store_false", help="Pure list = +R re-anchors only.")
+    p.add_argument("--pure-reanchor-any-time", dest="pure_reanchor_any_time", action="store_true", default=None, help="A re-anchored row is listed whenever it re-anchored today, no minutes limit (default: PURE_REANCHOR_ANY_TIME).")
+    p.add_argument("--no-pure-reanchor-any-time", dest="pure_reanchor_any_time", action="store_false", help="Re-anchors obey the same window as first anchors.")
+    p.add_argument("--prior-min-r", dest="prior_min_r", type=float, default=None, help="An earlier attempt counts as +R only when it exited at least this many R in profit (default: PRIOR_ATTEMPT_MIN_POSITIVE_R = 0.10).")
     # Trailing SL + ATR basis
     p.add_argument("--sl-trailing", dest="sl_trailing", action="store_true", default=None, help="SL trails the best price since the anchor (default: SL_TRAILING_ENABLED).")
     p.add_argument("--no-sl-trailing", dest="sl_trailing", action="store_false", help="SL fixed at Anchor -/+ SL_ATR_MULT x ATR (old behaviour).")
@@ -3485,6 +3538,11 @@ if __name__ == "__main__":
     _pml = args.pure_anchor_minutes if args.pure_anchor_minutes is not None else (os.environ.get(ENV_PURE_ANCHOR_LOOKBACK_MIN) or os.environ.get("PURE_REANCHOR_LOOKBACK_MIN"))
     if _pml is not None and str(_pml).strip() != "":
         try: PURE_ANCHOR_LOOKBACK_MIN = int(_pml)
+        except ValueError: pass
+    PURE_REANCHOR_ANY_TIME = args.pure_reanchor_any_time if args.pure_reanchor_any_time is not None else _parse_bool_env(ENV_PURE_REANCHOR_ANY_TIME, PURE_REANCHOR_ANY_TIME)
+    _pmp = args.prior_min_r if args.prior_min_r is not None else os.environ.get(ENV_PRIOR_ATTEMPT_MIN_POSITIVE_R)
+    if _pmp is not None and str(_pmp).strip() != "":
+        try: PRIOR_ATTEMPT_MIN_POSITIVE_R = float(_pmp)
         except ValueError: pass
 
     SL_TRAILING_ENABLED = args.sl_trailing if args.sl_trailing is not None else _parse_bool_env(ENV_SL_TRAILING_ENABLED, SL_TRAILING_ENABLED)
