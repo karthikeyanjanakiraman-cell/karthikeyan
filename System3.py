@@ -120,7 +120,7 @@ PURE_1ST_TIME_CURRENT_ITER_ONLY = False
 PURE_ANCHOR_LOOKBACK_MIN = 60       # Window for FIRST anchors: Anchor column within the last N minutes of the run. Lifts the NO_OF_ITERATIONS x INTERVAL window up to this length (never shorter). 0 = off
 PURE_REANCHOR_ANY_TIME = True       # True: a re-anchored row is listed whenever it re-anchored today (no minutes limit, no Seen-Anchor gap limit). False = re-anchors obey the same window as first anchors
 PURE_ANCHOR_IGNORE_GAP = True       # True: the window is the freshness rule (MAX_TIMESTAMP_GAP_MINUTES is not applied to popups). False = strict "Seen - Anchor <= MAX_TIMESTAMP_GAP_MINUTES" for first anchors
-PURE_ANCHOR_REQUIRE_GRID = False    # False: never reject an all-zero ATR/BB grid (momentum fades long before a setup stops holding). True = apply POPUP_REQUIRE_NON_ZERO_GRID to both
+PURE_ANCHOR_REQUIRE_GRID = True    # False: never reject an all-zero ATR/BB grid (momentum fades long before a setup stops holding). True = apply POPUP_REQUIRE_NON_ZERO_GRID to both
 PURE_ANCHOR_MIN_R = None            # Lowest CURRENT R (since the current anchor) for both. None = POPUP_MIN_R_MULTIPLE (0.0 = not underwater). E.g. -0.5 also keeps slightly red rows
 PURE_ALLOW_REANCHOR_WITH_POSITIVE_PRIOR = True   # Master toggle for re-anchors (False = old behaviour: every '*' row is kept out of the pure list)
 PURE_REANCHOR_PRIOR_MODE = "ANY"    # Re-anchor history test: ANY = at least one earlier attempt is +R | ALL = every earlier attempt is +R | NET = earlier attempts net +R | NONE = every re-anchor
@@ -196,7 +196,7 @@ SOFT_STOP_ATR_MULT = 1.0
 SOFT_STOP_OPPOSING_SCORE = 4
 OPPOSING_VEL_ATR_MULT = 1.0
 OPPOSING_BB_STD_MULT = 1.0
-WARZONE_OPPOSING_SCORE = 2
+WARZONE_OPPOSING_SCORE = 4
 
 SOFT_STOP_DISABLE_R = 1.5
 PROFIT_LOCK_TRIGGER_R = 1.8
