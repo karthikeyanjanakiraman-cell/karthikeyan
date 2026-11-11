@@ -1,6 +1,10 @@
 #!/usr/bin/env python3
 """
 Strict Institutional Volatility Tracker (Upstox) - System 3.0
++ Implied Volatility (IV) & IV Crush Engine: Real-time bar-by-bar IV derivation via Black-Scholes inversion for options.
++ Dual-Confluence Option Anchor Gate: Option buyers require concurrent Price breakout ([BB > KC]) and non-collapsing IV (vel_iv >= 0).
++ Dynamic Kinetic SL (IV Crush): Kills live option setups if IV drops >15% from post-anchor peak or suffers severe negative velocity shock.
++ Multi-Timeframe IV Grids: Seamlessly integrates IV velocity and IV Bollinger Band pierces into ATR and BB grids (0 to 5) for options.
 + Configurable Timestamp Gap Check: Filters stale setups where (Seen - Anchor) > MAX_TIMESTAMP_GAP_MINUTES.
 + Risk-to-Reward (R:R) Column: Formatted like 0.1:1, 0.28:1 before LTP/Exit, sorted ascending for Bulls and Bears.
 + Dedicated Still-Holding Good Email: Sends a separate email for active setups that triggered earlier (e.g. 09:43) and still hold good at snapshot time.
@@ -368,6 +372,17 @@ INDEX_CONFIG = {
 }
 ALIAS_TO_INDEX = {a: idx for idx, cfg in INDEX_CONFIG.items() for a in cfg["aliases"]}
 PROBE_KEY = INDEX_CONFIG["NIFTY"]["spot_key"]
+
+# --- 0.9B OPTION IMPLIED VOLATILITY (IV) & CRUSH PROTECTION ENGINE ---
+ENABLE_OPTION_IV_ENGINE = True
+IV_CRUSH_DROP_PCT = 0.15              # 15% drop from post-anchor peak IV triggers Kinetic SL
+IV_CRUSH_VEL_MULT = 1.5              # Negative IV velocity > 1.5x ATR_vel triggers IV crush warning/kill
+IV_REQUIRE_NON_NEGATIVE_VEL = True   # Block anchor if IV velocity <= 0 at anchor candle
+RISK_FREE_RATE = 0.065               # 6.5% standard Indian risk-free rate
+ENV_ENABLE_OPTION_IV_ENGINE = "ENABLE_OPTION_IV_ENGINE"
+ENV_IV_CRUSH_DROP_PCT = "IV_CRUSH_DROP_PCT"
+ENV_IV_CRUSH_VEL_MULT = "IV_CRUSH_VEL_MULT"
+ENV_IV_REQUIRE_NON_NEGATIVE_VEL = "IV_REQUIRE_NON_NEGATIVE_VEL"
 
 # --- 0.10 DASHBOARD DISPLAY & FORMATTING ---
 TOP_N_BUYERS = 50
@@ -1283,11 +1298,16 @@ def _index_options_universe(cutoff_dt, use_intraday, needles=()):
                 sym = str(_field(row, "trading_symbol", "tradingsymbol") or key)
                 flat.append((sym, (exp_date, strike, itype, sym), key))
         sym_to_key = {sym: key for sym, _, key in flat}
-        for sym in sorted(resolve_pins([(s, k) for s, k, _ in flat], needles, "option contract")):
-            key = sym_to_key[sym]
+        sym_to_item = {sym: (key, exp_date, strike, itype, idx) for sym, (exp_date, strike, itype, _), key in flat}
+        for sym in sorted(resolve_pins([(s, k) for s, _, k in flat], needles, "option contract")):
+            key, exp_date, strike, itype, idx = sym_to_item[sym]
             if key not in seen:
                 seen.add(key)
-                universe.append({"key": key, "symbol": sym, "pinned": True, "is_sector_index": False, "sector": "INDEX_OPTIONS", "sector_weight": 100.0})
+                universe.append({
+                    "key": key, "symbol": sym, "pinned": True, "is_sector_index": False,
+                    "sector": "INDEX_OPTIONS", "sector_weight": 100.0,
+                    "strike": float(strike), "option_type": itype, "expiry": exp_date, "underlying": idx
+                })
 
     for idx, contracts in by_idx.items():
         if idx not in spot or not contracts: continue
@@ -1308,6 +1328,7 @@ def _index_options_universe(cutoff_dt, use_intraday, needles=()):
                 universe.append({
                     "key": key, "symbol": str(_field(row, "trading_symbol", "tradingsymbol") or key),
                     "pinned": False, "is_sector_index": False, "sector": idx, "sector_weight": 100.0,
+                    "strike": float(strike), "option_type": itype, "expiry": exp_date, "underlying": idx
                 })
     return universe
 
@@ -1362,6 +1383,164 @@ def _ewm(x, alpha):
     for i in range(1, len(xs)):
         out[i] = prev = keep * prev + alpha * xs[i]
     return np.asarray(out)
+
+
+# ==============================================================================
+# 1B. OPTION IMPLIED VOLATILITY (IV) MATHEMATICAL ENGINE & KINEMATICS
+# ==============================================================================
+import math
+
+_SPOT_1M_CACHE = {}
+_SPOT_CACHE_LOCK = threading.Lock()
+
+def _norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / 1.4142135623730951))
+
+def _bs_price(S, K, T, r, sigma, is_call=True):
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return max(0.0, S - K) if is_call else max(0.0, K - S)
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    d2 = d1 - sigma * math.sqrt(T)
+    if is_call:
+        return S * _norm_cdf(d1) - K * math.exp(-r * T) * _norm_cdf(d2)
+    else:
+        return K * math.exp(-r * T) * _norm_cdf(-d2) - S * _norm_cdf(-d1)
+
+def _bs_vega(S, K, T, r, sigma):
+    if T <= 0 or sigma <= 0 or S <= 0 or K <= 0: return 0.0
+    d1 = (math.log(S / K) + (r + 0.5 * sigma * sigma) * T) / (sigma * math.sqrt(T))
+    return S * math.sqrt(T) * (1.0 / math.sqrt(2 * math.pi)) * math.exp(-0.5 * d1 * d1)
+
+def calc_implied_volatility(price, S, K, T, r=0.065, is_call=True):
+    intrinsic = max(0.0, S - K) if is_call else max(0.0, K - S)
+    if price <= intrinsic or price <= 0.05 or S <= 0 or K <= 0 or T <= 0:
+        return 0.0
+    sigma = 0.20
+    for _ in range(10):
+        p = _bs_price(S, K, T, r, sigma, is_call)
+        diff = p - price
+        if abs(diff) < 1e-3: return sigma
+        v = _bs_vega(S, K, T, r, sigma)
+        if v < 1e-4: break
+        sigma -= diff / v
+        if sigma <= 0.01 or sigma > 5.0: break
+    low, high = 0.01, 3.5
+    for _ in range(12):
+        mid = 0.5 * (low + high)
+        p = _bs_price(S, K, T, r, mid, is_call)
+        if abs(p - price) < 1e-2: return mid
+        if p < price: low = mid
+        else: high = mid
+    return mid
+
+def _parse_contract_specs(symbol, item=None):
+    sym = str(symbol or "").upper().strip()
+    is_ce = _is_ce_symbol(sym)
+    is_pe = _is_pe_symbol(sym)
+    if not (is_ce or is_pe): return None
+    itype = "CE" if is_ce else "PE"
+
+    strike = 0.0
+    if item and item.get("strike"):
+        try: strike = float(item["strike"])
+        except Exception: pass
+    if strike <= 0:
+        m = re.search(r'(\d+(?:\.\d+)?)\s*(?:CE|PE)', sym)
+        if m:
+            try: strike = float(m.group(1))
+            except Exception: pass
+
+    underlying = "NIFTY"
+    if item and item.get("underlying"):
+        underlying = item["underlying"]
+    else:
+        for idx in ("BANKNIFTY", "FINNIFTY", "SENSEX", "NIFTY"):
+            if idx in sym:
+                underlying = idx
+                break
+
+    expiry_dt = None
+    if item and item.get("expiry"):
+        expiry_dt = item["expiry"]
+    if expiry_dt is None:
+        months = {'JAN': 1, 'FEB': 2, 'MAR': 3, 'APR': 4, 'MAY': 5, 'JUN': 6,
+                  'JUL': 7, 'AUG': 8, 'SEP': 9, 'OCT': 10, 'NOV': 11, 'DEC': 12}
+        m = re.search(r'(\d{1,2})\s*([A-Z]{3})\s*(\d{2,4})?', sym)
+        if m:
+            day = int(m.group(1))
+            mon_str = m.group(2)
+            yr_str = m.group(3)
+            if mon_str in months:
+                yr = int(yr_str) if yr_str else now_ist().year
+                if yr < 100: yr += 2000
+                try: expiry_dt = datetime(yr, months[mon_str], day).date()
+                except Exception: pass
+    if expiry_dt is None:
+        expiry_dt = now_ist().date()
+
+    return {"symbol": sym, "option_type": itype, "strike": strike, "underlying": underlying, "expiry": expiry_dt}
+
+
+def _get_cached_spot_1m(idx, target_dt, history_days=MIN1_HISTORY_DAYS, use_intraday=True):
+    cfg = INDEX_CONFIG.get(idx)
+    if not cfg: return None
+    spot_key = cfg.get("spot_key")
+    if not spot_key: return None
+    cache_key = (idx, target_dt)
+    with _SPOT_CACHE_LOCK:
+        if cache_key in _SPOT_1M_CACHE:
+            return _SPOT_1M_CACHE[cache_key]
+    try:
+        frames = []
+        for c_start, c_end in _date_chunks(target_dt - timedelta(days=history_days), target_dt + timedelta(days=1), span=CHUNK_SPAN_1M_DAYS):
+            status, df = _candles(_url_range_1m(spot_key, c_start, c_end))
+            if status == 200 and df is not None: frames.append(df)
+        if use_intraday:
+            today_df = fetch_today(spot_key)
+            if today_df is not None: frames.append(today_df)
+        if frames:
+            master_spot = prepare_master(frames)
+            with _SPOT_CACHE_LOCK:
+                _SPOT_1M_CACHE[cache_key] = master_spot
+            return master_spot
+    except Exception as e:
+        ERRORS.add(f"spot_1m:{idx}", e)
+    return None
+
+def _evaluate_iv_arrays(iv, sess_starts, sid):
+    n = len(iv)
+    delta_iv = np.diff(iv, prepend=iv[0])
+    delta_iv = np.where(sess_starts, 0.0, delta_iv)
+    
+    alpha_vel = 1.0 / float(VEL_ATR_PERIOD)
+    out = [0.0] * n
+    prev = out[0] = abs(delta_iv[0])
+    keep = 1.0 - alpha_vel
+    for i in range(1, n):
+        out[i] = prev = keep * prev + alpha_vel * abs(delta_iv[i])
+    atr_iv = np.asarray(out)
+    
+    iv_s = pd.Series(iv)
+    iv_mean = iv_s.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values
+    iv_std = iv_s.rolling(IND_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0).values
+    
+    w = max(1, int(SHOCK_WINDOW_BARS))
+    win_viv_max = pd.Series(delta_iv).rolling(w, min_periods=ROLLING_MIN_PERIODS).max().values
+    win_viv_min = pd.Series(delta_iv).rolling(w, min_periods=ROLLING_MIN_PERIODS).min().values
+    
+    return {
+        'iv': iv,
+        'iv_mean': iv_mean,
+        'iv_std': iv_std,
+        'vel_iv': delta_iv,
+        'atr_iv': atr_iv,
+        'win_viv_max': win_viv_max,
+        'win_viv_min': win_viv_min,
+        'iv_bb_upper': iv_mean + 2.0 * iv_std,
+        'iv_bb_lower': iv_mean - 2.0 * iv_std,
+        'iv_kc_upper': iv_mean + 1.5 * atr_iv,
+        'iv_kc_lower': iv_mean - 1.5 * atr_iv
+    }
 
 def _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts, sid):
     n = len(close)
@@ -1521,7 +1700,7 @@ def get_kinetics(kin_1m, idx):
         bull_struct, bear_struct, bull_shock, bear_shock
     )
 
-def calculate_grids(kin_1m, idx, direction):
+def calculate_grids(kin_1m, idx, direction, iv_kin=None):
     hist, h_mean, h_std = kin_1m['hist'][idx], kin_1m['h_mean'][idx], kin_1m['h_std'][idx]
     obv, o_mean, o_std = kin_1m['obv'][idx], kin_1m['o_mean'][idx], kin_1m['o_std'][idx]
     p_di, p_mean, p_std = kin_1m['plus_di'][idx], kin_1m['p_mean'][idx], kin_1m['p_std'][idx]
@@ -1534,6 +1713,14 @@ def calculate_grids(kin_1m, idx, direction):
     vp = max(kin_1m['vel_pdi'][idx], kin_1m['win_vp_max'][idx])
     vm = max(kin_1m['vel_mdi'][idx], kin_1m['win_vm_max'][idx])
     va = max(kin_1m['vel_adx'][idx], kin_1m['win_va_max'][idx])
+
+    has_iv = bool(iv_kin and ENABLE_OPTION_IV_ENGINE and idx < len(iv_kin.get('iv', [])))
+    if has_iv:
+        v_iv = max(iv_kin['vel_iv'][idx], iv_kin['win_viv_max'][idx]) if direction == "BULL" else min(iv_kin['vel_iv'][idx], iv_kin['win_viv_min'][idx])
+        a_iv = max(iv_kin['atr_iv'][idx], 1e-6)
+        iv_v = iv_kin['iv'][idx]
+        iv_m = iv_kin['iv_mean'][idx]
+        iv_s = iv_kin['iv_std'][idx]
 
     atr_grid = {m: 0 for m in GRID_MULTIPLIERS}
     bb_grid = {m: 0 for m in GRID_MULTIPLIERS}
@@ -1549,23 +1736,27 @@ def calculate_grids(kin_1m, idx, direction):
             if vo > mult * ao: a_count += 1
             if vp > mult * ap: a_count += 1
             if va > mult * aa: a_count += 1
+            if has_iv and v_iv > mult * a_iv: a_count += 1
             if check_bb(hist, h_mean, h_std, mult, True): b_count += 1
             if check_bb(obv, o_mean, o_std, mult, True): b_count += 1
             if check_bb(p_di, p_mean, p_std, mult, True): b_count += 1
             if check_bb(adx, a_mean, a_std, mult, True): b_count += 1
+            if has_iv and check_bb(iv_v, iv_m, iv_s, mult, True): b_count += 1
         else:
             if vh < -mult * ah: a_count += 1
             if vo < -mult * ao: a_count += 1
             if vm > mult * am: a_count += 1
             if va > mult * aa: a_count += 1
+            if has_iv and v_iv < -mult * a_iv: a_count += 1
             if check_bb(hist, h_mean, h_std, mult, False): b_count += 1
             if check_bb(obv, o_mean, o_std, mult, False): b_count += 1
             if check_bb(m_di, m_mean, m_std, mult, True): b_count += 1
             if check_bb(adx, a_mean, a_std, mult, True): b_count += 1
+            if has_iv and check_bb(iv_v, iv_m, iv_s, mult, False): b_count += 1
         atr_grid[mult], bb_grid[mult] = a_count, b_count
     return atr_grid, bb_grid
 
-def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, today_start, is_late_session, end=None, allow_bull=True, allow_bear=True):
+def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, today_start, is_late_session, end=None, allow_bull=True, allow_bear=True, iv_kin=None, is_option=False):
     n = len(close) if end is None else min(int(end), len(close))
     if today_start >= n:
         return None, {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0, 'killed_time': '-', 'killed_price': 0.0, 'reason': 'No data for today', 'kills': []}
@@ -1592,10 +1783,24 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
             bb_kc_bull_fire = (bb_upper[i] > kc_upper[i]) or (close[i] > bb_upper[i] and close[i] > kc_upper[i])
             bb_kc_bear_fire = (bb_lower[i] < kc_lower[i]) or (close[i] < bb_lower[i] and close[i] < kc_lower[i])
 
-            if allow_bull and not is_late_session[i] and bull_struct and bull_shock and bb_kc_bull_fire:
+            iv_ok_bull = True
+            iv_ok_bear = True
+            if is_option and iv_kin and ENABLE_OPTION_IV_ENGINE and i < len(iv_kin.get('iv', [])):
+                vel_iv_i = iv_kin['vel_iv'][i]
+                atr_iv_i = max(iv_kin['atr_iv'][i], 1e-6)
+                iv_i = iv_kin['iv'][i]
+                iv_mean_i = iv_kin['iv_mean'][i]
+                iv_std_i = iv_kin['iv_std'][i]
+                if IV_REQUIRE_NON_NEGATIVE_VEL:
+                    if vel_iv_i < -0.2 * atr_iv_i:
+                        iv_ok_bull = False
+                if iv_std_i > 0 and iv_i < iv_mean_i - 1.5 * iv_std_i:
+                    iv_ok_bull = False
+
+            if allow_bull and not is_late_session[i] and bull_struct and bull_shock and bb_kc_bull_fire and iv_ok_bull:
                 if r_bear: warzone_kills += 1
                 else: anchor = {"dir": "BULL", "idx": i, "time": dt_1m[i], "price": close[i]}; break
-            elif allow_bear and not is_late_session[i] and bear_struct and bear_shock and bb_kc_bear_fire:
+            elif allow_bear and not is_late_session[i] and bear_struct and bear_shock and bb_kc_bear_fire and iv_ok_bear:
                 if r_bull: warzone_kills += 1
                 else: anchor = {"dir": "BEAR", "idx": i, "time": dt_1m[i], "price": close[i]}; break
             i += 1
@@ -1603,6 +1808,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
         if not anchor: break
         survived, is_bull = True, anchor['dir'] == "BULL"
         peak_price, true_peak, j = anchor['price'], anchor['price'], anchor['idx'] + 1
+        peak_iv = iv_kin['iv'][anchor['idx']] if (is_option and iv_kin and anchor['idx'] < len(iv_kin.get('iv', []))) else 0.0
 
         while j < n:
             (bull_score, bear_score, _, _, _, _, _, _) = get_kinetics(kin_1m, j)
@@ -1625,6 +1831,15 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                 reason = f"Profit Lock (+{lock_trig_r:g}R Peak -> +{lock_floor_r:g}R Breakeven Floor)"
             elif max_r < soft_disable_r and adverse >= soft_mult * base_atr and opposing >= opp_thresh:
                 reason = soft_reason
+            elif is_option and iv_kin and ENABLE_OPTION_IV_ENGINE and j < len(iv_kin.get('iv', [])):
+                cur_iv = iv_kin['iv'][j]
+                peak_iv = max(peak_iv, cur_iv)
+                vel_iv_j = iv_kin['vel_iv'][j]
+                atr_iv_j = max(iv_kin['atr_iv'][j], 1e-6)
+                if peak_iv > 0 and (peak_iv - cur_iv) / peak_iv >= float(IV_CRUSH_DROP_PCT):
+                    reason = f"Kinetic SL (IV Crush -{((peak_iv - cur_iv)/peak_iv)*100:.1f}% from peak)"
+                elif vel_iv_j < -float(IV_CRUSH_VEL_MULT) * atr_iv_j and curr_r < 1.0:
+                    reason = f"Kinetic SL (IV Crush Velocity Shock)"
 
             if reason:
                 last_killed_info = {
@@ -1648,7 +1863,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
     info['kills'] = kills
     return None, info
 
-def prepare_series(master, target_dt, is_sector_index=False, is_option=False):
+def prepare_series(master, target_dt, is_sector_index=False, is_option=False, opt_item=None):
     if master is None or master.empty: return None, "no_data"
     day_mask = (master['Datetime'].dt.date == target_dt).values
     if not day_mask.any(): return None, "no_data"
@@ -1706,11 +1921,49 @@ def prepare_series(master, target_dt, is_sector_index=False, is_option=False):
         sma_kc = pd.Series(stitched_close).rolling(PRICE_KC_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values + stitched_offset
         atr_kc = pd.Series(tr).rolling(PRICE_KC_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values
 
+    iv_kin = None
+    if is_option and ENABLE_OPTION_IV_ENGINE:
+        try:
+            opt_specs = _parse_contract_specs(opt_item.get('symbol') if opt_item else None, opt_item)
+            if opt_specs and opt_specs.get('strike') and opt_specs['strike'] > 0:
+                u_idx = opt_specs.get('underlying', 'NIFTY')
+                spot_df = _get_cached_spot_1m(u_idx, target_dt, MIN1_HISTORY_DAYS, target_dt == now_ist().date())
+                if spot_df is not None and not spot_df.empty:
+                    s_dt = spot_df['Datetime'].values
+                    s_cl = spot_df['Close'].values.astype(float)
+                    pos = np.searchsorted(s_dt, master['Datetime'].values, side='right') - 1
+                    pos = np.clip(pos, 0, len(s_cl) - 1)
+                    spot_closes = s_cl[pos]
+                else:
+                    spot_closes = np.full(n, float(opt_specs['strike']))
+                
+                exp_dt = opt_specs.get('expiry') or target_dt
+                exp_datetime = datetime.combine(exp_dt, dtime(15, 30))
+                candle_dts = master['Datetime'].dt.to_pydatetime()
+                iv_arr = np.zeros(n, dtype=float)
+                is_call_opt = (opt_specs.get('option_type') == 'CE')
+                stk_val = float(opt_specs['strike'])
+                
+                for k_i in range(n):
+                    t_sec = max(60.0, (exp_datetime - candle_dts[k_i]).total_seconds())
+                    t_yr = t_sec / (365.0 * 86400.0)
+                    iv_arr[k_i] = calc_implied_volatility(close[k_i], spot_closes[k_i], stk_val, t_yr, r=RISK_FREE_RATE, is_call=is_call_opt)
+                
+                if (iv_arr > 0).any():
+                    last_valid_iv = iv_arr[iv_arr > 0][0]
+                    for k_i in range(n):
+                        if iv_arr[k_i] > 0: last_valid_iv = iv_arr[k_i]
+                        else: iv_arr[k_i] = last_valid_iv
+                iv_kin = _evaluate_iv_arrays(iv_arr, sess_starts, sid)
+        except Exception as e:
+            ERRORS.add("prepare_series:iv_kin", e)
+
     return {
         'close': close, 'dt': master['Datetime'].values, 'today_start': ts, 'is_late_session': is_late_session,
         'day_open': float(open_[ts]), 'prev_close': float(close[ts - 1]) if ts > 0 else 0.0,
         'base_atr': base_atr, 'risk_atr': risk_atr, 'atr_bars': int(atr_bars), 'atr_tf': atr_tf_used,
         'kin': _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts, sid),
+        'iv_kin': iv_kin,
         'bb_upper': sma_bb + PRICE_BB_STD_MULT * std_bb, 'bb_lower': sma_bb - PRICE_BB_STD_MULT * std_bb,
         'kc_upper': sma_kc + PRICE_KC_ATR_MULT * atr_kc, 'kc_lower': sma_kc - PRICE_KC_ATR_MULT * atr_kc,
     }, None
@@ -1737,15 +1990,18 @@ def row_at(S, end, symbol, sector="", sector_weight=0.0, is_sector_index=False):
         'SectorWeight': float(sector_weight or 0.0), 'IsSectorIndex': bool(is_sector_index),
     }
 
+    iv_kin = S.get('iv_kin')
+    row['IV_Kin'] = iv_kin
     anchor, info = evaluate_anchor_tripwire(
         close, S['dt'], kin, base_atr, S['bb_upper'], S['bb_lower'], S['kc_upper'], S['kc_lower'],
-        ts, S['is_late_session'], end, allow_bull=allow_bull_anchor, allow_bear=allow_bear_anchor
+        ts, S['is_late_session'], end, allow_bull=allow_bull_anchor, allow_bear=allow_bear_anchor,
+        iv_kin=iv_kin, is_option=is_opt
     )
     row['Kills'] = info.get('kills', [])
     eval_dir = anchor['dir'] if anchor else info.get('dir')
     if not eval_dir or eval_dir == "NONE": eval_dir = "BULL"
 
-    row['ATR_Grid'], row['BB_Grid'] = calculate_grids(kin, last, eval_dir)
+    row['ATR_Grid'], row['BB_Grid'] = calculate_grids(kin, last, eval_dir, iv_kin=iv_kin)
     bb_expanding = (S['bb_upper'][last] > S['kc_upper'][last] or (close[last] > S['bb_upper'][last] and close[last] > S['kc_upper'][last])) if eval_dir == "BULL" else (S['bb_lower'][last] < S['kc_lower'][last] or (close[last] < S['bb_lower'][last] and close[last] < S['kc_lower'][last]))
     pure_state = "[ BB > KC ]" if bb_expanding else "[ BB < KC ]"
 
@@ -1829,7 +2085,7 @@ def process_stock_checkpoints(args):
             if day.empty or day['Close'].iloc[-1] < OPT_MIN_PRICE or day['Volume'].sum() < OPT_MIN_VOLUME:
                 return [(cp, "illiquid", sym) for cp in checkpoints], []
 
-        S, why = prepare_series(master, target_dt, is_sector_index=is_sec_idx, is_option=(mode == "INDEX_OPTIONS" or _is_option_symbol(sym)))
+        S, why = prepare_series(master, target_dt, is_sector_index=is_sec_idx, is_option=(mode == "INDEX_OPTIONS" or _is_option_symbol(sym)), opt_item=item)
         if S is None: return [(cp, why, sym) for cp in checkpoints], []
 
         ends = np.searchsorted(S['dt'], np.array(checkpoints, dtype='datetime64[ns]'), side='left')
@@ -3316,6 +3572,9 @@ def run_screener(
 
     if mode == "INDEX_OPTIONS":
         stock_candidates = universe_raw
+        if ENABLE_OPTION_IV_ENGINE:
+            for _u_idx in INDEX_CONFIG:
+                _get_cached_spot_1m(_u_idx, target_dt, MIN1_HISTORY_DAYS, today_session)
     else:
         prog = Progress("prefilter", len(universe_raw))
         lookback_cal_days = days * PREFILTER_LOOKBACK_MULT + PREFILTER_LOOKBACK_PAD_DAYS
@@ -3576,6 +3835,10 @@ def parse_args():
     p.add_argument("--adverse-drift-r", type=float, default=ADVERSE_DRIFT_R_FLOOR)
     p.add_argument("--day-pct-basis", choices=["PREV_CLOSE", "OPEN"], default=DAY_PCT_BASIS)
     p.add_argument("--graveyard-max", type=int, default=TOP_N_GRAVEYARD)
+    p.add_argument("--iv-engine", dest="iv_engine", action="store_true", default=None, help="Enable Option IV Engine and Crush Protection (default: ENABLE_OPTION_IV_ENGINE).")
+    p.add_argument("--no-iv-engine", dest="iv_engine", action="store_false")
+    p.add_argument("--iv-crush-pct", type=float, default=None, help="IV drawdown percentage from peak to trigger Kinetic SL (default: IV_CRUSH_DROP_PCT = 0.15).")
+    p.add_argument("--iv-crush-vel-mult", type=float, default=None, help="IV negative velocity ATR multiplier to trigger IV crush (default: IV_CRUSH_VEL_MULT = 1.5).")
     p.add_argument("--track", type=str, default="")
     return p.parse_args()
 
@@ -3713,6 +3976,12 @@ if __name__ == "__main__":
     DAY_PCT_BASIS = args.day_pct_basis
     TOP_N_GRAVEYARD = args.graveyard_max
     if args.single_snapshot: BACKTRACE_CHECKPOINTS = False
+    if args.iv_engine is not None:
+        ENABLE_OPTION_IV_ENGINE = args.iv_engine
+    if args.iv_crush_pct is not None:
+        IV_CRUSH_DROP_PCT = args.iv_crush_pct
+    if args.iv_crush_vel_mult is not None:
+        IV_CRUSH_VEL_MULT = args.iv_crush_vel_mult
 
     try:
         code = run_screener(
