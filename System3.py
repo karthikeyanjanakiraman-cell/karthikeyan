@@ -1332,8 +1332,132 @@ def _index_options_universe(cutoff_dt, use_intraday, needles=()):
                 })
     return universe
 
+
+def _stock_options_universe(cutoff_dt, use_intraday, needles=()):
+    target_dt = cutoff_dt.date()
+    nse = _download_master("NSE")
+    if not nse: return []
+
+    def ts_of(i): return i.get("tradingsymbol", i.get("trading_symbol"))
+
+    # 1. Map underlying F&O stocks to their cash equity keys
+    eq_keys = {}
+    for r in nse:
+        if r.get("segment") == "NSE_EQ" and (INCLUDE_NON_EQ_SERIES or (r.get("instrument_type") or "EQ") == "EQ"):
+            sym = str(ts_of(r) or "").upper().strip()
+            if sym and r.get("instrument_key"):
+                eq_keys[sym] = r["instrument_key"]
+
+    # 2. Group all stock option contracts in NSE_FO by underlying
+    by_stock = {}
+    fno_underlyings = set()
+    for row in nse:
+        seg = str(_field(row, "segment") or "").upper()
+        if seg != "NSE_FO": continue
+        itype = str(_field(row, "option_type", "instrument_type") or "").upper()
+        ts = str(_field(row, "trading_symbol", "tradingsymbol") or "").upper()
+        if itype not in ("CE", "PE", "OPTSTK"):
+            if not (ts.endswith("CE") or ts.endswith("PE") or " CE " in ts or " PE " in ts):
+                continue
+        if itype not in ("CE", "PE"):
+            itype = "CE" if ("CE" in ts.split()[-1] or ts.endswith("CE")) else "PE"
+
+        u_sym = str(_field(row, "underlying_symbol") or "").upper().strip()
+        if not u_sym:
+            m_pre = re.match(r'^([A-Z0-9_\-]+)', ts)
+            if m_pre: u_sym = m_pre.group(1)
+        if not u_sym: continue
+        fno_underlyings.add(u_sym)
+
+        exp_date = _expiry_to_date(_field(row, "expiry"))
+        if exp_date is None or exp_date < target_dt: continue
+        strike_raw = _field(row, "strike_price", "strike")
+        try: strike = float(strike_raw) if strike_raw is not None else 0.0
+        except Exception: strike = 0.0
+        if strike <= 0:
+            m_stk = re.search(r'(\d+(?:\.\d+)?)\s*(?:CE|PE)', ts)
+            if m_stk:
+                try: strike = float(m_stk.group(1))
+                except Exception: strike = 0.0
+        if strike <= 0 or not _field(row, "instrument_key"): continue
+        by_stock.setdefault(u_sym, []).append((exp_date, strike, itype, row))
+
+    if not by_stock: return []
+
+    # 3. Resolve spot price for each F&O stock
+    spot = {}
+    cands_to_fetch = [{"key": eq_keys[u], "symbol": u} for u in by_stock if u in eq_keys]
+    if cands_to_fetch:
+        q_map = fetch_quotes(cands_to_fetch)
+        for c in cands_to_fetch:
+            ltp = q_map.get(c["key"], {}).get("ltp", 0.0)
+            if ltp and ltp > 0:
+                spot[c["symbol"]] = float(ltp)
+
+    universe, seen = [], set()
+
+    # 4. Handle pinned / needles contracts
+    if needles:
+        flat = []
+        for u_sym, contracts in by_stock.items():
+            for exp_date, strike, itype, row in contracts:
+                key = _field(row, "instrument_key")
+                sym = str(_field(row, "trading_symbol", "tradingsymbol") or key)
+                flat.append((sym, (exp_date, strike, itype, sym, u_sym), key))
+                flat.append((u_sym, (exp_date, strike, itype, sym, u_sym), key))
+        pinned_keys = set()
+        for sym, (exp_date, strike, itype, opt_sym, u_sym), key in flat:
+            for needle in needles:
+                n_clean = _norm_sym(needle)
+                if n_clean and (n_clean == _norm_sym(sym) or n_clean == _norm_sym(opt_sym) or n_clean == _norm_sym(u_sym)):
+                    pinned_keys.add((key, opt_sym, strike, itype, exp_date, u_sym))
+        for key, opt_sym, strike, itype, exp_date, u_sym in pinned_keys:
+            if key not in seen:
+                seen.add(key)
+                sec_name, sec_wt, _ = resolve_primary_sector(u_sym)
+                stk_spot_ref = spot.get(u_sym, 0.0) or float(strike)
+                universe.append({
+                    "key": key, "symbol": opt_sym, "pinned": True, "is_sector_index": False,
+                    "sector": sec_name, "sector_weight": sec_wt,
+                    "strike": float(strike), "option_type": itype, "expiry": exp_date, "underlying": u_sym,
+                    "spot_price": float(stk_spot_ref)
+                })
+
+    # 5. Build ATM options chain for all F&O stocks
+    for u_sym, contracts in by_stock.items():
+        if not contracts: continue
+        expiries = sorted({c[0] for c in contracts if c[0] >= target_dt})
+        if not expiries: continue
+        expiry_idx = 1 if str(EXPIRY_SELECTION).upper() == "NEXT" else 0
+        target_exp = expiries[min(expiry_idx, len(expiries) - 1)]
+        chain = [c for c in contracts if c[0] == target_exp]
+        strikes = np.array(sorted({c[1] for c in chain}))
+
+        stock_spot = spot.get(u_sym, 0.0)
+        if stock_spot <= 0:
+            stock_spot = float(np.median(strikes))
+
+        atm_i = int(np.abs(strikes - stock_spot).argmin())
+        lo = max(0, atm_i - 1)
+        hi = min(len(strikes), atm_i + 2)
+        window = set(strikes[lo:hi].tolist())
+
+        sec_name, sec_wt, _ = resolve_primary_sector(u_sym)
+        for exp_date, strike, itype, row in chain:
+            key = _field(row, "instrument_key")
+            if strike in window and key not in seen:
+                seen.add(key)
+                universe.append({
+                    "key": key, "symbol": str(_field(row, "trading_symbol", "tradingsymbol") or key),
+                    "pinned": False, "is_sector_index": False, "sector": sec_name, "sector_weight": sec_wt,
+                    "strike": float(strike), "option_type": itype, "expiry": exp_date, "underlying": u_sym,
+                    "spot_price": float(stock_spot)
+                })
+    return universe
+
 def get_dynamic_universe(mode, cutoff_dt, use_intraday, needles=()):
-    if mode in ("STOCK_FNO", "CASH_EQUITY"): return _equity_universe(mode, needles)
+    if mode == "CASH_EQUITY": return _equity_universe(mode, needles)
+    if mode == "STOCK_FNO": return _stock_options_universe(cutoff_dt, use_intraday, needles)
     if mode == "INDEX_OPTIONS": return _index_options_universe(cutoff_dt, use_intraday, needles)
     return []
 
@@ -1935,7 +2059,8 @@ def prepare_series(master, target_dt, is_sector_index=False, is_option=False, op
                     pos = np.clip(pos, 0, len(s_cl) - 1)
                     spot_closes = s_cl[pos]
                 else:
-                    spot_closes = np.full(n, float(opt_specs['strike']))
+                    stk_spot_val = opt_item.get('spot_price') if (opt_item and opt_item.get('spot_price')) else float(opt_specs['strike'])
+                    spot_closes = np.full(n, float(stk_spot_val))
                 
                 exp_dt = opt_specs.get('expiry') or target_dt
                 exp_datetime = datetime.combine(exp_dt, dtime(15, 30))
@@ -2080,12 +2205,12 @@ def process_stock_checkpoints(args):
 
         master = prepare_master(frames)
         master = master[master['Datetime'] < final_cutoff].reset_index(drop=True)
-        if mode == "INDEX_OPTIONS" and not is_sec_idx:
+        if mode in ("INDEX_OPTIONS", "STOCK_FNO") and not is_sec_idx:
             day = master[master['Datetime'].dt.date == target_dt]
             if day.empty or day['Close'].iloc[-1] < OPT_MIN_PRICE or day['Volume'].sum() < OPT_MIN_VOLUME:
                 return [(cp, "illiquid", sym) for cp in checkpoints], []
 
-        S, why = prepare_series(master, target_dt, is_sector_index=is_sec_idx, is_option=(mode == "INDEX_OPTIONS" or _is_option_symbol(sym)), opt_item=item)
+        S, why = prepare_series(master, target_dt, is_sector_index=is_sec_idx, is_option=(mode in ("INDEX_OPTIONS", "STOCK_FNO") or _is_option_symbol(sym)), opt_item=item)
         if S is None: return [(cp, why, sym) for cp in checkpoints], []
 
         ends = np.searchsorted(S['dt'], np.array(checkpoints, dtype='datetime64[ns]'), side='left')
@@ -3570,9 +3695,9 @@ def run_screener(
     if STATS.auth_failed or not universe_raw: return 1
     print(f"   {COLOR_DIM}» Universe: {len(universe_raw)} instruments{COLOR_RESET}")
 
-    if mode == "INDEX_OPTIONS":
+    if mode in ("INDEX_OPTIONS", "STOCK_FNO"):
         stock_candidates = universe_raw
-        if ENABLE_OPTION_IV_ENGINE:
+        if ENABLE_OPTION_IV_ENGINE and mode == "INDEX_OPTIONS":
             for _u_idx in INDEX_CONFIG:
                 _get_cached_spot_1m(_u_idx, target_dt, MIN1_HISTORY_DAYS, today_session)
     else:
