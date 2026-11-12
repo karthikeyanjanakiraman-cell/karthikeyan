@@ -384,6 +384,20 @@ ENV_IV_CRUSH_DROP_PCT = "IV_CRUSH_DROP_PCT"
 ENV_IV_CRUSH_VEL_MULT = "IV_CRUSH_VEL_MULT"
 ENV_IV_REQUIRE_NON_NEGATIVE_VEL = "IV_REQUIRE_NON_NEGATIVE_VEL"
 
+# --- 0.9C UNDERLYING TREND GATE & WHIPSAW COOLDOWN (ANTI CE/PE FLIP-FLOP) ---
+ENABLE_UNDERLYING_TREND_FILTER = True   # Require underlying spot (NIFTY/BANKNIFTY/etc.) to align with CE (BULL) or PE (BEAR)
+UNDERLYING_TREND_EMA_PERIOD = 20        # 1-min EMA/SMA period on underlying spot to confirm trend direction
+DIRECTION_FLIP_COOLDOWN_MIN = 30        # Min minutes before an underlying can flip from CE->PE or PE->CE (prevents whipsaw)
+UNDERLYING_EXCLUSIVE_DIRECTION = True   # Never allow both CE and PE on the same underlying in the same snapshot
+ENV_ENABLE_UNDERLYING_TREND_FILTER = "ENABLE_UNDERLYING_TREND_FILTER"
+ENV_DIRECTION_FLIP_COOLDOWN_MIN = "DIRECTION_FLIP_COOLDOWN_MIN"
+
+# --- 0.9D CE BOLLINGER BAND + PE INSIDE CE BAND PAIR GATE ---
+ENABLE_PAIR_BB_GATE = True              # Draw BB on CE Price & place PE Price inside it; require opposite band breakouts
+PAIR_BB_STD_MULT = 1.0                  # StdDev multiplier inside CE's BB for CE vs PE divergence (e.g. 1.0 or 1.5 or 2.0)
+ENV_ENABLE_PAIR_BB_GATE = "ENABLE_PAIR_BB_GATE"
+ENV_PAIR_BB_STD_MULT = "PAIR_BB_STD_MULT"
+
 # --- 0.10 DASHBOARD DISPLAY & FORMATTING ---
 TOP_N_BUYERS = 50
 TOP_N_SELLERS = 50
@@ -1306,7 +1320,7 @@ def _index_options_universe(cutoff_dt, use_intraday, needles=()):
                 universe.append({
                     "key": key, "symbol": sym, "pinned": True, "is_sector_index": False,
                     "sector": "INDEX_OPTIONS", "sector_weight": 100.0,
-                    "strike": float(strike), "option_type": itype, "expiry": exp_date, "underlying": idx
+                    "strike": float(strike), "option_type": itype, "expiry": exp_date, "underlying": idx, "spot_key": INDEX_CONFIG.get(idx, {}).get("spot_key", "")
                 })
 
     for idx, contracts in by_idx.items():
@@ -1328,7 +1342,7 @@ def _index_options_universe(cutoff_dt, use_intraday, needles=()):
                 universe.append({
                     "key": key, "symbol": str(_field(row, "trading_symbol", "tradingsymbol") or key),
                     "pinned": False, "is_sector_index": False, "sector": idx, "sector_weight": 100.0,
-                    "strike": float(strike), "option_type": itype, "expiry": exp_date, "underlying": idx
+                    "strike": float(strike), "option_type": itype, "expiry": exp_date, "underlying": idx, "spot_key": INDEX_CONFIG.get(idx, {}).get("spot_key", "")
                 })
     return universe
 
@@ -1420,7 +1434,7 @@ def _stock_options_universe(cutoff_dt, use_intraday, needles=()):
                     "key": key, "symbol": opt_sym, "pinned": True, "is_sector_index": False,
                     "sector": sec_name, "sector_weight": sec_wt,
                     "strike": float(strike), "option_type": itype, "expiry": exp_date, "underlying": u_sym,
-                    "spot_price": float(stk_spot_ref)
+                    "spot_price": float(stk_spot_ref), "spot_key": eq_keys.get(u_sym, "")
                 })
 
     # 5. Build ATM options chain for all F&O stocks
@@ -1451,14 +1465,14 @@ def _stock_options_universe(cutoff_dt, use_intraday, needles=()):
                     "key": key, "symbol": str(_field(row, "trading_symbol", "tradingsymbol") or key),
                     "pinned": False, "is_sector_index": False, "sector": sec_name, "sector_weight": sec_wt,
                     "strike": float(strike), "option_type": itype, "expiry": exp_date, "underlying": u_sym,
-                    "spot_price": float(stock_spot)
+                    "spot_price": float(stock_spot), "spot_key": eq_keys.get(u_sym, "")
                 })
     return universe
 
 def get_dynamic_universe(mode, cutoff_dt, use_intraday, needles=()):
     if mode == "CASH_EQUITY": return _equity_universe(mode, needles)
-    if mode == "STOCK_FNO": return _stock_options_universe(cutoff_dt, use_intraday, needles)
-    if mode == "INDEX_OPTIONS": return _index_options_universe(cutoff_dt, use_intraday, needles)
+    if mode == "STOCK_FNO": return _attach_option_pair_keys(_stock_options_universe(cutoff_dt, use_intraday, needles))
+    if mode == "INDEX_OPTIONS": return _attach_option_pair_keys(_index_options_universe(cutoff_dt, use_intraday, needles))
     return []
 
 # ==============================================================================
@@ -1605,10 +1619,9 @@ def _parse_contract_specs(symbol, item=None):
     return {"symbol": sym, "option_type": itype, "strike": strike, "underlying": underlying, "expiry": expiry_dt}
 
 
-def _get_cached_spot_1m(idx, target_dt, history_days=MIN1_HISTORY_DAYS, use_intraday=True):
+def _get_cached_spot_1m(idx, target_dt, history_days=MIN1_HISTORY_DAYS, use_intraday=True, spot_key_override=None):
     cfg = INDEX_CONFIG.get(idx)
-    if not cfg: return None
-    spot_key = cfg.get("spot_key")
+    spot_key = spot_key_override or (cfg.get("spot_key") if cfg else None)
     if not spot_key: return None
     cache_key = (idx, target_dt)
     with _SPOT_CACHE_LOCK:
@@ -1630,6 +1643,98 @@ def _get_cached_spot_1m(idx, target_dt, history_days=MIN1_HISTORY_DAYS, use_intr
     except Exception as e:
         ERRORS.add(f"spot_1m:{idx}", e)
     return None
+
+
+_SPOT_TREND_CACHE = {}
+
+_OPTION_1M_CACHE = {}
+_OPT_CACHE_LOCK = threading.Lock()
+
+def _attach_option_pair_keys(universe):
+    """Links each CE contract to its matching PE contract (same underlying, expiry, strike) and vice versa."""
+    lookup = {}
+    for it in universe:
+        u = str(it.get("underlying") or "").upper()
+        exp = it.get("expiry")
+        stk = float(it.get("strike") or 0.0)
+        otype = str(it.get("option_type") or "").upper()
+        if u and exp and stk > 0 and otype in ("CE", "PE"):
+            lookup[(u, exp, stk, otype)] = it["key"]
+    for it in universe:
+        u = str(it.get("underlying") or "").upper()
+        exp = it.get("expiry")
+        stk = float(it.get("strike") or 0.0)
+        otype = str(it.get("option_type") or "").upper()
+        if otype in ("CE", "PE"):
+            opp = "PE" if otype == "CE" else "CE"
+            it["pair_key"] = lookup.get((u, exp, stk, opp), "")
+    return universe
+
+def _get_cached_option_1m(inst_key, target_dt, history_days=MIN1_HISTORY_DAYS, use_intraday=True):
+    if not inst_key: return None
+    ck = (inst_key, target_dt)
+    with _OPT_CACHE_LOCK:
+        if ck in _OPTION_1M_CACHE:
+            return _OPTION_1M_CACHE[ck]
+    try:
+        frames = []
+        for c_start, c_end in _date_chunks(target_dt - timedelta(days=history_days), target_dt + timedelta(days=1), span=CHUNK_SPAN_1M_DAYS):
+            status, df = _candles(_url_range_1m(inst_key, c_start, c_end))
+            if status == 200 and df is not None: frames.append(df)
+        if use_intraday:
+            today_df = fetch_today(inst_key)
+            if today_df is not None: frames.append(today_df)
+        if frames:
+            m_df = prepare_master(frames)
+            with _OPT_CACHE_LOCK:
+                _OPTION_1M_CACHE[ck] = m_df
+            return m_df
+    except Exception as e:
+        ERRORS.add(f"opt_1m:{inst_key}", e)
+    return None
+
+
+def _get_underlying_trend_arrays(idx, target_dt, history_days=MIN1_HISTORY_DAYS, use_intraday=True, spot_key_override=None):
+    cache_key = (idx, target_dt, spot_key_override or "")
+    with _SPOT_CACHE_LOCK:
+        if cache_key in _SPOT_TREND_CACHE:
+            return _SPOT_TREND_CACHE[cache_key]
+    spot_df = _get_cached_spot_1m(idx, target_dt, history_days, use_intraday, spot_key_override=spot_key_override)
+    if spot_df is None or spot_df.empty:
+        return None
+    try:
+        op = spot_df['Open'].values.astype(float)
+        cl = spot_df['Close'].values.astype(float)
+        hi = spot_df['High'].values.astype(float)
+        lo = spot_df['Low'].values.astype(float)
+        vol = spot_df['Volume'].values.astype(float)
+        sid = spot_df['SessId'].values
+        n = len(cl)
+        sess_starts = np.zeros(n, dtype=bool)
+        sess_starts[0] = True
+        sess_starts[1:] = sid[1:] != sid[:-1]
+        kin = _evaluate_kinetic_arrays(op, cl, hi, lo, vol, sess_starts, sid)
+        ema_p = max(2, int(UNDERLYING_TREND_EMA_PERIOD or 20))
+        ema = _ewm(cl, 2.0 / (float(ema_p) + 1.0))
+        # Also compute session-anchored VWAP/mean price for intraday bias
+        day_mask = (spot_df['Datetime'].dt.date == target_dt).values
+        ts = int(np.argmax(day_mask)) if day_mask.any() else 0
+        day_open = float(op[ts]) if ts < n else float(op[0])
+        res = {
+            'dt': spot_df['Datetime'].values,
+            'close': cl,
+            'ema': ema,
+            'plus_di': kin['plus_di'],
+            'minus_di': kin['minus_di'],
+            'hist': kin['hist'],
+            'day_open': day_open,
+        }
+        with _SPOT_CACHE_LOCK:
+            _SPOT_TREND_CACHE[cache_key] = res
+        return res
+    except Exception as e:
+        ERRORS.add(f"spot_trend:{idx}", e)
+        return None
 
 def _evaluate_iv_arrays(iv, sess_starts, sid):
     n = len(iv)
@@ -1880,7 +1985,7 @@ def calculate_grids(kin_1m, idx, direction, iv_kin=None):
         atr_grid[mult], bb_grid[mult] = a_count, b_count
     return atr_grid, bb_grid
 
-def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, today_start, is_late_session, end=None, allow_bull=True, allow_bear=True, iv_kin=None, is_option=False):
+def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, today_start, is_late_session, end=None, allow_bull=True, allow_bear=True, iv_kin=None, is_option=False, u_trend=None, is_ce=False, is_pe=False, pair_bb_ok=None):
     n = len(close) if end is None else min(int(end), len(close))
     if today_start >= n:
         return None, {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0, 'killed_time': '-', 'killed_price': 0.0, 'reason': 'No data for today', 'kills': []}
@@ -1921,10 +2026,22 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                 if iv_std_i > 0 and iv_i < iv_mean_i - 1.5 * iv_std_i:
                     iv_ok_bull = False
 
-            if allow_bull and not is_late_session[i] and bull_struct and bull_shock and bb_kc_bull_fire and iv_ok_bull:
+            u_ok_bull = True
+            u_ok_bear = True
+            if is_option and ENABLE_UNDERLYING_TREND_FILTER and u_trend is not None and i < len(u_trend.get('bull_ok', [])):
+                if is_ce:
+                    u_ok_bull = bool(u_trend['bull_ok'][i])
+                elif is_pe:
+                    u_ok_bull = bool(u_trend['bear_ok'][i])
+
+            p_bb_ok = True
+            if is_option and ENABLE_PAIR_BB_GATE and pair_bb_ok is not None and i < len(pair_bb_ok):
+                p_bb_ok = bool(pair_bb_ok[i])
+
+            if allow_bull and not is_late_session[i] and bull_struct and bull_shock and bb_kc_bull_fire and iv_ok_bull and u_ok_bull and p_bb_ok:
                 if r_bear: warzone_kills += 1
                 else: anchor = {"dir": "BULL", "idx": i, "time": dt_1m[i], "price": close[i]}; break
-            elif allow_bear and not is_late_session[i] and bear_struct and bear_shock and bb_kc_bear_fire and iv_ok_bear:
+            elif allow_bear and not is_late_session[i] and bear_struct and bear_shock and bb_kc_bear_fire and iv_ok_bear and u_ok_bear:
                 if r_bull: warzone_kills += 1
                 else: anchor = {"dir": "BEAR", "idx": i, "time": dt_1m[i], "price": close[i]}; break
             i += 1
@@ -2051,7 +2168,8 @@ def prepare_series(master, target_dt, is_sector_index=False, is_option=False, op
             opt_specs = _parse_contract_specs(opt_item.get('symbol') if opt_item else None, opt_item)
             if opt_specs and opt_specs.get('strike') and opt_specs['strike'] > 0:
                 u_idx = opt_specs.get('underlying', 'NIFTY')
-                spot_df = _get_cached_spot_1m(u_idx, target_dt, MIN1_HISTORY_DAYS, target_dt == now_ist().date())
+                u_spot_key = opt_item.get('spot_key') if opt_item else None
+                spot_df = _get_cached_spot_1m(u_idx, target_dt, MIN1_HISTORY_DAYS, target_dt == now_ist().date(), spot_key_override=u_spot_key)
                 if spot_df is not None and not spot_df.empty:
                     s_dt = spot_df['Datetime'].values
                     s_cl = spot_df['Close'].values.astype(float)
@@ -2083,12 +2201,72 @@ def prepare_series(master, target_dt, is_sector_index=False, is_option=False, op
         except Exception as e:
             ERRORS.add("prepare_series:iv_kin", e)
 
+    u_trend = None
+    if is_option and ENABLE_UNDERLYING_TREND_FILTER:
+        try:
+            opt_specs_t = _parse_contract_specs(opt_item.get('symbol') if opt_item else None, opt_item)
+            if opt_specs_t:
+                u_idx_t = opt_specs_t.get('underlying', 'NIFTY')
+                u_skey_t = opt_item.get('spot_key') if opt_item else None
+                ut = _get_underlying_trend_arrays(u_idx_t, target_dt, MIN1_HISTORY_DAYS, target_dt == now_ist().date(), spot_key_override=u_skey_t)
+                if ut is not None and len(ut['dt']) > 0:
+                    pos_t = np.searchsorted(ut['dt'], master['Datetime'].values, side='right') - 1
+                    pos_t = np.clip(pos_t, 0, len(ut['close']) - 1)
+                    u_cl = ut['close'][pos_t]
+                    u_ema = ut['ema'][pos_t]
+                    u_pdi = ut['plus_di'][pos_t]
+                    u_mdi = ut['minus_di'][pos_t]
+                    u_hist = ut['hist'][pos_t]
+                    bull_ok = (u_cl >= u_ema) & (u_pdi >= u_mdi) & (u_hist >= 0)
+                    bear_ok = (u_cl <= u_ema) & (u_mdi >= u_pdi) & (u_hist <= 0)
+                    u_trend = {'bull_ok': bull_ok, 'bear_ok': bear_ok}
+        except Exception as e:
+            ERRORS.add("prepare_series:u_trend", e)
+
+    pair_bb_ok = None
+    if is_option and ENABLE_PAIR_BB_GATE and opt_item and opt_item.get('pair_key'):
+        try:
+            pair_df = _get_cached_option_1m(opt_item['pair_key'], target_dt, MIN1_HISTORY_DAYS, target_dt == now_ist().date())
+            if pair_df is not None and not pair_df.empty:
+                p_dt = pair_df['Datetime'].values
+                p_cl = pair_df['Close'].values.astype(float)
+                pos_p = np.searchsorted(p_dt, master['Datetime'].values, side='right') - 1
+                pos_p = np.clip(pos_p, 0, len(p_cl) - 1)
+                pair_close = p_cl[pos_p]
+                is_ce_leg = (str(opt_item.get('option_type') or '').upper() == 'CE') or _is_ce_symbol(opt_item.get('symbol'))
+                ce_cl = close if is_ce_leg else pair_close
+                pe_cl = pair_close if is_ce_leg else close
+
+                ce_s = pd.Series(ce_cl)
+                pe_s = pd.Series(pe_cl)
+                ce_sma = ce_s.rolling(PRICE_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values
+                ce_std = ce_s.rolling(PRICE_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0).values
+                pe_sma = pe_s.rolling(PRICE_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).mean().values
+                pe_std = pe_s.rolling(PRICE_BB_PERIOD, min_periods=ROLLING_MIN_PERIODS).std(ddof=0).values
+
+                # Place PE price inside CE's Bollinger Band (scaled to CE's mean & std envelope)
+                pe_in_ce_band = np.where(pe_std > EPSILON, ce_sma + ((pe_cl - pe_sma) / pe_std) * ce_std, ce_sma)
+                band_k = float(PAIR_BB_STD_MULT or 1.0)
+                ce_upper_gate = ce_sma + band_k * ce_std
+                ce_lower_gate = ce_sma - band_k * ce_std
+
+                if is_ce_leg:
+                    # CE BUY: CE breaks above CE's Upper BB AND PE breaks below CE's Lower BB
+                    pair_bb_ok = (ce_std > EPSILON) & (ce_cl > ce_upper_gate) & (pe_in_ce_band < ce_lower_gate)
+                else:
+                    # PE BUY: PE breaks above CE's Upper BB AND CE breaks below CE's Lower BB
+                    pair_bb_ok = (ce_std > EPSILON) & (pe_in_ce_band > ce_upper_gate) & (ce_cl < ce_lower_gate)
+        except Exception as e:
+            ERRORS.add("prepare_series:pair_bb", e)
+
     return {
         'close': close, 'dt': master['Datetime'].values, 'today_start': ts, 'is_late_session': is_late_session,
         'day_open': float(open_[ts]), 'prev_close': float(close[ts - 1]) if ts > 0 else 0.0,
         'base_atr': base_atr, 'risk_atr': risk_atr, 'atr_bars': int(atr_bars), 'atr_tf': atr_tf_used,
         'kin': _evaluate_kinetic_arrays(open_, close, high, low, vol, sess_starts, sid),
         'iv_kin': iv_kin,
+        'u_trend': u_trend,
+        'pair_bb_ok': pair_bb_ok,
         'bb_upper': sma_bb + PRICE_BB_STD_MULT * std_bb, 'bb_lower': sma_bb - PRICE_BB_STD_MULT * std_bb,
         'kc_upper': sma_kc + PRICE_KC_ATR_MULT * atr_kc, 'kc_lower': sma_kc - PRICE_KC_ATR_MULT * atr_kc,
     }, None
@@ -2120,7 +2298,8 @@ def row_at(S, end, symbol, sector="", sector_weight=0.0, is_sector_index=False):
     anchor, info = evaluate_anchor_tripwire(
         close, S['dt'], kin, base_atr, S['bb_upper'], S['bb_lower'], S['kc_upper'], S['kc_lower'],
         ts, S['is_late_session'], end, allow_bull=allow_bull_anchor, allow_bear=allow_bear_anchor,
-        iv_kin=iv_kin, is_option=is_opt
+        iv_kin=iv_kin, is_option=is_opt, u_trend=S.get('u_trend'),
+        is_ce=_is_ce_symbol(symbol), is_pe=_is_pe_symbol(symbol), pair_bb_ok=S.get('pair_bb_ok')
     )
     row['Kills'] = info.get('kills', [])
     eval_dir = anchor['dir'] if anchor else info.get('dir')
@@ -2204,6 +2383,9 @@ def process_stock_checkpoints(args):
         if not frames: return [(cp, "no_data", sym) for cp in checkpoints], []
 
         master = prepare_master(frames)
+        if mode in ("INDEX_OPTIONS", "STOCK_FNO") and not is_sec_idx and item.get('key'):
+            with _OPT_CACHE_LOCK:
+                _OPTION_1M_CACHE[(item['key'], target_dt)] = master
         master = master[master['Datetime'] < final_cutoff].reset_index(drop=True)
         if mode in ("INDEX_OPTIONS", "STOCK_FNO") and not is_sec_idx:
             day = master[master['Datetime'].dt.date == target_dt]
@@ -2662,6 +2844,34 @@ def evaluate_first_time_popups_in_memory(by_symbol_all_cps, current_bulls, curre
     _classify_rows(pool_bulls if pool_bulls is not None else current_bulls, prior_bull_appearances, new_bulls, window_first_bulls)
     _classify_rows(pool_bears if pool_bears is not None else current_bears, prior_bear_appearances, new_bears, window_first_bears)
 
+    if UNDERLYING_EXCLUSIVE_DIRECTION:
+        def _resolve_underlying_conflicts(bull_list, bear_list):
+            # Group by underlying (_script_group_key) and keep only the dominant/newest direction
+            by_u_bull, by_u_bear = {}, {}
+            for r in bull_list: by_u_bull.setdefault(_script_group_key(r), []).append(r)
+            for r in bear_list: by_u_bear.setdefault(_script_group_key(r), []).append(r)
+            conflicts = set(by_u_bull.keys()) & set(by_u_bear.keys())
+            drop_bull_u, drop_bear_u = set(), set()
+            for u in conflicts:
+                b_rows, r_rows = by_u_bull[u], by_u_bear[u]
+                b_max_t = max(_hhmm_to_min(x.get('ActiveAnchor')) for x in b_rows)
+                r_max_t = max(_hhmm_to_min(x.get('ActiveAnchor')) for x in r_rows)
+                if abs(b_max_t - r_max_t) < int(DIRECTION_FLIP_COOLDOWN_MIN or 0):
+                    # Within cooldown: keep whichever has stronger count or higher net R
+                    b_score = (len(b_rows), sum(_r_multiple(x) for x in b_rows))
+                    r_score = (len(r_rows), sum(_r_multiple(x) for x in r_rows))
+                    if b_score >= r_score: drop_bear_u.add(u)
+                    else: drop_bull_u.add(u)
+                else:
+                    if b_max_t >= r_max_t: drop_bear_u.add(u)
+                    else: drop_bull_u.add(u)
+            return (
+                [r for r in bull_list if _script_group_key(r) not in drop_bull_u],
+                [r for r in bear_list if _script_group_key(r) not in drop_bear_u]
+            )
+        new_bulls, new_bears = _resolve_underlying_conflicts(new_bulls, new_bears)
+        window_first_bulls, window_first_bears = _resolve_underlying_conflicts(window_first_bulls, window_first_bears)
+
     sort_rows_by_script_count(new_bulls)
     sort_rows_by_script_count(new_bears)
     sort_rows_by_script_count(window_first_bulls)
@@ -2669,45 +2879,6 @@ def evaluate_first_time_popups_in_memory(by_symbol_all_cps, current_bulls, curre
 
     return {"new_bulls": new_bulls, "new_bears": new_bears, "window_first_bulls": window_first_bulls, "window_first_bears": window_first_bears, "iter_stats": iter_stats}
 
-    w_start = lookback_meta["window_start_dt"]
-    w_end = lookback_meta["window_end_dt"]
-    prior_dts = lookback_meta["prior_iter_dts_chrono"]
-
-    prior_bull_appearances, prior_bear_appearances, iter_stats = {}, {}, []
-
-    for it_dt in prior_dts:
-        it_cps = set(generate_checkpoints(it_dt, interval_min=CHECKPOINT_INTERVAL_MIN) if BACKTRACE_CHECKPOINTS else [it_dt])
-        it_cps.add(it_dt)
-
-        sub_map = {}
-        for sym, rows in by_symbol_all_cps.items():
-            f_rows = [r for r in rows if r['CheckpointTime'] <= it_dt and r['CheckpointTime'] in it_cps]
-            if not f_rows: f_rows = [r for r in rows if r['CheckpointTime'] <= it_dt]
-            if f_rows: sub_map[sym] = f_rows
-
-        it_bulls, it_bears, it_grave = segregate_and_rank_buckets(sub_map, filter_timestamp_gap=False, filter_popup_strict=False) if sub_map else ([], [], [])
-        it_bulls = [r for r in it_bulls if _popup_row_ok(r)]
-        it_bears = [r for r in it_bears if _popup_row_ok(r)]
-        it_label = it_dt.strftime("%H:%M")
-        iter_stats.append({"iter_time": it_label, "bull_count": len(it_bulls), "bear_count": len(it_bears), "grave_count": len(it_grave)})
-
-        for r in it_bulls: prior_bull_appearances.setdefault(r['Symbol'], []).append((it_label, str(r.get('ActiveAnchor') or '-').replace('*', '').strip()))
-        for r in it_bears: prior_bear_appearances.setdefault(r['Symbol'], []).append((it_label, str(r.get('ActiveAnchor') or '-').replace('*', '').strip()))
-
-    curr_label = w_end.strftime("%H:%M")
-    new_bulls, new_bears, window_first_bulls, window_first_bears = [], [], [], []
-
-    # Tag all pool rows and current rows canonically IN-PLACE so all tables and emails see identical PopupType & FirstPopupIter
-    for r in (pool_bulls or []):
-        classify_setup_popup_type(r, prior_bull_appearances, w_start, w_end, curr_label)
-    for r in (pool_bears or []):
-        classify_setup_popup_type(r, prior_bear_appearances, w_start, w_end, curr_label)
-    for r in (current_bulls or []):
-        classify_setup_popup_type(r, prior_bull_appearances, w_start, w_end, curr_label)
-    for r in (current_bears or []):
-        classify_setup_popup_type(r, prior_bear_appearances, w_start, w_end, curr_label)
-
-    
 def _state_display(row):
     return f"[STOP {row.get('KilledTime')}]" if row['State'] == "[STOPPED]" and row.get('KilledTime') and row.get('KilledTime') != '-' else row['State']
 
@@ -3020,24 +3191,28 @@ def build_full_untruncated_plain_text(
     if lookback_meta and lookback_meta.get("enabled") and stock_popup_res is not None:
         w_start_s = lookback_meta["window_start_dt"].strftime("%H:%M")
         w_end_s = lookback_meta["window_end_dt"].strftime("%H:%M")
-        nb_ce, nb_pe = _ce_pe_counts(new_stk_b)
-        nr_ce, nr_pe = _ce_pe_counts(new_stk_r)
+        p_idx_b = new_idx_b if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else win_idx_b
+        p_idx_r = new_idx_r if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else win_idx_r
+        p_stk_b = new_stk_b if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else win_stk_b
+        p_stk_r = new_stk_r if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else win_stk_r
+        pb_ce, pb_pe = _ce_pe_counts(p_stk_b)
+        pr_ce, pr_pe = _ce_pe_counts(p_stk_r)
+        lbl = _pure_label().upper() if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else "ALL WINDOW POPUPS"
 
-        if EMAIL_ONLY_PURE_1ST_TIME_CONTENT:
-            lines.append(f"=== SYSTEM 3.0 [{mode}] — {_pure_label().upper()} POPUPS REPORT ({w_start_s}..{w_end_s}) ===")
-            lines.append(f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Anchor Window: {w_start_s} to {w_end_s}")
-            lines.append(_report_legend_text())
-            lines.append(_pure_note_text())
-            lines.append(
-                f"Sectoral Indices Pure 1st-Time: ▲ {len(new_idx_b)} Bull / ▼ {len(new_idx_r)} Bear | "
-                f"Stocks Pure 1st-Time: ▲ {len(new_stk_b)} Bull [CE({nb_ce}) PE({nb_pe})] / ▼ {len(new_stk_r)} Bear [CE({nr_ce}) PE({nr_pe})]\n"
-            )
-            if new_idx_b or new_idx_r:
-                _fmt_active_block("PURE FIRST-TIME SECTORAL INDEX POPUPS — BULL", new_idx_b, show_sector=False, show_first_iter=True, include_ce_pe_counts=False)
-                _fmt_active_block("PURE FIRST-TIME SECTORAL INDEX POPUPS — BEAR", new_idx_r, show_sector=False, show_first_iter=True, include_ce_pe_counts=False)
-            _fmt_active_block("PURE FIRST-TIME STOCK POPUPS — BULL", new_stk_b, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
-            _fmt_active_block("PURE FIRST-TIME STOCK POPUPS — BEAR", new_stk_r, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
-            return "\n".join(lines)
+        lines.append(f"=== SYSTEM 3.0 [{mode}] — {lbl} REPORT ({w_start_s}..{w_end_s}) ===")
+        lines.append(f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Anchor Window: {w_start_s} to {w_end_s}")
+        lines.append(_report_legend_text())
+        lines.append(_pure_note_text())
+        lines.append(
+            f"Sectoral Indices: ▲ {len(p_idx_b)} Bull / ▼ {len(p_idx_r)} Bear | "
+            f"Stocks: ▲ {len(p_stk_b)} Bull [CE({pb_ce}) PE({pb_pe})] / ▼ {len(p_stk_r)} Bear [CE({pr_ce}) PE({pr_pe})]\n"
+        )
+        if p_idx_b or p_idx_r:
+            _fmt_active_block("SECTORAL INDEX POPUPS — BULL", p_idx_b, show_sector=False, show_first_iter=True, include_ce_pe_counts=False)
+            _fmt_active_block("SECTORAL INDEX POPUPS — BEAR", p_idx_r, show_sector=False, show_first_iter=True, include_ce_pe_counts=False)
+        _fmt_active_block("STOCK POPUPS — BULL", p_stk_b, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
+        _fmt_active_block("STOCK POPUPS — BEAR", p_stk_r, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
+        return "\n".join(lines)
 
     lines.append(f"=== SYSTEM 3.0 INSTITUTIONAL VOLATILITY TRACKER [{mode}] ===")
     lines.append(f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')}")
@@ -3110,7 +3285,6 @@ def build_email_and_attachment_html(
             return "<div style='background-color:#ffffff;border:1px solid #cbd5e1;border-radius:6px;padding:10px 14px;color:#64748b;font-style:italic;margin-bottom:14px;'>No setups in this category for the current lookback window.</div>"
         th_style = "background-color:#1e293b;color:#ffffff;padding:8px 10px;border:1px solid #334155;font-weight:700;font-size:12px;"
         sec_th = f"<th style='{th_style}' align='left'>Sector (MaxWt%)</th>" if show_sec else ""
-        iter_th = f"<th style='{th_style}' align='center'>1stIter</th><th style='{th_style}' align='center'>PopupType</th>"
         iter_th = f"<th style='{th_style}' align='center'>1stIter</th><th style='{th_style}' align='center'>PopupType</th>" if show_first_iter else ""
 
         tr_list = []
@@ -3191,8 +3365,8 @@ def build_email_and_attachment_html(
         )
 
     light_css = "body{background-color:#f1f5f9;color:#0f172a;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:13px;margin:0;padding:16px;}.pill{background-color:#ffffff;color:#1e293b;border:1px solid #94a3b8;padding:5px 10px;margin:2px;border-radius:4px;cursor:pointer;font-weight:600;}.pill:hover,.pill.active{background-color:#2563eb;color:#ffffff;border-color:#1d4ed8;}.clr{background-color:#dc2626;color:#ffffff;border:none;padding:6px 14px;border-radius:4px;font-weight:700;cursor:pointer;}"
-    nb_ce, nb_pe = _ce_pe_counts(new_stk_b)
-    nr_ce, nr_pe = _ce_pe_counts(new_stk_r)
+    nb_ce, nb_pe = _ce_pe_counts(email_stk_b)
+    nr_ce, nr_pe = _ce_pe_counts(email_stk_r)
 
     header_card_html = (
         f"<div style='background-color:#ffffff;border:1px solid #cbd5e1;border-left:6px solid #2563eb;border-radius:6px;padding:14px 18px;margin-bottom:16px;'>"
@@ -3373,6 +3547,7 @@ def build_still_holding_email_and_attachment_html(
 
         cp_val = r.get('CheckpointTime')
         seen_s = cp_val.strftime('%H:%M') if hasattr(cp_val, 'strftime') else str(cp_val or '-')
+        first_iter_s = str(r.get('FirstPopupIter') or seen_s)
         shown_ltp = f"{float(r['KilledPrice']):.2f}x" if ("[STOP" in st and float(r.get('KilledPrice', 0.0) or 0.0) > 0) else f"{float(r.get('LTP', 0.0) or 0.0):.2f}"
 
         return {
@@ -3380,6 +3555,8 @@ def build_still_holding_email_and_attachment_html(
             "rr": r.get('RR_Str') or compute_risk_reward_ratio(r)[1],
             "sector": r.get('Sector', DEFAULT_UNMAPPED_SECTOR),
             "weight": f"{float(r.get('SectorWeight', 0.0)):.1f}%",
+            "first_iter": first_iter_s,
+            "popup_type": r.get('PopupType', '1ST-TIME'),
             "ltp": shown_ltp,
             "tgt_tag": _target_tag(r),
             "prior": _prior_attempts_text(r),
@@ -3439,14 +3616,14 @@ def build_still_holding_email_and_attachment_html(
             if d["prior"]:
                 tr_list.append(
                     f"<tr data-sector='{sec_attr}' style='background-color:{row_bg};'>"
-                    f"<td colspan='{12 + (1 if show_sec else 0)}' style='padding:3px 10px 6px 24px;border:1px solid #cbd5e1;background-color:{row_bg};color:#64748b;font-size:11px;font-style:italic;'>↳ {html.escape(d['prior'])}</td></tr>"
+                    f"<td colspan='{14 + (1 if show_sec else 0)}' style='padding:3px 10px 6px 24px;border:1px solid #cbd5e1;background-color:{row_bg};color:#64748b;font-size:11px;font-style:italic;'>↳ {html.escape(d['prior'])}</td></tr>"
                 )
         return (
             f"<table style='width:100%;border-collapse:collapse;margin-bottom:16px;background-color:#ffffff;border:1px solid #cbd5e1;font-family:Consolas,monospace;font-size:12px;'>"
             f"<thead><tr>"
             f"<th style='{th_style}' align='left'>Script</th><th style='{th_style}' align='center'>R:R</th><th style='{th_style}' align='right'>LTP/Exit</th>"
             f"<th style='{th_style}' align='right'>Target</th><th style='{th_style}' align='right'>SL</th>"
-            f"{sec_th}"
+            f"{sec_th}{iter_th}"
             f"<th style='{th_style}' align='center'>Seen</th><th style='{th_style}' align='center'>Anchor</th><th style='{th_style}' align='right'>Anch Val</th>"
             f"<th style='{th_style}' align='right'>R-Mult (Bank)</th><th style='{th_style}' align='center'>ATR: 1X 2X 3X 5X</th>"
             f"<th style='{th_style}' align='center'>BB: 1X 2X 3X 5X</th><th style='{th_style}' align='center'>State</th>"
@@ -3769,10 +3946,11 @@ def run_screener(
     )
 
     if SEND_DASHBOARD_EMAIL:
-        new_idx_b = (idx_popup_res or {}).get("new_bulls", [])
-        new_idx_r = (idx_popup_res or {}).get("new_bears", [])
-        new_stk_b = (stock_popup_res or {}).get("new_bulls", [])
-        new_stk_r = (stock_popup_res or {}).get("new_bears", [])
+        _k_b, _k_r = ("new_bulls", "new_bears") if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else ("window_first_bulls", "window_first_bears")
+        new_idx_b = (idx_popup_res or {}).get(_k_b, [])
+        new_idx_r = (idx_popup_res or {}).get(_k_r, [])
+        new_stk_b = (stock_popup_res or {}).get(_k_b, [])
+        new_stk_r = (stock_popup_res or {}).get(_k_r, [])
 
         new_b_cnt, new_r_cnt = len(new_stk_b), len(new_stk_r)
         new_idx_b_cnt, new_idx_r_cnt = len(new_idx_b), len(new_idx_r)
@@ -3964,6 +4142,12 @@ def parse_args():
     p.add_argument("--no-iv-engine", dest="iv_engine", action="store_false")
     p.add_argument("--iv-crush-pct", type=float, default=None, help="IV drawdown percentage from peak to trigger Kinetic SL (default: IV_CRUSH_DROP_PCT = 0.15).")
     p.add_argument("--iv-crush-vel-mult", type=float, default=None, help="IV negative velocity ATR multiplier to trigger IV crush (default: IV_CRUSH_VEL_MULT = 1.5).")
+    p.add_argument("--underlying-trend-filter", dest="underlying_trend_filter", action="store_true", default=None, help="Require underlying spot trend to align with CE/PE option direction (default: ENABLE_UNDERLYING_TREND_FILTER).")
+    p.add_argument("--no-underlying-trend-filter", dest="underlying_trend_filter", action="store_false")
+    p.add_argument("--flip-cooldown-min", type=int, default=None, help="Minutes cooldown before flipping CE<->PE on same underlying (default: DIRECTION_FLIP_COOLDOWN_MIN = 30).")
+    p.add_argument("--pair-bb-gate", dest="pair_bb_gate", action="store_true", default=None, help="Require PE inside CE Bollinger Band divergence for options (default: ENABLE_PAIR_BB_GATE).")
+    p.add_argument("--no-pair-bb-gate", dest="pair_bb_gate", action="store_false")
+    p.add_argument("--pair-bb-std", type=float, default=None, help="StdDev multiplier inside CE BB for CE vs PE divergence (default: PAIR_BB_STD_MULT = 1.0).")
     p.add_argument("--track", type=str, default="")
     return p.parse_args()
 
@@ -4107,6 +4291,18 @@ if __name__ == "__main__":
         IV_CRUSH_DROP_PCT = args.iv_crush_pct
     if args.iv_crush_vel_mult is not None:
         IV_CRUSH_VEL_MULT = args.iv_crush_vel_mult
+    if args.underlying_trend_filter is not None:
+        ENABLE_UNDERLYING_TREND_FILTER = args.underlying_trend_filter
+    else:
+        ENABLE_UNDERLYING_TREND_FILTER = _parse_bool_env(ENV_ENABLE_UNDERLYING_TREND_FILTER, ENABLE_UNDERLYING_TREND_FILTER)
+    if args.flip_cooldown_min is not None:
+        DIRECTION_FLIP_COOLDOWN_MIN = args.flip_cooldown_min
+    if args.pair_bb_gate is not None:
+        ENABLE_PAIR_BB_GATE = args.pair_bb_gate
+    else:
+        ENABLE_PAIR_BB_GATE = _parse_bool_env(ENV_ENABLE_PAIR_BB_GATE, ENABLE_PAIR_BB_GATE)
+    if args.pair_bb_std is not None:
+        PAIR_BB_STD_MULT = args.pair_bb_std
 
     try:
         code = run_screener(
