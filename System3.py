@@ -854,8 +854,13 @@ def _report_legend_text():
     else:
         parts.append(f"R = move ÷ {ATR_BASIS_TF} ATR (also used for Target / SL)")
     parts.append("↳ = today's attempts on this script (earlier stopped-out anchors with their prices, current one, Day %)")
-    if _dual_gate_required(None, _RUN_MODE):
-        parts.append(f"Dual-Band ✔ = mandatory CE/PE gate: {int(DUAL_BAND_PERIOD)}-bar ±{float(DUAL_BAND_STD_MULT):g}σ band on the CE, PE normalised into it (U/L = upper/lower). CE BUY = CE > U & PE(norm) < L | PE BUY = PE(norm) > U & CE < L | both legs on the same side = IV trap, none inside = chop -> no anchor | opposite side confirmed = exit")
+    if _dual_gate_required(None, mode):
+        print(
+            f"   {COLOR_DIM}» CE/PE Dual-Band gate: MANDATORY (symmetric host-anchored) | "
+            f"{int(DUAL_BAND_PERIOD)}-bar log-stitched BB ±{float(DUAL_BAND_STD_MULT):g}σ on active leg, "
+            f"twin normalised by {str(DUAL_BAND_ALIGN_MODE).upper()} | twin max stale {float(DUAL_BAND_TWIN_MAX_STALE_MIN):g}m | "
+            f"reversal exit {'ON' if DUAL_BAND_REVERSAL_EXIT else 'OFF'} | missing twin = no anchor{COLOR_RESET}"
+        )
     return "Legend: " + " | ".join(parts)
 
 def _get_timestamp_gap_min(row):
@@ -1678,8 +1683,14 @@ def _get_cached_spot_1m(idx, target_dt, history_days=MIN1_HISTORY_DAYS, use_intr
 # ==============================================================================
 # 1C. CE/PE DUAL-BAND CONFLUENCE GATE ENGINE (MANDATORY FOR EVERY OPTION ANCHOR)
 # ==============================================================================
-# One arena per strike. The band lives on the CE price, the PE is normalised into it. Both legs are judged on the SAME bars: the twin leg is sampled
-# AS-OF every bar of the evaluated contract (never a later print) and its own SMA / sigma are computed on those sampled bars, so the two windows never drift apart.
+# Symmetric, host-anchored arena per strike:
+#   - On a CE contract: BB lives on CE's native bars; PE's native stats are AS-OF aligned and normalised onto CE's BB.
+#   - On a PE contract: BB lives on PE's native bars; CE's native stats are AS-OF aligned and normalised onto PE's BB.
+# Because each leg computes its own log-stitched SMA/sigma on its OWN native timestamps and SessId BEFORE alignment:
+#   1) Overnight gaps never leak into the twin leg when one leg prints after 09:15.
+#   2) Overnight price-level shifts (e.g. Rs 200 -> Rs 40) rescale yesterday's volatility proportionally to today's premium.
+#   3) Missing 1-min candles in the twin never create forward-filled duplicate closes that collapse sigma.
+#   4) CE and PE runs of the same strike produce 100% identical gate verdicts at every shared timestamp.
 _DUAL_CODE_TEXT = {
     0: "twin/band data not ready",
     3: "TRAP - CE & PE both above the Upper band (IV spike)",
@@ -1704,57 +1715,77 @@ def _closed_dual_gate(own_type, reason):
     return {'required': True, 'available': False, 'own_type': str(own_type or "").upper(), 'reason': reason}
 
 def _dual_leg_arrays(frame):
-    """SMA / sigma of ONE leg's close over DUAL_BAND_PERIOD bars. Overnight gaps are stitched out exactly like the price BB in prepare_series."""
-    open_ = frame['Open'].values.astype(float)
-    close = frame['Close'].values.astype(float)
+    """Per-leg scale-invariant Bollinger arrays computed strictly on the leg's OWN native bars and OWN SessId.
+    Uses multiplicative (log-return) gap stitching across sessions so overnight repricing automatically rescales
+    yesterday's volatility to today's premium level and Lower BB stays strictly positive."""
+    open_ = np.maximum(frame['Open'].values.astype(float), EPSILON)
+    close = np.maximum(frame['Close'].values.astype(float), EPSILON)
     sid = frame['SessId'].values
     n = len(close)
     period = max(2, int(DUAL_BAND_PERIOD))
+    floor_rs = max(float(DUAL_BAND_MIN_SIGMA or 0.0), EPSILON)
+    log_c = np.log(close)
+    log_o = np.log(open_)
+
     if ISOLATE_SESSION_BANDS:
-        grouped = pd.DataFrame({'close': close, 'sid': sid}).groupby('sid')['close']
-        mean = grouped.transform(lambda x: x.rolling(period, min_periods=period).mean()).values
-        std = grouped.transform(lambda x: x.rolling(period, min_periods=period).std(ddof=0)).values
+        min_p = min(period, max(5, int(ANCHOR_OPEN_WARMUP_BARS or 5)))
+        grouped = pd.DataFrame({'lc': log_c, 'sid': sid}).groupby('sid')['lc']
+        mu_log = grouped.transform(lambda x: x.rolling(period, min_periods=min_p).mean()).values
+        sd_log = grouped.transform(lambda x: x.rolling(period, min_periods=min_p).std(ddof=0)).values
     else:
         sess_starts = np.zeros(n, dtype=bool)
         sess_starts[0] = True
         sess_starts[1:] = sid[1:] != sid[:-1]
-        delta = np.diff(close, prepend=close[0])
-        delta = np.where(sess_starts, close - open_, delta)
-        stitched = np.cumsum(delta) + open_[0]
-        offset = close - stitched
-        s = pd.Series(stitched)
-        mean = s.rolling(period, min_periods=period).mean().values + offset
-        std = s.rolling(period, min_periods=period).std(ddof=0).values
-    return {'close': close, 'mean': mean, 'std': std}
+        log_ret = np.diff(log_c, prepend=log_c[0])
+        log_ret = np.where(sess_starts, log_c - log_o, log_ret)
+        stitched_log = np.cumsum(log_ret) + log_o[0]
+        log_offset = log_c - stitched_log
+        s_log = pd.Series(stitched_log)
+        mu_log = s_log.rolling(period, min_periods=period).mean().values + log_offset
+        sd_log = s_log.rolling(period, min_periods=period).std(ddof=0).values
 
-def _dual_align_twin(master, twin_master):
-    """The twin leg sampled AS-OF every bar of the evaluated contract (last print at or before the bar, never a later one),
-    plus a per-bar freshness mask (same session day and not older than DUAL_BAND_TWIN_MAX_STALE_MIN minutes) and a 'has printed yet' mask."""
-    own_dt = master['Datetime'].values.astype('datetime64[ns]')
-    tw_dt = twin_master['Datetime'].values.astype('datetime64[ns]')
+    with np.errstate(all='ignore'):
+        rel_floor = np.maximum(floor_rs / close, 1e-4)
+        sd_eff = np.maximum(sd_log, rel_floor)      # NaN stays NaN until rolling window is ready
+        mid = np.exp(mu_log)
+        std_rs = np.maximum(mid * sd_eff, floor_rs)
+        z = (log_c - mu_log) / sd_eff
+
+    return {
+        'dt': frame['Datetime'].values.astype('datetime64[ns]'),
+        'close': close, 'mu_log': mu_log, 'sd_eff': sd_eff,
+        'mid': mid, 'std_rs': std_rs, 'z': z,
+    }
+
+def _dual_align_twin_arrays(own_dt, twin_arr):
+    """Sample the twin leg's ALREADY-COMPUTED native Bollinger stats AS-OF each bar of the host leg
+    (last twin print <= host bar, zero lookahead) plus per-bar same-day freshness mask."""
+    tw_dt = twin_arr['dt']
     pos = np.searchsorted(tw_dt, own_dt, side='right') - 1
     have = pos >= 0
-    pos = np.clip(pos, 0, len(tw_dt) - 1)
-    last_dt = tw_dt[pos]
+    pos_safe = np.clip(pos, 0, len(tw_dt) - 1)
+    last_dt = tw_dt[pos_safe]
     fresh = have & (own_dt.astype('datetime64[D]') == last_dt.astype('datetime64[D]'))
     max_stale = float(DUAL_BAND_TWIN_MAX_STALE_MIN or 0)
     if max_stale > 0:
         age_min = (own_dt - last_dt).astype('timedelta64[s]').astype(float) / 60.0
         fresh = fresh & (age_min <= max_stale)
-    frame = pd.DataFrame({
-        'Datetime': own_dt,
-        'Open': twin_master['Open'].values.astype(float)[pos],
-        'Close': twin_master['Close'].values.astype(float)[pos],
-        'SessId': master['SessId'].values,
-    })
-    return frame, fresh, have
+
+    aligned = {
+        k: twin_arr[k][pos_safe]
+        for k in ('close', 'mu_log', 'sd_eff', 'mid', 'std_rs', 'z')
+    }
+    return aligned, fresh
 
 def build_dual_band_gate(master, twin_master, own_type):
-    """Per-bar CE/PE confluence arrays on the evaluated contract's own bar timeline.
+    """Per-bar symmetric CE<->PE confluence arrays on the evaluated contract's own bar timeline.
 
-    code[i]: 1 = CE BUY confirmed (CE > Upper & PE(norm) < Lower) | 2 = PE BUY confirmed (PE(norm) > Upper & CE < Lower)
-             3 = both above Upper (IV-spike TRAP) | 4 = both below Lower (IV-crush TRAP) | 5 = CHOP (all inside) | 6 = one leg only | 0 = data not ready
-    A full DUAL_BAND_PERIOD window on both legs and a fresh twin print are required; anything missing leaves code 0 (= no anchor).
+    Host BB = evaluated leg (CE for CE contracts, PE for PE contracts); twin leg is normalised onto Host BB:
+      ZSCORE (default): twin_aligned = exp(mu_log_host + z_twin * sd_eff_host)  -> exact, strike-independent, 100% CE<->PE symmetric
+      OFFSET          : twin_aligned = mid_host + (twin_close - mid_twin)       -> literal rupee offset onto host band (ATM only)
+
+    code[i]: 1 = CE BUY confirmed (CE > U & PE(norm) < L) | 2 = PE BUY confirmed (PE > U & CE(norm) < L)
+             3 = both above Upper (IV-spike TRAP) | 4 = both below Lower (IV-crush TRAP) | 5 = CHOP (both inside) | 6 = one leg only | 0 = data not ready
     """
     own_type = str(own_type).upper()
     if own_type not in ("CE", "PE"):
@@ -1764,31 +1795,46 @@ def build_dual_band_gate(master, twin_master, own_type):
 
     n = len(master)
     own = _dual_leg_arrays(master)
-    tw_frame, fresh, have = _dual_align_twin(master, twin_master)
-    period = max(2, int(DUAL_BAND_PERIOD))
-    win_have = pd.Series(have.astype(float)).rolling(period, min_periods=period).min().values >= 1.0     # the twin's whole window must be real prints, never back-filled
-    twin = _dual_leg_arrays(tw_frame)
-    ce, pe = (own, twin) if own_type == "CE" else (twin, own)
+    twin_native = _dual_leg_arrays(twin_master)
+    twin, fresh = _dual_align_twin_arrays(own['dt'], twin_native)
 
     mode = str(DUAL_BAND_ALIGN_MODE).strip().upper()
     k = float(DUAL_BAND_STD_MULT)
-    floor = max(float(DUAL_BAND_MIN_SIGMA or 0.0), EPSILON)
-    c, p, mC, mP = ce['close'], pe['close'], ce['mean'], pe['mean']
+    is_ce = (own_type == "CE")
+    twin_type = "PE" if is_ce else "CE"
+
+    h_close, h_mu, h_sd, h_mid, h_std_rs, h_z = (
+        own['close'], own['mu_log'], own['sd_eff'], own['mid'], own['std_rs'], own['z']
+    )
+    t_close, t_mu, t_sd, t_mid, t_z = (
+        twin['close'], twin['mu_log'], twin['sd_eff'], twin['mid'], twin['z']
+    )
+
     with np.errstate(all='ignore'):
-        sC, sP = np.maximum(ce['std'], floor), np.maximum(pe['std'], floor)      # NaN (window not full) stays NaN
-        valid = fresh & win_have & np.isfinite(mC) & np.isfinite(sC) & np.isfinite(mP) & np.isfinite(sP)
-        upper, lower = mC + k * sC, mC - k * sC
-        dev_p = p - mP                                      # PE divergence from ITS OWN baseline ...
-        if mode != "OFFSET":
-            dev_p = dev_p * (sC / sP)                       # ... measured in units of its OWN sigma, re-expressed in the CE's sigma
-        pe_al = mC + dev_p                                  # ... and re-based onto the CE's middle band: both legs start at the mid-line
-        z_ce, z_pe = (c - mC) / sC, (p - mP) / sP
-        ce_up, ce_dn = c > upper, c < lower
-        pe_up, pe_dn = pe_al > upper, pe_al < lower
+        valid = fresh & np.isfinite(h_mu) & np.isfinite(h_sd) & np.isfinite(t_mu) & np.isfinite(t_sd)
+        if mode == "OFFSET":
+            upper = h_mid + k * h_std_rs
+            lower = np.maximum(0.0, h_mid - k * h_std_rs)
+            twin_aligned = h_mid + (t_close - t_mid)
+            host_up, host_dn = (h_close > upper), (h_close < lower)
+            twin_up, twin_dn = (twin_aligned > upper), (twin_aligned < lower)
+        else:
+            upper = np.exp(h_mu + k * h_sd)
+            lower = np.exp(h_mu - k * h_sd)
+            twin_aligned = np.exp(h_mu + t_z * h_sd)
+            host_up, host_dn = (h_z > k), (h_z < -k)
+            twin_up, twin_dn = (t_z > k), (t_z < -k)
+
+    # Canonical market-direction flags regardless of whether host is CE or PE
+    ce_up, ce_dn = (host_up, host_dn) if is_ce else (twin_up, twin_dn)
+    pe_up, pe_dn = (twin_up, twin_dn) if is_ce else (host_up, host_dn)
+    z_ce, z_pe = (h_z, t_z) if is_ce else (t_z, h_z)
+    ce_close, pe_close = (h_close, t_close) if is_ce else (t_close, h_close)
 
     up_ok, dn_ok = valid & ce_up & pe_dn, valid & pe_up & ce_dn
     trap_up, trap_dn = valid & ce_up & pe_up, valid & ce_dn & pe_dn
     chop = valid & ~(ce_up | ce_dn | pe_up | pe_dn)
+
     code = np.zeros(n, dtype=np.int8)
     code[valid] = 6
     code[chop] = 5
@@ -1797,12 +1843,16 @@ def build_dual_band_gate(master, twin_master, own_type):
     code[dn_ok] = 2
     code[up_ok] = 1
 
-    is_ce = (own_type == "CE")
     return {
-        'required': True, 'available': True, 'reason': "", 'own_type': own_type, 'mode': "OFFSET" if mode == "OFFSET" else "ZSCORE", 'code': code,
-        'ok_bull': up_ok if is_ce else dn_ok,               # a rising CE premium needs the underlying UP, a rising PE premium needs it DOWN
-        'ok_bear': dn_ok if is_ce else up_ok,               # = the OPPOSITE side confirmed: reversal exit for a BULL anchor, entry only with --allow-option-selling
-        'ce_close': c, 'pe_close': p, 'pe_aligned': pe_al, 'mid': mC, 'upper': upper, 'lower': lower, 'z_ce': z_ce, 'z_pe': z_pe,
+        'required': True, 'available': True, 'reason': "",
+        'own_type': own_type, 'twin_type': twin_type,
+        'mode': "OFFSET" if mode == "OFFSET" else "ZSCORE", 'code': code,
+        'ok_bull': up_ok if is_ce else dn_ok,               # rising CE needs underlying UP; rising PE needs underlying DOWN
+        'ok_bear': dn_ok if is_ce else up_ok,               # opposite side confirmed -> reversal exit for BULL anchor
+        'host_close': h_close, 'twin_close': t_close, 'twin_aligned': twin_aligned,
+        'ce_close': ce_close, 'pe_close': pe_close,
+        'mid': h_mid, 'upper': upper, 'lower': lower,
+        'z_ce': z_ce, 'z_pe': z_pe, 'z_host': h_z, 'z_twin': t_z,
     }
 
 def _dual_gate_pass(gate, i, direction):
@@ -1820,18 +1870,23 @@ def _dual_gate_pass(gate, i, direction):
     return False, _DUAL_CODE_TEXT.get(code, "not confirmed")
 
 def _dual_gate_snapshot(gate, i, direction):
-    """Levels that confirmed the anchor, kept on the row (and on its kill record) so every report can show the proof."""
+    """Levels that confirmed the anchor (host leg on its own BB, twin leg normalised onto host BB)."""
     if not gate or not gate.get('required') or not gate.get('available'):
         return None
     return {
-        'own_type': gate['own_type'], 'dir': direction, 'side': "UP" if int(gate['code'][i]) == 1 else "DOWN", 'mode': gate.get('mode', "ZSCORE"),
-        'ce': float(gate['ce_close'][i]), 'pe': float(gate['pe_close'][i]), 'pe_aligned': float(gate['pe_aligned'][i]),
+        'own_type': gate['own_type'], 'twin_type': gate['twin_type'],
+        'dir': direction, 'side': "UP" if int(gate['code'][i]) == 1 else "DOWN",
+        'mode': gate.get('mode', "ZSCORE"),
+        'host': float(gate['host_close'][i]), 'twin': float(gate['twin_close'][i]),
+        'twin_aligned': float(gate['twin_aligned'][i]),
+        'ce': float(gate['ce_close'][i]), 'pe': float(gate['pe_close'][i]),
         'mid': float(gate['mid'][i]), 'upper': float(gate['upper'][i]), 'lower': float(gate['lower'][i]),
+        'z_host': float(gate['z_host'][i]), 'z_twin': float(gate['z_twin'][i]),
         'z_ce': float(gate['z_ce'][i]), 'z_pe': float(gate['z_pe'][i]),
     }
 
 def _dual_reversal_reason(gate, j, is_bull):
-    """Kill reason when the arena FULLY confirms the opposite side of a live option anchor (CE and PE both break their bands the other way); None otherwise."""
+    """Kill reason when the arena FULLY confirms the opposite side of a live option anchor; None otherwise."""
     if not (DUAL_BAND_REVERSAL_EXIT and gate and gate.get('required') and gate.get('available')):
         return None
     rev = gate['ok_bear'] if is_bull else gate['ok_bull']
@@ -1851,14 +1906,17 @@ def _dual_band_text(row):
     if not d:
         return ""
     try:
-        lbl = f"{d['own_type']} {'BUY' if d.get('dir') == 'BULL' else 'SELL'}"
-        pe_lbl = "PE(al)" if d.get('mode') == "OFFSET" else "PE(norm)"
-        raw = f" [raw {d['pe']:.2f}]" if abs(d['pe'] - d['pe_aligned']) >= 0.01 else ""
-        if d['side'] == "UP":
-            body = f"CE {d['ce']:.2f} > U {d['upper']:.2f} & {pe_lbl} {d['pe_aligned']:.2f}{raw} < L {d['lower']:.2f}"
+        own_t = d['own_type']
+        twin_t = d.get('twin_type') or ("PE" if own_t == "CE" else "CE")
+        is_bull = (d.get('dir') == 'BULL')
+        lbl = f"{own_t} {'BUY' if is_bull else 'SELL'}"
+        tw_lbl = f"{twin_t}(al)" if d.get('mode') == "OFFSET" else f"{twin_t}(norm)"
+        raw = f" [raw {d['twin']:.2f}]" if abs(d['twin'] - d['twin_aligned']) >= 0.01 else ""
+        if is_bull:
+            body = f"{own_t} {d['host']:.2f} > U {d['upper']:.2f} & {tw_lbl} {d['twin_aligned']:.2f}{raw} < L {d['lower']:.2f}"
         else:
-            body = f"{pe_lbl} {d['pe_aligned']:.2f}{raw} > U {d['upper']:.2f} & CE {d['ce']:.2f} < L {d['lower']:.2f}"
-        return f"Dual-Band ✔ {lbl} @anchor: {body} (z CE {d['z_ce']:+.1f} / PE {d['z_pe']:+.1f})"
+            body = f"{tw_lbl} {d['twin_aligned']:.2f}{raw} > U {d['upper']:.2f} & {own_t} {d['host']:.2f} < L {d['lower']:.2f}"
+        return f"Dual-Band ✔ {lbl} @anchor: {body} (z {own_t} {d['z_host']:+.1f} / {twin_t} {d['z_twin']:+.1f})"
     except Exception:
         return ""
 
