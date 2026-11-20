@@ -406,6 +406,7 @@ DUAL_BAND_ALIGN_MODE = "ZSCORE"         # ZSCORE (default) | OFFSET (literal: PE
 DUAL_BAND_MIN_SIGMA = 0.10              # Rs floor on each leg's sigma (2 ticks): a flat leg must still move more than the floor to break its band (stops tick-noise "breakouts")
 DUAL_BAND_TWIN_MAX_STALE_MIN = 15       # The other leg must have printed on the same session day and at most N minutes before the evaluated bar (0 = same day only)
 DUAL_BAND_REVERSAL_EXIT = True          # Kill a live option anchor when the OPPOSITE side is fully confirmed by the same arena (the arena governs exits, not only entries)
+DUAL_BAND_REVERSAL_CONFIRM_BARS = 2     # Consecutive reversal bars required (or 1 bar with opposing kinetic score >= WARZONE_OPPOSING_SCORE)
 ENV_DUAL_BAND_PERIOD = "DUAL_BAND_PERIOD"
 ENV_DUAL_BAND_STD_MULT = "DUAL_BAND_STD_MULT"
 ENV_DUAL_BAND_ALIGN_MODE = "DUAL_BAND_ALIGN_MODE"
@@ -655,15 +656,14 @@ def _compute_target_sl(row):
     trailed = abs(sl_price - init_sl) > 1e-9
 
     lock_trig = float(PROFIT_LOCK_TRIGGER_R or 0.0)
-    fav_engine_r = (((ap - peak) if p_dir == 'BEAR' else (peak - ap)) / engine_atr) if (anchored and engine_atr > 0) else 0.0
-    if SL_TRAIL_TO_LOCK_FLOOR and anchored and engine_atr > 0 and lock_trig > 0 and fav_engine_r + 1e-9 >= lock_trig:
+    if SL_TRAIL_TO_LOCK_FLOOR and anchored and base_atr > 0 and lock_trig > 0 and fav_r + 1e-9 >= lock_trig:
         floor_r = float(PROFIT_LOCK_FLOOR_R or 0.0)
         if p_dir == 'BEAR':
-            lock_sl = ref_price - floor_r * engine_atr
+            lock_sl = ref_price - floor_r * base_atr
             if lock_sl > ltp and lock_sl < sl_price:
                 sl_price, trailed = lock_sl, True
         else:
-            lock_sl = ref_price + floor_r * engine_atr
+            lock_sl = ref_price + floor_r * base_atr
             if 0.05 < lock_sl < ltp and lock_sl > sl_price:
                 sl_price, trailed = lock_sl, True
 
@@ -1435,15 +1435,36 @@ def _stock_options_universe(cutoff_dt, use_intraday, needles=()):
 
     if not by_stock: return []
 
-    # 3. Resolve spot price for each F&O stock
+    # 3. Resolve spot price for each F&O stock (historical daily close on past dates, live quote on today's session)
     spot = {}
     cands_to_fetch = [{"key": eq_keys[u], "symbol": u} for u in by_stock if u in eq_keys]
     if cands_to_fetch:
-        q_map = fetch_quotes(cands_to_fetch)
-        for c in cands_to_fetch:
-            ltp = q_map.get(c["key"], {}).get("ltp", 0.0)
-            if ltp and ltp > 0:
-                spot[c["symbol"]] = float(ltp)
+        if use_intraday:
+            q_map = fetch_quotes(cands_to_fetch)
+            for c in cands_to_fetch:
+                ltp = q_map.get(c["key"], {}).get("ltp", 0.0)
+                if ltp and ltp > 0:
+                    spot[c["symbol"]] = float(ltp)
+        else:
+            limit_dt = target_dt if cutoff_dt >= _close_dt(target_dt) else target_dt - timedelta(days=1)
+            def _hist_spot_one(c):
+                status, df = _candles(_url_range_daily(c["key"], target_dt - timedelta(days=SPOT_DAILY_LOOKBACK_DAYS), target_dt + timedelta(days=1)))
+                if status == 200 and df is not None and not df.empty:
+                    sub = df[df['Datetime'].dt.date <= limit_dt]
+                    if not sub.empty:
+                        return c["symbol"], float(sub['Close'].iloc[-1])
+                return c["symbol"], 0.0
+            with concurrent.futures.ThreadPoolExecutor(max_workers=WORKERS) as ex:
+                for sym_, px_ in ex.map(_hist_spot_one, cands_to_fetch):
+                    if px_ > 0:
+                        spot[sym_] = px_
+            missing_cands = [c for c in cands_to_fetch if c["symbol"] not in spot]
+            if missing_cands:
+                q_map = fetch_quotes(missing_cands)
+                for c in missing_cands:
+                    ltp = q_map.get(c["key"], {}).get("ltp", 0.0)
+                    if ltp and ltp > 0:
+                        spot[c["symbol"]] = float(ltp)
 
     universe, seen = [], set()
 
@@ -1742,9 +1763,10 @@ def _dual_leg_arrays(frame):
         log_ret = np.where(sess_starts, log_c - log_o, log_ret)
         stitched_log = np.cumsum(log_ret) + log_o[0]
         log_offset = log_c - stitched_log
+        min_p = min(period, max(5, int(ANCHOR_OPEN_WARMUP_BARS or 5)))
         s_log = pd.Series(stitched_log)
-        mu_log = s_log.rolling(period, min_periods=period).mean().values + log_offset
-        sd_log = s_log.rolling(period, min_periods=period).std(ddof=0).values
+        mu_log = s_log.rolling(period, min_periods=min_p).mean().values + log_offset
+        sd_log = s_log.rolling(period, min_periods=min_p).std(ddof=0).values
 
     with np.errstate(all='ignore'):
         rel_floor = np.maximum(floor_rs / close, 1e-4)
@@ -2230,6 +2252,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
         survived, is_bull = True, anchor['dir'] == "BULL"
         peak_price, true_peak, j = anchor['price'], anchor['price'], anchor['idx'] + 1
         peak_iv = iv_kin['iv'][anchor['idx']] if (is_option and iv_kin and anchor['idx'] < len(iv_kin.get('iv', []))) else 0.0
+        dual_rev_streak = 0
 
         while j < n:
             (bull_score, bear_score, _, _, _, _, _, _) = get_kinetics(kin_1m, j)
@@ -2263,7 +2286,14 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                     reason = f"Kinetic SL (IV Crush Velocity Shock)"
 
             if reason is None:
-                reason = _dual_reversal_reason(dual_gate, j, is_bull)      # the arena fully confirms the OPPOSITE side -> the live anchor is dead
+                rev_msg = _dual_reversal_reason(dual_gate, j, is_bull)
+                if rev_msg:
+                    dual_rev_streak += 1
+                    req_bars = max(1, int(DUAL_BAND_REVERSAL_CONFIRM_BARS or 1))
+                    if dual_rev_streak >= req_bars or opposing >= WARZONE_OPPOSING_SCORE:
+                        reason = rev_msg
+                else:
+                    dual_rev_streak = 0
 
             if reason:
                 last_killed_info = {
@@ -2728,6 +2758,7 @@ def sort_rows_by_script_count(rows_list):
     tiers = ATTEMPT_SORT_ENABLED
     t_sign = -1 if ATTEMPT_SORT_TIME_DESC else 1
     rows_list.sort(key=lambda r: (
+        1 if str(r.get('RR_Str', '')) == 'SL hit' else 0,
         _attempt_tier(r) if tiers else 0,
         t_sign * _hhmm_to_min(r.get('ActiveAnchor')) if tiers else 0,
         r.get('RR_Val', 999.0) if is_asc else -r.get('RR_Val', 0.0),
@@ -2892,8 +2923,7 @@ def _passes_strict_popup_quality(row, check_gap=True, check_grid=True, min_r=Non
         if anc_dir == 'BEAR' and not _is_pe_symbol(sym): return False
 
     if check_gap and ENABLE_TIMESTAMP_GAP_CHECK and MAX_TIMESTAMP_GAP_MINUTES > 0:
-        max_allowed_gap = max(MAX_TIMESTAMP_GAP_MINUTES, int(PURE_ANCHOR_LOOKBACK_MIN or 0)) if int(PURE_ANCHOR_LOOKBACK_MIN or 0) > 0 else MAX_TIMESTAMP_GAP_MINUTES
-        if _get_timestamp_gap_min(row) > max_allowed_gap:
+        if _get_timestamp_gap_min(row) > MAX_TIMESTAMP_GAP_MINUTES:
             return False
 
     if not STRICT_FIRST_TIME_POPUP_FILTER: return True
@@ -3518,8 +3548,8 @@ def build_email_and_attachment_html(
         )
 
     light_css = "body{background-color:#f1f5f9;color:#0f172a;font-family:'Segoe UI',Roboto,Helvetica,Arial,sans-serif;font-size:13px;margin:0;padding:16px;}.pill{background-color:#ffffff;color:#1e293b;border:1px solid #94a3b8;padding:5px 10px;margin:2px;border-radius:4px;cursor:pointer;font-weight:600;}.pill:hover,.pill.active{background-color:#2563eb;color:#ffffff;border-color:#1d4ed8;}.clr{background-color:#dc2626;color:#ffffff;border:none;padding:6px 14px;border-radius:4px;font-weight:700;cursor:pointer;}"
-    nb_ce, nb_pe = _ce_pe_counts(new_stk_b)
-    nr_ce, nr_pe = _ce_pe_counts(new_stk_r)
+    nb_ce, nb_pe = _ce_pe_counts(email_stk_b)
+    nr_ce, nr_pe = _ce_pe_counts(email_stk_r)
 
     header_card_html = (
         f"<div style='background-color:#ffffff;border:1px solid #cbd5e1;border-left:6px solid #2563eb;border-radius:6px;padding:14px 18px;margin-bottom:16px;'>"
@@ -4036,6 +4066,19 @@ def run_screener(
 
     if mode in ("INDEX_OPTIONS", "STOCK_FNO"):
         stock_candidates = universe_raw
+        if mode == "STOCK_FNO" and today_session and universe_raw:
+            q_opt = fetch_quotes(universe_raw)
+            if q_opt and any((v.get('vol') or 0) > 0 for v in q_opt.values()):
+                liquid = [
+                    it for it in universe_raw
+                    if it.get("pinned") or (
+                        (q_opt.get(it["key"], {}).get("ltp") or 0.0) >= OPT_MIN_PRICE
+                        and (q_opt.get(it["key"], {}).get("vol") or 0) >= OPT_MIN_VOLUME
+                    )
+                ]
+                if liquid:
+                    print(f"   {COLOR_DIM}» Pre-quote liquidity filter: {len(universe_raw)} -> {len(liquid)} liquid options{COLOR_RESET}")
+                    stock_candidates = liquid
         if ENABLE_OPTION_IV_ENGINE and mode == "INDEX_OPTIONS":
             for _u_idx in INDEX_CONFIG:
                 _get_cached_spot_1m(_u_idx, target_dt, MIN1_HISTORY_DAYS, today_session)
@@ -4109,6 +4152,18 @@ def run_screener(
         lookback_meta=lookback_meta, idx_popup_res=idx_popup_res, stock_popup_res=stock_popup_res
     )
 
+    if SAVE_LOCAL_HTML_FILE and html_out:
+        try:
+            _, _local_html = build_email_and_attachment_html(
+                mode, cutoff_dt, checkpoints, idx_bulls, idx_bears, idx_grave,
+                stock_bulls, stock_bears, stock_grave, lookback_meta=lookback_meta,
+                idx_popup_res=idx_popup_res, stock_popup_res=stock_popup_res
+            )
+            with open(html_out, "w", encoding="utf-8") as f: f.write(_local_html)
+            print(f"   {COLOR_GREEN_FG}» Local HTML Dashboard saved to: {html_out}{COLOR_RESET}")
+        except Exception as e:
+            print(f"   {COLOR_YELLOW}» Could not write local HTML file ({e}){COLOR_RESET}")
+
     if SEND_DASHBOARD_EMAIL:
         new_idx_b = (idx_popup_res or {}).get("new_bulls", [])
         new_idx_r = (idx_popup_res or {}).get("new_bears", [])
@@ -4135,12 +4190,7 @@ def run_screener(
                 stock_bulls, stock_bears, stock_grave, lookback_meta=lookback_meta,
                 idx_popup_res=idx_popup_res, stock_popup_res=stock_popup_res
             )
-            if SAVE_LOCAL_HTML_FILE and html_out:
-                try:
-                    with open(html_out, "w", encoding="utf-8") as f: f.write(attachment_js_html)
-                    print(f"   {COLOR_GREEN_FG}» Local HTML Dashboard saved to: {html_out}{COLOR_RESET}")
-                except Exception as e:
-                    print(f"   {COLOR_YELLOW}» Could not write local HTML file ({e}){COLOR_RESET}")
+            pass
 
             w_start_s = lookback_meta["window_start_dt"].strftime("%H:%M") if (lookback_meta and lookback_meta.get("enabled")) else ""
             w_end_s = lookback_meta["window_end_dt"].strftime("%H:%M") if (lookback_meta and lookback_meta.get("enabled")) else cutoff_dt.strftime("%H:%M")
