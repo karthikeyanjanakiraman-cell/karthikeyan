@@ -364,6 +364,8 @@ OPTIONS_BUYING_ONLY = True
 EXPIRY_SELECTION = "CURRENT"
 STRIKES_ABOVE_ATM = 5
 STRIKES_BELOW_ATM = 5
+STOCK_OPT_STRIKES_ABOVE_ATM = 2
+STOCK_OPT_STRIKES_BELOW_ATM = 2
 OPT_MIN_PRICE = 10.0
 OPT_MIN_VOLUME = 5000
 LIVE_QUOTE_FALLBACK_MIN = 3
@@ -399,10 +401,10 @@ ENV_IV_REQUIRE_NON_NEGATIVE_VEL = "IV_REQUIRE_NON_NEGATIVE_VEL"
 #   OFFSET (literal rupee alignment): scale = 1       -> only correct at ATM; on an ITM-CE strike the PE can never reach the CE's lower band (gate stays shut), on an OTM-CE strike it degenerates to CE-only.
 DUAL_BAND_GATE_MANDATORY = True         # HARD-WIRED ON: no CLI / env switch by design. A missing / stale / unidentifiable twin leg => no anchor (fail-closed).
 DUAL_BAND_PERIOD = 20                   # Bollinger period (bars) used for BOTH legs
-DUAL_BAND_STD_MULT = 2.0                # Band half-width in standard deviations of the CE price
+DUAL_BAND_STD_MULT = 1.5                # Band half-width in standard deviations of the host leg
 DUAL_BAND_ALIGN_MODE = "ZSCORE"         # ZSCORE (default) | OFFSET (literal: PE(norm) = SMA(CE) + PE - SMA(PE))
 DUAL_BAND_MIN_SIGMA = 0.10              # Rs floor on each leg's sigma (2 ticks): a flat leg must still move more than the floor to break its band (stops tick-noise "breakouts")
-DUAL_BAND_TWIN_MAX_STALE_MIN = 5        # The other leg must have printed on the same session day and at most N minutes before the evaluated bar (0 = same day only)
+DUAL_BAND_TWIN_MAX_STALE_MIN = 15       # The other leg must have printed on the same session day and at most N minutes before the evaluated bar (0 = same day only)
 DUAL_BAND_REVERSAL_EXIT = True          # Kill a live option anchor when the OPPOSITE side is fully confirmed by the same arena (the arena governs exits, not only entries)
 ENV_DUAL_BAND_PERIOD = "DUAL_BAND_PERIOD"
 ENV_DUAL_BAND_STD_MULT = "DUAL_BAND_STD_MULT"
@@ -577,11 +579,11 @@ def _norm_sym(s):
 
 def _is_ce_symbol(symbol):
     s = str(symbol or "").upper().strip()
-    return bool(" CE " in s or s.endswith(" CE") or re.search(r'\dCE$', s) or re.search(r'CE', s))
+    return bool(re.search(r'(?:\s|\d)CE$', s) or re.search(r'\sCE\s', s))
 
 def _is_pe_symbol(symbol):
     s = str(symbol or "").upper().strip()
-    return bool(" PE " in s or s.endswith(" PE") or re.search(r'\dPE$', s) or re.search(r'PE', s))
+    return bool(re.search(r'(?:\s|\d)PE$', s) or re.search(r'\sPE\s', s))
 
 def _is_option_symbol(symbol):
     return _is_ce_symbol(symbol) or _is_pe_symbol(symbol)
@@ -1415,7 +1417,7 @@ def _stock_options_universe(cutoff_dt, use_intraday, needles=()):
         if not u_sym:
             m_pre = re.match(r'^([A-Z0-9_\-]+)', ts)
             if m_pre: u_sym = m_pre.group(1)
-        if not u_sym: continue
+        if not u_sym or u_sym not in eq_keys: continue
         fno_underlyings.add(u_sym)
 
         exp_date = _expiry_to_date(_field(row, "expiry"))
@@ -1487,8 +1489,8 @@ def _stock_options_universe(cutoff_dt, use_intraday, needles=()):
             stock_spot = float(np.median(strikes))
 
         atm_i = int(np.abs(strikes - stock_spot).argmin())
-        lo = max(0, atm_i - 1)
-        hi = min(len(strikes), atm_i + 2)
+        lo = max(0, atm_i - STOCK_OPT_STRIKES_BELOW_ATM)
+        hi = min(len(strikes), atm_i + STOCK_OPT_STRIKES_ABOVE_ATM + 1)
         window = set(strikes[lo:hi].tolist())
 
         sec_name, sec_wt, _ = resolve_primary_sector(u_sym)
@@ -2358,28 +2360,25 @@ def prepare_series(master, target_dt, is_sector_index=False, is_option=False, op
                     pos = np.searchsorted(s_dt, master['Datetime'].values, side='right') - 1
                     pos = np.clip(pos, 0, len(s_cl) - 1)
                     spot_closes = s_cl[pos]
-                else:
-                    stk_spot_val = opt_item.get('spot_price') if (opt_item and opt_item.get('spot_price')) else float(opt_specs['strike'])
-                    spot_closes = np.full(n, float(stk_spot_val))
-                
-                exp_dt = opt_specs.get('expiry') or target_dt
-                exp_datetime = datetime.combine(exp_dt, dtime(15, 30))
-                candle_dts = master['Datetime'].dt.to_pydatetime()
-                iv_arr = np.zeros(n, dtype=float)
-                is_call_opt = (opt_specs.get('option_type') == 'CE')
-                stk_val = float(opt_specs['strike'])
-                
-                for k_i in range(n):
-                    t_sec = max(60.0, (exp_datetime - candle_dts[k_i]).total_seconds())
-                    t_yr = t_sec / (365.0 * 86400.0)
-                    iv_arr[k_i] = calc_implied_volatility(close[k_i], spot_closes[k_i], stk_val, t_yr, r=RISK_FREE_RATE, is_call=is_call_opt)
-                
-                if (iv_arr > 0).any():
-                    last_valid_iv = iv_arr[iv_arr > 0][0]
+
+                    exp_dt = opt_specs.get('expiry') or target_dt
+                    exp_datetime = datetime.combine(exp_dt, dtime(15, 30))
+                    candle_dts = master['Datetime'].dt.to_pydatetime()
+                    iv_arr = np.zeros(n, dtype=float)
+                    is_call_opt = (opt_specs.get('option_type') == 'CE')
+                    stk_val = float(opt_specs['strike'])
+
                     for k_i in range(n):
-                        if iv_arr[k_i] > 0: last_valid_iv = iv_arr[k_i]
-                        else: iv_arr[k_i] = last_valid_iv
-                iv_kin = _evaluate_iv_arrays(iv_arr, sess_starts, sid)
+                        t_sec = max(60.0, (exp_datetime - candle_dts[k_i]).total_seconds())
+                        t_yr = t_sec / (365.0 * 86400.0)
+                        iv_arr[k_i] = calc_implied_volatility(close[k_i], spot_closes[k_i], stk_val, t_yr, r=RISK_FREE_RATE, is_call=is_call_opt)
+
+                    if (iv_arr > 0).any():
+                        last_valid_iv = iv_arr[iv_arr > 0][0]
+                        for k_i in range(n):
+                            if iv_arr[k_i] > 0: last_valid_iv = iv_arr[k_i]
+                            else: iv_arr[k_i] = last_valid_iv
+                    iv_kin = _evaluate_iv_arrays(iv_arr, sess_starts, sid)
         except Exception as e:
             ERRORS.add("prepare_series:iv_kin", e)
 
@@ -4200,8 +4199,8 @@ def parse_args():
     p.add_argument("--opt-min-price", type=float, default=OPT_MIN_PRICE)
     p.add_argument("--opt-min-volume", type=float, default=OPT_MIN_VOLUME)
     p.add_argument("--expiry", choices=["CURRENT", "NEXT"], default=EXPIRY_SELECTION)
-    p.add_argument("--strikes-up", type=int, default=STRIKES_ABOVE_ATM)
-    p.add_argument("--strikes-down", type=int, default=STRIKES_BELOW_ATM)
+    p.add_argument("--strikes-up", type=int, default=None)
+    p.add_argument("--strikes-down", type=int, default=None)
     p.add_argument("--checkpoint-min", type=int, default=CHECKPOINT_INTERVAL_MIN)
     p.add_argument("--single-snapshot", action="store_true")
     p.add_argument("--isolate-session-bands", action="store_true", default=ISOLATE_SESSION_BANDS)
@@ -4333,8 +4332,12 @@ if __name__ == "__main__":
     OPT_MIN_PRICE = args.opt_min_price
     OPT_MIN_VOLUME = args.opt_min_volume
     EXPIRY_SELECTION = args.expiry
-    STRIKES_ABOVE_ATM = args.strikes_up
-    STRIKES_BELOW_ATM = args.strikes_down
+    if args.strikes_up is not None:
+        STRIKES_ABOVE_ATM = args.strikes_up
+        STOCK_OPT_STRIKES_ABOVE_ATM = args.strikes_up
+    if args.strikes_down is not None:
+        STRIKES_BELOW_ATM = args.strikes_down
+        STOCK_OPT_STRIKES_BELOW_ATM = args.strikes_down
     CHECKPOINT_INTERVAL_MIN = args.checkpoint_min
     ISOLATE_SESSION_BANDS = args.isolate_session_bands
     OPTIONS_BUYING_ONLY = args.options_buying_only
