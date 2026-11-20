@@ -209,7 +209,10 @@ WARZONE_OPPOSING_SCORE = 2
 
 SOFT_STOP_DISABLE_R = 1.5
 PROFIT_LOCK_TRIGGER_R = 1.8
-PROFIT_LOCK_FLOOR_R = 0.3
+PROFIT_LOCK_FLOOR_R = 0.5
+PROFIT_LOCK_STEPS = [(1.8, 0.5), (2.5, 1.5), (3.5, 2.5)]  # Stepped (peak_r_trigger, floor_r) ratchet
+POST_LOSS_COOLDOWN_BARS = 15            # Wait N bars after a losing exit before re-anchoring the same contract
+MAX_CONSECUTIVE_LOSSES_PER_DAY = 2      # Stop re-anchoring a contract for the rest of the day after N consecutive losing stops (0 = unlimited)
 
 TARGET_ATR_MULT = PROFIT_LOCK_TRIGGER_R
 SL_ATR_MULT = SOFT_STOP_ATR_MULT
@@ -362,8 +365,8 @@ SECTOR_CONSTITUENT_WEIGHTS = {
 # --- 0.9 INDEX OPTIONS CONFIGURATION ---
 OPTIONS_BUYING_ONLY = True
 EXPIRY_SELECTION = "CURRENT"
-STRIKES_ABOVE_ATM = 5
-STRIKES_BELOW_ATM = 5
+STRIKES_ABOVE_ATM = 2
+STRIKES_BELOW_ATM = 2
 STOCK_OPT_STRIKES_ABOVE_ATM = 2
 STOCK_OPT_STRIKES_BELOW_ATM = 2
 OPT_MIN_PRICE = 10.0
@@ -401,10 +404,12 @@ ENV_IV_REQUIRE_NON_NEGATIVE_VEL = "IV_REQUIRE_NON_NEGATIVE_VEL"
 #   OFFSET (literal rupee alignment): scale = 1       -> only correct at ATM; on an ITM-CE strike the PE can never reach the CE's lower band (gate stays shut), on an OTM-CE strike it degenerates to CE-only.
 DUAL_BAND_GATE_MANDATORY = True         # HARD-WIRED ON: no CLI / env switch by design. A missing / stale / unidentifiable twin leg => no anchor (fail-closed).
 DUAL_BAND_PERIOD = 20                   # Bollinger period (bars) used for BOTH legs
-DUAL_BAND_STD_MULT = 1.5                # Band half-width in standard deviations of the host leg
+DUAL_BAND_STD_MULT = 2.0                # Band half-width in standard deviations (INDEX_OPTIONS default)
+STOCK_OPT_DUAL_BAND_STD_MULT = 1.5      # Relaxed band half-width for STOCK_FNO
 DUAL_BAND_ALIGN_MODE = "ZSCORE"         # ZSCORE (default) | OFFSET (literal: PE(norm) = SMA(CE) + PE - SMA(PE))
 DUAL_BAND_MIN_SIGMA = 0.10              # Rs floor on each leg's sigma (2 ticks): a flat leg must still move more than the floor to break its band (stops tick-noise "breakouts")
-DUAL_BAND_TWIN_MAX_STALE_MIN = 15       # The other leg must have printed on the same session day and at most N minutes before the evaluated bar (0 = same day only)
+DUAL_BAND_TWIN_MAX_STALE_MIN = 5        # Twin max stale minutes (INDEX_OPTIONS default; 0 = same day only)
+STOCK_OPT_DUAL_BAND_TWIN_MAX_STALE_MIN = 15  # Relaxed twin max stale minutes for STOCK_FNO
 DUAL_BAND_REVERSAL_EXIT = True          # Kill a live option anchor when the OPPOSITE side is fully confirmed by the same arena (the arena governs exits, not only entries)
 DUAL_BAND_REVERSAL_CONFIRM_BARS = 2     # Consecutive reversal bars required (or 1 bar with opposing kinetic score >= WARZONE_OPPOSING_SCORE)
 ENV_DUAL_BAND_PERIOD = "DUAL_BAND_PERIOD"
@@ -599,6 +604,17 @@ def _format_count_with_ce_pe(rows_list):
     ce_cnt, pe_cnt = _ce_pe_counts(rows_list)
     return f"({total}) CE({ce_cnt}) PE({pe_cnt})"
 
+def _active_profit_lock(max_r):
+    """Returns (trig_r, floor_r) for the highest stepped Profit-Lock tier reached by max_r, or (None, None)."""
+    if float(PROFIT_LOCK_TRIGGER_R or 0.0) <= 0:
+        return None, None
+    steps = PROFIT_LOCK_STEPS or [(float(PROFIT_LOCK_TRIGGER_R), float(PROFIT_LOCK_FLOOR_R))]
+    best = (None, None)
+    for trig, flr in sorted(steps, key=lambda x: float(x[0])):
+        if float(trig) > 0 and max_r + 1e-9 >= float(trig):
+            best = (float(trig), float(flr))
+    return best
+
 def _compute_target_sl(row):
     ap = float(row.get('AnchorPrice', 0.0) or 0.0)
     ltp = float(row.get('LTP', 0.0) or 0.0)
@@ -655,9 +671,9 @@ def _compute_target_sl(row):
             sl_price = max(init_sl, peak - trail_mult * base_atr)
     trailed = abs(sl_price - init_sl) > 1e-9
 
-    lock_trig = float(PROFIT_LOCK_TRIGGER_R or 0.0)
-    if SL_TRAIL_TO_LOCK_FLOOR and anchored and base_atr > 0 and lock_trig > 0 and fav_r + 1e-9 >= lock_trig:
-        floor_r = float(PROFIT_LOCK_FLOOR_R or 0.0)
+    pl_trig, pl_floor = _active_profit_lock(fav_r)
+    if SL_TRAIL_TO_LOCK_FLOOR and anchored and base_atr > 0 and pl_trig is not None:
+        floor_r = pl_floor
         if p_dir == 'BEAR':
             lock_sl = ref_price - floor_r * base_atr
             if lock_sl > ltp and lock_sl < sl_price:
@@ -859,8 +875,8 @@ def _report_legend_text():
     if _dual_gate_required(None, _RUN_MODE):
         parts.append(
             f"CE/PE Dual-Band gate: MANDATORY (symmetric host-anchored, "
-            f"{int(DUAL_BAND_PERIOD)}-bar log-stitched BB ±{float(DUAL_BAND_STD_MULT):g}σ on active leg, "
-            f"twin normalised by {str(DUAL_BAND_ALIGN_MODE).upper()}, twin max stale {float(DUAL_BAND_TWIN_MAX_STALE_MIN):g}m, "
+            f"{int(DUAL_BAND_PERIOD)}-bar log-stitched BB ±{_dual_eff_std_mult():g}σ on active leg, "
+            f"twin normalised by {str(DUAL_BAND_ALIGN_MODE).upper()}, twin max stale {_dual_eff_max_stale():g}m, "
             f"reversal exit {'ON' if DUAL_BAND_REVERSAL_EXIT else 'OFF'}, missing twin = no anchor)"
         )
     return "Legend: " + " | ".join(parts)
@@ -1727,6 +1743,12 @@ def _is_true_option_item(item):
     (which also matches equities such as PERSISTENT / FORCEMOT), so equities and sector indices are never gated."""
     return bool(item) and not item.get('is_sector_index') and str(item.get('option_type') or '').upper() in ("CE", "PE")
 
+def _dual_eff_std_mult():
+    return float(STOCK_OPT_DUAL_BAND_STD_MULT if str(_RUN_MODE or "").upper() == "STOCK_FNO" else DUAL_BAND_STD_MULT)
+
+def _dual_eff_max_stale():
+    return float(STOCK_OPT_DUAL_BAND_TWIN_MAX_STALE_MIN if str(_RUN_MODE or "").upper() == "STOCK_FNO" else DUAL_BAND_TWIN_MAX_STALE_MIN)
+
 def _dual_gate_required(item, mode, is_sector_index=False):
     """Mandatory for every non-index instrument of an option run, and for any true option contract wherever it comes from."""
     if not DUAL_BAND_GATE_MANDATORY or is_sector_index:
@@ -1790,7 +1812,7 @@ def _dual_align_twin_arrays(own_dt, twin_arr):
     pos_safe = np.clip(pos, 0, len(tw_dt) - 1)
     last_dt = tw_dt[pos_safe]
     fresh = have & (own_dt.astype('datetime64[D]') == last_dt.astype('datetime64[D]'))
-    max_stale = float(DUAL_BAND_TWIN_MAX_STALE_MIN or 0)
+    max_stale = _dual_eff_max_stale()
     if max_stale > 0:
         age_min = (own_dt - last_dt).astype('timedelta64[s]').astype(float) / 60.0
         fresh = fresh & (age_min <= max_stale)
@@ -1823,7 +1845,7 @@ def build_dual_band_gate(master, twin_master, own_type):
     twin, fresh = _dual_align_twin_arrays(own['dt'], twin_native)
 
     mode = str(DUAL_BAND_ALIGN_MODE).strip().upper()
-    k = float(DUAL_BAND_STD_MULT)
+    k = _dual_eff_std_mult()
     is_ce = (own_type == "CE")
     twin_type = "PE" if is_ce else "CE"
 
@@ -2211,7 +2233,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
         return None, {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0, 'killed_time': '-', 'killed_price': 0.0, 'reason': f'Open warm-up ({warmup} bars)', 'kills': []}
     survived_anchor = None
     last_killed_info = {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0, 'killed_time': '-', 'killed_price': 0.0, 'reason': 'Failed Kinetic Alignment'}
-    kills, warzone_kills = [], 0
+    kills, warzone_kills, consec_losses = [], 0, 0
     dual_blocks = []                       # (bar index, why) where every kinetic condition passed but the CE/PE Dual-Band gate refused
 
     while i < n:
@@ -2269,10 +2291,11 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
             curr_r = (close[j] - anchor['price']) / base_atr if is_bull else (anchor['price'] - close[j]) / base_atr
 
             reason = None
+            pl_trig, pl_floor = _active_profit_lock(max_r)
             if hard_mult > 0 and hard_adverse >= hard_mult * base_atr:
                 reason = f"Hard stop ({hard_mult:g} ATR trailing floor)"
-            elif lock_trig_r > 0 and max_r >= lock_trig_r and curr_r <= lock_floor_r:
-                reason = f"Profit Lock (+{lock_trig_r:g}R Peak -> +{lock_floor_r:g}R Breakeven Floor)"
+            elif pl_trig is not None and curr_r <= pl_floor:
+                reason = f"Profit Lock (+{pl_trig:g}R Peak -> +{pl_floor:g}R Floor)"
             elif max_r < soft_disable_r and adverse >= soft_mult * base_atr and opposing >= opp_thresh:
                 reason = soft_reason
             elif is_option and iv_kin and ENABLE_OPTION_IV_ENGINE and j < len(iv_kin.get('iv', [])):
@@ -2304,7 +2327,15 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                 }
                 kills.append(last_killed_info)
                 survived = False
-                i = j + 1
+                if curr_r < 0:
+                    consec_losses += 1
+                    if MAX_CONSECUTIVE_LOSSES_PER_DAY > 0 and consec_losses >= int(MAX_CONSECUTIVE_LOSSES_PER_DAY):
+                        i = n
+                    else:
+                        i = j + 1 + max(0, int(POST_LOSS_COOLDOWN_BARS or 0))
+                else:
+                    consec_losses = 0
+                    i = j + 1
                 break
             j += 1
 
@@ -4054,8 +4085,8 @@ def run_screener(
     if _dual_gate_required(None, mode):
         print(
             f"   {COLOR_DIM}» CE/PE Dual-Band gate: MANDATORY (symmetric host-anchored) | "
-            f"{int(DUAL_BAND_PERIOD)}-bar log-stitched BB ±{float(DUAL_BAND_STD_MULT):g}σ on active leg, "
-            f"twin normalised by {str(DUAL_BAND_ALIGN_MODE).upper()} | twin max stale {float(DUAL_BAND_TWIN_MAX_STALE_MIN):g}m | "
+            f"{int(DUAL_BAND_PERIOD)}-bar log-stitched BB ±{_dual_eff_std_mult():g}σ on active leg, "
+            f"twin normalised by {str(DUAL_BAND_ALIGN_MODE).upper()} | twin max stale {_dual_eff_max_stale():g}m | "
             f"reversal exit {'ON' if DUAL_BAND_REVERSAL_EXIT else 'OFF'} | missing twin = no anchor{COLOR_RESET}"
         )
 
@@ -4523,6 +4554,10 @@ if __name__ == "__main__":
             except ValueError: pass
     if DUAL_BAND_PERIOD < 2: DUAL_BAND_PERIOD = 20
     if DUAL_BAND_STD_MULT <= 0: DUAL_BAND_STD_MULT = 2.0
+    if args.dual_band_std is not None or os.environ.get(ENV_DUAL_BAND_STD_MULT):
+        STOCK_OPT_DUAL_BAND_STD_MULT = DUAL_BAND_STD_MULT
+    if args.dual_band_max_stale is not None or os.environ.get(ENV_DUAL_BAND_TWIN_MAX_STALE_MIN):
+        STOCK_OPT_DUAL_BAND_TWIN_MAX_STALE_MIN = DUAL_BAND_TWIN_MAX_STALE_MIN
     _dba = str(args.dual_band_align or os.environ.get(ENV_DUAL_BAND_ALIGN_MODE) or DUAL_BAND_ALIGN_MODE).strip().upper()
     DUAL_BAND_ALIGN_MODE = _dba if _dba in ("ZSCORE", "OFFSET") else "ZSCORE"
     DUAL_BAND_REVERSAL_EXIT = args.dual_band_reversal_exit if args.dual_band_reversal_exit is not None else _parse_bool_env(ENV_DUAL_BAND_REVERSAL_EXIT, DUAL_BAND_REVERSAL_EXIT)
