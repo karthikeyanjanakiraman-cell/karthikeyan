@@ -203,6 +203,8 @@ ENV_OPT_MAX_ATR_PCT = "OPT_MAX_ATR_PCT"
 ABSOLUTE_MIN_ATR = 0.01
 
 HARD_STOP_ATR_MULT = 2.5
+HARD_STOP_RUNNER_TRIGGER_R = 3.0        # Tighten trailing hard stop once peak R >= this level (0 = off)
+HARD_STOP_RUNNER_ATR_MULT = 1.5         # Tighter trailing hard stop in ATR for runners
 SOFT_STOP_ATR_MULT = 1.0
 SOFT_STOP_OPPOSING_SCORE = 4
 OPPOSING_VEL_ATR_MULT = 1.0
@@ -212,7 +214,7 @@ WARZONE_OPPOSING_SCORE = 2
 SOFT_STOP_DISABLE_R = 1.5
 PROFIT_LOCK_TRIGGER_R = 1.8
 PROFIT_LOCK_FLOOR_R = 0.5
-PROFIT_LOCK_STEPS = [(1.8, 0.5), (2.5, 1.5), (3.5, 2.5)]  # Stepped (peak_r_trigger, floor_r) ratchet
+PROFIT_LOCK_STEPS = [(1.2, 0.1), (1.8, 0.5), (2.5, 1.5), (3.5, 2.5)]  # Stepped (peak_r_trigger, floor_r) ratchet
 POST_LOSS_COOLDOWN_BARS = 15            # Wait N bars after a losing exit before re-anchoring the same contract
 MAX_CONSECUTIVE_LOSSES_PER_DAY = 2      # Stop re-anchoring a contract for the rest of the day after N consecutive losing stops (0 = unlimited)
 
@@ -2310,6 +2312,8 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
 
         if not anchor: break
         survived, is_bull = True, anchor['dir'] == "BULL"
+        eff_atr = max(float(base_atr), float(anchor['price']) * float(OPT_MIN_ATR_PCT)) if is_option else float(base_atr)
+        anchor['eff_atr'] = eff_atr
         peak_price, true_peak, j = anchor['price'], anchor['price'], anchor['idx'] + 1
         peak_iv = iv_kin['iv'][anchor['idx']] if (is_option and iv_kin and anchor['idx'] < len(iv_kin.get('iv', []))) else 0.0
         dual_rev_streak = 0
@@ -2325,16 +2329,21 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                 adverse, hard_adverse, opposing = close[j] - peak_price, close[j] - true_peak, bull_score
                 soft_reason = f"Kinetic SL ({soft_mult:g} ATR Rally)"
 
-            max_r = (true_peak - anchor['price']) / base_atr if is_bull else (anchor['price'] - true_peak) / base_atr
-            curr_r = (close[j] - anchor['price']) / base_atr if is_bull else (anchor['price'] - close[j]) / base_atr
+            max_r = (true_peak - anchor['price']) / eff_atr if is_bull else (anchor['price'] - true_peak) / eff_atr
+            curr_r = (close[j] - anchor['price']) / eff_atr if is_bull else (anchor['price'] - close[j]) / eff_atr
 
             reason = None
             pl_trig, pl_floor = _active_profit_lock(max_r)
-            if hard_mult > 0 and hard_adverse >= hard_mult * base_atr:
-                reason = f"Hard stop ({hard_mult:g} ATR trailing floor)"
+            eff_hard_mult = (
+                float(HARD_STOP_RUNNER_ATR_MULT)
+                if (hard_mult > 0 and float(HARD_STOP_RUNNER_TRIGGER_R or 0.0) > 0 and max_r >= float(HARD_STOP_RUNNER_TRIGGER_R))
+                else hard_mult
+            )
+            if eff_hard_mult > 0 and hard_adverse >= eff_hard_mult * eff_atr:
+                reason = f"Hard stop ({eff_hard_mult:g} ATR trailing floor)"
             elif pl_trig is not None and curr_r <= pl_floor:
                 reason = f"Profit Lock (+{pl_trig:g}R Peak -> +{pl_floor:g}R Floor)"
-            elif max_r < soft_disable_r and adverse >= soft_mult * base_atr and opposing >= opp_thresh:
+            elif max_r < soft_disable_r and adverse >= soft_mult * eff_atr and opposing >= opp_thresh:
                 reason = soft_reason
             elif is_option and iv_kin and ENABLE_OPTION_IV_ENGINE and j < len(iv_kin.get('iv', [])):
                 cur_iv = iv_kin['iv'][j]
@@ -2362,7 +2371,7 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                     'dir': anchor['dir'], 'anchor_time': pd.to_datetime(anchor['time']).strftime('%H:%M'),
                     'anchor_price': float(anchor['price']), 'killed_time': pd.to_datetime(dt_1m[j]).strftime('%H:%M'),
                     'killed_price': float(close[j]), 'reason': reason, 'peak_price': float(true_peak),
-                    'dual': anchor.get('dual')
+                    'eff_atr': float(eff_atr), 'dual': anchor.get('dual')
                 }
                 kills.append(last_killed_info)
                 survived = False
@@ -2558,6 +2567,9 @@ def row_at(S, end, symbol, sector="", sector_weight=0.0, is_sector_index=False):
     pure_state = "[ BB > KC ]" if bb_expanding else "[ BB < KC ]"
 
     if anchor:
+        if anchor.get('eff_atr'):
+            row['BaseAtr'] = float(anchor['eff_atr'])
+            row['RiskAtr'] = max(float(row.get('RiskAtr', 0.0) or 0.0), float(anchor['eff_atr']))
         row['ActiveAnchor'] = pd.to_datetime(anchor['time']).strftime("%H:%M")
         row['AnchorPrice'] = float(anchor['price'])
         row['AnchorDir'] = anchor['dir']
@@ -2740,8 +2752,9 @@ def _exit_price(row):
 
 def _kill_r_multiple(kill_dict, base_atr):
     ap, kp = float(kill_dict.get('anchor_price', 0.0) or 0.0), float(kill_dict.get('killed_price', 0.0) or 0.0)
-    if ap <= 0 or kp <= 0 or base_atr <= 0: return 0.0
-    return (kp - ap) / base_atr if kill_dict.get('dir', 'BULL') == 'BULL' else (ap - kp) / base_atr
+    atr = float(kill_dict.get('eff_atr') or base_atr or 0.0)
+    if ap <= 0 or kp <= 0 or atr <= 0: return 0.0
+    return (kp - ap) / atr if kill_dict.get('dir', 'BULL') == 'BULL' else (ap - kp) / atr
 
 def _r_multiple(row, include_banked=False):
     ap, base_atr, live_r = row.get('AnchorPrice', 0.0), row.get('BaseAtr', 0.0), 0.0
