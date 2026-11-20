@@ -421,14 +421,14 @@ MAX_SYMBOL_WIDTH = 30
 SECTOR_COL_WIDTH = 18
 BANKED_R_DISPLAY_EPSILON = 0.01
 
-COLOR_RESET = '[0m'
-COLOR_BOLD = '[1m'
-COLOR_DIM = '[90m'
-COLOR_CYAN = '[96;1m'
-COLOR_GREEN_FG = '[92;1m'
-COLOR_RED_FG = '[91;1m'
-COLOR_YELLOW = '[93;1m'
-ANSI_RE = re.compile(r'\[[0-9;]*m')
+COLOR_RESET = '[0m'
+COLOR_BOLD = '[1m'
+COLOR_DIM = '[90m'
+COLOR_CYAN = '[96;1m'
+COLOR_GREEN_FG = '[92;1m'
+COLOR_RED_FG = '[91;1m'
+COLOR_YELLOW = '[93;1m'
+ANSI_RE = re.compile(r'\[[0-9;]*m')
 
 ACTIVE_BULL_STATES = ("[ BB > KC ]", "[ BB < KC ]")
 ACTIVE_BEAR_STATES = ("[ BB > KC ]", "[ BB < KC ]")
@@ -577,11 +577,11 @@ def _norm_sym(s):
 
 def _is_ce_symbol(symbol):
     s = str(symbol or "").upper().strip()
-    return bool(" CE " in s or s.endswith(" CE") or re.search(r'\dCE$', s) or re.search(r'CE', s))
+    return bool(" CE " in s or s.endswith(" CE") or re.search(r'\dCE$', s) or re.search(r'CE', s))
 
 def _is_pe_symbol(symbol):
     s = str(symbol or "").upper().strip()
-    return bool(" PE " in s or s.endswith(" PE") or re.search(r'\dPE$', s) or re.search(r'PE', s))
+    return bool(" PE " in s or s.endswith(" PE") or re.search(r'\dPE$', s) or re.search(r'PE', s))
 
 def _is_option_symbol(symbol):
     return _is_ce_symbol(symbol) or _is_pe_symbol(symbol)
@@ -854,12 +854,12 @@ def _report_legend_text():
     else:
         parts.append(f"R = move ÷ {ATR_BASIS_TF} ATR (also used for Target / SL)")
     parts.append("↳ = today's attempts on this script (earlier stopped-out anchors with their prices, current one, Day %)")
-    if _dual_gate_required(None, mode):
-        print(
-            f"   {COLOR_DIM}» CE/PE Dual-Band gate: MANDATORY (symmetric host-anchored) | "
+    if _dual_gate_required(None, _RUN_MODE):
+        parts.append(
+            f"CE/PE Dual-Band gate: MANDATORY (symmetric host-anchored, "
             f"{int(DUAL_BAND_PERIOD)}-bar log-stitched BB ±{float(DUAL_BAND_STD_MULT):g}σ on active leg, "
-            f"twin normalised by {str(DUAL_BAND_ALIGN_MODE).upper()} | twin max stale {float(DUAL_BAND_TWIN_MAX_STALE_MIN):g}m | "
-            f"reversal exit {'ON' if DUAL_BAND_REVERSAL_EXIT else 'OFF'} | missing twin = no anchor{COLOR_RESET}"
+            f"twin normalised by {str(DUAL_BAND_ALIGN_MODE).upper()}, twin max stale {float(DUAL_BAND_TWIN_MAX_STALE_MIN):g}m, "
+            f"reversal exit {'ON' if DUAL_BAND_REVERSAL_EXIT else 'OFF'}, missing twin = no anchor)"
         )
     return "Legend: " + " | ".join(parts)
 
@@ -1320,7 +1320,7 @@ def _index_options_universe(cutoff_dt, use_intraday, needles=()):
         ts = str(_field(row, "trading_symbol", "tradingsymbol") or "").upper()
         itype = str(_field(row, "option_type", "instrument_type") or "").upper()
         if itype not in ("CE", "PE"):
-            m = re.search(r'(CE|PE)', ts) or re.search(r'\d(CE|PE)$', ts)
+            m = re.search(r'(CE|PE)', ts) or re.search(r'\d(CE|PE)$', ts)
             if not m: continue
             itype = m.group(1)
         cands = [str(_field(row, "underlying_symbol") or ""), str(_field(row, "name") or ""), ts.split()[0] if ts else ""]
@@ -1332,7 +1332,7 @@ def _index_options_universe(cutoff_dt, use_intraday, needles=()):
         try: strike = float(strike_raw) if strike_raw is not None else 0.0
         except Exception: strike = 0.0
         if strike <= 0:
-            m = re.search(r'(\d+(?:\.\d+)?)\s+(?:CE|PE)', ts) or re.search(r'(\d+)(?:CE|PE)$', ts)
+            m = re.search(r'(\d+(?:\.\d+)?)\s+(?:CE|PE)', ts) or re.search(r'(\d+)(?:CE|PE)$', ts)
             strike = float(m.group(1)) if m else 0.0
         if strike <= 0 or not _field(row, "instrument_key"): continue
         by_idx[idx].append((exp_date, strike, itype, row))
@@ -2910,9 +2910,9 @@ def classify_setup_popup_type(row, appearances_map=None, window_start_dt=None, w
     """
     Single canonical source of truth for PopupType and FirstPopupIter.
     Guarantees 100% identical classification across:
-      - Console Stage 1 / Stage 2 / Stage 3
-      - Pure 1st-Time Popups Email & Interactive HTML
-      - Still-Holding Good Email & Interactive HTML
+- Console Stage 1 / Stage 2 / Stage 3
+- Pure 1st-Time Popups Email & Interactive HTML
+- Still-Holding Good Email & Interactive HTML
     """
     sym = str(row.get('Symbol', '') or '')
     curr_anc = str(row.get('ActiveAnchor') or '-').replace('*', '').strip()
@@ -3037,45 +3037,6 @@ def evaluate_first_time_popups_in_memory(by_symbol_all_cps, current_bulls, curre
 
     return {"new_bulls": new_bulls, "new_bears": new_bears, "window_first_bulls": window_first_bulls, "window_first_bears": window_first_bears, "iter_stats": iter_stats}
 
-    w_start = lookback_meta["window_start_dt"]
-    w_end = lookback_meta["window_end_dt"]
-    prior_dts = lookback_meta["prior_iter_dts_chrono"]
-
-    prior_bull_appearances, prior_bear_appearances, iter_stats = {}, {}, []
-
-    for it_dt in prior_dts:
-        it_cps = set(generate_checkpoints(it_dt, interval_min=CHECKPOINT_INTERVAL_MIN) if BACKTRACE_CHECKPOINTS else [it_dt])
-        it_cps.add(it_dt)
-
-        sub_map = {}
-        for sym, rows in by_symbol_all_cps.items():
-            f_rows = [r for r in rows if r['CheckpointTime'] <= it_dt and r['CheckpointTime'] in it_cps]
-            if not f_rows: f_rows = [r for r in rows if r['CheckpointTime'] <= it_dt]
-            if f_rows: sub_map[sym] = f_rows
-
-        it_bulls, it_bears, it_grave = segregate_and_rank_buckets(sub_map, filter_timestamp_gap=False, filter_popup_strict=False) if sub_map else ([], [], [])
-        it_bulls = [r for r in it_bulls if _popup_row_ok(r)]
-        it_bears = [r for r in it_bears if _popup_row_ok(r)]
-        it_label = it_dt.strftime("%H:%M")
-        iter_stats.append({"iter_time": it_label, "bull_count": len(it_bulls), "bear_count": len(it_bears), "grave_count": len(it_grave)})
-
-        for r in it_bulls: prior_bull_appearances.setdefault(r['Symbol'], []).append((it_label, str(r.get('ActiveAnchor') or '-').replace('*', '').strip()))
-        for r in it_bears: prior_bear_appearances.setdefault(r['Symbol'], []).append((it_label, str(r.get('ActiveAnchor') or '-').replace('*', '').strip()))
-
-    curr_label = w_end.strftime("%H:%M")
-    new_bulls, new_bears, window_first_bulls, window_first_bears = [], [], [], []
-
-    # Tag all pool rows and current rows canonically IN-PLACE so all tables and emails see identical PopupType & FirstPopupIter
-    for r in (pool_bulls or []):
-        classify_setup_popup_type(r, prior_bull_appearances, w_start, w_end, curr_label)
-    for r in (pool_bears or []):
-        classify_setup_popup_type(r, prior_bear_appearances, w_start, w_end, curr_label)
-    for r in (current_bulls or []):
-        classify_setup_popup_type(r, prior_bull_appearances, w_start, w_end, curr_label)
-    for r in (current_bears or []):
-        classify_setup_popup_type(r, prior_bear_appearances, w_start, w_end, curr_label)
-
-    
 def _state_display(row):
     return f"[STOP {row.get('KilledTime')}]" if row['State'] == "[STOPPED]" and row.get('KilledTime') and row.get('KilledTime') != '-' else row['State']
 
@@ -3478,7 +3439,6 @@ def build_email_and_attachment_html(
             return "<div style='background-color:#ffffff;border:1px solid #cbd5e1;border-radius:6px;padding:10px 14px;color:#64748b;font-style:italic;margin-bottom:14px;'>No setups in this category for the current lookback window.</div>"
         th_style = "background-color:#1e293b;color:#ffffff;padding:8px 10px;border:1px solid #334155;font-weight:700;font-size:12px;"
         sec_th = f"<th style='{th_style}' align='left'>Sector (MaxWt%)</th>" if show_sec else ""
-        iter_th = f"<th style='{th_style}' align='center'>1stIter</th><th style='{th_style}' align='center'>PopupType</th>"
         iter_th = f"<th style='{th_style}' align='center'>1stIter</th><th style='{th_style}' align='center'>PopupType</th>" if show_first_iter else ""
 
         tr_list = []
@@ -3748,6 +3708,8 @@ def build_still_holding_email_and_attachment_html(
             "rr": r.get('RR_Str') or compute_risk_reward_ratio(r)[1],
             "sector": r.get('Sector', DEFAULT_UNMAPPED_SECTOR),
             "weight": f"{float(r.get('SectorWeight', 0.0)):.1f}%",
+            "first_iter": str(r.get('FirstPopupIter') or seen_s),
+            "popup_type": r.get('PopupType', '1ST-TIME'),
             "ltp": shown_ltp,
             "tgt_tag": _target_tag(r),
             "prior": _prior_attempts_text(r),
@@ -3807,14 +3769,14 @@ def build_still_holding_email_and_attachment_html(
             if d["prior"]:
                 tr_list.append(
                     f"<tr data-sector='{sec_attr}' style='background-color:{row_bg};'>"
-                    f"<td colspan='{12 + (1 if show_sec else 0)}' style='padding:3px 10px 6px 24px;border:1px solid #cbd5e1;background-color:{row_bg};color:#64748b;font-size:11px;font-style:italic;'>↳ {html.escape(d['prior'])}</td></tr>"
+                    f"<td colspan='{14 + (1 if show_sec else 0)}' style='padding:3px 10px 6px 24px;border:1px solid #cbd5e1;background-color:{row_bg};color:#64748b;font-size:11px;font-style:italic;'>↳ {html.escape(d['prior'])}</td></tr>"
                 )
         return (
             f"<table style='width:100%;border-collapse:collapse;margin-bottom:16px;background-color:#ffffff;border:1px solid #cbd5e1;font-family:Consolas,monospace;font-size:12px;'>"
             f"<thead><tr>"
             f"<th style='{th_style}' align='left'>Script</th><th style='{th_style}' align='center'>R:R</th><th style='{th_style}' align='right'>LTP/Exit</th>"
             f"<th style='{th_style}' align='right'>Target</th><th style='{th_style}' align='right'>SL</th>"
-            f"{sec_th}"
+            f"{sec_th}{iter_th}"
             f"<th style='{th_style}' align='center'>Seen</th><th style='{th_style}' align='center'>Anchor</th><th style='{th_style}' align='right'>Anch Val</th>"
             f"<th style='{th_style}' align='right'>R-Mult (Bank)</th><th style='{th_style}' align='center'>ATR: 1X 2X 3X 5X</th>"
             f"<th style='{th_style}' align='center'>BB: 1X 2X 3X 5X</th><th style='{th_style}' align='center'>State</th>"
@@ -4061,7 +4023,12 @@ def run_screener(
     print(f"   {COLOR_DIM}» ATR basis: {_tf_to_minutes(ATR_BASIS_TF)}min x{ATR_BASIS_PERIOD} (min {ATR_MIN_BARS} bars, fallback {str(_fb) + 'min' if _fb else 'off'}){_risk_txt} | ATR cap % of day-open: stocks {MAX_ATR_PCT:g} / index {INDEX_MAX_ATR_PCT:g} / options {OPT_MAX_ATR_PCT:g} (0=off) | SL: {_trail_txt}{COLOR_RESET}")
 
     if _dual_gate_required(None, mode):
-        print(f"   {COLOR_DIM}» CE/PE Dual-Band gate: MANDATORY | {int(DUAL_BAND_PERIOD)}-bar band ±{float(DUAL_BAND_STD_MULT):g}σ on the CE, PE normalised by {str(DUAL_BAND_ALIGN_MODE).upper()} | twin max stale {float(DUAL_BAND_TWIN_MAX_STALE_MIN):g}m | reversal exit {'ON' if DUAL_BAND_REVERSAL_EXIT else 'OFF'} | missing twin = no anchor{COLOR_RESET}")
+        print(
+            f"   {COLOR_DIM}» CE/PE Dual-Band gate: MANDATORY (symmetric host-anchored) | "
+            f"{int(DUAL_BAND_PERIOD)}-bar log-stitched BB ±{float(DUAL_BAND_STD_MULT):g}σ on active leg, "
+            f"twin normalised by {str(DUAL_BAND_ALIGN_MODE).upper()} | twin max stale {float(DUAL_BAND_TWIN_MAX_STALE_MIN):g}m | "
+            f"reversal exit {'ON' if DUAL_BAND_REVERSAL_EXIT else 'OFF'} | missing twin = no anchor{COLOR_RESET}"
+        )
 
     needles = [track_symbol] if (track_symbol and track_symbol != "***") else []
     universe_raw = get_dynamic_universe(mode, cutoff_dt, today_session, needles=needles)
