@@ -105,6 +105,8 @@ IST = timezone(timedelta(hours=IST_OFFSET_HOURS, minutes=IST_OFFSET_MINUTES))
 SESSION_OPEN_MIN = 9 * 60 + 15
 SESSION_CLOSE_MIN = 15 * 60 + 30
 LAST_NEW_ANCHOR_MIN = 15 * 60 + 15
+CANDLE_TF_MIN = 3                       # Engine candle timeframe in minutes (1 = raw 1m, 3 = 3m, 5 = 5m; CLI --candle-tf)
+ENV_CANDLE_TF_MIN = "CANDLE_TF_MIN"
 ANCHOR_OPEN_WARMUP_BARS = 5
 DEFAULT_SNAPSHOT_TIME = "15:30"
 CHECKPOINT_INTERVAL_MIN = 5
@@ -386,7 +388,8 @@ PROBE_KEY = INDEX_CONFIG["NIFTY"]["spot_key"]
 # --- 0.9B OPTION IMPLIED VOLATILITY (IV) & CRUSH PROTECTION ENGINE ---
 ENABLE_OPTION_IV_ENGINE = True
 IV_CRUSH_DROP_PCT = 0.15              # 15% drop from post-anchor peak IV triggers Kinetic SL
-IV_CRUSH_VEL_MULT = 1.5              # Negative IV velocity > 1.5x ATR_vel triggers IV crush warning/kill
+IV_CRUSH_VEL_MULT = 2.5              # Negative IV velocity > 2.5x ATR_vel (on smoothed IV) triggers IV crush kill
+IV_CRUSH_VEL_MIN_DROP_PCT = 0.05     # Require >= 5% IV drop from post-anchor peak alongside velocity shock (and curr_r < 0)
 IV_REQUIRE_NON_NEGATIVE_VEL = True   # Block anchor if IV velocity <= 0 at anchor candle
 RISK_FREE_RATE = 0.065               # 6.5% standard Indian risk-free rate
 ENV_ENABLE_OPTION_IV_ENGINE = "ENABLE_OPTION_IV_ENGINE"
@@ -871,6 +874,7 @@ def _report_legend_text():
         parts.append(f"R = move ÷ {ATR_BASIS_TF} ATR (engine); Target / SL distances use the {_rt} ATR")
     else:
         parts.append(f"R = move ÷ {ATR_BASIS_TF} ATR (also used for Target / SL)")
+    parts.append(f"Candles: {int(CANDLE_TF_MIN or 1)}min")
     parts.append("↳ = today's attempts on this script (earlier stopped-out anchors with their prices, current one, Day %)")
     if _dual_gate_required(None, _RUN_MODE):
         parts.append(
@@ -1168,6 +1172,37 @@ def prepare_master(dfs):
     master['SessId'] = day.values.astype('datetime64[D]').astype('int64')
     master['Session'] = day.dt.date
     return master
+
+def _resample_master(master, tf_min):
+    """Session-aligned OHLCV resampling from 1-minute bars to tf_min (e.g. 3m, 5m).
+    Stamps each bar with its last 1m candle Datetime so checkpoints never see incomplete future bars."""
+    tf = max(1, int(tf_min or 1))
+    if tf <= 1 or master is None or master.empty:
+        return master
+    sid = master['SessId'].values
+    mins = np.clip(master['Min'].values, SESSION_OPEN_MIN, SESSION_CLOSE_MIN - 1)
+    bidx = (mins - SESSION_OPEN_MIN) // tf
+    bucket = sid * SESSION_BUCKET_MULT + bidx
+    starts = np.concatenate(([0], np.flatnonzero(np.diff(bucket)) + 1))
+    ends = np.concatenate((starts[1:], [len(bucket)])) - 1
+
+    dt_vals = master['Datetime'].values[ends]
+    op_vals = master['Open'].values[starts].astype(float)
+    hi_vals = np.maximum.reduceat(master['High'].values.astype(float), starts)
+    lo_vals = np.minimum.reduceat(master['Low'].values.astype(float), starts)
+    cl_vals = master['Close'].values[ends].astype(float)
+    vol_vals = np.add.reduceat(master['Volume'].values.astype(float), starts)
+
+    out = pd.DataFrame({
+        'Datetime': dt_vals, 'Open': op_vals, 'High': hi_vals,
+        'Low': lo_vals, 'Close': cl_vals, 'Volume': vol_vals,
+    })
+    dt = out['Datetime']
+    day = dt.dt.normalize()
+    out['Min'] = dt.dt.hour.values * 60 + dt.dt.minute.values
+    out['SessId'] = day.values.astype('datetime64[D]').astype('int64')
+    out['Session'] = day.dt.date
+    return out
 
 def _unwrap_master(data):
     if isinstance(data, list): return data
@@ -1747,7 +1782,8 @@ def _dual_eff_std_mult():
     return float(STOCK_OPT_DUAL_BAND_STD_MULT if str(_RUN_MODE or "").upper() == "STOCK_FNO" else DUAL_BAND_STD_MULT)
 
 def _dual_eff_max_stale():
-    return float(STOCK_OPT_DUAL_BAND_TWIN_MAX_STALE_MIN if str(_RUN_MODE or "").upper() == "STOCK_FNO" else DUAL_BAND_TWIN_MAX_STALE_MIN)
+    base = float(STOCK_OPT_DUAL_BAND_TWIN_MAX_STALE_MIN if str(_RUN_MODE or "").upper() == "STOCK_FNO" else DUAL_BAND_TWIN_MAX_STALE_MIN)
+    return max(base, float(CANDLE_TF_MIN or 1)) if base > 0 else 0.0
 
 def _dual_gate_required(item, mode, is_sector_index=False):
     """Mandatory for every non-index instrument of an option run, and for any true option contract wherever it comes from."""
@@ -1968,7 +2004,8 @@ def _dual_band_text(row):
 
 def _evaluate_iv_arrays(iv, sess_starts, sid):
     n = len(iv)
-    delta_iv = np.diff(iv, prepend=iv[0])
+    iv_smooth = _ewm(iv, 2.0 / 4.0) if n > 1 else iv
+    delta_iv = np.diff(iv_smooth, prepend=iv_smooth[0])
     delta_iv = np.where(sess_starts, 0.0, delta_iv)
     
     alpha_vel = 1.0 / float(VEL_ATR_PERIOD)
@@ -2227,7 +2264,8 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
     lock_floor_r = float(PROFIT_LOCK_FLOOR_R)
     soft_disable_r = float(SOFT_STOP_DISABLE_R)
 
-    warmup = max(0, int(ANCHOR_OPEN_WARMUP_BARS or 0))
+    _tf_scale = max(1, int(CANDLE_TF_MIN or 1))
+    warmup = max(0, int(math.ceil(int(ANCHOR_OPEN_WARMUP_BARS or 0) / _tf_scale)))
     i = today_start + warmup
     if i >= n:
         return None, {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0, 'killed_time': '-', 'killed_price': 0.0, 'reason': f'Open warm-up ({warmup} bars)', 'kills': []}
@@ -2303,9 +2341,10 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                 peak_iv = max(peak_iv, cur_iv)
                 vel_iv_j = iv_kin['vel_iv'][j]
                 atr_iv_j = max(iv_kin['atr_iv'][j], 1e-6)
-                if peak_iv > 0 and (peak_iv - cur_iv) / peak_iv >= float(IV_CRUSH_DROP_PCT):
-                    reason = f"Kinetic SL (IV Crush -{((peak_iv - cur_iv)/peak_iv)*100:.1f}% from peak)"
-                elif vel_iv_j < -float(IV_CRUSH_VEL_MULT) * atr_iv_j and curr_r < 1.0:
+                iv_dd = ((peak_iv - cur_iv) / peak_iv) if peak_iv > 0 else 0.0
+                if iv_dd >= float(IV_CRUSH_DROP_PCT):
+                    reason = f"Kinetic SL (IV Crush -{iv_dd*100:.1f}% from peak)"
+                elif curr_r < 0.0 and iv_dd >= float(IV_CRUSH_VEL_MIN_DROP_PCT) and vel_iv_j < -float(IV_CRUSH_VEL_MULT) * atr_iv_j:
                     reason = f"Kinetic SL (IV Crush Velocity Shock)"
 
             if reason is None:
@@ -2332,7 +2371,8 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                     if MAX_CONSECUTIVE_LOSSES_PER_DAY > 0 and consec_losses >= int(MAX_CONSECUTIVE_LOSSES_PER_DAY):
                         i = n
                     else:
-                        i = j + 1 + max(0, int(POST_LOSS_COOLDOWN_BARS or 0))
+                        _cd_bars = int(round(max(0, int(POST_LOSS_COOLDOWN_BARS or 0)) / _tf_scale))
+                        i = j + 1 + _cd_bars
                 else:
                     consec_losses = 0
                     i = j + 1
@@ -2352,6 +2392,39 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
 
 def prepare_series(master, target_dt, is_sector_index=False, is_option=False, opt_item=None, twin_master=None, dual_required=None):
     if master is None or master.empty: return None, "no_data"
+    raw_day_mask = (master['Datetime'].dt.date == target_dt).values
+    if not raw_day_mask.any(): return None, "no_data"
+    raw_ts = int(np.argmax(raw_day_mask))
+
+    # Compute Base ATR & Risk ATR on raw 1m history before resampling engine candles
+    base_atr_calc, atr_bars = compute_base_atr(master.iloc[:raw_ts])
+    atr_tf_used = f"{_tf_to_minutes(ATR_BASIS_TF)}min"
+    if base_atr_calc is None or atr_bars < ATR_MIN_BARS:
+        fb_min = _atr_fallback_minutes()
+        if fb_min and fb_min < _tf_to_minutes(ATR_BASIS_TF):
+            fb_atr, fb_bars = compute_base_atr(master.iloc[:raw_ts], tf=fb_min)
+            if fb_atr is not None and fb_bars >= ATR_MIN_BARS:
+                base_atr_calc, atr_bars, atr_tf_used = fb_atr, fb_bars, f"{fb_min}min*"
+    if base_atr_calc is None or atr_bars < ATR_MIN_BARS: return None, "short_history"
+    raw_first_close = float(master['Close'].values[raw_ts])
+    atr_pct_floor = float(INDEX_MIN_ATR_PCT) if is_sector_index else (float(OPT_MIN_ATR_PCT) if is_option else float(MIN_ATR_PCT))
+    atr_pct_cap = float(INDEX_MAX_ATR_PCT or 0.0) if is_sector_index else (float(OPT_MAX_ATR_PCT or 0.0) if is_option else float(MAX_ATR_PCT or 0.0))
+    floor_v = max(raw_first_close * atr_pct_floor, float(ABSOLUTE_MIN_ATR))
+    cap_v = raw_first_close * atr_pct_cap if atr_pct_cap > 0 else float('inf')
+    base_atr = max(min(float(base_atr_calc), cap_v), floor_v)
+    risk_atr = base_atr
+    _rt = str(RISK_ATR_TF if RISK_ATR_TF is not None else "").strip().lower()
+    if _rt and _rt not in ("none", "off", "same", "0", "false"):
+        r_calc, r_bars = compute_base_atr(master.iloc[:raw_ts], tf=_rt)
+        if r_calc is not None and r_bars >= ATR_MIN_BARS:
+            risk_atr = max(min(float(r_calc), cap_v), floor_v)
+
+    # Resample engine candles (and twin leg) to CANDLE_TF_MIN (entries remain 100% identical)
+    if int(CANDLE_TF_MIN or 1) > 1:
+        master = _resample_master(master, CANDLE_TF_MIN)
+        if twin_master is not None and not twin_master.empty:
+            twin_master = _resample_master(twin_master, CANDLE_TF_MIN)
+
     day_mask = (master['Datetime'].dt.date == target_dt).values
     if not day_mask.any(): return None, "no_data"
     ts = int(np.argmax(day_mask))
@@ -2367,27 +2440,6 @@ def prepare_series(master, target_dt, is_sector_index=False, is_option=False, op
     sess_starts[0] = True
     sess_starts[1:] = sid[1:] != sid[:-1]
     is_late_session = (master['Min'].values >= LAST_NEW_ANCHOR_MIN)
-
-    base_atr_calc, atr_bars = compute_base_atr(master.iloc[:ts])
-    atr_tf_used = f"{_tf_to_minutes(ATR_BASIS_TF)}min"
-    if base_atr_calc is None or atr_bars < ATR_MIN_BARS:
-        fb_min = _atr_fallback_minutes()
-        if fb_min and fb_min < _tf_to_minutes(ATR_BASIS_TF):
-            fb_atr, fb_bars = compute_base_atr(master.iloc[:ts], tf=fb_min)
-            if fb_atr is not None and fb_bars >= ATR_MIN_BARS:
-                base_atr_calc, atr_bars, atr_tf_used = fb_atr, fb_bars, f"{fb_min}min*"
-    if base_atr_calc is None or atr_bars < ATR_MIN_BARS: return None, "short_history"
-    atr_pct_floor = float(INDEX_MIN_ATR_PCT) if is_sector_index else (float(OPT_MIN_ATR_PCT) if is_option else float(MIN_ATR_PCT))
-    atr_pct_cap = float(INDEX_MAX_ATR_PCT or 0.0) if is_sector_index else (float(OPT_MAX_ATR_PCT or 0.0) if is_option else float(MAX_ATR_PCT or 0.0))
-    floor_v = max(float(close[ts]) * atr_pct_floor, float(ABSOLUTE_MIN_ATR))
-    cap_v = float(close[ts]) * atr_pct_cap if atr_pct_cap > 0 else float('inf')
-    base_atr = max(min(float(base_atr_calc), cap_v), floor_v)
-    risk_atr = base_atr
-    _rt = str(RISK_ATR_TF if RISK_ATR_TF is not None else "").strip().lower()
-    if _rt and _rt not in ("none", "off", "same", "0", "false"):
-        r_calc, r_bars = compute_base_atr(master.iloc[:ts], tf=_rt)
-        if r_calc is not None and r_bars >= ATR_MIN_BARS:
-            risk_atr = max(min(float(r_calc), cap_v), floor_v)
 
     tr = np.maximum(high - low, np.maximum(np.abs(high - np.roll(close, 1)), np.abs(low - np.roll(close, 1))))
     tr = np.where(sess_starts, high - low, tr)
@@ -4080,7 +4132,7 @@ def run_screener(
     _fb = _atr_fallback_minutes()
     _trail_txt = ("trailing " + (f"{float(SL_TRAIL_ATR_MULT):g}" if SL_TRAIL_ATR_MULT not in (None, "") else f"{float(SL_ATR_MULT):g}") + " ATR behind best price") if SL_TRAILING_ENABLED else f"fixed {float(SL_ATR_MULT):g} ATR from anchor"
     _risk_txt = f" | SL/Target ATR: {_tf_to_minutes(RISK_ATR_TF)}min" if (RISK_ATR_TF and str(RISK_ATR_TF).strip().lower() not in ("none", "off", "same", "0", "false")) else ""
-    print(f"   {COLOR_DIM}» ATR basis: {_tf_to_minutes(ATR_BASIS_TF)}min x{ATR_BASIS_PERIOD} (min {ATR_MIN_BARS} bars, fallback {str(_fb) + 'min' if _fb else 'off'}){_risk_txt} | ATR cap % of day-open: stocks {MAX_ATR_PCT:g} / index {INDEX_MAX_ATR_PCT:g} / options {OPT_MAX_ATR_PCT:g} (0=off) | SL: {_trail_txt}{COLOR_RESET}")
+    print(f"   {COLOR_DIM}» Candle TF: {int(CANDLE_TF_MIN or 1)}min | ATR basis: {_tf_to_minutes(ATR_BASIS_TF)}min x{ATR_BASIS_PERIOD} (min {ATR_MIN_BARS} bars, fallback {str(_fb) + 'min' if _fb else 'off'}){_risk_txt} | ATR cap % of day-open: stocks {MAX_ATR_PCT:g} / index {INDEX_MAX_ATR_PCT:g} / options {OPT_MAX_ATR_PCT:g} (0=off) | SL: {_trail_txt}{COLOR_RESET}")
 
     if _dual_gate_required(None, mode):
         print(
@@ -4282,6 +4334,7 @@ def parse_args():
     p.add_argument("--expiry", choices=["CURRENT", "NEXT"], default=EXPIRY_SELECTION)
     p.add_argument("--strikes-up", type=int, default=None)
     p.add_argument("--strikes-down", type=int, default=None)
+    p.add_argument("--candle-tf", type=int, default=None, help="Engine candle timeframe in minutes, e.g. 1, 3, 5 (default: CANDLE_TF_MIN = 3).")
     p.add_argument("--checkpoint-min", type=int, default=CHECKPOINT_INTERVAL_MIN)
     p.add_argument("--single-snapshot", action="store_true")
     p.add_argument("--isolate-session-bands", action="store_true", default=ISOLATE_SESSION_BANDS)
@@ -4419,6 +4472,10 @@ if __name__ == "__main__":
     if args.strikes_down is not None:
         STRIKES_BELOW_ATM = args.strikes_down
         STOCK_OPT_STRIKES_BELOW_ATM = args.strikes_down
+    _ctf = args.candle_tf if args.candle_tf is not None else os.environ.get(ENV_CANDLE_TF_MIN)
+    if _ctf is not None and str(_ctf).strip() != "":
+        try: CANDLE_TF_MIN = max(1, int(_ctf))
+        except ValueError: pass
     CHECKPOINT_INTERVAL_MIN = args.checkpoint_min
     ISOLATE_SESSION_BANDS = args.isolate_session_bands
     OPTIONS_BUYING_ONLY = args.options_buying_only
