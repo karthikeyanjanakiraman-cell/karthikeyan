@@ -1,0 +1,131 @@
+name: System 3.0 Historical Backtest
+
+on:
+  workflow_dispatch:
+    inputs:
+      trading_mode:
+        description: 'Trading Universe'
+        required: true
+        default: 'INDEX_OPTIONS'
+        type: choice
+        options:
+          - 'BOTH (STOCK_FNO & INDEX_OPTIONS)'
+          - INDEX_OPTIONS
+          - STOCK_FNO
+          - CASH_EQUITY
+      start_date:
+        description: 'Start Date (YYYY-MM-DD, optional - defaults to 7 days before end_date)'
+        required: false
+        default: ''
+        type: string
+      end_date:
+        description: 'End Date (YYYY-MM-DD, optional - defaults to today IST)'
+        required: false
+        default: ''
+        type: string
+      eod_time:
+        description: 'Daily Cutoff Time (HH:MM) - Defaults to 15:30'
+        required: false
+        default: '15:30'
+        type: string
+      win_r:
+        description: 'Minimum R-Multiple for Win (default: 0.10)'
+        required: false
+        default: '0.10'
+        type: string
+      track_symbol:
+        description: 'Optional Tracking Symbol (Manual Fallback)'
+        required: false
+        default: ''
+        type: string
+
+jobs:
+  run_backtest:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Code Repository
+        uses: actions/checkout@v4
+
+      - name: Initialize Python 3.11 Runtime
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache Pip Wheelhouse
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-backtest-v1
+          restore-keys: |
+            ${{ runner.os }}-pip-backtest-
+
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy pandas requests
+
+      - name: Execute Historical Backtest
+        env:
+          UPSTOX_ACCESS_TOKEN: ${{ secrets.UPSTOX_ACCESS_TOKEN }}
+          ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+          SECRET_TRACK: ${{ secrets.TRACK_SYMBOL }}
+          INPUT_MODE: ${{ inputs.trading_mode }}
+          PARAM_START_DATE: ${{ inputs.start_date }}
+          PARAM_END_DATE: ${{ inputs.end_date }}
+          PARAM_EOD_TIME: ${{ inputs.eod_time }}
+          PARAM_WIN_R: ${{ inputs.win_r }}
+          PARAM_TRACK: ${{ inputs.track_symbol }}
+        run: |
+          # 1. Determine modes to run
+          if [ -z "$INPUT_MODE" ] || [ "$INPUT_MODE" = "BOTH (STOCK_FNO & INDEX_OPTIONS)" ]; then
+            MODES=("INDEX_OPTIONS" "STOCK_FNO")
+          else
+            MODES=("$INPUT_MODE")
+          fi
+
+          # 2. Build common CLI arguments
+          EXTRA_ARGS=()
+
+          if [ -n "$PARAM_START_DATE" ]; then
+            EXTRA_ARGS+=("--start-date" "$PARAM_START_DATE")
+          fi
+
+          if [ -n "$PARAM_END_DATE" ]; then
+            EXTRA_ARGS+=("--end-date" "$PARAM_END_DATE")
+          fi
+
+          if [ -n "$PARAM_EOD_TIME" ]; then
+            EXTRA_ARGS+=("--eod-time" "$PARAM_EOD_TIME")
+          fi
+
+          if [ -n "$PARAM_WIN_R" ]; then
+            EXTRA_ARGS+=("--win-r" "$PARAM_WIN_R")
+          fi
+
+          if [ -n "$SECRET_TRACK" ]; then
+            EXTRA_ARGS+=("--track" "$SECRET_TRACK")
+          elif [ -n "$PARAM_TRACK" ]; then
+            EXTRA_ARGS+=("--track" "$PARAM_TRACK")
+          fi
+
+          # 3. Iterate sequentially
+          for MODE in "${MODES[@]}"; do
+            echo "=============================================="
+            echo "Starting Backtest for Mode: $MODE"
+            echo "=============================================="
+
+            CSV_FILE="backtest_${MODE}.csv"
+            python -u backtest_system3.py --mode "$MODE" --csv-out "$CSV_FILE" "${EXTRA_ARGS[@]}"
+
+            echo "Finished backtest for $MODE"
+            sleep 5
+          done
+
+      - name: Upload Backtest Trade CSVs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: system3-backtest-results
+          path: backtest_*.csv
+          if-no-files-found: ignore
