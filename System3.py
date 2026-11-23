@@ -404,6 +404,8 @@ SECTOR_CONSTITUENT_WEIGHTS = {
 # --- 0.9 INDEX OPTIONS CONFIGURATION ---
 OPTIONS_BUYING_ONLY = True
 EXPIRY_SELECTION = "CURRENT"
+STOCK_FNO_AUTO_ROLL_ON_EXPIRY_DAY = True   # On monthly expiry day (0DTE), automatically roll STOCK_FNO to next expiry to avoid 0DTE IV/theta crush
+INDEX_AUTO_ROLL_ON_EXPIRY_DAY = False      # Optional: keep False for index weekly 0DTE trading, True to roll index options on expiry day too
 STRIKES_ABOVE_ATM = 2
 STRIKES_BELOW_ATM = 2
 STOCK_OPT_STRIKES_ABOVE_ATM = 0
@@ -743,13 +745,7 @@ def _compute_target_sl(row):
                 peak = min(float(pk), ltp) if p_dir == 'BEAR' else max(float(pk), ltp)
         except Exception:
             pass
-        _ad = float(row.get('AnchorDelta', 0.0) or 0.0)
-        _pd = float(row.get('PeakDelta', 0.0) or 0.0)
-        _datr = float(row.get('DeltaBaseAtr', 0.0) or 0.0)
-        if _ad > 0 and _pd > 0 and _datr > 0 and _is_option_symbol(sym):
-            fav_r = ((_ad - _pd) if p_dir == 'BEAR' else (_pd - _ad)) / _datr
-        else:
-            fav_r = ((ap - peak) if p_dir == 'BEAR' else (peak - ap)) / base_atr
+        fav_r = ((ap - peak) if p_dir == 'BEAR' else (peak - ap)) / base_atr
 
     level = 1
     if TARGET_LADDER_ENABLED and anchored:
@@ -1575,7 +1571,8 @@ def _index_options_universe(cutoff_dt, use_intraday, needles=()):
 
     for idx, contracts in by_idx.items():
         if idx not in spot or not contracts: continue
-        expiries = sorted({c[0] for c in contracts if c[0] >= target_dt})
+        min_exp_dt = (target_dt + timedelta(days=1)) if INDEX_AUTO_ROLL_ON_EXPIRY_DAY else target_dt
+        expiries = sorted({c[0] for c in contracts if c[0] >= min_exp_dt}) or sorted({c[0] for c in contracts if c[0] >= target_dt})
         if not expiries: continue
         expiry_idx = 1 if str(EXPIRY_SELECTION).upper() == "NEXT" else 0
         target_exp = expiries[min(expiry_idx, len(expiries) - 1)]
@@ -1718,7 +1715,8 @@ def _stock_options_universe(cutoff_dt, use_intraday, needles=()):
     # 5. Build ATM options chain for all F&O stocks
     for u_sym, contracts in by_stock.items():
         if not contracts: continue
-        expiries = sorted({c[0] for c in contracts if c[0] >= target_dt})
+        min_exp_dt = (target_dt + timedelta(days=1)) if STOCK_FNO_AUTO_ROLL_ON_EXPIRY_DAY else target_dt
+        expiries = sorted({c[0] for c in contracts if c[0] >= min_exp_dt}) or sorted({c[0] for c in contracts if c[0] >= target_dt})
         if not expiries: continue
         expiry_idx = 1 if str(EXPIRY_SELECTION).upper() == "NEXT" else 0
         target_exp = expiries[min(expiry_idx, len(expiries) - 1)]
@@ -2408,6 +2406,20 @@ def _delta_block_reason(delta_blocks, dt_1m):
     except Exception: last_t = '-'
     return f"Delta-BB Gate: {last_why} ({len(delta_blocks)}x, last {last_t})"
 
+def _inception_block_reason(inception_blocks, dt_1m):
+    if not inception_blocks: return ""
+    last_i, last_why = inception_blocks[-1]
+    try: last_t = pd.to_datetime(dt_1m[last_i]).strftime('%H:%M')
+    except Exception: last_t = '-'
+    return f"Inception |Δ| Gate: {last_why} ({len(inception_blocks)}x, last {last_t})"
+
+def _iv_block_reason(iv_blocks, dt_1m):
+    if not iv_blocks: return ""
+    last_i, last_why = iv_blocks[-1]
+    try: last_t = pd.to_datetime(dt_1m[last_i]).strftime('%H:%M')
+    except Exception: last_t = '-'
+    return f"IV Gate: {last_why} ({len(iv_blocks)}x, last {last_t})"
+
 def _dual_band_text(row):
     d = row.get('DualBand')
     if not d:
@@ -2680,7 +2692,7 @@ def calculate_grids(kin_1m, idx, direction, iv_kin=None):
         atr_grid[mult], bb_grid[mult] = a_count, b_count
     return atr_grid, bb_grid
 
-def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, today_start, is_late_session, end=None, allow_bull=True, allow_bear=True, iv_kin=None, is_option=False, dual_gate=None, delta_gate=None, day_ref=0.0, ind_close=None, delta_base_atr=None, inception_gate=None):
+def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower, kc_upper, kc_lower, today_start, is_late_session, end=None, allow_bull=True, allow_bear=True, iv_kin=None, is_option=False, dual_gate=None, delta_gate=None, day_ref=0.0, ind_close=None, delta_base_atr=None, inception_gate=None, is_expiry_day=False):
     n = len(close) if end is None else min(int(end), len(close))
     if today_start >= n:
         return None, {'dir': 'NONE', 'anchor_time': '-', 'anchor_price': 0.0, 'killed_time': '-', 'killed_price': 0.0, 'reason': 'No data for today', 'kills': []}
@@ -2702,6 +2714,8 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
     kills, warzone_kills, consec_losses = [], 0, 0
     dual_blocks = []                       # (bar index, why) where every kinetic condition passed but the CE/PE Dual-Band gate refused
     delta_blocks = []                      # (bar index, why) where kinetic + Dual-Band passed but mandatory |Delta| BB gate refused
+    inception_blocks = []                  # (bar index, why) where kinetic + Dual-Band + Delta-BB passed but Inception |Delta| regime refused
+    iv_blocks = []                         # (bar index, why) where kinetic passed but IV velocity/crush gate refused
 
     while i < n:
         anchor = None
@@ -2713,17 +2727,19 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
 
             iv_ok_bull = True
             iv_ok_bear = True
-            if is_option and iv_kin and ENABLE_OPTION_IV_ENGINE and i < len(iv_kin.get('iv', [])):
+            iv_why = ""
+            if is_option and iv_kin and ENABLE_OPTION_IV_ENGINE and (not is_expiry_day) and i < len(iv_kin.get('iv', [])):
                 vel_iv_i = iv_kin['vel_iv'][i]
                 atr_iv_i = max(iv_kin['atr_iv'][i], 1e-6)
                 iv_i = iv_kin['iv'][i]
                 iv_mean_i = iv_kin['iv_mean'][i]
                 iv_std_i = iv_kin['iv_std'][i]
-                if IV_REQUIRE_NON_NEGATIVE_VEL:
-                    if vel_iv_i < -0.2 * atr_iv_i:
-                        iv_ok_bull = False
+                if IV_REQUIRE_NON_NEGATIVE_VEL and vel_iv_i < -0.2 * atr_iv_i:
+                    iv_ok_bull = False
+                    iv_why = "falling IV velocity"
                 if iv_std_i > 0 and iv_i < iv_mean_i - 1.5 * iv_std_i:
                     iv_ok_bull = False
+                    iv_why = "IV below -1.5σ band"
 
             is_reanchor_try = (len(kills) > 0)
             opt_px_ok = True
@@ -2739,23 +2755,26 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                     elif (not is_reanchor_try) and OPT_MAX_DAY_PCT is not None and dp_i > float(OPT_MAX_DAY_PCT):
                         opt_px_ok = False
 
-            # MANDATORY CE/PE Dual-Band + |Delta|-BB gates: evaluated LAST among entry conditions.
+            # MANDATORY CE/PE Dual-Band + |Delta|-BB + Inception |Delta| gates: evaluated LAST among entry conditions.
             # On re-anchors (len(kills) > 0), bull_struct + BB>KC + Dual-Band + Δ-BB suffices (no duplicate shock explosion required).
-            if opt_px_ok and allow_bull and not is_late_session[i] and bull_struct and (bull_shock or is_reanchor_try) and bb_kc_bull_fire and iv_ok_bull:
-                dual_pass, dual_why = _dual_gate_pass(dual_gate, i, "BULL")
-                if not dual_pass: dual_blocks.append((i, dual_why))
+            if opt_px_ok and allow_bull and not is_late_session[i] and bull_struct and (bull_shock or is_reanchor_try) and bb_kc_bull_fire:
+                if not iv_ok_bull:
+                    iv_blocks.append((i, iv_why or "IV decay"))
                 else:
-                    delta_pass, delta_why = _delta_bb_pass(delta_gate, i, "BULL")
-                    if not delta_pass: delta_blocks.append((i, delta_why))
-                    elif inception_gate and inception_gate.get("enabled") and i < len(inception_gate["ok_bull"]) and not bool(inception_gate["ok_bull"][i]):
-                        delta_blocks.append((i, f"Inception |Δ| z {float(inception_gate['z'][i]):+.2f} < {float(INCEPTION_DELTA_MIN_Z):g} (since {inception_gate['first_date']})"))
-                    elif r_bear: warzone_kills += 1
+                    dual_pass, dual_why = _dual_gate_pass(dual_gate, i, "BULL")
+                    if not dual_pass: dual_blocks.append((i, dual_why))
                     else:
-                        inc_snap = (
-                            {"first_date": inception_gate["first_date"], "mean": float(inception_gate["mean"][i]), "z": float(inception_gate["z"][i]), "prior_days": int(inception_gate["prior_days"])}
-                            if (inception_gate and i < len(inception_gate["mean"])) else None
-                        )
-                        anchor = {"dir": "BULL", "idx": i, "time": dt_1m[i], "price": float(close[i]), "delta": float(ind_close[i]) if ind_close is not None else float(close[i]), "dual": _dual_gate_snapshot(dual_gate, i, "BULL"), "delta_bb": _delta_bb_snapshot(delta_gate, i), "inception_delta": inc_snap}; break
+                        delta_pass, delta_why = _delta_bb_pass(delta_gate, i, "BULL")
+                        if not delta_pass: delta_blocks.append((i, delta_why))
+                        elif inception_gate and inception_gate.get("enabled") and i < len(inception_gate["ok_bull"]) and not bool(inception_gate["ok_bull"][i]):
+                            inception_blocks.append((i, f"|Δ| z {float(inception_gate['z'][i]):+.2f} < {float(INCEPTION_DELTA_MIN_Z):g} (since {inception_gate['first_date']})"))
+                        elif r_bear: warzone_kills += 1
+                        else:
+                            inc_snap = (
+                                {"first_date": inception_gate["first_date"], "mean": float(inception_gate["mean"][i]), "z": float(inception_gate["z"][i]), "prior_days": int(inception_gate["prior_days"])}
+                                if (inception_gate and i < len(inception_gate["mean"])) else None
+                            )
+                            anchor = {"dir": "BULL", "idx": i, "time": dt_1m[i], "price": float(close[i]), "delta": float(ind_close[i]) if ind_close is not None else float(close[i]), "dual": _dual_gate_snapshot(dual_gate, i, "BULL"), "delta_bb": _delta_bb_snapshot(delta_gate, i), "inception_delta": inc_snap}; break
             elif opt_px_ok and allow_bear and not is_late_session[i] and bear_struct and (bear_shock or is_reanchor_try) and bb_kc_bear_fire and iv_ok_bear:
                 dual_pass, dual_why = _dual_gate_pass(dual_gate, i, "BEAR")
                 if not dual_pass: dual_blocks.append((i, dual_why))
@@ -2768,29 +2787,28 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
 
         if not anchor: break
         survived, is_bull = True, anchor['dir'] == "BULL"
-        use_delta_engine = bool(is_option and ind_close is not None and delta_base_atr is not None and float(delta_base_atr) > 0)
-        eval_series = ind_close if use_delta_engine else close
-        anchor_eval = float(anchor['delta']) if use_delta_engine else float(anchor['price'])
-        eff_atr = float(delta_base_atr) if use_delta_engine else (max(float(base_atr), float(anchor['price']) * float(OPT_MIN_ATR_PCT)) if is_option else float(base_atr))
-        anchor['eff_atr'] = max(float(base_atr), float(anchor['price']) * float(OPT_MIN_ATR_PCT)) if is_option else float(base_atr)
-        anchor['delta_eff_atr'] = float(delta_base_atr) if use_delta_engine else 0.0
-        peak_val, true_peak_val = anchor_eval, anchor_eval
+        # Signals/gates run on Black-Scholes |Delta|; stops, Profit-Lock & R-multiples run on tradable rupee price
+        eff_atr = max(float(base_atr), float(anchor['price']) * float(OPT_MIN_ATR_PCT)) if is_option else float(base_atr)
+        anchor['eff_atr'] = eff_atr
+        anchor['delta_eff_atr'] = float(delta_base_atr) if (is_option and delta_base_atr) else 0.0
+        peak_val, true_peak_val = float(anchor['price']), float(anchor['price'])
         true_peak_px = float(anchor['price'])
+        anchor_eval = float(anchor['price'])
         j = anchor['idx'] + 1
         peak_iv = iv_kin['iv'][anchor['idx']] if (is_option and iv_kin and anchor['idx'] < len(iv_kin.get('iv', []))) else 0.0
         dual_rev_streak = 0
 
         while j < n:
             (bull_score, bear_score, _, _, _, _, _, _) = get_kinetics(kin_1m, j)
-            ev_j = float(eval_series[j])
+            ev_j = float(close[j])
             if is_bull:
                 peak_val, true_peak_val = max(peak_val, ev_j), max(true_peak_val, ev_j)
-                true_peak_px = max(true_peak_px, float(close[j]))
+                true_peak_px = true_peak_val
                 adverse, hard_adverse, opposing = peak_val - ev_j, true_peak_val - ev_j, bear_score
                 soft_reason = f"Kinetic SL ({soft_mult:g} ATR Pullback)"
             else:
                 peak_val, true_peak_val = min(peak_val, ev_j), min(true_peak_val, ev_j)
-                true_peak_px = min(true_peak_px, float(close[j]))
+                true_peak_px = true_peak_val
                 adverse, hard_adverse, opposing = ev_j - peak_val, ev_j - true_peak_val, bull_score
                 soft_reason = f"Kinetic SL ({soft_mult:g} ATR Rally)"
 
@@ -2810,13 +2828,13 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                 reason = f"Profit Lock (+{pl_trig:g}R Peak -> +{pl_floor:g}R Floor)"
             elif max_r < soft_disable_r and adverse >= soft_mult * eff_atr and opposing >= opp_thresh:
                 reason = soft_reason
-            elif is_option and iv_kin and ENABLE_OPTION_IV_ENGINE and j < len(iv_kin.get('iv', [])):
+            elif is_option and iv_kin and ENABLE_OPTION_IV_ENGINE and (not is_expiry_day) and j < len(iv_kin.get('iv', [])):
                 cur_iv = iv_kin['iv'][j]
                 peak_iv = max(peak_iv, cur_iv)
                 vel_iv_j = iv_kin['vel_iv'][j]
                 atr_iv_j = max(iv_kin['atr_iv'][j], 1e-6)
                 iv_dd = ((peak_iv - cur_iv) / peak_iv) if peak_iv > 0 else 0.0
-                if iv_dd >= float(IV_CRUSH_DROP_PCT):
+                if curr_r < 0.25 and iv_dd >= float(IV_CRUSH_DROP_PCT):
                     reason = f"Kinetic SL (IV Crush -{iv_dd*100:.1f}% from peak)"
                 elif curr_r < 0.0 and iv_dd >= float(IV_CRUSH_VEL_MIN_DROP_PCT) and vel_iv_j < -float(IV_CRUSH_VEL_MULT) * atr_iv_j:
                     reason = f"Kinetic SL (IV Crush Velocity Shock)"
@@ -2836,9 +2854,9 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
                     'dir': anchor['dir'], 'anchor_time': pd.to_datetime(anchor['time']).strftime('%H:%M'),
                     'anchor_price': float(anchor['price']), 'killed_time': pd.to_datetime(dt_1m[j]).strftime('%H:%M'),
                     'killed_price': float(close[j]), 'reason': reason, 'peak_price': float(true_peak_px),
-                    'anchor_delta': float(anchor.get('delta', 0.0)), 'killed_delta': float(eval_series[j]) if use_delta_engine else 0.0,
-                    'peak_delta': float(true_peak_val) if use_delta_engine else 0.0,
-                    'delta_eff_atr': float(delta_base_atr) if use_delta_engine else 0.0,
+                    'anchor_delta': float(anchor.get('delta', 0.0)), 'killed_delta': float(ind_close[j]) if (is_option and ind_close is not None) else 0.0,
+                    'peak_delta': float(np.max(ind_close[anchor['idx']:j + 1])) if (is_option and ind_close is not None and is_bull) else 0.0,
+                    'delta_eff_atr': float(delta_base_atr) if (is_option and delta_base_atr) else 0.0,
                     'eff_atr': float(anchor['eff_atr']), 'dual': anchor.get('dual')
                 }
                 kills.append(last_killed_info)
@@ -2863,8 +2881,10 @@ def evaluate_anchor_tripwire(close, dt_1m, kin_1m, base_atr, bb_upper, bb_lower,
     if survived_anchor: return survived_anchor, {"status": "Survived", "kills": kills}
     info = dict(last_killed_info)
     if warzone_kills > 0 and info['dir'] == 'NONE': info['reason'] = f"Warzone Inversion Chop ({warzone_kills}x)"
+    elif inception_blocks and info['dir'] == 'NONE': info['reason'] = _inception_block_reason(inception_blocks, dt_1m)
     elif delta_blocks and info['dir'] == 'NONE': info['reason'] = _delta_block_reason(delta_blocks, dt_1m)
     elif dual_blocks and info['dir'] == 'NONE': info['reason'] = _dual_block_reason(dual_blocks, dt_1m)
+    elif iv_blocks and info['dir'] == 'NONE': info['reason'] = _iv_block_reason(iv_blocks, dt_1m)
     info['kills'] = kills
     return None, info
 
@@ -2921,6 +2941,7 @@ def prepare_series(master, target_dt, is_sector_index=False, is_option=False, op
     iv_kin = None
     delta_base_atr = None
     inception_delta = None
+    is_expiry_day = False
     delta_bb = _closed_delta_bb_gate("underlying spot 1m candles unavailable (fail-closed)") if is_option else None
     ind_open, ind_high, ind_low, ind_close = open_, high, low, close
     host_dual_df, twin_dual_df, dual_min_sig = master, twin_master, None
@@ -2935,6 +2956,7 @@ def prepare_series(master, target_dt, is_sector_index=False, is_option=False, op
                 spot_df = _get_cached_spot_1m(u_idx, target_dt, MIN1_HISTORY_DAYS, target_dt == now_ist().date(), spot_key=u_key)
                 if spot_df is not None and not spot_df.empty:
                     exp_dt = opt_specs.get('expiry') or target_dt
+                    is_expiry_day = (exp_dt == target_dt)
                     is_call_opt = (opt_specs.get('option_type') == 'CE')
                     stk_val = float(opt_specs['strike'])
 
@@ -3017,7 +3039,7 @@ def prepare_series(master, target_dt, is_sector_index=False, is_option=False, op
         'day_open': float(open_[ts]), 'prev_close': float(close[ts - 1]) if ts > 0 else 0.0,
         'base_atr': base_atr, 'risk_atr': risk_atr, 'delta_base_atr': delta_base_atr, 'atr_bars': int(atr_bars), 'atr_tf': atr_tf_used,
         'kin': _evaluate_kinetic_arrays(ind_open, ind_close, ind_high, ind_low, vol, sess_starts, sid),
-        'iv_kin': iv_kin, 'dual_band': dual_band, 'delta_bb': delta_bb, 'inception_delta': inception_delta,
+        'iv_kin': iv_kin, 'dual_band': dual_band, 'delta_bb': delta_bb, 'inception_delta': inception_delta, 'is_expiry_day': is_expiry_day,
         'bb_upper': sma_bb + PRICE_BB_STD_MULT * std_bb, 'bb_lower': sma_bb - PRICE_BB_STD_MULT * std_bb,
         'kc_upper': sma_kc + PRICE_KC_ATR_MULT * atr_kc, 'kc_lower': sma_kc - PRICE_KC_ATR_MULT * atr_kc,
     }, None
@@ -3054,7 +3076,7 @@ def row_at(S, end, symbol, sector="", sector_weight=0.0, is_sector_index=False):
         ts, S['is_late_session'], end, allow_bull=allow_bull_anchor, allow_bear=allow_bear_anchor,
         iv_kin=iv_kin, is_option=is_opt, dual_gate=S.get('dual_band'), delta_gate=S.get('delta_bb'),
         day_ref=ref, ind_close=S.get('ind_close'), delta_base_atr=S.get('delta_base_atr'),
-        inception_gate=S.get('inception_delta')
+        inception_gate=S.get('inception_delta'), is_expiry_day=bool(S.get('is_expiry_day', False))
     )
     row['Kills'] = info.get('kills', [])
     row['DualBand'] = anchor.get('dual') if anchor else None
@@ -3271,29 +3293,15 @@ def _exit_price(row):
     return float(row['KilledPrice']) if row.get('State') == "[STOPPED]" and row.get('KilledPrice', 0) > 0 else float(row.get('LTP', 0.0) or 0.0)
 
 def _kill_r_multiple(kill_dict, base_atr):
-    ad = float(kill_dict.get('anchor_delta', 0.0) or 0.0)
-    kd = float(kill_dict.get('killed_delta', 0.0) or 0.0)
-    datr = float(kill_dict.get('delta_eff_atr', 0.0) or 0.0)
-    if ad > 0 and kd > 0 and datr > 0:
-        return (kd - ad) / datr if kill_dict.get('dir', 'BULL') == 'BULL' else (ad - kd) / datr
     ap, kp = float(kill_dict.get('anchor_price', 0.0) or 0.0), float(kill_dict.get('killed_price', 0.0) or 0.0)
     atr = float(kill_dict.get('eff_atr') or base_atr or 0.0)
     if ap <= 0 or kp <= 0 or atr <= 0: return 0.0
     return (kp - ap) / atr if kill_dict.get('dir', 'BULL') == 'BULL' else (ap - kp) / atr
 
 def _r_multiple(row, include_banked=False):
-    live_r = 0.0
-    direction = row.get('PremiumDir', row.get('AnchorDir'))
-    ad = float(row.get('AnchorDelta', 0.0) or 0.0)
-    datr = float(row.get('DeltaBaseAtr', 0.0) or 0.0)
-    if ad > 0 and datr > 0 and _is_option_symbol(row.get('Symbol', '')):
-        cur_d = float(row.get('KilledDelta', 0.0) or 0.0) if (row.get('State') == "[STOPPED]" and float(row.get('KilledDelta', 0.0) or 0.0) > 0) else float(row.get('CurrDelta', 0.0) or 0.0)
-        if cur_d > 0:
-            live_r = (cur_d - ad) / datr if direction == 'BULL' else (ad - cur_d) / datr
-            return live_r + float(row.get('BankedR', 0.0) or 0.0) if include_banked else live_r
-    ap, base_atr = row.get('AnchorPrice', 0.0), row.get('BaseAtr', 0.0)
+    ap, base_atr, live_r = row.get('AnchorPrice', 0.0), row.get('BaseAtr', 0.0), 0.0
     if ap > 0 and base_atr > 0:
-        price = _exit_price(row)
+        price, direction = _exit_price(row), row.get('PremiumDir', row.get('AnchorDir'))
         live_r = (price - ap) / base_atr if direction == 'BULL' else (ap - price) / base_atr
     return live_r + float(row.get('BankedR', 0.0) or 0.0) if include_banked else live_r
 
@@ -3473,7 +3481,8 @@ def segregate_and_rank_buckets(by_symbol_map, filter_timestamp_gap=None, filter_
 
     for r in bears_live:
         if str(r.get('RR_Str', '')) == 'SL hit':
-            r['RejectReason'] = "Trailing SL Breached (LTP >= Displayed SL)"
+            _pdir = str(r.get('PremiumDir') or r.get('AnchorDir') or 'BEAR').upper()
+            r['RejectReason'] = "Trailing SL Breached (LTP <= Displayed SL)" if _pdir == 'BULL' else "Trailing SL Breached (LTP >= Displayed SL)"
             graveyard_candidates.append(r)
         elif not (_r_multiple(r) > drift_floor or _r_multiple(r, include_banked=True) > BANKED_R_PROTECTION_FLOOR):
             r['RejectReason'] = f"Adverse Drift (Losing R-Multiple < {drift_floor:g}R)"
@@ -3574,17 +3583,11 @@ def _passes_strict_popup_quality(row, check_gap=True, check_grid=True, min_r=Non
     if float(POPUP_MAX_R_MULTIPLE or 0.0) > 0 and live_r > float(POPUP_MAX_R_MULTIPLE):
         return False
     if float(POPUP_MAX_PULLBACK_FROM_PEAK_R or 0.0) > 0:
-        _ad = float(row.get('AnchorDelta', 0.0) or 0.0)
-        _pd = float(row.get('PeakDelta', 0.0) or 0.0)
-        _datr = float(row.get('DeltaBaseAtr', 0.0) or 0.0)
         _pdir = str(row.get('PremiumDir') or row.get('AnchorDir') or 'BULL').upper()
-        if _ad > 0 and _pd > 0 and _datr > 0 and _is_option_symbol(sym):
-            peak_r = ((_ad - _pd) if _pdir == 'BEAR' else (_pd - _ad)) / _datr
-        else:
-            _ap = float(row.get('AnchorPrice', 0.0) or 0.0)
-            _pk = float(row.get('PeakPrice', 0.0) or 0.0)
-            _batr = float(row.get('BaseAtr', 0.0) or 0.0)
-            peak_r = (((_ap - _pk) if _pdir == 'BEAR' else (_pk - _ap)) / _batr) if (_ap > 0 and _pk > 0 and _batr > 0) else live_r
+        _ap = float(row.get('AnchorPrice', 0.0) or 0.0)
+        _pk = float(row.get('PeakPrice', 0.0) or 0.0)
+        _batr = float(row.get('BaseAtr', 0.0) or 0.0)
+        peak_r = (((_ap - _pk) if _pdir == 'BEAR' else (_pk - _ap)) / _batr) if (_ap > 0 and _pk > 0 and _batr > 0) else live_r
         if (peak_r - live_r) > float(POPUP_MAX_PULLBACK_FROM_PEAK_R):
             return False
 
