@@ -507,7 +507,8 @@ DELTA_ENTRY_MAX_ABS = 0.85              # Anti-chase guard: skip options whose |
 ENABLE_INCEPTION_DELTA_REGIME = True    # Two-layer macro filter: require |Delta| >= inception-to-date mean from strike's first liquid trade day
 INCEPTION_LOOKBACK_CAL_DAYS = 95        # Single daily API call lookback to find the strike's first liquid trade day
 INCEPTION_MIN_DAILY_VOLUME = 1000       # Ignore dormant far-OTM days below this daily volume when anchoring contract inception
-INCEPTION_DELTA_MIN_Z = 0.0             # Minimum inception |Delta| z-score for BULL option entry (0.0 = above lifecycle mean)
+INCEPTION_DELTA_MIN_Z = 0.0             # Informational lifecycle z-score reference (gate uses rising gap-stitched |Delta| slope)
+INCEPTION_SLOPE_PERIOD = 10             # Short-term gap-stitched |Delta| mean period for rising-slope confirmation
 STOCK_OPT_DUAL_BAND_STD_MULT = 1.5      # Relaxed band half-width for STOCK_FNO / SWING_FNO
 DUAL_BAND_ALIGN_MODE = "ZSCORE"         # ZSCORE (default) | OFFSET (literal: PE(norm) = SMA(CE) + PE - SMA(PE))
 DUAL_BAND_MIN_SIGMA = 0.10              # Rs floor on each leg's sigma (2 ticks): stops tick-noise breakouts
@@ -2141,7 +2142,7 @@ def _get_cached_daily(cache_dict, cache_key, inst_key, target_dt, lookback_days=
         cache_dict[cache_key] = res
     return res
 
-def _build_inception_delta_regime(master, d_c, target_dt, opt_item, opt_specs, spot_df_1m):
+def _build_inception_delta_regime(master, d_c, target_dt, opt_item, opt_specs, spot_df_1m, sig_o=None, sig_c=None):
     """Build Two-Layer Inception-to-Date Macro |Delta| regime from the strike's FIRST LIQUID TRADE DAY."""
     n = len(d_c)
     if n == 0:
@@ -2218,14 +2219,30 @@ def _build_inception_delta_regime(master, d_c, target_dt, opt_item, opt_specs, s
             inc_mean[i] = mu
             inc_std[i] = sd
             inc_z[i] = (v - mu) / sd
-            ok_bull[i] = (inc_z[i] >= float(INCEPTION_DELTA_MIN_Z or 0.0) - 1e-9)
     else:
         first_liq_date = target_dt
         s_d = pd.Series(d_c)
         inc_mean = s_d.expanding(min_periods=1).mean().values
         inc_std = np.maximum(s_d.expanding(min_periods=1).std(ddof=0).fillna(min_sig).values, min_sig)
         inc_z = (d_c - inc_mean) / inc_std
-        ok_bull = inc_z >= (float(INCEPTION_DELTA_MIN_Z or 0.0) - 1e-9)
+
+    # Rising gap-stitched |Delta| slope gate: passes whenever |Delta| is rising above its
+    # gap-stitched short-term mean, regardless of whether 2-week lifecycle z is negative.
+    sc = np.asarray(sig_c if sig_c is not None else d_c, dtype=float)
+    so = np.asarray(sig_o if sig_o is not None else sc, dtype=float)
+    sess_starts = np.zeros(n, dtype=bool)
+    sess_starts[0] = True
+    if master is not None and not master.empty and 'SessId' in master.columns and len(master) == n:
+        sid_v = master['SessId'].values
+        sess_starts[1:] = sid_v[1:] != sid_v[:-1]
+    d_diff = np.diff(sc, prepend=sc[0])
+    d_diff = np.where(sess_starts, sc - so, d_diff)
+    stitched_sc = np.cumsum(d_diff) + so[0]
+    slope_p = max(3, int(INCEPTION_SLOPE_PERIOD or 10))
+    st_mean = pd.Series(stitched_sc).rolling(slope_p, min_periods=min(3, slope_p)).mean().values
+    st_slope = np.diff(st_mean, prepend=st_mean[0])
+    st_above = stitched_sc - st_mean
+    ok_bull = np.isfinite(st_mean) & (st_above > 0.0) & (st_slope >= 0.0)
 
     return {
         "enabled": bool(ENABLE_INCEPTION_DELTA_REGIME),
@@ -2234,6 +2251,8 @@ def _build_inception_delta_regime(master, d_c, target_dt, opt_item, opt_specs, s
         "mean": inc_mean,
         "std": inc_std,
         "z": inc_z,
+        "st_above": st_above,
+        "st_slope": st_slope,
         "ok_bull": ok_bull,
     }
 
@@ -2897,7 +2916,7 @@ def evaluate_anchor_tripwire(
                         delta_pass, delta_why = _delta_bb_pass(delta_gate, i, "BULL")
                         if not delta_pass: delta_blocks.append((i, delta_why))
                         elif inception_gate and inception_gate.get("enabled") and i < len(inception_gate["ok_bull"]) and not bool(inception_gate["ok_bull"][i]):
-                            inception_blocks.append((i, f"|Δ| z {float(inception_gate['z'][i]):+.2f} < {float(INCEPTION_DELTA_MIN_Z):g} (since {inception_gate['first_date']})"))
+                            inception_blocks.append((i, f"|Δ| slope not rising (vs mean {float(inception_gate['st_above'][i]):+.4f}, slope {float(inception_gate['st_slope'][i]):+.4f}, life z {float(inception_gate['z'][i]):+.2f})"))
                         elif r_bear: warzone_kills += 1
                         else:
                             inc_snap = (
@@ -3151,7 +3170,7 @@ def prepare_series(master, target_dt, is_sector_index=False, is_option=False, op
                     # Gap-stitched |Delta| Bollinger Band (runs on Charm/Vanna-neutralized sig_c in swing mode)
                     delta_bb = _build_delta_bb_gate(sig_c, sid, abs_delta_open=sig_o)
                     if ENABLE_INCEPTION_DELTA_REGIME:
-                        inception_delta = _build_inception_delta_regime(master, d_c, target_dt, opt_item, opt_specs, spot_df)
+                        inception_delta = _build_inception_delta_regime(master, d_c, target_dt, opt_item, opt_specs, spot_df, sig_o=sig_o, sig_c=sig_c)
 
                     # Directional indicators & BB/KC run on Black-Scholes |Delta| OHLC (Charm/Vanna-neutralized in swing mode)
                     ind_open, ind_high, ind_low, ind_close = sig_o, sig_h, sig_l, sig_c
