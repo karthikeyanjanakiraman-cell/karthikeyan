@@ -106,7 +106,7 @@ jobs:
             echo "=============================================="
 
             # Build command array for this mode
-            CMD_ARGS=("-u" "System3.py" "--mode" "$MODE")
+            CMD_ARGS=("-u" "System4.py" "--mode" "$MODE")
 
             # For INDEX_OPTIONS, force email send so it doesn't get skipped when pure popups = 0
             if [ "$MODE" = "INDEX_OPTIONS" ]; then
