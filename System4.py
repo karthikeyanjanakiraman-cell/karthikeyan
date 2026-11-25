@@ -57,11 +57,13 @@ HTML_DASHBOARD_PATH = "system3_dashboard.html"
 SEND_STILL_HOLDING_EMAIL = True                  # Master toggle: send separate email for setups that still hold good
 EMAIL_SEND_ONLY_WHEN_STILL_HOLDING_GT_0 = True   # Only send if at least 1 setup still holds good
 STILL_HOLDING_EXCLUDE_PURE_1ST_TIME = True       # Avoid duplicating brand-new Pure 1st-Time popups into the Still-Holding email
+STILL_HOLDING_MIN_R = 0.0                        # Minimum live R-multiple for Still-Holding email (0.0 = non-underwater only; e.g. -0.5 to allow slightly red)
 EMAIL_ATTACH_STILL_HOLDING_HTML = True           # Attach interactive HTML for still-holding setups
 EMAIL_STILL_HOLDING_ATTACHMENT_FILENAME = "System3_Still_Holding_Setups.html"
 ENV_SEND_STILL_HOLDING_EMAIL = "SEND_STILL_HOLDING_EMAIL"
 ENV_EMAIL_SEND_ONLY_WHEN_STILL_HOLDING_GT_0 = "EMAIL_SEND_ONLY_WHEN_STILL_HOLDING_GT_0"
 ENV_STILL_HOLDING_EXCLUDE_PURE_1ST_TIME = "STILL_HOLDING_EXCLUDE_PURE_1ST_TIME"
+ENV_STILL_HOLDING_MIN_R = "STILL_HOLDING_MIN_R"
 
 EMAIL_MAX_BUYERS = 0
 EMAIL_MAX_SELLERS = 0
@@ -453,9 +455,12 @@ SECTOR_CONSTITUENT_WEIGHTS = {
 
 # --- 0.9 INDEX OPTIONS CONFIGURATION ---
 OPTIONS_BUYING_ONLY = True
-EXPIRY_SELECTION = "CURRENT"
+EXPIRY_SELECTION = "CURRENT"               # Choices: CURRENT (0), NEXT (1), NEXT2 (2), MONTHLY, NEXT_MONTHLY, or exact date (YYYY-MM-DD / DD-MMM-YYYY)
+ENV_EXPIRY_SELECTION = "EXPIRY_SELECTION"
 STOCK_FNO_AUTO_ROLL_ON_EXPIRY_DAY = True   # On monthly expiry day (0DTE), automatically roll STOCK_FNO/SWING_FNO to next expiry
 INDEX_AUTO_ROLL_ON_EXPIRY_DAY = False      # Optional: keep False for index weekly 0DTE trading, True to roll index options on expiry day too
+ENV_STOCK_FNO_AUTO_ROLL_ON_EXPIRY_DAY = "STOCK_FNO_AUTO_ROLL_ON_EXPIRY_DAY"
+ENV_INDEX_AUTO_ROLL_ON_EXPIRY_DAY = "INDEX_AUTO_ROLL_ON_EXPIRY_DAY"
 STRIKES_ABOVE_ATM = 2
 STRIKES_BELOW_ATM = 2
 STOCK_OPT_STRIKES_ABOVE_ATM = 0
@@ -1608,6 +1613,37 @@ def _expiry_to_date(exp):
     except Exception: pass
     return None
 
+def _resolve_target_expiry(expiries, selection):
+    """Resolve target expiry date from sorted available expiry dates.
+    Supports: CURRENT (0), NEXT (1), NEXT2 (2), any integer index, MONTHLY, NEXT_MONTHLY, or explicit date (YYYY-MM-DD / DD-MMM-YYYY)."""
+    if not expiries:
+        return None
+    sel = str(selection or "CURRENT").strip().upper()
+    if sel in ("CURRENT", "NEAR", "0"):
+        return expiries[0]
+    if sel in ("NEXT", "1"):
+        return expiries[min(1, len(expiries) - 1)]
+    if sel in ("NEXT2", "2"):
+        return expiries[min(2, len(expiries) - 1)]
+    if sel.isdigit():
+        idx = int(sel)
+        return expiries[min(max(0, idx), len(expiries) - 1)]
+    if sel in ("MONTHLY", "NEXT_MONTHLY"):
+        by_ym = {}
+        for d in expiries:
+            by_ym[(d.year, d.month)] = max(d, by_ym.get((d.year, d.month), d))
+        monthlies = sorted(by_ym.values())
+        if not monthlies:
+            return expiries[0]
+        return monthlies[0] if sel == "MONTHLY" else monthlies[min(1, len(monthlies) - 1)]
+    parsed = _expiry_to_date(sel)
+    if parsed is not None:
+        if parsed in expiries:
+            return parsed
+        ge = [d for d in expiries if d >= parsed]
+        return ge[0] if ge else expiries[-1]
+    return expiries[0]
+
 def _attach_twin_keys(universe, lookup):
     """Give every option of the universe the instrument key of its CE<->PE twin (same underlying / expiry / strike)."""
     for it in universe:
@@ -1704,8 +1740,7 @@ def _index_options_universe(cutoff_dt, use_intraday, needles=()):
         min_exp_dt = (target_dt + timedelta(days=1)) if INDEX_AUTO_ROLL_ON_EXPIRY_DAY else target_dt
         expiries = sorted({c[0] for c in contracts if c[0] >= min_exp_dt}) or sorted({c[0] for c in contracts if c[0] >= target_dt})
         if not expiries: continue
-        expiry_idx = 1 if str(EXPIRY_SELECTION).upper() == "NEXT" else 0
-        target_exp = expiries[min(expiry_idx, len(expiries) - 1)]
+        target_exp = _resolve_target_expiry(expiries, EXPIRY_SELECTION)
         chain = [c for c in contracts if c[0] == target_exp]
         strikes = np.array(sorted({c[1] for c in chain}))
         ce_win, pe_win = _select_option_strikes(strikes, spot[idx], STRIKES_BELOW_ATM, STRIKES_ABOVE_ATM, no_otm=NO_OTM_STRIKES)
@@ -1816,11 +1851,10 @@ def _stock_options_universe(cutoff_dt, use_intraday, needles=()):
     # 4. Handle pinned / needles contracts (scoped to target expiry & near-ATM when tracking an underlying symbol)
     if needles:
         min_exp_dt = (target_dt + timedelta(days=1)) if STOCK_FNO_AUTO_ROLL_ON_EXPIRY_DAY else target_dt
-        expiry_idx = 1 if str(EXPIRY_SELECTION).upper() == "NEXT" else 0
         pinned_cands = []
         for u_sym, contracts in by_stock.items():
             expiries = sorted({c[0] for c in contracts if c[0] >= min_exp_dt}) or sorted({c[0] for c in contracts if c[0] >= target_dt})
-            target_exp = expiries[min(expiry_idx, len(expiries) - 1)] if expiries else None
+            target_exp = _resolve_target_expiry(expiries, EXPIRY_SELECTION) if expiries else None
             stk_spot = spot.get(u_sym, 0.0)
             for exp_date, strike, itype, row in contracts:
                 key = _field(row, "instrument_key")
@@ -1852,8 +1886,7 @@ def _stock_options_universe(cutoff_dt, use_intraday, needles=()):
         min_exp_dt = (target_dt + timedelta(days=1)) if STOCK_FNO_AUTO_ROLL_ON_EXPIRY_DAY else target_dt
         expiries = sorted({c[0] for c in contracts if c[0] >= min_exp_dt}) or sorted({c[0] for c in contracts if c[0] >= target_dt})
         if not expiries: continue
-        expiry_idx = 1 if str(EXPIRY_SELECTION).upper() == "NEXT" else 0
-        target_exp = expiries[min(expiry_idx, len(expiries) - 1)]
+        target_exp = _resolve_target_expiry(expiries, EXPIRY_SELECTION)
         chain = [c for c in contracts if c[0] == target_exp]
         strikes = np.array(sorted({c[1] for c in chain}))
 
@@ -4834,8 +4867,9 @@ def build_still_holding_email_and_attachment_html(
             sec_attr = html.escape(raw_sec, quote=True)
             click_attr = f" onclick=\"filterBySector({_js_onclick_arg(raw_sec)})\"" if js_clickable_index else ""
             sec_td = f"<td style='{td_b}color:#1e40af;font-weight:600;'>{html.escape(d['sector'])} ({d['weight']})</td>" if show_sec else ""
-            is_re = str(d.get('popup_type', '1ST-TIME')).startswith('RE-ANCHOR') or str(d.get('popup_type', '')).startswith('SWING-RE')
-            pt_bg, pt_fg = ("#fef3c7", "#92400e") if is_re else ("#dcfce7", "#166534")
+            _pt_s = str(d.get('popup_type', '1ST-TIME'))
+            is_re = _pt_s.startswith('RE-ANCHOR') or _pt_s.startswith('SWING-RE')
+            pt_bg, pt_fg = ("#fef3c7", "#92400e") if is_re else (("#dbeafe", "#1e40af") if _pt_s.startswith("HOLD-") else ("#dcfce7", "#166534"))
             r_bg, r_fg = ("#dcfce7", "#166534") if d["rank_r_pos"] else ("#fee2e2", "#991b1b")
             st_bg, st_fg = (("#dcfce7", "#166534") if basket_dir == "BULL" else ("#fee2e2", "#991b1b")) if d["is_expanding"] else ("#fef3c7", "#92400e")
 
@@ -5120,7 +5154,12 @@ def run_screener(
     _recent_session = (now_ist().date() - target_dt).days <= 3
     universe_raw = get_dynamic_universe(mode, cutoff_dt, (today_session or _recent_session), needles=needles)
     if STATS.auth_failed or not universe_raw: return 1
-    print(f"   {COLOR_DIM}» Universe: {len(universe_raw)} instruments{COLOR_RESET}")
+    _exp_summary = ""
+    if _is_option_mode(mode):
+        _exps = sorted({str(it.get("expiry")) for it in universe_raw if it.get("expiry")})
+        if _exps:
+            _exp_summary = f" | Expiry ({EXPIRY_SELECTION}): {', '.join(_exps[:6])}"
+    print(f"   {COLOR_DIM}» Universe: {len(universe_raw)} instruments{_exp_summary}{COLOR_RESET}")
 
     if _is_option_mode(mode):
         stock_candidates = universe_raw
@@ -5320,17 +5359,25 @@ def run_screener(
             )
 
     if SEND_STILL_HOLDING_EMAIL:
-        _eh_idx_b = list(idx_hold_bulls)
-        _eh_idx_r = list(idx_hold_bears)
-        _eh_stk_b = list(stock_hold_bulls)
-        _eh_stk_r = list(stock_hold_bears)
-        if STILL_HOLDING_EXCLUDE_PURE_1ST_TIME and SEND_DASHBOARD_EMAIL:
-            _pure_idx_keys = {(r.get('Symbol'), r.get('ActiveAnchor')) for r in (new_idx_b + new_idx_r)}
-            _pure_stk_keys = {(r.get('Symbol'), r.get('ActiveAnchor')) for r in (new_stk_b + new_stk_r)}
-            _eh_idx_b = [r for r in _eh_idx_b if (r.get('Symbol'), r.get('ActiveAnchor')) not in _pure_idx_keys]
-            _eh_idx_r = [r for r in _eh_idx_r if (r.get('Symbol'), r.get('ActiveAnchor')) not in _pure_idx_keys]
-            _eh_stk_b = [r for r in _eh_stk_b if (r.get('Symbol'), r.get('ActiveAnchor')) not in _pure_stk_keys]
-            _eh_stk_r = [r for r in _eh_stk_r if (r.get('Symbol'), r.get('ActiveAnchor')) not in _pure_stk_keys]
+        _pure_idx_keys = {(r.get('Symbol'), r.get('ActiveAnchor')) for r in (new_idx_b + new_idx_r)}
+        _pure_stk_keys = {(r.get('Symbol'), r.get('ActiveAnchor')) for r in (new_stk_b + new_stk_r)}
+        def _prep_holding(rows_in, pure_keys):
+            out = []
+            for r_ in rows_in:
+                key_ = (r_.get('Symbol'), r_.get('ActiveAnchor'))
+                if STILL_HOLDING_EXCLUDE_PURE_1ST_TIME and SEND_DASHBOARD_EMAIL and key_ in pure_keys:
+                    continue
+                if STILL_HOLDING_MIN_R is not None and _r_multiple(r_, include_banked=False) < float(STILL_HOLDING_MIN_R) - 1e-6:
+                    continue
+                rc = dict(r_)
+                if (not swing_mode) and str(rc.get('PopupType', '')) == '1ST-TIME' and key_ not in pure_keys:
+                    rc['PopupType'] = 'HOLD-1ST'
+                out.append(rc)
+            return out
+        _eh_idx_b = _prep_holding(idx_hold_bulls, _pure_idx_keys)
+        _eh_idx_r = _prep_holding(idx_hold_bears, _pure_idx_keys)
+        _eh_stk_b = _prep_holding(stock_hold_bulls, _pure_stk_keys)
+        _eh_stk_r = _prep_holding(stock_hold_bears, _pure_stk_keys)
         if sector_filter:
             _nf = _norm_sym(sector_filter)
             _eh_stk_b = [r for r in _eh_stk_b if _norm_sym(r.get('Sector', '')) == _nf or _nf in _norm_sym(r.get('Sector', ''))]
@@ -5378,7 +5425,11 @@ def parse_args():
     p.add_argument("--history-days", type=int, default=None)
     p.add_argument("--opt-min-price", type=float, default=None)
     p.add_argument("--opt-min-volume", type=float, default=None)
-    p.add_argument("--expiry", choices=["CURRENT", "NEXT"], default=EXPIRY_SELECTION)
+    p.add_argument("--expiry", type=str, default=None, help="Expiry choice: CURRENT (0), NEXT (1), NEXT2 (2), MONTHLY, NEXT_MONTHLY, or exact date (YYYY-MM-DD / DD-MMM-YYYY).")
+    p.add_argument("--auto-roll-index-expiry", dest="auto_roll_index_expiry", action="store_true", default=None)
+    p.add_argument("--no-auto-roll-index-expiry", dest="auto_roll_index_expiry", action="store_false")
+    p.add_argument("--auto-roll-stock-expiry", dest="auto_roll_stock_expiry", action="store_true", default=None)
+    p.add_argument("--no-auto-roll-stock-expiry", dest="auto_roll_stock_expiry", action="store_false")
     p.add_argument("--strikes-up", type=int, default=None)
     p.add_argument("--strikes-down", type=int, default=None)
     p.add_argument("--best-strike-only", dest="best_strike_only", action="store_true", default=None)
@@ -5461,6 +5512,7 @@ def parse_args():
     p.add_argument("--email-always-send-still-holding", dest="email_only_when_still_holding_gt_0", action="store_false")
     p.add_argument("--still-holding-exclude-pure", dest="still_holding_exclude_pure", action="store_true", default=None)
     p.add_argument("--still-holding-include-pure", dest="still_holding_exclude_pure", action="store_false")
+    p.add_argument("--still-holding-min-r", dest="still_holding_min_r", type=float, default=None, help="Min live R-multiple for Still-Holding email (default: 0.0; set e.g. -0.5 to allow slightly red).")
 
     p.add_argument("--save-html", dest="save_html", action="store_true", default=SAVE_LOCAL_HTML_FILE)
     p.add_argument("--no-sector-indices", action="store_true")
@@ -5544,7 +5596,24 @@ if __name__ == "__main__":
     if args.opt_min_volume is not None:
         OPT_MIN_VOLUME = args.opt_min_volume
         _CLI_OVERRIDES.add("opt_min_volume")
-    EXPIRY_SELECTION = args.expiry
+    _exp_raw = args.expiry if args.expiry is not None else os.environ.get(ENV_EXPIRY_SELECTION)
+    if _exp_raw is not None and str(_exp_raw).strip() != "":
+        EXPIRY_SELECTION = str(_exp_raw).strip().upper()
+    if args.auto_roll_index_expiry is not None:
+        INDEX_AUTO_ROLL_ON_EXPIRY_DAY = args.auto_roll_index_expiry
+    else:
+        INDEX_AUTO_ROLL_ON_EXPIRY_DAY = _parse_bool_env(ENV_INDEX_AUTO_ROLL_ON_EXPIRY_DAY, INDEX_AUTO_ROLL_ON_EXPIRY_DAY)
+    if args.auto_roll_stock_expiry is not None:
+        STOCK_FNO_AUTO_ROLL_ON_EXPIRY_DAY = args.auto_roll_stock_expiry
+    else:
+        STOCK_FNO_AUTO_ROLL_ON_EXPIRY_DAY = _parse_bool_env(ENV_STOCK_FNO_AUTO_ROLL_ON_EXPIRY_DAY, STOCK_FNO_AUTO_ROLL_ON_EXPIRY_DAY)
+    _sh_min_r = args.still_holding_min_r if args.still_holding_min_r is not None else os.environ.get(ENV_STILL_HOLDING_MIN_R)
+    if _sh_min_r is not None and str(_sh_min_r).strip() != "":
+        if str(_sh_min_r).strip().lower() in ("none", "off"):
+            STILL_HOLDING_MIN_R = None
+        else:
+            try: STILL_HOLDING_MIN_R = float(_sh_min_r)
+            except ValueError: pass
     if args.strikes_up is not None:
         STRIKES_ABOVE_ATM = args.strikes_up
         STOCK_OPT_STRIKES_ABOVE_ATM = args.strikes_up
