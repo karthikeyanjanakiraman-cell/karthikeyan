@@ -461,7 +461,7 @@ STRIKES_BELOW_ATM = 2
 STOCK_OPT_STRIKES_ABOVE_ATM = 0
 STOCK_OPT_STRIKES_BELOW_ATM = 0
 NO_OTM_STRIKES = True
-INDEX_OPTIONS_BEST_STRIKE_ONLY = False     # Optional: collapse correlated ATM/ITM strikes to the single highest-ranked strike per index/direction
+INDEX_OPTIONS_BEST_STRIKE_ONLY = True      # Collapse correlated ATM/ITM strikes to the single highest-ranked strike per index/direction (override with --all-strikes)
 ENV_INDEX_OPTIONS_BEST_STRIKE_ONLY = "INDEX_OPTIONS_BEST_STRIKE_ONLY"
 STOCK_FNO_MAX_STRIKES = 120             # Top N most-liquid stock option strike pairs by turnover (0 = unlimited)
 OPT_MIN_PRICE = 10.0
@@ -1927,7 +1927,12 @@ def compute_base_atr(m, tf=None, ignore_gaps=None):
         b_sess_start[0] = True
         b_sess_start[1:] = b_sid[1:] != b_sid[:-1]
         tr = np.where(b_sess_start, b_high - b_low, tr)
-    return float(tr[-ATR_BASIS_PERIOD:].mean()), len(b_close)
+    tr_win = tr[-ATR_BASIS_PERIOD:]
+    if len(tr_win) >= 5:
+        med_tr = float(np.median(tr_win))
+        if med_tr > 0:
+            tr_win = np.minimum(tr_win, 3.0 * med_tr)
+    return float(tr_win.mean()), len(b_close)
 
 def _ewm(x, alpha, sess_starts=None):
     xs = x.tolist()
@@ -3186,6 +3191,11 @@ def prepare_series(master, target_dt, is_sector_index=False, is_option=False, op
         r_calc, r_bars = compute_base_atr(master.iloc[:raw_ts], tf=_rt, ignore_gaps=atr_ignore_gaps)
         if r_calc is not None and r_bars >= ATR_MIN_BARS:
             risk_atr = max(min(float(r_calc), cap_v), floor_v)
+            _base_min = max(1, _tf_to_minutes(ATR_BASIS_TF))
+            _risk_min = max(1, _tf_to_minutes(_rt))
+            if _risk_min > _base_min and base_atr > 0:
+                _max_ratio = max(1.5, math.sqrt(_risk_min / float(_base_min)) * 1.25)
+                risk_atr = min(risk_atr, base_atr * _max_ratio)
 
     # Resample engine candles (and twin leg) to CANDLE_TF_MIN with canonical bar open/close timestamps
     master = _resample_master(master, CANDLE_TF_MIN, cutoff_dt=cutoff_dt)
@@ -3633,6 +3643,8 @@ def _merge_signal(sig_rows, last_row, direction):
     first, latest = sig_rows[0], sig_rows[-1]
     row = dict(last_row)
     row['ActiveAnchor'], row['AnchorPrice'], row['AnchorDir'] = first['ActiveAnchor'], first['AnchorPrice'], direction
+    _fcp = first.get('CheckpointTime')
+    row['FirstSeenIter'] = _fcp.strftime('%H:%M') if hasattr(_fcp, 'strftime') else str(_fcp or '')
     row['AnchorDate'] = first.get('AnchorDate', '')
     row['DaysHeld'] = int(last_row.get('DaysHeld', first.get('DaysHeld', 0)) or 0)
     row['AnchorDelta'] = float(first.get('AnchorDelta', 0.0) or 0.0)
@@ -3985,9 +3997,14 @@ def classify_setup_popup_type(row, appearances_map=None, window_start_dt=None, w
         if window_start_dt and window_end_dt:
             other_anc_iters = [it_lbl for (it_lbl, anc) in app_list if anc != curr_anc and _anchor_within_lookback_window(anc, window_start_dt, window_end_dt)]
 
-    # FirstPopupIter = first iteration that detected this anchor (prefer curr_label over bar-open Anchor time)
-    if same_anc_iters and (not window_start_dt or _anchor_within_lookback_window(curr_anc, window_start_dt, window_end_dt)):
+    # FirstPopupIter = earliest detection iteration/checkpoint for this anchor (never overwrite with later snapshot time)
+    first_seen_cp = str(row.get('FirstSeenIter') or '').strip()
+    if same_anc_iters and first_seen_cp:
+        first_it = same_anc_iters[0] if _hhmm_to_min(same_anc_iters[0]) <= _hhmm_to_min(first_seen_cp) else first_seen_cp
+    elif same_anc_iters:
         first_it = same_anc_iters[0]
+    elif first_seen_cp:
+        first_it = first_seen_cp
     elif curr_label:
         first_it = curr_label
     else:
@@ -4811,7 +4828,7 @@ def build_still_holding_email_and_attachment_html(
         tr_list = []
         for idx_i, r in enumerate(rows_list):
             d = _ser_holding(r, basket_dir)
-            tgt_badge = f"<span style='font-size:10px;background:#fef3c7;color:#92400e;border-radius:3px;padding:1px 3px;margin-right:2px;'>{d['tgt_tag']}</span>" if d["tgt_tag"] else ""
+            tgt_badge = f"<span style='font-size:10px;background:#fef3c7;color:#92400e;border-radius:3px;padding:1px 3px;margin-right:2px;'>{d['tgt_tag']}</span> " if d["tgt_tag"] else ""
             row_bg = "background:#f8fafc;" if idx_i % 2 else "background:#fff;"
             raw_sec = d["symbol"] if not show_sec else d["sector"]
             sec_attr = html.escape(raw_sec, quote=True)
