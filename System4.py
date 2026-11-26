@@ -132,7 +132,7 @@ MODE_PROFILES = {
         "swing_mode": True,
     },
     "SWING_INDEX": {
-        "candle_tf_min": 15,
+        "candle_tf_min": "75min",
         "atr_basis_tf": "75min",
         "risk_atr_tf": "375min",
         "history_days": 14,
@@ -141,7 +141,7 @@ MODE_PROFILES = {
         "opt_min_price": 10.0,
         "opt_min_volume": 5000,
         "dual_band_std_mult": 1.0,
-        "dual_band_twin_max_stale_min": 15,
+        "dual_band_twin_max_stale_min": 75,
         "isolate_session_bands": False,
         "swing_mode": True,
     },
