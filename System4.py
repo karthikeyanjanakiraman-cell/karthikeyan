@@ -449,7 +449,7 @@ SECTOR_CONSTITUENT_WEIGHTS = {
 
 # --- 0.9 INDEX OPTIONS CONFIGURATION ---
 OPTIONS_BUYING_ONLY = True
-EXPIRY_SELECTION = "CURRENT"               # Choices: CURRENT (0), NEXT (1), NEXT2 (2), MONTHLY, NEXT_MONTHLY, or exact date (YYYY-MM-DD / DD-MMM-YYYY)
+EXPIRY_SELECTION = "MONTHLY"               # Choices: CURRENT (0), NEXT (1), NEXT2 (2), MONTHLY, NEXT_MONTHLY, or exact date (YYYY-MM-DD / DD-MMM-YYYY)
 ENV_EXPIRY_SELECTION = "EXPIRY_SELECTION"
 STOCK_FNO_AUTO_ROLL_ON_EXPIRY_DAY = True   # On monthly expiry day (0DTE), automatically roll STOCK_FNO/SWING_FNO to next expiry
 INDEX_AUTO_ROLL_ON_EXPIRY_DAY = False      # Optional: keep False for index weekly 0DTE trading, True to roll index options on expiry day too
