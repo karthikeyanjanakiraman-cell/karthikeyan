@@ -449,7 +449,7 @@ SECTOR_CONSTITUENT_WEIGHTS = {
 
 # --- 0.9 INDEX OPTIONS CONFIGURATION ---
 OPTIONS_BUYING_ONLY = True
-EXPIRY_SELECTION = "CURRENT"               # Choices: CURRENT (0), NEXT (1), NEXT2 (2), MONTHLY, NEXT_MONTHLY, or exact date (YYYY-MM-DD / DD-MMM-YYYY)
+EXPIRY_SELECTION = "NEXT_MONTHLY"               # Choices: CURRENT (0), NEXT (1), NEXT2 (2), MONTHLY, NEXT_MONTHLY, or exact date (YYYY-MM-DD / DD-MMM-YYYY)
 ENV_EXPIRY_SELECTION = "EXPIRY_SELECTION"
 STOCK_FNO_AUTO_ROLL_ON_EXPIRY_DAY = True   # On monthly expiry day (0DTE), automatically roll STOCK_FNO/SWING_FNO to next expiry
 INDEX_AUTO_ROLL_ON_EXPIRY_DAY = False      # Optional: keep False for index weekly 0DTE trading, True to roll index options on expiry day too
@@ -481,7 +481,7 @@ ALIAS_TO_INDEX = {a: idx for idx, cfg in INDEX_CONFIG.items() for a in cfg["alia
 PROBE_KEY = INDEX_CONFIG["NIFTY"]["spot_key"]
 
 # --- 0.9B OPTION IMPLIED VOLATILITY (IV) & CRUSH PROTECTION ENGINE ---
-ENABLE_OPTION_IV_ENGINE = True
+ENABLE_OPTION_IV_ENGINE = False
 IV_CRUSH_DROP_PCT = 0.15              # 15% drop from post-anchor peak IV triggers Kinetic SL
 IV_CRUSH_VEL_MULT = 2.5              # Negative IV velocity > 2.5x ATR_vel (on smoothed IV) triggers IV crush kill
 IV_CRUSH_VEL_MIN_DROP_PCT = 0.05     # Require >= 5% IV drop from post-anchor peak alongside velocity shock (and curr_r < 0)
@@ -493,7 +493,7 @@ ENV_IV_CRUSH_VEL_MULT = "IV_CRUSH_VEL_MULT"
 ENV_IV_REQUIRE_NON_NEGATIVE_VEL = "IV_REQUIRE_NON_NEGATIVE_VEL"
 
 # --- 0.9C BLACK-SCHOLES |DELTA| GATE & INCEPTION REGIME (OPTIONS) ---
-ENABLE_OPTION_DELTA_ENGINE = True       # Run Lock 1 (BB/KC), Lock 2 (MACD/ADX/+DI/-DI/OBV), Lock 3 (Kinetic Shock), & Delta-BB on Black-Scholes |Delta|
+ENABLE_OPTION_DELTA_ENGINE = False       # Run Lock 1 (BB/KC), Lock 2 (MACD/ADX/+DI/-DI/OBV), Lock 3 (Kinetic Shock), & Delta-BB on Black-Scholes |Delta|
 ENV_ENABLE_OPTION_DELTA_ENGINE = "ENABLE_OPTION_DELTA_ENGINE"
 DELTA_BB_PERIOD = 20                    # Mandatory |Delta| Bollinger Band period (bars) for intraday option modes
 DELTA_BB_STD_MULT = 1.0                 # Mandatory |Delta| Upper BB sigma multiplier for intraday option modes
