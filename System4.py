@@ -495,8 +495,10 @@ ENV_IV_REQUIRE_NON_NEGATIVE_VEL = "IV_REQUIRE_NON_NEGATIVE_VEL"
 # --- 0.9C BLACK-SCHOLES |DELTA| GATE & INCEPTION REGIME (OPTIONS) ---
 ENABLE_OPTION_DELTA_ENGINE = True       # Run Lock 1 (BB/KC), Lock 2 (MACD/ADX/+DI/-DI/OBV), Lock 3 (Kinetic Shock), & Delta-BB on Black-Scholes |Delta|
 ENV_ENABLE_OPTION_DELTA_ENGINE = "ENABLE_OPTION_DELTA_ENGINE"
-DELTA_BB_PERIOD = 20                    # Mandatory |Delta| Bollinger Band period (bars) for all option modes
-DELTA_BB_STD_MULT = 1.0                 # Mandatory |Delta| Upper BB sigma multiplier (early entry requires |Delta| > +1.0sigma Upper BB)
+DELTA_BB_PERIOD = 20                    # Mandatory |Delta| Bollinger Band period (bars) for intraday option modes
+DELTA_BB_STD_MULT = 1.0                 # Mandatory |Delta| Upper BB sigma multiplier for intraday option modes
+SWING_DELTA_BB_PERIOD = 10              # 75m Swing |Delta| BB period (10 bars = 2 trading sessions; avoids 4-day lag on reversals)
+SWING_DELTA_BB_STD_MULT = 0.75          # 75m Swing |Delta| Upper BB sigma multiplier (aligned with IND_BB_PIERCE_STD)
 DELTA_BB_MIN_SIGMA = 0.005              # Floor on |Delta| std to prevent zero-variance tick glitches
 DELTA_MIN_ATR = 0.005                   # Floor on Black-Scholes |Delta| ATR used for option stops & R-multiples
 DELTA_MAX_ATR = 0.15                    # Cap on Black-Scholes |Delta| ATR used for option stops & R-multiples
@@ -579,6 +581,12 @@ def _is_stock_option_mode(mode=None):
 def _is_index_option_mode(mode=None):
     m = str(mode if mode is not None else (_RUN_MODE or TRADING_MODE)).upper()
     return m in ("INDEX_OPTIONS", "SWING_INDEX")
+
+def _entity_labels(mode=None):
+    """Return (PLURAL_UPPER, SINGULAR_UPPER, singular_lower, title_plural) for console/email headers."""
+    if _is_index_option_mode(mode):
+        return ("INDEX OPTIONS", "INDEX OPTION", "index option", "Index Options")
+    return ("STOCKS", "STOCK", "stock", "Stocks")
 
 def _apply_mode_profile(mode):
     """Apply mode-specific defaults (candle TF, ATR basis, strikes, liquidity, Dual-Band, Swing settings) unless explicitly overridden via CLI/env."""
@@ -1098,7 +1106,9 @@ def _report_legend_text():
     if _is_option_mode(_RUN_MODE):
         _eng_parts = []
         if ENABLE_OPTION_DELTA_ENGINE:
-            _eng_parts.append(f"Black-Scholes |Δ| ({int(DELTA_BB_PERIOD)}-bar {'session-isolated' if ISOLATE_SESSION_BANDS else 'gap-stitched'} |Δ| > Upper BB +{float(DELTA_BB_STD_MULT):g}σ)")
+            _dbb_p = int(SWING_DELTA_BB_PERIOD if _is_swing_mode() else DELTA_BB_PERIOD)
+            _dbb_s = float(SWING_DELTA_BB_STD_MULT if _is_swing_mode() else DELTA_BB_STD_MULT)
+            _eng_parts.append(f"Black-Scholes |Δ| ({_dbb_p}-bar {'session-isolated' if ISOLATE_SESSION_BANDS else 'gap-stitched'} |Δ| > Upper BB +{_dbb_s:g}σ)")
         if ENABLE_OPTION_VOLUME_ENGINE:
             _eng_parts.append(f"Volume ({int(VOL_BB_PERIOD)}-bar Vol > Upper BB +{float(VOL_BB_STD_MULT):g}σ)")
         parts.append(f"Option Engine Lock 1-3 & BB: {' + '.join(_eng_parts) if _eng_parts else 'NONE (fail-closed)'}")
@@ -2343,15 +2353,15 @@ def _is_true_option_item(item):
 def _closed_delta_bb_gate(reason):
     return {'required': True, 'available': False, 'reason': reason}
 
-def _build_delta_bb_gate(abs_delta, sid, abs_delta_open=None):
+def _build_delta_bb_gate(abs_delta, sid, abs_delta_open=None, swing_mode=False):
     """Mandatory |Delta| Bollinger Band gate (fail-closed). Entry requires |Delta| > Upper BB(|Delta|).
     When ISOLATE_SESSION_BANDS=False, gap-stitches across sessions so overnight gap-ups/gap-downs are ignored."""
     d_arr = np.asarray(abs_delta, dtype=float)
     n = len(d_arr)
     if n == 0 or not np.isfinite(d_arr).any():
         return _closed_delta_bb_gate("delta series unavailable (fail-closed)")
-    period = max(2, int(DELTA_BB_PERIOD or 20))
-    std_mult = float(DELTA_BB_STD_MULT or 1.0)
+    period = max(2, int((SWING_DELTA_BB_PERIOD if swing_mode else DELTA_BB_PERIOD) or 20))
+    std_mult = float((SWING_DELTA_BB_STD_MULT if swing_mode else DELTA_BB_STD_MULT) or 1.0)
     min_sig = max(float(DELTA_BB_MIN_SIGMA or 0.005), 1e-6)
     min_p = min(period, _scaled_warmup_bars())
     if ISOLATE_SESSION_BANDS:
@@ -2407,25 +2417,28 @@ def _delta_bb_snapshot(gate, i):
         'z': float(gate['z'][i]),
     }
 
-def _delta_block_reason(delta_blocks, dt_1m):
+def _format_block_ts(dt_1m, idx, target_dt=None, swing_mode=False):
+    try:
+        return _format_anchor_label(dt_1m[idx], target_dt if swing_mode else None)
+    except Exception:
+        return '-'
+
+def _delta_block_reason(delta_blocks, dt_1m, target_dt=None, swing_mode=False):
     if not delta_blocks: return ""
     last_i, last_why = delta_blocks[-1]
-    try: last_t = pd.to_datetime(dt_1m[last_i]).strftime('%H:%M')
-    except Exception: last_t = '-'
+    last_t = _format_block_ts(dt_1m, last_i, target_dt=target_dt, swing_mode=swing_mode)
     return f"Delta-BB Gate: {last_why} ({len(delta_blocks)}x, last {last_t})"
 
-def _inception_block_reason(inception_blocks, dt_1m):
+def _inception_block_reason(inception_blocks, dt_1m, target_dt=None, swing_mode=False):
     if not inception_blocks: return ""
     last_i, last_why = inception_blocks[-1]
-    try: last_t = pd.to_datetime(dt_1m[last_i]).strftime('%H:%M')
-    except Exception: last_t = '-'
+    last_t = _format_block_ts(dt_1m, last_i, target_dt=target_dt, swing_mode=swing_mode)
     return f"Inception |Δ| Gate: {last_why} ({len(inception_blocks)}x, last {last_t})"
 
-def _iv_block_reason(iv_blocks, dt_1m):
+def _iv_block_reason(iv_blocks, dt_1m, target_dt=None, swing_mode=False):
     if not iv_blocks: return ""
     last_i, last_why = iv_blocks[-1]
-    try: last_t = pd.to_datetime(dt_1m[last_i]).strftime('%H:%M')
-    except Exception: last_t = '-'
+    last_t = _format_block_ts(dt_1m, last_i, target_dt=target_dt, swing_mode=swing_mode)
     return f"IV Gate: {last_why} ({len(iv_blocks)}x, last {last_t})"
 
 def _closed_vol_bb_gate(reason):
@@ -2482,11 +2495,10 @@ def _vol_bb_snapshot(gate, i):
         'z': float(gate['z'][i]),
     }
 
-def _vol_block_reason(vol_blocks, dt_1m):
+def _vol_block_reason(vol_blocks, dt_1m, target_dt=None, swing_mode=False):
     if not vol_blocks: return ""
     last_i, last_why = vol_blocks[-1]
-    try: last_t = pd.to_datetime(dt_1m[last_i]).strftime('%H:%M')
-    except Exception: last_t = '-'
+    last_t = _format_block_ts(dt_1m, last_i, target_dt=target_dt, swing_mode=swing_mode)
     return f"Volume Gate: {last_why} ({len(vol_blocks)}x, last {last_t})"
 
 def _build_option_volume_engine(vol, sess_starts, sid):
@@ -2563,6 +2575,7 @@ def _evaluate_iv_arrays(iv, sess_starts, sid):
 
     return {
         'iv': iv,
+        'iv_smooth': iv_smooth,
         'iv_mean': iv_mean,
         'iv_std': iv_std,
         'vel_iv': delta_iv,
@@ -2958,7 +2971,8 @@ def evaluate_anchor_tripwire(
         peak_live_delta = float(anchor.get('delta', 0.0))
         peak_sig_delta = float(anchor.get('sig_delta', peak_live_delta))
         j = anchor['idx'] + 1
-        peak_iv = iv_kin['iv'][anchor['idx']] if (is_option and iv_kin and anchor['idx'] < len(iv_kin.get('iv', []))) else 0.0
+        _iv_series = (iv_kin.get('iv_smooth') if (iv_kin and iv_kin.get('iv_smooth') is not None) else (iv_kin.get('iv') if iv_kin else None))
+        peak_iv = float(_iv_series[anchor['idx']]) if (is_option and _iv_series is not None and anchor['idx'] < len(_iv_series)) else 0.0
 
         while j < n:
             (bull_score, bear_score, _, _, _, _, _, _) = get_kinetics(kin_1m, j)
@@ -3007,8 +3021,8 @@ def evaluate_anchor_tripwire(
                     reason = f"Profit Lock (+{pl_trig:g}R Peak -> +{pl_floor:g}R Floor)"
                 elif max_r < soft_disable_r and adverse >= soft_mult * eff_atr and opposing >= opp_thresh:
                     reason = soft_reason
-                elif is_option and iv_kin and ENABLE_OPTION_IV_ENGINE and (not is_expiry_day) and j < len(iv_kin.get('iv', [])):
-                    cur_iv = iv_kin['iv'][j]
+                elif is_option and iv_kin and ENABLE_OPTION_IV_ENGINE and (not is_expiry_day) and _iv_series is not None and j < len(_iv_series):
+                    cur_iv = float(_iv_series[j])
                     peak_iv = max(peak_iv, cur_iv)
                     vel_iv_j = iv_kin['vel_iv'][j]
                     atr_iv_j = max(iv_kin['atr_iv'][j], 1e-6)
@@ -3057,10 +3071,10 @@ def evaluate_anchor_tripwire(
     if survived_anchor: return survived_anchor, {"status": "Survived", "kills": kills}
     info = dict(last_killed_info)
     if warzone_kills > 0 and info['dir'] == 'NONE': info['reason'] = f"Warzone Inversion Chop ({warzone_kills}x)"
-    elif vol_blocks and info['dir'] == 'NONE': info['reason'] = _vol_block_reason(vol_blocks, dt_1m)
-    elif inception_blocks and info['dir'] == 'NONE': info['reason'] = _inception_block_reason(inception_blocks, dt_1m)
-    elif delta_blocks and info['dir'] == 'NONE': info['reason'] = _delta_block_reason(delta_blocks, dt_1m)
-    elif iv_blocks and info['dir'] == 'NONE': info['reason'] = _iv_block_reason(iv_blocks, dt_1m)
+    elif vol_blocks and info['dir'] == 'NONE': info['reason'] = _vol_block_reason(vol_blocks, dt_1m, target_dt=target_dt, swing_mode=swing_mode)
+    elif inception_blocks and info['dir'] == 'NONE': info['reason'] = _inception_block_reason(inception_blocks, dt_1m, target_dt=target_dt, swing_mode=swing_mode)
+    elif delta_blocks and info['dir'] == 'NONE': info['reason'] = _delta_block_reason(delta_blocks, dt_1m, target_dt=target_dt, swing_mode=swing_mode)
+    elif iv_blocks and info['dir'] == 'NONE': info['reason'] = _iv_block_reason(iv_blocks, dt_1m, target_dt=target_dt, swing_mode=swing_mode)
     info['kills'] = kills
     return None, info
 
@@ -3171,7 +3185,7 @@ def prepare_series(master, target_dt, is_sector_index=False, is_option=False, op
                         if ENABLE_OPTION_IV_ENGINE:
                             iv_kin = _evaluate_iv_arrays(iv_arr, sess_starts, sid)
                         # Gap-stitched |Delta| Bollinger Band (runs on causal Charm/Vanna-neutralized sig_c in swing mode)
-                        delta_bb = _build_delta_bb_gate(sig_c, sid, abs_delta_open=sig_o)
+                        delta_bb = _build_delta_bb_gate(sig_c, sid, abs_delta_open=sig_o, swing_mode=swing_mode)
                         if ENABLE_INCEPTION_DELTA_REGIME:
                             inception_delta = _build_inception_delta_regime(master, d_c, target_dt, opt_item, opt_specs, spot_df, sig_o=sig_o, sig_c=sig_c)
 
@@ -4106,11 +4120,14 @@ def render_console_dashboard(
         ),
     )
 
+    ent_pl, ent_sg, ent_lo, ent_ti = _entity_labels(mode)
+    if not norm_filter and _is_index_option_mode(mode):
+        filter_banner = " [DEFAULT VIEW: SHOWING ALL INDEX OPTIONS]"
     print(f"\n{COLOR_BOLD}=== STATEFUL INSTITUTIONAL VOLATILITY TRACKER [{mode}]{filter_banner} ==={COLOR_RESET}")
     print(
         f"Target Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Checkpoints: {len(checkpoints)} | "
         f"Sectoral Indices (Bull: {len(idx_bulls)}, Bear: {len(idx_bears)}, Grave: {len(idx_grave)}) | "
-        f"Stocks Shown (Bull: {len(f_stock_bulls)}, Bear: {len(f_stock_bears)}, Grave: {len(f_stock_grave)})\n"
+        f"{ent_ti} Shown (Bull: {len(f_stock_bulls)}, Bear: {len(f_stock_bears)}, Grave: {len(f_stock_grave)})\n"
         f"{COLOR_DIM}{_report_legend_text()}{COLOR_RESET}\n"
     )
 
@@ -4224,14 +4241,19 @@ def render_console_dashboard(
         print_grave_table("SECTORAL INDICES — THE GRAVEYARD", "🏛️🚫", idx_grave, show_sector_col=False)
 
     print(f"\n{COLOR_CYAN}{'=' * 95}{COLOR_RESET}")
-    stage2_label = f"STAGE 2: STOCKS FOR SECTOR [{active_sector_filter.upper()}]" if norm_filter else "STAGE 2: ALL ACTIVE STOCKS (Mapped by Highest Sectoral Index Weightage)"
+    if norm_filter:
+        stage2_label = f"STAGE 2: {ent_pl} FOR SECTOR [{active_sector_filter.upper()}]"
+    elif _is_index_option_mode(mode):
+        stage2_label = "STAGE 2: ALL ACTIVE INDEX OPTIONS (NIFTY / BANKNIFTY / FINNIFTY / SENSEX)"
+    else:
+        stage2_label = "STAGE 2: ALL ACTIVE STOCKS (Mapped by Highest Sectoral Index Weightage)"
     print(f"{COLOR_BOLD}📈  {stage2_label}{COLOR_RESET}")
     print(f"{COLOR_CYAN}{'=' * 95}{COLOR_RESET}")
-    print_active_table(f"STOCKS — TOP BULL SETUPS — BULL {_format_count_with_ce_pe(f_stock_bulls)}", "🔥", f_stock_bulls, show_sector_col=True, show_first_iter_col=True, show_target_sl=True)
-    print_active_table(f"STOCKS — TOP BEAR SETUPS — BEAR {_format_count_with_ce_pe(f_stock_bears)}", "🩸", f_stock_bears, show_sector_col=True, show_first_iter_col=True, show_target_sl=True)
+    print_active_table(f"{ent_pl} — TOP BULL SETUPS — BULL {_format_count_with_ce_pe(f_stock_bulls)}", "🔥", f_stock_bulls, show_sector_col=True, show_first_iter_col=True, show_target_sl=True)
+    print_active_table(f"{ent_pl} — TOP BEAR SETUPS — BEAR {_format_count_with_ce_pe(f_stock_bears)}", "🩸", f_stock_bears, show_sector_col=True, show_first_iter_col=True, show_target_sl=True)
     if not f_stock_bulls and not f_stock_bears:
-        print(f"{COLOR_YELLOW}No surviving stock anchors for this view.{COLOR_RESET}")
-    print_grave_table("STOCKS — THE GRAVEYARD", "🚫", f_stock_grave, show_sector_col=True)
+        print(f"{COLOR_YELLOW}No surviving {ent_lo} anchors for this view.{COLOR_RESET}")
+    print_grave_table(f"{ent_pl} — THE GRAVEYARD", "🚫", f_stock_grave, show_sector_col=True)
 
     if ((lookback_meta and lookback_meta.get("enabled")) or _is_swing_mode()) and stock_popup_res is not None:
         w_start_s = lookback_meta["window_start_dt"].strftime("%H:%M") if lookback_meta else "-"
@@ -4253,15 +4275,15 @@ def render_console_dashboard(
             print_active_table(f"PURE FIRST-TIME SECTORAL INDEX POPUPS — BULL ({len(new_idx_bulls)})", "🏛️🆕🔥", new_idx_bulls, show_sector_col=False, show_first_iter_col=True, show_target_sl=True)
             print_active_table(f"PURE FIRST-TIME SECTORAL INDEX POPUPS — BEAR ({len(new_idx_bears)})", "🏛️🆕🩸", new_idx_bears, show_sector_col=False, show_first_iter_col=True, show_target_sl=True)
 
-        print_active_table(f"PURE FIRST-TIME STOCK POPUPS — BULL {_format_count_with_ce_pe(new_stk_bulls)}", "🆕🔥", new_stk_bulls, show_sector_col=True, show_first_iter_col=True, show_target_sl=True)
-        print_active_table(f"PURE FIRST-TIME STOCK POPUPS — BEAR {_format_count_with_ce_pe(new_stk_bears)}", "🆕🩸", new_stk_bears, show_sector_col=True, show_first_iter_col=True, show_target_sl=True)
+        print_active_table(f"PURE FIRST-TIME {ent_sg} POPUPS — BULL {_format_count_with_ce_pe(new_stk_bulls)}", "🆕🔥", new_stk_bulls, show_sector_col=True, show_first_iter_col=True, show_target_sl=True)
+        print_active_table(f"PURE FIRST-TIME {ent_sg} POPUPS — BEAR {_format_count_with_ce_pe(new_stk_bears)}", "🆕🩸", new_stk_bears, show_sector_col=True, show_first_iter_col=True, show_target_sl=True)
 
         if win_idx_bulls or win_idx_bears:
             print_active_table(f"ALL WINDOW SECTORAL INDEX POPUPS — BULL ({len(win_idx_bulls)})", "🏛️⏱️🔥", win_idx_bulls, show_sector_col=False, show_first_iter_col=True, show_target_sl=True)
             print_active_table(f"ALL WINDOW SECTORAL INDEX POPUPS — BEAR ({len(win_idx_bears)})", "🏛️⏱️🩸", win_idx_bears, show_sector_col=False, show_first_iter_col=True, show_target_sl=True)
 
-        print_active_table(f"ALL WINDOW STOCK POPUPS — BULL {_format_count_with_ce_pe(win_stk_bulls)}", "⏱️🔥", win_stk_bulls, show_sector_col=True, show_first_iter_col=True, show_target_sl=True)
-        print_active_table(f"ALL WINDOW STOCK POPUPS — BEAR {_format_count_with_ce_pe(win_stk_bears)}", "⏱️🩸", win_stk_bears, show_sector_col=True, show_first_iter_col=True, show_target_sl=True)
+        print_active_table(f"ALL WINDOW {ent_sg} POPUPS — BULL {_format_count_with_ce_pe(win_stk_bulls)}", "⏱️🔥", win_stk_bulls, show_sector_col=True, show_first_iter_col=True, show_target_sl=True)
+        print_active_table(f"ALL WINDOW {ent_sg} POPUPS — BEAR {_format_count_with_ce_pe(win_stk_bears)}", "⏱️🩸", win_stk_bears, show_sector_col=True, show_first_iter_col=True, show_target_sl=True)
 
 def build_full_untruncated_plain_text(
     mode, cutoff_dt, checkpoints, idx_bulls, idx_bears, idx_grave,
@@ -4373,25 +4395,27 @@ def build_full_untruncated_plain_text(
         lines.append(f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Anchor Window: {w_start_s} to {w_end_s}")
         lines.append(_report_legend_text())
         lines.append(_pure_note_text())
+        ent_pl, ent_sg, _, ent_ti = _entity_labels(mode)
         lines.append(
             f"Sectoral Indices {scope_tag}: ▲ {len(sel_idx_b)} Bull / ▼ {len(sel_idx_r)} Bear | "
-            f"Stocks {scope_tag}: ▲ {len(sel_stk_b)} Bull [CE({nb_ce}) PE({nb_pe})] / ▼ {len(sel_stk_r)} Bear [CE({nr_ce}) PE({nr_pe})]\n"
+            f"{ent_ti} {scope_tag}: ▲ {len(sel_stk_b)} Bull [CE({nb_ce}) PE({nb_pe})] / ▼ {len(sel_stk_r)} Bear [CE({nr_ce}) PE({nr_pe})]\n"
         )
         if sel_idx_b or sel_idx_r:
             _fmt_active_block(f"{scope_tag} SECTORAL INDEX POPUPS — BULL", sel_idx_b, show_sector=False, show_first_iter=True, include_ce_pe_counts=False)
             _fmt_active_block(f"{scope_tag} SECTORAL INDEX POPUPS — BEAR", sel_idx_r, show_sector=False, show_first_iter=True, include_ce_pe_counts=False)
-        _fmt_active_block(f"{scope_tag} STOCK POPUPS — BULL", sel_stk_b, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
-        _fmt_active_block(f"{scope_tag} STOCK POPUPS — BEAR", sel_stk_r, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
+        _fmt_active_block(f"{scope_tag} {ent_sg} POPUPS — BULL", sel_stk_b, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
+        _fmt_active_block(f"{scope_tag} {ent_sg} POPUPS — BEAR", sel_stk_r, show_sector=True, show_first_iter=True, include_ce_pe_counts=True)
         return "\n".join(lines)
 
+    ent_pl, ent_sg, _, ent_ti = _entity_labels(mode)
     lines.append(f"=== SYSTEM 3.0 INSTITUTIONAL VOLATILITY TRACKER [{mode}] ===")
     lines.append(f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')}")
     lines.append(_report_legend_text() + "\n")
     if idx_bulls or idx_bears:
         _fmt_active_block("SECTORAL INDICES — TOP BULL SETUPS", idx_bulls, show_sector=False, include_ce_pe_counts=False)
         _fmt_active_block("SECTORAL INDICES — TOP BEAR SETUPS", idx_bears, show_sector=False, include_ce_pe_counts=False)
-    _fmt_active_block("ALL STOCKS — TOP BULL SETUPS", e_bulls, show_sector=True, include_ce_pe_counts=True)
-    _fmt_active_block("ALL STOCKS — TOP BEAR SETUPS", e_bears, show_sector=True, include_ce_pe_counts=True)
+    _fmt_active_block(f"ALL {ent_pl} — TOP BULL SETUPS", e_bulls, show_sector=True, include_ce_pe_counts=True)
+    _fmt_active_block(f"ALL {ent_pl} — TOP BEAR SETUPS", e_bears, show_sector=True, include_ce_pe_counts=True)
     return "\n".join(lines)
 
 def build_email_and_attachment_html(
@@ -4533,10 +4557,11 @@ def build_email_and_attachment_html(
         f"<div style='color:#0369a1;font-size:11px;margin-bottom:4px;'>{html.escape(_pure_note_text())}</div>"
         f"<div style='color:#334155;font-size:12px;margin-top:4px;'>"
         f"<b>Sectoral Indices:</b> <span style='color:#15803d;font-weight:700;'>▲ {len(email_idx_b)} Bull</span> &nbsp;/&nbsp; <span style='color:#b91c1c;font-weight:700;'>▼ {len(email_idx_r)} Bear</span> &nbsp;|&nbsp; "
-        f"<b>Stocks:</b> <span style='color:#15803d;font-weight:700;'>▲ {len(email_stk_b)} Bull [CE({nb_ce}) PE({nb_pe})]</span> &nbsp;/&nbsp; <span style='color:#b91c1c;font-weight:700;'>▼ {len(email_stk_r)} Bear [CE({nr_ce}) PE({nr_pe})]</span>"
+        f"<b>{_entity_labels(mode)[3]}:</b> <span style='color:#15803d;font-weight:700;'>▲ {len(email_stk_b)} Bull [CE({nb_ce}) PE({nb_pe})]</span> &nbsp;/&nbsp; <span style='color:#b91c1c;font-weight:700;'>▼ {len(email_stk_r)} Bear [CE({nr_ce}) PE({nr_pe})]</span>"
         f"</div></div>"
     )
 
+    ent_pl, ent_sg, _, _ = _entity_labels(mode)
     idx_section_html = ""
     if email_idx_b or email_idx_r:
         idx_section_html = (
@@ -4550,10 +4575,10 @@ def build_email_and_attachment_html(
     stk_section_html = ""
     if email_stk_b or email_stk_r:
         stk_section_html = (
-            f"<div style='font-size:15px;font-weight:800;color:#0f172a;margin:18px 0 6px 0;'>📈 STOCKS — {sec_tag} POPUPS</div>"
-            + (f"{_sec_banner(f'🆕🔥 {sec_tag} STOCK POPUPS — BULL {_format_count_with_ce_pe(email_stk_b)}', True)}"
+            f"<div style='font-size:15px;font-weight:800;color:#0f172a;margin:18px 0 6px 0;'>📈 {ent_pl} — {sec_tag} POPUPS</div>"
+            + (f"{_sec_banner(f'🆕🔥 {sec_tag} {ent_sg} POPUPS — BULL {_format_count_with_ce_pe(email_stk_b)}', True)}"
                f"{_table_active_html(email_stk_b, 'BULL', show_sec=True, show_first_iter=True)}" if email_stk_b else "")
-            + (f"{_sec_banner(f'🆕🩸 {sec_tag} STOCK POPUPS — BEAR {_format_count_with_ce_pe(email_stk_r)}', False)}"
+            + (f"{_sec_banner(f'🆕🩸 {sec_tag} {ent_sg} POPUPS — BEAR {_format_count_with_ce_pe(email_stk_r)}', False)}"
                f"{_table_active_html(email_stk_r, 'BEAR', show_sec=True, show_first_iter=True)}" if email_stk_r else "")
         )
 
@@ -4616,9 +4641,10 @@ def build_still_holding_plain_text(
     lines.append(f"=== SYSTEM 3.0 [{mode}] — SETUPS STILL HOLDING GOOD REPORT ===")
     lines.append(f"Snapshot: {cutoff_dt.strftime('%Y-%m-%d %H:%M')} | Active Holding Setups (Alive & Not Stopped Out)")
     lines.append(_report_legend_text())
+    ent_pl, _, _, ent_ti = _entity_labels(mode)
     lines.append(
         f"Sectoral Indices Still Holding: ▲ {len(idx_hold_bulls)} Bull / ▼ {len(idx_hold_bears)} Bear | "
-        f"Stocks Still Holding: ▲ {len(stock_hold_bulls)} Bull [CE({hb_ce}) PE({hb_pe})] / ▼ {len(stock_hold_bears)} Bear [CE({hr_ce}) PE({hr_pe})]\n"
+        f"{ent_ti} Still Holding: ▲ {len(stock_hold_bulls)} Bull [CE({hb_ce}) PE({hb_pe})] / ▼ {len(stock_hold_bears)} Bear [CE({hr_ce}) PE({hr_pe})]\n"
     )
 
     def _fmt_holding_block(title, data_list, show_sector=True, include_ce_pe_counts=True):
@@ -4681,8 +4707,8 @@ def build_still_holding_plain_text(
         _fmt_holding_block("SECTORAL INDICES — STILL HOLDING BULL", idx_hold_bulls, show_sector=False, include_ce_pe_counts=False)
         _fmt_holding_block("SECTORAL INDICES — STILL HOLDING BEAR", idx_hold_bears, show_sector=False, include_ce_pe_counts=False)
 
-    _fmt_holding_block("STOCKS — STILL HOLDING BULL", stock_hold_bulls, show_sector=True, include_ce_pe_counts=True)
-    _fmt_holding_block("STOCKS — STILL HOLDING BEAR", stock_hold_bears, show_sector=True, include_ce_pe_counts=True)
+    _fmt_holding_block(f"{ent_pl} — STILL HOLDING BULL", stock_hold_bulls, show_sector=True, include_ce_pe_counts=True)
+    _fmt_holding_block(f"{ent_pl} — STILL HOLDING BEAR", stock_hold_bears, show_sector=True, include_ce_pe_counts=True)
     return "\n".join(lines)
 
 def build_still_holding_email_and_attachment_html(
@@ -4801,10 +4827,11 @@ def build_still_holding_email_and_attachment_html(
         f"<div style='color:#64748b;font-size:11px;margin-bottom:4px;'>{html.escape(_report_legend_text())}</div>"
         f"<div style='color:#334155;font-size:12px;margin-top:4px;'>"
         f"<b>Sectoral Indices:</b> <span style='color:#15803d;font-weight:700;'>▲ {len(idx_hold_bulls)} Bull</span> &nbsp;/&nbsp; <span style='color:#b91c1c;font-weight:700;'>▼ {len(idx_hold_bears)} Bear</span> &nbsp;|&nbsp; "
-        f"<b>Stocks:</b> <span style='color:#15803d;font-weight:700;'>▲ {len(stock_hold_bulls)} Bull [CE({hb_ce}) PE({hb_pe})]</span> &nbsp;/&nbsp; <span style='color:#b91c1c;font-weight:700;'>▼ {len(stock_hold_bears)} Bear [CE({hr_ce}) PE({hr_pe})]</span>"
+        f"<b>{_entity_labels(mode)[3]}:</b> <span style='color:#15803d;font-weight:700;'>▲ {len(stock_hold_bulls)} Bull [CE({hb_ce}) PE({hb_pe})]</span> &nbsp;/&nbsp; <span style='color:#b91c1c;font-weight:700;'>▼ {len(stock_hold_bears)} Bear [CE({hr_ce}) PE({hr_pe})]</span>"
         f"</div></div>"
     )
 
+    ent_pl = _entity_labels(mode)[0]
     idx_section_html = ""
     if idx_hold_bulls or idx_hold_bears:
         idx_section_html = (
@@ -4818,10 +4845,10 @@ def build_still_holding_email_and_attachment_html(
     stk_section_html = ""
     if stock_hold_bulls or stock_hold_bears:
         stk_section_html = (
-            f"<div style='font-size:15px;font-weight:800;color:#0f172a;margin:18px 0 6px 0;'>📈 STOCKS — STILL HOLDING</div>"
-            + (f"{_sec_banner(f'🔥 STOCKS — STILL HOLDING BULL {_format_count_with_ce_pe(stock_hold_bulls)}', True)}"
+            f"<div style='font-size:15px;font-weight:800;color:#0f172a;margin:18px 0 6px 0;'>📈 {ent_pl} — STILL HOLDING</div>"
+            + (f"{_sec_banner(f'🔥 {ent_pl} — STILL HOLDING BULL {_format_count_with_ce_pe(stock_hold_bulls)}', True)}"
                f"{_table_holding_html(stock_hold_bulls, 'BULL', show_sec=True)}" if stock_hold_bulls else "")
-            + (f"{_sec_banner(f'🩸 STOCKS — STILL HOLDING BEAR {_format_count_with_ce_pe(stock_hold_bears)}', False)}"
+            + (f"{_sec_banner(f'🩸 {ent_pl} — STILL HOLDING BEAR {_format_count_with_ce_pe(stock_hold_bears)}', False)}"
                f"{_table_holding_html(stock_hold_bears, 'BEAR', show_sec=True)}" if stock_hold_bears else "")
         )
 
@@ -5027,7 +5054,9 @@ def run_screener(
             return 1
         _eng_b = []
         if ENABLE_OPTION_DELTA_ENGINE:
-            _eng_b.append(f"Black-Scholes |Δ| ({int(DELTA_BB_PERIOD)}-bar {'session-isolated' if ISOLATE_SESSION_BANDS else 'gap-stitched'} |Δ| > Upper BB +{float(DELTA_BB_STD_MULT):g}σ)")
+            _dbb_p = int(SWING_DELTA_BB_PERIOD if swing_mode else DELTA_BB_PERIOD)
+            _dbb_s = float(SWING_DELTA_BB_STD_MULT if swing_mode else DELTA_BB_STD_MULT)
+            _eng_b.append(f"Black-Scholes |Δ| ({_dbb_p}-bar {'session-isolated' if ISOLATE_SESSION_BANDS else 'gap-stitched'} |Δ| > Upper BB +{_dbb_s:g}σ)")
         if ENABLE_OPTION_VOLUME_ENGINE:
             _eng_b.append(f"Volume ({int(VOL_BB_PERIOD)}-bar Vol > Upper BB +{float(VOL_BB_STD_MULT):g}σ)")
         print(
@@ -5125,6 +5154,22 @@ def run_screener(
     outcomes = [o for sym_outcomes, _ in per_symbol for o in sym_outcomes]
     results = [p for _, s, p in outcomes if s == "ok"]
     extra_results = [p for _, extra_outcomes in per_symbol for _, s, p in extra_outcomes if s == "ok"]
+    _ok_syms = {r.get('Symbol') for r in results}
+    _dropped_by_reason = {}
+    for _sym_outcomes, _ in per_symbol:
+        if not _sym_outcomes:
+            continue
+        _last_st, _last_payload = _sym_outcomes[-1][1], _sym_outcomes[-1][2]
+        if _last_st != "ok" and _last_payload not in _ok_syms:
+            _dropped_by_reason.setdefault(_last_st, []).append(str(_last_payload))
+    if _dropped_by_reason:
+        _total_drop = sum(len(v) for v in _dropped_by_reason.values())
+        _parts = []
+        for _rk, _rsyms in sorted(_dropped_by_reason.items()):
+            _u_syms = sorted(set(_rsyms))
+            _sample = ", ".join(_u_syms[:12]) + (f" (+{len(_u_syms) - 12} more)" if len(_u_syms) > 12 else "")
+            _parts.append(f"{_rk}({len(_u_syms)}): [{_sample}]")
+        print(f"   {COLOR_YELLOW}» Dropped upstream ({_total_drop}): {' | '.join(_parts)}{COLOR_RESET}")
     if not results:
         status_counts = {}
         for _, s, _ in outcomes:
@@ -5213,8 +5258,9 @@ def run_screener(
         nb_ce, nb_pe = _ce_pe_counts(new_stk_b)
         nr_ce, nr_pe = _ce_pe_counts(new_stk_r)
 
+        _ent_ti = _entity_labels(mode)[3]
         if EMAIL_SEND_ONLY_WHEN_PURE_1ST_TIME_GT_0 and pure_total <= 0:
-            print(f"   {COLOR_YELLOW}📧 [dashboard-email] Skipped sending: No popup rows to send (Index: ▲{new_idx_b_cnt} ▼{new_idx_r_cnt} | Stocks: ▲{new_b_cnt} ▼{new_r_cnt}).{COLOR_RESET}")
+            print(f"   {COLOR_YELLOW}📧 [dashboard-email] Skipped sending: No popup rows to send (Index: ▲{new_idx_b_cnt} ▼{new_idx_r_cnt} | {_ent_ti}: ▲{new_b_cnt} ▼{new_r_cnt}).{COLOR_RESET}")
         else:
             _email_stock_popup_res = dict(stock_popup_res or {}, **{_k_b: new_stk_b, _k_r: new_stk_r})
             plain_text_report = build_full_untruncated_plain_text(
@@ -5232,7 +5278,7 @@ def run_screener(
             w_end_s = lookback_meta["window_end_dt"].strftime("%H:%M") if (lookback_meta and lookback_meta.get("enabled")) else cutoff_dt.strftime("%H:%M")
             win_tag = f"Last {int(SWING_FRESH_SESSIONS)}d" if swing_mode else f"{w_start_s}..{w_end_s}"
             lbl = _pure_label() if EMAIL_ONLY_PURE_1ST_TIME_CONTENT else "All Window Popups"
-            email_subject = f"[System3 {mode}] {lbl} ({win_tag}): Index(▲{new_idx_b_cnt} ▼{new_idx_r_cnt}) | Stocks: {new_b_cnt}▲ (CE:{nb_ce} PE:{nb_pe}) | {new_r_cnt}▼ (CE:{nr_ce} PE:{nr_pe})"
+            email_subject = f"[System3 {mode}] {lbl} ({win_tag}): Index(▲{new_idx_b_cnt} ▼{new_idx_r_cnt}) | {_ent_ti}: {new_b_cnt}▲ (CE:{nb_ce} PE:{nb_pe}) | {new_r_cnt}▼ (CE:{nr_ce} PE:{nr_pe})"
             _send_email_message(
                 subject=email_subject,
                 plain_body=plain_text_report,
@@ -5270,8 +5316,9 @@ def run_screener(
         hb_ce, hb_pe = _ce_pe_counts(_eh_stk_b)
         hr_ce, hr_pe = _ce_pe_counts(_eh_stk_r)
 
+        _sh_ent_ti = _entity_labels(mode)[3]
         if EMAIL_SEND_ONLY_WHEN_STILL_HOLDING_GT_0 and holding_total <= 0:
-            print(f"   {COLOR_YELLOW}📧 [still-holding-email] Skipped sending: No still-holding rows (Index: ▲{len(_eh_idx_b)} ▼{len(_eh_idx_r)} | Stocks: ▲0 ▼0).{COLOR_RESET}")
+            print(f"   {COLOR_YELLOW}📧 [still-holding-email] Skipped sending: No still-holding rows (Index: ▲{len(_eh_idx_b)} ▼{len(_eh_idx_r)} | {_sh_ent_ti}: ▲0 ▼0).{COLOR_RESET}")
         else:
             holding_plain_text = build_still_holding_plain_text(
                 mode, cutoff_dt, checkpoints, _eh_idx_b, _eh_idx_r,
@@ -5284,7 +5331,7 @@ def run_screener(
             holding_subject = (
                 f"[System3 {mode}] Still Holding Good: "
                 f"Index(▲{len(_eh_idx_b)} ▼{len(_eh_idx_r)}) | "
-                f"Stocks: {len(_eh_stk_b)}▲ (CE:{hb_ce} PE:{hb_pe}) | "
+                f"{_sh_ent_ti}: {len(_eh_stk_b)}▲ (CE:{hb_ce} PE:{hb_pe}) | "
                 f"{len(_eh_stk_r)}▼ (CE:{hr_ce} PE:{hr_pe})"
             )
             _send_email_message(
