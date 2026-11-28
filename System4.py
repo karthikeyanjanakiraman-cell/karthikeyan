@@ -5710,9 +5710,6 @@ if __name__ == "__main__":
         IV_CRUSH_DROP_PCT = args.iv_crush_pct
     if args.iv_crush_vel_mult is not None:
         IV_CRUSH_VEL_MULT = args.iv_crush_vel_mult
-
-
-
     try:
         code = run_screener(
             args.mode, args.days, args.date, args.time,
