@@ -90,60 +90,53 @@ SMTP_TIMEOUT_SEC = 30
 
 # --- 0.2 EXECUTION & UNIVERSE FILTERING ---
 TRADING_MODE = "STOCK_FNO"
+
+_INTRADAY_SWING_2D = {
+    "profile_label": "Intraday Swing (2d)",
+    "candle_tf_min": 15,
+    "atr_basis_tf": "75min",
+    "risk_atr_tf": "375min",
+    "history_days": 19,
+    "isolate_session_bands": False,
+    "swing_mode": True,
+    "swing_lookback_sessions": 2,
+    "swing_fresh_sessions": 1,
+    "swing_delta_trail_atr_mult": 1.5,
+    "swing_delta_bb_period": 20,
+    "swing_delta_bb_std_mult": 1.0,
+}
+
+_WEEKLY_SWING_1W = {
+    "profile_label": "Weekly Swing (1wk / 5d)",
+    "candle_tf_min": 75,
+    "atr_basis_tf": "75min",
+    "risk_atr_tf": "375min",
+    "history_days": 30,
+    "isolate_session_bands": False,
+    "swing_mode": True,
+    "swing_lookback_sessions": 5,
+    "swing_fresh_sessions": 2,
+    "swing_delta_trail_atr_mult": 2.0,
+    "swing_delta_bb_period": 10,
+    "swing_delta_bb_std_mult": 0.75,
+}
+
+_INDEX_OPT_SPEC = {"strikes_up": 2, "strikes_down": 2, "opt_min_price": 10.0, "opt_min_volume": 5000}
+_STOCK_OPT_SPEC = {"strikes_up": 0, "strikes_down": 0, "opt_min_price": 5.0,  "opt_min_volume": 50000}
+
 MODE_PROFILES = {
-    "INDEX_OPTIONS": {
-        "candle_tf_min": 75,
-        "atr_basis_tf": "75min",
-        "risk_atr_tf": "375min",
-        "history_days": 30,
-        "strikes_up": 2,
-        "strikes_down": 2,
-        "opt_min_price": 10.0,
-        "opt_min_volume": 5000,
-        "isolate_session_bands": False,
-        "swing_mode": True,
-    },
-    "STOCK_FNO": {
-        "candle_tf_min": 75,
-        "atr_basis_tf": "75min",
-        "risk_atr_tf": "375min",
-        "history_days": 30,
-        "strikes_up": 0,
-        "strikes_down": 0,
-        "opt_min_price": 5.0,
-        "opt_min_volume": 50000,
-        "isolate_session_bands": False,
-        "swing_mode": True,
-    },
-    "SWING_FNO": {
-        "candle_tf_min": 75,
-        "atr_basis_tf": "75min",
-        "risk_atr_tf": "375min",
-        "history_days": 30,
-        "strikes_up": 0,
-        "strikes_down": 0,
-        "opt_min_price": 5.0,
-        "opt_min_volume": 50000,
-        "isolate_session_bands": False,
-        "swing_mode": True,
-    },
-    "SWING_INDEX": {
-        "candle_tf_min": 75,
-        "atr_basis_tf": "75min",
-        "risk_atr_tf": "375min",
-        "history_days": 30,
-        "strikes_up": 2,
-        "strikes_down": 2,
-        "opt_min_price": 10.0,
-        "opt_min_volume": 5000,
-        "isolate_session_bands": False,
-        "swing_mode": True,
-    },
+    "INDEX_OPTIONS": {**_INTRADAY_SWING_2D, **_INDEX_OPT_SPEC},
+    "STOCK_FNO":     {**_INTRADAY_SWING_2D, **_STOCK_OPT_SPEC},
+    "SWING_INDEX":   {**_WEEKLY_SWING_1W,   **_INDEX_OPT_SPEC},
+    "SWING_FNO":     {**_WEEKLY_SWING_1W,   **_STOCK_OPT_SPEC},
     "CASH_EQUITY": {
+        "profile_label": "Intraday Cash",
         "candle_tf_min": 15,
         "atr_basis_tf": "60min",
         "risk_atr_tf": "360min",
         "history_days": 19,
+        "isolate_session_bands": True,
+        "swing_mode": False,
     },
 }
 _CLI_OVERRIDES = set()
@@ -449,7 +442,7 @@ SECTOR_CONSTITUENT_WEIGHTS = {
 
 # --- 0.9 INDEX OPTIONS CONFIGURATION ---
 OPTIONS_BUYING_ONLY = True
-EXPIRY_SELECTION = "NEXT_MONTHLY"               # Choices: CURRENT (0), NEXT (1), NEXT2 (2), MONTHLY, NEXT_MONTHLY, or exact date (YYYY-MM-DD / DD-MMM-YYYY)
+EXPIRY_SELECTION = "CURRENT"               # Choices: CURRENT (0), NEXT (1), NEXT2 (2), MONTHLY, NEXT_MONTHLY, or exact date (YYYY-MM-DD / DD-MMM-YYYY)
 ENV_EXPIRY_SELECTION = "EXPIRY_SELECTION"
 STOCK_FNO_AUTO_ROLL_ON_EXPIRY_DAY = True   # On monthly expiry day (0DTE), automatically roll STOCK_FNO/SWING_FNO to next expiry
 INDEX_AUTO_ROLL_ON_EXPIRY_DAY = False      # Optional: keep False for index weekly 0DTE trading, True to roll index options on expiry day too
